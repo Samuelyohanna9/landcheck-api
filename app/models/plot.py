@@ -1,6 +1,7 @@
 from sqlalchemy import Column, Integer
 from geoalchemy2 import Geometry
-from app.db import Base
+from app.db_base import Base
+
 
 class Plot(Base):
     __tablename__ = "plots"
