@@ -1,6 +1,7 @@
 from sqlalchemy import Column, Integer, String, ForeignKey
 from geoalchemy2 import Geometry
-from app.db import Base
+from app.db_base import Base
+
 
 class DetectedFeature(Base):
     __tablename__ = "detected_features"
