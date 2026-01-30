@@ -4,22 +4,19 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.routers import health, plots, analytics, feedback
-from app.db_init import init_db   # 👈 ADD THIS
+from app.db_init import init_db
 
 app = FastAPI(title="LandCheck API")
 
 # ✅ Create tables on startup
 @app.on_event("startup")
-def on_startup():
+def startup_event():
     init_db()
 
-# CORS middleware
+# CORS (relaxed for MVP)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:5173",
-        "https://your-frontend-domain.vercel.app",  # add later
-    ],
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
