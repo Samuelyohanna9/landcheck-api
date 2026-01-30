@@ -23,13 +23,14 @@ def render_back_computation_pdf(rows, sum_de, sum_dn, area_m2, plot_id, output_p
     c.drawString(margin_left, top_y, f"PLOT {plot_id}")
 
     # ================= TABLE SETUP =================
+    # Changed to single ±ΔE and ±ΔN columns
     headers = [
-        "FROM", "TO", "E", "N", "+ΔE", "-ΔE", "+ΔN", "-ΔN",
+        "FROM", "TO", "E", "N", "±ΔE", "±ΔN",
         "DIST (m)", "FB (DMS)", "BB (DMS)"
     ]
 
-    # Fits A4 landscape safely
-    col_x = [40, 80, 125, 190, 255, 320, 385, 450, 525, 610, 695]
+    # Adjusted column positions for new layout
+    col_x = [40, 85, 135, 220, 305, 390, 475, 570, 680]
 
     row_y = top_y - 60
     row_h = 22
@@ -67,20 +68,20 @@ def render_back_computation_pdf(rows, sum_de, sum_dn, area_m2, plot_id, output_p
         de = r["dE"]
         dn = r["dN"]
 
+        # Single column with ± sign included in value
         values = [
             r["from"], r["to"],
             f"{r['E']:.3f}", f"{r['N']:.3f}",
-            f"{de:.3f}" if de > 0 else "",
-            f"{abs(de):.3f}" if de < 0 else "",
-            f"{dn:.3f}" if dn > 0 else "",
-            f"{abs(dn):.3f}" if dn < 0 else "",
+            f"{de:+.3f}",  # Shows + or - sign
+            f"{dn:+.3f}",  # Shows + or - sign
             f"{r['distance']:.3f}",
             str(r["fb"]),
             str(r["bb"]),
         ]
 
-        for x, v in zip(col_x, values):
-            if v.replace('.', '', 1).replace('-', '', 1).isdigit():
+        for i, (x, v) in enumerate(zip(col_x, values)):
+            # Color numeric values in red
+            if i >= 2 and i <= 6:  # E, N, ±ΔE, ±ΔN, DIST columns
                 c.setFillColor(red)
             else:
                 c.setFillColor(black)
@@ -117,16 +118,10 @@ def render_back_computation_pdf(rows, sum_de, sum_dn, area_m2, plot_id, output_p
 
     c.drawString(col_x[0], y, "TOTAL")
 
+    # Show totals in the ±ΔE and ±ΔN columns (should be ~0.000 for closed polygon)
     c.setFillColor(red)
-    if sum_de > 0:
-        c.drawString(col_x[4], y, f"{sum_de:.3f}")
-    elif sum_de < 0:
-        c.drawString(col_x[5], y, f"{abs(sum_de):.3f}")
-
-    if sum_dn > 0:
-        c.drawString(col_x[6], y, f"{sum_dn:.3f}")
-    elif sum_dn < 0:
-        c.drawString(col_x[7], y, f"{abs(sum_dn):.3f}")
+    c.drawString(col_x[4], y, f"{sum_de:+.3f}")
+    c.drawString(col_x[5], y, f"{sum_dn:+.3f}")
 
     # bottom line
     c.setFillColor(black)
