@@ -1,4 +1,7 @@
-from app.db import Base, engine
+# app/db_init.py
+
+from app.db import engine
+from app.db_base import Base  # 👈 THIS IS THE FIX
 
 # Import ALL models so SQLAlchemy registers them
 from app.models.plot import Plot
@@ -8,6 +11,3 @@ from app.models.detected_feature import DetectedFeature
 
 def init_db():
     Base.metadata.create_all(bind=engine)
-
-if __name__ == "__main__":
-    init_db()
