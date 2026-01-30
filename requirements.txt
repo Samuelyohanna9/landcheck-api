@@ -15,3 +15,4 @@ pyproj
 numpy
 pandas
 requests
+psycopg2-binary
