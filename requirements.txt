@@ -1,5 +1,5 @@
 fastapi
-uvicorn
+uvicorn[standard]
 psycopg2-binary
 sqlalchemy
 geoalchemy2
@@ -10,3 +10,8 @@ geopandas
 Pillow
 contextily
 ezdxf
+shapely
+pyproj
+numpy
+pandas
+requests
