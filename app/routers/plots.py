@@ -29,6 +29,27 @@ from app.utils.orthophoto_renderer import (
 
 router = APIRouter(prefix="/plots", tags=["plots"])
 
+# Coordinate system EPSG codes mapping
+COORDINATE_SYSTEMS = {
+    "wgs84": 4326,
+    "utm_31n": 32631,
+    "utm_32n": 32632,
+    "utm_33n": 32633,
+    "minna_31": 26331,
+    "minna_32": 26332,
+    "minna_33": 26333,
+}
+
+COORDINATE_SYSTEM_NAMES = {
+    "wgs84": "WGS84 (Lat/Lon)",
+    "utm_31n": "UTM Zone 31N",
+    "utm_32n": "UTM Zone 32N",
+    "utm_33n": "UTM Zone 33N",
+    "minna_31": "Minna Datum Zone 31",
+    "minna_32": "Minna Datum Zone 32",
+    "minna_33": "Minna Datum Zone 33",
+}
+
 
 def get_db():
     db = SessionLocal()
@@ -216,7 +237,8 @@ def download_plot_report_pdf(plot_id: int, db: Session = Depends(get_db),
     scale_text: str = Body("1 : 1000"),
     surveyor_name: str = Body(""),
     surveyor_rank: str = Body(""),
-    station_names: list[str] = Body(default=[])):
+    station_names: list[str] = Body(default=[]),
+    coordinate_system: str = Body("wgs84")):
 
     reports_dir = "app/reports"
     maps_dir = "app/reports/maps"
@@ -225,6 +247,10 @@ def download_plot_report_pdf(plot_id: int, db: Session = Depends(get_db),
 
     pdf_path = f"{reports_dir}/plot_{plot_id}_report.pdf"
     map_path = f"{maps_dir}/plot_{plot_id}_map.png"
+
+    # Get EPSG code for selected coordinate system
+    epsg_code = COORDINATE_SYSTEMS.get(coordinate_system, 4326)
+    crs_name = COORDINATE_SYSTEM_NAMES.get(coordinate_system, "WGS84")
 
     render_plot_map_layout(
         db=db,
@@ -237,7 +263,10 @@ def download_plot_report_pdf(plot_id: int, db: Session = Depends(get_db),
         scale_text=scale_text,
         surveyor_name=surveyor_name,
         surveyor_rank=surveyor_rank,
-        station_names=station_names if station_names else None
+        station_names=station_names if station_names else None,
+        coordinate_system=coordinate_system,
+        epsg_code=epsg_code,
+        crs_footer_text=f"COORDINATE SYSTEM: {crs_name}"
     )
 
     report = get_plot_report(plot_id, db)
@@ -257,12 +286,17 @@ def preview_plot_map(plot_id: int, db: Session = Depends(get_db),
     scale_text: str = Body("1 : 1000"),
     surveyor_name: str = Body(""),
     surveyor_rank: str = Body(""),
-    station_names: list[str] = Body(default=[])):
+    station_names: list[str] = Body(default=[]),
+    coordinate_system: str = Body("wgs84")):
 
     maps_dir = "app/reports/previews"
     os.makedirs(maps_dir, exist_ok=True)
 
     map_path = f"{maps_dir}/plot_{plot_id}_preview.png"
+
+    # Get EPSG code for selected coordinate system
+    epsg_code = COORDINATE_SYSTEMS.get(coordinate_system, 4326)
+    crs_name = COORDINATE_SYSTEM_NAMES.get(coordinate_system, "WGS84")
 
     render_plot_map_layout(
         db=db,
@@ -275,7 +309,10 @@ def preview_plot_map(plot_id: int, db: Session = Depends(get_db),
         scale_text=scale_text,
         surveyor_name=surveyor_name,
         surveyor_rank=surveyor_rank,
-        station_names=station_names if station_names else None
+        station_names=station_names if station_names else None,
+        coordinate_system=coordinate_system,
+        epsg_code=epsg_code,
+        crs_footer_text=f"COORDINATE SYSTEM: {crs_name}"
     )
 
     return FileResponse(map_path, media_type="image/png")
@@ -283,8 +320,10 @@ def preview_plot_map(plot_id: int, db: Session = Depends(get_db),
 
 # ---------------- BACK COMPUTATION ----------------
 
-@router.get("/{plot_id}/back-computation/pdf")
-def download_back_computation_pdf(plot_id: int, db: Session = Depends(get_db)):
+@router.post("/{plot_id}/back-computation/pdf")
+def download_back_computation_pdf(plot_id: int, db: Session = Depends(get_db),
+    coordinate_system: str = Body("wgs84"),
+    station_names: list[str] = Body(default=[])):
 
     reports_dir = "app/reports"
     os.makedirs(reports_dir, exist_ok=True)
@@ -301,21 +340,30 @@ def download_back_computation_pdf(plot_id: int, db: Session = Depends(get_db)):
         {"id": plot_id}
     ).scalar() or 0
 
-    # Convert to UTM for accurate distance/bearing calculations
+    # Convert to user's selected coordinate system
     gdf = gpd.GeoDataFrame(geometry=[plot_geom], crs="EPSG:4326")
 
-    # Determine appropriate UTM zone based on centroid
-    centroid = plot_geom.centroid
-    utm_zone = int((centroid.x + 180) / 6) + 1
-    hemisphere = "north" if centroid.y >= 0 else "south"
-    epsg_code = 32600 + utm_zone if hemisphere == "north" else 32700 + utm_zone
+    # Get EPSG code for selected coordinate system
+    epsg_code = COORDINATE_SYSTEMS.get(coordinate_system, 4326)
+    crs_name = COORDINATE_SYSTEM_NAMES.get(coordinate_system, "WGS84")
 
-    gdf_utm = gdf.to_crs(epsg=epsg_code)
-    poly = gdf_utm.geometry.iloc[0]
+    # If WGS84 is selected, use UTM for calculations (need projected CRS for distances)
+    if coordinate_system == "wgs84":
+        centroid = plot_geom.centroid
+        utm_zone = int((centroid.x + 180) / 6) + 1
+        hemisphere = "north" if centroid.y >= 0 else "south"
+        epsg_code = 32600 + utm_zone if hemisphere == "north" else 32700 + utm_zone
+        crs_name = f"UTM Zone {utm_zone}{'N' if hemisphere == 'north' else 'S'}"
 
-    rows, sum_de, sum_dn = compute_back_computation(poly)
+    gdf_projected = gdf.to_crs(epsg=epsg_code)
+    poly = gdf_projected.geometry.iloc[0]
 
-    render_back_computation_pdf(rows, sum_de, sum_dn, area_m2, plot_id, pdf_path)
+    # Use custom station names if provided
+    labels = station_names if station_names else None
+
+    rows, sum_de, sum_dn = compute_back_computation(poly, labels)
+
+    render_back_computation_pdf(rows, sum_de, sum_dn, area_m2, plot_id, pdf_path, crs_name)
 
     return FileResponse(pdf_path, filename=f"plot_{plot_id}_back_computation.pdf")
 
@@ -325,19 +373,27 @@ def download_back_computation_pdf(plot_id: int, db: Session = Depends(get_db)):
 @router.post("/{plot_id}/orthophoto/preview")
 def orthophoto_preview(plot_id: int, db: Session = Depends(get_db),
     scale_text: str = Body("1 : 1000"),
-    station_names: list[str] = Body(default=[])):
+    station_names: list[str] = Body(default=[]),
+    coordinate_system: str = Body("wgs84")):
 
     out_dir = "app/reports/orthophoto"
     os.makedirs(out_dir, exist_ok=True)
 
     png_path = f"{out_dir}/plot_{plot_id}_orthophoto_preview.png"
 
+    # Get EPSG code for selected coordinate system
+    epsg_code = COORDINATE_SYSTEMS.get(coordinate_system, 4326)
+    crs_name = COORDINATE_SYSTEM_NAMES.get(coordinate_system, "WGS84")
+
     render_orthophoto_png(
         db=db,
         plot_id=plot_id,
         output_path=png_path,
         scale_text=scale_text,
-        station_names=station_names if station_names else None
+        station_names=station_names if station_names else None,
+        coordinate_system=coordinate_system,
+        epsg_code=epsg_code,
+        crs_footer_text=f"COORDINATE SYSTEM: {crs_name}"
     )
 
     return FileResponse(png_path, media_type="image/png")
@@ -352,13 +408,18 @@ def orthophoto_pdf(plot_id: int, db: Session = Depends(get_db),
     scale_text: str = Body("1 : 1000"),
     surveyor_name: str = Body(""),
     surveyor_rank: str = Body(""),
-    station_names: list[str] = Body(default=[])):
+    station_names: list[str] = Body(default=[]),
+    coordinate_system: str = Body("wgs84")):
 
     out_dir = "app/reports/orthophoto"
     os.makedirs(out_dir, exist_ok=True)
 
     png_path = f"{out_dir}/plot_{plot_id}_orthophoto.png"
     pdf_path = f"{out_dir}/plot_{plot_id}_orthophoto.pdf"
+
+    # Get EPSG code for selected coordinate system
+    epsg_code = COORDINATE_SYSTEMS.get(coordinate_system, 4326)
+    crs_name = COORDINATE_SYSTEM_NAMES.get(coordinate_system, "WGS84")
 
     render_orthophoto_png(
         db=db,
@@ -371,7 +432,10 @@ def orthophoto_pdf(plot_id: int, db: Session = Depends(get_db),
         scale_text=scale_text,
         surveyor_name=surveyor_name,
         surveyor_rank=surveyor_rank,
-        station_names=station_names if station_names else None
+        station_names=station_names if station_names else None,
+        coordinate_system=coordinate_system,
+        epsg_code=epsg_code,
+        crs_footer_text=f"COORDINATE SYSTEM: {crs_name}"
     )
 
     render_orthophoto_pdf_from_png(png_path, pdf_path)

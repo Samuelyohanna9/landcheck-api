@@ -386,6 +386,8 @@ def render_plot_map_layout(
     surveyor_name: str = "SURV",
     surveyor_rank: str = "RANK",
     station_names=None,
+    coordinate_system: str = "wgs84",
+    epsg_code: int = 4326,
 ):
     plot_wkb = db.execute(text("SELECT geom FROM plots WHERE id=:id"), {"id": plot_id}).scalar()
     rows = db.execute(
@@ -413,7 +415,17 @@ def render_plot_map_layout(
         elif r.feature_type == "river":
             rivers.append(g)
 
-    gdf_plot = gpd.GeoDataFrame(geometry=[plot_geom], crs="EPSG:4326").to_crs(3857)
+    # Use user's selected coordinate system for rendering
+    # If WGS84 selected, use appropriate UTM zone for projected display
+    display_epsg = epsg_code
+    if coordinate_system == "wgs84" or epsg_code == 4326:
+        # Auto-detect UTM zone for display
+        centroid = plot_geom.centroid
+        utm_zone = int((centroid.x + 180) / 6) + 1
+        hemisphere = "north" if centroid.y >= 0 else "south"
+        display_epsg = 32600 + utm_zone if hemisphere == "north" else 32700 + utm_zone
+
+    gdf_plot = gpd.GeoDataFrame(geometry=[plot_geom], crs="EPSG:4326").to_crs(epsg=display_epsg)
     poly = gdf_plot.geometry.iloc[0]
 
     fig = plt.figure(figsize=(8.27, 11.69), dpi=200)
@@ -433,11 +445,11 @@ def render_plot_map_layout(
     draw_key_box(fig, has_buildings=has_buildings, has_roads=has_roads, has_rivers=has_rivers)
 
     if rivers:
-        gpd.GeoDataFrame(geometry=rivers, crs="EPSG:4326").to_crs(3857).plot(ax=ax, color="blue", lw=1.2)
+        gpd.GeoDataFrame(geometry=rivers, crs="EPSG:4326").to_crs(epsg=display_epsg).plot(ax=ax, color="blue", lw=1.2)
     if roads:
-        gpd.GeoDataFrame(geometry=roads, crs="EPSG:4326").to_crs(3857).plot(ax=ax, color="dimgray", lw=1.2)
+        gpd.GeoDataFrame(geometry=roads, crs="EPSG:4326").to_crs(epsg=display_epsg).plot(ax=ax, color="dimgray", lw=1.2)
     if buildings:
-        gpd.GeoDataFrame(geometry=buildings, crs="EPSG:4326").to_crs(3857).plot(
+        gpd.GeoDataFrame(geometry=buildings, crs="EPSG:4326").to_crs(epsg=display_epsg).plot(
             ax=ax, facecolor="none", edgecolor="black"
         )
 
