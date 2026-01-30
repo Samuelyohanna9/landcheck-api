@@ -1,6 +1,6 @@
 # app/routers/plots.py
 
-from fastapi import APIRouter, Depends, Body
+from fastapi import APIRouter, Depends, Body, HTTPException
 from sqlalchemy.orm import Session
 from geoalchemy2.shape import from_shape
 from shapely.geometry import Polygon
@@ -52,25 +52,9 @@ def create_plot(payload: PlotCreateRequest, db: Session = Depends(get_db)):
     geom = from_shape(polygon, srid=4326)
 
     plot = Plot(geom=geom)
-
-    # OPTIONAL: store metadata if columns exist
-    if payload.meta:
-        plot.title = payload.meta.title
-        plot.location = payload.meta.location
-        plot.lga = payload.meta.lga
-        plot.state = payload.meta.state
-        plot.surveyor = payload.meta.surveyor
-        plot.rank = payload.meta.rank
-        plot.scale = payload.meta.scale
-
     db.add(plot)
     db.commit()
     db.refresh(plot)
-
-    return {
-        "status": "ok",
-        "plot_id": plot.id
-    }
 
     # ---------------- BUFFER ----------------
 
@@ -226,7 +210,6 @@ def get_plot_report(plot_id: int, db: Session = Depends(get_db)):
 @router.post("/{plot_id}/report/pdf")
 def download_plot_report_pdf(plot_id: int, db: Session = Depends(get_db),
     title_text: str = Body("SURVEY PLAN"),
-    station_text: str = Body(""),
     location_text: str = Body(""),
     lga_text: str = Body(""),
     state_text: str = Body(""),
@@ -243,9 +226,19 @@ def download_plot_report_pdf(plot_id: int, db: Session = Depends(get_db),
     pdf_path = f"{reports_dir}/plot_{plot_id}_report.pdf"
     map_path = f"{maps_dir}/plot_{plot_id}_map.png"
 
-    render_plot_map_layout(db, plot_id, map_path, title_text, location_text,
-                            lga_text, state_text, station_text, scale_text,
-                            surveyor_name, surveyor_rank, station_names)
+    render_plot_map_layout(
+        db=db,
+        plot_id=plot_id,
+        output_path=map_path,
+        title_text=title_text,
+        location_text=location_text,
+        lga_text=lga_text,
+        state_text=state_text,
+        scale_text=scale_text,
+        surveyor_name=surveyor_name,
+        surveyor_rank=surveyor_rank,
+        station_names=station_names if station_names else None
+    )
 
     report = get_plot_report(plot_id, db)
     generate_plot_report_pdf(report, pdf_path, map_path)
@@ -258,7 +251,6 @@ def download_plot_report_pdf(plot_id: int, db: Session = Depends(get_db),
 @router.post("/{plot_id}/report/preview")
 def preview_plot_map(plot_id: int, db: Session = Depends(get_db),
     title_text: str = Body("SURVEY PLAN"),
-    station_text: str = Body(""),
     location_text: str = Body(""),
     lga_text: str = Body(""),
     state_text: str = Body(""),
@@ -272,9 +264,19 @@ def preview_plot_map(plot_id: int, db: Session = Depends(get_db),
 
     map_path = f"{maps_dir}/plot_{plot_id}_preview.png"
 
-    render_plot_map_layout(db, plot_id, map_path, title_text, location_text,
-                            lga_text, state_text, station_text, scale_text,
-                            surveyor_name, surveyor_rank, station_names)
+    render_plot_map_layout(
+        db=db,
+        plot_id=plot_id,
+        output_path=map_path,
+        title_text=title_text,
+        location_text=location_text,
+        lga_text=lga_text,
+        state_text=state_text,
+        scale_text=scale_text,
+        surveyor_name=surveyor_name,
+        surveyor_rank=surveyor_rank,
+        station_names=station_names if station_names else None
+    )
 
     return FileResponse(map_path, media_type="image/png")
 
@@ -305,7 +307,9 @@ def download_back_computation_pdf(plot_id: int, db: Session = Depends(get_db)):
 # ---------------- ORTHOPHOTO ----------------
 
 @router.post("/{plot_id}/orthophoto/preview")
-def orthophoto_preview(plot_id: int, db: Session = Depends(get_db)):
+def orthophoto_preview(plot_id: int, db: Session = Depends(get_db),
+    scale_text: str = Body("1 : 1000"),
+    station_names: list[str] = Body(default=[])):
 
     out_dir = "app/reports/orthophoto"
     os.makedirs(out_dir, exist_ok=True)
@@ -316,14 +320,23 @@ def orthophoto_preview(plot_id: int, db: Session = Depends(get_db)):
         db=db,
         plot_id=plot_id,
         output_path=png_path,
-        scale_text="1 : 1000"
+        scale_text=scale_text,
+        station_names=station_names if station_names else None
     )
 
     return FileResponse(png_path, media_type="image/png")
 
 
-@router.get("/{plot_id}/orthophoto/pdf")   # <-- CHANGED TO GET
-def orthophoto_pdf(plot_id: int, db: Session = Depends(get_db)):
+@router.post("/{plot_id}/orthophoto/pdf")
+def orthophoto_pdf(plot_id: int, db: Session = Depends(get_db),
+    title_text: str = Body("ORTHOPHOTO"),
+    location_text: str = Body(""),
+    lga_text: str = Body(""),
+    state_text: str = Body(""),
+    scale_text: str = Body("1 : 1000"),
+    surveyor_name: str = Body(""),
+    surveyor_rank: str = Body(""),
+    station_names: list[str] = Body(default=[])):
 
     out_dir = "app/reports/orthophoto"
     os.makedirs(out_dir, exist_ok=True)
@@ -335,12 +348,19 @@ def orthophoto_pdf(plot_id: int, db: Session = Depends(get_db)):
         db=db,
         plot_id=plot_id,
         output_path=png_path,
-        scale_text="1 : 1000"
+        title_text=title_text,
+        location_text=location_text,
+        lga_text=lga_text,
+        state_text=state_text,
+        scale_text=scale_text,
+        surveyor_name=surveyor_name,
+        surveyor_rank=surveyor_rank,
+        station_names=station_names if station_names else None
     )
 
     render_orthophoto_pdf_from_png(png_path, pdf_path)
 
-    return FileResponse(pdf_path, media_type="application/pdf")
+    return FileResponse(pdf_path, media_type="application/pdf", filename=f"plot_{plot_id}_orthophoto.pdf")
 @router.get("/{plot_id}/survey-plan/dwg")
 def download_survey_plan_dwg(plot_id: int, db: Session = Depends(get_db)):
 
