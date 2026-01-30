@@ -1,9 +1,8 @@
 # app/db_init.py
-
 from app.db import engine
-from app.db_base import Base  # 👈 THIS IS THE FIX
+from app.db_base import Base
 
-# Import ALL models so SQLAlchemy registers them
+# IMPORTANT: import ALL models so they register with Base
 from app.models.plot import Plot
 from app.models.plot_buffer import PlotBuffer
 from app.models.detected_feature import DetectedFeature
