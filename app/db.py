@@ -1,23 +1,13 @@
-# app/db.py
-import os
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
+import os
 from dotenv import load_dotenv
 
-# Load .env ONLY for local development
-if os.path.exists(".env"):
-    load_dotenv()
+load_dotenv()
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 
-if not DATABASE_URL:
-    raise RuntimeError("DATABASE_URL is not set")
-
-engine = create_engine(
-    DATABASE_URL,
-    echo=False,           # DO NOT log SQL in production
-    pool_pre_ping=True    # Prevent stale DB connections (Supabase-safe)
-)
+engine = create_engine(DATABASE_URL, echo=True)
 
 SessionLocal = sessionmaker(
     autocommit=False,
