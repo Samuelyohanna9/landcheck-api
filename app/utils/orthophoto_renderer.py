@@ -67,15 +67,16 @@ def draw_sheet_frame(fig):
                                      transform=fig.transFigure, fill=False, lw=0.8, zorder=10))
 
 
-def draw_title_block(fig, title_text, plot_id, scale_text, location, lga, state, station):
+def draw_title_block(fig, title_text, plot_id, scale_text, location, lga, state):
+    # Plot number at top right corner for identification
+    fig.text(0.94, 0.95, f"Plot #{plot_id}", ha="right", fontsize=8, weight="bold",)
+    
     y = 0.955
     fig.text(0.5, y, title_text, ha="center", fontsize=12, weight="bold")
-    fig.text(0.5, y-0.025, f"OF PLOT {plot_id}", ha="center", fontsize=10)
-    fig.text(0.5, y-0.055, f"STATION: {station}", ha="center", fontsize=9)
-    fig.text(0.5, y-0.075, f"LOCATED AT: {location}", ha="center", fontsize=9)
-    fig.text(0.5, y-0.095, lga, ha="center", fontsize=9)
-    fig.text(0.5, y-0.115, state, ha="center", fontsize=9)
-    fig.text(0.5, y-0.145, f"SCALE {scale_text}", ha="center", fontsize=9)
+    fig.text(0.5, y-0.030, f"LOCATED AT: {location}", ha="center", fontsize=9)
+    fig.text(0.5, y-0.050, lga, ha="center", fontsize=9)
+    fig.text(0.5, y-0.070, state, ha="center", fontsize=9)
+    fig.text(0.5, y-0.100, f"SCALE {scale_text}", ha="center", fontsize=9)
 
 
 def draw_footer(fig, crs, source, surveyor, rank):
@@ -90,17 +91,19 @@ def draw_footer(fig, crs, source, surveyor, rank):
 
 
 def add_north_arrow(ax):
+    # Keep your current placement (figure fraction)
     ax.annotate(
         "N",
-        xy=(0.93, 0.90),
-        xytext=(0.93, 0.80),
-        xycoords="axes fraction",
+        xy=(0.85, 0.90),
+        xytext=(0.85, 0.83),
+        xycoords="figure fraction",
         arrowprops=dict(facecolor="black", width=2, headwidth=8),
         ha="center",
         fontsize=12,
         weight="bold",
-        zorder=15
+        zorder=20,
     )
+
 
 
 def choose_scalebar_length(scale_ratio):
@@ -148,6 +151,32 @@ def draw_grid(ax, minor, major):
             ax.plot([xmin, xmax], [y, y], color="blue", lw=lw, alpha=a, zorder=3)
 
 
+def annotate_vertices_orthophoto(ax, poly, station_names=None):
+    """Add station name labels to plot vertices in orthophoto."""
+    from shapely.geometry import Point
+
+    coords = list(poly.exterior.coords)
+    default_labels = list("ABCDEFGHIJKLMNOPQRSTUVWXYZ")
+    labels = station_names if station_names else default_labels
+
+    for i in range(len(coords) - 1):
+        p1 = Point(coords[i])
+        label = labels[i % len(labels)]
+
+        ax.text(
+            p1.x,
+            p1.y,
+            label,
+            fontsize=9,
+            color="black",
+            ha="center",
+            va="center",
+            weight="bold",
+            zorder=25,
+            bbox=dict(facecolor="white", edgecolor="red", boxstyle="circle,pad=0.2", alpha=0.9)
+        )
+
+
 def draw_coordinate_frame(ax, spacing):
     xmin, xmax = ax.get_xlim()
     ymin, ymax = ax.get_ylim()
@@ -161,13 +190,16 @@ def draw_coordinate_frame(ax, spacing):
     xs = np.arange(math.floor(xmin / spacing) * spacing, xmax + 0.1, spacing)
     ys = np.arange(math.floor(ymin / spacing) * spacing, ymax + 0.1, spacing)
 
+    # Draw easting labels at the top - filter to only show labels within bounds
     for x in xs:
-        ax.text(x, ymax + pad*0.45, f"{int(x)}", ha="center", fontsize=7, color="blue", zorder=11)
+        if x >= xmin and x <= xmax:
+            ax.text(x, ymax + pad*0.45, f"{int(x)}", ha="center", fontsize=7, color="blue", zorder=11)
 
+    # Draw northing labels on both sides - include ALL grid lines including the first one
     for y in ys:
-        if y < ymin + spacing * 0.9: continue
-        ax.text(xmin-pad*0.45, y, f"{int(y)}", va="center", ha="right", fontsize=7, color="blue", rotation=90, zorder=11)
-        ax.text(xmax+pad*0.45, y, f"{int(y)}", va="center", ha="left", fontsize=7, color="blue", rotation=90, zorder=11)
+        if y >= ymin and y <= ymax:
+            ax.text(xmin-pad*0.45, y, f"{int(y)}", va="center", ha="right", fontsize=7, color="blue", rotation=90, zorder=11)
+            ax.text(xmax+pad*0.45, y, f"{int(y)}", va="center", ha="left", fontsize=7, color="blue", rotation=90, zorder=11)
 
 
 # =======================
@@ -177,9 +209,9 @@ def draw_coordinate_frame(ax, spacing):
 def render_orthophoto_png(
     db, plot_id, output_path,
     title_text="ORTHOPHOTO", location_text="", lga_text="", state_text="",
-    station_text="", scale_text="1 : 1000", crs_footer_text="ORIGIN: WGS84 (UTM Projection)",
+    scale_text="1 : 1000", crs_footer_text="ORIGIN: WGS84 (UTM Projection)",
     source_footer_text="SOURCE: LandCheck System", surveyor_name="", surveyor_rank="",
-    tile_source="esri"
+    tile_source="esri", station_names=None
 ):
     # Fetch Geometry from DB
     res = db.execute(text("SELECT geom FROM plots WHERE id=:id"), {"id": plot_id}).fetchone()
@@ -199,12 +231,47 @@ def render_orthophoto_png(
     scale_ratio = parse_scale_ratio(scale_text)
     apply_true_scale(ax, poly, scale_ratio, 8.27 * map_width, 11.69 * map_height)
 
-    # Basemap
-    source = ctx.providers.Esri.WorldImagery if tile_source == "esri" else ctx.providers.OpenStreetMap.Mapnik
+    # Basemap - try multiple sources for reliability
+    # Using URL-based providers for better compatibility
+    basemap_sources = [
+        ("Esri WorldImagery", "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}"),
+        ("OpenStreetMap", "https://tile.openstreetmap.org/{z}/{x}/{y}.png"),
+        ("CartoDB Light", "https://basemaps.cartocdn.com/light_all/{z}/{x}/{y}.png"),
+    ]
+
+    basemap_loaded = False
+
+    # First try the contextily providers
     try:
-        ctx.add_basemap(ax, source=source, crs="EPSG:3857", attribution=False)
-    except Exception:
-        pass
+        ctx.add_basemap(ax, source=ctx.providers.Esri.WorldImagery, crs="EPSG:3857", attribution=False, zoom=17)
+        basemap_loaded = True
+    except Exception as e:
+        print(f"Esri WorldImagery failed: {e}")
+
+    if not basemap_loaded:
+        try:
+            ctx.add_basemap(ax, source=ctx.providers.OpenStreetMap.Mapnik, crs="EPSG:3857", attribution=False, zoom=17)
+            basemap_loaded = True
+        except Exception as e:
+            print(f"OpenStreetMap failed: {e}")
+
+    if not basemap_loaded:
+        # Try URL-based approach as last resort
+        for name, url in basemap_sources:
+            try:
+                ctx.add_basemap(ax, source=url, crs="EPSG:3857", attribution=False, zoom=17)
+                basemap_loaded = True
+                print(f"Loaded basemap from {name}")
+                break
+            except Exception as e:
+                print(f"{name} failed: {e}")
+                continue
+
+    if not basemap_loaded:
+        # Add a light green background to represent land if no basemap loads
+        ax.set_facecolor('#e8f4e8')
+        ax.text(0.5, 0.5, "Satellite imagery temporarily unavailable\nShowing plot boundary",
+                transform=ax.transAxes, ha="center", va="center", fontsize=10, color="#555", alpha=0.8)
 
     # Grid Calculation
     span = max(ax.get_xlim()[1] - ax.get_xlim()[0], ax.get_ylim()[1] - ax.get_ylim()[0])
@@ -214,9 +281,12 @@ def render_orthophoto_png(
     draw_grid(ax, major/5, major)
     draw_coordinate_frame(ax, major)
     gdf_plot.plot(ax=ax, facecolor="none", edgecolor="red", lw=2, zorder=20)
-    
+
+    # Add station name labels to vertices
+    annotate_vertices_orthophoto(ax, poly, station_names)
+
     draw_sheet_frame(fig)
-    draw_title_block(fig, title_text, plot_id, scale_text, location_text, lga_text, state_text, station_text)
+    draw_title_block(fig, title_text, plot_id, scale_text, location_text, lga_text, state_text)
     draw_footer(fig, crs_footer_text, source_footer_text, surveyor_name, surveyor_rank)
     add_north_arrow(ax)
     add_scalebar(ax, choose_scalebar_length(scale_ratio))
