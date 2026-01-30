@@ -25,9 +25,10 @@ def deg_to_dms(angle_deg: float) -> str:
 # Back computation
 # -------------------------------
 
-def compute_back_computation(poly: Polygon):
+def compute_back_computation(poly: Polygon, station_names=None):
     coords = list(poly.exterior.coords)
-    stations = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    default_stations = list("ABCDEFGHIJKLMNOPQRSTUVWXYZ")
+    stations = station_names if station_names else default_stations
 
     rows = []
     sum_de = 0.0
@@ -48,8 +49,8 @@ def compute_back_computation(poly: Polygon):
         sum_dn += dn
 
         rows.append({
-            "from": stations[i % 26],
-            "to": stations[(i + 1) % 26],
+            "from": stations[i % len(stations)],
+            "to": stations[(i + 1) % len(stations)],
             "E": round(p1.x, 3),
             "N": round(p1.y, 3),
             "dE": round(de, 3),

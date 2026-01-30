@@ -5,7 +5,7 @@ from reportlab.lib.colors import red, black
 from datetime import datetime
 
 
-def render_back_computation_pdf(rows, sum_de, sum_dn, area_m2, plot_id, output_path):
+def render_back_computation_pdf(rows, sum_de, sum_dn, area_m2, plot_id, output_path, crs_name="UTM"):
 
     c = canvas.Canvas(output_path, pagesize=landscape(A4))
     width, height = landscape(A4)
@@ -134,7 +134,7 @@ def render_back_computation_pdf(rows, sum_de, sum_dn, area_m2, plot_id, output_p
     c.drawString(
         margin_left,
         30,
-        f"Printed: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+        f"Printed: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}  |  Coordinate System: {crs_name}"
     )
 
     c.save()

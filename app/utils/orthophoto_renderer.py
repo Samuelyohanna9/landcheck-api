@@ -177,7 +177,10 @@ def annotate_vertices_orthophoto(ax, poly, station_names=None):
         )
 
 
-def draw_coordinate_frame(ax, spacing):
+def draw_coordinate_frame(ax, spacing, epsg_code=3857):
+    """Draw coordinate frame with labels in the specified coordinate system."""
+    from pyproj import Transformer
+
     xmin, xmax = ax.get_xlim()
     ymin, ymax = ax.get_ylim()
     pad = (xmax - xmin) * 0.035
@@ -187,19 +190,34 @@ def draw_coordinate_frame(ax, spacing):
     ax.add_patch(patches.Rectangle((xmin, ymin), (xmax-xmin), (ymax-ymin),
                                    fill=False, lw=1.0, zorder=10))
 
+    # Transform from Web Mercator (3857) to user's coordinate system for labels
+    transformer = None
+    if epsg_code != 3857:
+        transformer = Transformer.from_crs(3857, epsg_code, always_xy=True)
+
     xs = np.arange(math.floor(xmin / spacing) * spacing, xmax + 0.1, spacing)
     ys = np.arange(math.floor(ymin / spacing) * spacing, ymax + 0.1, spacing)
 
     # Draw easting labels at the top - filter to only show labels within bounds
     for x in xs:
         if x >= xmin and x <= xmax:
-            ax.text(x, ymax + pad*0.45, f"{int(x)}", ha="center", fontsize=7, color="blue", zorder=11)
+            if transformer:
+                tx, _ = transformer.transform(x, (ymin + ymax) / 2)
+                label = f"{int(tx)}"
+            else:
+                label = f"{int(x)}"
+            ax.text(x, ymax + pad*0.45, label, ha="center", fontsize=7, color="blue", zorder=11)
 
     # Draw northing labels on both sides - include ALL grid lines including the first one
     for y in ys:
         if y >= ymin and y <= ymax:
-            ax.text(xmin-pad*0.45, y, f"{int(y)}", va="center", ha="right", fontsize=7, color="blue", rotation=90, zorder=11)
-            ax.text(xmax+pad*0.45, y, f"{int(y)}", va="center", ha="left", fontsize=7, color="blue", rotation=90, zorder=11)
+            if transformer:
+                _, ty = transformer.transform((xmin + xmax) / 2, y)
+                label = f"{int(ty)}"
+            else:
+                label = f"{int(y)}"
+            ax.text(xmin-pad*0.45, y, label, va="center", ha="right", fontsize=7, color="blue", rotation=90, zorder=11)
+            ax.text(xmax+pad*0.45, y, label, va="center", ha="left", fontsize=7, color="blue", rotation=90, zorder=11)
 
 
 # =======================
@@ -211,7 +229,8 @@ def render_orthophoto_png(
     title_text="ORTHOPHOTO", location_text="", lga_text="", state_text="",
     scale_text="1 : 1000", crs_footer_text="ORIGIN: WGS84 (UTM Projection)",
     source_footer_text="SOURCE: LandCheck System", surveyor_name="", surveyor_rank="",
-    tile_source="esri", station_names=None
+    tile_source="esri", station_names=None,
+    coordinate_system="wgs84", epsg_code=4326
 ):
     # Fetch Geometry from DB
     res = db.execute(text("SELECT geom FROM plots WHERE id=:id"), {"id": plot_id}).fetchone()
@@ -277,9 +296,19 @@ def render_orthophoto_png(
     span = max(ax.get_xlim()[1] - ax.get_xlim()[0], ax.get_ylim()[1] - ax.get_ylim()[0])
     major = nice_grid_step(span)
 
+    # Determine display EPSG for labels
+    # If WGS84 selected, use appropriate UTM zone
+    display_epsg = epsg_code
+    if coordinate_system == "wgs84" or epsg_code == 4326:
+        plot_geom = wkb.loads(res[0])
+        centroid = plot_geom.centroid
+        utm_zone = int((centroid.x + 180) / 6) + 1
+        hemisphere = "north" if centroid.y >= 0 else "south"
+        display_epsg = 32600 + utm_zone if hemisphere == "north" else 32700 + utm_zone
+
     # Features
     draw_grid(ax, major/5, major)
-    draw_coordinate_frame(ax, major)
+    draw_coordinate_frame(ax, major, display_epsg)
     gdf_plot.plot(ax=ax, facecolor="none", edgecolor="red", lw=2, zorder=20)
 
     # Add station name labels to vertices
