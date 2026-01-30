@@ -291,15 +291,31 @@ def download_back_computation_pdf(plot_id: int, db: Session = Depends(get_db)):
 
     pdf_path = f"{reports_dir}/plot_{plot_id}_back_computation.pdf"
 
+    # Get plot geometry
     plot_wkb = db.execute(text("SELECT geom FROM plots WHERE id=:id"), {"id": plot_id}).scalar()
     plot_geom = wkb.loads(plot_wkb)
 
-    gdf = gpd.GeoDataFrame(geometry=[plot_geom], crs="EPSG:4326").to_crs(3857)
-    poly = gdf.geometry.iloc[0]
+    # Get accurate area using geography (meters squared)
+    area_m2 = db.execute(
+        text("SELECT ST_Area(geom::geography) FROM plots WHERE id=:id"),
+        {"id": plot_id}
+    ).scalar() or 0
+
+    # Convert to UTM for accurate distance/bearing calculations
+    gdf = gpd.GeoDataFrame(geometry=[plot_geom], crs="EPSG:4326")
+
+    # Determine appropriate UTM zone based on centroid
+    centroid = plot_geom.centroid
+    utm_zone = int((centroid.x + 180) / 6) + 1
+    hemisphere = "north" if centroid.y >= 0 else "south"
+    epsg_code = 32600 + utm_zone if hemisphere == "north" else 32700 + utm_zone
+
+    gdf_utm = gdf.to_crs(epsg=epsg_code)
+    poly = gdf_utm.geometry.iloc[0]
 
     rows, sum_de, sum_dn = compute_back_computation(poly)
 
-    render_back_computation_pdf(rows, sum_de, sum_dn, poly.area, plot_id, pdf_path)
+    render_back_computation_pdf(rows, sum_de, sum_dn, area_m2, plot_id, pdf_path)
 
     return FileResponse(pdf_path, filename=f"plot_{plot_id}_back_computation.pdf")
 
