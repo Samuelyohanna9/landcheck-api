@@ -396,6 +396,12 @@ def render_plot_map_layout(
     if not plot_wkb:
         raise ValueError("Plot not found")
 
+    # Get accurate area using geography (meters squared) - same as back computation
+    area_m2 = db.execute(
+        text("SELECT ST_Area(geom::geography) FROM plots WHERE id=:id"),
+        {"id": plot_id}
+    ).scalar() or 0
+
     plot_geom = wkb.loads(plot_wkb)
     buildings, roads, rivers = [], [], []
     for r in rows:
@@ -409,7 +415,6 @@ def render_plot_map_layout(
 
     gdf_plot = gpd.GeoDataFrame(geometry=[plot_geom], crs="EPSG:4326").to_crs(3857)
     poly = gdf_plot.geometry.iloc[0]
-    area_m2 = float(poly.area)
 
     fig = plt.figure(figsize=(8.27, 11.69), dpi=200)
     canvas_obj = FigureCanvas(fig)
