@@ -13,13 +13,14 @@ app = FastAPI(title="LandCheck API")
 def startup_event():
     init_db()
 
-# CORS (relaxed for MVP)
+# CORS (relaxed for MVP - allow all origins)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
+    allow_credentials=False,  # Must be False when allow_origins is "*"
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"],
     allow_headers=["*"],
+    expose_headers=["*"],
 )
 
 # Routers
