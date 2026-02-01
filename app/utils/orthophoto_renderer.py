@@ -239,7 +239,8 @@ def render_orthophoto_png(
     scale_text="1 : 1000", crs_footer_text="ORIGIN: WGS84 (UTM Projection)",
     source_footer_text="SOURCE: LandCheck System", surveyor_name="", surveyor_rank="",
     tile_source="esri", station_names=None,
-    coordinate_system="wgs84", epsg_code=4326
+    coordinate_system="wgs84", epsg_code=4326,
+    use_topo_map=False
 ):
     # Fetch Geometry from DB
     res = db.execute(text("SELECT geom FROM plots WHERE id=:id"), {"id": plot_id}).fetchone()
@@ -259,46 +260,72 @@ def render_orthophoto_png(
     scale_ratio = parse_scale_ratio(scale_text)
     apply_true_scale(ax, poly, scale_ratio, 8.27 * map_width, 11.69 * map_height)
 
-    # Basemap - try multiple sources for reliability
-    # Using URL-based providers for better compatibility
-    basemap_sources = [
-        ("Esri WorldImagery", "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}"),
-        ("OpenStreetMap", "https://tile.openstreetmap.org/{z}/{x}/{y}.png"),
-        ("CartoDB Light", "https://basemaps.cartocdn.com/light_all/{z}/{x}/{y}.png"),
-    ]
-
+    # Basemap - choose based on use_topo_map setting
     basemap_loaded = False
 
-    # First try the contextily providers
-    try:
-        ctx.add_basemap(ax, source=ctx.providers.Esri.WorldImagery, crs="EPSG:3857", attribution=False, zoom=17)
-        basemap_loaded = True
-    except Exception as e:
-        print(f"Esri WorldImagery failed: {e}")
+    if use_topo_map:
+        # Use OpenTopoMap for terrain/elevation visualization
+        topo_sources = [
+            ("OpenTopoMap", "https://tile.opentopomap.org/{z}/{x}/{y}.png"),
+            ("Stamen Terrain", "https://stamen-tiles.a.ssl.fastly.net/terrain/{z}/{x}/{y}.png"),
+        ]
 
-    if not basemap_loaded:
-        try:
-            ctx.add_basemap(ax, source=ctx.providers.OpenStreetMap.Mapnik, crs="EPSG:3857", attribution=False, zoom=17)
-            basemap_loaded = True
-        except Exception as e:
-            print(f"OpenStreetMap failed: {e}")
-
-    if not basemap_loaded:
-        # Try URL-based approach as last resort
-        for name, url in basemap_sources:
+        for name, url in topo_sources:
             try:
-                ctx.add_basemap(ax, source=url, crs="EPSG:3857", attribution=False, zoom=17)
+                ctx.add_basemap(ax, source=url, crs="EPSG:3857", attribution=False, zoom=15)
                 basemap_loaded = True
-                print(f"Loaded basemap from {name}")
+                print(f"Loaded topo basemap from {name}")
                 break
             except Exception as e:
                 print(f"{name} failed: {e}")
                 continue
 
+        if not basemap_loaded:
+            # Fallback to contextily OpenTopoMap provider
+            try:
+                ctx.add_basemap(ax, source=ctx.providers.OpenTopoMap, crs="EPSG:3857", attribution=False, zoom=15)
+                basemap_loaded = True
+            except Exception as e:
+                print(f"OpenTopoMap provider failed: {e}")
+    else:
+        # Use satellite/aerial imagery
+        basemap_sources = [
+            ("Esri WorldImagery", "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}"),
+            ("OpenStreetMap", "https://tile.openstreetmap.org/{z}/{x}/{y}.png"),
+            ("CartoDB Light", "https://basemaps.cartocdn.com/light_all/{z}/{x}/{y}.png"),
+        ]
+
+        # First try the contextily providers
+        try:
+            ctx.add_basemap(ax, source=ctx.providers.Esri.WorldImagery, crs="EPSG:3857", attribution=False, zoom=17)
+            basemap_loaded = True
+        except Exception as e:
+            print(f"Esri WorldImagery failed: {e}")
+
+        if not basemap_loaded:
+            try:
+                ctx.add_basemap(ax, source=ctx.providers.OpenStreetMap.Mapnik, crs="EPSG:3857", attribution=False, zoom=17)
+                basemap_loaded = True
+            except Exception as e:
+                print(f"OpenStreetMap failed: {e}")
+
+        if not basemap_loaded:
+            # Try URL-based approach as last resort
+            for name, url in basemap_sources:
+                try:
+                    ctx.add_basemap(ax, source=url, crs="EPSG:3857", attribution=False, zoom=17)
+                    basemap_loaded = True
+                    print(f"Loaded basemap from {name}")
+                    break
+                except Exception as e:
+                    print(f"{name} failed: {e}")
+                    continue
+
     if not basemap_loaded:
         # Add a light green background to represent land if no basemap loads
         ax.set_facecolor('#e8f4e8')
-        ax.text(0.5, 0.5, "Satellite imagery temporarily unavailable\nShowing plot boundary",
+        map_type = "Topo" if use_topo_map else "Satellite"
+        ax.text(0.5, 0.5, f"{map_type} imagery temporarily unavailable\nShowing plot boundary",
                 transform=ax.transAxes, ha="center", va="center", fontsize=10, color="#555", alpha=0.8)
 
     # Grid Calculation

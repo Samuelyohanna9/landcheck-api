@@ -415,12 +415,16 @@ def download_back_computation_pdf(plot_id: int, db: Session = Depends(get_db),
 def orthophoto_preview(plot_id: int, db: Session = Depends(get_db),
     scale_text: str = Body("1 : 1000"),
     station_names: list[str] = Body(default=[]),
-    coordinate_system: str = Body("wgs84")):
+    coordinate_system: str = Body("wgs84"),
+    paper_size: str = Body("A4"),
+    use_topo_map: bool = Body(False)):
 
     out_dir = "app/reports/orthophoto"
     os.makedirs(out_dir, exist_ok=True)
 
-    png_path = f"{out_dir}/plot_{plot_id}_orthophoto_preview.png"
+    # Use different filename for topo vs satellite to cache both
+    map_type = "topo" if use_topo_map else "satellite"
+    png_path = f"{out_dir}/plot_{plot_id}_orthophoto_{map_type}_preview.png"
 
     # Get EPSG code for selected coordinate system
     epsg_code = COORDINATE_SYSTEMS.get(coordinate_system, 4326)
@@ -434,7 +438,8 @@ def orthophoto_preview(plot_id: int, db: Session = Depends(get_db),
         station_names=station_names if station_names else None,
         coordinate_system=coordinate_system,
         epsg_code=epsg_code,
-        crs_footer_text=f"COORDINATE SYSTEM: {crs_name}"
+        crs_footer_text=f"COORDINATE SYSTEM: {crs_name}",
+        use_topo_map=use_topo_map
     )
 
     return FileResponse(png_path, media_type="image/png")
@@ -451,13 +456,16 @@ def orthophoto_pdf(plot_id: int, db: Session = Depends(get_db),
     surveyor_rank: str = Body(""),
     station_names: list[str] = Body(default=[]),
     coordinate_system: str = Body("wgs84"),
-    paper_size: str = Body("A4")):
+    paper_size: str = Body("A4"),
+    use_topo_map: bool = Body(False)):
 
     out_dir = "app/reports/orthophoto"
     os.makedirs(out_dir, exist_ok=True)
 
-    png_path = f"{out_dir}/plot_{plot_id}_orthophoto.png"
-    pdf_path = f"{out_dir}/plot_{plot_id}_orthophoto.pdf"
+    # Use different filename for topo vs satellite
+    map_type = "topo" if use_topo_map else "satellite"
+    png_path = f"{out_dir}/plot_{plot_id}_orthophoto_{map_type}.png"
+    pdf_path = f"{out_dir}/plot_{plot_id}_orthophoto_{map_type}.pdf"
 
     # Get EPSG code for selected coordinate system
     epsg_code = COORDINATE_SYSTEMS.get(coordinate_system, 4326)
@@ -477,12 +485,14 @@ def orthophoto_pdf(plot_id: int, db: Session = Depends(get_db),
         station_names=station_names if station_names else None,
         coordinate_system=coordinate_system,
         epsg_code=epsg_code,
-        crs_footer_text=f"COORDINATE SYSTEM: {crs_name}"
+        crs_footer_text=f"COORDINATE SYSTEM: {crs_name}",
+        use_topo_map=use_topo_map
     )
 
     render_orthophoto_pdf_from_png(png_path, pdf_path, paper_size=paper_size)
 
-    return FileResponse(pdf_path, media_type="application/pdf", filename=f"plot_{plot_id}_orthophoto.pdf")
+    filename = f"plot_{plot_id}_{'topomap' if use_topo_map else 'orthophoto'}.pdf"
+    return FileResponse(pdf_path, media_type="application/pdf", filename=filename)
 @router.get("/{plot_id}/survey-plan/dwg")
 def download_survey_plan_dwg(plot_id: int, db: Session = Depends(get_db)):
 
