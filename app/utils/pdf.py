@@ -1,25 +1,56 @@
 # pdf.py
-from reportlab.lib.pagesizes import A4
+from reportlab.lib.pagesizes import A4, A3, A2, A1, A0
 from reportlab.pdfgen import canvas
 from datetime import datetime
 from PIL import Image
 
+# Paper size mapping
+PAPER_SIZES = {
+    "A4": A4,
+    "A3": A3,
+    "A2": A2,
+    "A1": A1,
+    "A0": A0,
+}
 
-def generate_plot_report_pdf(report_data, filepath, map_image_path):
 
-    c = canvas.Canvas(filepath, pagesize=A4)
-    page_width, page_height = A4
+def generate_plot_report_pdf(report_data, filepath, map_image_path, paper_size="A4"):
+    """Generate PDF report with specified paper size"""
+
+    # Get page size (default to A4 if invalid)
+    page_size = PAPER_SIZES.get(paper_size.upper(), A4)
+
+    c = canvas.Canvas(filepath, pagesize=page_size)
+    page_width, page_height = page_size
+
+    # Scale font size based on paper size
+    font_scale = 1.0
+    if paper_size.upper() == "A3":
+        font_scale = 1.2
+    elif paper_size.upper() == "A2":
+        font_scale = 1.4
+    elif paper_size.upper() == "A1":
+        font_scale = 1.6
+    elif paper_size.upper() == "A0":
+        font_scale = 1.8
+
+    base_font_size = int(12 * font_scale)
+    margin = int(50 * font_scale)
+    line_height = int(18 * font_scale)
 
     # ---------- PAGE 1 : TEXT SUMMARY ----------
 
-    y = page_height - 50
+    y = page_height - margin
 
-    def line(text):
+    def line(text, font_size=base_font_size):
         nonlocal y
-        c.drawString(50, y, text)
-        y -= 18
+        c.setFontSize(font_size)
+        c.drawString(margin, y, text)
+        y -= line_height
 
-    line("Land Verification Report")
+    c.setFont("Helvetica-Bold", int(16 * font_scale))
+    line("Land Verification Report", int(16 * font_scale))
+    c.setFont("Helvetica", base_font_size)
     line("=" * 50)
     line(f"Plot ID: {report_data['plot_id']}")
     line(f"Generated: {datetime.utcnow()} UTC")
@@ -50,11 +81,19 @@ def generate_plot_report_pdf(report_data, filepath, map_image_path):
     img = Image.open(map_image_path)
     img_width_px, img_height_px = img.size
 
-    # Desired width on PDF (points)
-    target_width = 500
+    # Calculate target size to fit the page with margins
+    max_width = page_width - (2 * margin)
+    max_height = page_height - (2 * margin)
 
     aspect_ratio = img_height_px / img_width_px
-    target_height = target_width * aspect_ratio
+
+    # Fit to page while maintaining aspect ratio
+    if max_width * aspect_ratio <= max_height:
+        target_width = max_width
+        target_height = max_width * aspect_ratio
+    else:
+        target_height = max_height
+        target_width = max_height / aspect_ratio
 
     # Center position
     x = (page_width - target_width) / 2

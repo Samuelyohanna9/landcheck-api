@@ -14,10 +14,19 @@ from shapely import wkb
 from datetime import datetime
 import contextily as ctx
 
-from reportlab.lib.pagesizes import A4
+from reportlab.lib.pagesizes import A4, A3, A2, A1, A0
 from reportlab.pdfgen import canvas
 from reportlab.lib.utils import ImageReader
 from matplotlib.backends.backend_agg import FigureCanvasAgg as FigureCanvas
+
+# Paper size mapping
+PAPER_SIZES_REPORTLAB = {
+    "A4": A4,
+    "A3": A3,
+    "A2": A2,
+    "A1": A1,
+    "A0": A0,
+}
 
 # =======================
 # Helpers
@@ -329,12 +338,14 @@ def render_orthophoto_png(
     plt.close(fig)
 
 
-def render_orthophoto_pdf_from_png(png_path, pdf_path):
+def render_orthophoto_pdf_from_png(png_path, pdf_path, paper_size="A4"):
+    """Convert PNG to PDF with specified paper size"""
     if not os.path.exists(png_path) or os.path.getsize(png_path) < 2000:
         raise RuntimeError("Generated PNG is invalid or missing.")
 
-    c = canvas.Canvas(pdf_path, pagesize=A4)
-    w, h = A4
+    page_size = PAPER_SIZES_REPORTLAB.get(paper_size.upper(), A4)
+    c = canvas.Canvas(pdf_path, pagesize=page_size)
+    w, h = page_size
     img = ImageReader(png_path)
     c.drawImage(img, 0, 0, w, h, preserveAspectRatio=True)
     c.showPage()

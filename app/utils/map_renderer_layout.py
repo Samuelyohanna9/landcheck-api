@@ -403,15 +403,15 @@ def draw_coordinate_frame(ax, spacing: float, font_scale=1.0, first_point_info=N
                 rotation=90,
             )
 
-    # Add first point coordinates text below the grid frame
+    # Add first point coordinates text to the LEFT of the grid frame (to avoid scale bar overlap)
     if first_point_info:
         station_name, easting, northing = first_point_info
         coord_text = f"{station_name}: {easting:.2f}E, {northing:.2f}N"
         ax.text(
-            (xmin + xmax) / 2,
-            ymin - pad * 2.5,
+            xmin,
+            ymin - pad * 2.0,
             coord_text,
-            ha="center",
+            ha="left",
             va="top",
             fontsize=int(8*font_scale),
             color="black",

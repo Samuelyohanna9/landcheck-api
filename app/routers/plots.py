@@ -272,7 +272,7 @@ def download_plot_report_pdf(plot_id: int, db: Session = Depends(get_db),
     )
 
     report = get_plot_report(plot_id, db)
-    generate_plot_report_pdf(report, pdf_path, map_path)
+    generate_plot_report_pdf(report, pdf_path, map_path, paper_size=paper_size)
 
     return FileResponse(pdf_path, filename=f"plot_{plot_id}_report.pdf")
 
@@ -450,7 +450,8 @@ def orthophoto_pdf(plot_id: int, db: Session = Depends(get_db),
     surveyor_name: str = Body(""),
     surveyor_rank: str = Body(""),
     station_names: list[str] = Body(default=[]),
-    coordinate_system: str = Body("wgs84")):
+    coordinate_system: str = Body("wgs84"),
+    paper_size: str = Body("A4")):
 
     out_dir = "app/reports/orthophoto"
     os.makedirs(out_dir, exist_ok=True)
@@ -479,7 +480,7 @@ def orthophoto_pdf(plot_id: int, db: Session = Depends(get_db),
         crs_footer_text=f"COORDINATE SYSTEM: {crs_name}"
     )
 
-    render_orthophoto_pdf_from_png(png_path, pdf_path)
+    render_orthophoto_pdf_from_png(png_path, pdf_path, paper_size=paper_size)
 
     return FileResponse(pdf_path, media_type="application/pdf", filename=f"plot_{plot_id}_orthophoto.pdf")
 @router.get("/{plot_id}/survey-plan/dwg")
