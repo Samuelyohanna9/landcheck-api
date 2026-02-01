@@ -309,21 +309,33 @@ def draw_grid(ax, plot_poly, minor: float, major: float, font_scale=1.0):
     xmin, xmax = ax.get_xlim()
     ymin, ymax = ax.get_ylim()
 
+    # Fix invalid/self-intersecting polygons
+    if not plot_poly.is_valid:
+        plot_poly = plot_poly.buffer(0)  # This fixes most self-intersections
+
     def draw(step, lw, alpha):
         xs = np.arange(math.floor(xmin / step) * step, xmax + step, step)
         ys = np.arange(math.floor(ymin / step) * step, ymax + step, step)
 
         for x in xs:
-            g = LineString([(x, ymin), (x, ymax)]).difference(plot_poly)
-            for gg in getattr(g, "geoms", [g]):
-                if not gg.is_empty:
-                    ax.plot(*gg.xy, color="blue", lw=lw*font_scale, alpha=alpha)
+            try:
+                g = LineString([(x, ymin), (x, ymax)]).difference(plot_poly)
+                for gg in getattr(g, "geoms", [g]):
+                    if not gg.is_empty:
+                        ax.plot(*gg.xy, color="blue", lw=lw*font_scale, alpha=alpha)
+            except Exception:
+                # If difference fails, just draw the full line
+                ax.plot([x, x], [ymin, ymax], color="blue", lw=lw*font_scale, alpha=alpha)
 
         for y in ys:
-            g = LineString([(xmin, y), (xmax, y)]).difference(plot_poly)
-            for gg in getattr(g, "geoms", [g]):
-                if not gg.is_empty:
-                    ax.plot(*gg.xy, color="blue", lw=lw*font_scale, alpha=alpha)
+            try:
+                g = LineString([(xmin, y), (xmax, y)]).difference(plot_poly)
+                for gg in getattr(g, "geoms", [g]):
+                    if not gg.is_empty:
+                        ax.plot(*gg.xy, color="blue", lw=lw*font_scale, alpha=alpha)
+            except Exception:
+                # If difference fails, just draw the full line
+                ax.plot([xmin, xmax], [y, y], color="blue", lw=lw*font_scale, alpha=alpha)
 
     draw(minor, 0.3, 0.20)
     draw(major, 1.0, 0.60)
@@ -503,6 +515,11 @@ def render_plot_map_layout(
 
     gdf_plot = gpd.GeoDataFrame(geometry=[plot_geom], crs="EPSG:4326").to_crs(epsg=display_epsg)
     poly = gdf_plot.geometry.iloc[0]
+
+    # Fix invalid/self-intersecting polygons
+    if not poly.is_valid:
+        poly = poly.buffer(0)
+        gdf_plot = gpd.GeoDataFrame(geometry=[poly], crs=f"EPSG:{display_epsg}")
 
     # Get paper configuration
     paper_config = get_paper_config(paper_size)
