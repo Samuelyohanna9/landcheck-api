@@ -275,6 +275,43 @@ def download_plot_report_pdf(plot_id: int, db: Session = Depends(get_db),
     return FileResponse(pdf_path, filename=f"plot_{plot_id}_report.pdf")
 
 
+# ---------------- SIMPLE PDF DOWNLOAD (GET) ----------------
+
+@router.get("/{plot_id}/download/pdf")
+def simple_download_pdf(plot_id: int, db: Session = Depends(get_db)):
+    """Simple GET endpoint for basic PDF download from dashboard"""
+    reports_dir = "app/reports"
+    maps_dir = "app/reports/maps"
+    os.makedirs(reports_dir, exist_ok=True)
+    os.makedirs(maps_dir, exist_ok=True)
+
+    pdf_path = f"{reports_dir}/plot_{plot_id}_report.pdf"
+    map_path = f"{maps_dir}/plot_{plot_id}_map.png"
+
+    # Use default values
+    render_plot_map_layout(
+        db=db,
+        plot_id=plot_id,
+        output_path=map_path,
+        title_text="SURVEY PLAN",
+        location_text="",
+        lga_text="",
+        state_text="",
+        scale_text="1 : 1000",
+        surveyor_name="",
+        surveyor_rank="",
+        station_names=None,
+        coordinate_system="wgs84",
+        epsg_code=4326,
+        crs_footer_text="COORDINATE SYSTEM: WGS84"
+    )
+
+    report = get_plot_report(plot_id, db)
+    generate_plot_report_pdf(report, pdf_path, map_path)
+
+    return FileResponse(pdf_path, filename=f"plot_{plot_id}_report.pdf")
+
+
 # ---------------- SURVEY PLAN PREVIEW ----------------
 
 @router.post("/{plot_id}/report/preview")
