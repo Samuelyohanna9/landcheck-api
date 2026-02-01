@@ -1,11 +1,6 @@
 # app/utils/map_renderer_layout.py
-# A4 PORTRAIT – Professional survey plan layout with TRUE SCALE rendering
-#
-# Updates you requested:
-# 1) KEY shows ONLY features that exist on the map (plot always, others conditional)
-# 2) Building symbol in KEY is a rectangle (not a line)
-# 3) Key box is adjusted down a bit (as your current layout)
-# 4) Keeps your current footer/scale bar/north arrow positions (no breaking changes)
+# Professional survey plan layout with TRUE SCALE rendering
+# Supports multiple paper sizes: A4, A3, A2, A1, A0
 
 import matplotlib
 matplotlib.use("Agg")
@@ -21,6 +16,39 @@ import matplotlib.patches as patches
 import matplotlib.lines as mlines
 from datetime import datetime
 from matplotlib.backends.backend_agg import FigureCanvasAgg as FigureCanvas
+
+# ======================
+# Paper Size Configuration
+# ======================
+# Paper sizes in inches (width, height) for portrait orientation
+PAPER_SIZES = {
+    "A4": (8.27, 11.69),     # 210 x 297 mm
+    "A3": (11.69, 16.54),    # 297 x 420 mm
+    "A2": (16.54, 23.39),    # 420 x 594 mm
+    "A1": (23.39, 33.11),    # 594 x 841 mm
+    "A0": (33.11, 46.81),    # 841 x 1189 mm
+}
+
+# Scale factors for fonts and elements relative to A4
+SCALE_FACTORS = {
+    "A4": 1.0,
+    "A3": 1.25,
+    "A2": 1.5,
+    "A1": 1.8,
+    "A0": 2.2,
+}
+
+def get_paper_config(paper_size: str):
+    """Get paper dimensions and scale factor"""
+    size = paper_size.upper() if paper_size else "A4"
+    if size not in PAPER_SIZES:
+        size = "A4"
+    return {
+        "width": PAPER_SIZES[size][0],
+        "height": PAPER_SIZES[size][1],
+        "scale": SCALE_FACTORS[size],
+        "name": size,
+    }
 
 # ======================
 # Geometry & Scale Helpers
@@ -74,37 +102,38 @@ def draw_sheet_frame(fig):
     )
 
 
-def draw_title_block(fig, title_text, plot_id, area_m2, scale_text, location_text, lga_text, state_text):
+def draw_title_block(fig, title_text, plot_id, area_m2, scale_text, location_text, lga_text, state_text, font_scale=1.0):
     # Plot number at top right corner for identification
-    fig.text(0.94, 0.95, f"Plot #{plot_id}", ha="right", fontsize=8, weight="bold",)
+    fig.text(0.94, 0.95, f"Plot #{plot_id}", ha="right", fontsize=int(8*font_scale), weight="bold",)
 
     y = 0.955
-    fig.text(0.5, y, str(title_text), ha="center", fontsize=12, weight="bold")
-    fig.text(0.5, y - 0.030, f"LOCATED AT: {location_text}", ha="center", fontsize=9)
-    fig.text(0.5, y - 0.050, str(lga_text), ha="center", fontsize=9)
-    fig.text(0.5, y - 0.070, str(state_text), ha="center", fontsize=9)
-    fig.text(0.5, y - 0.100, f"AREA = {area_m2/10000:.4f} HA.", ha="center", fontsize=9, color="red")
-    fig.text(0.5, y - 0.120, f"SCALE  {scale_text}", ha="center", fontsize=9)
+    fig.text(0.5, y, str(title_text), ha="center", fontsize=int(12*font_scale), weight="bold")
+    fig.text(0.5, y - 0.030, f"LOCATED AT: {location_text}", ha="center", fontsize=int(9*font_scale))
+    fig.text(0.5, y - 0.050, str(lga_text), ha="center", fontsize=int(9*font_scale))
+    fig.text(0.5, y - 0.070, str(state_text), ha="center", fontsize=int(9*font_scale))
+    fig.text(0.5, y - 0.100, f"AREA = {area_m2/10000:.4f} HA.", ha="center", fontsize=int(9*font_scale), color="red")
+    fig.text(0.5, y - 0.120, f"SCALE  {scale_text}", ha="center", fontsize=int(9*font_scale))
 
 
-def draw_footer(fig, crs_text, source_text, surveyor, rank):
+def draw_footer(fig, crs_text, source_text, surveyor, rank, font_scale=1.0):
     y_top = 0.185
     y_bot = 0.055
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
 
-    fig.text(0.06, y_top, f"SURVEYOR: {surveyor}", fontsize=9)
-    fig.text(0.06, y_top - 0.025, f"RANK: {rank}", fontsize=9)
-    fig.text(0.06, y_top - 0.050, "SIGNATURE: ____________________", fontsize=9)
-    fig.text(0.06, y_top - 0.075, f"DATE PRINTED: {now}", fontsize=9)
+    fig.text(0.06, y_top, f"SURVEYOR: {surveyor}", fontsize=int(9*font_scale))
+    fig.text(0.06, y_top - 0.025, f"RANK: {rank}", fontsize=int(9*font_scale))
+    fig.text(0.06, y_top - 0.050, "SIGNATURE: ____________________", fontsize=int(9*font_scale))
+    fig.text(0.06, y_top - 0.075, f"DATE PRINTED: {now}", fontsize=int(9*font_scale))
 
-    fig.text(0.06, y_bot, str(crs_text), fontsize=8, color="blue")
-    fig.text(0.94, y_bot, str(source_text), fontsize=8, ha="right")
+    fig.text(0.06, y_bot, str(crs_text), fontsize=int(8*font_scale), color="blue")
+    fig.text(0.94, y_bot, str(source_text), fontsize=int(8*font_scale), ha="right")
 
 
-def draw_key_box(fig, has_buildings: bool, has_roads: bool, has_rivers: bool):
+def draw_key_box(fig, has_buildings: bool, has_roads: bool, has_rivers: bool, font_scale=1.0):
     """
     KEY shows ONLY features that exist on map.
     Buildings symbol is a rectangle (not a line).
+    Roads shown as double lines.
     """
     items = []
     # Plot perimeter always
@@ -114,7 +143,7 @@ def draw_key_box(fig, has_buildings: bool, has_roads: bool, has_rivers: bool):
         items.append(("BUILDINGS", "rect", "black", 1))
 
     if has_roads:
-        items.append(("ROADS", "line", "dimgray", 1))
+        items.append(("ROADS", "double_line", "dimgray", 1))  # Changed to double_line
 
     if has_rivers:
         items.append(("RIVERS", "line", "blue", 1))
@@ -130,9 +159,9 @@ def draw_key_box(fig, has_buildings: bool, has_roads: bool, has_rivers: bool):
     y = 0.065  # moved down a bit (you asked)
 
     fig.add_artist(
-        patches.Rectangle((x, y), w, h, transform=fig.transFigure, fill=False, lw=0.9)
+        patches.Rectangle((x, y), w, h, transform=fig.transFigure, fill=False, lw=0.9*font_scale)
     )
-    fig.text(x + w / 2.0, y + h - 0.020, "KEY", ha="center", fontsize=8, weight="bold")
+    fig.text(x + w / 2.0, y + h - 0.020, "KEY", ha="center", fontsize=int(8*font_scale), weight="bold")
 
     yy = y + h - 0.050
     for lbl, sym, col, lw in items:
@@ -143,9 +172,29 @@ def draw_key_box(fig, has_buildings: bool, has_roads: bool, has_rivers: bool):
                 [yy, yy],
                 transform=fig.transFigure,
                 color=col,
-                lw=lw,
+                lw=lw*font_scale,
             )
             fig.add_artist(line)
+
+        elif sym == "double_line":
+            # Double line for roads
+            offset = 0.004
+            line1 = mlines.Line2D(
+                [x + 0.03, x + 0.10],
+                [yy + offset, yy + offset],
+                transform=fig.transFigure,
+                color=col,
+                lw=lw*font_scale,
+            )
+            line2 = mlines.Line2D(
+                [x + 0.03, x + 0.10],
+                [yy - offset, yy - offset],
+                transform=fig.transFigure,
+                color=col,
+                lw=lw*font_scale,
+            )
+            fig.add_artist(line1)
+            fig.add_artist(line2)
 
         elif sym == "rect":
             # Building rectangle symbol
@@ -161,7 +210,7 @@ def draw_key_box(fig, has_buildings: bool, has_roads: bool, has_rivers: bool):
                 )
             )
 
-        fig.text(x + 0.12, yy, lbl, fontsize=7, va="center")
+        fig.text(x + 0.12, yy, lbl, fontsize=int(7*font_scale), va="center")
         yy -= row_h
 
 
@@ -169,22 +218,22 @@ def draw_key_box(fig, has_buildings: bool, has_roads: bool, has_rivers: bool):
 # Map Decorations
 # ======================
 
-def add_north_arrow(ax):
+def add_north_arrow(ax, font_scale=1.0):
     # Keep your current placement (figure fraction)
     ax.annotate(
         "N",
         xy=(0.85, 0.90),
         xytext=(0.85, 0.83),
         xycoords="figure fraction",
-        arrowprops=dict(facecolor="black", width=2, headwidth=8),
+        arrowprops=dict(facecolor="black", width=2*font_scale, headwidth=8*font_scale),
         ha="center",
-        fontsize=12,
+        fontsize=int(12*font_scale),
         weight="bold",
         zorder=20,
     )
 
 
-def add_scalebar(ax, length_m: float, segments: int = 4):
+def add_scalebar(ax, length_m: float, segments: int = 4, font_scale=1.0):
     # Keep your current fixed position in axes coordinates
     x0, y0, bar_h, total_w = 0.225, -0.15, 0.012, 0.55
     seg_w = total_w / float(segments)
@@ -200,7 +249,7 @@ def add_scalebar(ax, length_m: float, segments: int = 4):
                 transform=ax.transAxes,
                 facecolor=face,
                 edgecolor="black",
-                linewidth=0.8,
+                linewidth=0.8*font_scale,
                 clip_on=False,
             )
         )
@@ -213,7 +262,7 @@ def add_scalebar(ax, length_m: float, segments: int = 4):
             transform=ax.transAxes,
             fill=False,
             edgecolor="black",
-            linewidth=1.2,
+            linewidth=1.2*font_scale,
             clip_on=False,
         )
     )
@@ -225,7 +274,7 @@ def add_scalebar(ax, length_m: float, segments: int = 4):
         transform=ax.transAxes,
         ha="center",
         va="top",
-        fontsize=7,
+        fontsize=int(7*font_scale),
         clip_on=False,
     )
     for i in range(1, segments + 1):
@@ -237,7 +286,7 @@ def add_scalebar(ax, length_m: float, segments: int = 4):
             transform=ax.transAxes,
             ha="center",
             va="top",
-            fontsize=7,
+            fontsize=int(7*font_scale),
             clip_on=False,
         )
 
@@ -247,7 +296,7 @@ def add_scalebar(ax, length_m: float, segments: int = 4):
         "meters",
         transform=ax.transAxes,
         ha="center",
-        fontsize=7,
+        fontsize=int(7*font_scale),
         clip_on=False,
     )
 
@@ -256,7 +305,7 @@ def add_scalebar(ax, length_m: float, segments: int = 4):
 # Grid & Annotations
 # ======================
 
-def draw_grid(ax, plot_poly, minor: float, major: float):
+def draw_grid(ax, plot_poly, minor: float, major: float, font_scale=1.0):
     xmin, xmax = ax.get_xlim()
     ymin, ymax = ax.get_ylim()
 
@@ -268,19 +317,23 @@ def draw_grid(ax, plot_poly, minor: float, major: float):
             g = LineString([(x, ymin), (x, ymax)]).difference(plot_poly)
             for gg in getattr(g, "geoms", [g]):
                 if not gg.is_empty:
-                    ax.plot(*gg.xy, color="blue", lw=lw, alpha=alpha)
+                    ax.plot(*gg.xy, color="blue", lw=lw*font_scale, alpha=alpha)
 
         for y in ys:
             g = LineString([(xmin, y), (xmax, y)]).difference(plot_poly)
             for gg in getattr(g, "geoms", [g]):
                 if not gg.is_empty:
-                    ax.plot(*gg.xy, color="blue", lw=lw, alpha=alpha)
+                    ax.plot(*gg.xy, color="blue", lw=lw*font_scale, alpha=alpha)
 
     draw(minor, 0.3, 0.20)
     draw(major, 1.0, 0.60)
 
 
-def draw_coordinate_frame(ax, spacing: float):
+def draw_coordinate_frame(ax, spacing: float, font_scale=1.0, first_point_info=None):
+    """
+    Draw coordinate frame with grid labels.
+    first_point_info: tuple (station_name, easting, northing) to display below the grid
+    """
     xmin, xmax = ax.get_xlim()
     ymin, ymax = ax.get_ylim()
     pad = (xmax - xmin) * 0.035
@@ -291,7 +344,7 @@ def draw_coordinate_frame(ax, spacing: float):
             (xmax - xmin) + 2 * pad,
             (ymax - ymin) + 2 * pad,
             fill=False,
-            lw=1.5,
+            lw=1.5*font_scale,
             clip_on=False,
         )
     )
@@ -301,7 +354,7 @@ def draw_coordinate_frame(ax, spacing: float):
             (xmax - xmin),
             (ymax - ymin),
             fill=False,
-            lw=1.0,
+            lw=1.0*font_scale,
             clip_on=False,
         )
     )
@@ -312,7 +365,7 @@ def draw_coordinate_frame(ax, spacing: float):
     # Draw easting labels at the top - filter to only show labels within bounds
     for x in xs:
         if x >= xmin and x <= xmax:
-            ax.text(x, ymax + pad * 0.45, f"{int(round(x))}", ha="center", fontsize=7, color="blue")
+            ax.text(x, ymax + pad * 0.45, f"{int(round(x))}", ha="center", fontsize=int(7*font_scale), color="blue")
 
     # Draw northing labels on both sides - include ALL grid lines including the first one
     for y in ys:
@@ -323,7 +376,7 @@ def draw_coordinate_frame(ax, spacing: float):
                 f"{int(round(y))}",
                 va="center",
                 ha="right",
-                fontsize=7,
+                fontsize=int(7*font_scale),
                 color="blue",
                 rotation=90,
             )
@@ -333,13 +386,33 @@ def draw_coordinate_frame(ax, spacing: float):
                 f"{int(round(y))}",
                 va="center",
                 ha="left",
-                fontsize=7,
+                fontsize=int(7*font_scale),
                 color="blue",
                 rotation=90,
             )
 
+    # Add first point coordinates text below the grid frame
+    if first_point_info:
+        station_name, easting, northing = first_point_info
+        coord_text = f"{station_name}: {easting:.2f}E, {northing:.2f}N"
+        ax.text(
+            (xmin + xmax) / 2,
+            ymin - pad * 2.5,
+            coord_text,
+            ha="center",
+            va="top",
+            fontsize=int(8*font_scale),
+            color="black",
+            weight="bold",
+            clip_on=False,
+        )
 
-def annotate_vertices(ax, poly, plot_id: int, station_names=None):
+
+def annotate_vertices(ax, poly, plot_id: int, station_names=None, font_scale=1.0, first_point_coords=None):
+    """
+    Annotate vertices with station names and bearing/distance in RED.
+    first_point_coords: tuple (station_name, easting, northing) for first point label
+    """
     coords = list(poly.exterior.coords)
     default_labels = list("ABCDEFGHIJKLMNOPQRSTUVWXYZ")
     labels = station_names if station_names else default_labels
@@ -352,20 +425,22 @@ def annotate_vertices(ax, poly, plot_id: int, station_names=None):
             p1.x,
             p1.y,
             label,
-            fontsize=9,
+            fontsize=int(9*font_scale),
             color="black",
             ha="center",
             va="center",
             weight="bold",
         )
 
+        # Bearing and distance in RED
         bearing, dist = calculate_bearing_deg(p1, p2), p1.distance(p2)
         mx, my = (p1.x + p2.x) / 2.0, (p1.y + p2.y) / 2.0
         ang = math.degrees(math.atan2(p2.y - p1.y, p2.x - p1.x))
         if ang < -90 or ang > 90:
             ang += 180
 
-        ax.text(mx, my, f"{bearing:.1f}°\n{dist:.1f}m", fontsize=6.5, ha="center", va="center", rotation=ang)
+        ax.text(mx, my, f"{bearing:.1f}°\n{dist:.1f}m", fontsize=int(6.5*font_scale),
+                ha="center", va="center", rotation=ang, color="red", weight="bold")
 
 
 # ======================
@@ -388,6 +463,7 @@ def render_plot_map_layout(
     station_names=None,
     coordinate_system: str = "wgs84",
     epsg_code: int = 4326,
+    paper_size: str = "A4",
 ):
     plot_wkb = db.execute(text("SELECT geom FROM plots WHERE id=:id"), {"id": plot_id}).scalar()
     rows = db.execute(
@@ -428,47 +504,70 @@ def render_plot_map_layout(
     gdf_plot = gpd.GeoDataFrame(geometry=[plot_geom], crs="EPSG:4326").to_crs(epsg=display_epsg)
     poly = gdf_plot.geometry.iloc[0]
 
-    fig = plt.figure(figsize=(8.27, 11.69), dpi=200)
+    # Get paper configuration
+    paper_config = get_paper_config(paper_size)
+    fig_width = paper_config["width"]
+    fig_height = paper_config["height"]
+    font_scale = paper_config["scale"]
+
+    # Adjust DPI based on paper size (larger papers need lower DPI for reasonable file sizes)
+    dpi = 200 if paper_size in ["A4", "A3"] else 150 if paper_size == "A2" else 100
+
+    fig = plt.figure(figsize=(fig_width, fig_height), dpi=dpi)
     canvas_obj = FigureCanvas(fig)
 
     map_left, map_bottom, map_width, map_height = 0.10, 0.30, 0.80, 0.45
     ax = fig.add_axes([map_left, map_bottom, map_width, map_height])
 
     draw_sheet_frame(fig)
-    draw_title_block(fig, title_text, plot_id, area_m2, scale_text, location_text, lga_text, state_text)
-    draw_footer(fig, crs_footer_text, source_footer_text, surveyor_name, surveyor_rank)
+    draw_title_block(fig, title_text, plot_id, area_m2, scale_text, location_text, lga_text, state_text, font_scale)
+    draw_footer(fig, crs_footer_text, source_footer_text, surveyor_name, surveyor_rank, font_scale)
 
     # flags for KEY (only show what exists)
     has_buildings = len(buildings) > 0
     has_roads = len(roads) > 0
     has_rivers = len(rivers) > 0
-    draw_key_box(fig, has_buildings=has_buildings, has_roads=has_roads, has_rivers=has_rivers)
+    draw_key_box(fig, has_buildings=has_buildings, has_roads=has_roads, has_rivers=has_rivers, font_scale=font_scale)
 
     if rivers:
-        gpd.GeoDataFrame(geometry=rivers, crs="EPSG:4326").to_crs(epsg=display_epsg).plot(ax=ax, color="blue", lw=1.2)
+        gpd.GeoDataFrame(geometry=rivers, crs="EPSG:4326").to_crs(epsg=display_epsg).plot(ax=ax, color="blue", lw=1.2*font_scale)
+
+    # Draw roads as double lines
     if roads:
-        gpd.GeoDataFrame(geometry=roads, crs="EPSG:4326").to_crs(epsg=display_epsg).plot(ax=ax, color="dimgray", lw=1.2)
+        gdf_roads = gpd.GeoDataFrame(geometry=roads, crs="EPSG:4326").to_crs(epsg=display_epsg)
+        road_width = 3 * font_scale  # Total road width
+        # Draw outer line (wider)
+        gdf_roads.plot(ax=ax, color="dimgray", lw=road_width)
+        # Draw inner line (narrower, white to create double-line effect)
+        gdf_roads.plot(ax=ax, color="white", lw=road_width * 0.5)
+
     if buildings:
         gpd.GeoDataFrame(geometry=buildings, crs="EPSG:4326").to_crs(epsg=display_epsg).plot(
-            ax=ax, facecolor="none", edgecolor="black"
+            ax=ax, facecolor="none", edgecolor="black", lw=1*font_scale
         )
 
-    gdf_plot.plot(ax=ax, facecolor="none", edgecolor="red", lw=2)
+    gdf_plot.plot(ax=ax, facecolor="none", edgecolor="red", lw=2*font_scale)
 
     scale_ratio = parse_scale_ratio(scale_text)
-    apply_true_scale(ax, poly, scale_ratio, 8.27 * map_width, 11.69 * map_height)
+    apply_true_scale(ax, poly, scale_ratio, fig_width * map_width, fig_height * map_height)
 
     major = nice_grid_step(max(ax.get_xlim()[1] - ax.get_xlim()[0], ax.get_ylim()[1] - ax.get_ylim()[0]))
-    draw_grid(ax, poly, major / 5.0, major)
-    draw_coordinate_frame(ax, major)
-    annotate_vertices(ax, poly, plot_id, station_names)
+    draw_grid(ax, poly, major / 5.0, major, font_scale)
 
-    add_north_arrow(ax)
-    add_scalebar(ax, 100 if scale_ratio <= 1000 else 500)
+    # Get first point coordinates for display
+    first_coords = list(poly.exterior.coords)[0]
+    first_station = station_names[0] if station_names and len(station_names) > 0 else "A"
+    first_point_info = (first_station, first_coords[0], first_coords[1])
+
+    draw_coordinate_frame(ax, major, font_scale, first_point_info)
+    annotate_vertices(ax, poly, plot_id, station_names, font_scale)
+
+    add_north_arrow(ax, font_scale)
+    add_scalebar(ax, 100 if scale_ratio <= 1000 else 500, font_scale=font_scale)
 
     ax.set_aspect("equal")
     ax.axis("off")
 
     fig.canvas.draw()
-    plt.savefig(output_path, dpi=200, bbox_inches=None)
+    plt.savefig(output_path, dpi=dpi, bbox_inches=None)
     plt.close(fig)

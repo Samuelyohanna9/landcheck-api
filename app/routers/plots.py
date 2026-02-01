@@ -238,7 +238,8 @@ def download_plot_report_pdf(plot_id: int, db: Session = Depends(get_db),
     surveyor_name: str = Body(""),
     surveyor_rank: str = Body(""),
     station_names: list[str] = Body(default=[]),
-    coordinate_system: str = Body("wgs84")):
+    coordinate_system: str = Body("wgs84"),
+    paper_size: str = Body("A4")):
 
     reports_dir = "app/reports"
     maps_dir = "app/reports/maps"
@@ -266,7 +267,8 @@ def download_plot_report_pdf(plot_id: int, db: Session = Depends(get_db),
         station_names=station_names if station_names else None,
         coordinate_system=coordinate_system,
         epsg_code=epsg_code,
-        crs_footer_text=f"COORDINATE SYSTEM: {crs_name}"
+        crs_footer_text=f"COORDINATE SYSTEM: {crs_name}",
+        paper_size=paper_size
     )
 
     report = get_plot_report(plot_id, db)
@@ -324,7 +326,8 @@ def preview_plot_map(plot_id: int, db: Session = Depends(get_db),
     surveyor_name: str = Body(""),
     surveyor_rank: str = Body(""),
     station_names: list[str] = Body(default=[]),
-    coordinate_system: str = Body("wgs84")):
+    coordinate_system: str = Body("wgs84"),
+    paper_size: str = Body("A4")):
 
     maps_dir = "app/reports/previews"
     os.makedirs(maps_dir, exist_ok=True)
@@ -349,7 +352,8 @@ def preview_plot_map(plot_id: int, db: Session = Depends(get_db),
         station_names=station_names if station_names else None,
         coordinate_system=coordinate_system,
         epsg_code=epsg_code,
-        crs_footer_text=f"COORDINATE SYSTEM: {crs_name}"
+        crs_footer_text=f"COORDINATE SYSTEM: {crs_name}",
+        paper_size=paper_size
     )
 
     return FileResponse(map_path, media_type="image/png")
