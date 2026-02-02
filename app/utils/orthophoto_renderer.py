@@ -309,7 +309,14 @@ def render_orthophoto_png(
 
         for name, url in topo_sources:
             try:
-                ctx.add_basemap(ax, source=url, crs="EPSG:3857", attribution=False, zoom=15)
+                ctx.add_basemap(
+                    ax,
+                    source=url,
+                    crs="EPSG:3857",
+                    attribution=False,
+                    zoom=15,
+                    reset_extent=False,
+                )
                 basemap_loaded = True
                 print(f"Loaded topo basemap from {name}")
                 break
@@ -320,7 +327,14 @@ def render_orthophoto_png(
         if not basemap_loaded:
             # Fallback to contextily OpenTopoMap provider
             try:
-                ctx.add_basemap(ax, source=ctx.providers.OpenTopoMap, crs="EPSG:3857", attribution=False, zoom=15)
+                ctx.add_basemap(
+                    ax,
+                    source=ctx.providers.OpenTopoMap,
+                    crs="EPSG:3857",
+                    attribution=False,
+                    zoom=15,
+                    reset_extent=False,
+                )
                 basemap_loaded = True
             except Exception as e:
                 print(f"OpenTopoMap provider failed: {e}")
@@ -334,14 +348,28 @@ def render_orthophoto_png(
 
         # First try the contextily providers
         try:
-            ctx.add_basemap(ax, source=ctx.providers.Esri.WorldImagery, crs="EPSG:3857", attribution=False, zoom=17)
+            ctx.add_basemap(
+                ax,
+                source=ctx.providers.Esri.WorldImagery,
+                crs="EPSG:3857",
+                attribution=False,
+                zoom=17,
+                reset_extent=False,
+            )
             basemap_loaded = True
         except Exception as e:
             print(f"Esri WorldImagery failed: {e}")
 
         if not basemap_loaded:
             try:
-                ctx.add_basemap(ax, source=ctx.providers.OpenStreetMap.Mapnik, crs="EPSG:3857", attribution=False, zoom=17)
+                ctx.add_basemap(
+                    ax,
+                    source=ctx.providers.OpenStreetMap.Mapnik,
+                    crs="EPSG:3857",
+                    attribution=False,
+                    zoom=17,
+                    reset_extent=False,
+                )
                 basemap_loaded = True
             except Exception as e:
                 print(f"OpenStreetMap failed: {e}")
@@ -350,7 +378,14 @@ def render_orthophoto_png(
             # Try URL-based approach as last resort
             for name, url in basemap_sources:
                 try:
-                    ctx.add_basemap(ax, source=url, crs="EPSG:3857", attribution=False, zoom=17)
+                    ctx.add_basemap(
+                        ax,
+                        source=url,
+                        crs="EPSG:3857",
+                        attribution=False,
+                        zoom=17,
+                        reset_extent=False,
+                    )
                     basemap_loaded = True
                     print(f"Loaded basemap from {name}")
                     break
