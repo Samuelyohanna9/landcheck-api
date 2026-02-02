@@ -434,12 +434,15 @@ def orthophoto_preview(plot_id: int, db: Session = Depends(get_db),
         db=db,
         plot_id=plot_id,
         output_path=png_path,
+        title_text="TOPO MAP" if use_topo_map else "ORTHOPHOTO",
         scale_text=scale_text,
         station_names=station_names if station_names else None,
         coordinate_system=coordinate_system,
         epsg_code=epsg_code,
         crs_footer_text=f"COORDINATE SYSTEM: {crs_name}",
-        use_topo_map=use_topo_map
+        source_footer_text="SOURCE: OpenTopoMap" if use_topo_map else "SOURCE: Satellite Imagery",
+        use_topo_map=use_topo_map,
+        paper_size=paper_size
     )
 
     return FileResponse(png_path, media_type="image/png")
@@ -486,7 +489,8 @@ def orthophoto_pdf(plot_id: int, db: Session = Depends(get_db),
         coordinate_system=coordinate_system,
         epsg_code=epsg_code,
         crs_footer_text=f"COORDINATE SYSTEM: {crs_name}",
-        use_topo_map=use_topo_map
+        use_topo_map=use_topo_map,
+        paper_size=paper_size
     )
 
     render_orthophoto_pdf_from_png(png_path, pdf_path, paper_size=paper_size)
