@@ -9,6 +9,7 @@ from fastapi.responses import FileResponse
 from app.schemas.plot_create import PlotCreateRequest
 
 import os
+import re
 
 from app.db import SessionLocal
 from app.models.plot import Plot
@@ -422,9 +423,11 @@ def orthophoto_preview(plot_id: int, db: Session = Depends(get_db),
     out_dir = "app/reports/orthophoto"
     os.makedirs(out_dir, exist_ok=True)
 
-    # Use different filename for topo vs satellite to cache both
+    # Use different filename for topo vs satellite and include size/scale to avoid stale previews
     map_type = "topo" if use_topo_map else "satellite"
-    png_path = f"{out_dir}/plot_{plot_id}_orthophoto_{map_type}_preview.png"
+    scale_key = re.sub(r"[^0-9]", "", str(scale_text)) or "1000"
+    paper_key = str(paper_size).upper() if paper_size else "A4"
+    png_path = f"{out_dir}/plot_{plot_id}_orthophoto_{map_type}_preview_{paper_key}_{scale_key}.png"
 
     # Get EPSG code for selected coordinate system
     epsg_code = COORDINATE_SYSTEMS.get(coordinate_system, 4326)
@@ -445,7 +448,11 @@ def orthophoto_preview(plot_id: int, db: Session = Depends(get_db),
         paper_size=paper_size
     )
 
-    return FileResponse(png_path, media_type="image/png")
+    return FileResponse(
+        png_path,
+        media_type="image/png",
+        headers={"Cache-Control": "no-store"}
+    )
 
 
 @router.post("/{plot_id}/orthophoto/pdf")
