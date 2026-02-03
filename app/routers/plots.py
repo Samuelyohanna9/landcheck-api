@@ -78,6 +78,26 @@ def ensure_plot_meta_table(db: Session):
             updated_at TIMESTAMP DEFAULT NOW()
         )
     """))
+    # Ensure columns exist if the table was created previously with missing fields
+    columns_to_add = [
+        ("title_text", "VARCHAR(255)"),
+        ("location_text", "TEXT"),
+        ("lga_text", "TEXT"),
+        ("state_text", "TEXT"),
+        ("surveyor_name", "TEXT"),
+        ("surveyor_rank", "TEXT"),
+        ("scale_text", "VARCHAR(50)"),
+        ("paper_size", "VARCHAR(10)"),
+        ("coordinate_system", "VARCHAR(20)"),
+        ("created_at", "TIMESTAMP DEFAULT NOW()"),
+        ("updated_at", "TIMESTAMP DEFAULT NOW()"),
+    ]
+    for col_name, col_type in columns_to_add:
+        try:
+            db.execute(text(f"ALTER TABLE plot_meta ADD COLUMN IF NOT EXISTS {col_name} {col_type}"))
+        except Exception:
+            # Ignore for databases that don't support IF NOT EXISTS or already have column
+            pass
     db.commit()
 
 

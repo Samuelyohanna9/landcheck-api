@@ -38,6 +38,26 @@ def ensure_plot_meta_table(db: Session):
             updated_at TIMESTAMP DEFAULT NOW()
         )
     """))
+    # Ensure columns exist if the table was created previously with missing fields
+    columns_to_add = [
+        ("title_text", "VARCHAR(255)"),
+        ("location_text", "TEXT"),
+        ("lga_text", "TEXT"),
+        ("state_text", "TEXT"),
+        ("surveyor_name", "TEXT"),
+        ("surveyor_rank", "TEXT"),
+        ("scale_text", "VARCHAR(50)"),
+        ("paper_size", "VARCHAR(10)"),
+        ("coordinate_system", "VARCHAR(20)"),
+        ("created_at", "TIMESTAMP DEFAULT NOW()"),
+        ("updated_at", "TIMESTAMP DEFAULT NOW()"),
+    ]
+    for col_name, col_type in columns_to_add:
+        try:
+            db.execute(text(f"ALTER TABLE plot_meta ADD COLUMN IF NOT EXISTS {col_name} {col_type}"))
+        except Exception:
+            # Ignore for databases that don't support IF NOT EXISTS or already have column
+            pass
     db.commit()
 
 
@@ -254,26 +274,54 @@ def get_plot_details(db: Session = Depends(get_db)):
 
     created_at_col = "p.created_at" if has_created_at else "NULL"
 
-    rows = db.execute(text(f"""
-        SELECT
-            p.id,
-            ST_AsGeoJSON(p.geom) AS geojson,
-            {created_at_col} AS created_at,
-            m.title_text,
-            m.location_text,
-            m.lga_text,
-            m.state_text,
-            m.surveyor_name,
-            m.surveyor_rank,
-            m.scale_text,
-            m.paper_size,
-            m.coordinate_system,
-            m.created_at AS meta_created_at,
-            m.updated_at AS meta_updated_at
-        FROM plots p
-        LEFT JOIN plot_meta m ON m.plot_id = p.id
-        ORDER BY p.id DESC
-    """)).fetchall()
+    rows = []
+    try:
+        rows = db.execute(text(f"""
+            SELECT
+                p.id,
+                ST_AsGeoJSON(p.geom) AS geojson,
+                {created_at_col} AS created_at,
+                m.title_text,
+                m.location_text,
+                m.lga_text,
+                m.state_text,
+                m.surveyor_name,
+                m.surveyor_rank,
+                m.scale_text,
+                m.paper_size,
+                m.coordinate_system,
+                m.created_at AS meta_created_at,
+                m.updated_at AS meta_updated_at
+            FROM plots p
+            LEFT JOIN plot_meta m ON m.plot_id = p.id
+            ORDER BY p.id DESC
+        """)).fetchall()
+    except Exception as e:
+        print(f"Plot details query failed: {e}")
+        # Fallback without plot_meta join
+        try:
+            rows = db.execute(text(f"""
+                SELECT
+                    p.id,
+                    NULL AS geojson,
+                    {created_at_col} AS created_at,
+                    NULL AS title_text,
+                    NULL AS location_text,
+                    NULL AS lga_text,
+                    NULL AS state_text,
+                    NULL AS surveyor_name,
+                    NULL AS surveyor_rank,
+                    NULL AS scale_text,
+                    NULL AS paper_size,
+                    NULL AS coordinate_system,
+                    NULL AS meta_created_at,
+                    NULL AS meta_updated_at
+                FROM plots p
+                ORDER BY p.id DESC
+            """)).fetchall()
+        except Exception as inner_e:
+            print(f"Fallback plot query failed: {inner_e}")
+            rows = []
 
     # Preload detected features if table exists
     features_by_plot = {}
@@ -300,7 +348,15 @@ def get_plot_details(db: Session = Depends(get_db)):
 
     plot_list = []
     for row in rows:
-        geojson = json.loads(row[1]) if row[1] else None
+        geojson = None
+        if row[1]:
+            if isinstance(row[1], dict):
+                geojson = row[1]
+            else:
+                try:
+                    geojson = json.loads(row[1])
+                except Exception:
+                    geojson = None
         coords = []
         if geojson and geojson.get("type") == "Polygon":
             rings = geojson.get("coordinates", [])
