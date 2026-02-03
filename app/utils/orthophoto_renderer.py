@@ -449,13 +449,20 @@ def render_orthophoto_png(
 
 def render_orthophoto_pdf_from_png(png_path, pdf_path, paper_size="A4"):
     """Convert PNG to PDF with specified paper size"""
-    if not os.path.exists(png_path) or os.path.getsize(png_path) < 2000:
-        raise RuntimeError("Generated PNG is invalid or missing.")
+    try:
+        if not os.path.exists(png_path) or os.path.getsize(png_path) < 2000:
+            raise RuntimeError("Generated PNG is invalid or missing.")
 
-    page_size = PAPER_SIZES_REPORTLAB.get(paper_size.upper(), A4)
-    c = canvas.Canvas(pdf_path, pagesize=page_size)
-    w, h = page_size
-    img = ImageReader(png_path)
-    c.drawImage(img, 0, 0, w, h, preserveAspectRatio=True)
-    c.showPage()
-    c.save()
+        page_size = PAPER_SIZES_REPORTLAB.get(paper_size.upper(), A4)
+        c = canvas.Canvas(pdf_path, pagesize=page_size)
+        w, h = page_size
+        img = ImageReader(png_path)
+        c.drawImage(img, 0, 0, w, h, preserveAspectRatio=True)
+        c.showPage()
+        c.save()
+
+    finally:
+        # THE CLEANUP: Delete the PNG after the PDF is created
+        if os.path.exists(png_path):
+            os.remove(png_path)
+            print(f"Cleaned up temporary image: {png_path}")
