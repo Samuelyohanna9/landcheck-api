@@ -11,6 +11,7 @@ from typing import Optional, Union, List
 
 import os
 import tempfile
+import glob
 import re
 
 from app.db import SessionLocal
@@ -167,6 +168,17 @@ def safe_remove(path: str):
         pass
     except Exception:
         pass
+
+
+def cleanup_preview_files(plot_id: int):
+    patterns = [
+        f"app/reports/orthophoto/plot_{plot_id}_orthophoto_*_preview*.png",
+        f"app/reports/orthophoto/plot_{plot_id}_orthophoto_preview*.png",
+        f"app/reports/previews/plot_{plot_id}_preview*.png",
+    ]
+    for pattern in patterns:
+        for path in glob.glob(pattern):
+            safe_remove(path)
 
 
 # ---------------- CREATE PLOT ----------------
@@ -489,6 +501,7 @@ def preview_plot_map(plot_id: int, db: Session = Depends(get_db), background_tas
     coordinate_system: str = Body("wgs84"),
     paper_size: str = Body("A4")):
 
+    cleanup_preview_files(plot_id)
     tmp_map = tempfile.NamedTemporaryFile(suffix="_preview.png", delete=False)
     map_path = tmp_map.name
     tmp_map.close()
@@ -596,6 +609,7 @@ def orthophoto_preview(plot_id: int, db: Session = Depends(get_db), background_t
     paper_size: str = Body("A4"),
     use_topo_map: bool = Body(False)):
 
+    cleanup_preview_files(plot_id)
     tmp_png = tempfile.NamedTemporaryFile(suffix="_orthophoto_preview.png", delete=False)
     png_path = tmp_png.name
     tmp_png.close()
