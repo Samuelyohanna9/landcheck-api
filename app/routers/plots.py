@@ -1,6 +1,6 @@
 # app/routers/plots.py
 
-from fastapi import APIRouter, Depends, Body, HTTPException
+from fastapi import APIRouter, Depends, Body, HTTPException, BackgroundTasks
 from sqlalchemy.orm import Session
 from geoalchemy2.shape import from_shape
 from shapely.geometry import Polygon
@@ -10,6 +10,7 @@ from app.schemas.plot_create import PlotCreateRequest
 from typing import Optional, Union, List
 
 import os
+import tempfile
 import re
 
 from app.db import SessionLocal
@@ -157,6 +158,15 @@ def upsert_plot_meta(
         "coordinate_system": coordinate_system,
     })
     db.commit()
+
+
+def safe_remove(path: str):
+    try:
+        os.remove(path)
+    except FileNotFoundError:
+        pass
+    except Exception:
+        pass
 
 
 # ---------------- CREATE PLOT ----------------
@@ -354,7 +364,7 @@ def get_plot_report(plot_id: int, db: Session = Depends(get_db)):
 # ---------------- SURVEY PLAN PDF ----------------
 
 @router.post("/{plot_id}/report/pdf")
-def download_plot_report_pdf(plot_id: int, db: Session = Depends(get_db),
+def download_plot_report_pdf(plot_id: int, db: Session = Depends(get_db), background_tasks: BackgroundTasks = None,
     title_text: str = Body("SURVEY PLAN"),
     location_text: str = Body(""),
     lga_text: str = Body(""),
@@ -372,7 +382,10 @@ def download_plot_report_pdf(plot_id: int, db: Session = Depends(get_db),
     os.makedirs(maps_dir, exist_ok=True)
 
     pdf_path = f"{reports_dir}/plot_{plot_id}_report.pdf"
-    map_path = f"{maps_dir}/plot_{plot_id}_map.png"
+
+    tmp_map = tempfile.NamedTemporaryFile(suffix="_map.png", delete=False)
+    map_path = tmp_map.name
+    tmp_map.close()
 
     # Save/refresh plot metadata
     upsert_plot_meta(
@@ -414,13 +427,15 @@ def download_plot_report_pdf(plot_id: int, db: Session = Depends(get_db),
     report = get_plot_report(plot_id, db)
     generate_plot_report_pdf(report, pdf_path, map_path, paper_size=paper_size)
 
+    safe_remove(map_path)
+
     return FileResponse(pdf_path, filename=f"plot_{plot_id}_report.pdf")
 
 
 # ---------------- SIMPLE PDF DOWNLOAD (GET) ----------------
 
 @router.get("/{plot_id}/download/pdf")
-def simple_download_pdf(plot_id: int, db: Session = Depends(get_db)):
+def simple_download_pdf(plot_id: int, db: Session = Depends(get_db), background_tasks: BackgroundTasks = None):
     """Simple GET endpoint for basic PDF download from dashboard"""
     reports_dir = "app/reports"
     maps_dir = "app/reports/maps"
@@ -428,7 +443,10 @@ def simple_download_pdf(plot_id: int, db: Session = Depends(get_db)):
     os.makedirs(maps_dir, exist_ok=True)
 
     pdf_path = f"{reports_dir}/plot_{plot_id}_report.pdf"
-    map_path = f"{maps_dir}/plot_{plot_id}_map.png"
+
+    tmp_map = tempfile.NamedTemporaryFile(suffix="_map.png", delete=False)
+    map_path = tmp_map.name
+    tmp_map.close()
 
     # Use default values
     render_plot_map_layout(
@@ -451,13 +469,15 @@ def simple_download_pdf(plot_id: int, db: Session = Depends(get_db)):
     report = get_plot_report(plot_id, db)
     generate_plot_report_pdf(report, pdf_path, map_path)
 
+    safe_remove(map_path)
+
     return FileResponse(pdf_path, filename=f"plot_{plot_id}_report.pdf")
 
 
 # ---------------- SURVEY PLAN PREVIEW ----------------
 
 @router.post("/{plot_id}/report/preview")
-def preview_plot_map(plot_id: int, db: Session = Depends(get_db),
+def preview_plot_map(plot_id: int, db: Session = Depends(get_db), background_tasks: BackgroundTasks = None,
     title_text: str = Body("SURVEY PLAN"),
     location_text: str = Body(""),
     lga_text: str = Body(""),
@@ -469,10 +489,9 @@ def preview_plot_map(plot_id: int, db: Session = Depends(get_db),
     coordinate_system: str = Body("wgs84"),
     paper_size: str = Body("A4")):
 
-    maps_dir = "app/reports/previews"
-    os.makedirs(maps_dir, exist_ok=True)
-
-    map_path = f"{maps_dir}/plot_{plot_id}_preview.png"
+    tmp_map = tempfile.NamedTemporaryFile(suffix="_preview.png", delete=False)
+    map_path = tmp_map.name
+    tmp_map.close()
 
     # Save/refresh plot metadata
     upsert_plot_meta(
@@ -511,13 +530,16 @@ def preview_plot_map(plot_id: int, db: Session = Depends(get_db),
         paper_size=paper_size
     )
 
-    return FileResponse(map_path, media_type="image/png")
+    if background_tasks:
+        background_tasks.add_task(safe_remove, map_path)
+
+    return FileResponse(map_path, media_type="image/png", background=background_tasks)
 
 
 # ---------------- BACK COMPUTATION ----------------
 
 @router.post("/{plot_id}/back-computation/pdf")
-def download_back_computation_pdf(plot_id: int, db: Session = Depends(get_db),
+def download_back_computation_pdf(plot_id: int, db: Session = Depends(get_db), background_tasks: BackgroundTasks = None,
     coordinate_system: str = Body("wgs84"),
     station_names: list[str] = Body(default=[])):
 
@@ -567,21 +589,16 @@ def download_back_computation_pdf(plot_id: int, db: Session = Depends(get_db),
 # ---------------- ORTHOPHOTO ----------------
 
 @router.post("/{plot_id}/orthophoto/preview")
-def orthophoto_preview(plot_id: int, db: Session = Depends(get_db),
+def orthophoto_preview(plot_id: int, db: Session = Depends(get_db), background_tasks: BackgroundTasks = None,
     scale_text: str = Body("1 : 1000"),
     station_names: list[str] = Body(default=[]),
     coordinate_system: str = Body("wgs84"),
     paper_size: str = Body("A4"),
     use_topo_map: bool = Body(False)):
 
-    out_dir = "app/reports/orthophoto"
-    os.makedirs(out_dir, exist_ok=True)
-
-    # Use different filename for topo vs satellite and include size/scale to avoid stale previews
-    map_type = "topo" if use_topo_map else "satellite"
-    scale_key = re.sub(r"[^0-9]", "", str(scale_text)) or "1000"
-    paper_key = str(paper_size).upper() if paper_size else "A4"
-    png_path = f"{out_dir}/plot_{plot_id}_orthophoto_{map_type}_preview_{paper_key}_{scale_key}.png"
+    tmp_png = tempfile.NamedTemporaryFile(suffix="_orthophoto_preview.png", delete=False)
+    png_path = tmp_png.name
+    tmp_png.close()
 
     # Save/refresh plot metadata (scale, paper size, coord system)
     upsert_plot_meta(
@@ -611,15 +628,19 @@ def orthophoto_preview(plot_id: int, db: Session = Depends(get_db),
         paper_size=paper_size
     )
 
+    if background_tasks:
+        background_tasks.add_task(safe_remove, png_path)
+
     return FileResponse(
         png_path,
         media_type="image/png",
-        headers={"Cache-Control": "no-store"}
+        headers={"Cache-Control": "no-store"},
+        background=background_tasks,
     )
 
 
 @router.post("/{plot_id}/orthophoto/pdf")
-def orthophoto_pdf(plot_id: int, db: Session = Depends(get_db),
+def orthophoto_pdf(plot_id: int, db: Session = Depends(get_db), background_tasks: BackgroundTasks = None,
     title_text: str = Body("ORTHOPHOTO"),
     location_text: str = Body(""),
     lga_text: str = Body(""),
@@ -635,10 +656,13 @@ def orthophoto_pdf(plot_id: int, db: Session = Depends(get_db),
     out_dir = "app/reports/orthophoto"
     os.makedirs(out_dir, exist_ok=True)
 
-    # Use different filename for topo vs satellite
+    # Use different filename for topo vs satellite (response name only)
     map_type = "topo" if use_topo_map else "satellite"
-    png_path = f"{out_dir}/plot_{plot_id}_orthophoto_{map_type}.png"
     pdf_path = f"{out_dir}/plot_{plot_id}_orthophoto_{map_type}.pdf"
+
+    tmp_png = tempfile.NamedTemporaryFile(suffix=f"_{map_type}.png", delete=False)
+    png_path = tmp_png.name
+    tmp_png.close()
 
     # Save/refresh plot metadata (scale, paper size, coord system)
     upsert_plot_meta(
@@ -681,6 +705,8 @@ def orthophoto_pdf(plot_id: int, db: Session = Depends(get_db),
     render_orthophoto_pdf_from_png(png_path, pdf_path, paper_size=paper_size)
 
     filename = f"plot_{plot_id}_{'topomap' if use_topo_map else 'orthophoto'}.pdf"
+    safe_remove(png_path)
+
     return FileResponse(pdf_path, media_type="application/pdf", filename=filename)
 @router.get("/{plot_id}/survey-plan/dwg")
 def download_survey_plan_dwg(plot_id: int, db: Session = Depends(get_db)):
