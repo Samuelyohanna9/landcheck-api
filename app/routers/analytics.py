@@ -4,6 +4,9 @@ from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session
 from sqlalchemy import text, func
 from datetime import datetime, timedelta
+import json
+import os
+import glob
 
 from app.db import SessionLocal
 
@@ -16,6 +19,59 @@ def get_db():
         yield db
     finally:
         db.close()
+
+
+def ensure_plot_meta_table(db: Session):
+    db.execute(text("""
+        CREATE TABLE IF NOT EXISTS plot_meta (
+            plot_id INTEGER PRIMARY KEY REFERENCES plots(id) ON DELETE CASCADE,
+            title_text VARCHAR(255),
+            location_text TEXT,
+            lga_text TEXT,
+            state_text TEXT,
+            surveyor_name TEXT,
+            surveyor_rank TEXT,
+            scale_text VARCHAR(50),
+            paper_size VARCHAR(10),
+            coordinate_system VARCHAR(20),
+            created_at TIMESTAMP DEFAULT NOW(),
+            updated_at TIMESTAMP DEFAULT NOW()
+        )
+    """))
+    db.commit()
+
+
+def build_report_flags(plot_id: int):
+    base_dir = os.path.join("app", "reports")
+    orthophoto_dir = os.path.join(base_dir, "orthophoto")
+    previews_dir = os.path.join(base_dir, "previews")
+    dwg_dir = os.path.join(base_dir, "dwg")
+
+    def exists(path: str) -> bool:
+        return os.path.exists(path) and os.path.getsize(path) > 0
+
+    orthophoto_preview_glob = glob.glob(
+        os.path.join(orthophoto_dir, f"plot_{plot_id}_orthophoto_satellite_preview*.png")
+    ) + glob.glob(
+        os.path.join(orthophoto_dir, f"plot_{plot_id}_orthophoto_preview*.png")
+    )
+    topo_preview_glob = glob.glob(
+        os.path.join(orthophoto_dir, f"plot_{plot_id}_orthophoto_topo_preview*.png")
+    )
+
+    return {
+        "survey_plan_pdf": exists(os.path.join(base_dir, f"plot_{plot_id}_report.pdf")),
+        "survey_plan_preview": exists(os.path.join(previews_dir, f"plot_{plot_id}_preview.png")),
+        "orthophoto_pdf": (
+            exists(os.path.join(orthophoto_dir, f"plot_{plot_id}_orthophoto_satellite.pdf"))
+            or exists(os.path.join(orthophoto_dir, f"plot_{plot_id}_orthophoto.pdf"))
+        ),
+        "topo_map_pdf": exists(os.path.join(orthophoto_dir, f"plot_{plot_id}_orthophoto_topo.pdf")),
+        "orthophoto_preview": len(orthophoto_preview_glob) > 0,
+        "topo_map_preview": len(topo_preview_glob) > 0,
+        "dwg": exists(os.path.join(dwg_dir, f"plot_{plot_id}_survey_plan.dxf")),
+        "back_computation_pdf": exists(os.path.join(base_dir, f"plot_{plot_id}_back_computation.pdf")),
+    }
 
 
 @router.get("/overview")
@@ -182,3 +238,93 @@ def get_feedback_summary(db: Session = Depends(get_db)):
             "avg_satisfaction": 0,
             "willing_to_pay": {}
         }
+
+
+@router.get("/plots/details")
+def get_plot_details(db: Session = Depends(get_db)):
+    """Get full plot details for admin view."""
+    ensure_plot_meta_table(db)
+
+    # Check if created_at exists on plots table
+    has_created_at = True
+    try:
+        db.execute(text("SELECT created_at FROM plots LIMIT 1")).fetchone()
+    except Exception:
+        has_created_at = False
+
+    created_at_col = "p.created_at" if has_created_at else "NULL"
+
+    rows = db.execute(text(f"""
+        SELECT
+            p.id,
+            ST_AsGeoJSON(p.geom) AS geojson,
+            {created_at_col} AS created_at,
+            m.title_text,
+            m.location_text,
+            m.lga_text,
+            m.state_text,
+            m.surveyor_name,
+            m.surveyor_rank,
+            m.scale_text,
+            m.paper_size,
+            m.coordinate_system,
+            m.created_at AS meta_created_at,
+            m.updated_at AS meta_updated_at
+        FROM plots p
+        LEFT JOIN plot_meta m ON m.plot_id = p.id
+        ORDER BY p.id DESC
+    """)).fetchall()
+
+    # Preload detected features if table exists
+    features_by_plot = {}
+    try:
+        table_check = db.execute(text("""
+            SELECT EXISTS (
+                SELECT FROM information_schema.tables
+                WHERE table_name = 'detected_features'
+            )
+        """)).scalar()
+
+        if table_check:
+            feature_rows = db.execute(text("""
+                SELECT plot_id, feature_type, location, COUNT(*) as count
+                FROM detected_features
+                GROUP BY plot_id, feature_type, location
+            """)).fetchall()
+
+            for plot_id, feature_type, location, count in feature_rows:
+                features_by_plot.setdefault(plot_id, {"inside": {}, "buffer": {}})
+                features_by_plot[plot_id][location][feature_type] = count
+    except Exception:
+        pass
+
+    plot_list = []
+    for row in rows:
+        geojson = json.loads(row[1]) if row[1] else None
+        coords = []
+        if geojson and geojson.get("type") == "Polygon":
+            rings = geojson.get("coordinates", [])
+            coords = rings[0] if rings else []
+
+        created_at = row[2] or row[12]
+
+        plot_list.append({
+            "plot_id": row[0],
+            "created_at": created_at.isoformat() if created_at else None,
+            "title_text": row[3],
+            "location_text": row[4],
+            "lga_text": row[5],
+            "state_text": row[6],
+            "surveyor_name": row[7],
+            "surveyor_rank": row[8],
+            "scale_text": row[9],
+            "paper_size": row[10],
+            "coordinate_system": row[11],
+            "geometry": geojson,
+            "coords": coords,
+            "detected_features": features_by_plot.get(row[0], {"inside": {}, "buffer": {}}),
+            "reports_generated": build_report_flags(row[0]),
+            "meta_updated_at": row[13].isoformat() if row[13] else None
+        })
+
+    return plot_list

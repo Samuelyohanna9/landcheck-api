@@ -7,6 +7,7 @@ from shapely.geometry import Polygon
 from sqlalchemy import text
 from fastapi.responses import FileResponse
 from app.schemas.plot_create import PlotCreateRequest
+from typing import Optional
 
 import os
 import re
@@ -60,6 +61,76 @@ def get_db():
         db.close()
 
 
+def ensure_plot_meta_table(db: Session):
+    db.execute(text("""
+        CREATE TABLE IF NOT EXISTS plot_meta (
+            plot_id INTEGER PRIMARY KEY REFERENCES plots(id) ON DELETE CASCADE,
+            title_text VARCHAR(255),
+            location_text TEXT,
+            lga_text TEXT,
+            state_text TEXT,
+            surveyor_name TEXT,
+            surveyor_rank TEXT,
+            scale_text VARCHAR(50),
+            paper_size VARCHAR(10),
+            coordinate_system VARCHAR(20),
+            created_at TIMESTAMP DEFAULT NOW(),
+            updated_at TIMESTAMP DEFAULT NOW()
+        )
+    """))
+    db.commit()
+
+
+def upsert_plot_meta(
+    db: Session,
+    plot_id: int,
+    title_text: Optional[str] = None,
+    location_text: Optional[str] = None,
+    lga_text: Optional[str] = None,
+    state_text: Optional[str] = None,
+    surveyor_name: Optional[str] = None,
+    surveyor_rank: Optional[str] = None,
+    scale_text: Optional[str] = None,
+    paper_size: Optional[str] = None,
+    coordinate_system: Optional[str] = None,
+):
+    ensure_plot_meta_table(db)
+
+    db.execute(text("""
+        INSERT INTO plot_meta (
+            plot_id, title_text, location_text, lga_text, state_text,
+            surveyor_name, surveyor_rank, scale_text, paper_size, coordinate_system
+        )
+        VALUES (
+            :plot_id, :title_text, :location_text, :lga_text, :state_text,
+            :surveyor_name, :surveyor_rank, :scale_text, :paper_size, :coordinate_system
+        )
+        ON CONFLICT (plot_id) DO UPDATE SET
+            title_text = COALESCE(NULLIF(EXCLUDED.title_text, ''), plot_meta.title_text),
+            location_text = COALESCE(NULLIF(EXCLUDED.location_text, ''), plot_meta.location_text),
+            lga_text = COALESCE(NULLIF(EXCLUDED.lga_text, ''), plot_meta.lga_text),
+            state_text = COALESCE(NULLIF(EXCLUDED.state_text, ''), plot_meta.state_text),
+            surveyor_name = COALESCE(NULLIF(EXCLUDED.surveyor_name, ''), plot_meta.surveyor_name),
+            surveyor_rank = COALESCE(NULLIF(EXCLUDED.surveyor_rank, ''), plot_meta.surveyor_rank),
+            scale_text = COALESCE(NULLIF(EXCLUDED.scale_text, ''), plot_meta.scale_text),
+            paper_size = COALESCE(NULLIF(EXCLUDED.paper_size, ''), plot_meta.paper_size),
+            coordinate_system = COALESCE(NULLIF(EXCLUDED.coordinate_system, ''), plot_meta.coordinate_system),
+            updated_at = NOW()
+    """), {
+        "plot_id": plot_id,
+        "title_text": title_text,
+        "location_text": location_text,
+        "lga_text": lga_text,
+        "state_text": state_text,
+        "surveyor_name": surveyor_name,
+        "surveyor_rank": surveyor_rank,
+        "scale_text": scale_text,
+        "paper_size": paper_size,
+        "coordinate_system": coordinate_system,
+    })
+    db.commit()
+
+
 # ---------------- CREATE PLOT ----------------
 
 @router.post("")
@@ -77,6 +148,15 @@ def create_plot(payload: PlotCreateRequest, db: Session = Depends(get_db)):
     db.add(plot)
     db.commit()
     db.refresh(plot)
+
+    # Ensure meta table exists and create a base row for this plot
+    ensure_plot_meta_table(db)
+    db.execute(text("""
+        INSERT INTO plot_meta (plot_id)
+        VALUES (:plot_id)
+        ON CONFLICT (plot_id) DO NOTHING
+    """), {"plot_id": plot.id})
+    db.commit()
 
     # ---------------- BUFFER ----------------
 
@@ -250,6 +330,21 @@ def download_plot_report_pdf(plot_id: int, db: Session = Depends(get_db),
     pdf_path = f"{reports_dir}/plot_{plot_id}_report.pdf"
     map_path = f"{maps_dir}/plot_{plot_id}_map.png"
 
+    # Save/refresh plot metadata
+    upsert_plot_meta(
+        db=db,
+        plot_id=plot_id,
+        title_text=title_text,
+        location_text=location_text,
+        lga_text=lga_text,
+        state_text=state_text,
+        surveyor_name=surveyor_name,
+        surveyor_rank=surveyor_rank,
+        scale_text=scale_text,
+        paper_size=paper_size,
+        coordinate_system=coordinate_system,
+    )
+
     # Get EPSG code for selected coordinate system
     epsg_code = COORDINATE_SYSTEMS.get(coordinate_system, 4326)
     crs_name = COORDINATE_SYSTEM_NAMES.get(coordinate_system, "WGS84")
@@ -334,6 +429,21 @@ def preview_plot_map(plot_id: int, db: Session = Depends(get_db),
     os.makedirs(maps_dir, exist_ok=True)
 
     map_path = f"{maps_dir}/plot_{plot_id}_preview.png"
+
+    # Save/refresh plot metadata
+    upsert_plot_meta(
+        db=db,
+        plot_id=plot_id,
+        title_text=title_text,
+        location_text=location_text,
+        lga_text=lga_text,
+        state_text=state_text,
+        surveyor_name=surveyor_name,
+        surveyor_rank=surveyor_rank,
+        scale_text=scale_text,
+        paper_size=paper_size,
+        coordinate_system=coordinate_system,
+    )
 
     # Get EPSG code for selected coordinate system
     epsg_code = COORDINATE_SYSTEMS.get(coordinate_system, 4326)
@@ -429,6 +539,15 @@ def orthophoto_preview(plot_id: int, db: Session = Depends(get_db),
     paper_key = str(paper_size).upper() if paper_size else "A4"
     png_path = f"{out_dir}/plot_{plot_id}_orthophoto_{map_type}_preview_{paper_key}_{scale_key}.png"
 
+    # Save/refresh plot metadata (scale, paper size, coord system)
+    upsert_plot_meta(
+        db=db,
+        plot_id=plot_id,
+        scale_text=scale_text,
+        paper_size=paper_size,
+        coordinate_system=coordinate_system,
+    )
+
     # Get EPSG code for selected coordinate system
     epsg_code = COORDINATE_SYSTEMS.get(coordinate_system, 4326)
     crs_name = COORDINATE_SYSTEM_NAMES.get(coordinate_system, "WGS84")
@@ -476,6 +595,21 @@ def orthophoto_pdf(plot_id: int, db: Session = Depends(get_db),
     map_type = "topo" if use_topo_map else "satellite"
     png_path = f"{out_dir}/plot_{plot_id}_orthophoto_{map_type}.png"
     pdf_path = f"{out_dir}/plot_{plot_id}_orthophoto_{map_type}.pdf"
+
+    # Save/refresh plot metadata (scale, paper size, coord system)
+    upsert_plot_meta(
+        db=db,
+        plot_id=plot_id,
+        title_text=title_text,
+        location_text=location_text,
+        lga_text=lga_text,
+        state_text=state_text,
+        surveyor_name=surveyor_name,
+        surveyor_rank=surveyor_rank,
+        scale_text=scale_text,
+        paper_size=paper_size,
+        coordinate_system=coordinate_system,
+    )
 
     # Get EPSG code for selected coordinate system
     epsg_code = COORDINATE_SYSTEMS.get(coordinate_system, 4326)
