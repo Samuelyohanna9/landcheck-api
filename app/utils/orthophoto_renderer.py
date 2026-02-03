@@ -216,8 +216,8 @@ def annotate_vertices_orthophoto(ax, poly, station_names=None, font_scale=1.0):
         )
 
 
-def draw_coordinate_frame(ax, spacing, epsg_code=3857, font_scale=1.0):
-    """Draw coordinate frame with labels in the specified coordinate system."""
+def draw_coordinate_frame(ax, spacing, axis_epsg=3857, label_epsg=3857, font_scale=1.0):
+    """Draw coordinate frame with labels in the requested coordinate system."""
     from pyproj import Transformer
 
     xmin, xmax = ax.get_xlim()
@@ -229,15 +229,14 @@ def draw_coordinate_frame(ax, spacing, epsg_code=3857, font_scale=1.0):
     ax.add_patch(patches.Rectangle((xmin, ymin), (xmax-xmin), (ymax-ymin),
                                    fill=False, lw=1.0*font_scale, zorder=10))
 
-    # Transform from Web Mercator (3857) to user's coordinate system for labels
     transformer = None
-    if epsg_code != 3857:
-        transformer = Transformer.from_crs(3857, epsg_code, always_xy=True)
+    if axis_epsg != label_epsg:
+        transformer = Transformer.from_crs(axis_epsg, label_epsg, always_xy=True)
 
     xs = np.arange(math.floor(xmin / spacing) * spacing, xmax + 0.1, spacing)
     ys = np.arange(math.floor(ymin / spacing) * spacing, ymax + 0.1, spacing)
 
-    # Draw easting labels at the top - filter to only show labels within bounds
+    # Draw easting labels at the top
     for x in xs:
         if x >= xmin and x <= xmax:
             if transformer:
@@ -247,7 +246,7 @@ def draw_coordinate_frame(ax, spacing, epsg_code=3857, font_scale=1.0):
                 label = f"{int(x)}"
             ax.text(x, ymax + pad*0.45, label, ha="center", fontsize=int(7*font_scale), color="blue", zorder=11)
 
-    # Draw northing labels on both sides - include ALL grid lines including the first one
+    # Draw northing labels on both sides
     for y in ys:
         if y >= ymin and y <= ymax:
             if transformer:
@@ -278,7 +277,16 @@ def render_orthophoto_png(
     if not res: 
         raise ValueError("Plot not found")
 
-    gdf_plot = gpd.GeoDataFrame(geometry=[wkb.loads(res[0])], crs="EPSG:4326").to_crs(3857)
+    plot_geom = wkb.loads(res[0])
+
+    display_epsg = epsg_code
+    if coordinate_system == "wgs84" or epsg_code == 4326:
+        centroid = plot_geom.centroid
+        utm_zone = int((centroid.x + 180) / 6) + 1
+        hemisphere = "north" if centroid.y >= 0 else "south"
+        display_epsg = 32600 + utm_zone if hemisphere == "north" else 32700 + utm_zone
+
+    gdf_plot = gpd.GeoDataFrame(geometry=[plot_geom], crs="EPSG:4326").to_crs(epsg=display_epsg)
     poly = gdf_plot.geometry.iloc[0]
 
     # Canvas setup based on paper size
@@ -291,7 +299,8 @@ def render_orthophoto_png(
     fig = plt.figure(figsize=(fig_width, fig_height), dpi=dpi)
     canvas_agg = FigureCanvas(fig)
     
-    map_left, map_bottom, map_width, map_height = 0.10, 0.24, 0.80, 0.52
+    # Match survey plan layout so scale/plot size aligns across previews
+    map_left, map_bottom, map_width, map_height = 0.10, 0.30, 0.80, 0.45
     ax = fig.add_axes([map_left, map_bottom, map_width, map_height])
 
     scale_ratio = parse_scale_ratio(scale_text)
@@ -299,6 +308,7 @@ def render_orthophoto_png(
 
     # Basemap - choose based on use_topo_map setting
     basemap_loaded = False
+    axis_crs = f"EPSG:{display_epsg}"
 
     if use_topo_map:
         # Use OpenTopoMap for terrain/elevation visualization
@@ -312,7 +322,7 @@ def render_orthophoto_png(
                 ctx.add_basemap(
                     ax,
                     source=url,
-                    crs="EPSG:3857",
+                    crs=axis_crs,
                     attribution=False,
                     zoom=15,
                     reset_extent=False,
@@ -330,7 +340,7 @@ def render_orthophoto_png(
                 ctx.add_basemap(
                     ax,
                     source=ctx.providers.OpenTopoMap,
-                    crs="EPSG:3857",
+                    crs=axis_crs,
                     attribution=False,
                     zoom=15,
                     reset_extent=False,
@@ -351,7 +361,7 @@ def render_orthophoto_png(
             ctx.add_basemap(
                 ax,
                 source=ctx.providers.Esri.WorldImagery,
-                crs="EPSG:3857",
+                crs=axis_crs,
                 attribution=False,
                 zoom=17,
                 reset_extent=False,
@@ -365,7 +375,7 @@ def render_orthophoto_png(
                 ctx.add_basemap(
                     ax,
                     source=ctx.providers.OpenStreetMap.Mapnik,
-                    crs="EPSG:3857",
+                    crs=axis_crs,
                     attribution=False,
                     zoom=17,
                     reset_extent=False,
@@ -381,7 +391,7 @@ def render_orthophoto_png(
                     ctx.add_basemap(
                         ax,
                         source=url,
-                        crs="EPSG:3857",
+                        crs=axis_crs,
                         attribution=False,
                         zoom=17,
                         reset_extent=False,
@@ -404,19 +414,9 @@ def render_orthophoto_png(
     span = max(ax.get_xlim()[1] - ax.get_xlim()[0], ax.get_ylim()[1] - ax.get_ylim()[0])
     major = nice_grid_step(span)
 
-    # Determine display EPSG for labels
-    # If WGS84 selected, use appropriate UTM zone
-    display_epsg = epsg_code
-    if coordinate_system == "wgs84" or epsg_code == 4326:
-        plot_geom = wkb.loads(res[0])
-        centroid = plot_geom.centroid
-        utm_zone = int((centroid.x + 180) / 6) + 1
-        hemisphere = "north" if centroid.y >= 0 else "south"
-        display_epsg = 32600 + utm_zone if hemisphere == "north" else 32700 + utm_zone
-
     # Features
     draw_grid(ax, major/5, major, font_scale)
-    draw_coordinate_frame(ax, major, display_epsg, font_scale)
+    draw_coordinate_frame(ax, major, axis_epsg=display_epsg, label_epsg=display_epsg, font_scale=font_scale)
     gdf_plot.plot(ax=ax, facecolor="none", edgecolor="red", lw=2, zorder=20)
 
     # Add station name labels to vertices
