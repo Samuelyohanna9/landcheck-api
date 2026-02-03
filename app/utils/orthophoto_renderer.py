@@ -305,6 +305,8 @@ def render_orthophoto_png(
 
     scale_ratio = parse_scale_ratio(scale_text)
     apply_true_scale(ax, poly, scale_ratio, fig_width * map_width, fig_height * map_height)
+    target_xlim = ax.get_xlim()
+    target_ylim = ax.get_ylim()
 
     # Basemap - choose based on use_topo_map setting
     basemap_loaded = False
@@ -325,7 +327,7 @@ def render_orthophoto_png(
                     crs=axis_crs,
                     attribution=False,
                     zoom=15,
-                    reset_extent=False,
+                    reset_extent=True,
                 )
                 basemap_loaded = True
                 print(f"Loaded topo basemap from {name}")
@@ -343,7 +345,7 @@ def render_orthophoto_png(
                     crs=axis_crs,
                     attribution=False,
                     zoom=15,
-                    reset_extent=False,
+                    reset_extent=True,
                 )
                 basemap_loaded = True
             except Exception as e:
@@ -364,7 +366,7 @@ def render_orthophoto_png(
                 crs=axis_crs,
                 attribution=False,
                 zoom=17,
-                reset_extent=False,
+                reset_extent=True,
             )
             basemap_loaded = True
         except Exception as e:
@@ -378,7 +380,7 @@ def render_orthophoto_png(
                     crs=axis_crs,
                     attribution=False,
                     zoom=17,
-                    reset_extent=False,
+                    reset_extent=True,
                 )
                 basemap_loaded = True
             except Exception as e:
@@ -394,7 +396,7 @@ def render_orthophoto_png(
                         crs=axis_crs,
                         attribution=False,
                         zoom=17,
-                        reset_extent=False,
+                        reset_extent=True,
                     )
                     basemap_loaded = True
                     print(f"Loaded basemap from {name}")
@@ -410,6 +412,15 @@ def render_orthophoto_png(
         ax.text(0.5, 0.5, f"{map_type} imagery temporarily unavailable\nShowing plot boundary",
                 transform=ax.transAxes, ha="center", va="center", fontsize=10, color="#555", alpha=0.8)
 
+    # Restore target extent after basemap
+    ax.set_xlim(target_xlim)
+    ax.set_ylim(target_ylim)
+
+    # Plot boundary (GeoPandas can autoscale; reapply limits afterward)
+    gdf_plot.plot(ax=ax, facecolor="none", edgecolor="red", lw=2, zorder=20)
+    ax.set_xlim(target_xlim)
+    ax.set_ylim(target_ylim)
+
     # Grid Calculation
     span = max(ax.get_xlim()[1] - ax.get_xlim()[0], ax.get_ylim()[1] - ax.get_ylim()[0])
     major = nice_grid_step(span)
@@ -417,7 +428,6 @@ def render_orthophoto_png(
     # Features
     draw_grid(ax, major/5, major, font_scale)
     draw_coordinate_frame(ax, major, axis_epsg=display_epsg, label_epsg=display_epsg, font_scale=font_scale)
-    gdf_plot.plot(ax=ax, facecolor="none", edgecolor="red", lw=2, zorder=20)
 
     # Add station name labels to vertices
     annotate_vertices_orthophoto(ax, poly, station_names, font_scale)
