@@ -61,6 +61,14 @@ def ensure_plot_meta_table(db: Session):
     db.commit()
 
 
+def ensure_plots_created_at(db: Session):
+    try:
+        db.execute(text("ALTER TABLE plots ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT NOW()"))
+        db.commit()
+    except Exception:
+        db.rollback()
+
+
 def build_report_flags(plot_id: int):
     base_dir = os.path.join("app", "reports")
     orthophoto_dir = os.path.join(base_dir, "orthophoto")
@@ -263,6 +271,7 @@ def get_feedback_summary(db: Session = Depends(get_db)):
 @router.get("/plots/details")
 def get_plot_details(db: Session = Depends(get_db)):
     """Get full plot details for admin view."""
+    ensure_plots_created_at(db)
     ensure_plot_meta_table(db)
 
     # Check if created_at exists on plots table

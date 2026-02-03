@@ -7,7 +7,7 @@ from shapely.geometry import Polygon
 from sqlalchemy import text
 from fastapi.responses import FileResponse
 from app.schemas.plot_create import PlotCreateRequest
-from typing import Optional
+from typing import Optional, Union, List
 
 import os
 import re
@@ -101,6 +101,14 @@ def ensure_plot_meta_table(db: Session):
     db.commit()
 
 
+def ensure_plots_created_at(db: Session):
+    try:
+        db.execute(text("ALTER TABLE plots ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT NOW()"))
+        db.commit()
+    except Exception:
+        db.rollback()
+
+
 def upsert_plot_meta(
     db: Session,
     plot_id: int,
@@ -154,12 +162,15 @@ def upsert_plot_meta(
 # ---------------- CREATE PLOT ----------------
 
 @router.post("")
-def create_plot(payload: PlotCreateRequest, db: Session = Depends(get_db)):
+def create_plot(payload: Union[PlotCreateRequest, List[List[float]]], db: Session = Depends(get_db)):
 
-    coords = payload.coordinates
+    coords = payload.coordinates if isinstance(payload, PlotCreateRequest) else payload
+    meta = payload.meta if isinstance(payload, PlotCreateRequest) else None
 
     if len(coords) < 3:
         raise HTTPException(status_code=400, detail="Polygon requires at least 3 points")
+
+    ensure_plots_created_at(db)
 
     polygon = Polygon(coords)
     geom = from_shape(polygon, srid=4326)
@@ -177,6 +188,19 @@ def create_plot(payload: PlotCreateRequest, db: Session = Depends(get_db)):
         ON CONFLICT (plot_id) DO NOTHING
     """), {"plot_id": plot.id})
     db.commit()
+
+    if meta:
+        upsert_plot_meta(
+            db=db,
+            plot_id=plot.id,
+            title_text=meta.title or None,
+            location_text=meta.location or None,
+            lga_text=meta.lga or None,
+            state_text=meta.state or None,
+            surveyor_name=meta.surveyor or None,
+            surveyor_rank=meta.rank or None,
+            scale_text=meta.scale or None,
+        )
 
     # ---------------- BUFFER ----------------
 

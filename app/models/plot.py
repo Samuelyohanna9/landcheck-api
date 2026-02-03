@@ -1,4 +1,5 @@
-from sqlalchemy import Column, Integer
+from sqlalchemy import Column, Integer, DateTime
+from sqlalchemy.sql import func
 from geoalchemy2 import Geometry
 from app.db_base import Base
 
@@ -8,3 +9,4 @@ class Plot(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     geom = Column(Geometry("POLYGON", srid=4326))
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
