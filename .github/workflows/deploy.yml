@@ -21,8 +21,10 @@ jobs:
           fingerprint: ""
           script_stop: true
           script: |
+            script: |
             cd /root/landcheck-api
             git fetch origin main
             git reset --hard origin/main
-            docker compose up -d --build
+            # Point directly to the file to be safe
+            docker compose -f docker-compose.yml up -d --build
             docker system prune -f
