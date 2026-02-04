@@ -21,7 +21,6 @@ jobs:
           fingerprint: ""
           script_stop: true
           script: |
-            script: |
             cd /root/landcheck-api
             git fetch origin main
             git reset --hard origin/main
