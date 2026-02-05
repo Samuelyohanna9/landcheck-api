@@ -59,6 +59,14 @@ def calculate_bearing_deg(p1: Point, p2: Point) -> float:
     return (math.degrees(math.atan2(dx, dy)) + 360.0) % 360.0
 
 
+def format_bearing_dms(bearing_deg: float) -> str:
+    deg = int(bearing_deg)
+    minutes_full = (bearing_deg - deg) * 60.0
+    minutes = int(minutes_full)
+    seconds = (minutes_full - minutes) * 60.0
+    return f"{deg}\u00B0{minutes:02d}\u2032{seconds:05.2f}\u2033"
+
+
 def nice_grid_step(span_m: float) -> float:
     if span_m <= 0:
         return 100.0
@@ -520,7 +528,7 @@ def annotate_vertices(
         place_text(
             mx,
             my,
-            f"{bearing:.1f}deg\n{dist:.1f}m",
+            f"{format_bearing_dms(bearing)}\n{dist:.2f}m",
             font_size=int(6.5 * font_scale),
             color="red",
             rotation=ang,
@@ -544,8 +552,8 @@ def draw_skipped_table(ax, entries, font_scale=1.0):
         [
             e["from"],
             e["to"],
-            f"{e['bearing']:.1f}",
-            f"{e['distance']:.1f}",
+            format_bearing_dms(e["bearing"]),
+            f"{e['distance']:.2f}",
         ]
         for e in entries
     ]
