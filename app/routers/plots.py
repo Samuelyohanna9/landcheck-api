@@ -737,3 +737,29 @@ def download_survey_plan_dwg(plot_id: int, db: Session = Depends(get_db)):
         media_type="application/dxf",
         filename=f"plot_{plot_id}_survey_plan.dxf"
     )
+
+
+@router.get("/{plot_id}/reports/survey-plan")
+def get_saved_survey_plan_pdf(plot_id: int):
+    pdf_path = f"app/reports/plot_{plot_id}_report.pdf"
+    if not os.path.exists(pdf_path):
+        raise HTTPException(status_code=404, detail="Survey plan PDF not found")
+    return FileResponse(pdf_path, media_type="application/pdf", filename=f"plot_{plot_id}_survey_plan.pdf")
+
+
+@router.get("/{plot_id}/reports/orthophoto")
+def get_saved_orthophoto_pdf(plot_id: int, map_type: str = "satellite"):
+    safe_type = "topo" if str(map_type).lower() in ["topo", "topomap", "topo_map"] else "satellite"
+    pdf_path = f"app/reports/orthophoto/plot_{plot_id}_orthophoto_{safe_type}.pdf"
+    if not os.path.exists(pdf_path):
+        raise HTTPException(status_code=404, detail="Orthophoto PDF not found")
+    filename = f"plot_{plot_id}_{'topomap' if safe_type == 'topo' else 'orthophoto'}.pdf"
+    return FileResponse(pdf_path, media_type="application/pdf", filename=filename)
+
+
+@router.get("/{plot_id}/reports/back-computation")
+def get_saved_back_computation_pdf(plot_id: int):
+    pdf_path = f"app/reports/plot_{plot_id}_back_computation.pdf"
+    if not os.path.exists(pdf_path):
+        raise HTTPException(status_code=404, detail="Back computation PDF not found")
+    return FileResponse(pdf_path, media_type="application/pdf", filename=f"plot_{plot_id}_back_computation.pdf")
