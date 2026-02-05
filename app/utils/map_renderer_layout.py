@@ -484,9 +484,11 @@ def annotate_vertices(
                 return True
         return False
 
+    skipped = []
     for i in range(len(coords) - 1):
         p1, p2 = Point(coords[i]), Point(coords[i + 1])
         label = labels[i % len(labels)]
+        next_label = labels[(i + 1) % len(labels)]
 
         place_text(
             p1.x,
@@ -502,6 +504,12 @@ def annotate_vertices(
 
         bearing, dist = calculate_bearing_deg(p1, p2), p1.distance(p2)
         if min_label_length_m and dist < min_label_length_m:
+            skipped.append({
+                "from": label,
+                "to": next_label,
+                "bearing": bearing,
+                "distance": dist,
+            })
             continue
 
         mx, my = (p1.x + p2.x) / 2.0, (p1.y + p2.y) / 2.0
@@ -520,6 +528,41 @@ def annotate_vertices(
             scale_w=0.02,
             scale_h=0.025,
         )
+
+    return skipped
+
+
+def draw_skipped_table(ax, entries, font_scale=1.0):
+    if not entries:
+        return
+
+    max_rows = 8
+    entries = entries[:max_rows]
+
+    header = ["From", "To", "Bearing", "Dist (m)"]
+    cell_text = [
+        [
+            e["from"],
+            e["to"],
+            f"{e['bearing']:.1f}",
+            f"{e['distance']:.1f}",
+        ]
+        for e in entries
+    ]
+
+    table = ax.table(
+        cellText=cell_text,
+        colLabels=header,
+        cellLoc="center",
+        colLoc="center",
+        bbox=[0.62, 0.02, 0.36, 0.18],
+    )
+    table.auto_set_font_size(False)
+    table.set_fontsize(max(5, int(6 * font_scale)))
+    for (row, col), cell in table.get_celld().items():
+        if row == 0:
+            cell.set_text_props(weight="bold")
+        cell.set_linewidth(0.5)
 
 # ======================
 # Main Renderer Function
@@ -646,7 +689,15 @@ def render_plot_map_layout(
     first_point_info = (first_station, first_coords[0], first_coords[1])
 
     draw_coordinate_frame(ax, major, font_scale, first_point_info)
-    annotate_vertices(ax, poly, plot_id, station_names, font_scale, min_label_length_m=min_label_length_m)
+    skipped_entries = annotate_vertices(
+        ax,
+        poly,
+        plot_id,
+        station_names,
+        font_scale,
+        min_label_length_m=min_label_length_m,
+    )
+    draw_skipped_table(ax, skipped_entries, font_scale)
 
     add_north_arrow(ax, font_scale)
     add_scalebar(ax, 100 if scale_ratio <= 1000 else 500, font_scale=font_scale)
