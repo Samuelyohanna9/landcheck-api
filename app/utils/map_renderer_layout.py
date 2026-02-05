@@ -512,8 +512,7 @@ def annotate_vertices(
         place_text(
             mx,
             my,
-            f"{bearing:.1f}??
-{dist:.1f}m",
+            f"{bearing:.1f}deg\n{dist:.1f}m",
             font_size=int(6.5 * font_scale),
             color="red",
             rotation=ang,
