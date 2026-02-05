@@ -12,6 +12,9 @@ from app.db import SessionLocal
 
 router = APIRouter(prefix="/analytics", tags=["analytics"])
 
+BASE_DIR = os.path.dirname(os.path.dirname(__file__))
+REPORTS_DIR = os.path.join(BASE_DIR, "reports")
+
 
 def get_db():
     db = SessionLocal()
@@ -70,35 +73,69 @@ def ensure_plots_created_at(db: Session):
 
 
 def build_report_flags(plot_id: int):
-    base_dir = os.path.join("app", "reports")
+    base_dir = REPORTS_DIR
+    legacy_dir = os.path.join("app", "reports")
     orthophoto_dir = os.path.join(base_dir, "orthophoto")
     previews_dir = os.path.join(base_dir, "previews")
     dwg_dir = os.path.join(base_dir, "dwg")
+    legacy_orthophoto_dir = os.path.join(legacy_dir, "orthophoto")
+    legacy_previews_dir = os.path.join(legacy_dir, "previews")
+    legacy_dwg_dir = os.path.join(legacy_dir, "dwg")
 
     def exists(path: str) -> bool:
         return os.path.exists(path) and os.path.getsize(path) > 0
+
+    def exists_any(paths: list[str]) -> bool:
+        return any(exists(p) for p in paths)
 
     orthophoto_preview_glob = glob.glob(
         os.path.join(orthophoto_dir, f"plot_{plot_id}_orthophoto_satellite_preview*.png")
     ) + glob.glob(
         os.path.join(orthophoto_dir, f"plot_{plot_id}_orthophoto_preview*.png")
+    ) + glob.glob(
+        os.path.join(legacy_orthophoto_dir, f"plot_{plot_id}_orthophoto_satellite_preview*.png")
+    ) + glob.glob(
+        os.path.join(legacy_orthophoto_dir, f"plot_{plot_id}_orthophoto_preview*.png")
     )
     topo_preview_glob = glob.glob(
         os.path.join(orthophoto_dir, f"plot_{plot_id}_orthophoto_topo_preview*.png")
+    ) + glob.glob(
+        os.path.join(legacy_orthophoto_dir, f"plot_{plot_id}_orthophoto_topo_preview*.png")
     )
 
     return {
-        "survey_plan_pdf": exists(os.path.join(base_dir, f"plot_{plot_id}_report.pdf")),
-        "survey_plan_preview": exists(os.path.join(previews_dir, f"plot_{plot_id}_preview.png")),
+        "survey_plan_pdf": exists_any([
+            os.path.join(base_dir, f"plot_{plot_id}_report.pdf"),
+            os.path.join(legacy_dir, f"plot_{plot_id}_report.pdf"),
+        ]),
+        "survey_plan_preview": exists_any([
+            os.path.join(previews_dir, f"plot_{plot_id}_preview.png"),
+            os.path.join(legacy_previews_dir, f"plot_{plot_id}_preview.png"),
+        ]),
         "orthophoto_pdf": (
-            exists(os.path.join(orthophoto_dir, f"plot_{plot_id}_orthophoto_satellite.pdf"))
-            or exists(os.path.join(orthophoto_dir, f"plot_{plot_id}_orthophoto.pdf"))
+            exists_any([
+                os.path.join(orthophoto_dir, f"plot_{plot_id}_orthophoto_satellite.pdf"),
+                os.path.join(legacy_orthophoto_dir, f"plot_{plot_id}_orthophoto_satellite.pdf"),
+            ])
+            or exists_any([
+                os.path.join(orthophoto_dir, f"plot_{plot_id}_orthophoto.pdf"),
+                os.path.join(legacy_orthophoto_dir, f"plot_{plot_id}_orthophoto.pdf"),
+            ])
         ),
-        "topo_map_pdf": exists(os.path.join(orthophoto_dir, f"plot_{plot_id}_orthophoto_topo.pdf")),
+        "topo_map_pdf": exists_any([
+            os.path.join(orthophoto_dir, f"plot_{plot_id}_orthophoto_topo.pdf"),
+            os.path.join(legacy_orthophoto_dir, f"plot_{plot_id}_orthophoto_topo.pdf"),
+        ]),
         "orthophoto_preview": len(orthophoto_preview_glob) > 0,
         "topo_map_preview": len(topo_preview_glob) > 0,
-        "dwg": exists(os.path.join(dwg_dir, f"plot_{plot_id}_survey_plan.dxf")),
-        "back_computation_pdf": exists(os.path.join(base_dir, f"plot_{plot_id}_back_computation.pdf")),
+        "dwg": exists_any([
+            os.path.join(dwg_dir, f"plot_{plot_id}_survey_plan.dxf"),
+            os.path.join(legacy_dwg_dir, f"plot_{plot_id}_survey_plan.dxf"),
+        ]),
+        "back_computation_pdf": exists_any([
+            os.path.join(base_dir, f"plot_{plot_id}_back_computation.pdf"),
+            os.path.join(legacy_dir, f"plot_{plot_id}_back_computation.pdf"),
+        ]),
     }
 
 

@@ -33,6 +33,9 @@ from app.utils.orthophoto_renderer import (
 
 router = APIRouter(prefix="/plots", tags=["plots"])
 
+BASE_DIR = os.path.dirname(os.path.dirname(__file__))
+REPORTS_DIR = os.path.join(BASE_DIR, "reports")
+
 # Coordinate system EPSG codes mapping
 COORDINATE_SYSTEMS = {
     "wgs84": 4326,
@@ -170,8 +173,18 @@ def safe_remove(path: str):
         pass
 
 
+def resolve_existing_path(candidates: list[str]) -> str | None:
+    for path in candidates:
+        if os.path.exists(path):
+            return path
+    return None
+
+
 def cleanup_preview_files(plot_id: int):
     patterns = [
+        os.path.join(REPORTS_DIR, "orthophoto", f"plot_{plot_id}_orthophoto_*_preview*.png"),
+        os.path.join(REPORTS_DIR, "orthophoto", f"plot_{plot_id}_orthophoto_preview*.png"),
+        os.path.join(REPORTS_DIR, "previews", f"plot_{plot_id}_preview*.png"),
         f"app/reports/orthophoto/plot_{plot_id}_orthophoto_*_preview*.png",
         f"app/reports/orthophoto/plot_{plot_id}_orthophoto_preview*.png",
         f"app/reports/previews/plot_{plot_id}_preview*.png",
@@ -388,8 +401,8 @@ def download_plot_report_pdf(plot_id: int, db: Session = Depends(get_db), backgr
     coordinate_system: str = Body("wgs84"),
     paper_size: str = Body("A4")):
 
-    reports_dir = "app/reports"
-    maps_dir = "app/reports/maps"
+    reports_dir = REPORTS_DIR
+    maps_dir = os.path.join(REPORTS_DIR, "maps")
     os.makedirs(reports_dir, exist_ok=True)
     os.makedirs(maps_dir, exist_ok=True)
 
@@ -449,8 +462,8 @@ def download_plot_report_pdf(plot_id: int, db: Session = Depends(get_db), backgr
 @router.get("/{plot_id}/download/pdf")
 def simple_download_pdf(plot_id: int, db: Session = Depends(get_db), background_tasks: BackgroundTasks = None):
     """Simple GET endpoint for basic PDF download from dashboard"""
-    reports_dir = "app/reports"
-    maps_dir = "app/reports/maps"
+    reports_dir = REPORTS_DIR
+    maps_dir = os.path.join(REPORTS_DIR, "maps")
     os.makedirs(reports_dir, exist_ok=True)
     os.makedirs(maps_dir, exist_ok=True)
 
@@ -556,7 +569,7 @@ def download_back_computation_pdf(plot_id: int, db: Session = Depends(get_db), b
     coordinate_system: str = Body("wgs84"),
     station_names: list[str] = Body(default=[])):
 
-    reports_dir = "app/reports"
+    reports_dir = REPORTS_DIR
     os.makedirs(reports_dir, exist_ok=True)
 
     pdf_path = f"{reports_dir}/plot_{plot_id}_back_computation.pdf"
@@ -667,7 +680,7 @@ def orthophoto_pdf(plot_id: int, db: Session = Depends(get_db), background_tasks
     paper_size: str = Body("A4"),
     use_topo_map: bool = Body(False)):
 
-    out_dir = "app/reports/orthophoto"
+    out_dir = os.path.join(REPORTS_DIR, "orthophoto")
     os.makedirs(out_dir, exist_ok=True)
 
     # Use different filename for topo vs satellite (response name only)
@@ -725,7 +738,7 @@ def orthophoto_pdf(plot_id: int, db: Session = Depends(get_db), background_tasks
 @router.get("/{plot_id}/survey-plan/dwg")
 def download_survey_plan_dwg(plot_id: int, db: Session = Depends(get_db)):
 
-    out_dir = "app/reports/dwg"
+    out_dir = os.path.join(REPORTS_DIR, "dwg")
     os.makedirs(out_dir, exist_ok=True)
 
     dxf_path = f"{out_dir}/plot_{plot_id}_survey_plan.dxf"
@@ -741,8 +754,11 @@ def download_survey_plan_dwg(plot_id: int, db: Session = Depends(get_db)):
 
 @router.get("/{plot_id}/reports/survey-plan")
 def get_saved_survey_plan_pdf(plot_id: int):
-    pdf_path = f"app/reports/plot_{plot_id}_report.pdf"
-    if not os.path.exists(pdf_path):
+    pdf_path = resolve_existing_path([
+        os.path.join(REPORTS_DIR, f"plot_{plot_id}_report.pdf"),
+        f"app/reports/plot_{plot_id}_report.pdf",
+    ])
+    if not pdf_path:
         raise HTTPException(status_code=404, detail="Survey plan PDF not found")
     return FileResponse(pdf_path, media_type="application/pdf", filename=f"plot_{plot_id}_survey_plan.pdf")
 
@@ -750,8 +766,11 @@ def get_saved_survey_plan_pdf(plot_id: int):
 @router.get("/{plot_id}/reports/orthophoto")
 def get_saved_orthophoto_pdf(plot_id: int, map_type: str = "satellite"):
     safe_type = "topo" if str(map_type).lower() in ["topo", "topomap", "topo_map"] else "satellite"
-    pdf_path = f"app/reports/orthophoto/plot_{plot_id}_orthophoto_{safe_type}.pdf"
-    if not os.path.exists(pdf_path):
+    pdf_path = resolve_existing_path([
+        os.path.join(REPORTS_DIR, "orthophoto", f"plot_{plot_id}_orthophoto_{safe_type}.pdf"),
+        f"app/reports/orthophoto/plot_{plot_id}_orthophoto_{safe_type}.pdf",
+    ])
+    if not pdf_path:
         raise HTTPException(status_code=404, detail="Orthophoto PDF not found")
     filename = f"plot_{plot_id}_{'topomap' if safe_type == 'topo' else 'orthophoto'}.pdf"
     return FileResponse(pdf_path, media_type="application/pdf", filename=filename)
@@ -759,7 +778,10 @@ def get_saved_orthophoto_pdf(plot_id: int, map_type: str = "satellite"):
 
 @router.get("/{plot_id}/reports/back-computation")
 def get_saved_back_computation_pdf(plot_id: int):
-    pdf_path = f"app/reports/plot_{plot_id}_back_computation.pdf"
-    if not os.path.exists(pdf_path):
+    pdf_path = resolve_existing_path([
+        os.path.join(REPORTS_DIR, f"plot_{plot_id}_back_computation.pdf"),
+        f"app/reports/plot_{plot_id}_back_computation.pdf",
+    ])
+    if not pdf_path:
         raise HTTPException(status_code=404, detail="Back computation PDF not found")
     return FileResponse(pdf_path, media_type="application/pdf", filename=f"plot_{plot_id}_back_computation.pdf")
