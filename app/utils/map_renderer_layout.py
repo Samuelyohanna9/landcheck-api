@@ -62,9 +62,11 @@ def calculate_bearing_deg(p1: Point, p2: Point) -> float:
 def format_bearing_dms(bearing_deg: float) -> str:
     deg = int(bearing_deg)
     minutes_full = (bearing_deg - deg) * 60.0
-    minutes = int(minutes_full)
-    seconds = (minutes_full - minutes) * 60.0
-    return f"{deg}\u00B0{minutes:02d}\u2032{seconds:05.2f}\u2033"
+    minutes = int(round(minutes_full))
+    if minutes == 60:
+        deg += 1
+        minutes = 0
+    return f"{deg}\u00B0{minutes:02d}\u2032"
 
 
 def nice_grid_step(span_m: float) -> float:
