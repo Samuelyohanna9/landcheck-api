@@ -420,40 +420,107 @@ def draw_coordinate_frame(ax, spacing: float, font_scale=1.0, first_point_info=N
         )
 
 
-def annotate_vertices(ax, poly, plot_id: int, station_names=None, font_scale=1.0, first_point_coords=None):
+def annotate_vertices(
+    ax,
+    poly,
+    plot_id: int,
+    station_names=None,
+    font_scale=1.0,
+    first_point_coords=None,
+    min_label_length_m: float = 0.0,
+):
     """
     Annotate vertices with station names and bearing/distance in RED.
-    first_point_coords: tuple (station_name, easting, northing) for first point label
+    Applies simple collision-aware placement for tight turns.
     """
     coords = list(poly.exterior.coords)
     default_labels = list("ABCDEFGHIJKLMNOPQRSTUVWXYZ")
     labels = station_names if station_names else default_labels
 
+    placed_boxes = []
+    x0, x1 = ax.get_xlim()
+    y0, y1 = ax.get_ylim()
+    span_x = max(abs(x1 - x0), 1.0)
+    span_y = max(abs(y1 - y0), 1.0)
+
+    def intersects(a, b):
+        return not (a[2] < b[0] or a[0] > b[2] or a[3] < b[1] or a[1] > b[3])
+
+    def collides(box):
+        return any(intersects(box, other) for other in placed_boxes)
+
+    def estimate_box(x, y, text_len, scale_w, scale_h):
+        w = span_x * scale_w * max(1.0, text_len / 8.0)
+        h = span_y * scale_h
+        return (x - w / 2.0, y - h / 2.0, x + w / 2.0, y + h / 2.0)
+
+    def place_text(x, y, text, font_size, color, rotation=0, weight="bold", scale_w=0.015, scale_h=0.02):
+        offsets = [
+            (0, 0),
+            (span_x * 0.01, 0),
+            (-span_x * 0.01, 0),
+            (0, span_y * 0.01),
+            (0, -span_y * 0.01),
+            (span_x * 0.01, span_y * 0.01),
+            (-span_x * 0.01, span_y * 0.01),
+            (span_x * 0.01, -span_y * 0.01),
+            (-span_x * 0.01, -span_y * 0.01),
+        ]
+        for dx, dy in offsets:
+            bx = estimate_box(x + dx, y + dy, len(text), scale_w, scale_h)
+            if not collides(bx):
+                ax.text(
+                    x + dx,
+                    y + dy,
+                    text,
+                    fontsize=font_size,
+                    color=color,
+                    ha="center",
+                    va="center",
+                    rotation=rotation,
+                    weight=weight,
+                )
+                placed_boxes.append(bx)
+                return True
+        return False
+
     for i in range(len(coords) - 1):
         p1, p2 = Point(coords[i]), Point(coords[i + 1])
         label = labels[i % len(labels)]
 
-        ax.text(
+        place_text(
             p1.x,
             p1.y,
             label,
-            fontsize=int(9*font_scale),
+            font_size=int(9 * font_scale),
             color="black",
-            ha="center",
-            va="center",
+            rotation=0,
             weight="bold",
+            scale_w=0.012,
+            scale_h=0.018,
         )
 
-        # Bearing and distance in RED
         bearing, dist = calculate_bearing_deg(p1, p2), p1.distance(p2)
+        if min_label_length_m and dist < min_label_length_m:
+            continue
+
         mx, my = (p1.x + p2.x) / 2.0, (p1.y + p2.y) / 2.0
         ang = math.degrees(math.atan2(p2.y - p1.y, p2.x - p1.x))
         if ang < -90 or ang > 90:
             ang += 180
 
-        ax.text(mx, my, f"{bearing:.1f}°\n{dist:.1f}m", fontsize=int(6.5*font_scale),
-                ha="center", va="center", rotation=ang, color="red", weight="bold")
-
+        place_text(
+            mx,
+            my,
+            f"{bearing:.1f}??
+{dist:.1f}m",
+            font_size=int(6.5 * font_scale),
+            color="red",
+            rotation=ang,
+            weight="bold",
+            scale_w=0.02,
+            scale_h=0.025,
+        )
 
 # ======================
 # Main Renderer Function
@@ -568,6 +635,9 @@ def render_plot_map_layout(
     scale_ratio = parse_scale_ratio(scale_text)
     apply_true_scale(ax, poly, scale_ratio, fig_width * map_width, fig_height * map_height)
 
+    min_label_mm = 12
+    min_label_length_m = (min_label_mm / 1000.0) * scale_ratio
+
     major = nice_grid_step(max(ax.get_xlim()[1] - ax.get_xlim()[0], ax.get_ylim()[1] - ax.get_ylim()[0]))
     draw_grid(ax, poly, major / 5.0, major, font_scale)
 
@@ -577,7 +647,7 @@ def render_plot_map_layout(
     first_point_info = (first_station, first_coords[0], first_coords[1])
 
     draw_coordinate_frame(ax, major, font_scale, first_point_info)
-    annotate_vertices(ax, poly, plot_id, station_names, font_scale)
+    annotate_vertices(ax, poly, plot_id, station_names, font_scale, min_label_length_m=min_label_length_m)
 
     add_north_arrow(ax, font_scale)
     add_scalebar(ax, 100 if scale_ratio <= 1000 else 500, font_scale=font_scale)
