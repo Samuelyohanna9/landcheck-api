@@ -680,9 +680,7 @@ def render_plot_map_layout(
 
     # flags for KEY (only show what exists)
     has_buildings = len(buildings) > 0
-    has_roads = len(roads) > 0
     has_rivers = len(rivers) > 0
-    draw_key_box(fig, has_buildings=has_buildings, has_roads=has_roads, has_rivers=has_rivers, font_scale=font_scale)
 
     if rivers:
         gpd.GeoDataFrame(geometry=rivers, crs="EPSG:4326").to_crs(epsg=display_epsg).plot(ax=ax, color="blue", lw=1.2*font_scale)
@@ -712,6 +710,9 @@ def render_plot_map_layout(
             road_polys.append(geom.buffer(half_w, cap_style=2, join_style=2))
         except Exception:
             continue
+
+    has_roads = len(road_rows) > 0
+    draw_key_box(fig, has_buildings=has_buildings, has_roads=has_roads, has_rivers=has_rivers, font_scale=font_scale)
 
     if road_polys:
         gdf_roads = gpd.GeoDataFrame(geometry=road_polys, crs="EPSG:4326").to_crs(epsg=display_epsg)
