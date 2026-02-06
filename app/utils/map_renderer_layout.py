@@ -830,11 +830,6 @@ def render_plot_map_layout(
                 if geom.length <= min_label_length_m * 1.5:
                     continue
                 mid = geom.interpolate(0.5, normalized=True)
-                if boundary_buffer.contains(mid) or boundary_buffer.intersects(geom):
-                    continue
-                label_box = estimate_box(mid.x, mid.y, len(name))
-                if label_overlaps_boundary(label_box):
-                    continue
                 angle = 0.0
                 try:
                     p1 = geom.interpolate(0.45, normalized=True)
@@ -844,18 +839,49 @@ def render_plot_map_layout(
                         angle += 180
                 except Exception:
                     pass
-                ax.text(
-                    mid.x,
-                    mid.y,
-                    name,
-                    fontsize=max(5, int(4 * font_scale)),
-                    color="dimgray",
-                    ha="center",
-                    va="center",
-                    rotation=angle,
-                    weight="bold",
-                    zorder=10,
-                )
+                # Try to place road label away from boundary/boundary labels.
+                # Use an offset normal to the road segment and multiple candidate distances.
+                nx, ny = 0.0, 0.0
+                try:
+                    seg_dx = p2.x - p1.x
+                    seg_dy = p2.y - p1.y
+                    seg_len = math.hypot(seg_dx, seg_dy) or 1.0
+                    nx, ny = -seg_dy / seg_len, seg_dx / seg_len
+                except Exception:
+                    pass
+                base_offset = max(3.0, (8.0 / 1000.0) * scale_ratio)
+                candidates = [
+                    (mid.x, mid.y),
+                    (mid.x + nx * base_offset, mid.y + ny * base_offset),
+                    (mid.x - nx * base_offset, mid.y - ny * base_offset),
+                    (mid.x + nx * base_offset * 1.5, mid.y + ny * base_offset * 1.5),
+                    (mid.x - nx * base_offset * 1.5, mid.y - ny * base_offset * 1.5),
+                ]
+                placed = False
+                for cx, cy in candidates:
+                    label_box = estimate_box(cx, cy, len(name))
+                    if label_overlaps_boundary(label_box):
+                        continue
+                    # Allow labels near boundary, but not inside its buffer.
+                    if boundary_buffer.contains(Point(cx, cy)):
+                        continue
+                    ax.text(
+                        cx,
+                        cy,
+                        name,
+                        fontsize=max(5, int(4 * font_scale)),
+                        color="dimgray",
+                        ha="center",
+                        va="center",
+                        rotation=angle,
+                        weight="bold",
+                        zorder=10,
+                        bbox=dict(facecolor="white", edgecolor="none", alpha=0.6, pad=0.4),
+                    )
+                    placed = True
+                    break
+                if not placed:
+                    continue
             except Exception:
                 continue
 
