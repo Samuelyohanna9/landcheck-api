@@ -321,7 +321,7 @@ def draw_grid(ax, minor, major, font_scale=1.0):
             ax.plot([xmin, xmax], [y, y], color="blue", lw=lw*font_scale, alpha=a, zorder=3)
 
 
-def annotate_vertices_orthophoto(ax, poly, station_names=None, font_scale=1.0):
+def annotate_vertices_orthophoto(ax, poly, station_names=None, font_scale=1.0, scale_ratio: int = 1000):
     """Add station name labels to plot vertices in orthophoto."""
     from shapely.geometry import Point
 
@@ -331,19 +331,28 @@ def annotate_vertices_orthophoto(ax, poly, station_names=None, font_scale=1.0):
 
     for i in range(len(coords) - 1):
         p1 = Point(coords[i])
+        p2 = Point(coords[i + 1])
         label = labels[i % len(labels)]
 
+        seg_dx = p2.x - p1.x
+        seg_dy = p2.y - p1.y
+        seg_len = math.hypot(seg_dx, seg_dy) or 1.0
+        nx, ny = -seg_dy / seg_len, seg_dx / seg_len
+        station_offset = max(2.0, (5.0 / 1000.0) * scale_ratio)
+        lx = p1.x + nx * station_offset
+        ly = p1.y + ny * station_offset
+
         ax.text(
-            p1.x,
-            p1.y,
+            lx,
+            ly,
             label,
-            fontsize=int(9*font_scale),
+            fontsize=int(8*font_scale),
             color="black",
             ha="center",
             va="center",
             weight="bold",
             zorder=25,
-            bbox=dict(facecolor="white", edgecolor="red", boxstyle="circle,pad=0.2", alpha=0.9)
+            bbox=dict(facecolor="white", edgecolor="black", boxstyle="round,pad=0.15", alpha=0.85)
         )
 
 
@@ -563,7 +572,7 @@ def render_orthophoto_png(
     draw_coordinate_frame(ax, major, axis_epsg=display_epsg, label_epsg=display_epsg, font_scale=font_scale)
 
     # Add station name labels to vertices
-    annotate_vertices_orthophoto(ax, poly, station_names, font_scale)
+    annotate_vertices_orthophoto(ax, poly, station_names, font_scale, scale_ratio=scale_ratio)
 
     draw_sheet_frame(fig, font_scale)
     draw_title_block(fig, title_text, plot_id, scale_text, location_text, lga_text, state_text, font_scale)
