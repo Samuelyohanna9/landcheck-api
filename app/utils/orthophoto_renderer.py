@@ -150,6 +150,83 @@ def add_north_arrow(ax, font_scale=1.0, style: str = "classic", color: str = "bl
                  fontsize=int(11 * font_scale), color=col, weight="bold")
         return
 
+    if style == "chevron":
+        tri = patches.Polygon(
+            [(x, y + size * 1.05), (x - size * 0.55, y - size * 0.55), (x + size * 0.55, y - size * 0.55)],
+            closed=True,
+            facecolor="white",
+            edgecolor=col,
+            lw=1.2 * font_scale,
+            transform=fig.transFigure,
+            zorder=20,
+        )
+        fig.add_artist(tri)
+        fig.add_artist(patches.Polygon(
+            [(x, y + size * 0.85), (x - size * 0.35, y - size * 0.35), (x + size * 0.35, y - size * 0.35)],
+            closed=True,
+            facecolor=col,
+            edgecolor=col,
+            transform=fig.transFigure,
+            zorder=21,
+        ))
+        fig.text(x, y + size * 1.2, "N", ha="center", va="center",
+                 fontsize=int(10 * font_scale), color=col, weight="bold")
+        return
+
+    if style == "orienteering":
+        circle = patches.Circle(
+            (x, y),
+            radius=size * 0.95,
+            fill=False,
+            edgecolor=col,
+            lw=1.1 * font_scale,
+            transform=fig.transFigure,
+            zorder=20,
+        )
+        fig.add_artist(circle)
+        outer = patches.Polygon(
+            [(x, y + size), (x - size * 0.35, y - size * 0.2), (x + size * 0.35, y - size * 0.2)],
+            closed=True,
+            facecolor="white",
+            edgecolor=col,
+            lw=1.0 * font_scale,
+            transform=fig.transFigure,
+            zorder=21,
+        )
+        inner = patches.Polygon(
+            [(x, y + size * 0.8), (x - size * 0.2, y - size * 0.15), (x + size * 0.2, y - size * 0.15)],
+            closed=True,
+            facecolor=col,
+            edgecolor=col,
+            transform=fig.transFigure,
+            zorder=22,
+        )
+        fig.add_artist(outer)
+        fig.add_artist(inner)
+        fig.text(x, y + size * 1.2, "N", ha="center", va="center",
+                 fontsize=int(10 * font_scale), color=col, weight="bold")
+        return
+
+    if style == "star":
+        pts = []
+        for i in range(8):
+            ang = math.radians(i * 45)
+            r = size if i % 2 == 0 else size * 0.45
+            pts.append((x + r * math.sin(ang), y + r * math.cos(ang)))
+        star = patches.Polygon(
+            pts,
+            closed=True,
+            facecolor="white",
+            edgecolor=col,
+            lw=1.0 * font_scale,
+            transform=fig.transFigure,
+            zorder=20,
+        )
+        fig.add_artist(star)
+        fig.text(x, y + size * 1.1, "N", ha="center", va="center",
+                 fontsize=int(10 * font_scale), color=col, weight="bold")
+        return
+
     if style == "compass":
         circle = patches.Circle(
             (x, y),
