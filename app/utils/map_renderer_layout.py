@@ -233,17 +233,71 @@ def draw_key_box(fig, has_buildings: bool, has_roads: bool, has_rivers: bool, fo
 # Map Decorations
 # ======================
 
-def add_north_arrow(ax, font_scale=1.0):
-    # Keep your current placement (figure fraction)
+def add_north_arrow(ax, font_scale=1.0, style: str = "classic", color: str = "black"):
+    fig = ax.figure
+    col = "blue" if str(color).lower() == "blue" else "black"
+    style = (style or "classic").lower()
+    x, y = 0.85, 0.86
+    size = 0.030 * max(0.8, font_scale)
+
+    if style == "triangle":
+        tri = patches.Polygon(
+            [(x, y + size), (x - size * 0.6, y - size * 0.6), (x + size * 0.6, y - size * 0.6)],
+            closed=True,
+            facecolor=col,
+            edgecolor=col,
+            transform=fig.transFigure,
+            zorder=20,
+        )
+        fig.add_artist(tri)
+        fig.text(x, y + size * 1.15, "N", ha="center", va="center",
+                 fontsize=int(11 * font_scale), color=col, weight="bold")
+        return
+
+    if style == "compass":
+        circle = patches.Circle(
+            (x, y),
+            radius=size * 0.9,
+            fill=False,
+            edgecolor=col,
+            lw=1.1 * font_scale,
+            transform=fig.transFigure,
+            zorder=20,
+        )
+        fig.add_artist(circle)
+        north = patches.Polygon(
+            [(x, y + size), (x - size * 0.4, y), (x + size * 0.4, y)],
+            closed=True,
+            facecolor=col,
+            edgecolor=col,
+            transform=fig.transFigure,
+            zorder=21,
+        )
+        south = patches.Polygon(
+            [(x, y - size), (x - size * 0.35, y), (x + size * 0.35, y)],
+            closed=True,
+            facecolor="white",
+            edgecolor=col,
+            transform=fig.transFigure,
+            zorder=21,
+        )
+        fig.add_artist(north)
+        fig.add_artist(south)
+        fig.text(x, y + size * 1.15, "N", ha="center", va="center",
+                 fontsize=int(10 * font_scale), color=col, weight="bold")
+        return
+
+    # default: classic arrow
     ax.annotate(
         "N",
         xy=(0.85, 0.90),
         xytext=(0.85, 0.83),
         xycoords="figure fraction",
-        arrowprops=dict(facecolor="black", width=2*font_scale, headwidth=8*font_scale),
+        arrowprops=dict(facecolor=col, edgecolor=col, width=2*font_scale, headwidth=8*font_scale),
         ha="center",
         fontsize=int(12*font_scale),
         weight="bold",
+        color=col,
         zorder=20,
     )
 
@@ -637,6 +691,8 @@ def render_plot_map_layout(
     coordinate_system: str = "wgs84",
     epsg_code: int = 4326,
     paper_size: str = "A4",
+    north_arrow_style: str = "classic",
+    north_arrow_color: str = "black",
 ):
     plot_wkb = db.execute(text("SELECT geom FROM plots WHERE id=:id"), {"id": plot_id}).scalar()
     rows = db.execute(
@@ -889,7 +945,7 @@ def render_plot_map_layout(
             except Exception:
                 continue
 
-    add_north_arrow(ax, font_scale)
+    add_north_arrow(ax, font_scale, style=north_arrow_style, color=north_arrow_color)
     add_scalebar(ax, 100 if scale_ratio <= 1000 else 500, font_scale=font_scale)
 
     ax.set_aspect("equal")

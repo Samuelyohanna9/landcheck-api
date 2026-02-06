@@ -399,7 +399,9 @@ def download_plot_report_pdf(plot_id: int, db: Session = Depends(get_db), backgr
     surveyor_rank: str = Body(""),
     station_names: list[str] = Body(default=[]),
     coordinate_system: str = Body("wgs84"),
-    paper_size: str = Body("A4")):
+    paper_size: str = Body("A4"),
+    north_arrow_style: str = Body("classic"),
+    north_arrow_color: str = Body("black")):
 
     reports_dir = REPORTS_DIR
     maps_dir = os.path.join(REPORTS_DIR, "maps")
@@ -446,7 +448,9 @@ def download_plot_report_pdf(plot_id: int, db: Session = Depends(get_db), backgr
         coordinate_system=coordinate_system,
         epsg_code=epsg_code,
         crs_footer_text=f"COORDINATE SYSTEM: {crs_name}",
-        paper_size=paper_size
+        paper_size=paper_size,
+        north_arrow_style=north_arrow_style,
+        north_arrow_color=north_arrow_color,
     )
 
     report = get_plot_report(plot_id, db)
@@ -512,7 +516,9 @@ def preview_plot_map(plot_id: int, db: Session = Depends(get_db), background_tas
     surveyor_rank: str = Body(""),
     station_names: list[str] = Body(default=[]),
     coordinate_system: str = Body("wgs84"),
-    paper_size: str = Body("A4")):
+    paper_size: str = Body("A4"),
+    north_arrow_style: str = Body("classic"),
+    north_arrow_color: str = Body("black")):
 
     cleanup_preview_files(plot_id)
     tmp_map = tempfile.NamedTemporaryFile(suffix="_preview.png", delete=False)
@@ -553,7 +559,9 @@ def preview_plot_map(plot_id: int, db: Session = Depends(get_db), background_tas
         coordinate_system=coordinate_system,
         epsg_code=epsg_code,
         crs_footer_text=f"COORDINATE SYSTEM: {crs_name}",
-        paper_size=paper_size
+        paper_size=paper_size,
+        north_arrow_style=north_arrow_style,
+        north_arrow_color=north_arrow_color,
     )
 
     if background_tasks:
@@ -620,7 +628,9 @@ def orthophoto_preview(plot_id: int, db: Session = Depends(get_db), background_t
     station_names: list[str] = Body(default=[]),
     coordinate_system: str = Body("wgs84"),
     paper_size: str = Body("A4"),
-    use_topo_map: bool = Body(False)):
+    use_topo_map: bool = Body(False),
+    north_arrow_style: str = Body("classic"),
+    north_arrow_color: str = Body("black")):
 
     cleanup_preview_files(plot_id)
     tmp_png = tempfile.NamedTemporaryFile(suffix="_orthophoto_preview.png", delete=False)
@@ -652,7 +662,9 @@ def orthophoto_preview(plot_id: int, db: Session = Depends(get_db), background_t
         crs_footer_text=f"COORDINATE SYSTEM: {crs_name}",
         source_footer_text="SOURCE: OpenTopoMap" if use_topo_map else "SOURCE: Satellite Imagery",
         use_topo_map=use_topo_map,
-        paper_size=paper_size
+        paper_size=paper_size,
+        north_arrow_style=north_arrow_style,
+        north_arrow_color=north_arrow_color,
     )
 
     if background_tasks:
@@ -678,7 +690,9 @@ def orthophoto_pdf(plot_id: int, db: Session = Depends(get_db), background_tasks
     station_names: list[str] = Body(default=[]),
     coordinate_system: str = Body("wgs84"),
     paper_size: str = Body("A4"),
-    use_topo_map: bool = Body(False)):
+    use_topo_map: bool = Body(False),
+    north_arrow_style: str = Body("classic"),
+    north_arrow_color: str = Body("black")):
 
     out_dir = os.path.join(REPORTS_DIR, "orthophoto")
     os.makedirs(out_dir, exist_ok=True)
@@ -726,7 +740,9 @@ def orthophoto_pdf(plot_id: int, db: Session = Depends(get_db), background_tasks
         epsg_code=epsg_code,
         crs_footer_text=f"COORDINATE SYSTEM: {crs_name}",
         use_topo_map=use_topo_map,
-        paper_size=paper_size
+        paper_size=paper_size,
+        north_arrow_style=north_arrow_style,
+        north_arrow_color=north_arrow_color,
     )
 
     render_orthophoto_pdf_from_png(png_path, pdf_path, paper_size=paper_size)

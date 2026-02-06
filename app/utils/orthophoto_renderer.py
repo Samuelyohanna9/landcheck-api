@@ -129,17 +129,71 @@ def draw_footer(fig, crs, source, surveyor, rank, font_scale=1.0):
     fig.text(0.95, 0.05, source, fontsize=int(7*font_scale), ha="right")
 
 
-def add_north_arrow(ax, font_scale=1.0):
-    # Keep your current placement (figure fraction)
+def add_north_arrow(ax, font_scale=1.0, style: str = "classic", color: str = "black"):
+    fig = ax.figure
+    col = "blue" if str(color).lower() == "blue" else "black"
+    style = (style or "classic").lower()
+    x, y = 0.85, 0.86
+    size = 0.030 * max(0.8, font_scale)
+
+    if style == "triangle":
+        tri = patches.Polygon(
+            [(x, y + size), (x - size * 0.6, y - size * 0.6), (x + size * 0.6, y - size * 0.6)],
+            closed=True,
+            facecolor=col,
+            edgecolor=col,
+            transform=fig.transFigure,
+            zorder=20,
+        )
+        fig.add_artist(tri)
+        fig.text(x, y + size * 1.15, "N", ha="center", va="center",
+                 fontsize=int(11 * font_scale), color=col, weight="bold")
+        return
+
+    if style == "compass":
+        circle = patches.Circle(
+            (x, y),
+            radius=size * 0.9,
+            fill=False,
+            edgecolor=col,
+            lw=1.1 * font_scale,
+            transform=fig.transFigure,
+            zorder=20,
+        )
+        fig.add_artist(circle)
+        north = patches.Polygon(
+            [(x, y + size), (x - size * 0.4, y), (x + size * 0.4, y)],
+            closed=True,
+            facecolor=col,
+            edgecolor=col,
+            transform=fig.transFigure,
+            zorder=21,
+        )
+        south = patches.Polygon(
+            [(x, y - size), (x - size * 0.35, y), (x + size * 0.35, y)],
+            closed=True,
+            facecolor="white",
+            edgecolor=col,
+            transform=fig.transFigure,
+            zorder=21,
+        )
+        fig.add_artist(north)
+        fig.add_artist(south)
+        fig.text(x, y + size * 1.15, "N", ha="center", va="center",
+                 fontsize=int(10 * font_scale), color=col, weight="bold")
+        return
+
+    # default: classic arrow
     ax.annotate(
         "N",
         xy=(0.85, 0.90),
         xytext=(0.85, 0.83),
         xycoords="figure fraction",
-        arrowprops=dict(facecolor="black", width=2*font_scale, headwidth=8*font_scale),
+        arrowprops=dict(facecolor=col, edgecolor=col, width=2*font_scale, headwidth=8*font_scale),
         ha="center",
         fontsize=int(12*font_scale),
         weight="bold",
+        color=col,
         zorder=20,
     )
 
@@ -270,7 +324,9 @@ def render_orthophoto_png(
     tile_source="esri", station_names=None,
     coordinate_system="wgs84", epsg_code=4326,
     use_topo_map=False,
-    paper_size="A4"
+    paper_size="A4",
+    north_arrow_style="classic",
+    north_arrow_color="black",
 ):
     # Fetch Geometry from DB
     res = db.execute(text("SELECT geom FROM plots WHERE id=:id"), {"id": plot_id}).fetchone()
@@ -435,7 +491,7 @@ def render_orthophoto_png(
     draw_sheet_frame(fig, font_scale)
     draw_title_block(fig, title_text, plot_id, scale_text, location_text, lga_text, state_text, font_scale)
     draw_footer(fig, crs_footer_text, source_footer_text, surveyor_name, surveyor_rank, font_scale)
-    add_north_arrow(ax, font_scale)
+    add_north_arrow(ax, font_scale, style=north_arrow_style, color=north_arrow_color)
     add_scalebar(ax, choose_scalebar_length(scale_ratio), font_scale=font_scale)
 
     ax.set_aspect("equal")
