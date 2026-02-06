@@ -510,6 +510,7 @@ def annotate_vertices(
                     va="center",
                     rotation=rotation,
                     weight=weight,
+                    zorder=25,
                 )
                 placed_boxes.append(bx)
                 return True
@@ -692,7 +693,7 @@ def render_plot_map_layout(
 
     if rivers:
         gpd.GeoDataFrame(geometry=rivers, crs="EPSG:4326").to_crs(epsg=display_epsg).plot(
-            ax=ax, color="blue", lw=1.2*font_scale
+            ax=ax, color="blue", lw=1.2*font_scale, zorder=5
         )
 
     # Draw roads with class-based real-world widths
@@ -742,10 +743,10 @@ def render_plot_map_layout(
             try:
                 boundary = poly.boundary
                 gpd.GeoSeries([boundary], crs=f"EPSG:{display_epsg}").plot(
-                    ax=ax, color="dimgray", lw=lw_pts
+                    ax=ax, color="dimgray", lw=lw_pts, zorder=6
                 )
                 gpd.GeoSeries([boundary], crs=f"EPSG:{display_epsg}").plot(
-                    ax=ax, color="white", lw=lw_pts * 0.6
+                    ax=ax, color="white", lw=lw_pts * 0.6, zorder=7
                 )
             except Exception:
                 continue
@@ -787,16 +788,17 @@ def render_plot_map_layout(
                     va="center",
                     rotation=angle,
                     weight="bold",
+                    zorder=12,
                 )
             except Exception:
                 continue
 
     if buildings:
         gpd.GeoDataFrame(geometry=buildings, crs="EPSG:4326").to_crs(epsg=display_epsg).plot(
-            ax=ax, facecolor="none", edgecolor="black", lw=1*font_scale
+            ax=ax, facecolor="none", edgecolor="black", lw=1*font_scale, zorder=8
         )
 
-    gdf_plot.plot(ax=ax, facecolor="none", edgecolor="red", lw=2*font_scale)
+    gdf_plot.plot(ax=ax, facecolor="none", edgecolor="red", lw=2*font_scale, zorder=20)
     ax.set_xlim(target_xlim)
     ax.set_ylim(target_ylim)
 
