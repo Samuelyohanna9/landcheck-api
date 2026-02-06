@@ -804,69 +804,6 @@ def render_plot_map_layout(
     )
     draw_skipped_table(ax, skipped_entries, font_scale)
 
-    # Label road names at midpoints between the two lines.
-    # Draw after boundary labels but keep a lower z-order, and avoid boundary labels.
-    if road_label_features:
-        seen_names = set()
-        boundary_buffer = poly.buffer((10.0 / 1000.0) * scale_ratio)
-        major_classes = {
-            "trunk", "trunk_link", "motorway", "motorway_link",
-            "primary", "primary_link", "secondary", "secondary_link",
-            "tertiary", "tertiary_link",
-        }
-        span_x = max(abs(target_xlim[1] - target_xlim[0]), 1.0)
-        span_y = max(abs(target_ylim[1] - target_ylim[0]), 1.0)
-
-        def intersects(a, b):
-            return not (a[2] < b[0] or a[0] > b[2] or a[3] < b[1] or a[1] > b[3])
-
-        def label_overlaps_boundary(box):
-            return any(intersects(box, other) for other in boundary_label_boxes)
-
-        def estimate_box(x, y, text_len, scale_w=0.02, scale_h=0.02):
-            w = span_x * scale_w * max(1.0, text_len / 10.0)
-            h = span_y * scale_h
-            return (x - w / 2.0, y - h / 2.0, x + w / 2.0, y + h / 2.0)
-
-        for geom, name, highway in road_label_features:
-            if not name or name in seen_names:
-                continue
-            if highway and highway.lower() not in major_classes:
-                continue
-            seen_names.add(name)
-            try:
-                mid = geom.interpolate(0.5, normalized=True)
-                if geom.length <= min_label_length_m * 1.5:
-                    continue
-                angle = 0.0
-                try:
-                    p1 = geom.interpolate(0.45, normalized=True)
-                    p2 = geom.interpolate(0.55, normalized=True)
-                    angle = math.degrees(math.atan2(p2.y - p1.y, p2.x - p1.x))
-                    if angle < -90 or angle > 90:
-                        angle += 180
-                except Exception:
-                    pass
-                if boundary_buffer.contains(mid) or boundary_buffer.intersects(geom):
-                    continue
-                label_box = estimate_box(mid.x, mid.y, len(name))
-                if label_overlaps_boundary(label_box):
-                    continue
-                ax.text(
-                    mid.x,
-                    mid.y,
-                    name,
-                    fontsize=max(5, int(5 * font_scale)),
-                    color="dimgray",
-                    ha="center",
-                    va="center",
-                    rotation=angle,
-                    weight="bold",
-                    zorder=12,
-                )
-            except Exception:
-                continue
-
     add_north_arrow(ax, font_scale)
     add_scalebar(ax, 100 if scale_ratio <= 1000 else 500, font_scale=font_scale)
 
