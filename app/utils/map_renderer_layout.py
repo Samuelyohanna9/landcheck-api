@@ -726,7 +726,7 @@ def render_plot_map_layout(
         road_label_features.append((clipped, name, highway))
         half_w = road_half_width_m(highway)
         try:
-            road_polys.append(clipped.buffer(half_w, cap_style=2, join_style=2))
+            road_polys.append((clipped.buffer(half_w, cap_style=2, join_style=2), half_w))
         except Exception:
             continue
 
@@ -734,8 +734,21 @@ def render_plot_map_layout(
     draw_key_box(fig, has_buildings=has_buildings, has_roads=has_roads, has_rivers=has_rivers, font_scale=font_scale)
 
     if road_polys:
-        gdf_roads = gpd.GeoDataFrame(geometry=road_polys, crs="EPSG:4326").to_crs(epsg=display_epsg)
-        gdf_roads.plot(ax=ax, facecolor="none", edgecolor="dimgray", lw=1.0*font_scale)
+        # Plot double-line road edges with width scaled to map scale
+        for poly, half_w in road_polys:
+            total_width_m = max(2.0 * half_w, 1.0)
+            mm_on_paper = (total_width_m / scale_ratio) * 1000.0
+            lw_pts = max(0.6, mm_on_paper * 72.0 / 25.4)
+            try:
+                boundary = poly.boundary
+                gpd.GeoSeries([boundary], crs=f"EPSG:{display_epsg}").plot(
+                    ax=ax, color="dimgray", lw=lw_pts
+                )
+                gpd.GeoSeries([boundary], crs=f"EPSG:{display_epsg}").plot(
+                    ax=ax, color="white", lw=lw_pts * 0.6
+                )
+            except Exception:
+                continue
 
     # Label road names at midpoints between the two lines
     if road_label_features:
