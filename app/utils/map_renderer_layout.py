@@ -90,23 +90,7 @@ def parse_scale_ratio(scale_text: str) -> int:
 
 
 def road_half_width_m(highway: str) -> float:
-    if not highway:
-        return 3.0
-    h = highway.lower()
-    if h in ("trunk", "trunk_link", "motorway", "motorway_link"):
-        return 15.0
-    if h in ("primary", "primary_link"):
-        return 12.5
-    if h in ("secondary", "secondary_link"):
-        return 10.0
-    if h in ("tertiary", "tertiary_link"):
-        return 7.5
-    if h in ("residential", "living_street"):
-        return 5.0
-    if h in ("unclassified", "service", "road", "construction"):
-        return 4.0
-    if h in ("track", "path", "footway", "steps"):
-        return 2.0
+    # Use a fixed, reasonable cartographic width for all roads
     return 3.0
 
 
