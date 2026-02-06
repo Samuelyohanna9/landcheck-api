@@ -401,7 +401,8 @@ def download_plot_report_pdf(plot_id: int, db: Session = Depends(get_db), backgr
     coordinate_system: str = Body("wgs84"),
     paper_size: str = Body("A4"),
     north_arrow_style: str = Body("classic"),
-    north_arrow_color: str = Body("black")):
+    north_arrow_color: str = Body("black"),
+    beacon_style: str = Body("circle")):
 
     reports_dir = REPORTS_DIR
     maps_dir = os.path.join(REPORTS_DIR, "maps")
@@ -451,6 +452,7 @@ def download_plot_report_pdf(plot_id: int, db: Session = Depends(get_db), backgr
         paper_size=paper_size,
         north_arrow_style=north_arrow_style,
         north_arrow_color=north_arrow_color,
+        beacon_style=beacon_style,
     )
 
     report = get_plot_report(plot_id, db)
@@ -518,7 +520,8 @@ def preview_plot_map(plot_id: int, db: Session = Depends(get_db), background_tas
     coordinate_system: str = Body("wgs84"),
     paper_size: str = Body("A4"),
     north_arrow_style: str = Body("classic"),
-    north_arrow_color: str = Body("black")):
+    north_arrow_color: str = Body("black"),
+    beacon_style: str = Body("circle")):
 
     cleanup_preview_files(plot_id)
     tmp_map = tempfile.NamedTemporaryFile(suffix="_preview.png", delete=False)
@@ -562,6 +565,7 @@ def preview_plot_map(plot_id: int, db: Session = Depends(get_db), background_tas
         paper_size=paper_size,
         north_arrow_style=north_arrow_style,
         north_arrow_color=north_arrow_color,
+        beacon_style=beacon_style,
     )
 
     if background_tasks:

@@ -577,6 +577,7 @@ def annotate_vertices(
     avoid_geom=None,
     scale_ratio: int = 1000,
     boundary_poly=None,
+    beacon_style: str = "circle",
 ):
     """
     Annotate vertices with station names and bearing/distance in RED.
@@ -661,6 +662,58 @@ def annotate_vertices(
         return False
 
     skipped = []
+    def draw_beacon(px, py):
+        size_m = max(1.0, (3.0 / 1000.0) * scale_ratio)
+        style = (beacon_style or "circle").lower()
+        if style == "square":
+            ax.add_patch(
+                patches.Rectangle(
+                    (px - size_m / 2.0, py - size_m / 2.0),
+                    size_m,
+                    size_m,
+                    fill=False,
+                    edgecolor="black",
+                    lw=1.0 * font_scale,
+                    zorder=24,
+                )
+            )
+        elif style == "triangle":
+            ax.add_patch(
+                patches.Polygon(
+                    [(px, py + size_m / 2.0), (px - size_m / 2.0, py - size_m / 2.0), (px + size_m / 2.0, py - size_m / 2.0)],
+                    closed=True,
+                    fill=False,
+                    edgecolor="black",
+                    lw=1.0 * font_scale,
+                    zorder=24,
+                )
+            )
+        elif style == "diamond":
+            ax.add_patch(
+                patches.Polygon(
+                    [(px, py + size_m / 2.0), (px - size_m / 2.0, py), (px, py - size_m / 2.0), (px + size_m / 2.0, py)],
+                    closed=True,
+                    fill=False,
+                    edgecolor="black",
+                    lw=1.0 * font_scale,
+                    zorder=24,
+                )
+            )
+        elif style == "cross":
+            ax.add_line(mlines.Line2D([px - size_m / 2.0, px + size_m / 2.0], [py, py], color="black", lw=1.0 * font_scale, zorder=24))
+            ax.add_line(mlines.Line2D([px, px], [py - size_m / 2.0, py + size_m / 2.0], color="black", lw=1.0 * font_scale, zorder=24))
+        else:
+            ax.add_patch(
+                patches.Circle(
+                    (px, py),
+                    radius=size_m / 2.0,
+                    fill=False,
+                    edgecolor="black",
+                    lw=1.0 * font_scale,
+                    zorder=24,
+                )
+            )
+
     for i in range(len(coords) - 1):
         p1, p2 = Point(coords[i]), Point(coords[i + 1])
         label = labels[i % len(labels)]
@@ -671,6 +724,7 @@ def annotate_vertices(
         seg_len = math.hypot(seg_dx, seg_dy) or 1.0
         normal = (-seg_dy / seg_len, seg_dx / seg_len)
 
+        draw_beacon(p1.x, p1.y)
         place_text(
             p1.x,
             p1.y,
@@ -770,6 +824,7 @@ def render_plot_map_layout(
     paper_size: str = "A4",
     north_arrow_style: str = "classic",
     north_arrow_color: str = "black",
+    beacon_style: str = "circle",
 ):
     plot_wkb = db.execute(text("SELECT geom FROM plots WHERE id=:id"), {"id": plot_id}).scalar()
     rows = db.execute(
@@ -931,6 +986,7 @@ def render_plot_map_layout(
         min_label_length_m=min_label_length_m,
         scale_ratio=scale_ratio,
         boundary_poly=poly,
+        beacon_style=beacon_style,
     )
     draw_skipped_table(ax, skipped_entries, font_scale)
 
