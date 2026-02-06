@@ -89,6 +89,27 @@ def parse_scale_ratio(scale_text: str) -> int:
         return 1000
 
 
+def road_half_width_m(highway: str) -> float:
+    if not highway:
+        return 3.0
+    h = highway.lower()
+    if h in ("trunk", "trunk_link", "motorway", "motorway_link"):
+        return 15.0
+    if h in ("primary", "primary_link"):
+        return 12.5
+    if h in ("secondary", "secondary_link"):
+        return 10.0
+    if h in ("tertiary", "tertiary_link"):
+        return 7.5
+    if h in ("residential", "living_street"):
+        return 5.0
+    if h in ("unclassified", "service", "road", "construction"):
+        return 4.0
+    if h in ("track", "path", "footway", "steps"):
+        return 2.0
+    return 3.0
+
+
 def apply_true_scale(ax, geom_for_extent, scale_ratio: int, map_width_in: float, map_height_in: float):
     minx, miny, maxx, maxy = geom_for_extent.bounds
     cx, cy = (minx + maxx) / 2.0, (miny + maxy) / 2.0
@@ -612,13 +633,11 @@ def render_plot_map_layout(
     ).scalar() or 0
 
     plot_geom = wkb.loads(plot_wkb)
-    buildings, roads, rivers = [], [], []
+    buildings, rivers = [], []
     for r in rows:
         g = wkb.loads(r.geom)
         if r.feature_type == "building":
             buildings.append(g)
-        elif r.feature_type == "road":
-            roads.append(g)
         elif r.feature_type == "river":
             rivers.append(g)
 
@@ -668,14 +687,73 @@ def render_plot_map_layout(
     if rivers:
         gpd.GeoDataFrame(geometry=rivers, crs="EPSG:4326").to_crs(epsg=display_epsg).plot(ax=ax, color="blue", lw=1.2*font_scale)
 
-    # Draw roads as double lines
-    if roads:
-        gdf_roads = gpd.GeoDataFrame(geometry=roads, crs="EPSG:4326").to_crs(epsg=display_epsg)
-        road_width = 3 * font_scale  # Total road width
-        # Draw outer line (wider)
-        gdf_roads.plot(ax=ax, color="dimgray", lw=road_width)
-        # Draw inner line (narrower, white to create double-line effect)
-        gdf_roads.plot(ax=ax, color="white", lw=road_width * 0.5)
+    scale_ratio = parse_scale_ratio(scale_text)
+    min_label_mm = 12
+    min_label_length_m = (min_label_mm / 1000.0) * scale_ratio
+
+    # Draw roads with class-based real-world widths
+    road_rows = db.execute(text("""
+        SELECT r.geom, r.highway, r.name
+        FROM lines r
+        JOIN plot_buffers b ON b.plot_id = :plot_id
+        WHERE r.highway IS NOT NULL
+          AND ST_Intersects(r.geom, b.geom)
+    """), {"plot_id": plot_id}).fetchall()
+
+    road_polys = []
+    road_label_features = []
+    for row in road_rows:
+        geom = wkb.loads(row.geom)
+        highway = row.highway
+        name = row.name
+        road_label_features.append((geom, name))
+        half_w = road_half_width_m(highway)
+        try:
+            road_polys.append(geom.buffer(half_w, cap_style=2, join_style=2))
+        except Exception:
+            continue
+
+    if road_polys:
+        gdf_roads = gpd.GeoDataFrame(geometry=road_polys, crs="EPSG:4326").to_crs(epsg=display_epsg)
+        gdf_roads.plot(ax=ax, facecolor="none", edgecolor="dimgray", lw=1.0*font_scale)
+
+    # Label road names at midpoints between the two lines
+    if road_label_features:
+        seen_names = set()
+        gdf_labels = gpd.GeoDataFrame(
+            geometry=[g[0] for g in road_label_features],
+            data={"name": [g[1] for g in road_label_features]},
+            crs="EPSG:4326",
+        ).to_crs(epsg=display_epsg)
+
+        for geom, name in zip(gdf_labels.geometry, gdf_labels["name"]):
+            if not name or name in seen_names:
+                continue
+            seen_names.add(name)
+            try:
+                mid = geom.interpolate(0.5, normalized=True)
+                if geom.length <= min_label_length_m * 1.5:
+                    continue
+                angle = 0.0
+                if hasattr(geom, "coords") and len(geom.coords) >= 2:
+                    p1 = geom.coords[0]
+                    p2 = geom.coords[-1]
+                    angle = math.degrees(math.atan2(p2[1] - p1[1], p2[0] - p1[0]))
+                    if angle < -90 or angle > 90:
+                        angle += 180
+                ax.text(
+                    mid.x,
+                    mid.y,
+                    name,
+                    fontsize=int(7 * font_scale),
+                    color="dimgray",
+                    ha="center",
+                    va="center",
+                    rotation=angle,
+                    weight="bold",
+                )
+            except Exception:
+                continue
 
     if buildings:
         gpd.GeoDataFrame(geometry=buildings, crs="EPSG:4326").to_crs(epsg=display_epsg).plot(
@@ -684,11 +762,7 @@ def render_plot_map_layout(
 
     gdf_plot.plot(ax=ax, facecolor="none", edgecolor="red", lw=2*font_scale)
 
-    scale_ratio = parse_scale_ratio(scale_text)
     apply_true_scale(ax, poly, scale_ratio, fig_width * map_width, fig_height * map_height)
-
-    min_label_mm = 12
-    min_label_length_m = (min_label_mm / 1000.0) * scale_ratio
 
     major = nice_grid_step(max(ax.get_xlim()[1] - ax.get_xlim()[0], ax.get_ylim()[1] - ax.get_ylim()[0]))
     draw_grid(ax, poly, major / 5.0, major, font_scale)
