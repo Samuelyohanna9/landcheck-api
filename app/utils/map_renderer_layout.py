@@ -1039,50 +1039,20 @@ def render_plot_map_layout(
                         angle += 180
                 except Exception:
                     pass
-                # Try to place road label away from boundary/boundary labels.
-                # Use an offset normal to the road segment and multiple candidate distances.
-                nx, ny = 0.0, 0.0
-                try:
-                    seg_dx = p2.x - p1.x
-                    seg_dy = p2.y - p1.y
-                    seg_len = math.hypot(seg_dx, seg_dy) or 1.0
-                    nx, ny = -seg_dy / seg_len, seg_dx / seg_len
-                except Exception:
-                    pass
-                base_offset = max(3.0, (8.0 / 1000.0) * scale_ratio)
-                candidates = [
-                    (mid.x, mid.y),
-                    (mid.x + nx * base_offset, mid.y + ny * base_offset),
-                    (mid.x - nx * base_offset, mid.y - ny * base_offset),
-                    (mid.x + nx * base_offset * 1.5, mid.y + ny * base_offset * 1.5),
-                    (mid.x - nx * base_offset * 1.5, mid.y - ny * base_offset * 1.5),
-                ]
-                placed = False
-                for cx, cy in candidates:
-                    label_box = estimate_box(cx, cy, len(name))
-                    if label_overlaps_boundary(label_box):
-                        continue
-                    # Allow labels near boundary, but not inside its buffer.
-                    if boundary_buffer.contains(Point(cx, cy)):
-                        continue
-                    road_label_size = max(6, int(7 * font_scale * max(0.85, scale_ratio / 1000.0) ** 0.15))
-                    ax.text(
-                        cx,
-                        cy,
-                        name,
-                        fontsize=road_label_size,
-                        color="dimgray",
-                        ha="center",
-                        va="center",
-                        rotation=angle,
-                        weight="bold",
-                        zorder=10,
-                        bbox=dict(facecolor="white", edgecolor="none", alpha=0.6, pad=0.4),
-                    )
-                    placed = True
-                    break
-                if not placed:
-                    continue
+                # Keep road label anchored at the road midpoint.
+                road_label_size = int(6.5 * font_scale)
+                ax.text(
+                    mid.x,
+                    mid.y,
+                    name,
+                    fontsize=road_label_size,
+                    color="black",
+                    ha="center",
+                    va="center",
+                    rotation=angle,
+                    weight="normal",
+                    zorder=10,
+                )
             except Exception:
                 continue
 
