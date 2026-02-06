@@ -488,9 +488,17 @@ def annotate_vertices(
                 (x - nx * offset_m * 1.5, y - ny * offset_m * 1.5),
                 (x, y),
             ]
-
-        if avoid_geom is not None:
-            candidates = [c for c in candidates if not avoid_geom.contains(Point(c[0], c[1]))] + candidates
+            if avoid_geom is not None:
+                candidates = [c for c in candidates if not avoid_geom.contains(Point(c[0], c[1]))]
+                if not candidates:
+                    for k in range(2, 7):
+                        cand = (x + nx * offset_m * k, y + ny * offset_m * k)
+                        if not avoid_geom.contains(Point(cand[0], cand[1])):
+                            candidates.append(cand)
+                    if not candidates:
+                        candidates = [(x, y)]
+        elif avoid_geom is not None:
+            candidates = [c for c in candidates if not avoid_geom.contains(Point(c[0], c[1]))] or candidates
         offsets = [
             (0, 0),
             (span_x * 0.01, 0),
