@@ -777,6 +777,7 @@ def render_plot_map_layout(
     # Label road names at midpoints between the two lines
     if road_label_features:
         seen_names = set()
+        boundary_buffer = poly.buffer((3.0 / 1000.0) * scale_ratio)
         major_classes = {
             "trunk", "trunk_link", "motorway", "motorway_link",
             "primary", "primary_link", "secondary", "secondary_link",
@@ -801,6 +802,8 @@ def render_plot_map_layout(
                         angle += 180
                 except Exception:
                     pass
+                if boundary_buffer.contains(mid):
+                    continue
                 ax.text(
                     mid.x,
                     mid.y,
@@ -841,7 +844,6 @@ def render_plot_map_layout(
         station_names,
         font_scale,
         min_label_length_m=min_label_length_m,
-        avoid_geom=road_union,
         scale_ratio=scale_ratio,
         boundary_poly=poly,
     )
