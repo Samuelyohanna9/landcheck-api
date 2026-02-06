@@ -581,7 +581,7 @@ def annotate_vertices(
             normal=normal,
         )
 
-    return skipped
+    return skipped, placed_boxes
 
 
 def draw_skipped_table(ax, entries, font_scale=1.0):
@@ -774,15 +774,60 @@ def render_plot_map_layout(
             except Exception:
                 continue
 
-    # Label road names at midpoints between the two lines
+    if buildings:
+        gpd.GeoDataFrame(geometry=buildings, crs="EPSG:4326").to_crs(epsg=display_epsg).plot(
+            ax=ax, facecolor="none", edgecolor="black", lw=1*font_scale, zorder=8
+        )
+
+    gdf_plot.plot(ax=ax, facecolor="none", edgecolor="red", lw=2*font_scale, zorder=20)
+    ax.set_xlim(target_xlim)
+    ax.set_ylim(target_ylim)
+
+    major = nice_grid_step(max(ax.get_xlim()[1] - ax.get_xlim()[0], ax.get_ylim()[1] - ax.get_ylim()[0]))
+    draw_grid(ax, poly, major / 5.0, major, font_scale)
+
+    # Get first point coordinates for display
+    first_coords = list(poly.exterior.coords)[0]
+    first_station = station_names[0] if station_names and len(station_names) > 0 else "A"
+    first_point_info = (first_station, first_coords[0], first_coords[1])
+
+    draw_coordinate_frame(ax, major, font_scale, first_point_info)
+    skipped_entries, boundary_label_boxes = annotate_vertices(
+        ax,
+        poly,
+        plot_id,
+        station_names,
+        font_scale,
+        min_label_length_m=min_label_length_m,
+        scale_ratio=scale_ratio,
+        boundary_poly=poly,
+    )
+    draw_skipped_table(ax, skipped_entries, font_scale)
+
+    # Label road names at midpoints between the two lines.
+    # Draw after boundary labels but keep a lower z-order, and avoid boundary labels.
     if road_label_features:
         seen_names = set()
-        boundary_buffer = poly.buffer((3.0 / 1000.0) * scale_ratio)
+        boundary_buffer = poly.buffer((10.0 / 1000.0) * scale_ratio)
         major_classes = {
             "trunk", "trunk_link", "motorway", "motorway_link",
             "primary", "primary_link", "secondary", "secondary_link",
             "tertiary", "tertiary_link",
         }
+        span_x = max(abs(target_xlim[1] - target_xlim[0]), 1.0)
+        span_y = max(abs(target_ylim[1] - target_ylim[0]), 1.0)
+
+        def intersects(a, b):
+            return not (a[2] < b[0] or a[0] > b[2] or a[3] < b[1] or a[1] > b[3])
+
+        def label_overlaps_boundary(box):
+            return any(intersects(box, other) for other in boundary_label_boxes)
+
+        def estimate_box(x, y, text_len, scale_w=0.02, scale_h=0.02):
+            w = span_x * scale_w * max(1.0, text_len / 10.0)
+            h = span_y * scale_h
+            return (x - w / 2.0, y - h / 2.0, x + w / 2.0, y + h / 2.0)
+
         for geom, name, highway in road_label_features:
             if not name or name in seen_names:
                 continue
@@ -802,7 +847,10 @@ def render_plot_map_layout(
                         angle += 180
                 except Exception:
                     pass
-                if boundary_buffer.contains(mid):
+                if boundary_buffer.contains(mid) or boundary_buffer.intersects(geom):
+                    continue
+                label_box = estimate_box(mid.x, mid.y, len(name))
+                if label_overlaps_boundary(label_box):
                     continue
                 ax.text(
                     mid.x,
@@ -818,36 +866,6 @@ def render_plot_map_layout(
                 )
             except Exception:
                 continue
-
-    if buildings:
-        gpd.GeoDataFrame(geometry=buildings, crs="EPSG:4326").to_crs(epsg=display_epsg).plot(
-            ax=ax, facecolor="none", edgecolor="black", lw=1*font_scale, zorder=8
-        )
-
-    gdf_plot.plot(ax=ax, facecolor="none", edgecolor="red", lw=2*font_scale, zorder=20)
-    ax.set_xlim(target_xlim)
-    ax.set_ylim(target_ylim)
-
-    major = nice_grid_step(max(ax.get_xlim()[1] - ax.get_xlim()[0], ax.get_ylim()[1] - ax.get_ylim()[0]))
-    draw_grid(ax, poly, major / 5.0, major, font_scale)
-
-    # Get first point coordinates for display
-    first_coords = list(poly.exterior.coords)[0]
-    first_station = station_names[0] if station_names and len(station_names) > 0 else "A"
-    first_point_info = (first_station, first_coords[0], first_coords[1])
-
-    draw_coordinate_frame(ax, major, font_scale, first_point_info)
-    skipped_entries = annotate_vertices(
-        ax,
-        poly,
-        plot_id,
-        station_names,
-        font_scale,
-        min_label_length_m=min_label_length_m,
-        scale_ratio=scale_ratio,
-        boundary_poly=poly,
-    )
-    draw_skipped_table(ax, skipped_entries, font_scale)
 
     add_north_arrow(ax, font_scale)
     add_scalebar(ax, 100 if scale_ratio <= 1000 else 500, font_scale=font_scale)
