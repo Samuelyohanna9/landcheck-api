@@ -445,6 +445,7 @@ def annotate_vertices(
     min_label_length_m: float = 0.0,
     avoid_geom=None,
     scale_ratio: int = 1000,
+    boundary_poly=None,
 ):
     """
     Annotate vertices with station names and bearing/distance in RED.
@@ -476,6 +477,10 @@ def annotate_vertices(
         candidates = [(x, y)]
         if normal is not None:
             nx, ny = normal
+            if boundary_poly is not None:
+                test_pt = Point(x + nx * offset_m, y + ny * offset_m)
+                if boundary_poly.contains(test_pt):
+                    nx, ny = -nx, -ny
             candidates = [
                 (x + nx * offset_m, y + ny * offset_m),
                 (x - nx * offset_m, y - ny * offset_m),
@@ -830,6 +835,7 @@ def render_plot_map_layout(
         min_label_length_m=min_label_length_m,
         avoid_geom=road_union,
         scale_ratio=scale_ratio,
+        boundary_poly=poly,
     )
     draw_skipped_table(ax, skipped_entries, font_scale)
 
