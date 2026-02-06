@@ -856,7 +856,7 @@ def render_plot_map_layout(
                     mid.x,
                     mid.y,
                     name,
-                    fontsize=int(7 * font_scale),
+                    fontsize=max(5, int(5 * font_scale)),
                     color="dimgray",
                     ha="center",
                     va="center",
