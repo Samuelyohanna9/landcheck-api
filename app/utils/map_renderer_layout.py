@@ -443,6 +443,8 @@ def annotate_vertices(
     font_scale=1.0,
     first_point_coords=None,
     min_label_length_m: float = 0.0,
+    avoid_geom=None,
+    scale_ratio: int = 1000,
 ):
     """
     Annotate vertices with station names and bearing/distance in RED.
@@ -469,7 +471,21 @@ def annotate_vertices(
         h = span_y * scale_h
         return (x - w / 2.0, y - h / 2.0, x + w / 2.0, y + h / 2.0)
 
-    def place_text(x, y, text, font_size, color, rotation=0, weight="bold", scale_w=0.015, scale_h=0.02):
+    def place_text(x, y, text, font_size, color, rotation=0, weight="bold", scale_w=0.015, scale_h=0.02, normal=None):
+        offset_m = max(2.0, (6.0 / 1000.0) * scale_ratio)
+        candidates = [(x, y)]
+        if normal is not None:
+            nx, ny = normal
+            candidates = [
+                (x + nx * offset_m, y + ny * offset_m),
+                (x - nx * offset_m, y - ny * offset_m),
+                (x + nx * offset_m * 1.5, y + ny * offset_m * 1.5),
+                (x - nx * offset_m * 1.5, y - ny * offset_m * 1.5),
+                (x, y),
+            ]
+
+        if avoid_geom is not None:
+            candidates = [c for c in candidates if not avoid_geom.contains(Point(c[0], c[1]))] + candidates
         offsets = [
             (0, 0),
             (span_x * 0.01, 0),
@@ -506,6 +522,11 @@ def annotate_vertices(
         label = labels[i % len(labels)]
         next_label = labels[(i + 1) % len(labels)]
 
+        seg_dx = p2.x - p1.x
+        seg_dy = p2.y - p1.y
+        seg_len = math.hypot(seg_dx, seg_dy) or 1.0
+        normal = (-seg_dy / seg_len, seg_dx / seg_len)
+
         place_text(
             p1.x,
             p1.y,
@@ -516,6 +537,7 @@ def annotate_vertices(
             weight="bold",
             scale_w=0.012,
             scale_h=0.018,
+            normal=normal,
         )
 
         bearing, dist = calculate_bearing_deg(p1, p2), p1.distance(p2)
@@ -543,6 +565,7 @@ def annotate_vertices(
             weight="bold",
             scale_w=0.02,
             scale_h=0.025,
+            normal=normal,
         )
 
     return skipped
@@ -718,13 +741,16 @@ def render_plot_map_layout(
     has_roads = len(road_rows) > 0
     draw_key_box(fig, has_buildings=has_buildings, has_roads=has_roads, has_rivers=has_rivers, font_scale=font_scale)
 
+    road_union = None
     if road_polys:
         # Plot double-line road edges with width scaled to map scale
+        road_union = None
         for poly, half_w in road_polys:
             total_width_m = max(2.0 * half_w, 1.0)
             mm_on_paper = (total_width_m / scale_ratio) * 1000.0
             lw_pts = max(0.6, mm_on_paper * 72.0 / 25.4)
             try:
+                road_union = poly if road_union is None else road_union.union(poly)
                 boundary = poly.boundary
                 gpd.GeoSeries([boundary], crs=f"EPSG:{display_epsg}").plot(
                     ax=ax, color="dimgray", lw=lw_pts, zorder=6
@@ -802,6 +828,8 @@ def render_plot_map_layout(
         station_names,
         font_scale,
         min_label_length_m=min_label_length_m,
+        avoid_geom=road_union,
+        scale_ratio=scale_ratio,
     )
     draw_skipped_table(ax, skipped_entries, font_scale)
 
