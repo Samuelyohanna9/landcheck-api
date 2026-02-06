@@ -923,7 +923,7 @@ def render_plot_map_layout(
     from shapely.geometry import box
 
     extent_poly = box(target_xlim[0], target_ylim[0], target_xlim[1], target_ylim[1])
-    road_lines = []
+    road_polys = []
     road_label_features = []
     for row in road_rows:
         geom = wkb.loads(row.geom)
@@ -940,27 +940,27 @@ def render_plot_map_layout(
             continue
 
         road_label_features.append((clipped, name, highway))
-        # Draw a reasonable double-line road without scale-based buffering
+        # Use buffered road polygon to keep intersections connected
         try:
-            offset_m = max(1.0, (road_width_m or 3.0) / 2.0)
-            left = clipped.parallel_offset(offset_m, "left", join_style=2)
-            right = clipped.parallel_offset(offset_m, "right", join_style=2)
-            road_lines.append(left)
-            road_lines.append(right)
+            half_w = max(1.0, (road_width_m or 3.0) / 2.0)
+            road_polys.append(clipped.buffer(half_w, cap_style=2, join_style=2))
         except Exception:
             continue
 
     has_roads = len(road_rows) > 0
     draw_key_box(fig, has_buildings=has_buildings, has_roads=has_roads, has_rivers=has_rivers, font_scale=font_scale)
 
-    if road_lines:
-        for line in road_lines:
-            try:
-                gpd.GeoSeries([line], crs=f"EPSG:{display_epsg}").plot(
-                    ax=ax, color="black", lw=0.8 * font_scale, zorder=6
-                )
-            except Exception:
-                continue
+    if road_polys:
+        try:
+            road_union = road_polys[0]
+            for rp in road_polys[1:]:
+                road_union = road_union.union(rp)
+            boundary = road_union.boundary
+            gpd.GeoSeries([boundary], crs=f"EPSG:{display_epsg}").plot(
+                ax=ax, color="black", lw=0.8 * font_scale, zorder=6
+            )
+        except Exception:
+            pass
 
     if buildings:
         gpd.GeoDataFrame(geometry=buildings, crs="EPSG:4326").to_crs(epsg=display_epsg).plot(
