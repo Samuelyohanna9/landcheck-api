@@ -728,7 +728,7 @@ def render_plot_map_layout(
     from shapely.geometry import box
 
     extent_poly = box(target_xlim[0], target_ylim[0], target_xlim[1], target_ylim[1])
-    road_polys = []
+    road_lines = []
     road_label_features = []
     for row in road_rows:
         geom = wkb.loads(row.geom)
@@ -745,31 +745,24 @@ def render_plot_map_layout(
             continue
 
         road_label_features.append((clipped, name, highway))
-        half_w = road_half_width_m(highway)
+        # Draw a reasonable double-line road without scale-based buffering
         try:
-            road_polys.append((clipped.buffer(half_w, cap_style=2, join_style=2), half_w))
+            offset_m = 1.5
+            left = clipped.parallel_offset(offset_m, "left", join_style=2)
+            right = clipped.parallel_offset(offset_m, "right", join_style=2)
+            road_lines.append(left)
+            road_lines.append(right)
         except Exception:
             continue
 
     has_roads = len(road_rows) > 0
     draw_key_box(fig, has_buildings=has_buildings, has_roads=has_roads, has_rivers=has_rivers, font_scale=font_scale)
 
-    road_union = None
-    if road_polys:
-        # Plot double-line road edges with width scaled to map scale
-        road_union = None
-        for poly, half_w in road_polys:
-            total_width_m = max(2.0 * half_w, 1.0)
-            mm_on_paper = (total_width_m / scale_ratio) * 1000.0
-            lw_pts = max(0.6, mm_on_paper * 72.0 / 25.4)
+    if road_lines:
+        for line in road_lines:
             try:
-                road_union = poly if road_union is None else road_union.union(poly)
-                boundary = poly.boundary
-                gpd.GeoSeries([boundary], crs=f"EPSG:{display_epsg}").plot(
-                    ax=ax, color="dimgray", lw=lw_pts, zorder=6
-                )
-                gpd.GeoSeries([boundary], crs=f"EPSG:{display_epsg}").plot(
-                    ax=ax, color="white", lw=lw_pts * 0.6, zorder=7
+                gpd.GeoSeries([line], crs=f"EPSG:{display_epsg}").plot(
+                    ax=ax, color="dimgray", lw=0.8 * font_scale, zorder=6
                 )
             except Exception:
                 continue
