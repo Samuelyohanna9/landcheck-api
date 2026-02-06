@@ -678,16 +678,22 @@ def render_plot_map_layout(
     draw_title_block(fig, title_text, plot_id, area_m2, scale_text, location_text, lga_text, state_text, font_scale)
     draw_footer(fig, crs_footer_text, source_footer_text, surveyor_name, surveyor_rank, font_scale)
 
+    scale_ratio = parse_scale_ratio(scale_text)
+    apply_true_scale(ax, poly, scale_ratio, fig_width * map_width, fig_height * map_height)
+    target_xlim = ax.get_xlim()
+    target_ylim = ax.get_ylim()
+
+    min_label_mm = 12
+    min_label_length_m = (min_label_mm / 1000.0) * scale_ratio
+
     # flags for KEY (only show what exists)
     has_buildings = len(buildings) > 0
     has_rivers = len(rivers) > 0
 
     if rivers:
-        gpd.GeoDataFrame(geometry=rivers, crs="EPSG:4326").to_crs(epsg=display_epsg).plot(ax=ax, color="blue", lw=1.2*font_scale)
-
-    scale_ratio = parse_scale_ratio(scale_text)
-    min_label_mm = 12
-    min_label_length_m = (min_label_mm / 1000.0) * scale_ratio
+        gpd.GeoDataFrame(geometry=rivers, crs="EPSG:4326").to_crs(epsg=display_epsg).plot(
+            ax=ax, color="blue", lw=1.2*font_scale
+        )
 
     # Draw roads with class-based real-world widths
     road_rows = db.execute(text("""
@@ -698,16 +704,29 @@ def render_plot_map_layout(
           AND ST_Intersects(r.geom, b.geom)
     """), {"plot_id": plot_id}).fetchall()
 
+    from shapely.geometry import box
+
+    extent_poly = box(target_xlim[0], target_ylim[0], target_xlim[1], target_ylim[1])
     road_polys = []
     road_label_features = []
     for row in road_rows:
         geom = wkb.loads(row.geom)
         highway = row.highway
         name = row.name
-        road_label_features.append((geom, name))
+        try:
+            gdf_line = gpd.GeoSeries([geom], crs="EPSG:4326").to_crs(epsg=display_epsg)
+            line_proj = gdf_line.iloc[0]
+        except Exception:
+            continue
+
+        clipped = line_proj.intersection(extent_poly)
+        if clipped.is_empty:
+            continue
+
+        road_label_features.append((clipped, name, highway))
         half_w = road_half_width_m(highway)
         try:
-            road_polys.append(geom.buffer(half_w, cap_style=2, join_style=2))
+            road_polys.append(clipped.buffer(half_w, cap_style=2, join_style=2))
         except Exception:
             continue
 
@@ -721,14 +740,15 @@ def render_plot_map_layout(
     # Label road names at midpoints between the two lines
     if road_label_features:
         seen_names = set()
-        gdf_labels = gpd.GeoDataFrame(
-            geometry=[g[0] for g in road_label_features],
-            data={"name": [g[1] for g in road_label_features]},
-            crs="EPSG:4326",
-        ).to_crs(epsg=display_epsg)
-
-        for geom, name in zip(gdf_labels.geometry, gdf_labels["name"]):
+        major_classes = {
+            "trunk", "trunk_link", "motorway", "motorway_link",
+            "primary", "primary_link", "secondary", "secondary_link",
+            "tertiary", "tertiary_link",
+        }
+        for geom, name, highway in road_label_features:
             if not name or name in seen_names:
+                continue
+            if highway and highway.lower() not in major_classes:
                 continue
             seen_names.add(name)
             try:
@@ -736,12 +756,14 @@ def render_plot_map_layout(
                 if geom.length <= min_label_length_m * 1.5:
                     continue
                 angle = 0.0
-                if hasattr(geom, "coords") and len(geom.coords) >= 2:
-                    p1 = geom.coords[0]
-                    p2 = geom.coords[-1]
-                    angle = math.degrees(math.atan2(p2[1] - p1[1], p2[0] - p1[0]))
+                try:
+                    p1 = geom.interpolate(0.45, normalized=True)
+                    p2 = geom.interpolate(0.55, normalized=True)
+                    angle = math.degrees(math.atan2(p2.y - p1.y, p2.x - p1.x))
                     if angle < -90 or angle > 90:
                         angle += 180
+                except Exception:
+                    pass
                 ax.text(
                     mid.x,
                     mid.y,
@@ -762,8 +784,8 @@ def render_plot_map_layout(
         )
 
     gdf_plot.plot(ax=ax, facecolor="none", edgecolor="red", lw=2*font_scale)
-
-    apply_true_scale(ax, poly, scale_ratio, fig_width * map_width, fig_height * map_height)
+    ax.set_xlim(target_xlim)
+    ax.set_ylim(target_ylim)
 
     major = nice_grid_step(max(ax.get_xlim()[1] - ax.get_xlim()[0], ax.get_ylim()[1] - ax.get_ylim()[0]))
     draw_grid(ax, poly, major / 5.0, major, font_scale)
