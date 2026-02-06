@@ -575,7 +575,7 @@ def annotate_vertices(
             font_size=int(6.5 * font_scale),
             color="red",
             rotation=ang,
-            weight="bold",
+            weight="normal",
             scale_w=0.02,
             scale_h=0.025,
             normal=normal,
@@ -762,7 +762,7 @@ def render_plot_map_layout(
         for line in road_lines:
             try:
                 gpd.GeoSeries([line], crs=f"EPSG:{display_epsg}").plot(
-                    ax=ax, color="dimgray", lw=0.8 * font_scale, zorder=6
+                    ax=ax, color="black", lw=0.8 * font_scale, zorder=6
                 )
             except Exception:
                 continue
@@ -772,7 +772,11 @@ def render_plot_map_layout(
             ax=ax, facecolor="none", edgecolor="black", lw=1*font_scale, zorder=8
         )
 
-    gdf_plot.plot(ax=ax, facecolor="none", edgecolor="red", lw=2*font_scale, zorder=20)
+    # Boundary thickness in mm based on common drafting line weights
+    paper_name = paper_config["name"]
+    boundary_mm = 0.7 if paper_name in ["A0"] else 0.5 if paper_name in ["A1"] else 0.35
+    boundary_lw_pts = boundary_mm * 72.0 / 25.4
+    gdf_plot.plot(ax=ax, facecolor="none", edgecolor="red", lw=boundary_lw_pts, zorder=20)
     ax.set_xlim(target_xlim)
     ax.set_ylim(target_ylim)
 

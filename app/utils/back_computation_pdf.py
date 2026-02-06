@@ -16,7 +16,7 @@ def render_back_computation_pdf(rows, sum_de, sum_dn, area_m2, plot_id, output_p
 
     # ================= HEADER =================
     c.setFont("Helvetica-Bold", 16)
-    c.setFillColor(black)
+    c.setFillColor(red)
     c.drawCentredString(width / 2, top_y, "BACK COMPUTATION")
 
     c.setFont("Helvetica-Bold", 12)
@@ -41,7 +41,7 @@ def render_back_computation_pdf(rows, sum_de, sum_dn, area_m2, plot_id, output_p
 
     # ================= HEADERS =================
     c.setFont("Helvetica-Bold", 9)
-    c.setFillColor(black)
+    c.setFillColor(red)
 
     for x, h in zip(col_x, headers):
         c.drawString(x, row_y, h)
@@ -80,12 +80,7 @@ def render_back_computation_pdf(rows, sum_de, sum_dn, area_m2, plot_id, output_p
         ]
 
         for i, (x, v) in enumerate(zip(col_x, values)):
-            # Color numeric values in red
-            if i >= 2 and i <= 6:  # E, N, ±ΔE, ±ΔN, DIST columns
-                c.setFillColor(red)
-            else:
-                c.setFillColor(black)
-
+            c.setFillColor(red)
             c.drawString(x, y, v)
 
         y -= row_h
@@ -97,6 +92,7 @@ def render_back_computation_pdf(rows, sum_de, sum_dn, area_m2, plot_id, output_p
 
             # redraw header
             c.setFont("Helvetica-Bold", 16)
+            c.setFillColor(red)
             c.drawCentredString(width / 2, top_y, "BACK COMPUTATION")
             c.setFont("Helvetica-Bold", 12)
             c.drawString(margin_left, top_y, f"PLOT {plot_id}")
@@ -112,7 +108,7 @@ def render_back_computation_pdf(rows, sum_de, sum_dn, area_m2, plot_id, output_p
 
     # ================= TOTAL ROW =================
     c.setFont("Helvetica-Bold", 9)
-    c.setFillColor(black)
+    c.setFillColor(red)
 
     c.line(margin_left - 5, y + 8, width - margin_right, y + 8)
 
@@ -124,13 +120,14 @@ def render_back_computation_pdf(rows, sum_de, sum_dn, area_m2, plot_id, output_p
     c.drawString(col_x[5], y, f"{sum_dn:+.3f}")
 
     # bottom line
-    c.setFillColor(black)
+    c.setFillColor(red)
     c.line(margin_left - 5, y - 6, width - margin_right, y - 6)
 
     draw_vertical_lines(y - 6)
 
     # ================= FOOTER =================
     c.setFont("Helvetica", 8)
+    c.setFillColor(red)
     c.drawString(
         margin_left,
         30,
