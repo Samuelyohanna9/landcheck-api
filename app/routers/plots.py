@@ -402,7 +402,8 @@ def download_plot_report_pdf(plot_id: int, db: Session = Depends(get_db), backgr
     paper_size: str = Body("A4"),
     north_arrow_style: str = Body("classic"),
     north_arrow_color: str = Body("black"),
-    beacon_style: str = Body("circle")):
+    beacon_style: str = Body("circle"),
+    road_width_m: float | None = Body(None)):
 
     reports_dir = REPORTS_DIR
     maps_dir = os.path.join(REPORTS_DIR, "maps")
@@ -453,6 +454,7 @@ def download_plot_report_pdf(plot_id: int, db: Session = Depends(get_db), backgr
         north_arrow_style=north_arrow_style,
         north_arrow_color=north_arrow_color,
         beacon_style=beacon_style,
+        road_width_m=road_width_m,
     )
 
     report = get_plot_report(plot_id, db)
@@ -521,7 +523,8 @@ def preview_plot_map(plot_id: int, db: Session = Depends(get_db), background_tas
     paper_size: str = Body("A4"),
     north_arrow_style: str = Body("classic"),
     north_arrow_color: str = Body("black"),
-    beacon_style: str = Body("circle")):
+    beacon_style: str = Body("circle"),
+    road_width_m: float | None = Body(None)):
 
     cleanup_preview_files(plot_id)
     tmp_map = tempfile.NamedTemporaryFile(suffix="_preview.png", delete=False)
@@ -566,6 +569,7 @@ def preview_plot_map(plot_id: int, db: Session = Depends(get_db), background_tas
         north_arrow_style=north_arrow_style,
         north_arrow_color=north_arrow_color,
         beacon_style=beacon_style,
+        road_width_m=road_width_m,
     )
 
     if background_tasks:

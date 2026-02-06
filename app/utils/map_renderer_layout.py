@@ -831,6 +831,7 @@ def render_plot_map_layout(
     north_arrow_style: str = "classic",
     north_arrow_color: str = "black",
     beacon_style: str = "circle",
+    road_width_m: float | None = None,
 ):
     plot_wkb = db.execute(text("SELECT geom FROM plots WHERE id=:id"), {"id": plot_id}).scalar()
     rows = db.execute(
@@ -941,7 +942,7 @@ def render_plot_map_layout(
         road_label_features.append((clipped, name, highway))
         # Draw a reasonable double-line road without scale-based buffering
         try:
-            offset_m = 1.5
+            offset_m = max(1.0, (road_width_m or 3.0) / 2.0)
             left = clipped.parallel_offset(offset_m, "left", join_style=2)
             right = clipped.parallel_offset(offset_m, "right", join_style=2)
             road_lines.append(left)
