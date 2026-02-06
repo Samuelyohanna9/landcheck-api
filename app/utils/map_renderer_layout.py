@@ -1065,16 +1065,17 @@ def render_plot_map_layout(
                     # Allow labels near boundary, but not inside its buffer.
                     if boundary_buffer.contains(Point(cx, cy)):
                         continue
-                    ax.text(
-                        cx,
-                        cy,
-                        name,
-                        fontsize=max(5, int(4 * font_scale)),
-                        color="dimgray",
-                        ha="center",
-                        va="center",
-                        rotation=angle,
-                        weight="bold",
+                road_label_size = max(6, int(7 * font_scale * max(0.85, scale_ratio / 1000.0) ** 0.15))
+                ax.text(
+                    cx,
+                    cy,
+                    name,
+                    fontsize=road_label_size,
+                    color="dimgray",
+                    ha="center",
+                    va="center",
+                    rotation=angle,
+                    weight="bold",
                         zorder=10,
                         bbox=dict(facecolor="white", edgecolor="none", alpha=0.6, pad=0.4),
                     )
