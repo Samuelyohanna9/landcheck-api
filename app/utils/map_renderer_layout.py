@@ -455,36 +455,22 @@ def draw_grid(ax, plot_poly, minor: float, major: float, font_scale=1.0):
     xmin, xmax = ax.get_xlim()
     ymin, ymax = ax.get_ylim()
 
-    # Fix invalid/self-intersecting polygons
-    if not plot_poly.is_valid:
-        plot_poly = plot_poly.buffer(0)  # This fixes most self-intersections
+    # Tick-only grid to keep plot area clean
+    tick_len = (xmax - xmin) * 0.01
+    xs = np.arange(math.floor(xmin / major) * major, xmax + 0.1, major)
+    ys = np.arange(math.floor(ymin / major) * major, ymax + 0.1, major)
 
-    def draw(step, lw, alpha):
-        xs = np.arange(math.floor(xmin / step) * step, xmax + step, step)
-        ys = np.arange(math.floor(ymin / step) * step, ymax + step, step)
+    for x in xs:
+        if x < xmin or x > xmax:
+            continue
+        ax.plot([x, x], [ymax, ymax - tick_len], color="blue", lw=0.6*font_scale, alpha=0.5)
+        ax.plot([x, x], [ymin, ymin + tick_len], color="blue", lw=0.6*font_scale, alpha=0.5)
 
-        for x in xs:
-            try:
-                g = LineString([(x, ymin), (x, ymax)]).difference(plot_poly)
-                for gg in getattr(g, "geoms", [g]):
-                    if not gg.is_empty:
-                        ax.plot(*gg.xy, color="blue", lw=lw*font_scale, alpha=alpha)
-            except Exception:
-                # If difference fails, just draw the full line
-                ax.plot([x, x], [ymin, ymax], color="blue", lw=lw*font_scale, alpha=alpha)
-
-        for y in ys:
-            try:
-                g = LineString([(xmin, y), (xmax, y)]).difference(plot_poly)
-                for gg in getattr(g, "geoms", [g]):
-                    if not gg.is_empty:
-                        ax.plot(*gg.xy, color="blue", lw=lw*font_scale, alpha=alpha)
-            except Exception:
-                # If difference fails, just draw the full line
-                ax.plot([xmin, xmax], [y, y], color="blue", lw=lw*font_scale, alpha=alpha)
-
-    draw(minor, 0.3, 0.20)
-    draw(major, 1.0, 0.60)
+    for y in ys:
+        if y < ymin or y > ymax:
+            continue
+        ax.plot([xmin, xmin + tick_len], [y, y], color="blue", lw=0.6*font_scale, alpha=0.5)
+        ax.plot([xmax, xmax - tick_len], [y, y], color="blue", lw=0.6*font_scale, alpha=0.5)
 
 
 def draw_coordinate_frame(ax, spacing: float, font_scale=1.0, first_point_info=None):
@@ -913,11 +899,22 @@ def render_plot_map_layout(
 
     # Draw roads with class-based real-world widths
     road_rows = db.execute(text("""
-        SELECT r.geom, r.highway, r.name
-        FROM lines r
+        WITH roads AS (
+            SELECT
+                CASE
+                    WHEN ST_SRID(r.geom) = 4326 THEN r.geom
+                    WHEN ST_SRID(r.geom) = 0 THEN ST_SetSRID(r.geom, 4326)
+                    ELSE ST_Transform(r.geom, 4326)
+                END AS geom,
+                r.highway,
+                r.name
+            FROM lines r
+            WHERE r.highway IS NOT NULL
+        )
+        SELECT roads.geom, roads.highway, roads.name
+        FROM roads
         JOIN plot_buffers b ON b.plot_id = :plot_id
-        WHERE r.highway IS NOT NULL
-          AND ST_Intersects(r.geom, b.geom)
+        WHERE ST_Intersects(roads.geom, b.geom)
     """), {"plot_id": plot_id}).fetchall()
 
     from shapely.geometry import box

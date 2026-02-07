@@ -311,14 +311,22 @@ def draw_grid(ax, minor, major, font_scale=1.0):
     xmin, xmax = ax.get_xlim()
     ymin, ymax = ax.get_ylim()
 
-    for step, lw, a in [(minor, 0.3, 0.2), (major, 1.0, 0.6)]:
-        xs = np.arange(math.floor(xmin / step) * step, xmax + step, step)
-        ys = np.arange(math.floor(ymin / step) * step, ymax + step, step)
+    # Tick-only grid to keep map area clean
+    tick_len = (xmax - xmin) * 0.01
+    xs = np.arange(math.floor(xmin / major) * major, xmax + 0.1, major)
+    ys = np.arange(math.floor(ymin / major) * major, ymax + 0.1, major)
 
-        for x in xs:
-            ax.plot([x, x], [ymin, ymax], color="blue", lw=lw*font_scale, alpha=a, zorder=3)
-        for y in ys:
-            ax.plot([xmin, xmax], [y, y], color="blue", lw=lw*font_scale, alpha=a, zorder=3)
+    for x in xs:
+        if x < xmin or x > xmax:
+            continue
+        ax.plot([x, x], [ymax, ymax - tick_len], color="blue", lw=0.6*font_scale, alpha=0.5, zorder=3)
+        ax.plot([x, x], [ymin, ymin + tick_len], color="blue", lw=0.6*font_scale, alpha=0.5, zorder=3)
+
+    for y in ys:
+        if y < ymin or y > ymax:
+            continue
+        ax.plot([xmin, xmin + tick_len], [y, y], color="blue", lw=0.6*font_scale, alpha=0.5, zorder=3)
+        ax.plot([xmax, xmax - tick_len], [y, y], color="blue", lw=0.6*font_scale, alpha=0.5, zorder=3)
 
 
 def annotate_vertices_orthophoto(ax, poly, station_names=None, font_scale=1.0, scale_ratio: int = 1000):
