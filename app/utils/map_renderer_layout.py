@@ -824,6 +824,14 @@ def render_plot_map_layout(
         text("SELECT geom, feature_type FROM detected_features WHERE plot_id=:id"),
         {"id": plot_id},
     ).fetchall()
+    override_rows = db.execute(
+        text("""
+            SELECT feature_type, action, name, ST_AsBinary(geom) AS geom
+            FROM plot_feature_overrides
+            WHERE plot_id = :id
+        """),
+        {"id": plot_id},
+    ).fetchall()
 
     if not plot_wkb:
         raise ValueError("Plot not found")
@@ -842,6 +850,33 @@ def render_plot_map_layout(
             buildings.append(g)
         elif r.feature_type == "river":
             rivers.append(g)
+
+    overrides = []
+    for r in override_rows:
+        geom = wkb.loads(r.geom) if r.geom else None
+        overrides.append({
+            "feature_type": r.feature_type,
+            "action": r.action,
+            "name": r.name,
+            "geom": geom,
+        })
+
+    def apply_overrides(base_list, feature_type: str):
+        result = list(base_list)
+        for ov in overrides:
+            if ov["feature_type"] != feature_type:
+                continue
+            geom = ov["geom"]
+            if geom is None:
+                continue
+            if ov["action"] in ("delete", "update"):
+                result = [g for g in result if not g.intersects(geom)]
+            if ov["action"] in ("add", "update"):
+                result.append(geom)
+        return result
+
+    buildings = apply_overrides(buildings, "building")
+    rivers = apply_overrides(rivers, "river")
 
     # Use user's selected coordinate system for rendering
     # If WGS84 selected, use appropriate UTM zone for projected display
@@ -922,10 +957,14 @@ def render_plot_map_layout(
     extent_poly = box(target_xlim[0], target_ylim[0], target_xlim[1], target_ylim[1])
     road_polys = []
     road_label_features = []
+    road_delete_geoms = [ov["geom"] for ov in overrides if ov["feature_type"] == "road" and ov["action"] in ("delete", "update") and ov["geom"] is not None]
+    road_add_geoms = [ov for ov in overrides if ov["feature_type"] == "road" and ov["action"] in ("add", "update") and ov["geom"] is not None]
     for row in road_rows:
         geom = wkb.loads(row.geom)
         highway = row.highway
         name = row.name
+        if road_delete_geoms and any(geom.intersects(dg) for dg in road_delete_geoms):
+            continue
         try:
             gdf_line = gpd.GeoSeries([geom], crs="EPSG:4326").to_crs(epsg=display_epsg)
             line_proj = gdf_line.iloc[0]
@@ -938,6 +977,25 @@ def render_plot_map_layout(
 
         road_label_features.append((clipped, name, highway))
         # Use buffered road polygon to keep intersections connected
+        try:
+            half_w = max(1.0, (road_width_m or 3.0) / 2.0)
+            road_polys.append(clipped.buffer(half_w, cap_style=2, join_style=2))
+        except Exception:
+            continue
+
+    # Add user-provided road overrides
+    for ov in road_add_geoms:
+        geom = ov["geom"]
+        name = ov["name"]
+        try:
+            gdf_line = gpd.GeoSeries([geom], crs="EPSG:4326").to_crs(epsg=display_epsg)
+            line_proj = gdf_line.iloc[0]
+        except Exception:
+            continue
+        clipped = line_proj.intersection(extent_poly)
+        if clipped.is_empty:
+            continue
+        road_label_features.append((clipped, name, "override"))
         try:
             half_w = max(1.0, (road_width_m or 3.0) / 2.0)
             road_polys.append(clipped.buffer(half_w, cap_style=2, join_style=2))

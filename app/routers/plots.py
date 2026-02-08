@@ -3,7 +3,7 @@
 from fastapi import APIRouter, Depends, Body, HTTPException, BackgroundTasks
 from sqlalchemy.orm import Session
 from geoalchemy2.shape import from_shape
-from shapely.geometry import Polygon
+from shapely.geometry import Polygon, shape
 from sqlalchemy import text
 from fastapi.responses import FileResponse
 from app.schemas.plot_create import PlotCreateRequest
@@ -61,6 +61,8 @@ COORDINATE_SYSTEM_NAMES = {
 def get_db():
     db = SessionLocal()
     try:
+        ensure_plot_meta_table(db)
+        ensure_plot_feature_overrides_table(db)
         yield db
     finally:
         db.close()
@@ -109,6 +111,27 @@ def ensure_plot_meta_table(db: Session):
 def ensure_plots_created_at(db: Session):
     try:
         db.execute(text("ALTER TABLE plots ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT NOW()"))
+        db.commit()
+    except Exception:
+        db.rollback()
+
+
+def ensure_plot_feature_overrides_table(db: Session):
+    db.execute(text("""
+        CREATE TABLE IF NOT EXISTS plot_feature_overrides (
+            id SERIAL PRIMARY KEY,
+            plot_id INTEGER NOT NULL REFERENCES plots(id) ON DELETE CASCADE,
+            feature_type TEXT NOT NULL CHECK (feature_type IN ('road', 'building', 'river')),
+            action TEXT NOT NULL CHECK (action IN ('add', 'delete', 'update')),
+            name TEXT,
+            geom GEOMETRY,
+            created_at TIMESTAMP DEFAULT NOW(),
+            updated_at TIMESTAMP DEFAULT NOW()
+        )
+    """))
+    try:
+        db.execute(text("CREATE INDEX IF NOT EXISTS idx_plot_feature_overrides_plot_id ON plot_feature_overrides(plot_id)"))
+        db.execute(text("CREATE INDEX IF NOT EXISTS idx_plot_feature_overrides_geom ON plot_feature_overrides USING GIST (geom)"))
         db.commit()
     except Exception:
         db.rollback()
@@ -354,6 +377,83 @@ def get_plot_features(plot_id: int, db: Session = Depends(get_db)):
         response[r.location][r.feature_type] = r.count
 
     return response
+
+
+# ---------------- FEATURE OVERRIDES ----------------
+
+@router.get("/{plot_id}/feature-overrides")
+def get_feature_overrides(plot_id: int, db: Session = Depends(get_db)):
+    rows = db.execute(text("""
+        SELECT id, feature_type, action, name, ST_AsGeoJSON(geom) AS geojson, created_at, updated_at
+        FROM plot_feature_overrides
+        WHERE plot_id = :plot_id
+        ORDER BY id DESC
+    """), {"plot_id": plot_id}).fetchall()
+
+    return [
+        {
+            "id": r.id,
+            "feature_type": r.feature_type,
+            "action": r.action,
+            "name": r.name,
+            "geojson": r.geojson,
+            "created_at": r.created_at,
+            "updated_at": r.updated_at,
+        }
+        for r in rows
+    ]
+
+
+@router.post("/{plot_id}/feature-overrides")
+def add_feature_override(
+    plot_id: int,
+    db: Session = Depends(get_db),
+    feature_type: str = Body(...),
+    action: str = Body(...),
+    name: str = Body(default=""),
+    wkt: str | None = Body(default=None),
+    geojson: dict | None = Body(default=None),
+):
+    if feature_type not in {"road", "building", "river"}:
+        raise HTTPException(status_code=400, detail="Invalid feature_type")
+    if action not in {"add", "delete", "update"}:
+        raise HTTPException(status_code=400, detail="Invalid action")
+
+    geom_wkt = None
+    if wkt:
+        geom_wkt = wkt
+    elif geojson:
+        try:
+            geom_wkt = shape(geojson).wkt
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid geojson")
+    if not geom_wkt:
+        raise HTTPException(status_code=400, detail="Geometry is required")
+
+    db.execute(text("""
+        INSERT INTO plot_feature_overrides (plot_id, feature_type, action, name, geom)
+        VALUES (:plot_id, :feature_type, :action, :name, ST_SetSRID(ST_GeomFromText(:wkt), 4326))
+    """), {
+        "plot_id": plot_id,
+        "feature_type": feature_type,
+        "action": action,
+        "name": name or None,
+        "wkt": geom_wkt,
+    })
+    db.commit()
+    return {"status": "ok"}
+
+
+@router.delete("/{plot_id}/feature-overrides/{override_id}")
+def delete_feature_override(plot_id: int, override_id: int, db: Session = Depends(get_db)):
+    res = db.execute(text("""
+        DELETE FROM plot_feature_overrides
+        WHERE id = :id AND plot_id = :plot_id
+    """), {"id": override_id, "plot_id": plot_id})
+    db.commit()
+    if res.rowcount == 0:
+        raise HTTPException(status_code=404, detail="Override not found")
+    return {"status": "ok"}
 
 
 # ---------------- REPORT DATA ----------------
