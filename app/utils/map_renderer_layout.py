@@ -818,6 +818,7 @@ def render_plot_map_layout(
     north_arrow_color: str = "black",
     beacon_style: str = "circle",
     road_width_m: float | None = None,
+    road_width_override_m: float | None = None,
 ):
     plot_wkb = db.execute(text("SELECT geom FROM plots WHERE id=:id"), {"id": plot_id}).scalar()
     rows = db.execute(
@@ -1011,7 +1012,7 @@ def render_plot_map_layout(
             continue
         road_label_features.append((clipped, name, "override"))
         try:
-            half_w = max(1.0, (road_width_m or 3.0) / 2.0)
+            half_w = max(1.0, (road_width_override_m or road_width_m or 3.0) / 2.0)
             road_polys.append(clipped.buffer(half_w, cap_style=2, join_style=2))
         except Exception:
             continue
