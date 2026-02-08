@@ -827,7 +827,7 @@ def render_plot_map_layout(
     ).fetchall()
     override_rows = db.execute(
         text("""
-            SELECT feature_type, action, name, ST_AsGeoJSON(geom) AS geojson
+            SELECT feature_type, action, name, width_m, ST_AsGeoJSON(geom) AS geojson
             FROM plot_feature_overrides
             WHERE plot_id = :id
         """),
@@ -865,12 +865,14 @@ def render_plot_map_layout(
             "feature_type": r.feature_type,
             "action": r.action,
             "name": r.name,
+            "width_m": r.width_m if hasattr(r, "width_m") else None,
             "geom": geom,
         })
 
     def apply_overrides(base_list, feature_type: str):
         result = list(base_list)
         added = []
+        delete_geoms = []
         for ov in overrides:
             if ov["feature_type"] != feature_type:
                 continue
@@ -885,9 +887,12 @@ def render_plot_map_layout(
                 pass
             if ov["action"] in ("delete", "update"):
                 result = [g for g in result if not g.intersects(geom)]
+                delete_geoms.append(geom)
             if ov["action"] in ("add", "update"):
                 result.append(geom)
                 added.append(geom)
+        if delete_geoms:
+            added = [g for g in added if not any(g.intersects(dg) for dg in delete_geoms)]
         return result, added
 
     buildings, added_buildings = apply_overrides(buildings, "building")
@@ -974,6 +979,8 @@ def render_plot_map_layout(
     road_label_features = []
     road_delete_geoms = [ov["geom"] for ov in overrides if ov["feature_type"] == "road" and ov["action"] in ("delete", "update") and ov["geom"] is not None]
     road_add_geoms = [ov for ov in overrides if ov["feature_type"] == "road" and ov["action"] in ("add", "update") and ov["geom"] is not None]
+    if road_delete_geoms:
+        road_add_geoms = [ov for ov in road_add_geoms if not any(ov["geom"].intersects(dg) for dg in road_delete_geoms)]
     for row in road_rows:
         geom = wkb.loads(row.geom)
         highway = row.highway
@@ -1012,7 +1019,7 @@ def render_plot_map_layout(
             continue
         road_label_features.append((clipped, name, "override"))
         try:
-            half_w = max(1.0, (road_width_override_m or road_width_m or 3.0) / 2.0)
+            half_w = max(1.0, ((ov.get("width_m") or road_width_override_m or road_width_m) or 3.0) / 2.0)
             road_polys.append(clipped.buffer(half_w, cap_style=2, join_style=2))
         except Exception:
             continue
@@ -1097,7 +1104,7 @@ def render_plot_map_layout(
         for geom, name, highway in road_label_features:
             if not name or name in seen_names:
                 continue
-            if highway and highway.lower() not in major_classes:
+            if highway and highway.lower() not in major_classes and highway != "override":
                 continue
             seen_names.add(name)
             try:

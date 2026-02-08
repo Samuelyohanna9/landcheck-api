@@ -124,12 +124,14 @@ def ensure_plot_feature_overrides_table(db: Session):
             feature_type TEXT NOT NULL CHECK (feature_type IN ('road', 'building', 'river')),
             action TEXT NOT NULL CHECK (action IN ('add', 'delete', 'update')),
             name TEXT,
+            width_m DOUBLE PRECISION,
             geom GEOMETRY,
             created_at TIMESTAMP DEFAULT NOW(),
             updated_at TIMESTAMP DEFAULT NOW()
         )
     """))
     try:
+        db.execute(text("ALTER TABLE plot_feature_overrides ADD COLUMN IF NOT EXISTS width_m DOUBLE PRECISION"))
         db.execute(text("CREATE INDEX IF NOT EXISTS idx_plot_feature_overrides_plot_id ON plot_feature_overrides(plot_id)"))
         db.execute(text("CREATE INDEX IF NOT EXISTS idx_plot_feature_overrides_geom ON plot_feature_overrides USING GIST (geom)"))
         db.commit()
@@ -410,7 +412,7 @@ def get_plot_features_geojson(plot_id: int, db: Session = Depends(get_db)):
 
     # Overrides (adds only for display)
     override_rows = db.execute(text("""
-        SELECT feature_type, action, name, ST_AsGeoJSON(geom) AS geojson
+        SELECT feature_type, action, name, width_m, ST_AsGeoJSON(geom) AS geojson
         FROM plot_feature_overrides
         WHERE plot_id = :plot_id
     """), {"plot_id": plot_id}).fetchall()
@@ -445,7 +447,7 @@ def get_plot_features_geojson(plot_id: int, db: Session = Depends(get_db)):
             continue
         if r.action not in ("add", "update"):
             continue
-        feat = to_feature(r.geojson, {"source": "override", "name": r.name})
+        feat = to_feature(r.geojson, {"source": "override", "name": r.name, "width_m": r.width_m})
         if r.feature_type == "road":
             roads.append(feat)
         elif r.feature_type == "building":
@@ -465,7 +467,7 @@ def get_plot_features_geojson(plot_id: int, db: Session = Depends(get_db)):
 @router.get("/{plot_id}/feature-overrides")
 def get_feature_overrides(plot_id: int, db: Session = Depends(get_db)):
     rows = db.execute(text("""
-        SELECT id, feature_type, action, name, ST_AsGeoJSON(geom) AS geojson, created_at, updated_at
+        SELECT id, feature_type, action, name, width_m, ST_AsGeoJSON(geom) AS geojson, created_at, updated_at
         FROM plot_feature_overrides
         WHERE plot_id = :plot_id
         ORDER BY id DESC
@@ -477,6 +479,7 @@ def get_feature_overrides(plot_id: int, db: Session = Depends(get_db)):
             "feature_type": r.feature_type,
             "action": r.action,
             "name": r.name,
+            "width_m": r.width_m,
             "geojson": r.geojson,
             "created_at": r.created_at,
             "updated_at": r.updated_at,
@@ -492,6 +495,7 @@ def add_feature_override(
     feature_type: str = Body(...),
     action: str = Body(...),
     name: str = Body(default=""),
+    width_m: float | None = Body(default=None),
     wkt: str | None = Body(default=None),
     geojson: dict | None = Body(default=None),
 ):
@@ -516,24 +520,26 @@ def add_feature_override(
     if geom_geojson:
         import json
         db.execute(text("""
-            INSERT INTO plot_feature_overrides (plot_id, feature_type, action, name, geom)
-            VALUES (:plot_id, :feature_type, :action, :name, ST_SetSRID(ST_GeomFromGeoJSON(:geojson), 4326))
+            INSERT INTO plot_feature_overrides (plot_id, feature_type, action, name, width_m, geom)
+            VALUES (:plot_id, :feature_type, :action, :name, :width_m, ST_SetSRID(ST_GeomFromGeoJSON(:geojson), 4326))
         """), {
             "plot_id": plot_id,
             "feature_type": feature_type,
             "action": action,
             "name": name or None,
+            "width_m": width_m,
             "geojson": json.dumps(geom_geojson),
         })
     else:
         db.execute(text("""
-            INSERT INTO plot_feature_overrides (plot_id, feature_type, action, name, geom)
-            VALUES (:plot_id, :feature_type, :action, :name, ST_SetSRID(ST_GeomFromText(:wkt), 4326))
+            INSERT INTO plot_feature_overrides (plot_id, feature_type, action, name, width_m, geom)
+            VALUES (:plot_id, :feature_type, :action, :name, :width_m, ST_SetSRID(ST_GeomFromText(:wkt), 4326))
         """), {
             "plot_id": plot_id,
             "feature_type": feature_type,
             "action": action,
             "name": name or None,
+            "width_m": width_m,
             "wkt": geom_wkt,
         })
     db.commit()
