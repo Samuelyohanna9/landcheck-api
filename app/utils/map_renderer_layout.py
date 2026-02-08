@@ -995,12 +995,14 @@ def render_plot_map_layout(
         clipped = line_proj.intersection(extent_poly)
         if clipped.is_empty:
             continue
-
-        road_label_features.append((clipped, name, highway))
+        # Snap to frame boundary so buffered road edges reach the grid border cleanly.
+        snap_tol = max(1.0, (5.0 / 1000.0) * scale_ratio)
+        snapped_clipped = snap(clipped, extent_poly.boundary, snap_tol)
+        road_label_features.append((snapped_clipped, name, highway))
         # Use buffered road polygon to keep intersections connected
         try:
             half_w = max(1.0, (road_width_m or 3.0) / 2.0)
-            road_polys.append(clipped.buffer(half_w, cap_style=2, join_style=2))
+            road_polys.append(snapped_clipped.buffer(half_w, cap_style=2, join_style=2))
         except Exception:
             continue
 
@@ -1016,10 +1018,12 @@ def render_plot_map_layout(
         clipped = line_proj.intersection(extent_poly)
         if clipped.is_empty:
             continue
-        road_label_features.append((clipped, name, "override"))
+        snap_tol = max(1.0, (5.0 / 1000.0) * scale_ratio)
+        snapped_clipped = snap(clipped, extent_poly.boundary, snap_tol)
+        road_label_features.append((snapped_clipped, name, "override"))
         try:
             half_w = max(1.0, ((ov.get("width_m") or road_width_override_m or road_width_m) or 3.0) / 2.0)
-            road_polys.append(clipped.buffer(half_w, cap_style=2, join_style=2))
+            road_polys.append(snapped_clipped.buffer(half_w, cap_style=2, join_style=2))
         except Exception:
             continue
 
