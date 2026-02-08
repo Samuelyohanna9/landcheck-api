@@ -12,6 +12,7 @@ import matplotlib.pyplot as plt
 from sqlalchemy import text
 from shapely import wkb
 from shapely.geometry import LineString, Point, shape
+from shapely.ops import snap
 import matplotlib.patches as patches
 import matplotlib.lines as mlines
 from datetime import datetime
@@ -1033,7 +1034,9 @@ def render_plot_map_layout(
             boundary = road_union.boundary
             # Clip roads to map frame for even endings at the border
             frame = box(target_xlim[0], target_ylim[0], target_xlim[1], target_ylim[1])
-            clipped = boundary.intersection(frame)
+            snap_tol = max(1.0, (5.0 / 1000.0) * scale_ratio)
+            snapped = snap(boundary, frame.boundary, snap_tol)
+            clipped = snapped.intersection(frame)
             gpd.GeoSeries([clipped], crs=f"EPSG:{display_epsg}").plot(
                 ax=ax, color="black", lw=0.8 * font_scale, zorder=6
             )
