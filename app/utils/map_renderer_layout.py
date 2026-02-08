@@ -868,6 +868,7 @@ def render_plot_map_layout(
 
     def apply_overrides(base_list, feature_type: str):
         result = list(base_list)
+        added = []
         for ov in overrides:
             if ov["feature_type"] != feature_type:
                 continue
@@ -878,10 +879,11 @@ def render_plot_map_layout(
                 result = [g for g in result if not g.intersects(geom)]
             if ov["action"] in ("add", "update"):
                 result.append(geom)
-        return result
+                added.append(geom)
+        return result, added
 
-    buildings = apply_overrides(buildings, "building")
-    rivers = apply_overrides(rivers, "river")
+    buildings, added_buildings = apply_overrides(buildings, "building")
+    rivers, added_rivers = apply_overrides(rivers, "river")
 
     # Use user's selected coordinate system for rendering
     # If WGS84 selected, use appropriate UTM zone for projected display
@@ -1025,6 +1027,10 @@ def render_plot_map_layout(
     if buildings:
         gpd.GeoDataFrame(geometry=buildings, crs="EPSG:4326").to_crs(epsg=display_epsg).plot(
             ax=ax, facecolor="none", edgecolor="black", lw=1*font_scale, zorder=8
+        )
+    if added_buildings:
+        gpd.GeoDataFrame(geometry=added_buildings, crs="EPSG:4326").to_crs(epsg=display_epsg).plot(
+            ax=ax, facecolor="none", edgecolor="black", lw=1.5*font_scale, zorder=9
         )
 
     # Boundary thickness in mm based on common drafting line weights
