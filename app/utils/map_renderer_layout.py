@@ -11,7 +11,7 @@ import geopandas as gpd
 import matplotlib.pyplot as plt
 from sqlalchemy import text
 from shapely import wkb
-from shapely.geometry import LineString, Point
+from shapely.geometry import LineString, Point, shape
 import matplotlib.patches as patches
 import matplotlib.lines as mlines
 from datetime import datetime
@@ -826,7 +826,7 @@ def render_plot_map_layout(
     ).fetchall()
     override_rows = db.execute(
         text("""
-            SELECT feature_type, action, name, ST_AsBinary(geom) AS geom
+            SELECT feature_type, action, name, ST_AsGeoJSON(geom) AS geojson
             FROM plot_feature_overrides
             WHERE plot_id = :id
         """),
@@ -852,11 +852,12 @@ def render_plot_map_layout(
             rivers.append(g)
 
     overrides = []
+    import json
     for r in override_rows:
         geom = None
-        if r.geom:
+        if r.geojson:
             try:
-                geom = wkb.loads(r.geom)
+                geom = shape(json.loads(r.geojson))
             except Exception:
                 geom = None
         overrides.append({
@@ -875,6 +876,12 @@ def render_plot_map_layout(
             geom = ov["geom"]
             if geom is None:
                 continue
+            # Fix invalid polygons from user edits
+            try:
+                if hasattr(geom, "is_valid") and not geom.is_valid:
+                    geom = geom.buffer(0)
+            except Exception:
+                pass
             if ov["action"] in ("delete", "update"):
                 result = [g for g in result if not g.intersects(geom)]
             if ov["action"] in ("add", "update"):
@@ -1030,7 +1037,7 @@ def render_plot_map_layout(
         )
     if added_buildings:
         gpd.GeoDataFrame(geometry=added_buildings, crs="EPSG:4326").to_crs(epsg=display_epsg).plot(
-            ax=ax, facecolor="none", edgecolor="black", lw=1.5*font_scale, zorder=9
+            ax=ax, facecolor="none", edgecolor="black", lw=1.8*font_scale, zorder=9
         )
 
     # Boundary thickness in mm based on common drafting line weights
