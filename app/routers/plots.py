@@ -501,26 +501,41 @@ def add_feature_override(
         raise HTTPException(status_code=400, detail="Invalid action")
 
     geom_wkt = None
+    geom_geojson = None
     if wkt:
         geom_wkt = wkt
     elif geojson:
         try:
-            geom_wkt = shape(geojson).wkt
+            geom_geojson = geojson
         except Exception:
             raise HTTPException(status_code=400, detail="Invalid geojson")
     if not geom_wkt:
-        raise HTTPException(status_code=400, detail="Geometry is required")
+        if not geom_geojson:
+            raise HTTPException(status_code=400, detail="Geometry is required")
 
-    db.execute(text("""
-        INSERT INTO plot_feature_overrides (plot_id, feature_type, action, name, geom)
-        VALUES (:plot_id, :feature_type, :action, :name, ST_SetSRID(ST_GeomFromText(:wkt), 4326))
-    """), {
-        "plot_id": plot_id,
-        "feature_type": feature_type,
-        "action": action,
-        "name": name or None,
-        "wkt": geom_wkt,
-    })
+    if geom_geojson:
+        import json
+        db.execute(text("""
+            INSERT INTO plot_feature_overrides (plot_id, feature_type, action, name, geom)
+            VALUES (:plot_id, :feature_type, :action, :name, ST_SetSRID(ST_GeomFromGeoJSON(:geojson), 4326))
+        """), {
+            "plot_id": plot_id,
+            "feature_type": feature_type,
+            "action": action,
+            "name": name or None,
+            "geojson": json.dumps(geom_geojson),
+        })
+    else:
+        db.execute(text("""
+            INSERT INTO plot_feature_overrides (plot_id, feature_type, action, name, geom)
+            VALUES (:plot_id, :feature_type, :action, :name, ST_SetSRID(ST_GeomFromText(:wkt), 4326))
+        """), {
+            "plot_id": plot_id,
+            "feature_type": feature_type,
+            "action": action,
+            "name": name or None,
+            "wkt": geom_wkt,
+        })
     db.commit()
     return {"status": "ok"}
 
