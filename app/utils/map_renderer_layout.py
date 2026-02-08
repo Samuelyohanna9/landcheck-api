@@ -1045,7 +1045,7 @@ def render_plot_map_layout(
         )
     if added_buildings:
         gpd.GeoDataFrame(geometry=added_buildings, crs="EPSG:4326").to_crs(epsg=display_epsg).plot(
-            ax=ax, facecolor="none", edgecolor="black", lw=1.8*font_scale, zorder=9
+            ax=ax, facecolor="none", edgecolor="black", lw=1*font_scale, zorder=9
         )
 
     # Boundary thickness in mm based on common drafting line weights
