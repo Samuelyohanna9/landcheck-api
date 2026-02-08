@@ -1031,7 +1031,10 @@ def render_plot_map_layout(
             for rp in road_polys[1:]:
                 road_union = road_union.union(rp)
             boundary = road_union.boundary
-            gpd.GeoSeries([boundary], crs=f"EPSG:{display_epsg}").plot(
+            # Clip roads to map frame for even endings at the border
+            frame = box(target_xlim[0], target_ylim[0], target_xlim[1], target_ylim[1])
+            clipped = boundary.intersection(frame)
+            gpd.GeoSeries([clipped], crs=f"EPSG:{display_epsg}").plot(
                 ax=ax, color="black", lw=0.8 * font_scale, zorder=6
             )
         except Exception:
