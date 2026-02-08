@@ -189,6 +189,38 @@ def upsert_plot_meta(
     db.commit()
 
 
+def get_plot_meta(db: Session, plot_id: int) -> dict:
+    row = db.execute(text("""
+        SELECT title_text, location_text, lga_text, state_text,
+               surveyor_name, surveyor_rank, scale_text, paper_size, coordinate_system
+        FROM plot_meta
+        WHERE plot_id = :plot_id
+    """), {"plot_id": plot_id}).mappings().first()
+    if not row:
+        return {
+            "title_text": "SURVEY PLAN",
+            "location_text": "",
+            "lga_text": "",
+            "state_text": "",
+            "surveyor_name": "",
+            "surveyor_rank": "",
+            "scale_text": "1 : 1000",
+            "paper_size": "A4",
+            "coordinate_system": "wgs84",
+        }
+    return {
+        "title_text": row.get("title_text") or "SURVEY PLAN",
+        "location_text": row.get("location_text") or "",
+        "lga_text": row.get("lga_text") or "",
+        "state_text": row.get("state_text") or "",
+        "surveyor_name": row.get("surveyor_name") or "",
+        "surveyor_rank": row.get("surveyor_rank") or "",
+        "scale_text": row.get("scale_text") or "1 : 1000",
+        "paper_size": row.get("paper_size") or "A4",
+        "coordinate_system": row.get("coordinate_system") or "wgs84",
+    }
+
+
 def safe_remove(path: str):
     try:
         os.remove(path)
@@ -988,35 +1020,128 @@ def download_survey_plan_dwg(plot_id: int, db: Session = Depends(get_db)):
 
 
 @router.get("/{plot_id}/reports/survey-plan")
-def get_saved_survey_plan_pdf(plot_id: int):
+def get_saved_survey_plan_pdf(plot_id: int, refresh: bool = False, db: Session = Depends(get_db)):
     pdf_path = resolve_existing_path([
         os.path.join(REPORTS_DIR, f"plot_{plot_id}_report.pdf"),
         f"app/reports/plot_{plot_id}_report.pdf",
     ])
-    if not pdf_path:
+    if refresh or not pdf_path:
+        meta = get_plot_meta(db, plot_id)
+        maps_dir = os.path.join(REPORTS_DIR, "maps")
+        os.makedirs(REPORTS_DIR, exist_ok=True)
+        os.makedirs(maps_dir, exist_ok=True)
+        pdf_path = os.path.join(REPORTS_DIR, f"plot_{plot_id}_report.pdf")
+        tmp_map = tempfile.NamedTemporaryFile(suffix="_map.png", delete=False)
+        map_path = tmp_map.name
+        tmp_map.close()
+        epsg_code = COORDINATE_SYSTEMS.get(meta["coordinate_system"], 4326)
+        crs_name = COORDINATE_SYSTEM_NAMES.get(meta["coordinate_system"], "WGS84")
+        render_plot_map_layout(
+            db=db,
+            plot_id=plot_id,
+            output_path=map_path,
+            title_text=meta["title_text"],
+            location_text=meta["location_text"],
+            lga_text=meta["lga_text"],
+            state_text=meta["state_text"],
+            scale_text=meta["scale_text"],
+            surveyor_name=meta["surveyor_name"],
+            surveyor_rank=meta["surveyor_rank"],
+            station_names=None,
+            coordinate_system=meta["coordinate_system"],
+            epsg_code=epsg_code,
+            crs_footer_text=f"COORDINATE SYSTEM: {crs_name}",
+            paper_size=meta["paper_size"],
+            north_arrow_style="classic",
+            north_arrow_color="black",
+            beacon_style="circle",
+            road_width_m=None,
+            road_width_override_m=None,
+        )
+        report = get_plot_report(plot_id, db)
+        generate_plot_report_pdf(report, pdf_path, map_path, paper_size=meta["paper_size"])
+        safe_remove(map_path)
+    if not pdf_path or not os.path.exists(pdf_path):
         raise HTTPException(status_code=404, detail="Survey plan PDF not found")
     return FileResponse(pdf_path, media_type="application/pdf", filename=f"plot_{plot_id}_survey_plan.pdf")
 
 
 @router.get("/{plot_id}/reports/orthophoto")
-def get_saved_orthophoto_pdf(plot_id: int, map_type: str = "satellite"):
+def get_saved_orthophoto_pdf(plot_id: int, map_type: str = "satellite", refresh: bool = False, db: Session = Depends(get_db)):
     safe_type = "topo" if str(map_type).lower() in ["topo", "topomap", "topo_map"] else "satellite"
     pdf_path = resolve_existing_path([
         os.path.join(REPORTS_DIR, "orthophoto", f"plot_{plot_id}_orthophoto_{safe_type}.pdf"),
         f"app/reports/orthophoto/plot_{plot_id}_orthophoto_{safe_type}.pdf",
     ])
-    if not pdf_path:
+    if refresh or not pdf_path:
+        meta = get_plot_meta(db, plot_id)
+        out_dir = os.path.join(REPORTS_DIR, "orthophoto")
+        os.makedirs(out_dir, exist_ok=True)
+        pdf_path = os.path.join(out_dir, f"plot_{plot_id}_orthophoto_{safe_type}.pdf")
+        tmp_png = tempfile.NamedTemporaryFile(suffix=f"_{safe_type}.png", delete=False)
+        png_path = tmp_png.name
+        tmp_png.close()
+        epsg_code = COORDINATE_SYSTEMS.get(meta["coordinate_system"], 4326)
+        crs_name = COORDINATE_SYSTEM_NAMES.get(meta["coordinate_system"], "WGS84")
+        render_orthophoto_png(
+            db=db,
+            plot_id=plot_id,
+            output_path=png_path,
+            title_text=meta["title_text"] if safe_type == "satellite" else "TOPO MAP",
+            location_text=meta["location_text"],
+            lga_text=meta["lga_text"],
+            state_text=meta["state_text"],
+            scale_text=meta["scale_text"],
+            surveyor_name=meta["surveyor_name"],
+            surveyor_rank=meta["surveyor_rank"],
+            station_names=None,
+            coordinate_system=meta["coordinate_system"],
+            epsg_code=epsg_code,
+            crs_footer_text=f"COORDINATE SYSTEM: {crs_name}",
+            source_footer_text="SOURCE: OpenTopoMap" if safe_type == "topo" else "SOURCE: Satellite Imagery",
+            use_topo_map=(safe_type == "topo"),
+            paper_size=meta["paper_size"],
+            north_arrow_style="classic",
+            north_arrow_color="black",
+        )
+        render_orthophoto_pdf_from_png(png_path, pdf_path, paper_size=meta["paper_size"])
+        safe_remove(png_path)
+    if not pdf_path or not os.path.exists(pdf_path):
         raise HTTPException(status_code=404, detail="Orthophoto PDF not found")
     filename = f"plot_{plot_id}_{'topomap' if safe_type == 'topo' else 'orthophoto'}.pdf"
     return FileResponse(pdf_path, media_type="application/pdf", filename=filename)
 
 
 @router.get("/{plot_id}/reports/back-computation")
-def get_saved_back_computation_pdf(plot_id: int):
+def get_saved_back_computation_pdf(plot_id: int, refresh: bool = False, db: Session = Depends(get_db)):
     pdf_path = resolve_existing_path([
         os.path.join(REPORTS_DIR, f"plot_{plot_id}_back_computation.pdf"),
         f"app/reports/plot_{plot_id}_back_computation.pdf",
     ])
-    if not pdf_path:
+    if refresh or not pdf_path:
+        meta = get_plot_meta(db, plot_id)
+        pdf_path = os.path.join(REPORTS_DIR, f"plot_{plot_id}_back_computation.pdf")
+        os.makedirs(REPORTS_DIR, exist_ok=True)
+        # Get plot geometry
+        plot_wkb = db.execute(text("SELECT geom FROM plots WHERE id=:id"), {"id": plot_id}).scalar()
+        plot_geom = wkb.loads(plot_wkb)
+        area_m2 = db.execute(
+            text("SELECT ST_Area(geom::geography) FROM plots WHERE id=:id"),
+            {"id": plot_id}
+        ).scalar() or 0
+        gdf = gpd.GeoDataFrame(geometry=[plot_geom], crs="EPSG:4326")
+        epsg_code = COORDINATE_SYSTEMS.get(meta["coordinate_system"], 4326)
+        crs_name = COORDINATE_SYSTEM_NAMES.get(meta["coordinate_system"], "WGS84")
+        if meta["coordinate_system"] == "wgs84":
+            centroid = plot_geom.centroid
+            utm_zone = int((centroid.x + 180) / 6) + 1
+            hemisphere = "north" if centroid.y >= 0 else "south"
+            epsg_code = 32600 + utm_zone if hemisphere == "north" else 32700 + utm_zone
+            crs_name = f"UTM Zone {utm_zone}{'N' if hemisphere == 'north' else 'S'}"
+        gdf_projected = gdf.to_crs(epsg=epsg_code)
+        poly = gdf_projected.geometry.iloc[0]
+        rows, sum_de, sum_dn = compute_back_computation(poly, None)
+        render_back_computation_pdf(rows, sum_de, sum_dn, area_m2, plot_id, pdf_path, crs_name)
+    if not pdf_path or not os.path.exists(pdf_path):
         raise HTTPException(status_code=404, detail="Back computation PDF not found")
     return FileResponse(pdf_path, media_type="application/pdf", filename=f"plot_{plot_id}_back_computation.pdf")
