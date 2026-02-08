@@ -979,8 +979,6 @@ def render_plot_map_layout(
     road_label_features = []
     road_delete_geoms = [ov["geom"] for ov in overrides if ov["feature_type"] == "road" and ov["action"] in ("delete", "update") and ov["geom"] is not None]
     road_add_geoms = [ov for ov in overrides if ov["feature_type"] == "road" and ov["action"] in ("add", "update") and ov["geom"] is not None]
-    if road_delete_geoms:
-        road_add_geoms = [ov for ov in road_add_geoms if not any(ov["geom"].intersects(dg) for dg in road_delete_geoms)]
     for row in road_rows:
         geom = wkb.loads(row.geom)
         highway = row.highway
