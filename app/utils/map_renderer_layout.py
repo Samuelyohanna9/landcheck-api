@@ -853,7 +853,12 @@ def render_plot_map_layout(
 
     overrides = []
     for r in override_rows:
-        geom = wkb.loads(r.geom) if r.geom else None
+        geom = None
+        if r.geom:
+            try:
+                geom = wkb.loads(r.geom)
+            except Exception:
+                geom = None
         overrides.append({
             "feature_type": r.feature_type,
             "action": r.action,

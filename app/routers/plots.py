@@ -379,6 +379,87 @@ def get_plot_features(plot_id: int, db: Session = Depends(get_db)):
     return response
 
 
+@router.get("/{plot_id}/features/geojson")
+def get_plot_features_geojson(plot_id: int, db: Session = Depends(get_db)):
+    # Buildings and rivers from detected_features
+    feature_rows = db.execute(text("""
+        SELECT feature_type, ST_AsGeoJSON(geom) AS geojson
+        FROM detected_features
+        WHERE plot_id = :plot_id
+    """), {"plot_id": plot_id}).fetchall()
+
+    # Roads from lines (same logic as renderer)
+    road_rows = db.execute(text("""
+        WITH roads AS (
+            SELECT
+                CASE
+                    WHEN ST_SRID(r.geom) = 4326 THEN r.geom
+                    WHEN ST_SRID(r.geom) = 0 THEN ST_SetSRID(r.geom, 4326)
+                    ELSE ST_Transform(r.geom, 4326)
+                END AS geom,
+                r.highway,
+                r.name
+            FROM lines r
+            WHERE r.highway IS NOT NULL
+        )
+        SELECT ST_AsGeoJSON(roads.geom) AS geojson, roads.name
+        FROM roads
+        JOIN plot_buffers b ON b.plot_id = :plot_id
+        WHERE ST_Intersects(roads.geom, b.geom)
+    """), {"plot_id": plot_id}).fetchall()
+
+    # Overrides (adds only for display)
+    override_rows = db.execute(text("""
+        SELECT feature_type, action, name, ST_AsGeoJSON(geom) AS geojson
+        FROM plot_feature_overrides
+        WHERE plot_id = :plot_id
+    """), {"plot_id": plot_id}).fetchall()
+
+    def to_feature(geojson_str, props):
+        return {
+            "type": "Feature",
+            "geometry": json.loads(geojson_str) if geojson_str else None,
+            "properties": props,
+        }
+
+    import json
+
+    buildings = []
+    rivers = []
+    for r in feature_rows:
+        if not r.geojson:
+            continue
+        if r.feature_type == "building":
+            buildings.append(to_feature(r.geojson, {"source": "detected"}))
+        elif r.feature_type == "river":
+            rivers.append(to_feature(r.geojson, {"source": "detected"}))
+
+    roads = []
+    for r in road_rows:
+        if not r.geojson:
+            continue
+        roads.append(to_feature(r.geojson, {"source": "detected", "name": r.name}))
+
+    for r in override_rows:
+        if not r.geojson:
+            continue
+        if r.action not in ("add", "update"):
+            continue
+        feat = to_feature(r.geojson, {"source": "override", "name": r.name})
+        if r.feature_type == "road":
+            roads.append(feat)
+        elif r.feature_type == "building":
+            buildings.append(feat)
+        elif r.feature_type == "river":
+            rivers.append(feat)
+
+    return {
+        "roads": {"type": "FeatureCollection", "features": roads},
+        "buildings": {"type": "FeatureCollection", "features": buildings},
+        "rivers": {"type": "FeatureCollection", "features": rivers},
+    }
+
+
 # ---------------- FEATURE OVERRIDES ----------------
 
 @router.get("/{plot_id}/feature-overrides")
