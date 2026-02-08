@@ -977,7 +977,7 @@ def render_plot_map_layout(
     extent_poly = box(target_xlim[0], target_ylim[0], target_xlim[1], target_ylim[1])
     road_polys = []
     road_label_features = []
-    road_delete_geoms = [ov["geom"] for ov in overrides if ov["feature_type"] == "road" and ov["action"] in ("delete", "update") and ov["geom"] is not None]
+    road_delete_geoms = [ov["geom"] for ov in overrides if ov["feature_type"] == "road" and ov["action"] == "delete" and ov["geom"] is not None]
     road_add_geoms = [ov for ov in overrides if ov["feature_type"] == "road" and ov["action"] in ("add", "update") and ov["geom"] is not None]
     for row in road_rows:
         geom = wkb.loads(row.geom)
