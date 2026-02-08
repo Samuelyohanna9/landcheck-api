@@ -771,7 +771,12 @@ def preview_plot_map(plot_id: int, db: Session = Depends(get_db), background_tas
     if background_tasks:
         background_tasks.add_task(safe_remove, map_path)
 
-    return FileResponse(map_path, media_type="image/png", background=background_tasks)
+    return FileResponse(
+        map_path,
+        media_type="image/png",
+        headers={"Cache-Control": "no-store"},
+        background=background_tasks,
+    )
 
 
 # ---------------- BACK COMPUTATION ----------------
