@@ -3,7 +3,7 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.routers import health, plots, analytics, feedback
+from app.routers import health, plots, analytics, feedback, hazards, green
 from app.db_init import init_db
 
 app = FastAPI(title="LandCheck API")
@@ -28,6 +28,8 @@ app.include_router(health.router)
 app.include_router(plots.router)
 app.include_router(analytics.router)
 app.include_router(feedback.router)
+app.include_router(hazards.router)
+app.include_router(green.router)
 
 @app.get("/")
 def root():

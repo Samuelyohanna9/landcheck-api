@@ -1,5 +1,7 @@
 # Environment variables
 .env
+.env.*
+*.env
 
 # Python specific
 __pycache__/
@@ -10,6 +12,16 @@ env/
 venv/
 .pytest_cache/
 
+# Credentials / keys
+*.json
+*.pem
+*.p12
+*.key
+
 # OS specific
 .DS_Store
 Thumbs.db
+
+# Local artifacts
+app/reports/
+*.log
