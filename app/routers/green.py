@@ -8,7 +8,7 @@ import tempfile
 import csv
 import uuid
 from pathlib import Path
-from urllib.parse import quote, urlparse
+from urllib.parse import quote, unquote, urlparse
 
 import boto3
 from botocore.exceptions import ClientError
@@ -201,12 +201,33 @@ def _make_r2_client(settings: dict):
     )
 
 
+def _normalize_object_key(raw_key: str, bucket: str) -> str:
+    key = (raw_key or "").strip().lstrip("/")
+    if not key:
+        return ""
+
+    # Handle keys that were encoded once/twice by older clients.
+    for _ in range(3):
+        decoded = unquote(key)
+        if decoded == key:
+            break
+        key = decoded
+
+    bucket_prefix = f"{bucket}/"
+    if key.startswith(bucket_prefix):
+        key = key[len(bucket_prefix):]
+    return key
+
+
 @router.get("/uploads/object/{object_key:path}")
 def get_uploaded_photo(object_key: str):
     settings = _build_r2_settings()
+    resolved_key = _normalize_object_key(object_key, settings["bucket"])
+    if not resolved_key:
+        raise HTTPException(status_code=400, detail="Invalid photo key.")
     try:
         client = _make_r2_client(settings)
-        obj = client.get_object(Bucket=settings["bucket"], Key=object_key)
+        obj = client.get_object(Bucket=settings["bucket"], Key=resolved_key)
     except ClientError as exc:
         code = (exc.response.get("Error") or {}).get("Code", "")
         if code in {"NoSuchKey", "404", "NotFound"}:
@@ -575,7 +596,7 @@ def update_task(
 @router.get("/trees/{tree_id}/timeline")
 def tree_timeline(tree_id: int, db: Session = Depends(get_db)):
     tree = db.execute(text("""
-        SELECT id, species, planting_date, status, created_at
+        SELECT id, species, planting_date, status, notes, photo_url, created_by, created_at
         FROM trees
         WHERE id = :tree_id
     """), {"tree_id": tree_id}).mappings().first()
