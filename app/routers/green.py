@@ -248,9 +248,15 @@ def get_uploaded_photo(object_key: str):
 @router.post("/uploads/photo")
 async def upload_photo_to_r2(
     request: Request,
+    db: Session = Depends(get_db),
     file: UploadFile = File(...),
     folder: str = Form(default="trees"),
+    tree_id: int | None = Form(default=None),
+    task_id: int | None = Form(default=None),
 ):
+    if tree_id is not None and task_id is not None:
+        raise HTTPException(status_code=400, detail="Provide either tree_id or task_id, not both.")
+
     content_type = (file.content_type or "").strip().lower()
     if not content_type.startswith("image/"):
         raise HTTPException(status_code=400, detail="Only image uploads are allowed.")
@@ -299,7 +305,40 @@ async def upload_photo_to_r2(
     public_url = f"{settings['public_base']}/{quote(object_key, safe='/')}"
     app_base = str(request.base_url).rstrip("/")
     proxy_url = f"{app_base}/green/uploads/object/{quote(object_key, safe='/')}"
-    return {"url": proxy_url, "key": object_key, "public_url": public_url}
+
+    linked_tree_id = None
+    linked_task_id = None
+
+    if tree_id is not None:
+        linked_tree_id = db.execute(text("""
+            UPDATE trees
+            SET photo_url = :photo_url
+            WHERE id = :tree_id
+            RETURNING id
+        """), {"photo_url": proxy_url, "tree_id": tree_id}).scalar()
+        if not linked_tree_id:
+            db.rollback()
+            raise HTTPException(status_code=404, detail="Tree not found for photo link.")
+        db.commit()
+    elif task_id is not None:
+        linked_task_id = db.execute(text("""
+            UPDATE tree_tasks
+            SET photo_url = :photo_url
+            WHERE id = :task_id
+            RETURNING id
+        """), {"photo_url": proxy_url, "task_id": task_id}).scalar()
+        if not linked_task_id:
+            db.rollback()
+            raise HTTPException(status_code=404, detail="Task not found for photo link.")
+        db.commit()
+
+    return {
+        "url": proxy_url,
+        "key": object_key,
+        "public_url": public_url,
+        "linked_tree_id": linked_tree_id,
+        "linked_task_id": linked_task_id,
+    }
 
 
 @router.post("/projects")
