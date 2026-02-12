@@ -490,15 +490,20 @@ def create_work_order(
 
 
 @router.get("/work-orders")
-def list_work_orders(project_id: int, db: Session = Depends(get_db)):
+def list_work_orders(
+    project_id: int,
+    assignee_name: str | None = None,
+    db: Session = Depends(get_db),
+):
     rows = db.execute(text("""
         SELECT id, project_id, assignee_name, work_type, target_trees,
                maintenance_schedule, due_date, status, planted_count, visits_done,
                last_update, created_at
         FROM green_work_orders
         WHERE project_id = :project_id
+          AND (:assignee_name IS NULL OR assignee_name = :assignee_name)
         ORDER BY created_at DESC
-    """), {"project_id": project_id}).mappings().all()
+    """), {"project_id": project_id, "assignee_name": assignee_name}).mappings().all()
     return [dict(r) for r in rows]
 
 
