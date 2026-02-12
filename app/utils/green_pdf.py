@@ -9,6 +9,7 @@ def render_green_report_pdf(
     map_png: bytes | None = None,
     map_rows: list[dict] | None = None,
     map_view: dict | None = None,
+    maintenance_rows: list[dict] | None = None,
 ):
     c = canvas.Canvas(output_path, pagesize=A4)
     width, height = A4
@@ -33,40 +34,39 @@ def render_green_report_pdf(
     c.drawString(420, height - 188, f"Survival: {stats.get('survival_rate', 0)}%")
 
     c.setFont("Helvetica-Bold", 12)
-    c.drawString(40, height - 220, "Tree Records (latest 200)")
+    c.drawString(40, height - 220, "Tree Records + Maintenance (latest 200)")
+
+    def draw_tree_header(y_pos: float):
+        c.setFont("Helvetica-Bold", 8)
+        c.drawString(40, y_pos, "Tree ID")
+        c.drawString(84, y_pos, "Species")
+        c.drawString(160, y_pos, "Status")
+        c.drawString(222, y_pos, "Planting Date")
+        c.drawString(300, y_pos, "Maint #")
+        c.drawString(344, y_pos, "Maint Type(s)")
+        c.drawString(474, y_pos, "Last Maint Date")
 
     y = height - 240
-    c.setFont("Helvetica-Bold", 9)
-    c.drawString(40, y, "ID")
-    c.drawString(70, y, "Lng")
-    c.drawString(140, y, "Lat")
-    c.drawString(210, y, "Species")
-    c.drawString(320, y, "Status")
-    c.drawString(390, y, "Planting Date")
+    draw_tree_header(y)
     y -= 12
-    c.setFont("Helvetica", 8)
+    c.setFont("Helvetica", 7.5)
 
     for r in rows:
         if y < 60:
             c.showPage()
             y = height - 60
-            c.setFont("Helvetica-Bold", 9)
-            c.drawString(40, y, "ID")
-            c.drawString(70, y, "Lng")
-            c.drawString(140, y, "Lat")
-            c.drawString(210, y, "Species")
-            c.drawString(320, y, "Status")
-            c.drawString(390, y, "Planting Date")
+            draw_tree_header(y)
             y -= 12
-            c.setFont("Helvetica", 8)
+            c.setFont("Helvetica", 7.5)
 
         c.drawString(40, y, str(r.get("id", "")))
-        c.drawString(70, y, f"{r.get('lng', ''):.6f}" if r.get("lng") is not None else "")
-        c.drawString(140, y, f"{r.get('lat', ''):.6f}" if r.get("lat") is not None else "")
-        c.drawString(210, y, (r.get("species") or "")[:16])
-        c.drawString(320, y, str(r.get("status", "")))
-        c.drawString(390, y, str(r.get("planting_date", "")))
-        y -= 12
+        c.drawString(84, y, (str(r.get("species", "")) or "-")[:16])
+        c.drawString(160, y, (str(r.get("status", "")) or "-")[:13])
+        c.drawString(222, y, str(r.get("planting_date", "") or "-")[:14])
+        c.drawString(300, y, str(r.get("maintenance_count", 0) or 0))
+        c.drawString(344, y, (str(r.get("maintenance_types", "")) or "-")[:30])
+        c.drawString(474, y, str(r.get("last_maintenance_date", "") or "-")[:16])
+        y -= 11
 
     # Always render a map page so reports include a visual snapshot.
     c.showPage()
@@ -194,7 +194,52 @@ def render_green_report_pdf(
                 c.setStrokeColorRGB(0, 0, 0)
                 c.circle(px, py, 3.4, stroke=1, fill=1)
 
-    c.showPage()
+    if maintenance_rows:
+        c.showPage()
+        c.setFont("Helvetica-Bold", 14)
+        c.drawString(40, height - 50, "Maintenance Summary By Tree")
+        c.setFont("Helvetica", 9)
+        c.drawString(40, height - 68, "Columns: maintenance type, last date, and number of times.")
+
+        y = height - 92
+        c.setFont("Helvetica-Bold", 8)
+        c.drawString(40, y, "Tree ID")
+        c.drawString(92, y, "Times")
+        c.drawString(134, y, "Done")
+        c.drawString(172, y, "Pending")
+        c.drawString(226, y, "Overdue")
+        c.drawString(282, y, "Last Type")
+        c.drawString(376, y, "Type(s)")
+        c.drawString(494, y, "Last Date")
+        y -= 12
+
+        c.setFont("Helvetica", 7.5)
+        for row in maintenance_rows:
+            if y < 52:
+                c.showPage()
+                y = height - 60
+                c.setFont("Helvetica-Bold", 8)
+                c.drawString(40, y, "Tree ID")
+                c.drawString(92, y, "Times")
+                c.drawString(134, y, "Done")
+                c.drawString(172, y, "Pending")
+                c.drawString(226, y, "Overdue")
+                c.drawString(282, y, "Last Type")
+                c.drawString(376, y, "Type(s)")
+                c.drawString(494, y, "Last Date")
+                y -= 12
+                c.setFont("Helvetica", 7.5)
+
+            c.drawString(40, y, str(row.get("tree_id", "")))
+            c.drawString(92, y, str(row.get("maintenance_count", 0) or 0))
+            c.drawString(134, y, str(row.get("maintenance_done", 0) or 0))
+            c.drawString(172, y, str(row.get("maintenance_pending", 0) or 0))
+            c.drawString(226, y, str(row.get("maintenance_overdue", 0) or 0))
+            c.drawString(282, y, (str(row.get("last_maintenance_type", "")) or "-")[:16])
+            c.drawString(376, y, (str(row.get("maintenance_types", "")) or "-")[:24])
+            c.drawString(494, y, str(row.get("last_maintenance_date", "") or "-")[:16])
+            y -= 11
+
     c.save()
 
 
@@ -210,27 +255,118 @@ def render_green_work_report_pdf(output_path: str, project: dict, stats: dict):
     c.drawString(40, height - 98, f"Location: {project.get('location_text', '')}")
     c.drawString(40, height - 116, f"Sponsor: {project.get('sponsor', '')}")
 
+    maintenance_by_assignee = {
+        str(r.get("assignee_name", "")): dict(r)
+        for r in stats.get("maintenance_by_assignee", [])
+    }
+    assignee_rows = [dict(r) for r in stats.get("orders", [])]
+
+    # Include assignees who only have maintenance data (no planting order rows).
+    seen_names = {str(r.get("assignee_name", "")) for r in assignee_rows}
+    for assignee_name, maintenance_row in maintenance_by_assignee.items():
+        if assignee_name in seen_names:
+            continue
+        assignee_rows.append({
+            "assignee_name": assignee_name,
+            "orders": 0,
+            "target_trees": 0,
+            "planted_count": 0,
+            "maintenance_total": maintenance_row.get("maintenance_total", 0),
+            "maintenance_done": maintenance_row.get("maintenance_done", 0),
+            "maintenance_pending": maintenance_row.get("maintenance_pending", 0),
+            "maintenance_overdue": maintenance_row.get("maintenance_overdue", 0),
+            "maintenance_types": maintenance_row.get("maintenance_types", ""),
+            "last_maintenance_date": maintenance_row.get("last_maintenance_date"),
+        })
+
+    for row in assignee_rows:
+        extra = maintenance_by_assignee.get(str(row.get("assignee_name", "")), {})
+        row["maintenance_total"] = int(extra.get("maintenance_total", row.get("maintenance_total", 0)) or 0)
+        row["maintenance_done"] = int(extra.get("maintenance_done", row.get("maintenance_done", 0)) or 0)
+        row["maintenance_pending"] = int(extra.get("maintenance_pending", row.get("maintenance_pending", 0)) or 0)
+        row["maintenance_overdue"] = int(extra.get("maintenance_overdue", row.get("maintenance_overdue", 0)) or 0)
+        row["maintenance_types"] = extra.get("maintenance_types", row.get("maintenance_types", "")) or ""
+        row["last_maintenance_date"] = extra.get("last_maintenance_date", row.get("last_maintenance_date"))
+
     c.setFont("Helvetica-Bold", 12)
-    c.drawString(40, height - 150, "Assignee Summary")
+    c.drawString(40, height - 150, "Assignee Summary + Maintenance")
 
     y = height - 170
-    c.setFont("Helvetica-Bold", 9)
+    c.setFont("Helvetica-Bold", 8)
     c.drawString(40, y, "Assignee")
-    c.drawString(160, y, "Orders")
-    c.drawString(220, y, "Target")
-    c.drawString(280, y, "Planted")
+    c.drawString(130, y, "Orders")
+    c.drawString(168, y, "Target")
+    c.drawString(206, y, "Planted")
+    c.drawString(252, y, "Maint #")
+    c.drawString(296, y, "Done/Pend/Over")
+    c.drawString(396, y, "Type(s)")
+    c.drawString(502, y, "Last Date")
     y -= 12
-    c.setFont("Helvetica", 9)
+    c.setFont("Helvetica", 7.3)
 
-    for r in stats.get("orders", []):
+    for r in assignee_rows:
         if y < 60:
             c.showPage()
             y = height - 60
-        c.drawString(40, y, str(r.get("assignee_name", "")))
-        c.drawString(160, y, str(r.get("orders", 0)))
-        c.drawString(220, y, str(r.get("target_trees", 0)))
-        c.drawString(280, y, str(r.get("planted_count", 0)))
-        y -= 12
+            c.setFont("Helvetica-Bold", 8)
+            c.drawString(40, y, "Assignee")
+            c.drawString(130, y, "Orders")
+            c.drawString(168, y, "Target")
+            c.drawString(206, y, "Planted")
+            c.drawString(252, y, "Maint #")
+            c.drawString(296, y, "Done/Pend/Over")
+            c.drawString(396, y, "Type(s)")
+            c.drawString(502, y, "Last Date")
+            y -= 12
+            c.setFont("Helvetica", 7.3)
 
-    c.showPage()
+        c.drawString(40, y, str(r.get("assignee_name", ""))[:15])
+        c.drawString(130, y, str(r.get("orders", 0)))
+        c.drawString(168, y, str(r.get("target_trees", 0)))
+        c.drawString(206, y, str(r.get("planted_count", 0)))
+        c.drawString(252, y, str(r.get("maintenance_total", 0)))
+        c.drawString(
+            296,
+            y,
+            f"{r.get('maintenance_done', 0)}/{r.get('maintenance_pending', 0)}/{r.get('maintenance_overdue', 0)}",
+        )
+        c.drawString(396, y, str(r.get("maintenance_types", "") or "-")[:23])
+        c.drawString(502, y, str(r.get("last_maintenance_date", "") or "-")[:12])
+        y -= 11
+
+    maintenance_by_type = stats.get("maintenance_by_type", [])
+    if maintenance_by_type:
+        c.showPage()
+        c.setFont("Helvetica-Bold", 12)
+        c.drawString(40, height - 50, "Maintenance Type Activity")
+        c.setFont("Helvetica", 9)
+        c.drawString(40, height - 68, "Columns: type, date, and number of times by assignee.")
+
+        y = height - 90
+        c.setFont("Helvetica-Bold", 8)
+        c.drawString(40, y, "Assignee")
+        c.drawString(170, y, "Maintenance Type")
+        c.drawString(330, y, "Number of Times")
+        c.drawString(450, y, "Last Date")
+        y -= 12
+        c.setFont("Helvetica", 8)
+
+        for row in maintenance_by_type:
+            if y < 55:
+                c.showPage()
+                y = height - 60
+                c.setFont("Helvetica-Bold", 8)
+                c.drawString(40, y, "Assignee")
+                c.drawString(170, y, "Maintenance Type")
+                c.drawString(330, y, "Number of Times")
+                c.drawString(450, y, "Last Date")
+                y -= 12
+                c.setFont("Helvetica", 8)
+
+            c.drawString(40, y, str(row.get("assignee_name", ""))[:22])
+            c.drawString(170, y, str(row.get("task_type", ""))[:24])
+            c.drawString(330, y, str(row.get("maintenance_times", 0)))
+            c.drawString(450, y, str(row.get("last_maintenance_date", "") or "-")[:16])
+            y -= 11
+
     c.save()

@@ -321,15 +321,22 @@ async def upload_photo_to_r2(
             raise HTTPException(status_code=404, detail="Tree not found for photo link.")
         db.commit()
     elif task_id is not None:
-        linked_task_id = db.execute(text("""
+        task_row = db.execute(text("""
             UPDATE tree_tasks
             SET photo_url = :photo_url
             WHERE id = :task_id
-            RETURNING id
-        """), {"photo_url": proxy_url, "task_id": task_id}).scalar()
-        if not linked_task_id:
+            RETURNING id, tree_id
+        """), {"photo_url": proxy_url, "task_id": task_id}).mappings().first()
+        if not task_row:
             db.rollback()
             raise HTTPException(status_code=404, detail="Task not found for photo link.")
+        linked_task_id = task_row["id"]
+        linked_tree_id = task_row["tree_id"]
+        db.execute(text("""
+            UPDATE trees
+            SET photo_url = :photo_url
+            WHERE id = :tree_id
+        """), {"photo_url": proxy_url, "tree_id": linked_tree_id})
         db.commit()
 
     return {
@@ -620,14 +627,25 @@ def update_task(
 ):
     if status and status not in {"pending", "done", "overdue"}:
         raise HTTPException(status_code=400, detail="Invalid status")
-    db.execute(text("""
+    row = db.execute(text("""
         UPDATE tree_tasks
         SET status = COALESCE(:status, status),
             notes = COALESCE(:notes, notes),
             photo_url = COALESCE(:photo_url, photo_url),
             completed_at = CASE WHEN :status = 'done' THEN NOW() ELSE completed_at END
         WHERE id = :task_id
-    """), {"status": status, "notes": notes, "photo_url": photo_url, "task_id": task_id})
+        RETURNING tree_id, photo_url
+    """), {"status": status, "notes": notes, "photo_url": photo_url, "task_id": task_id}).mappings().first()
+    if not row:
+        db.rollback()
+        raise HTTPException(status_code=404, detail="Task not found")
+    resolved_photo = row.get("photo_url")
+    if resolved_photo:
+        db.execute(text("""
+            UPDATE trees
+            SET photo_url = :photo_url
+            WHERE id = :tree_id
+        """), {"photo_url": resolved_photo, "tree_id": row["tree_id"]})
     db.commit()
     return {"status": "ok"}
 
@@ -786,9 +804,38 @@ def work_stats(project_id: int, db: Session = Depends(get_db)):
         row["planted_count"] = tree_map.get(row.get("assignee_name"), 0)
         merged.append(row)
 
+    maintenance_by_assignee = db.execute(text("""
+        SELECT t.assignee_name,
+               COUNT(*) AS maintenance_total,
+               SUM(CASE WHEN t.status = 'done' THEN 1 ELSE 0 END) AS maintenance_done,
+               SUM(CASE WHEN t.status = 'pending' THEN 1 ELSE 0 END) AS maintenance_pending,
+               SUM(CASE WHEN t.status = 'overdue' THEN 1 ELSE 0 END) AS maintenance_overdue,
+               COALESCE(STRING_AGG(DISTINCT t.task_type, ', ' ORDER BY t.task_type), '') AS maintenance_types,
+               MAX(COALESCE(t.completed_at::date, t.due_date, t.created_at::date)) AS last_maintenance_date
+        FROM tree_tasks t
+        JOIN trees tr ON tr.id = t.tree_id
+        WHERE tr.project_id = :project_id
+        GROUP BY t.assignee_name
+        ORDER BY t.assignee_name
+    """), {"project_id": project_id}).mappings().all()
+
+    maintenance_by_type = db.execute(text("""
+        SELECT t.assignee_name,
+               t.task_type,
+               COUNT(*) AS maintenance_times,
+               MAX(COALESCE(t.completed_at::date, t.due_date, t.created_at::date)) AS last_maintenance_date
+        FROM tree_tasks t
+        JOIN trees tr ON tr.id = t.tree_id
+        WHERE tr.project_id = :project_id
+        GROUP BY t.assignee_name, t.task_type
+        ORDER BY t.assignee_name, maintenance_times DESC, t.task_type
+    """), {"project_id": project_id}).mappings().all()
+
     return {
         "orders": merged,
         "trees_by_user": [dict(r) for r in tree_counts],
+        "maintenance_by_assignee": [dict(r) for r in maintenance_by_assignee],
+        "maintenance_by_type": [dict(r) for r in maintenance_by_type],
     }
 
 
@@ -905,6 +952,55 @@ def export_project_csv(project_id: int, db: Session = Depends(get_db)):
     return FileResponse(csv_path, media_type="text/csv", filename=filename)
 
 
+def _maintenance_summary_by_tree(project_id: int, db: Session, assignee_name: str | None = None) -> list[dict]:
+    rows = db.execute(text("""
+        SELECT tr.id AS tree_id,
+               COUNT(t.id) AS maintenance_count,
+               SUM(CASE WHEN t.status = 'done' THEN 1 ELSE 0 END) AS maintenance_done,
+               SUM(CASE WHEN t.status = 'pending' THEN 1 ELSE 0 END) AS maintenance_pending,
+               SUM(CASE WHEN t.status = 'overdue' THEN 1 ELSE 0 END) AS maintenance_overdue,
+               COALESCE(STRING_AGG(DISTINCT t.task_type, ', ' ORDER BY t.task_type), '') AS maintenance_types,
+               MAX(COALESCE(t.completed_at::date, t.due_date, t.created_at::date)) AS last_maintenance_date,
+               (ARRAY_AGG(t.task_type ORDER BY COALESCE(t.completed_at, t.created_at) DESC NULLS LAST, t.id DESC))[1]
+                 AS last_maintenance_type
+        FROM trees tr
+        LEFT JOIN tree_tasks t ON t.tree_id = tr.id
+        WHERE tr.project_id = :project_id
+          AND (:assignee_name IS NULL OR tr.created_by = :assignee_name)
+        GROUP BY tr.id
+        ORDER BY tr.id
+    """), {"project_id": project_id, "assignee_name": assignee_name}).mappings().all()
+
+    cleaned = []
+    for row in rows:
+        item = dict(row)
+        item["maintenance_count"] = int(item.get("maintenance_count") or 0)
+        item["maintenance_done"] = int(item.get("maintenance_done") or 0)
+        item["maintenance_pending"] = int(item.get("maintenance_pending") or 0)
+        item["maintenance_overdue"] = int(item.get("maintenance_overdue") or 0)
+        item["maintenance_types"] = item.get("maintenance_types") or ""
+        item["last_maintenance_type"] = item.get("last_maintenance_type") or ""
+        cleaned.append(item)
+    return cleaned
+
+
+def _attach_maintenance_to_tree_rows(rows: list[dict], summary_rows: list[dict]) -> list[dict]:
+    summary_by_tree = {r["tree_id"]: r for r in summary_rows}
+    merged = []
+    for row in rows:
+        item = dict(row)
+        summary = summary_by_tree.get(item.get("id")) or {}
+        item["maintenance_count"] = summary.get("maintenance_count", 0)
+        item["maintenance_done"] = summary.get("maintenance_done", 0)
+        item["maintenance_pending"] = summary.get("maintenance_pending", 0)
+        item["maintenance_overdue"] = summary.get("maintenance_overdue", 0)
+        item["maintenance_types"] = summary.get("maintenance_types", "")
+        item["last_maintenance_type"] = summary.get("last_maintenance_type", "")
+        item["last_maintenance_date"] = summary.get("last_maintenance_date")
+        merged.append(item)
+    return merged
+
+
 @router.get("/projects/{project_id}/export/pdf")
 def export_project_pdf(
     project_id: int,
@@ -932,6 +1028,9 @@ def export_project_pdf(
         ORDER BY created_at DESC
         LIMIT 1000
     """), {"project_id": project_id}).mappings().all()
+    maintenance_rows = _maintenance_summary_by_tree(project_id, db)
+    rows = _attach_maintenance_to_tree_rows(rows, maintenance_rows)
+    map_rows = _attach_maintenance_to_tree_rows(map_rows, maintenance_rows)
 
     os.makedirs(REPORTS_DIR, exist_ok=True)
     tmp_pdf = tempfile.NamedTemporaryFile(suffix="_project_report.pdf", delete=False)
@@ -1002,7 +1101,15 @@ def export_project_pdf(
     map_view = None
     if lng is not None and lat is not None and zoom is not None:
         map_view = {"lng": lng, "lat": lat, "zoom": zoom}
-    render_green_report_pdf(pdf_path, project, rows, map_png=map_png, map_rows=map_rows, map_view=map_view)
+    render_green_report_pdf(
+        pdf_path,
+        project,
+        rows,
+        map_png=map_png,
+        map_rows=map_rows,
+        map_view=map_view,
+        maintenance_rows=maintenance_rows,
+    )
     filename = f"project_{project_id}_report.pdf"
     return FileResponse(pdf_path, media_type="application/pdf", filename=filename)
 
@@ -1070,6 +1177,10 @@ def export_work_report_pdf(
             ORDER BY created_at DESC
             LIMIT 1000
         """), {"project_id": project_id}).mappings().all()
+
+    maintenance_rows = _maintenance_summary_by_tree(project_id, db, assignee_name)
+    rows = _attach_maintenance_to_tree_rows(rows, maintenance_rows)
+    map_rows = _attach_maintenance_to_tree_rows(map_rows, maintenance_rows)
 
     project_copy = dict(project)
     project_copy["stats"] = _build_tree_stats(map_rows)
@@ -1142,7 +1253,15 @@ def export_work_report_pdf(
     map_view = None
     if lng is not None and lat is not None and zoom is not None:
         map_view = {"lng": lng, "lat": lat, "zoom": zoom}
-    render_green_report_pdf(pdf_path, project_copy, rows, map_png=map_png, map_rows=map_rows, map_view=map_view)
+    render_green_report_pdf(
+        pdf_path,
+        project_copy,
+        rows,
+        map_png=map_png,
+        map_rows=map_rows,
+        map_view=map_view,
+        maintenance_rows=maintenance_rows,
+    )
     filename = (
         f"project_{project_id}_work_report_{assignee_name}.pdf"
         if assignee_name
