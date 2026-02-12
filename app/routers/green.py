@@ -627,6 +627,15 @@ def update_task(
 ):
     if status and status not in {"pending", "done", "overdue"}:
         raise HTTPException(status_code=400, detail="Invalid status")
+    existing = db.execute(text("""
+        SELECT id, status
+        FROM tree_tasks
+        WHERE id = :task_id
+    """), {"task_id": task_id}).mappings().first()
+    if not existing:
+        raise HTTPException(status_code=404, detail="Task not found")
+    if existing["status"] == "done":
+        raise HTTPException(status_code=409, detail="Task already done and locked")
     row = db.execute(text("""
         UPDATE tree_tasks
         SET status = COALESCE(:status, status),
@@ -636,9 +645,6 @@ def update_task(
         WHERE id = :task_id
         RETURNING tree_id, photo_url
     """), {"status": status, "notes": notes, "photo_url": photo_url, "task_id": task_id}).mappings().first()
-    if not row:
-        db.rollback()
-        raise HTTPException(status_code=404, detail="Task not found")
     resolved_photo = row.get("photo_url")
     if resolved_photo:
         db.execute(text("""
