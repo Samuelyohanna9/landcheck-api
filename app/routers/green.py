@@ -1,5 +1,5 @@
-from fastapi import APIRouter, Body, Depends, HTTPException, Query, UploadFile, File, Form
-from fastapi.responses import FileResponse
+from fastapi import APIRouter, Body, Depends, HTTPException, Query, UploadFile, File, Form, Request
+from fastapi.responses import FileResponse, StreamingResponse
 from sqlalchemy.orm import Session
 from sqlalchemy import text
 from datetime import datetime
@@ -11,6 +11,7 @@ from pathlib import Path
 from urllib.parse import quote, urlparse
 
 import boto3
+from botocore.exceptions import ClientError
 
 from app.db import SessionLocal
 from app.utils.green_pdf import render_green_report_pdf, render_green_work_report_pdf
@@ -190,8 +191,42 @@ def _build_r2_settings() -> dict:
     }
 
 
+def _make_r2_client(settings: dict):
+    return boto3.client(
+        "s3",
+        endpoint_url=settings["endpoint_url"],
+        aws_access_key_id=settings["access_key"],
+        aws_secret_access_key=settings["secret_key"],
+        region_name=settings["region"],
+    )
+
+
+@router.get("/uploads/object/{object_key:path}")
+def get_uploaded_photo(object_key: str):
+    settings = _build_r2_settings()
+    try:
+        client = _make_r2_client(settings)
+        obj = client.get_object(Bucket=settings["bucket"], Key=object_key)
+    except ClientError as exc:
+        code = (exc.response.get("Error") or {}).get("Code", "")
+        if code in {"NoSuchKey", "404", "NotFound"}:
+            raise HTTPException(status_code=404, detail="Photo not found.")
+        raise HTTPException(status_code=502, detail="Failed to read photo from storage.")
+    except Exception:
+        raise HTTPException(status_code=502, detail="Failed to read photo from storage.")
+
+    content_type = obj.get("ContentType") or "application/octet-stream"
+    cache_control = obj.get("CacheControl") or "public, max-age=86400"
+    return StreamingResponse(
+        obj["Body"].iter_chunks(),
+        media_type=content_type,
+        headers={"Cache-Control": cache_control},
+    )
+
+
 @router.post("/uploads/photo")
 async def upload_photo_to_r2(
+    request: Request,
     file: UploadFile = File(...),
     folder: str = Form(default="trees"),
 ):
@@ -229,13 +264,7 @@ async def upload_photo_to_r2(
     object_key = f"{safe_folder}/{date_path}/{uuid.uuid4().hex}{ext}"
 
     try:
-        client = boto3.client(
-            "s3",
-            endpoint_url=settings["endpoint_url"],
-            aws_access_key_id=settings["access_key"],
-            aws_secret_access_key=settings["secret_key"],
-            region_name=settings["region"],
-        )
+        client = _make_r2_client(settings)
         client.put_object(
             Bucket=settings["bucket"],
             Key=object_key,
@@ -247,7 +276,9 @@ async def upload_photo_to_r2(
         raise HTTPException(status_code=502, detail="Photo upload failed.")
 
     public_url = f"{settings['public_base']}/{quote(object_key, safe='/')}"
-    return {"url": public_url, "key": object_key}
+    app_base = str(request.base_url).rstrip("/")
+    proxy_url = f"{app_base}/green/uploads/object/{quote(object_key, safe='/')}"
+    return {"url": proxy_url, "key": object_key, "public_url": public_url}
 
 
 @router.post("/projects")
