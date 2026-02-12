@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Body, Depends, HTTPException, Query
+from fastapi import APIRouter, Body, Depends, HTTPException, Query, UploadFile, File, Form
 from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
 from sqlalchemy import text
@@ -6,6 +6,11 @@ from datetime import datetime
 import os
 import tempfile
 import csv
+import uuid
+from pathlib import Path
+from urllib.parse import quote, urlparse
+
+import boto3
 
 from app.db import SessionLocal
 from app.utils.green_pdf import render_green_report_pdf, render_green_work_report_pdf
@@ -131,6 +136,118 @@ def _load_env_token() -> str | None:
     except Exception:
         return None
     return None
+
+
+def _build_r2_settings() -> dict:
+    default_endpoint = "https://751ea1abdb3fb6ff7f276b3753e4c6a1.r2.cloudflarestorage.com"
+    default_bucket = "photosgreen"
+    default_public_base = f"{default_endpoint}/{default_bucket}"
+
+    endpoint_raw = (os.getenv("R2_ENDPOINT_URL") or default_endpoint).strip()
+    public_base = (os.getenv("R2_PUBLIC_BASE_URL") or default_public_base).strip()
+    bucket = (os.getenv("R2_BUCKET") or default_bucket).strip()
+    access_key = (os.getenv("R2_ACCESS_KEY_ID") or "").strip()
+    secret_key = (os.getenv("R2_SECRET_ACCESS_KEY") or "").strip()
+    region = (os.getenv("R2_REGION") or "auto").strip()
+
+    raw_for_parse = endpoint_raw or public_base
+    if not raw_for_parse:
+        raise HTTPException(
+            status_code=500,
+            detail="R2 is not configured. Set R2_ENDPOINT_URL (or R2_PUBLIC_BASE_URL), R2_BUCKET, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY.",
+        )
+
+    parsed = urlparse(raw_for_parse)
+    if not parsed.scheme or not parsed.netloc:
+        raise HTTPException(status_code=500, detail="Invalid R2 endpoint/public base URL format.")
+
+    path_parts = [part for part in parsed.path.split("/") if part]
+    if path_parts and not bucket:
+        bucket = path_parts[0]
+
+    endpoint_url = endpoint_raw.strip() if endpoint_raw else f"{parsed.scheme}://{parsed.netloc}"
+    endpoint_parsed = urlparse(endpoint_url)
+    endpoint_url = f"{endpoint_parsed.scheme}://{endpoint_parsed.netloc}"
+
+    if not public_base:
+        public_base = f"{endpoint_url.rstrip('/')}/{bucket}"
+
+    if not bucket:
+        raise HTTPException(status_code=500, detail="R2 bucket is not configured. Set R2_BUCKET.")
+    if not access_key or not secret_key:
+        raise HTTPException(
+            status_code=500,
+            detail="R2 credentials are not configured. Set R2_ACCESS_KEY_ID and R2_SECRET_ACCESS_KEY.",
+        )
+
+    return {
+        "endpoint_url": endpoint_url,
+        "public_base": public_base.rstrip("/"),
+        "bucket": bucket,
+        "access_key": access_key,
+        "secret_key": secret_key,
+        "region": region,
+    }
+
+
+@router.post("/uploads/photo")
+async def upload_photo_to_r2(
+    file: UploadFile = File(...),
+    folder: str = Form(default="trees"),
+):
+    content_type = (file.content_type or "").strip().lower()
+    if not content_type.startswith("image/"):
+        raise HTTPException(status_code=400, detail="Only image uploads are allowed.")
+
+    payload = await file.read()
+    if not payload:
+        raise HTTPException(status_code=400, detail="Uploaded file is empty.")
+
+    max_bytes = 10 * 1024 * 1024
+    if len(payload) > max_bytes:
+        raise HTTPException(status_code=413, detail="Image too large. Max size is 10MB.")
+
+    settings = _build_r2_settings()
+
+    ext = Path(file.filename or "").suffix.lower()
+    allowed_ext = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".heic", ".heif"}
+    if ext not in allowed_ext:
+        content_ext = {
+            "image/jpeg": ".jpg",
+            "image/png": ".png",
+            "image/webp": ".webp",
+            "image/gif": ".gif",
+            "image/bmp": ".bmp",
+            "image/heic": ".heic",
+            "image/heif": ".heif",
+        }
+        ext = content_ext.get(content_type, ".jpg")
+
+    folder_parts = [part for part in (folder or "trees").split("/") if part and part not in {".", ".."}]
+    safe_folder = "/".join(folder_parts) or "trees"
+    date_path = datetime.utcnow().strftime("%Y/%m")
+    object_key = f"{safe_folder}/{date_path}/{uuid.uuid4().hex}{ext}"
+
+    try:
+        client = boto3.client(
+            "s3",
+            endpoint_url=settings["endpoint_url"],
+            aws_access_key_id=settings["access_key"],
+            aws_secret_access_key=settings["secret_key"],
+            region_name=settings["region"],
+        )
+        client.put_object(
+            Bucket=settings["bucket"],
+            Key=object_key,
+            Body=payload,
+            ContentType=content_type,
+            CacheControl="public, max-age=31536000, immutable",
+        )
+    except Exception:
+        raise HTTPException(status_code=502, detail="Photo upload failed.")
+
+    public_url = f"{settings['public_base']}/{quote(object_key, safe='/')}"
+    return {"url": public_url, "key": object_key}
 
 
 @router.post("/projects")

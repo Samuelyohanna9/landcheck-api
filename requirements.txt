@@ -18,3 +18,5 @@ requests
 psycopg2-binary
 earthengine-api
 google-auth
+boto3
+python-multipart
