@@ -496,13 +496,24 @@ def list_work_orders(
     db: Session = Depends(get_db),
 ):
     rows = db.execute(text("""
-        SELECT id, project_id, assignee_name, work_type, target_trees,
-               maintenance_schedule, due_date, status, planted_count, visits_done,
-               last_update, created_at
-        FROM green_work_orders
-        WHERE project_id = :project_id
-          AND (:assignee_name IS NULL OR assignee_name = :assignee_name)
-        ORDER BY created_at DESC
+        WITH tree_counts AS (
+            SELECT created_by AS assignee_name, COUNT(*) AS planted
+            FROM trees
+            WHERE project_id = :project_id
+            GROUP BY created_by
+        )
+        SELECT o.id, o.project_id, o.assignee_name, o.work_type, o.target_trees,
+               o.maintenance_schedule, o.due_date, o.status,
+               CASE
+                   WHEN o.work_type = 'planting' THEN COALESCE(t.planted, 0)
+                   ELSE o.planted_count
+               END AS planted_count,
+               o.last_update, o.created_at
+        FROM green_work_orders o
+        LEFT JOIN tree_counts t ON t.assignee_name = o.assignee_name
+        WHERE o.project_id = :project_id
+          AND (:assignee_name IS NULL OR o.assignee_name = :assignee_name)
+        ORDER BY o.created_at DESC
     """), {"project_id": project_id, "assignee_name": assignee_name}).mappings().all()
     return [dict(r) for r in rows]
 
@@ -513,19 +524,30 @@ def update_work_order(
     db: Session = Depends(get_db),
     status: str | None = Body(default=None),
     planted_count: int | None = Body(default=None),
-    visits_done: int | None = Body(default=None),
 ):
+    # Auto-calc planted_count from trees created by assignee for planting orders.
+    row = db.execute(text("""
+        SELECT id, project_id, assignee_name, work_type
+        FROM green_work_orders
+        WHERE id = :work_id
+    """), {"work_id": work_id}).mappings().first()
+
+    planted_value = planted_count
+    if row and row["work_type"] == "planting":
+        planted_value = db.execute(text("""
+            SELECT COUNT(*) FROM trees
+            WHERE project_id = :project_id AND created_by = :assignee_name
+        """), {"project_id": row["project_id"], "assignee_name": row["assignee_name"]}).scalar()
+
     db.execute(text("""
         UPDATE green_work_orders
         SET status = COALESCE(:status, status),
             planted_count = COALESCE(:planted_count, planted_count),
-            visits_done = COALESCE(:visits_done, visits_done),
             last_update = NOW()
         WHERE id = :work_id
     """), {
         "status": status,
-        "planted_count": planted_count,
-        "visits_done": visits_done,
+        "planted_count": planted_value,
         "work_id": work_id,
     })
     db.commit()
@@ -537,9 +559,7 @@ def work_stats(project_id: int, db: Session = Depends(get_db)):
     orders = db.execute(text("""
         SELECT assignee_name,
                COUNT(*) AS orders,
-               SUM(target_trees) AS target_trees,
-               SUM(planted_count) AS planted_count,
-               SUM(visits_done) AS visits_done
+               SUM(target_trees) AS target_trees
         FROM green_work_orders
         WHERE project_id = :project_id
         GROUP BY assignee_name
@@ -551,18 +571,16 @@ def work_stats(project_id: int, db: Session = Depends(get_db)):
         WHERE project_id = :project_id
         GROUP BY created_by
     """), {"project_id": project_id}).mappings().all()
-
-    visit_counts = db.execute(text("""
-        SELECT created_by AS assignee_name, COUNT(*) AS visits_logged
-        FROM tree_visits
-        WHERE tree_id IN (SELECT id FROM trees WHERE project_id = :project_id)
-        GROUP BY created_by
-    """), {"project_id": project_id}).mappings().all()
+    tree_map = {r["assignee_name"]: r["trees_logged"] for r in tree_counts}
+    merged = []
+    for r in orders:
+        row = dict(r)
+        row["planted_count"] = tree_map.get(row.get("assignee_name"), 0)
+        merged.append(row)
 
     return {
-        "orders": [dict(r) for r in orders],
+        "orders": merged,
         "trees_by_user": [dict(r) for r in tree_counts],
-        "visits_by_user": [dict(r) for r in visit_counts],
     }
 
 
@@ -576,14 +594,13 @@ def export_work_stats_csv(project_id: int, db: Session = Depends(get_db)):
 
     with open(csv_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
-        writer.writerow(["assignee", "orders", "target_trees", "planted_count", "visits_done"])
+        writer.writerow(["assignee", "orders", "target_trees", "planted_count"])
         for r in stats["orders"]:
             writer.writerow([
                 r.get("assignee_name", ""),
                 r.get("orders", 0),
                 r.get("target_trees", 0),
                 r.get("planted_count", 0),
-                r.get("visits_done", 0),
             ])
 
     filename = f"project_{project_id}_work_stats.csv"

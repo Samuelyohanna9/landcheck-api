@@ -219,7 +219,6 @@ def render_green_work_report_pdf(output_path: str, project: dict, stats: dict):
     c.drawString(160, y, "Orders")
     c.drawString(220, y, "Target")
     c.drawString(280, y, "Planted")
-    c.drawString(350, y, "Visits")
     y -= 12
     c.setFont("Helvetica", 9)
 
@@ -231,7 +230,6 @@ def render_green_work_report_pdf(output_path: str, project: dict, stats: dict):
         c.drawString(160, y, str(r.get("orders", 0)))
         c.drawString(220, y, str(r.get("target_trees", 0)))
         c.drawString(280, y, str(r.get("planted_count", 0)))
-        c.drawString(350, y, str(r.get("visits_done", 0)))
         y -= 12
 
     c.showPage()
