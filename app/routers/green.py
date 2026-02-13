@@ -110,12 +110,25 @@ def ensure_green_tables(db: Session):
             created_at TIMESTAMP DEFAULT NOW()
         )
     """))
+    db.execute(text("""
+        CREATE TABLE IF NOT EXISTS green_species_maturity (
+            id SERIAL PRIMARY KEY,
+            project_id INTEGER NOT NULL REFERENCES tree_projects(id) ON DELETE CASCADE,
+            species_key TEXT NOT NULL,
+            species_label TEXT,
+            maturity_years INTEGER NOT NULL CHECK (maturity_years > 0),
+            updated_at TIMESTAMP DEFAULT NOW(),
+            created_at TIMESTAMP DEFAULT NOW(),
+            UNIQUE(project_id, species_key)
+        )
+    """))
     db.execute(text("CREATE INDEX IF NOT EXISTS idx_trees_project_id ON trees(project_id)"))
     db.execute(text("CREATE INDEX IF NOT EXISTS idx_trees_geom ON trees USING GIST (geom)"))
     db.execute(text("CREATE INDEX IF NOT EXISTS idx_tree_visits_tree_id ON tree_visits(tree_id)"))
     db.execute(text("CREATE INDEX IF NOT EXISTS idx_tree_tasks_tree_id ON tree_tasks(tree_id)"))
     db.execute(text("CREATE INDEX IF NOT EXISTS idx_green_users_name ON green_users(full_name)"))
     db.execute(text("CREATE INDEX IF NOT EXISTS idx_work_orders_project_id ON green_work_orders(project_id)"))
+    db.execute(text("CREATE INDEX IF NOT EXISTS idx_species_maturity_project_id ON green_species_maturity(project_id)"))
     db.commit()
 
 
@@ -425,6 +438,77 @@ def list_trees(project_id: int, db: Session = Depends(get_db)):
         ORDER BY created_at DESC
     """), {"project_id": project_id}).mappings().all()
     return [dict(r) for r in rows]
+
+
+@router.get("/projects/{project_id}/species-maturity")
+def get_species_maturity(project_id: int, db: Session = Depends(get_db)):
+    project_exists = db.execute(
+        text("SELECT 1 FROM tree_projects WHERE id = :project_id"),
+        {"project_id": project_id},
+    ).scalar()
+    if not project_exists:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    rows = db.execute(
+        text("""
+            SELECT species_key, species_label, maturity_years, updated_at
+            FROM green_species_maturity
+            WHERE project_id = :project_id
+            ORDER BY COALESCE(species_label, species_key) ASC
+        """),
+        {"project_id": project_id},
+    ).mappings().all()
+    items = [dict(row) for row in rows]
+    return {
+        "project_id": project_id,
+        "items": items,
+        "map": {row["species_key"]: int(row["maturity_years"]) for row in rows},
+    }
+
+
+@router.put("/projects/{project_id}/species-maturity")
+def upsert_species_maturity(
+    project_id: int,
+    db: Session = Depends(get_db),
+    species_key: str = Body(...),
+    maturity_years: int = Body(...),
+    species_label: str | None = Body(default=None),
+):
+    normalized_key = (species_key or "").strip().lower()
+    if not normalized_key:
+        raise HTTPException(status_code=400, detail="species_key is required")
+    if maturity_years < 1 or maturity_years > 50:
+        raise HTTPException(status_code=400, detail="maturity_years must be between 1 and 50")
+
+    project_exists = db.execute(
+        text("SELECT 1 FROM tree_projects WHERE id = :project_id"),
+        {"project_id": project_id},
+    ).scalar()
+    if not project_exists:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    cleaned_label = (species_label or "").strip() or None
+    row = db.execute(
+        text("""
+            INSERT INTO green_species_maturity (project_id, species_key, species_label, maturity_years)
+            VALUES (:project_id, :species_key, :species_label, :maturity_years)
+            ON CONFLICT (project_id, species_key)
+            DO UPDATE
+            SET
+                maturity_years = EXCLUDED.maturity_years,
+                species_label = COALESCE(EXCLUDED.species_label, green_species_maturity.species_label),
+                updated_at = NOW()
+            RETURNING project_id, species_key, species_label, maturity_years, updated_at
+        """),
+        {
+            "project_id": project_id,
+            "species_key": normalized_key,
+            "species_label": cleaned_label,
+            "maturity_years": int(maturity_years),
+        },
+    ).mappings().first()
+    db.commit()
+    return dict(row)
 
 
 @router.post("/trees")
