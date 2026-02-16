@@ -345,7 +345,7 @@ def _render_executive_summary(c, width, height, project, kpi_snapshot, carbon_da
 
     left_base_y = y - 148
     mini_h = 62
-    gap_h = 26
+    gap_h = 34
     top_chart_y = left_base_y + mini_h + gap_h
     _draw_mini_line_chart(
         c,
@@ -362,7 +362,7 @@ def _render_executive_summary(c, width, height, project, kpi_snapshot, carbon_da
     c.setFillColorRGB(0.45, 0.45, 0.45)
     c.drawString(40, top_chart_y - 10, "Context: monthly cumulative healthy share across planting cohorts (current status basis).")
     if trend_first_label or trend_last_label:
-        c.drawRightString(40 + chart_w, top_chart_y - 10, f"{trend_first_label} to {trend_last_label}".strip())
+        c.drawString(40, top_chart_y - 18, f"Period: {trend_first_label} to {trend_last_label}".strip())
 
     _draw_mini_line_chart(
         c,
@@ -379,7 +379,7 @@ def _render_executive_summary(c, width, height, project, kpi_snapshot, carbon_da
     c.setFillColorRGB(0.45, 0.45, 0.45)
     c.drawString(40, left_base_y - 12, "Context: monthly cumulative completion of required-proof task evidence.")
     if trend_first_label or trend_last_label:
-        c.drawRightString(40 + chart_w, left_base_y - 12, f"{trend_first_label} to {trend_last_label}".strip())
+        c.drawString(40, left_base_y - 20, f"Period: {trend_first_label} to {trend_last_label}".strip())
 
     # Top species by CO2 (right)
     top_species = carbon_data.get("top_species", []) if carbon_data else []
