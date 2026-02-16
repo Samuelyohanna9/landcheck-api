@@ -1082,9 +1082,11 @@ def ensure_green_tables(db: Session):
 
 
 def _load_env_token() -> str | None:
-    token = os.environ.get("MAPBOX_TOKEN") or os.environ.get("VITE_MAPBOX_TOKEN")
-    if token:
-        return token.strip().strip('"').strip("'")
+    token_keys = ("MAPBOX_TOKEN", "MAPBOX_ACCESS_TOKEN", "MAPBOX_PUBLIC_TOKEN", "VITE_MAPBOX_TOKEN")
+    for key in token_keys:
+        token = os.environ.get(key)
+        if token:
+            return token.strip().strip('"').strip("'")
     env_path = os.path.join(BASE_DIR, "..", ".env")
     if not os.path.exists(env_path):
         return None
@@ -1094,11 +1096,92 @@ def _load_env_token() -> str | None:
                 if line.strip().startswith("#") or "=" not in line:
                     continue
                 key, val = line.strip().split("=", 1)
-                if key in {"MAPBOX_TOKEN", "VITE_MAPBOX_TOKEN"}:
+                if key in {"MAPBOX_TOKEN", "MAPBOX_ACCESS_TOKEN", "MAPBOX_PUBLIC_TOKEN", "VITE_MAPBOX_TOKEN"}:
                     return val.strip().strip('"').strip("'")
     except Exception:
         return None
     return None
+
+
+def _http_get_binary(url: str, timeout: int = 15) -> bytes | None:
+    try:
+        import requests
+
+        resp = requests.get(url, timeout=timeout)
+        if resp.status_code == 200 and resp.content:
+            return resp.content
+    except Exception:
+        pass
+
+    try:
+        import urllib.request
+
+        req = urllib.request.Request(url, headers={"User-Agent": "LandCheck/1.0"})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = resp.read()
+            if data:
+                return data
+    except Exception:
+        return None
+    return None
+
+
+def _build_report_map_png(
+    map_rows: list[dict],
+    lng: float | None = None,
+    lat: float | None = None,
+    zoom: float | None = None,
+    bearing: float | None = 0.0,
+    pitch: float | None = 0.0,
+) -> bytes | None:
+    if not map_rows:
+        return None
+
+    lats = [r.get("lat") for r in map_rows if r.get("lat") is not None]
+    lngs = [r.get("lng") for r in map_rows if r.get("lng") is not None]
+    if not lats or not lngs:
+        return None
+
+    center_lat = lat if lat is not None else sum(lats) / len(lats)
+    center_lng = lng if lng is not None else sum(lngs) / len(lngs)
+    z = zoom if zoom is not None else 13
+    b = bearing or 0
+    p = pitch or 0
+
+    token = _load_env_token()
+    if token:
+        markers = []
+        for r in map_rows[:60]:
+            if r.get("lng") is None or r.get("lat") is None:
+                continue
+            color = _tree_status_color_hex(r.get("status"))
+            markers.append(f"pin-s+{color}({r['lng']},{r['lat']})")
+        overlay = ",".join(markers) if markers else ""
+        overlay_part = f"{quote(overlay, safe='(),:+')}/" if overlay else ""
+        for style in ("mapbox/satellite-streets-v12", "mapbox/satellite-v9"):
+            if overlay:
+                url = (
+                    f"https://api.mapbox.com/styles/v1/{style}/static/"
+                    f"{overlay_part}{center_lng},{center_lat},{z},{b},{p}/800x500@2x?access_token={token}"
+                )
+                map_png = _http_get_binary(url)
+                if map_png:
+                    return map_png
+            url = (
+                f"https://api.mapbox.com/styles/v1/{style}/static/"
+                f"{center_lng},{center_lat},{z},{b},{p}/800x500@2x?access_token={token}"
+            )
+            map_png = _http_get_binary(url)
+            if map_png:
+                return map_png
+
+    markers = "|".join([f"{r['lat']},{r['lng']},lightgreen1" for r in map_rows[:50] if r.get("lat") is not None and r.get("lng") is not None])
+    marker_qs = quote(markers, safe="|,")
+    osm_url = (
+        "https://staticmap.openstreetmap.de/staticmap.php?"
+        f"center={center_lat},{center_lng}&zoom={int(round(z))}&size=800x500&markers={marker_qs}"
+    )
+    return _http_get_binary(osm_url)
 
 
 def _build_r2_settings() -> dict:
@@ -1821,9 +1904,6 @@ def update_task(
         raise HTTPException(status_code=404, detail="Task not found")
     if _normalize_name(existing.get("review_state")) == "approved":
         raise HTTPException(status_code=409, detail="Task already approved and locked")
-    if _normalize_name(existing.get("task_type")) != "inspection":
-        normalized_tree_status = None
-
     next_status = status or existing.get("status")
     next_notes = notes if notes is not None else existing.get("notes")
     next_photo = photo_url if photo_url is not None else existing.get("photo_url")
@@ -1976,9 +2056,6 @@ def submit_task_for_review(
         raise HTTPException(status_code=404, detail="Task not found")
     if _normalize_name(task.get("review_state")) == "approved":
         raise HTTPException(status_code=409, detail="Task already approved and locked")
-    if _normalize_name(task.get("task_type")) != "inspection":
-        normalized_tree_status = None
-
     merged_notes = notes if notes is not None else task.get("notes")
     merged_photo = photo_url if photo_url is not None else task.get("photo_url")
     evidence_ok, detail = _has_required_evidence(task.get("task_type"), merged_notes, merged_photo)
@@ -2099,9 +2176,8 @@ def review_submitted_task(
                 "review_notes": review_notes or None,
             },
         )
-        task_type = _normalize_name(task.get("task_type"))
         reported_tree_status = _normalize_tree_status(task.get("reported_tree_status"))
-        if task_type == "inspection" and reported_tree_status in TREE_STATUS_VALUES:
+        if reported_tree_status in TREE_STATUS_VALUES:
             db.execute(
                 text("""
                     UPDATE trees
@@ -3559,60 +3635,14 @@ def export_project_pdf(
     pdf_path = tmp_pdf.name
     tmp_pdf.close()
 
-    map_png = None
-    token = _load_env_token()
-    if token and map_rows:
-        lats = [r["lat"] for r in map_rows if r["lat"] is not None]
-        lngs = [r["lng"] for r in map_rows if r["lng"] is not None]
-        if lats and lngs:
-            center_lat = lat if lat is not None else sum(lats) / len(lats)
-            center_lng = lng if lng is not None else sum(lngs) / len(lngs)
-            z = zoom if zoom is not None else 13
-            b = bearing or 0
-            p = pitch or 0
-            import urllib.parse
-            markers = []
-            for r in map_rows[:120]:
-                if r["lng"] is None or r["lat"] is None:
-                    continue
-                color = _tree_status_color_hex(r.get("status"))
-                markers.append(f"pin-s+{color}({r['lng']},{r['lat']})")
-            overlay = ",".join(markers) if markers else None
-            overlay_part = f"{urllib.parse.quote(overlay, safe='(),:+')}/" if overlay else ""
-            url = (
-                "https://api.mapbox.com/styles/v1/mapbox/satellite-streets-v12/static/"
-                f"{overlay_part}{center_lng},{center_lat},{z},{b},{p}/800x500@2x?access_token={token}"
-            )
-            try:
-                import requests
-                resp = requests.get(url, timeout=15)
-                if resp.status_code == 200:
-                    map_png = resp.content
-            except Exception:
-                map_png = None
-
-    if map_png is None and map_rows:
-        # Fallback to OpenStreetMap static image
-        try:
-            import requests
-            import urllib.parse
-            lats = [r["lat"] for r in map_rows if r["lat"] is not None]
-            lngs = [r["lng"] for r in map_rows if r["lng"] is not None]
-            if lats and lngs:
-                center_lat = lat if lat is not None else sum(lats) / len(lats)
-                center_lng = lng if lng is not None else sum(lngs) / len(lngs)
-                z = int(round(zoom)) if zoom is not None else 13
-                markers = "|".join([f"{r['lat']},{r['lng']},lightgreen1" for r in map_rows[:50]])
-                marker_qs = urllib.parse.quote(markers, safe="|,")
-                osm_url = (
-                    "https://staticmap.openstreetmap.de/staticmap.php?"
-                    f"center={center_lat},{center_lng}&zoom={z}&size=800x500&markers={marker_qs}"
-                )
-                resp = requests.get(osm_url, timeout=15)
-                if resp.status_code == 200:
-                    map_png = resp.content
-        except Exception:
-            map_png = None
+    map_png = _build_report_map_png(
+        map_rows=map_rows,
+        lng=lng,
+        lat=lat,
+        zoom=zoom,
+        bearing=bearing,
+        pitch=pitch,
+    )
 
     map_view = None
     if lng is not None and lat is not None and zoom is not None:
@@ -3708,59 +3738,14 @@ def export_work_report_pdf(
     pdf_path = tmp_pdf.name
     tmp_pdf.close()
 
-    map_png = None
-    token = _load_env_token()
-    if token and map_rows:
-        lats = [r["lat"] for r in map_rows if r["lat"] is not None]
-        lngs = [r["lng"] for r in map_rows if r["lng"] is not None]
-        if lats and lngs:
-            center_lat = lat if lat is not None else sum(lats) / len(lats)
-            center_lng = lng if lng is not None else sum(lngs) / len(lngs)
-            z = zoom if zoom is not None else 13
-            b = bearing or 0
-            p = pitch or 0
-            import urllib.parse
-            markers = []
-            for r in map_rows[:120]:
-                if r["lng"] is None or r["lat"] is None:
-                    continue
-                color = _tree_status_color_hex(r.get("status"))
-                markers.append(f"pin-s+{color}({r['lng']},{r['lat']})")
-            overlay = ",".join(markers) if markers else None
-            overlay_part = f"{urllib.parse.quote(overlay, safe='(),:+')}/" if overlay else ""
-            url = (
-                "https://api.mapbox.com/styles/v1/mapbox/satellite-streets-v12/static/"
-                f"{overlay_part}{center_lng},{center_lat},{z},{b},{p}/800x500@2x?access_token={token}"
-            )
-            try:
-                import requests
-                resp = requests.get(url, timeout=15)
-                if resp.status_code == 200:
-                    map_png = resp.content
-            except Exception:
-                map_png = None
-
-    if map_png is None and map_rows:
-        try:
-            import requests
-            import urllib.parse
-            lats = [r["lat"] for r in map_rows if r["lat"] is not None]
-            lngs = [r["lng"] for r in map_rows if r["lng"] is not None]
-            if lats and lngs:
-                center_lat = lat if lat is not None else sum(lats) / len(lats)
-                center_lng = lng if lng is not None else sum(lngs) / len(lngs)
-                z = int(round(zoom)) if zoom is not None else 13
-                markers = "|".join([f"{r['lat']},{r['lng']},lightgreen1" for r in map_rows[:50]])
-                marker_qs = urllib.parse.quote(markers, safe="|,")
-                osm_url = (
-                    "https://staticmap.openstreetmap.de/staticmap.php?"
-                    f"center={center_lat},{center_lng}&zoom={z}&size=800x500&markers={marker_qs}"
-                )
-                resp = requests.get(osm_url, timeout=15)
-                if resp.status_code == 200:
-                    map_png = resp.content
-        except Exception:
-            map_png = None
+    map_png = _build_report_map_png(
+        map_rows=map_rows,
+        lng=lng,
+        lat=lat,
+        zoom=zoom,
+        bearing=bearing,
+        pitch=pitch,
+    )
 
     map_view = None
     if lng is not None and lat is not None and zoom is not None:
