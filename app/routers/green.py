@@ -7,7 +7,9 @@ import json
 import os
 import tempfile
 import csv
+import io
 import uuid
+import zipfile
 from pathlib import Path
 from urllib.parse import quote, unquote, urlparse
 
@@ -48,6 +50,20 @@ LIVE_SOURCE_REFERENCES = [
     {
         "label": "NiMet seasonal outlook context for local onset/dry-period planning",
         "url": "https://www.nimet.gov.ng/news?id=94",
+    },
+]
+VERRA_VCS_REFERENCES = [
+    {
+        "label": "Verra - Verified Carbon Standard (program overview)",
+        "url": "https://verra.org/programs/verified-carbon-standard/",
+    },
+    {
+        "label": "Verra - VCS program rules and requirements",
+        "url": "https://verra.org/project/vcs-program-rules-and-requirements/",
+    },
+    {
+        "label": "Verra - Monitoring report templates and guidance (official resources page)",
+        "url": "https://verra.org/project/vcs-program-rules-and-requirements/",
     },
 ]
 
@@ -3235,6 +3251,886 @@ def _store_kpi_snapshot(project_id: int, metrics: dict, db: Session):
         {"project_id": project_id, "metrics": _safe_json(metrics)},
     )
 
+
+def _to_iso_text(value: object) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, date):
+        return value.isoformat()
+    return str(value)
+
+
+def _build_verra_vcs_payload(
+    project_id: int,
+    db: Session,
+    season_mode: str = "rainy",
+    assignee_name: str | None = None,
+) -> dict:
+    project = get_project(project_id, db)
+    season = "dry" if _normalize_name(season_mode) == "dry" else "rainy"
+    assignee_clean = (assignee_name or "").strip() or None
+
+    tree_rows_raw = db.execute(
+        text(
+            """
+            SELECT id, project_id, species, planting_date, status, notes, photo_url, created_by, created_at,
+                   ST_X(geom) AS lng, ST_Y(geom) AS lat
+            FROM trees
+            WHERE project_id = :project_id
+              AND (:assignee_name IS NULL OR created_by = :assignee_name)
+            ORDER BY created_at ASC, id ASC
+            """
+        ),
+        {"project_id": project_id, "assignee_name": assignee_clean},
+    ).mappings().all()
+    tree_rows = [dict(row) for row in tree_rows_raw]
+    maintenance_rows = _maintenance_summary_by_tree(project_id, db, assignee_clean)
+    tree_rows = _attach_maintenance_to_tree_rows(tree_rows, maintenance_rows)
+    review_summary = _review_summary_by_tree(project_id, db, assignee_clean)
+    for tree in tree_rows:
+        review = review_summary.get(int(tree.get("id") or 0), {})
+        tree["review_submitted"] = int(review.get("review_submitted", 0))
+        tree["review_approved"] = int(review.get("review_approved", 0))
+        tree["review_rejected"] = int(review.get("review_rejected", 0))
+        tree["last_review_state"] = review.get("last_review_state", "")
+        tree["last_review_note"] = review.get("last_review_note", "")
+        tree["last_submitted_at"] = review.get("last_submitted_at")
+        tree["last_reviewed_at"] = review.get("last_reviewed_at")
+
+    task_rows_raw = db.execute(
+        text(
+            """
+            SELECT t.id, t.tree_id, t.task_type, t.assignee_name, t.due_date, t.priority,
+                   t.status, t.notes, t.photo_url, t.created_at, t.completed_at, t.review_state,
+                   t.submitted_at, t.reviewed_at, t.reviewed_by, t.review_notes, t.auto_generated,
+                   t.model_season, t.source_task_id, t.reported_tree_status,
+                   tr.status AS tree_status, tr.species AS tree_species
+            FROM tree_tasks t
+            JOIN trees tr ON tr.id = t.tree_id
+            WHERE tr.project_id = :project_id
+              AND COALESCE(t.auto_generated, FALSE) = FALSE
+              AND (:assignee_name IS NULL OR t.assignee_name = :assignee_name)
+            ORDER BY t.created_at ASC, t.id ASC
+            """
+        ),
+        {"project_id": project_id, "assignee_name": assignee_clean},
+    ).mappings().all()
+    task_rows = [dict(row) for row in task_rows_raw]
+
+    donor_rows = _build_donor_report_rows(project_id, db)
+    if assignee_clean:
+        assignee_key = _normalize_name(assignee_clean)
+        donor_rows = [row for row in donor_rows if _normalize_name(row.get("assignee_name")) == assignee_key]
+
+    live_payload = _compute_live_maintenance_rows(
+        db=db,
+        project_id=project_id,
+        season_mode=season,
+        assignee_name=assignee_clean,
+    )
+
+    species_maturity_rows = db.execute(
+        text(
+            """
+            SELECT species_key, species_label, maturity_years, updated_at
+            FROM green_species_maturity
+            WHERE project_id = :project_id
+            ORDER BY COALESCE(species_label, species_key) ASC
+            """
+        ),
+        {"project_id": project_id},
+    ).mappings().all()
+    species_maturity = [dict(row) for row in species_maturity_rows]
+
+    scope_tree_rows_for_carbon = [
+        {
+            "id": row.get("id"),
+            "species": row.get("species"),
+            "planting_date": row.get("planting_date"),
+            "status": row.get("status"),
+            "created_at": row.get("created_at"),
+        }
+        for row in tree_rows
+    ]
+    carbon = compute_project_carbon(scope_tree_rows_for_carbon, projection_years=40)
+    carbon_projection = generate_co2_projection_table(scope_tree_rows_for_carbon, years=40)
+
+    total_trees = len(tree_rows)
+    trees_healthy = sum(
+        1 for row in tree_rows if _normalize_tree_status(row.get("status")) in HEALTHY_TREE_STATUSES
+    )
+    trees_dead_or_removed = sum(
+        1 for row in tree_rows if _normalize_tree_status(row.get("status")) in DEAD_TREE_STATUSES
+    )
+    trees_attention = sum(
+        1 for row in tree_rows if _normalize_tree_status(row.get("status")) in ATTENTION_TREE_STATUSES
+    )
+    trees_pending_planting = sum(
+        1 for row in tree_rows if _normalize_tree_status(row.get("status")) == "pending_planting"
+    )
+    survival_rate = round((trees_healthy / total_trees) * 100, 1) if total_trees else 0.0
+
+    today = date.today()
+    tasks_total = len(task_rows)
+    tasks_submitted = 0
+    tasks_approved = 0
+    tasks_rejected = 0
+    tasks_open = 0
+    tasks_overdue = 0
+    evidence_required = 0
+    evidence_complete = 0
+    for task in task_rows:
+        review_state = _normalize_name(task.get("review_state") or "none")
+        status = _normalize_name(task.get("status") or "pending")
+        due_date = _parse_date_value(task.get("due_date"))
+        if review_state == "submitted":
+            tasks_submitted += 1
+        if review_state == "approved":
+            tasks_approved += 1
+        if review_state == "rejected":
+            tasks_rejected += 1
+        if not (_is_done_status(status) and review_state in {"approved", "none"}):
+            tasks_open += 1
+        if due_date and due_date < today and not (_is_done_status(status) and review_state in {"approved", "none"}):
+            tasks_overdue += 1
+        policy = _task_needs_evidence(task.get("task_type"))
+        evidence_ok, _ = _has_required_evidence(task.get("task_type"), task.get("notes"), task.get("photo_url"))
+        evidence_in_scope = _is_done_status(status) or review_state in {"submitted", "approved", "rejected"}
+        if (policy.get("require_notes") or policy.get("require_photo")) and evidence_in_scope:
+            evidence_required += 1
+            if evidence_ok:
+                evidence_complete += 1
+    if evidence_required > 0:
+        evidence_complete_rate = round((evidence_complete / evidence_required) * 100, 1)
+    elif tasks_total > 0:
+        evidence_complete_rate = 100.0
+    else:
+        evidence_complete_rate = 0.0
+
+    monitoring_start_candidates: list[date] = []
+    for row in tree_rows:
+        planting_date = _parse_date_value(row.get("planting_date"))
+        created_stamp = _parse_date_value(row.get("created_at"))
+        if planting_date:
+            monitoring_start_candidates.append(planting_date)
+        elif created_stamp:
+            monitoring_start_candidates.append(created_stamp)
+    monitoring_start = min(monitoring_start_candidates) if monitoring_start_candidates else None
+
+    species_map: dict[str, dict] = {}
+    for row in tree_rows:
+        raw_species = (row.get("species") or "").strip()
+        species_label = raw_species if raw_species else "Unspecified"
+        species_key = f"{species_label.lower()}::{_normalize_species_key(raw_species)}"
+        model_species = _get_species_params(raw_species).get("label", "Medium-growth tropical (default)")
+        status_key = _normalize_tree_status(row.get("status"))
+        entry = species_map.setdefault(
+            species_key,
+            {
+                "species_input": species_label,
+                "model_species": model_species,
+                "tree_count": 0,
+                "healthy": 0,
+                "attention": 0,
+                "dead_or_removed": 0,
+                "pending_planting": 0,
+                "last_recorded_date": "",
+            },
+        )
+        entry["tree_count"] += 1
+        if status_key in HEALTHY_TREE_STATUSES:
+            entry["healthy"] += 1
+        if status_key in ATTENTION_TREE_STATUSES:
+            entry["attention"] += 1
+        if status_key in DEAD_TREE_STATUSES:
+            entry["dead_or_removed"] += 1
+        if status_key == "pending_planting":
+            entry["pending_planting"] += 1
+        last_date = _to_iso_text(row.get("created_at"))
+        if last_date and last_date > entry["last_recorded_date"]:
+            entry["last_recorded_date"] = last_date
+    species_summary = sorted(
+        species_map.values(),
+        key=lambda item: (-(item.get("tree_count") or 0), item.get("species_input") or ""),
+    )
+
+    task_type_map: dict[str, dict] = {}
+    for row in donor_rows:
+        activity = _normalize_name(row.get("task_type")) or "unknown"
+        entry = task_type_map.setdefault(
+            activity,
+            {
+                "task_type": activity,
+                "total": 0,
+                "open": 0,
+                "submitted": 0,
+                "approved": 0,
+                "rejected": 0,
+                "overdue": 0,
+                "with_photo": 0,
+                "with_notes": 0,
+                "avg_delay_days": 0.0,
+                "_delay_sum": 0.0,
+                "_delay_count": 0,
+            },
+        )
+        entry["total"] += 1
+        review_state = _normalize_name(row.get("review_state") or "none")
+        status = _normalize_name(row.get("status") or "pending")
+        due_date = _parse_date_value(row.get("due_date"))
+        if review_state == "submitted":
+            entry["submitted"] += 1
+        if review_state == "approved":
+            entry["approved"] += 1
+        if review_state == "rejected":
+            entry["rejected"] += 1
+        if not (_is_done_status(status) and review_state in {"approved", "none"}):
+            entry["open"] += 1
+        if due_date and due_date < today and not (_is_done_status(status) and review_state in {"approved", "none"}):
+            entry["overdue"] += 1
+        if (row.get("photo_url") or "").strip():
+            entry["with_photo"] += 1
+        if (row.get("notes") or "").strip():
+            entry["with_notes"] += 1
+        delay_days = row.get("delay_days")
+        if isinstance(delay_days, int):
+            entry["_delay_sum"] += float(delay_days)
+            entry["_delay_count"] += 1
+    for entry in task_type_map.values():
+        if entry["_delay_count"] > 0:
+            entry["avg_delay_days"] = round(entry["_delay_sum"] / entry["_delay_count"], 1)
+        entry.pop("_delay_sum", None)
+        entry.pop("_delay_count", None)
+    task_type_summary = sorted(task_type_map.values(), key=lambda item: item.get("task_type") or "")
+
+    order_rows = db.execute(
+        text(
+            """
+            SELECT assignee_name, work_type, target_trees, maintenance_schedule, due_date, status, created_at
+            FROM green_work_orders
+            WHERE project_id = :project_id
+              AND (:assignee_name IS NULL OR LOWER(TRIM(assignee_name)) = LOWER(TRIM(:assignee_name)))
+            ORDER BY created_at DESC, id DESC
+            """
+        ),
+        {"project_id": project_id, "assignee_name": assignee_clean},
+    ).mappings().all()
+    staff_map: dict[str, dict] = {}
+
+    def _staff_entry(name: str) -> dict:
+        key = _normalize_name(name)
+        label = name.strip() if name.strip() else "Unassigned"
+        if key not in staff_map:
+            staff_map[key] = {
+                "staff_name": label,
+                "trees_recorded": 0,
+                "trees_approved": 0,
+                "tasks_total": 0,
+                "tasks_open": 0,
+                "tasks_submitted": 0,
+                "tasks_approved": 0,
+                "tasks_rejected": 0,
+                "orders_total": 0,
+                "planting_target_trees": 0,
+                "maintenance_orders": 0,
+                "last_activity_at": "",
+            }
+        return staff_map[key]
+
+    for row in tree_rows:
+        name = str(row.get("created_by") or "Unassigned")
+        entry = _staff_entry(name)
+        entry["trees_recorded"] += 1
+        if _normalize_tree_status(row.get("status")) != "pending_planting":
+            entry["trees_approved"] += 1
+        created_at = _to_iso_text(row.get("created_at"))
+        if created_at and created_at > entry["last_activity_at"]:
+            entry["last_activity_at"] = created_at
+
+    for row in task_rows:
+        name = str(row.get("assignee_name") or "Unassigned")
+        entry = _staff_entry(name)
+        entry["tasks_total"] += 1
+        review_state = _normalize_name(row.get("review_state") or "none")
+        status = _normalize_name(row.get("status") or "pending")
+        if review_state == "submitted":
+            entry["tasks_submitted"] += 1
+        if review_state == "approved":
+            entry["tasks_approved"] += 1
+        if review_state == "rejected":
+            entry["tasks_rejected"] += 1
+        if not (_is_done_status(status) and review_state in {"approved", "none"}):
+            entry["tasks_open"] += 1
+        timestamps = [
+            _to_iso_text(row.get("created_at")),
+            _to_iso_text(row.get("completed_at")),
+            _to_iso_text(row.get("submitted_at")),
+            _to_iso_text(row.get("reviewed_at")),
+        ]
+        for stamp in timestamps:
+            if stamp and stamp > entry["last_activity_at"]:
+                entry["last_activity_at"] = stamp
+
+    for row in order_rows:
+        name = str(row.get("assignee_name") or "Unassigned")
+        entry = _staff_entry(name)
+        entry["orders_total"] += 1
+        if _normalize_name(row.get("work_type")) == "planting":
+            entry["planting_target_trees"] += int(row.get("target_trees") or 0)
+        elif _normalize_name(row.get("work_type")) == "maintenance":
+            entry["maintenance_orders"] += 1
+        created_at = _to_iso_text(row.get("created_at"))
+        if created_at and created_at > entry["last_activity_at"]:
+            entry["last_activity_at"] = created_at
+    staff_summary = sorted(staff_map.values(), key=lambda item: item.get("staff_name") or "")
+
+    risk_items: list[dict] = []
+    for item in live_payload.get("rows", []):
+        tone = item.get("tone") or "ok"
+        if tone not in {"danger", "warning"}:
+            continue
+        risk_items.append(
+            {
+                "tree_id": item.get("treeId"),
+                "activity": item.get("activity"),
+                "status_text": item.get("statusText"),
+                "indicator": item.get("indicator"),
+                "effective_due_date": item.get("effectiveDueDate"),
+                "countdown_days": item.get("countdownDays"),
+                "open_task_id": item.get("openTaskId"),
+                "severity": "high" if tone == "danger" else "medium",
+            }
+        )
+
+    manual_fields_required = [
+        {
+            "field": "VCS methodology reference (e.g., VMxxxx)",
+            "status": "manual_input_required",
+            "note": "Attach the approved methodology and version used for this project.",
+        },
+        {
+            "field": "Project boundary and strata definitions",
+            "status": "manual_input_required",
+            "note": "Provide shapefiles/boundary narrative aligned with Verra requirements.",
+        },
+        {
+            "field": "Leakage, non-permanence, and uncertainty treatment",
+            "status": "manual_input_required",
+            "note": "Document assumptions and verifier-ready calculations.",
+        },
+        {
+            "field": "Validation/verification body statements",
+            "status": "manual_input_required",
+            "note": "To be filled during third-party assurance workflow.",
+        },
+    ]
+
+    payload = {
+        "template": {
+            "name": "LandCheck Verra VCS Structured Monitoring Template",
+            "version": "1.0",
+            "aligned_standard": "Verra Verified Carbon Standard (VCS)",
+            "generated_at_utc": datetime.utcnow().isoformat() + "Z",
+            "data_mode": "live_project_snapshot",
+            "refresh_behavior": "Automatically recomputed from project records on each export.",
+            "scope_note": "This package pre-fills structured monitoring data and annex tables for drafting. Final VCS submission text and verifier evidence remain required.",
+        },
+        "project": {
+            "id": project.get("id"),
+            "name": project.get("name") or "",
+            "location_text": project.get("location_text") or "",
+            "sponsor": project.get("sponsor") or "",
+            "created_at": _to_iso_text(project.get("created_at")),
+        },
+        "monitoring_period": {
+            "start_date": _to_date_input(monitoring_start),
+            "end_date": _to_date_input(today),
+            "duration_days": _day_diff(today, monitoring_start) if monitoring_start else 0,
+            "season_model": season,
+            "assignee_filter": assignee_clean or "all",
+        },
+        "section_1_project_identification": {
+            "project_summary": {
+                "total_trees": total_trees,
+                "trees_healthy": trees_healthy,
+                "trees_dead_or_removed": trees_dead_or_removed,
+                "trees_attention": trees_attention,
+                "trees_pending_planting": trees_pending_planting,
+                "survival_rate_percent": survival_rate,
+            },
+            "species_count": len(species_summary),
+            "staff_count": len(staff_summary),
+        },
+        "section_2_activity_monitoring": {
+            "task_snapshot": {
+                "tasks_total": tasks_total,
+                "tasks_open": tasks_open,
+                "tasks_submitted": tasks_submitted,
+                "tasks_approved": tasks_approved,
+                "tasks_rejected": tasks_rejected,
+                "tasks_overdue": tasks_overdue,
+            },
+            "task_type_summary": task_type_summary,
+            "live_maintenance_summary": live_payload.get("summary", {}),
+            "high_risk_items": risk_items[:200],
+        },
+        "section_3_ghg_quantification": {
+            "co2_current_tonnes": carbon.get("current_co2_tonnes", 0),
+            "co2_annual_tonnes": carbon.get("annual_co2_tonnes", 0),
+            "co2_projected_lifetime_tonnes": carbon.get("projected_lifetime_co2_tonnes", 0),
+            "co2_average_per_tree_kg": carbon.get("co2_per_tree_avg_kg", 0),
+            "methodology": carbon.get("methodology"),
+            "top_species_by_co2": carbon.get("top_species", []),
+            "projection_table": carbon_projection,
+            "carbon_data_quality": {
+                "trees_missing_age_data": carbon.get("trees_missing_age_data", 0),
+                "trees_with_fallback_age": carbon.get("trees_with_fallback_age", 0),
+                "trees_pending_review": carbon.get("trees_pending_review", 0),
+            },
+        },
+        "section_4_qa_qc_and_evidence": {
+            "evidence_required_tasks": evidence_required,
+            "evidence_complete_tasks": evidence_complete,
+            "evidence_complete_rate_percent": evidence_complete_rate,
+            "recent_review_timeline": donor_rows[:500],
+        },
+        "section_5_reversal_and_risk_tracking": {
+            "tree_status_distribution": {
+                "healthy": trees_healthy,
+                "attention": trees_attention,
+                "dead_or_removed": trees_dead_or_removed,
+                "pending_planting": trees_pending_planting,
+            },
+            "risk_indicators": {
+                "live_danger_rows": int(live_payload.get("summary", {}).get("danger", 0)),
+                "live_warning_rows": int(live_payload.get("summary", {}).get("warning", 0)),
+                "overdue_tasks": tasks_overdue,
+                "rejected_tasks": tasks_rejected,
+            },
+        },
+        "section_6_annex_data_tables": {
+            "tree_inventory_count": len(tree_rows),
+            "task_timeline_count": len(donor_rows),
+            "live_maintenance_count": len(live_payload.get("rows", [])),
+            "species_summary_count": len(species_summary),
+            "staff_summary_count": len(staff_summary),
+            "species_maturity_rules_count": len(species_maturity),
+        },
+        "species_summary": species_summary,
+        "staff_summary": staff_summary,
+        "species_maturity_rules": species_maturity,
+        "manual_fields_required_for_submission": manual_fields_required,
+        "source_references": [*VERRA_VCS_REFERENCES, *LIVE_SOURCE_REFERENCES],
+    }
+
+    return {
+        "payload": payload,
+        "trees": tree_rows,
+        "tasks": task_rows,
+        "donor_rows": donor_rows,
+        "live_rows": live_payload.get("rows", []),
+        "species_summary": species_summary,
+        "staff_summary": staff_summary,
+        "species_maturity": species_maturity,
+    }
+
+
+def _write_csv_to_zip(zf: zipfile.ZipFile, filename: str, headers: list[str], rows: list[list[object]]):
+    sio = io.StringIO()
+    writer = csv.writer(sio)
+    writer.writerow(headers)
+    for row in rows:
+        writer.writerow([_to_iso_text(value) for value in row])
+    zf.writestr(filename, sio.getvalue())
+
+
+def _render_verra_vcs_zip(package: dict) -> io.BytesIO:
+    payload = package.get("payload") or {}
+    trees = package.get("trees") or []
+    tasks = package.get("tasks") or []
+    donor_rows = package.get("donor_rows") or []
+    live_rows = package.get("live_rows") or []
+    species_summary = package.get("species_summary") or []
+    staff_summary = package.get("staff_summary") or []
+    species_maturity = package.get("species_maturity") or []
+
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("01_verra_vcs_template.json", json.dumps(payload, indent=2, default=str))
+        readme_lines = [
+            "LandCheck Verra VCS Structured Export Package",
+            "",
+            "Purpose:",
+            "- Pre-fills monitoring data in a Verra-aligned structure using live project records.",
+            "- Regenerates on every export request to reflect latest project growth and reviews.",
+            "",
+            "Included files:",
+            "- 01_verra_vcs_template.json",
+            "- 02_tree_inventory.csv",
+            "- 03_task_activity.csv",
+            "- 04_review_timeline.csv",
+            "- 05_live_maintenance_table.csv",
+            "- 06_species_summary.csv",
+            "- 07_staff_summary.csv",
+            "- 08_species_maturity_rules.csv",
+            "- 09_source_references.csv",
+            "",
+            "Note:",
+            "This is a structured drafting package and does not replace final verifier-reviewed VCS submission requirements.",
+        ]
+        zf.writestr("00_README.txt", "\n".join(readme_lines))
+
+        _write_csv_to_zip(
+            zf,
+            "02_tree_inventory.csv",
+            [
+                "tree_id",
+                "project_id",
+                "created_by",
+                "species",
+                "planting_date",
+                "status",
+                "longitude",
+                "latitude",
+                "maintenance_count",
+                "maintenance_done",
+                "maintenance_pending",
+                "maintenance_overdue",
+                "maintenance_types",
+                "last_maintenance_type",
+                "last_maintenance_date",
+                "review_submitted",
+                "review_approved",
+                "review_rejected",
+                "last_review_state",
+                "last_review_note",
+                "last_submitted_at",
+                "last_reviewed_at",
+                "photo_url",
+                "notes",
+                "created_at",
+            ],
+            [
+                [
+                    row.get("id"),
+                    row.get("project_id"),
+                    row.get("created_by"),
+                    row.get("species"),
+                    row.get("planting_date"),
+                    row.get("status"),
+                    row.get("lng"),
+                    row.get("lat"),
+                    row.get("maintenance_count"),
+                    row.get("maintenance_done"),
+                    row.get("maintenance_pending"),
+                    row.get("maintenance_overdue"),
+                    row.get("maintenance_types"),
+                    row.get("last_maintenance_type"),
+                    row.get("last_maintenance_date"),
+                    row.get("review_submitted"),
+                    row.get("review_approved"),
+                    row.get("review_rejected"),
+                    row.get("last_review_state"),
+                    row.get("last_review_note"),
+                    row.get("last_submitted_at"),
+                    row.get("last_reviewed_at"),
+                    row.get("photo_url"),
+                    row.get("notes"),
+                    row.get("created_at"),
+                ]
+                for row in trees
+            ],
+        )
+
+        _write_csv_to_zip(
+            zf,
+            "03_task_activity.csv",
+            [
+                "task_id",
+                "tree_id",
+                "task_type",
+                "assignee_name",
+                "status",
+                "review_state",
+                "priority",
+                "due_date",
+                "completed_at",
+                "submitted_at",
+                "reviewed_at",
+                "reviewed_by",
+                "reported_tree_status",
+                "tree_status",
+                "photo_url",
+                "notes",
+                "created_at",
+            ],
+            [
+                [
+                    row.get("id"),
+                    row.get("tree_id"),
+                    row.get("task_type"),
+                    row.get("assignee_name"),
+                    row.get("status"),
+                    row.get("review_state"),
+                    row.get("priority"),
+                    row.get("due_date"),
+                    row.get("completed_at"),
+                    row.get("submitted_at"),
+                    row.get("reviewed_at"),
+                    row.get("reviewed_by"),
+                    row.get("reported_tree_status"),
+                    row.get("tree_status"),
+                    row.get("photo_url"),
+                    row.get("notes"),
+                    row.get("created_at"),
+                ]
+                for row in tasks
+            ],
+        )
+
+        _write_csv_to_zip(
+            zf,
+            "04_review_timeline.csv",
+            [
+                "task_id",
+                "tree_id",
+                "species",
+                "assignee_name",
+                "task_type",
+                "priority",
+                "status",
+                "review_state",
+                "due_date",
+                "completed_at",
+                "submitted_at",
+                "reviewed_at",
+                "reviewed_by",
+                "review_notes",
+                "delay_days",
+                "delay_context",
+                "evidence_status",
+                "reported_tree_status",
+                "tree_status",
+                "photo_url",
+                "notes",
+            ],
+            [
+                [
+                    row.get("task_id"),
+                    row.get("tree_id"),
+                    row.get("species"),
+                    row.get("assignee_name"),
+                    row.get("task_type"),
+                    row.get("priority"),
+                    row.get("status"),
+                    row.get("review_state"),
+                    row.get("due_date"),
+                    row.get("completed_at"),
+                    row.get("submitted_at"),
+                    row.get("reviewed_at"),
+                    row.get("reviewed_by"),
+                    row.get("review_notes"),
+                    row.get("delay_days"),
+                    row.get("delay_context"),
+                    row.get("evidence_status"),
+                    row.get("reported_tree_status"),
+                    row.get("tree_status"),
+                    row.get("photo_url"),
+                    row.get("notes"),
+                ]
+                for row in donor_rows
+            ],
+        )
+
+        _write_csv_to_zip(
+            zf,
+            "05_live_maintenance_table.csv",
+            [
+                "tree_id",
+                "assignee",
+                "activity",
+                "activity_label",
+                "planting_date",
+                "tree_age_days",
+                "last_done_at",
+                "model_due_date",
+                "assigned_due_date",
+                "effective_due_date",
+                "countdown_days",
+                "tone",
+                "status_text",
+                "indicator",
+                "done_count",
+                "pending_count",
+                "overdue_count",
+                "open_task_id",
+                "model_rationale",
+            ],
+            [
+                [
+                    row.get("treeId"),
+                    row.get("assignee"),
+                    row.get("activity"),
+                    row.get("activityLabel"),
+                    row.get("plantingDate"),
+                    row.get("treeAgeDays"),
+                    row.get("lastDoneAt"),
+                    row.get("modelDueDate"),
+                    row.get("assignedDueDate"),
+                    row.get("effectiveDueDate"),
+                    row.get("countdownDays"),
+                    row.get("tone"),
+                    row.get("statusText"),
+                    row.get("indicator"),
+                    row.get("doneCount"),
+                    row.get("pendingCount"),
+                    row.get("overdueCount"),
+                    row.get("openTaskId"),
+                    row.get("modelRationale"),
+                ]
+                for row in live_rows
+            ],
+        )
+
+        _write_csv_to_zip(
+            zf,
+            "06_species_summary.csv",
+            [
+                "species_input",
+                "model_species",
+                "tree_count",
+                "healthy",
+                "attention",
+                "dead_or_removed",
+                "pending_planting",
+                "last_recorded_date",
+            ],
+            [
+                [
+                    row.get("species_input"),
+                    row.get("model_species"),
+                    row.get("tree_count"),
+                    row.get("healthy"),
+                    row.get("attention"),
+                    row.get("dead_or_removed"),
+                    row.get("pending_planting"),
+                    row.get("last_recorded_date"),
+                ]
+                for row in species_summary
+            ],
+        )
+
+        _write_csv_to_zip(
+            zf,
+            "07_staff_summary.csv",
+            [
+                "staff_name",
+                "trees_recorded",
+                "trees_approved",
+                "tasks_total",
+                "tasks_open",
+                "tasks_submitted",
+                "tasks_approved",
+                "tasks_rejected",
+                "orders_total",
+                "planting_target_trees",
+                "maintenance_orders",
+                "last_activity_at",
+            ],
+            [
+                [
+                    row.get("staff_name"),
+                    row.get("trees_recorded"),
+                    row.get("trees_approved"),
+                    row.get("tasks_total"),
+                    row.get("tasks_open"),
+                    row.get("tasks_submitted"),
+                    row.get("tasks_approved"),
+                    row.get("tasks_rejected"),
+                    row.get("orders_total"),
+                    row.get("planting_target_trees"),
+                    row.get("maintenance_orders"),
+                    row.get("last_activity_at"),
+                ]
+                for row in staff_summary
+            ],
+        )
+
+        _write_csv_to_zip(
+            zf,
+            "08_species_maturity_rules.csv",
+            ["species_key", "species_label", "maturity_years", "updated_at"],
+            [
+                [
+                    row.get("species_key"),
+                    row.get("species_label"),
+                    row.get("maturity_years"),
+                    row.get("updated_at"),
+                ]
+                for row in species_maturity
+            ],
+        )
+
+        _write_csv_to_zip(
+            zf,
+            "09_source_references.csv",
+            ["label", "url"],
+            [
+                [ref.get("label"), ref.get("url")]
+                for ref in (payload.get("source_references") or [])
+            ],
+        )
+    buffer.seek(0)
+    return buffer
+
+
+@router.get("/projects/{project_id}/export/verra-vcs")
+def export_project_verra_vcs(
+    project_id: int,
+    season_mode: str = Query(default="rainy"),
+    assignee_name: str | None = Query(default=None),
+    output_format: str = Query(default="zip", alias="format"),
+    db: Session = Depends(get_db),
+):
+    package = _build_verra_vcs_payload(
+        project_id=project_id,
+        db=db,
+        season_mode=season_mode,
+        assignee_name=assignee_name,
+    )
+    format_key = _normalize_name(output_format)
+    project_token = f"project_{project_id}"
+
+    if format_key == "json":
+        payload = package.get("payload") or {}
+        content = json.dumps(payload, indent=2, default=str).encode("utf-8")
+        filename = f"{project_token}_verra_vcs_template.json"
+        headers = {"Content-Disposition": f'attachment; filename="{filename}"'}
+        return StreamingResponse(io.BytesIO(content), media_type="application/json", headers=headers)
+
+    zip_buffer = _render_verra_vcs_zip(package)
+    filename = f"{project_token}_verra_vcs_package.zip"
+    headers = {"Content-Disposition": f'attachment; filename="{filename}"'}
+    return StreamingResponse(zip_buffer, media_type="application/zip", headers=headers)
+
+
+@router.get("/donor/export/verra-vcs")
+def export_project_verra_vcs_alias(
+    project_id: int = Query(...),
+    season_mode: str = Query(default="rainy"),
+    assignee_name: str | None = Query(default=None),
+    output_format: str = Query(default="zip", alias="format"),
+    db: Session = Depends(get_db),
+):
+    return export_project_verra_vcs(
+        project_id=project_id,
+        season_mode=season_mode,
+        assignee_name=assignee_name,
+        output_format=output_format,
+        db=db,
+    )
 
 @router.get("/projects/{project_id}/donor-report/csv")
 def export_donor_report_csv(project_id: int, db: Session = Depends(get_db)):
