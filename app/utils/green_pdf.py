@@ -277,8 +277,35 @@ def _render_executive_summary(c, width, height, project, kpi_snapshot, carbon_da
         color=evidence_card_color,
     )
 
+    age_survival = stats.get("age_survival", {}) if isinstance(stats.get("age_survival"), dict) else {}
+    c.setFont("Helvetica-Bold", 10)
+    c.setFillColorRGB(0.1, 0.1, 0.1)
+    y -= card_h + 14
+    c.drawString(40, y, "Age-Based Survival Checkpoints (from planting date)")
+    y -= 8
+    age_card_w = (width - 80 - (2 * gap)) / 3
+    age_card_h = 40
+    for idx, checkpoint in enumerate((30, 90, 180)):
+        bucket = age_survival.get(f"day_{checkpoint}", {}) if isinstance(age_survival, dict) else {}
+        eligible = int(bucket.get("eligible_trees", 0) or 0)
+        survived = int(bucket.get("survived_trees", 0) or 0)
+        rate = float(bucket.get("survival_rate", 0) or 0)
+        value_text = f"{rate:.1f}%" if eligible > 0 else "n/a"
+        sub_text = f"{survived}/{eligible} surviving"
+        _draw_stat_card(
+            c,
+            40 + idx * (age_card_w + gap),
+            y - age_card_h,
+            age_card_w,
+            age_card_h,
+            f"{checkpoint}-Day Survival",
+            value_text,
+            sub=sub_text,
+            color=HexColor("#f2fbf5"),
+        )
+
     # Charts area - bottom half
-    y -= card_h + 20
+    y -= age_card_h + 18
     chart_w = (width - 100) / 2
 
     # Survival + evidence trend charts (left)

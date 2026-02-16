@@ -68,6 +68,7 @@ VERRA_VCS_REFERENCES = [
 ]
 
 MAINTENANCE_ACTIVITY_ORDER = ("watering", "weeding", "protection", "inspection", "replacement")
+AGE_SURVIVAL_CHECKPOINTS_DAYS = (30, 90, 180)
 SEASON_VALUES = {"rainy", "dry"}
 TASK_STATUS_VALUES = {"pending", "done", "overdue"}
 REVIEW_STATE_VALUES = {"none", "submitted", "approved", "rejected", "reopened"}
@@ -260,6 +261,75 @@ def _get_project_id_for_tree(db: Session, tree_id: int) -> int | None:
         text("SELECT project_id FROM trees WHERE id = :tree_id"),
         {"tree_id": tree_id},
     ).scalar()
+
+
+def _record_tree_status_history(
+    db: Session,
+    tree_id: int,
+    status: str,
+    project_id: int | None = None,
+    status_date: date | datetime | str | None = None,
+    source: str = "manual",
+    source_task_id: int | None = None,
+    changed_by: str | None = None,
+    notes: str | None = None,
+):
+    normalized_status = _normalize_tree_status(status)
+    if normalized_status not in TREE_STATUS_VALUES:
+        return
+
+    resolved_project_id = int(project_id) if project_id is not None else _get_project_id_for_tree(db, tree_id)
+    if resolved_project_id is None:
+        return
+
+    resolved_date = _parse_date_value(status_date) or date.today()
+    existing = db.execute(
+        text(
+            """
+            SELECT id
+            FROM green_tree_status_history
+            WHERE tree_id = :tree_id
+              AND status = :status
+              AND status_date = :status_date
+              AND COALESCE(source, '') = COALESCE(:source, '')
+              AND COALESCE(source_task_id, 0) = COALESCE(:source_task_id, 0)
+            ORDER BY id DESC
+            LIMIT 1
+            """
+        ),
+        {
+            "tree_id": int(tree_id),
+            "status": normalized_status,
+            "status_date": resolved_date,
+            "source": source or "manual",
+            "source_task_id": source_task_id,
+        },
+    ).scalar()
+    if existing:
+        return
+
+    db.execute(
+        text(
+            """
+            INSERT INTO green_tree_status_history (
+                tree_id, project_id, status, status_date, source, source_task_id, changed_by, notes
+            )
+            VALUES (
+                :tree_id, :project_id, :status, :status_date, :source, :source_task_id, :changed_by, :notes
+            )
+            """
+        ),
+        {
+            "tree_id": int(tree_id),
+            "project_id": int(resolved_project_id),
+            "status": normalized_status,
+            "status_date": resolved_date,
+            "source": source or "manual",
+            "source_task_id": source_task_id,
+            "changed_by": (changed_by or "").strip() or None,
+            "notes": notes or None,
+        },
+    )
 
 
 def _get_project_id_for_task(db: Session, task_id: int) -> int | None:
@@ -905,6 +975,20 @@ def ensure_green_tables(db: Session):
         )
     """))
     db.execute(text("""
+        CREATE TABLE IF NOT EXISTS green_tree_status_history (
+            id SERIAL PRIMARY KEY,
+            tree_id INTEGER NOT NULL REFERENCES trees(id) ON DELETE CASCADE,
+            project_id INTEGER NOT NULL REFERENCES tree_projects(id) ON DELETE CASCADE,
+            status TEXT NOT NULL,
+            status_date DATE NOT NULL,
+            source TEXT NOT NULL DEFAULT 'manual',
+            source_task_id INTEGER,
+            changed_by TEXT,
+            notes TEXT,
+            created_at TIMESTAMP DEFAULT NOW()
+        )
+    """))
+    db.execute(text("""
         CREATE TABLE IF NOT EXISTS green_users (
             id SERIAL PRIMARY KEY,
             full_name TEXT NOT NULL,
@@ -1111,6 +1195,8 @@ def ensure_green_tables(db: Session):
     db.execute(text("CREATE INDEX IF NOT EXISTS idx_trees_project_id ON trees(project_id)"))
     db.execute(text("CREATE INDEX IF NOT EXISTS idx_trees_geom ON trees USING GIST (geom)"))
     db.execute(text("CREATE INDEX IF NOT EXISTS idx_tree_visits_tree_id ON tree_visits(tree_id)"))
+    db.execute(text("CREATE INDEX IF NOT EXISTS idx_tree_status_history_tree_date ON green_tree_status_history(tree_id, status_date DESC, id DESC)"))
+    db.execute(text("CREATE INDEX IF NOT EXISTS idx_tree_status_history_project_date ON green_tree_status_history(project_id, status_date DESC, id DESC)"))
     db.execute(text("CREATE INDEX IF NOT EXISTS idx_tree_tasks_tree_id ON tree_tasks(tree_id)"))
     db.execute(text("CREATE INDEX IF NOT EXISTS idx_tree_tasks_review_state ON tree_tasks(review_state)"))
     db.execute(text("CREATE INDEX IF NOT EXISTS idx_green_users_name ON green_users(full_name)"))
@@ -1126,6 +1212,27 @@ def ensure_green_tables(db: Session):
     db.execute(text("CREATE INDEX IF NOT EXISTS idx_alert_events_project_time ON green_alert_events(project_id, triggered_at DESC)"))
     db.execute(text("CREATE INDEX IF NOT EXISTS idx_webhook_event ON green_webhook_deliveries(event_id, created_at DESC)"))
     db.execute(text("CREATE INDEX IF NOT EXISTS idx_verra_exports_project_time ON green_verra_exports(project_id, created_at DESC)"))
+    db.execute(
+        text(
+            """
+            INSERT INTO green_tree_status_history (tree_id, project_id, status, status_date, source, changed_by, notes)
+            SELECT
+                t.id,
+                t.project_id,
+                COALESCE(NULLIF(TRIM(t.status), ''), 'alive'),
+                COALESCE(t.planting_date, t.created_at::date, CURRENT_DATE),
+                'seed',
+                t.created_by,
+                'Auto-seeded baseline status from current tree row'
+            FROM trees t
+            WHERE NOT EXISTS (
+                SELECT 1
+                FROM green_tree_status_history h
+                WHERE h.tree_id = t.id
+            )
+            """
+        )
+    )
     db.commit()
 
 
@@ -1796,6 +1903,17 @@ def add_tree(
         "created_by": created_by_clean or None,
     }).scalar()
 
+    _record_tree_status_history(
+        db,
+        tree_id=int(row),
+        project_id=int(project_id),
+        status=normalized_status,
+        status_date=_parse_date_value(planting_date) or date.today(),
+        source="tree_created",
+        changed_by=created_by_clean or None,
+        notes="Initial tree record created",
+    )
+
     review_task_id = None
     if created_by_clean:
         review_task_id = db.execute(
@@ -1880,6 +1998,7 @@ def update_tree(
     status: str | None = Body(default=None),
     notes: str | None = Body(default=None),
     photo_url: str | None = Body(default=None),
+    actor_name: str | None = Body(default=None),
 ):
     normalized_status = _normalize_tree_status(status) if status is not None else None
     if normalized_status is not None and normalized_status not in TREE_STATUS_VALUES:
@@ -1907,6 +2026,19 @@ def update_tree(
         "photo_url": photo_url,
         "tree_id": tree_id,
     })
+    previous_status = _normalize_tree_status(existing.get("status"))
+    next_status = normalized_status if normalized_status is not None else previous_status
+    if normalized_status is not None and next_status != previous_status:
+        _record_tree_status_history(
+            db,
+            tree_id=tree_id,
+            project_id=int(existing["project_id"]),
+            status=next_status,
+            status_date=date.today(),
+            source="tree_updated",
+            changed_by=actor_name,
+            notes="Tree status updated via tree patch endpoint",
+        )
     _log_audit_event(
         db,
         project_id=int(existing["project_id"]),
@@ -1952,6 +2084,17 @@ def add_visit(
         "photo_url": photo_url or None,
         "created_by": created_by or None,
     })
+    project_id = _get_project_id_for_tree(db, tree_id)
+    _record_tree_status_history(
+        db,
+        tree_id=tree_id,
+        project_id=project_id,
+        status=normalized_status,
+        status_date=_parse_date_value(visit_date) or date.today(),
+        source="visit",
+        changed_by=(created_by or "").strip() or None,
+        notes=notes or None,
+    )
     db.commit()
     return {"status": "ok"}
 
@@ -2446,6 +2589,17 @@ def review_submitted_task(
                 """),
                 {"status": approved_status, "tree_id": int(task["tree_id"])},
             )
+            _record_tree_status_history(
+                db,
+                tree_id=int(task["tree_id"]),
+                project_id=project_id,
+                status=approved_status,
+                status_date=date.today(),
+                source="task_review_approved",
+                source_task_id=task_id,
+                changed_by=reviewer_name or None,
+                notes=review_notes or None,
+            )
         elif reported_tree_status in TREE_STATUS_VALUES:
             db.execute(
                 text("""
@@ -2454,6 +2608,17 @@ def review_submitted_task(
                     WHERE id = :tree_id
                 """),
                 {"status": reported_tree_status, "tree_id": int(task["tree_id"])},
+            )
+            _record_tree_status_history(
+                db,
+                tree_id=int(task["tree_id"]),
+                project_id=project_id,
+                status=reported_tree_status,
+                status_date=date.today(),
+                source="task_review_approved",
+                source_task_id=task_id,
+                changed_by=reviewer_name or None,
+                notes=review_notes or None,
             )
         # Auto-maintenance generation disabled: supervisors assign maintenance manually.
         auto_generated_task_id = None
@@ -3163,6 +3328,107 @@ def _review_summary_by_tree(project_id: int, db: Session, assignee_name: str | N
     return result
 
 
+def _compute_age_based_survival(
+    project_id: int,
+    db: Session,
+    checkpoints_days: tuple[int, ...] = AGE_SURVIVAL_CHECKPOINTS_DAYS,
+    as_of_date: date | None = None,
+) -> dict:
+    as_of = as_of_date or date.today()
+
+    tree_rows = db.execute(
+        text(
+            """
+            SELECT id, planting_date, created_at, status
+            FROM trees
+            WHERE project_id = :project_id
+            """
+        ),
+        {"project_id": project_id},
+    ).mappings().all()
+
+    history_rows = db.execute(
+        text(
+            """
+            SELECT tree_id, status, status_date, created_at, id
+            FROM green_tree_status_history
+            WHERE project_id = :project_id
+            ORDER BY tree_id ASC, status_date ASC, created_at ASC, id ASC
+            """
+        ),
+        {"project_id": project_id},
+    ).mappings().all()
+
+    history_by_tree: dict[int, list[tuple[date, str]]] = {}
+    for row in history_rows:
+        tree_id = int(row.get("tree_id") or 0)
+        status_date = _parse_date_value(row.get("status_date"))
+        if tree_id <= 0 or status_date is None:
+            continue
+        status_value = _normalize_tree_status(row.get("status"))
+        if status_value not in TREE_STATUS_VALUES:
+            continue
+        history_by_tree.setdefault(tree_id, []).append((status_date, status_value))
+
+    checkpoint_metrics: dict[int, dict] = {
+        int(day): {
+            "eligible_trees": 0,
+            "survived_trees": 0,
+            "missing_status_trees": 0,
+        }
+        for day in checkpoints_days
+    }
+
+    for row in tree_rows:
+        tree_id = int(row.get("id") or 0)
+        if tree_id <= 0:
+            continue
+        planting_ref = _parse_date_value(row.get("planting_date")) or _parse_date_value(row.get("created_at"))
+        if planting_ref is None:
+            continue
+        history = history_by_tree.get(tree_id) or []
+        fallback_status = _normalize_tree_status(row.get("status"))
+
+        for day in checkpoints_days:
+            checkpoint = int(day)
+            target_date = planting_ref + timedelta(days=checkpoint)
+            if target_date > as_of:
+                continue
+
+            metric = checkpoint_metrics[checkpoint]
+            metric["eligible_trees"] += 1
+
+            status_at_target = None
+            for status_date, status_value in history:
+                if status_date <= target_date:
+                    status_at_target = status_value
+                else:
+                    break
+            if status_at_target is None:
+                metric["missing_status_trees"] += 1
+                status_at_target = fallback_status
+            if status_at_target in HEALTHY_TREE_STATUSES:
+                metric["survived_trees"] += 1
+
+    result = {
+        "as_of_date": as_of.isoformat(),
+        "checkpoints_days": [int(day) for day in checkpoints_days],
+    }
+    for day in checkpoints_days:
+        metric = checkpoint_metrics[int(day)]
+        eligible = int(metric.get("eligible_trees") or 0)
+        survived = int(metric.get("survived_trees") or 0)
+        missing = int(metric.get("missing_status_trees") or 0)
+        rate = round((survived / eligible) * 100, 1) if eligible > 0 else 0.0
+        result[f"day_{int(day)}"] = {
+            "eligible_trees": eligible,
+            "survived_trees": survived,
+            "survival_rate": rate,
+            "missing_status_trees": missing,
+        }
+    return result
+
+
 def _compute_kpi_snapshot(project_id: int, db: Session) -> dict:
     tree_rows = db.execute(
         text("SELECT status FROM trees WHERE project_id = :project_id"),
@@ -3229,6 +3495,7 @@ def _compute_kpi_snapshot(project_id: int, db: Session) -> dict:
         FROM trees WHERE project_id = :project_id
     """), {"project_id": project_id}).mappings().all()
     carbon = compute_project_carbon([dict(r) for r in carbon_tree_rows])
+    age_survival = _compute_age_based_survival(project_id, db)
 
     return {
         "project_id": project_id,
@@ -3251,6 +3518,10 @@ def _compute_kpi_snapshot(project_id: int, db: Session) -> dict:
         "co2_current_tonnes": carbon["current_co2_tonnes"],
         "co2_annual_tonnes": carbon["annual_co2_tonnes"],
         "co2_projected_lifetime_tonnes": carbon["projected_lifetime_co2_tonnes"],
+        "age_survival": age_survival,
+        "age_survival_30d": age_survival.get("day_30", {}),
+        "age_survival_90d": age_survival.get("day_90", {}),
+        "age_survival_180d": age_survival.get("day_180", {}),
     }
 
 
