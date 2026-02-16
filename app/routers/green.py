@@ -1924,6 +1924,7 @@ def list_tree_tasks(tree_id: int, db: Session = Depends(get_db)):
                reported_tree_status
         FROM tree_tasks
         WHERE tree_id = :tree_id
+          AND COALESCE(auto_generated, FALSE) = FALSE
         ORDER BY created_at DESC
     """), {"tree_id": tree_id}).mappings().all()
     return [dict(r) for r in rows]
@@ -1944,6 +1945,7 @@ def list_tasks(
         FROM tree_tasks t
         JOIN trees tr ON tr.id = t.tree_id
         WHERE tr.project_id = :project_id
+          AND COALESCE(t.auto_generated, FALSE) = FALSE
           AND (:assignee_name IS NULL OR t.assignee_name = :assignee_name)
         ORDER BY t.created_at DESC
     """), {"project_id": project_id, "assignee_name": assignee_name}).mappings().all()
@@ -2306,7 +2308,8 @@ def review_submitted_task(
                 """),
                 {"status": reported_tree_status, "tree_id": int(task["tree_id"])},
             )
-        auto_generated_task_id = _auto_schedule_next_cycle(db, task_id, season_hint=season_mode or task.get("model_season"))
+        # Auto-maintenance generation disabled: supervisors assign maintenance manually.
+        auto_generated_task_id = None
         _resolve_task_alerts(db, task_id)
         action_name = "task_review_approved"
     else:
