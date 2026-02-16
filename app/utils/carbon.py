@@ -534,11 +534,23 @@ def compute_project_carbon(
         if is_alive:
             projected_co2 += estimate_lifetime_co2_kg(species, projection_years)
 
-        # Species aggregation
-        sp_key = _normalize_species_key(species)
-        sp_label = _get_species_params(species).get("label", species or "Unknown")
+        # Species aggregation:
+        # keep operator-entered species label visible, while also exposing matched model species.
+        matched_label = _get_species_params(species).get("label", "Unknown")
+        raw_species = str(species or "").strip()
+        if raw_species:
+            sp_key = raw_species.lower()
+            sp_label = raw_species
+        else:
+            sp_key = f"model::{_normalize_species_key(species)}"
+            sp_label = matched_label
         if sp_key not in species_agg:
-            species_agg[sp_key] = {"species": sp_label, "count": 0, "co2_kg": 0.0}
+            species_agg[sp_key] = {
+                "species": sp_label,
+                "model_species": matched_label,
+                "count": 0,
+                "co2_kg": 0.0,
+            }
         species_agg[sp_key]["count"] += 1
         species_agg[sp_key]["co2_kg"] += tree_co2
 

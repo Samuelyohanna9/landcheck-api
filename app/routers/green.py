@@ -3081,16 +3081,20 @@ def _build_donor_report_rows(project_id: int, db: Session) -> list[dict]:
     for row in rows:
         due_date = _parse_date_value(row.get("due_date"))
         completed_date = _parse_date_value(row.get("completed_at"))
+        delay_context = None
         if due_date and completed_date:
             delay_days = _day_diff(completed_date, due_date)
+            delay_context = "completion"
         elif due_date and not completed_date:
             delay_days = _day_diff(today, due_date)
+            delay_context = "schedule"
         else:
             delay_days = None
         evidence_ok, _ = _has_required_evidence(row.get("task_type"), row.get("notes"), row.get("photo_url"))
         item = dict(row)
         item["evidence_status"] = "complete" if evidence_ok else "missing"
         item["delay_days"] = delay_days
+        item["delay_context"] = delay_context
         report_rows.append(item)
     return report_rows
 
@@ -3160,6 +3164,7 @@ def _compute_kpi_snapshot(project_id: int, db: Session) -> dict:
     rejected_tasks = 0
     open_tasks = 0
     overdue_tasks = 0
+    evidence_required = 0
     evidence_complete = 0
     for task in task_rows:
         state = _normalize_name(task.get("review_state") or "none")
@@ -3175,11 +3180,20 @@ def _compute_kpi_snapshot(project_id: int, db: Session) -> dict:
             open_tasks += 1
         if due and due < today and not (_is_done_status(status) and state in {"approved", "none"}):
             overdue_tasks += 1
+        policy = _task_needs_evidence(task.get("task_type"))
         evidence_ok, _ = _has_required_evidence(task.get("task_type"), task.get("notes"), task.get("photo_url"))
-        if evidence_ok:
-            evidence_complete += 1
+        evidence_in_scope = _is_done_status(status) or state in {"submitted", "approved", "rejected"}
+        if (policy.get("require_notes") or policy.get("require_photo")) and evidence_in_scope:
+            evidence_required += 1
+            if evidence_ok:
+                evidence_complete += 1
 
-    evidence_rate = round((evidence_complete / total_tasks) * 100, 1) if total_tasks else 0.0
+    if evidence_required > 0:
+        evidence_rate = round((evidence_complete / evidence_required) * 100, 1)
+    elif total_tasks > 0:
+        evidence_rate = 100.0
+    else:
+        evidence_rate = 0.0
 
     # Carbon data for KPI
     carbon_tree_rows = db.execute(text("""
@@ -3204,6 +3218,8 @@ def _compute_kpi_snapshot(project_id: int, db: Session) -> dict:
         "tasks_rejected": rejected_tasks,
         "tasks_overdue": overdue_tasks,
         "evidence_complete_rate": evidence_rate,
+        "evidence_required_tasks": evidence_required,
+        "evidence_complete_tasks": evidence_complete,
         "co2_current_tonnes": carbon["current_co2_tonnes"],
         "co2_annual_tonnes": carbon["annual_co2_tonnes"],
         "co2_projected_lifetime_tonnes": carbon["projected_lifetime_co2_tonnes"],
@@ -3276,10 +3292,11 @@ def export_donor_report_csv(project_id: int, db: Session = Depends(get_db)):
         top_species_csv = carbon_csv.get("top_species", []) or []
         if top_species_csv:
             writer.writerow(["Top Species CO2 Table"])
-            writer.writerow(["species", "tree_count", "current_co2_kg"])
+            writer.writerow(["species_input", "model_species", "tree_count", "current_co2_kg"])
             for sp in top_species_csv[:10]:
                 writer.writerow([
                     sp.get("species", ""),
+                    sp.get("model_species", ""),
                     sp.get("count", 0),
                     sp.get("co2_kg", 0),
                 ])
@@ -3360,6 +3377,7 @@ def export_donor_report_csv(project_id: int, db: Session = Depends(get_db)):
             "reviewed_by",
             "review_notes",
             "delay_days",
+            "delay_context",
             "evidence_status",
             "reported_tree_status",
             "tree_status",
@@ -3384,6 +3402,7 @@ def export_donor_report_csv(project_id: int, db: Session = Depends(get_db)):
                 row.get("reviewed_by"),
                 row.get("review_notes"),
                 row.get("delay_days"),
+                row.get("delay_context"),
                 row.get("evidence_status"),
                 row.get("reported_tree_status"),
                 row.get("tree_status"),

@@ -60,7 +60,7 @@ def _draw_bar_chart(c, x, y, w, h, data, title=""):
             break
 
 
-def _draw_mini_line_chart(c, x, y, w, h, points, title="", y_label=""):
+def _draw_mini_line_chart(c, x, y, w, h, points, title="", y_label="", line_color="#16a34a"):
     """Draw a mini line chart for trending. points = list of (x_val, y_val)."""
     if not points or len(points) < 2:
         return
@@ -101,7 +101,7 @@ def _draw_mini_line_chart(c, x, y, w, h, points, title="", y_label=""):
         c.drawRightString(cx - 2, gy - 2, f"{y_min + (y_max - y_min) * i / 4:.0f}")
 
     # Draw line
-    c.setStrokeColor(HexColor("#16a34a"))
+    c.setStrokeColor(HexColor(line_color))
     c.setLineWidth(1.5)
     path = c.beginPath()
     px0, py0 = to_px(points[0][0], points[0][1])
@@ -112,7 +112,7 @@ def _draw_mini_line_chart(c, x, y, w, h, points, title="", y_label=""):
     c.drawPath(path, stroke=1, fill=0)
 
     # Draw dots
-    c.setFillColor(HexColor("#16a34a"))
+    c.setFillColor(HexColor(line_color))
     for xv, yv in points:
         px, py = to_px(xv, yv)
         c.circle(px, py, 2, stroke=0, fill=1)
@@ -122,6 +122,36 @@ def _draw_mini_line_chart(c, x, y, w, h, points, title="", y_label=""):
         c.setFont("Helvetica", 6)
         c.setFillColorRGB(0.4, 0.4, 0.4)
         c.drawString(x, y + h - 6, y_label)
+
+
+def _format_delay_label(delay_days, delay_context=None):
+    """Human-readable delay string. delay is measured in days."""
+    try:
+        if delay_days is None or delay_days == "":
+            return "-"
+        days = int(delay_days)
+    except Exception:
+        return str(delay_days)
+
+    if delay_context == "completion":
+        if days > 0:
+            return f"{days}d late"
+        if days < 0:
+            return f"{abs(days)}d early"
+        return "on time"
+
+    if delay_context == "schedule":
+        if days > 0:
+            return f"{days}d overdue"
+        if days < 0:
+            return f"due in {abs(days)}d"
+        return "due today"
+
+    if days > 0:
+        return f"{days}d"
+    if days < 0:
+        return f"-{abs(days)}d"
+    return "0d"
 
 
 def _render_executive_summary(c, width, height, project, kpi_snapshot, carbon_data, kpi_trend):
@@ -192,6 +222,7 @@ def _render_executive_summary(c, width, height, project, kpi_snapshot, carbon_da
     missing_age = int(carbon_data.get("trees_missing_age_data", 0)) if carbon_data else 0
     fallback_age = int(carbon_data.get("trees_with_fallback_age", 0)) if carbon_data else 0
     pending_review = int(carbon_data.get("trees_pending_review", 0)) if carbon_data else 0
+    warning_extra = 0
     if co2_current <= 0 or co2_projected <= 0:
         warning_text = (
             f"CO2 is low/zero. Missing age data: {missing_age} | "
@@ -203,9 +234,10 @@ def _render_executive_summary(c, width, height, project, kpi_snapshot, carbon_da
         c.setFillColor(HexColor("#7a4b00"))
         c.setFont("Helvetica", 7.5)
         c.drawString(44, y - card_h - 14, warning_text[:170])
+        warning_extra = 18
 
     # Task & operations summary row
-    y -= card_h + 20
+    y -= card_h + 20 + warning_extra
     c.setFont("Helvetica-Bold", 11)
     c.setFillColorRGB(0.1, 0.1, 0.1)
     c.drawString(40, y, "Operations Summary")
@@ -215,25 +247,79 @@ def _render_executive_summary(c, width, height, project, kpi_snapshot, carbon_da
     tasks_approved = stats.get("tasks_approved", 0)
     tasks_overdue = stats.get("tasks_overdue", 0)
     evidence_rate = stats.get("evidence_complete_rate", 0)
+    evidence_required = stats.get("evidence_required_tasks", 0)
+    evidence_complete = stats.get("evidence_complete_tasks", 0)
 
     _draw_stat_card(c, start_x, y - card_h, card_w, card_h, "Total Tasks", f"{tasks_total:,}")
     _draw_stat_card(c, start_x + card_w + gap, y - card_h, card_w, card_h, "Approved", f"{tasks_approved:,}", color=HexColor("#e8f5e9"))
     _draw_stat_card(c, start_x + 2 * (card_w + gap), y - card_h, card_w, card_h, "Overdue", f"{tasks_overdue:,}", color=HexColor("#ffebee") if tasks_overdue > 0 else None)
-    _draw_stat_card(c, start_x + 3 * (card_w + gap), y - card_h, card_w, card_h, "Evidence Rate", f"{evidence_rate}%")
+    evidence_card_color = (
+        HexColor("#e8f5e9")
+        if evidence_rate >= 85
+        else HexColor("#fff8e1")
+        if evidence_rate >= 60
+        else HexColor("#ffebee")
+    )
+    evidence_sub = (
+        f"{evidence_complete}/{evidence_required} required-proof tasks"
+        if evidence_required
+        else "No required-proof tasks yet"
+    )
+    _draw_stat_card(
+        c,
+        start_x + 3 * (card_w + gap),
+        y - card_h,
+        card_w,
+        card_h,
+        "Evidence Rate",
+        f"{evidence_rate}%",
+        sub=evidence_sub,
+        color=evidence_card_color,
+    )
 
     # Charts area - bottom half
     y -= card_h + 20
     chart_w = (width - 100) / 2
 
-    # Survival rate trend chart (left)
+    # Survival + evidence trend charts (left)
+    survival_points = []
+    evidence_points = []
     if kpi_trend and len(kpi_trend) >= 2:
-        trend_points = []
         for i, snap in enumerate(kpi_trend):
             metrics = snap.get("metrics", {})
-            sr = metrics.get("survival_rate", 0)
-            trend_points.append((i, sr))
-        _draw_mini_line_chart(c, 40, y - 140, chart_w, 130, trend_points,
-                              title="Survival Rate Trend", y_label="%")
+            survival_points.append((i, float(metrics.get("survival_rate", 0) or 0)))
+            evidence_points.append((i, float(metrics.get("evidence_complete_rate", 0) or 0)))
+    else:
+        current_survival = float(stats.get("survival_rate", 0) or 0)
+        current_evidence = float(stats.get("evidence_complete_rate", 0) or 0)
+        survival_points = [(0, current_survival), (1, current_survival)]
+        evidence_points = [(0, current_evidence), (1, current_evidence)]
+
+    left_base_y = y - 140
+    mini_h = 60
+    gap_h = 10
+    _draw_mini_line_chart(
+        c,
+        40,
+        left_base_y + mini_h + gap_h,
+        chart_w,
+        mini_h,
+        survival_points,
+        title="Survival Rate Trend",
+        y_label="%",
+        line_color="#16a34a",
+    )
+    _draw_mini_line_chart(
+        c,
+        40,
+        left_base_y,
+        chart_w,
+        mini_h,
+        evidence_points,
+        title="Evidence Rate Trend",
+        y_label="%",
+        line_color="#9a5800",
+    )
 
     # Top species by CO2 (right)
     top_species = carbon_data.get("top_species", []) if carbon_data else []
@@ -557,7 +643,13 @@ def render_green_report_pdf(
                 ),
             )
             y -= 12
-            c.drawString(40, y, f"Evidence completeness: {kpi_snapshot.get('evidence_complete_rate', 0)}%")
+            evidence_rate = kpi_snapshot.get("evidence_complete_rate", 0)
+            evidence_complete = kpi_snapshot.get("evidence_complete_tasks", 0)
+            evidence_required = kpi_snapshot.get("evidence_required_tasks", 0)
+            if evidence_required:
+                c.drawString(40, y, f"Evidence completeness: {evidence_rate}% ({evidence_complete}/{evidence_required} required-proof tasks)")
+            else:
+                c.drawString(40, y, f"Evidence completeness: {evidence_rate}% (no required-proof tasks)")
             y -= 12
             # CO2 KPI line
             co2_t = kpi_snapshot.get("co2_current_tonnes", 0)
@@ -584,9 +676,14 @@ def render_green_report_pdf(
             c.drawString(332, y, "Due")
             c.drawString(378, y, "Submitted")
             c.drawString(436, y, "Reviewed")
-            c.drawString(494, y, "Delay")
+            c.drawString(494, y, "Delay (days)")
             y -= 11
+            c.setFont("Helvetica-Oblique", 6.8)
+            c.setFillColorRGB(0.45, 0.45, 0.45)
+            c.drawString(40, y, "Delay legend: positive = late/overdue, negative = early/due in.")
+            y -= 10
             c.setFont("Helvetica", 7.2)
+            c.setFillColorRGB(0.1, 0.1, 0.1)
             for row in donor_rows[:170]:
                 if y < 50:
                     c.showPage()
@@ -600,9 +697,14 @@ def render_green_report_pdf(
                     c.drawString(332, y, "Due")
                     c.drawString(378, y, "Submitted")
                     c.drawString(436, y, "Reviewed")
-                    c.drawString(494, y, "Delay")
+                    c.drawString(494, y, "Delay (days)")
                     y -= 11
+                    c.setFont("Helvetica-Oblique", 6.8)
+                    c.setFillColorRGB(0.45, 0.45, 0.45)
+                    c.drawString(40, y, "Delay legend: positive = late/overdue, negative = early/due in.")
+                    y -= 10
                     c.setFont("Helvetica", 7.2)
+                    c.setFillColorRGB(0.1, 0.1, 0.1)
                 c.drawString(40, y, f"#{row.get('task_id', '-')}")
                 c.drawString(78, y, f"#{row.get('tree_id', '-')}")
                 c.drawString(110, y, str(row.get("assignee_name", "-"))[:16])
@@ -611,7 +713,7 @@ def render_green_report_pdf(
                 c.drawString(332, y, str(row.get("due_date", "") or "-")[:10])
                 c.drawString(378, y, str(row.get("submitted_at", "") or "-")[:10])
                 c.drawString(436, y, str(row.get("reviewed_at", "") or "-")[:10])
-                c.drawString(494, y, str(row.get("delay_days", "-")))
+                c.drawString(494, y, _format_delay_label(row.get("delay_days"), row.get("delay_context")))
                 y -= 10
 
     c.save()
