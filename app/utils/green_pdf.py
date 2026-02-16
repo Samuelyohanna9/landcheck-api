@@ -295,13 +295,14 @@ def _render_executive_summary(c, width, height, project, kpi_snapshot, carbon_da
         survival_points = [(0, current_survival), (1, current_survival)]
         evidence_points = [(0, current_evidence), (1, current_evidence)]
 
-    left_base_y = y - 140
-    mini_h = 60
-    gap_h = 10
+    left_base_y = y - 148
+    mini_h = 62
+    gap_h = 26
+    top_chart_y = left_base_y + mini_h + gap_h
     _draw_mini_line_chart(
         c,
         40,
-        left_base_y + mini_h + gap_h,
+        top_chart_y,
         chart_w,
         mini_h,
         survival_points,
@@ -311,7 +312,7 @@ def _render_executive_summary(c, width, height, project, kpi_snapshot, carbon_da
     )
     c.setFont("Helvetica", 6.5)
     c.setFillColorRGB(0.45, 0.45, 0.45)
-    c.drawString(40, left_base_y + mini_h + gap_h - 8, "Context: healthy trees / total trees (%).")
+    c.drawString(40, top_chart_y - 10, "Context: healthy trees / total trees (%).")
 
     _draw_mini_line_chart(
         c,
@@ -326,7 +327,7 @@ def _render_executive_summary(c, width, height, project, kpi_snapshot, carbon_da
     )
     c.setFont("Helvetica", 6.5)
     c.setFillColorRGB(0.45, 0.45, 0.45)
-    c.drawString(40, left_base_y - 8, "Context: required-proof tasks with complete note + photo (%).")
+    c.drawString(40, left_base_y - 12, "Context: required-proof tasks with complete note + photo (%).")
 
     # Top species by CO2 (right)
     top_species = carbon_data.get("top_species", []) if carbon_data else []

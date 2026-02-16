@@ -1091,6 +1091,23 @@ def ensure_green_tables(db: Session):
             created_at TIMESTAMP DEFAULT NOW()
         )
     """))
+    db.execute(text("""
+        CREATE TABLE IF NOT EXISTS green_verra_exports (
+            id SERIAL PRIMARY KEY,
+            project_id INTEGER NOT NULL REFERENCES tree_projects(id) ON DELETE CASCADE,
+            season_mode TEXT NOT NULL DEFAULT 'rainy',
+            assignee_name TEXT,
+            output_format TEXT NOT NULL DEFAULT 'zip',
+            monitoring_start DATE,
+            monitoring_end DATE,
+            methodology_id TEXT,
+            verifier_notes TEXT,
+            generated_by TEXT,
+            file_name TEXT,
+            payload_summary JSONB,
+            created_at TIMESTAMP DEFAULT NOW()
+        )
+    """))
     db.execute(text("CREATE INDEX IF NOT EXISTS idx_trees_project_id ON trees(project_id)"))
     db.execute(text("CREATE INDEX IF NOT EXISTS idx_trees_geom ON trees USING GIST (geom)"))
     db.execute(text("CREATE INDEX IF NOT EXISTS idx_tree_visits_tree_id ON tree_visits(tree_id)"))
@@ -1108,6 +1125,7 @@ def ensure_green_tables(db: Session):
     db.execute(text("CREATE INDEX IF NOT EXISTS idx_alert_rules_project_enabled ON green_alert_rules(project_id, is_enabled)"))
     db.execute(text("CREATE INDEX IF NOT EXISTS idx_alert_events_project_time ON green_alert_events(project_id, triggered_at DESC)"))
     db.execute(text("CREATE INDEX IF NOT EXISTS idx_webhook_event ON green_webhook_deliveries(event_id, created_at DESC)"))
+    db.execute(text("CREATE INDEX IF NOT EXISTS idx_verra_exports_project_time ON green_verra_exports(project_id, created_at DESC)"))
     db.commit()
 
 
@@ -3243,6 +3261,25 @@ def _compute_kpi_snapshot(project_id: int, db: Session) -> dict:
 
 
 def _store_kpi_snapshot(project_id: int, metrics: dict, db: Session):
+    latest = db.execute(
+        text(
+            """
+            SELECT snapshot_at, metrics
+            FROM green_kpi_snapshots
+            WHERE project_id = :project_id
+            ORDER BY snapshot_at DESC, id DESC
+            LIMIT 1
+            """
+        ),
+        {"project_id": project_id},
+    ).mappings().first()
+    if latest:
+        previous_metrics = dict(latest.get("metrics") or {})
+        is_same = _safe_json(previous_metrics) == _safe_json(metrics)
+        latest_at = latest.get("snapshot_at")
+        if is_same and isinstance(latest_at, datetime):
+            if latest_at >= datetime.utcnow() - timedelta(minutes=30):
+                return
     db.execute(
         text("""
             INSERT INTO green_kpi_snapshots (project_id, metrics)
@@ -3262,11 +3299,29 @@ def _to_iso_text(value: object) -> str:
     return str(value)
 
 
+def _is_within_monitoring_period(
+    candidate: date | None,
+    monitoring_start: date | None,
+    monitoring_end: date | None,
+) -> bool:
+    if candidate is None:
+        return monitoring_start is None and monitoring_end is None
+    if monitoring_start and candidate < monitoring_start:
+        return False
+    if monitoring_end and candidate > monitoring_end:
+        return False
+    return True
+
+
 def _build_verra_vcs_payload(
     project_id: int,
     db: Session,
     season_mode: str = "rainy",
     assignee_name: str | None = None,
+    monitoring_start: date | None = None,
+    monitoring_end: date | None = None,
+    methodology_id: str | None = None,
+    verifier_notes: str | None = None,
 ) -> dict:
     project = get_project(project_id, db)
     season = "dry" if _normalize_name(season_mode) == "dry" else "rainy"
@@ -3286,6 +3341,16 @@ def _build_verra_vcs_payload(
         {"project_id": project_id, "assignee_name": assignee_clean},
     ).mappings().all()
     tree_rows = [dict(row) for row in tree_rows_raw]
+    if monitoring_start or monitoring_end:
+        tree_rows = [
+            row
+            for row in tree_rows
+            if _is_within_monitoring_period(
+                _parse_date_value(row.get("planting_date")) or _parse_date_value(row.get("created_at")),
+                monitoring_start,
+                monitoring_end,
+            )
+        ]
     maintenance_rows = _maintenance_summary_by_tree(project_id, db, assignee_clean)
     tree_rows = _attach_maintenance_to_tree_rows(tree_rows, maintenance_rows)
     review_summary = _review_summary_by_tree(project_id, db, assignee_clean)
@@ -3318,11 +3383,51 @@ def _build_verra_vcs_payload(
         {"project_id": project_id, "assignee_name": assignee_clean},
     ).mappings().all()
     task_rows = [dict(row) for row in task_rows_raw]
+    filtered_tree_ids = {int(row.get("id")) for row in tree_rows}
+    if filtered_tree_ids:
+        task_rows = [row for row in task_rows if int(row.get("tree_id") or 0) in filtered_tree_ids]
+    elif monitoring_start or monitoring_end:
+        task_rows = []
+    if monitoring_start or monitoring_end:
+        task_rows = [
+            row
+            for row in task_rows
+            if _is_within_monitoring_period(
+                _parse_date_value(
+                    row.get("reviewed_at")
+                    or row.get("submitted_at")
+                    or row.get("completed_at")
+                    or row.get("due_date")
+                    or row.get("created_at")
+                ),
+                monitoring_start,
+                monitoring_end,
+            )
+        ]
 
     donor_rows = _build_donor_report_rows(project_id, db)
     if assignee_clean:
         assignee_key = _normalize_name(assignee_clean)
         donor_rows = [row for row in donor_rows if _normalize_name(row.get("assignee_name")) == assignee_key]
+    if filtered_tree_ids:
+        donor_rows = [row for row in donor_rows if int(row.get("tree_id") or 0) in filtered_tree_ids]
+    elif monitoring_start or monitoring_end:
+        donor_rows = []
+    if monitoring_start or monitoring_end:
+        donor_rows = [
+            row
+            for row in donor_rows
+            if _is_within_monitoring_period(
+                _parse_date_value(
+                    row.get("reviewed_at")
+                    or row.get("submitted_at")
+                    or row.get("completed_at")
+                    or row.get("due_date")
+                ),
+                monitoring_start,
+                monitoring_end,
+            )
+        ]
 
     live_payload = _compute_live_maintenance_rows(
         db=db,
@@ -3330,6 +3435,25 @@ def _build_verra_vcs_payload(
         season_mode=season,
         assignee_name=assignee_clean,
     )
+    if filtered_tree_ids:
+        live_rows_filtered = [
+            row for row in (live_payload.get("rows") or []) if int(row.get("treeId") or 0) in filtered_tree_ids
+        ]
+        live_payload = {
+            "rows": live_rows_filtered,
+            "summary": {
+                "total": len(live_rows_filtered),
+                "danger": sum(1 for item in live_rows_filtered if item.get("tone") == "danger"),
+                "warning": sum(1 for item in live_rows_filtered if item.get("tone") == "warning"),
+                "ok": sum(1 for item in live_rows_filtered if item.get("tone") == "ok"),
+                "info": sum(1 for item in live_rows_filtered if item.get("tone") == "info"),
+                "dueSoon": sum(
+                    1
+                    for item in live_rows_filtered
+                    if isinstance(item.get("countdownDays"), int) and 0 <= int(item.get("countdownDays")) <= 7
+                ),
+            },
+        }
 
     species_maturity_rows = db.execute(
         text(
@@ -3627,6 +3751,7 @@ def _build_verra_vcs_payload(
         },
     ]
 
+    monitoring_period_end = monitoring_end or today
     payload = {
         "template": {
             "name": "LandCheck Verra VCS Structured Monitoring Template",
@@ -3646,10 +3771,15 @@ def _build_verra_vcs_payload(
         },
         "monitoring_period": {
             "start_date": _to_date_input(monitoring_start),
-            "end_date": _to_date_input(today),
-            "duration_days": _day_diff(today, monitoring_start) if monitoring_start else 0,
+            "end_date": _to_date_input(monitoring_period_end),
+            "duration_days": _day_diff(monitoring_period_end, monitoring_start) if monitoring_start else 0,
             "season_model": season,
             "assignee_filter": assignee_clean or "all",
+            "is_custom_period_filter": bool(monitoring_start or monitoring_end),
+        },
+        "verifier_metadata": {
+            "methodology_id": (methodology_id or "").strip(),
+            "verifier_notes": (verifier_notes or "").strip(),
         },
         "section_1_project_identification": {
             "project_summary": {
@@ -4091,28 +4221,89 @@ def export_project_verra_vcs(
     project_id: int,
     season_mode: str = Query(default="rainy"),
     assignee_name: str | None = Query(default=None),
+    monitoring_start: str | None = Query(default=None),
+    monitoring_end: str | None = Query(default=None),
+    methodology_id: str | None = Query(default=None),
+    verifier_notes: str | None = Query(default=None),
+    generated_by: str | None = Query(default=None),
     output_format: str = Query(default="zip", alias="format"),
     db: Session = Depends(get_db),
 ):
+    monitoring_start_date = _parse_date_value(monitoring_start)
+    monitoring_end_date = _parse_date_value(monitoring_end)
+    if monitoring_start and monitoring_start_date is None:
+        raise HTTPException(status_code=400, detail="Invalid monitoring_start date.")
+    if monitoring_end and monitoring_end_date is None:
+        raise HTTPException(status_code=400, detail="Invalid monitoring_end date.")
+    if monitoring_start_date and monitoring_end_date and monitoring_end_date < monitoring_start_date:
+        raise HTTPException(status_code=400, detail="monitoring_end cannot be before monitoring_start.")
+
     package = _build_verra_vcs_payload(
         project_id=project_id,
         db=db,
         season_mode=season_mode,
         assignee_name=assignee_name,
+        monitoring_start=monitoring_start_date,
+        monitoring_end=monitoring_end_date,
+        methodology_id=methodology_id,
+        verifier_notes=verifier_notes,
     )
     format_key = _normalize_name(output_format)
+    if format_key not in {"zip", "json"}:
+        format_key = "zip"
     project_token = f"project_{project_id}"
+    file_name = (
+        f"{project_token}_verra_vcs_template.json"
+        if format_key == "json"
+        else f"{project_token}_verra_vcs_package.zip"
+    )
+
+    payload = package.get("payload") or {}
+    payload_summary = {
+        "tree_inventory_count": int(payload.get("section_6_annex_data_tables", {}).get("tree_inventory_count", 0)),
+        "task_timeline_count": int(payload.get("section_6_annex_data_tables", {}).get("task_timeline_count", 0)),
+        "live_maintenance_count": int(payload.get("section_6_annex_data_tables", {}).get("live_maintenance_count", 0)),
+        "co2_current_tonnes": float(payload.get("section_3_ghg_quantification", {}).get("co2_current_tonnes", 0) or 0),
+        "co2_projected_lifetime_tonnes": float(
+            payload.get("section_3_ghg_quantification", {}).get("co2_projected_lifetime_tonnes", 0) or 0
+        ),
+    }
+    db.execute(
+        text(
+            """
+            INSERT INTO green_verra_exports (
+                project_id, season_mode, assignee_name, output_format, monitoring_start, monitoring_end,
+                methodology_id, verifier_notes, generated_by, file_name, payload_summary
+            )
+            VALUES (
+                :project_id, :season_mode, :assignee_name, :output_format, :monitoring_start, :monitoring_end,
+                :methodology_id, :verifier_notes, :generated_by, :file_name, CAST(:payload_summary AS JSONB)
+            )
+            """
+        ),
+        {
+            "project_id": project_id,
+            "season_mode": "dry" if _normalize_name(season_mode) == "dry" else "rainy",
+            "assignee_name": (assignee_name or "").strip() or None,
+            "output_format": format_key,
+            "monitoring_start": monitoring_start_date,
+            "monitoring_end": monitoring_end_date,
+            "methodology_id": (methodology_id or "").strip() or None,
+            "verifier_notes": (verifier_notes or "").strip() or None,
+            "generated_by": (generated_by or "").strip() or None,
+            "file_name": file_name,
+            "payload_summary": _safe_json(payload_summary),
+        },
+    )
+    db.commit()
 
     if format_key == "json":
-        payload = package.get("payload") or {}
         content = json.dumps(payload, indent=2, default=str).encode("utf-8")
-        filename = f"{project_token}_verra_vcs_template.json"
-        headers = {"Content-Disposition": f'attachment; filename="{filename}"'}
+        headers = {"Content-Disposition": f'attachment; filename="{file_name}"'}
         return StreamingResponse(io.BytesIO(content), media_type="application/json", headers=headers)
 
     zip_buffer = _render_verra_vcs_zip(package)
-    filename = f"{project_token}_verra_vcs_package.zip"
-    headers = {"Content-Disposition": f'attachment; filename="{filename}"'}
+    headers = {"Content-Disposition": f'attachment; filename="{file_name}"'}
     return StreamingResponse(zip_buffer, media_type="application/zip", headers=headers)
 
 
@@ -4121,6 +4312,11 @@ def export_project_verra_vcs_alias(
     project_id: int = Query(...),
     season_mode: str = Query(default="rainy"),
     assignee_name: str | None = Query(default=None),
+    monitoring_start: str | None = Query(default=None),
+    monitoring_end: str | None = Query(default=None),
+    methodology_id: str | None = Query(default=None),
+    verifier_notes: str | None = Query(default=None),
+    generated_by: str | None = Query(default=None),
     output_format: str = Query(default="zip", alias="format"),
     db: Session = Depends(get_db),
 ):
@@ -4128,9 +4324,37 @@ def export_project_verra_vcs_alias(
         project_id=project_id,
         season_mode=season_mode,
         assignee_name=assignee_name,
+        monitoring_start=monitoring_start,
+        monitoring_end=monitoring_end,
+        methodology_id=methodology_id,
+        verifier_notes=verifier_notes,
+        generated_by=generated_by,
         output_format=output_format,
         db=db,
     )
+
+
+@router.get("/projects/{project_id}/verra/exports")
+def list_verra_export_history(
+    project_id: int,
+    limit: int = Query(default=100, ge=1, le=500),
+    db: Session = Depends(get_db),
+):
+    rows = db.execute(
+        text(
+            """
+            SELECT id, project_id, season_mode, assignee_name, output_format,
+                   monitoring_start, monitoring_end, methodology_id, verifier_notes,
+                   generated_by, file_name, payload_summary, created_at
+            FROM green_verra_exports
+            WHERE project_id = :project_id
+            ORDER BY created_at DESC, id DESC
+            LIMIT :limit
+            """
+        ),
+        {"project_id": project_id, "limit": int(limit)},
+    ).mappings().all()
+    return [dict(row) for row in rows]
 
 @router.get("/projects/{project_id}/donor-report/csv")
 def export_donor_report_csv(project_id: int, db: Session = Depends(get_db)):
@@ -4898,6 +5122,11 @@ def export_project_pdf(
         map_view = {"lng": lng_value, "lat": lat_value, "zoom": zoom_value}
     donor_rows = _build_donor_report_rows(project_id, db)
     kpi_snapshot = _compute_kpi_snapshot(project_id, db)
+    try:
+        _store_kpi_snapshot(project_id, kpi_snapshot, db)
+        db.commit()
+    except Exception:
+        db.rollback()
 
     # Carbon data for executive summary
     carbon_trees = db.execute(text("""
@@ -5058,6 +5287,11 @@ def export_work_report_pdf(
         map_view = {"lng": lng_value, "lat": lat_value, "zoom": zoom_value}
     donor_rows = _build_donor_report_rows(project_id, db)
     kpi_snapshot = _compute_kpi_snapshot(project_id, db)
+    try:
+        _store_kpi_snapshot(project_id, kpi_snapshot, db)
+        db.commit()
+    except Exception:
+        db.rollback()
 
     # Carbon data for executive summary
     carbon_trees = db.execute(text("""
