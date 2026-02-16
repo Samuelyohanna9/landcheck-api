@@ -3228,27 +3228,66 @@ def create_work_order(
 ):
     if work_type not in {"planting", "maintenance"}:
         raise HTTPException(status_code=400, detail="Invalid work_type")
-    row = db.execute(text("""
-        INSERT INTO green_work_orders (
-            project_id, assignee_name, work_type, target_trees, maintenance_schedule, due_date
-        )
-        VALUES (:project_id, :assignee_name, :work_type, :target_trees, :maintenance_schedule, :due_date)
-        RETURNING id
-    """), {
-        "project_id": project_id,
-        "assignee_name": assignee_name,
-        "work_type": work_type,
-        "target_trees": target_trees,
-        "maintenance_schedule": maintenance_schedule or None,
-        "due_date": due_date,
-    }).scalar()
+    assignee_clean = (assignee_name or "").strip()
+    if not assignee_clean:
+        raise HTTPException(status_code=400, detail="Assignee name required")
+    if work_type == "planting" and int(target_trees or 0) <= 0:
+        raise HTTPException(status_code=400, detail="Target trees must be greater than 0 for planting orders")
+
+    existing_id = db.execute(
+        text(
+            """
+            SELECT id
+            FROM green_work_orders
+            WHERE project_id = :project_id
+              AND LOWER(TRIM(assignee_name)) = LOWER(TRIM(:assignee_name))
+              AND work_type = :work_type
+              AND LOWER(COALESCE(status, 'assigned')) NOT IN ('done', 'completed', 'closed', 'cancelled')
+            ORDER BY created_at DESC, id DESC
+            LIMIT 1
+            """
+        ),
+        {"project_id": project_id, "assignee_name": assignee_clean, "work_type": work_type},
+    ).scalar()
+
+    if existing_id and work_type == "planting":
+        row = db.execute(
+            text(
+                """
+                UPDATE green_work_orders
+                SET target_trees = COALESCE(target_trees, 0) + :target_trees,
+                    due_date = COALESCE(:due_date, due_date),
+                    last_update = NOW()
+                WHERE id = :id
+                RETURNING id
+                """
+            ),
+            {"id": int(existing_id), "target_trees": int(target_trees or 0), "due_date": due_date},
+        ).scalar()
+        action_name = "work_order_accumulated"
+    else:
+        row = db.execute(text("""
+            INSERT INTO green_work_orders (
+                project_id, assignee_name, work_type, target_trees, maintenance_schedule, due_date
+            )
+            VALUES (:project_id, :assignee_name, :work_type, :target_trees, :maintenance_schedule, :due_date)
+            RETURNING id
+        """), {
+            "project_id": project_id,
+            "assignee_name": assignee_clean,
+            "work_type": work_type,
+            "target_trees": target_trees,
+            "maintenance_schedule": maintenance_schedule or None,
+            "due_date": due_date,
+        }).scalar()
+        action_name = "work_order_created"
     _log_audit_event(
         db,
         project_id=project_id,
         entity_type="work_order",
         entity_id=int(row),
-        action="work_order_created",
-        actor=assignee_name,
+        action=action_name,
+        actor=assignee_clean,
         details={
             "work_type": work_type,
             "target_trees": target_trees,
@@ -3268,7 +3307,7 @@ def list_work_orders(
 ):
     rows = db.execute(text("""
         WITH tree_counts AS (
-            SELECT created_by AS assignee_name, COUNT(*) AS planted
+            SELECT LOWER(TRIM(created_by)) AS assignee_key, COUNT(*) AS planted
             FROM trees
             WHERE project_id = :project_id
             GROUP BY created_by
@@ -3281,9 +3320,9 @@ def list_work_orders(
                END AS planted_count,
                o.last_update, o.created_at
         FROM green_work_orders o
-        LEFT JOIN tree_counts t ON t.assignee_name = o.assignee_name
+        LEFT JOIN tree_counts t ON t.assignee_key = LOWER(TRIM(o.assignee_name))
         WHERE o.project_id = :project_id
-          AND (:assignee_name IS NULL OR o.assignee_name = :assignee_name)
+          AND (:assignee_name IS NULL OR LOWER(TRIM(o.assignee_name)) = LOWER(TRIM(:assignee_name)))
         ORDER BY o.created_at DESC
     """), {"project_id": project_id, "assignee_name": assignee_name}).mappings().all()
     return [dict(r) for r in rows]
