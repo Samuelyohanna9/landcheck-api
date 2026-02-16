@@ -3393,6 +3393,9 @@ def _compute_age_based_survival(
                 "species_key": species_key,
                 "species_label": species_label,
                 "trees_with_planting_date": 0,
+                "current_total_trees": 0,
+                "current_healthy_trees": 0,
+                "max_tree_age_days": 0,
                 "checkpoints": {
                     int(day): {
                         "eligible_trees": 0,
@@ -3409,6 +3412,14 @@ def _compute_age_based_survival(
         species_metrics[species_key]["trees_with_planting_date"] += 1
         history = history_by_tree.get(tree_id) or []
         fallback_status = _normalize_tree_status(row.get("status"))
+        species_metrics[species_key]["current_total_trees"] += 1
+        if fallback_status in HEALTHY_TREE_STATUSES:
+            species_metrics[species_key]["current_healthy_trees"] += 1
+        tree_age_days = max((as_of - planting_ref).days, 0)
+        species_metrics[species_key]["max_tree_age_days"] = max(
+            int(species_metrics[species_key].get("max_tree_age_days") or 0),
+            int(tree_age_days),
+        )
 
         for day in checkpoints_days:
             checkpoint = int(day)
@@ -3459,7 +3470,13 @@ def _compute_age_based_survival(
             "species_key": item.get("species_key"),
             "species_label": item.get("species_label"),
             "trees_with_planting_date": int(item.get("trees_with_planting_date") or 0),
+            "current_total_trees": int(item.get("current_total_trees") or 0),
+            "current_healthy_trees": int(item.get("current_healthy_trees") or 0),
+            "max_tree_age_days": int(item.get("max_tree_age_days") or 0),
         }
+        current_total = int(item.get("current_total_trees") or 0)
+        current_healthy = int(item.get("current_healthy_trees") or 0)
+        row_payload["current_survival_rate"] = round((current_healthy / current_total) * 100, 1) if current_total > 0 else 0.0
         for day in checkpoints_days:
             bucket = checkpoints.get(int(day)) or {}
             eligible = int(bucket.get("eligible_trees") or 0)

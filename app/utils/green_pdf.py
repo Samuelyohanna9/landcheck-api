@@ -407,23 +407,45 @@ def _render_executive_summary(c, width, height, project, kpi_snapshot, carbon_da
         def _fmt_rate(bucket):
             eligible = int((bucket or {}).get("eligible_trees", 0) or 0)
             rate = float((bucket or {}).get("survival_rate", 0) or 0)
-            return f"{rate:.0f}%" if eligible > 0 else "-"
+            return f"{rate:.0f}%" if eligible > 0 else None
 
         row_y = header_y - 12
         for row in species_breakdown[:8]:
             species_label = str(row.get("species_label") or row.get("species_key") or "Unknown")[:22]
+            live_rate = float(row.get("current_survival_rate", 0) or 0)
+            carry_rate = live_rate
+            rate_30 = _fmt_rate(row.get("day_30"))
+            if rate_30 is None:
+                rate_30 = f"~{carry_rate:.0f}%"
+            else:
+                try:
+                    carry_rate = float(rate_30.replace("%", "").replace("~", ""))
+                except Exception:
+                    pass
+            rate_90 = _fmt_rate(row.get("day_90"))
+            if rate_90 is None:
+                rate_90 = f"~{carry_rate:.0f}%"
+            else:
+                try:
+                    carry_rate = float(rate_90.replace("%", "").replace("~", ""))
+                except Exception:
+                    pass
+            rate_180 = _fmt_rate(row.get("day_180"))
+            if rate_180 is None:
+                rate_180 = f"~{carry_rate:.0f}%"
+
             c.setFont("Helvetica", 6.6)
             c.setFillColorRGB(0.22, 0.33, 0.27)
             c.drawString(right_x, row_y, species_label)
-            c.drawString(right_x + 108, row_y, _fmt_rate(row.get("day_30")))
-            c.drawString(right_x + 142, row_y, _fmt_rate(row.get("day_90")))
-            c.drawString(right_x + 176, row_y, _fmt_rate(row.get("day_180")))
+            c.drawString(right_x + 108, row_y, rate_30)
+            c.drawString(right_x + 142, row_y, rate_90)
+            c.drawString(right_x + 176, row_y, rate_180)
             c.drawString(right_x + 212, row_y, str(int(row.get("trees_with_planting_date", 0) or 0)))
             row_y -= 9
 
         c.setFont("Helvetica", 6.5)
         c.setFillColorRGB(0.45, 0.45, 0.45)
-        c.drawString(right_x, y - 148, "Context: age-based species cohorts from planting date; '-' means no eligible trees.")
+        c.drawString(right_x, y - 148, "Context: age-based species cohorts from planting date; '~' denotes provisional carry-forward.")
     else:
         top_species = carbon_data.get("top_species", []) if carbon_data else []
         if top_species:
