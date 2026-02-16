@@ -4678,9 +4678,27 @@ def export_donor_report_csv(project_id: int, db: Session = Depends(get_db)):
 
 
 @router.get("/projects/{project_id}/donor-report/pdf")
-def export_donor_report_pdf(project_id: int, db: Session = Depends(get_db)):
+def export_donor_report_pdf(
+    project_id: int,
+    assignee_name: str | None = Query(default=None),
+    lng: float | None = Query(default=None),
+    lat: float | None = Query(default=None),
+    zoom: float | None = Query(default=None),
+    bearing: float | None = Query(default=0.0),
+    pitch: float | None = Query(default=0.0),
+    db: Session = Depends(get_db),
+):
     # Use the comprehensive map report and include donor/review details in additional pages.
-    return export_work_report_pdf(project_id=project_id, assignee_name=None, db=db)
+    return export_work_report_pdf(
+        project_id=project_id,
+        assignee_name=assignee_name,
+        lng=lng,
+        lat=lat,
+        zoom=zoom,
+        bearing=bearing,
+        pitch=pitch,
+        db=db,
+    )
 
 
 @router.get("/donor/export/csv")
@@ -4694,9 +4712,24 @@ def export_donor_report_csv_alias(
 @router.get("/donor/export/pdf")
 def export_donor_report_pdf_alias(
     project_id: int = Query(...),
+    assignee_name: str | None = Query(default=None),
+    lng: float | None = Query(default=None),
+    lat: float | None = Query(default=None),
+    zoom: float | None = Query(default=None),
+    bearing: float | None = Query(default=0.0),
+    pitch: float | None = Query(default=0.0),
     db: Session = Depends(get_db),
 ):
-    return export_donor_report_pdf(project_id=project_id, db=db)
+    return export_donor_report_pdf(
+        project_id=project_id,
+        assignee_name=assignee_name,
+        lng=lng,
+        lat=lat,
+        zoom=zoom,
+        bearing=bearing,
+        pitch=pitch,
+        db=db,
+    )
 
 
 @router.get("/trees/{tree_id}/timeline")
