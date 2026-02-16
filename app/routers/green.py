@@ -2796,15 +2796,17 @@ def reports_kpi(
         db.commit()
 
     trend = _build_kpi_trend_series(project_id, db, days=days)
+    species_daily_survival = _build_species_daily_survival_series(project_id, db)
     return {
         "project_id": project_id,
         "current": metrics,
         "trend_days": days,
         "trend_basis": {
             "survival": "Monthly cumulative survival across planting cohorts using current tree statuses (starts from first planting_date).",
-            "evidence": "Monthly cumulative proof completion across in-scope task activity records.",
+            "species_survival_daily": "Daily species survival from planting date using status history and live tree status.",
         },
         "trend": trend,
+        "species_daily_survival": species_daily_survival,
     }
 
 
@@ -3604,6 +3606,212 @@ def _next_month_start(value: date) -> date:
     if value.month == 12:
         return date(value.year + 1, 1, 1)
     return date(value.year, value.month + 1, 1)
+
+
+def _survival_phase_label(age_days: int) -> str:
+    age = max(int(age_days or 0), 0)
+    if age >= 180:
+        return "past 180 days"
+    if age >= 90:
+        return "past 90 days"
+    if age >= 30:
+        return "past 30 days"
+    return "0-29 days"
+
+
+def _build_species_daily_survival_series(project_id: int, db: Session) -> dict:
+    """
+    Build per-species daily survival lines from planting date to today.
+    Survival uses status history timeline (maintenance/task-review/manual updates)
+    with current tree status as fallback baseline.
+    """
+    today = date.today()
+
+    tree_rows = db.execute(
+        text(
+            """
+            SELECT id, species, planting_date, status
+            FROM trees
+            WHERE project_id = :project_id
+            """
+        ),
+        {"project_id": project_id},
+    ).mappings().all()
+
+    history_rows = db.execute(
+        text(
+            """
+            SELECT tree_id, status, status_date, created_at, id
+            FROM green_tree_status_history
+            WHERE project_id = :project_id
+            ORDER BY tree_id ASC, status_date ASC, created_at ASC, id ASC
+            """
+        ),
+        {"project_id": project_id},
+    ).mappings().all()
+
+    history_by_tree: dict[int, list[tuple[date, str]]] = {}
+    for row in history_rows:
+        tree_id = int(row.get("tree_id") or 0)
+        status_date = _parse_date_value(row.get("status_date"))
+        if tree_id <= 0 or status_date is None:
+            continue
+        status_value = _normalize_tree_status(row.get("status"))
+        if status_value not in TREE_STATUS_VALUES:
+            continue
+        history_by_tree.setdefault(tree_id, []).append((status_date, status_value))
+
+    total_deltas_by_day: dict[date, dict[str, int]] = {}
+    healthy_deltas_by_day: dict[date, dict[str, int]] = {}
+
+    def _apply_delta(store: dict[date, dict[str, int]], when: date, species_key: str, delta: int) -> None:
+        day_bucket = store.setdefault(when, {})
+        day_bucket[species_key] = int(day_bucket.get(species_key) or 0) + int(delta)
+
+    species_labels: dict[str, str] = {}
+    species_tree_counts: dict[str, int] = {}
+    species_first_planting: dict[str, date] = {}
+    trees_missing_planting_date = 0
+
+    for row in tree_rows:
+        tree_id = int(row.get("id") or 0)
+        if tree_id <= 0:
+            continue
+
+        planting_ref = _parse_date_value(row.get("planting_date"))
+        if planting_ref is None:
+            trees_missing_planting_date += 1
+            continue
+
+        species_label_raw = str(row.get("species") or "").strip()
+        species_key = _normalize_name(species_label_raw) or "__unknown__"
+        species_label = species_label_raw or "Unknown Species"
+        species_labels[species_key] = species_labels.get(species_key) or species_label
+        species_tree_counts[species_key] = int(species_tree_counts.get(species_key) or 0) + 1
+
+        first_for_species = species_first_planting.get(species_key)
+        if first_for_species is None or planting_ref < first_for_species:
+            species_first_planting[species_key] = planting_ref
+
+        fallback_status = _normalize_tree_status(row.get("status"))
+        if fallback_status not in TREE_STATUS_VALUES:
+            fallback_status = "alive"
+
+        timeline_raw = history_by_tree.get(tree_id) or []
+        timeline_by_day: dict[date, str] = {}
+        for event_date, event_status in timeline_raw:
+            # Keep last status event of the day.
+            timeline_by_day[event_date] = event_status
+        timeline = sorted(timeline_by_day.items(), key=lambda item: item[0])
+
+        baseline_status = fallback_status
+        for event_date, event_status in timeline:
+            if event_date <= planting_ref:
+                baseline_status = event_status
+            else:
+                break
+
+        _apply_delta(total_deltas_by_day, planting_ref, species_key, 1)
+        if baseline_status in HEALTHY_TREE_STATUSES:
+            _apply_delta(healthy_deltas_by_day, planting_ref, species_key, 1)
+
+        prev_status = baseline_status
+        for event_date, event_status in timeline:
+            if event_date <= planting_ref:
+                continue
+            if event_status == prev_status:
+                continue
+            was_healthy = prev_status in HEALTHY_TREE_STATUSES
+            is_healthy = event_status in HEALTHY_TREE_STATUSES
+            if was_healthy != is_healthy:
+                _apply_delta(healthy_deltas_by_day, event_date, species_key, 1 if is_healthy else -1)
+            prev_status = event_status
+
+    if not species_first_planting:
+        return {
+            "as_of_date": today.isoformat(),
+            "start_date": None,
+            "species_count": 0,
+            "trees_missing_planting_date": int(trees_missing_planting_date),
+            "day_markers": {"day_30": 30, "day_90": 90, "day_180": 180},
+            "species": [],
+        }
+
+    project_start_date = min(species_first_planting.values())
+    species_keys = sorted(
+        species_first_planting.keys(),
+        key=lambda key: (
+            -int(species_tree_counts.get(key) or 0),
+            str(species_labels.get(key) or key).lower(),
+        ),
+    )
+
+    running_total: dict[str, int] = {key: 0 for key in species_keys}
+    running_healthy: dict[str, int] = {key: 0 for key in species_keys}
+    points_by_species: dict[str, list[dict]] = {key: [] for key in species_keys}
+
+    cursor = project_start_date
+    while cursor <= today:
+        total_bucket = total_deltas_by_day.get(cursor) or {}
+        for species_key, delta in total_bucket.items():
+            running_total[species_key] = max(int(running_total.get(species_key) or 0) + int(delta), 0)
+
+        healthy_bucket = healthy_deltas_by_day.get(cursor) or {}
+        for species_key, delta in healthy_bucket.items():
+            running_healthy[species_key] = int(running_healthy.get(species_key) or 0) + int(delta)
+
+        for species_key in species_keys:
+            species_start = species_first_planting.get(species_key)
+            if species_start is None or cursor < species_start:
+                continue
+
+            eligible = int(running_total.get(species_key) or 0)
+            if eligible <= 0:
+                continue
+
+            survived = int(running_healthy.get(species_key) or 0)
+            survived = min(max(survived, 0), eligible)
+            day_since_species_start = (cursor - species_start).days
+            day_since_project_start = (cursor - project_start_date).days
+            survival_rate = round((survived / eligible) * 100, 1) if eligible > 0 else 0.0
+
+            points_by_species[species_key].append(
+                {
+                    "date": cursor.isoformat(),
+                    "day_since_species_start": int(day_since_species_start),
+                    "day_since_project_start": int(day_since_project_start),
+                    "survival_rate": survival_rate,
+                    "eligible_trees": eligible,
+                    "survived_trees": survived,
+                    "phase": _survival_phase_label(day_since_species_start),
+                }
+            )
+        cursor += timedelta(days=1)
+
+    species_rows: list[dict] = []
+    for species_key in species_keys:
+        points = points_by_species.get(species_key) or []
+        if not points:
+            continue
+        species_rows.append(
+            {
+                "species_key": species_key,
+                "species_label": species_labels.get(species_key) or "Unknown Species",
+                "trees_with_planting_date": int(species_tree_counts.get(species_key) or 0),
+                "start_date": species_first_planting.get(species_key).isoformat(),
+                "max_age_days": int(points[-1].get("day_since_species_start") or 0),
+                "points": points,
+            }
+        )
+
+    return {
+        "as_of_date": today.isoformat(),
+        "start_date": project_start_date.isoformat(),
+        "species_count": len(species_rows),
+        "trees_missing_planting_date": int(trees_missing_planting_date),
+        "day_markers": {"day_30": 30, "day_90": 90, "day_180": 180},
+        "species": species_rows,
+    }
 
 
 def _build_kpi_trend_series(project_id: int, db: Session, days: int = 180) -> list[dict]:

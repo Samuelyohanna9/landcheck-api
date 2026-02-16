@@ -315,7 +315,6 @@ def _render_executive_summary(c, width, height, project, kpi_snapshot, carbon_da
 
     # Survival + evidence trend charts (left)
     survival_points = []
-    evidence_points = []
     trend_first_label = ""
     trend_last_label = ""
 
@@ -341,17 +340,12 @@ def _render_executive_summary(c, width, height, project, kpi_snapshot, carbon_da
         for i, snap in enumerate(kpi_trend):
             metrics = snap.get("metrics", {})
             survival_points.append((i, float(metrics.get("survival_rate", 0) or 0)))
-            evidence_points.append((i, float(metrics.get("evidence_complete_rate", 0) or 0)))
     else:
         current_survival = float(stats.get("survival_rate", 0) or 0)
-        current_evidence = float(stats.get("evidence_complete_rate", 0) or 0)
         survival_points = [(0, current_survival), (1, current_survival)]
-        evidence_points = [(0, current_evidence), (1, current_evidence)]
 
-    left_base_y = y - 148
-    mini_h = 62
-    gap_h = 34
-    top_chart_y = left_base_y + mini_h + gap_h
+    mini_h = 86
+    top_chart_y = y - 128
     _draw_mini_line_chart(
         c,
         40,
@@ -368,23 +362,6 @@ def _render_executive_summary(c, width, height, project, kpi_snapshot, carbon_da
     c.drawString(40, top_chart_y - 10, "Context: monthly cumulative healthy share across planting cohorts from first planting date.")
     if trend_first_label or trend_last_label:
         c.drawString(40, top_chart_y - 18, f"Period: {trend_first_label} to {trend_last_label}".strip())
-
-    _draw_mini_line_chart(
-        c,
-        40,
-        left_base_y,
-        chart_w,
-        mini_h,
-        evidence_points,
-        title="Evidence Trend (Task Activity)",
-        y_label="%",
-        line_color="#9a5800",
-    )
-    c.setFont("Helvetica", 6.5)
-    c.setFillColorRGB(0.45, 0.45, 0.45)
-    c.drawString(40, left_base_y - 12, "Context: monthly cumulative completion of required-proof task evidence.")
-    if trend_first_label or trend_last_label:
-        c.drawString(40, left_base_y - 20, f"Period: {trend_first_label} to {trend_last_label}".strip())
 
     # Species-based age survival table (right)
     species_breakdown = age_survival.get("species_breakdown", []) if isinstance(age_survival, dict) else []
