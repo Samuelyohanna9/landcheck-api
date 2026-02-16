@@ -1813,6 +1813,8 @@ def review_submitted_task(
     decision_key = _normalize_name(decision)
     if decision_key not in {"approve", "reject"}:
         raise HTTPException(status_code=400, detail="Decision must be approve or reject")
+    if decision_key == "reject" and not (review_notes or "").strip():
+        raise HTTPException(status_code=400, detail="Review note is required when rejecting a task")
 
     task = db.execute(
         text("""
