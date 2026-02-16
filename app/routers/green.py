@@ -44,6 +44,55 @@ MAINTENANCE_ACTIVITY_ORDER = ("watering", "weeding", "protection", "inspection",
 SEASON_VALUES = {"rainy", "dry"}
 TASK_STATUS_VALUES = {"pending", "done", "overdue"}
 REVIEW_STATE_VALUES = {"none", "submitted", "approved", "rejected", "reopened"}
+TREE_STATUS_VALUES = {
+    "alive",
+    "healthy",
+    "dead",
+    "needs_attention",
+    "pending_planting",
+    "pest",
+    "disease",
+    "need_replacement",
+    "needs_replacement",
+    "damaged",
+    "removed",
+}
+REPLACEMENT_TRIGGER_STATUSES = {"dead", "damaged", "removed", "need_replacement", "needs_replacement"}
+TREE_STATUS_ALIASES = {
+    "needreplacement": "need_replacement",
+    "need_replacement": "need_replacement",
+    "needsreplacement": "needs_replacement",
+    "needs_replacement": "needs_replacement",
+    "need replacement": "need_replacement",
+    "needs replacement": "needs_replacement",
+    "deseas": "disease",
+    "diseased": "disease",
+    "needsattention": "needs_attention",
+    "need_attention": "needs_attention",
+}
+HEALTHY_TREE_STATUSES = {"alive", "healthy"}
+DEAD_TREE_STATUSES = {"dead", "removed"}
+ATTENTION_TREE_STATUSES = {
+    "needs_attention",
+    "pest",
+    "disease",
+    "need_replacement",
+    "needs_replacement",
+    "damaged",
+}
+TREE_STATUS_COLOR_HEX = {
+    "alive": "22c55e",
+    "healthy": "16a34a",
+    "pest": "eab308",
+    "disease": "f97316",
+    "need_replacement": "ef4444",
+    "needs_replacement": "ef4444",
+    "damaged": "dc2626",
+    "dead": "b91c1c",
+    "removed": "7f1d1d",
+    "needs_attention": "f59e0b",
+    "pending_planting": "3b82f6",
+}
 
 
 def get_db():
@@ -57,6 +106,20 @@ def get_db():
 
 def _normalize_name(value: str | None) -> str:
     return (value or "").strip().lower()
+
+
+def _normalize_tree_status(value: str | None) -> str:
+    raw = _normalize_name(value).replace("-", "_")
+    collapsed = raw.replace("_", "").replace(" ", "")
+    if raw in TREE_STATUS_ALIASES:
+        return TREE_STATUS_ALIASES[raw]
+    if collapsed in TREE_STATUS_ALIASES:
+        return TREE_STATUS_ALIASES[collapsed]
+    if " " in raw:
+        spaced = raw.replace(" ", "_")
+        if spaced in TREE_STATUS_ALIASES:
+            return TREE_STATUS_ALIASES[spaced]
+    return raw.replace(" ", "_")
 
 
 def _is_done_status(status: str | None) -> bool:
@@ -234,6 +297,14 @@ def _has_required_evidence(task_type: str | None, notes: str | None, photo_url: 
     if policy["require_photo"] and not photo_ok:
         return False, "Photo proof is required before submission."
     return True, ""
+
+
+def _is_replacement_trigger_status(status: str | None) -> bool:
+    return _normalize_tree_status(status) in REPLACEMENT_TRIGGER_STATUSES
+
+
+def _tree_status_color_hex(status: str | None) -> str:
+    return TREE_STATUS_COLOR_HEX.get(_normalize_tree_status(status), "22c55e")
 
 
 def _record_alert(
@@ -437,7 +508,8 @@ def _compute_live_maintenance_rows(
             if _normalize_name(tree_assignee) != assignee_key and not has_matching_task:
                 continue
 
-        tree_status = _normalize_name(tree.get("status") or "alive")
+        tree_status = _normalize_tree_status(tree.get("status") or "alive")
+        replacement_required = _is_replacement_trigger_status(tree_status)
         planting_date_obj = _parse_date_value(tree.get("planting_date"))
         replacement_key = f"{tree_id}:replacement"
         replacement_done = sorted(
@@ -454,7 +526,7 @@ def _compute_live_maintenance_rows(
         species_key = _normalize_name(tree.get("species"))
         maturity_years = species_maturity_map.get(species_key) if species_key else None
         maturity_reached = (
-            tree_status == "alive"
+            tree_status in HEALTHY_TREE_STATUSES
             and maturity_years is not None
             and tree_age_days is not None
             and tree_age_days >= maturity_years * 365
@@ -484,15 +556,29 @@ def _compute_live_maintenance_rows(
             model_due: date | None = None
             assigned_due = _parse_date_value(active_task.get("due_date")) if active_task else None
 
-            if tree_status == "dead" and activity != "replacement":
+            if replacement_required and activity != "replacement":
                 tone = "danger"
                 status_text = "Paused"
-                indicator = "Tree marked dead. Replacement required."
-            elif tree_status == "dead" and activity == "replacement":
+                indicator = f"Tree status '{tree_status.replace('_', ' ')}' requires replacement first."
+            elif activity == "replacement" and replacement_required:
                 model_due = today
-                tone = "warning"
-                status_text = "Replacement required"
-                indicator = "Replacement due immediately."
+                if active_task:
+                    tone = "warning"
+                    status_text = f"Task #{active_task['id']} {active_task.get('status') or 'pending'}"
+                    indicator = "Replacement assigned."
+                else:
+                    tone = "danger"
+                    status_text = "Replacement required"
+                    indicator = "Replacement due immediately."
+            elif activity == "replacement":
+                if active_task:
+                    tone = "warning"
+                    status_text = f"Task #{active_task['id']} {active_task.get('status') or 'pending'}"
+                    indicator = "Replacement is assigned, but tree status does not currently require replacement."
+                else:
+                    tone = "info"
+                    status_text = "Not required"
+                    indicator = "Replacement opens only for dead, damaged, removed, or needs replacement."
             elif maturity_reached:
                 tone = "info"
                 status_text = "Lifecycle complete"
@@ -543,6 +629,13 @@ def _compute_live_maintenance_rows(
                     overdue_open += 1
 
             intervals = _get_maintenance_intervals(activity, tree_age_days or 0, season)
+            if activity == "replacement":
+                rationale = (
+                    "Replacement is condition-triggered (dead/damaged/removed/needs replacement) "
+                    "and is not treated as a routine cyclical task."
+                )
+            else:
+                rationale = f"{season.title()} season model: first {intervals['first_days']}d, repeat {intervals['repeat_days']}d."
             rows.append(
                 {
                     "key": f"{tree_id}:{activity}",
@@ -564,7 +657,7 @@ def _compute_live_maintenance_rows(
                     "pendingCount": len(open_tasks),
                     "overdueCount": overdue_open,
                     "openTaskId": int(active_task["id"]) if active_task else None,
-                    "modelRationale": f"{season.title()} season model: first {intervals['first_days']}d, repeat {intervals['repeat_days']}d.",
+                    "modelRationale": rationale,
                 }
             )
 
@@ -610,9 +703,12 @@ def _auto_schedule_next_cycle(db: Session, task_id: int, season_hint: str | None
     if _normalize_name(task.get("review_state")) != "approved":
         return None
 
-    tree_status = _normalize_name(task.get("tree_status") or "alive")
+    tree_status = _normalize_tree_status(task.get("tree_status") or "alive")
     activity = _normalize_name(task.get("task_type"))
-    if tree_status == "dead" and activity != "replacement":
+    if activity == "replacement":
+        # Replacement is condition-triggered only; do not auto-generate recurring replacement cycles.
+        return None
+    if _is_replacement_trigger_status(tree_status):
         return None
 
     season = _normalize_name(season_hint or task.get("model_season") or "rainy")
@@ -645,7 +741,7 @@ def _auto_schedule_next_cycle(db: Session, task_id: int, season_hint: str | None
     species_key = _normalize_name(task.get("species"))
     maturity_map = _get_species_maturity_map(project_id, db)
     maturity_years = maturity_map.get(species_key) if species_key else None
-    if tree_status == "alive" and maturity_years and tree_age_days >= maturity_years * 365:
+    if tree_status in HEALTHY_TREE_STATUSES and maturity_years and tree_age_days >= maturity_years * 365:
         return None
 
     open_exists = db.execute(
@@ -1179,20 +1275,24 @@ def get_project(project_id: int, db: Session = Depends(get_db)):
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
 
-    stats = db.execute(text("""
-        SELECT
-            COUNT(*) AS total,
-            SUM(CASE WHEN status = 'alive' THEN 1 ELSE 0 END) AS alive,
-            SUM(CASE WHEN status = 'dead' THEN 1 ELSE 0 END) AS dead,
-            SUM(CASE WHEN status = 'needs_attention' THEN 1 ELSE 0 END) AS needs_attention
-        FROM trees
-        WHERE project_id = :project_id
-    """), {"project_id": project_id}).mappings().first()
+    stats_rows = db.execute(
+        text("""
+            SELECT status, COUNT(*) AS count
+            FROM trees
+            WHERE project_id = :project_id
+            GROUP BY status
+        """),
+        {"project_id": project_id},
+    ).mappings().all()
+    status_counts: dict[str, int] = {}
+    for row in stats_rows:
+        status_key = _normalize_tree_status(row.get("status"))
+        status_counts[status_key] = status_counts.get(status_key, 0) + int(row.get("count") or 0)
 
-    total = stats["total"] or 0
-    alive = stats["alive"] or 0
-    dead = stats["dead"] or 0
-    needs_attention = stats["needs_attention"] or 0
+    total = sum(status_counts.values())
+    alive = sum(status_counts.get(status_key, 0) for status_key in HEALTHY_TREE_STATUSES)
+    dead = sum(status_counts.get(status_key, 0) for status_key in DEAD_TREE_STATUSES)
+    needs_attention = sum(status_counts.get(status_key, 0) for status_key in ATTENTION_TREE_STATUSES)
     survival_rate = round((alive / total) * 100, 1) if total else 0.0
 
     return {
@@ -1303,7 +1403,8 @@ def add_tree(
     photo_url: str = Body(default=""),
     created_by: str = Body(default=""),
 ):
-    if status not in {"alive", "dead", "needs_attention", "pending_planting"}:
+    normalized_status = _normalize_tree_status(status or "alive")
+    if normalized_status not in TREE_STATUS_VALUES:
         raise HTTPException(status_code=400, detail="Invalid status")
     row = db.execute(text("""
         INSERT INTO trees (project_id, geom, species, planting_date, status, notes, photo_url, created_by)
@@ -1324,7 +1425,7 @@ def add_tree(
         "lat": lat,
         "species": species or None,
         "planting_date": planting_date,
-        "status": status,
+        "status": normalized_status,
         "notes": notes or None,
         "photo_url": photo_url or None,
         "created_by": created_by or None,
@@ -1338,7 +1439,7 @@ def add_tree(
         actor=created_by or None,
         details={
             "species": species or None,
-            "status": status,
+            "status": normalized_status,
             "planting_date": planting_date,
             "lng": lng,
             "lat": lat,
@@ -1358,7 +1459,8 @@ def update_tree(
     notes: str | None = Body(default=None),
     photo_url: str | None = Body(default=None),
 ):
-    if status and status not in {"alive", "dead", "needs_attention", "pending_planting"}:
+    normalized_status = _normalize_tree_status(status) if status is not None else None
+    if normalized_status is not None and normalized_status not in TREE_STATUS_VALUES:
         raise HTTPException(status_code=400, detail="Invalid status")
     existing = db.execute(
         text("SELECT project_id, species, planting_date, status, notes, photo_url FROM trees WHERE id = :tree_id"),
@@ -1378,7 +1480,7 @@ def update_tree(
     """), {
         "species": species,
         "planting_date": planting_date,
-        "status": status,
+        "status": normalized_status,
         "notes": notes,
         "photo_url": photo_url,
         "tree_id": tree_id,
@@ -1394,7 +1496,7 @@ def update_tree(
             "after": {
                 "species": species if species is not None else existing.get("species"),
                 "planting_date": planting_date if planting_date is not None else existing.get("planting_date"),
-                "status": status if status is not None else existing.get("status"),
+                "status": normalized_status if normalized_status is not None else existing.get("status"),
                 "notes": notes if notes is not None else existing.get("notes"),
                 "photo_url": photo_url if photo_url is not None else existing.get("photo_url"),
             },
@@ -1414,7 +1516,8 @@ def add_visit(
     photo_url: str = Body(default=""),
     created_by: str = Body(default=""),
 ):
-    if status not in {"alive", "dead", "needs_attention", "pending_planting"}:
+    normalized_status = _normalize_tree_status(status)
+    if normalized_status not in TREE_STATUS_VALUES:
         raise HTTPException(status_code=400, detail="Invalid status")
     db.execute(text("""
         INSERT INTO tree_visits (tree_id, visit_date, status, notes, photo_url, created_by)
@@ -1422,7 +1525,7 @@ def add_visit(
     """), {
         "tree_id": tree_id,
         "visit_date": visit_date,
-        "status": status,
+        "status": normalized_status,
         "notes": notes or None,
         "photo_url": photo_url or None,
         "created_by": created_by or None,
@@ -1446,12 +1549,27 @@ def add_task(
 ):
     if status not in {"pending", "done", "overdue"}:
         raise HTTPException(status_code=400, detail="Invalid status")
+    activity = _normalize_name(task_type)
+    if activity not in MAINTENANCE_ACTIVITY_ORDER:
+        raise HTTPException(status_code=400, detail="Invalid maintenance type")
     tree_row = db.execute(
-        text("SELECT project_id FROM trees WHERE id = :tree_id"),
+        text("SELECT project_id, status FROM trees WHERE id = :tree_id"),
         {"tree_id": tree_id},
     ).mappings().first()
     if not tree_row:
         raise HTTPException(status_code=404, detail="Tree not found")
+    tree_status = _normalize_tree_status(tree_row.get("status") or "alive")
+    replacement_required = _is_replacement_trigger_status(tree_status)
+    if activity == "replacement" and not replacement_required:
+        raise HTTPException(
+            status_code=400,
+            detail="Replacement can only be assigned when tree status is dead, damaged, removed, or needs replacement.",
+        )
+    if replacement_required and activity != "replacement":
+        raise HTTPException(
+            status_code=400,
+            detail="This tree currently requires replacement. Assign and complete replacement first.",
+        )
 
     normalized_season = _normalize_name(model_season)
     if normalized_season and normalized_season not in SEASON_VALUES:
@@ -1461,7 +1579,7 @@ def add_task(
     submitted_at = None
     completed_at = None
     if _is_done_status(status):
-        evidence_ok, detail = _has_required_evidence(task_type, notes, photo_url)
+        evidence_ok, detail = _has_required_evidence(activity, notes, photo_url)
         if not evidence_ok:
             raise HTTPException(status_code=400, detail=detail)
         review_state = "submitted"
@@ -1480,7 +1598,7 @@ def add_task(
         RETURNING id
     """), {
         "tree_id": tree_id,
-        "task_type": task_type,
+        "task_type": activity,
         "assignee_name": assignee_name,
         "due_date": due_date,
         "priority": priority,
@@ -1500,7 +1618,7 @@ def add_task(
         action="task_created",
         actor=assignee_name,
         details={
-            "task_type": task_type,
+            "task_type": activity,
             "due_date": due_date,
             "priority": priority,
             "status": status,
@@ -1587,15 +1705,19 @@ def update_task(
     status: str | None = Body(default=None),
     notes: str | None = Body(default=None),
     photo_url: str | None = Body(default=None),
+    tree_status: str | None = Body(default=None),
     actor_name: str | None = Body(default=None),
 ):
     if status and status not in TASK_STATUS_VALUES:
         raise HTTPException(status_code=400, detail="Invalid status")
+    normalized_tree_status = _normalize_tree_status(tree_status) if tree_status is not None else None
+    if normalized_tree_status is not None and normalized_tree_status not in TREE_STATUS_VALUES:
+        raise HTTPException(status_code=400, detail="Invalid tree status")
     existing = db.execute(text("""
         SELECT t.id, t.tree_id, t.task_type, t.status, t.review_state, t.notes, t.photo_url,
                t.completed_at,
                t.submitted_at, t.reviewed_at, t.reviewed_by, t.review_notes,
-               tr.project_id
+               tr.project_id, tr.status AS tree_status
         FROM tree_tasks t
         JOIN trees tr ON tr.id = t.tree_id
         WHERE t.id = :task_id
@@ -1653,12 +1775,13 @@ def update_task(
         "task_id": task_id,
     }).mappings().first()
     resolved_photo = row.get("photo_url")
-    if resolved_photo:
+    if normalized_tree_status is not None or resolved_photo:
         db.execute(text("""
             UPDATE trees
-            SET photo_url = :photo_url
+            SET status = COALESCE(:tree_status, status),
+                photo_url = COALESCE(:photo_url, photo_url)
             WHERE id = :tree_id
-        """), {"photo_url": resolved_photo, "tree_id": row["tree_id"]})
+        """), {"tree_status": normalized_tree_status, "photo_url": resolved_photo, "tree_id": row["tree_id"]})
 
     project_id = int(existing["project_id"])
     _log_audit_event(
@@ -1674,12 +1797,14 @@ def update_task(
                 "review_state": existing.get("review_state"),
                 "notes": existing.get("notes"),
                 "photo_url": existing.get("photo_url"),
+                "tree_status": existing.get("tree_status"),
             },
             "after": {
                 "status": row.get("status"),
                 "review_state": row.get("review_state"),
                 "notes": next_notes,
                 "photo_url": next_photo,
+                "tree_status": normalized_tree_status if normalized_tree_status is not None else existing.get("tree_status"),
             },
         },
     )
@@ -1729,8 +1854,12 @@ def submit_task_for_review(
     db: Session = Depends(get_db),
     notes: str | None = Body(default=None),
     photo_url: str | None = Body(default=None),
+    tree_status: str | None = Body(default=None),
     actor_name: str | None = Body(default=None),
 ):
+    normalized_tree_status = _normalize_tree_status(tree_status) if tree_status is not None else None
+    if normalized_tree_status is not None and normalized_tree_status not in TREE_STATUS_VALUES:
+        raise HTTPException(status_code=400, detail="Invalid tree status")
     task = db.execute(
         text("""
             SELECT t.id, t.tree_id, t.task_type, t.status, t.review_state, t.notes, t.photo_url,
@@ -1769,6 +1898,16 @@ def submit_task_for_review(
         """),
         {"task_id": task_id, "notes": notes, "photo_url": photo_url},
     ).mappings().first()
+    if normalized_tree_status is not None or merged_photo:
+        db.execute(
+            text("""
+                UPDATE trees
+                SET status = COALESCE(:tree_status, status),
+                    photo_url = COALESCE(:photo_url, photo_url)
+                WHERE id = :tree_id
+            """),
+            {"tree_status": normalized_tree_status, "photo_url": merged_photo or None, "tree_id": int(row["tree_id"])},
+        )
 
     project_id = int(task["project_id"])
     db.execute(
@@ -2662,18 +2801,12 @@ def export_project_pdf(
             z = zoom if zoom is not None else 13
             b = bearing or 0
             p = pitch or 0
-            status_colors = {
-                "alive": "22c55e",
-                "needs_attention": "f59e0b",
-                "dead": "ef4444",
-                "pending_planting": "3b82f6",
-            }
             import urllib.parse
             markers = []
             for r in map_rows[:120]:
                 if r["lng"] is None or r["lat"] is None:
                     continue
-                color = status_colors.get(str(r.get("status", "")).lower(), "22c55e")
+                color = _tree_status_color_hex(r.get("status"))
                 markers.append(f"pin-s+{color}({r['lng']},{r['lat']})")
             overlay = ",".join(markers) if markers else None
             overlay_part = f"{urllib.parse.quote(overlay, safe='(),:+')}/" if overlay else ""
@@ -2730,10 +2863,10 @@ def export_project_pdf(
 
 def _build_tree_stats(rows: list[dict]) -> dict:
     total = len(rows)
-    alive = sum(1 for r in rows if r.get("status") == "alive")
-    dead = sum(1 for r in rows if r.get("status") == "dead")
-    needs_attention = sum(1 for r in rows if r.get("status") == "needs_attention")
-    pending = sum(1 for r in rows if r.get("status") == "pending_planting")
+    alive = sum(1 for r in rows if _normalize_tree_status(r.get("status")) in HEALTHY_TREE_STATUSES)
+    dead = sum(1 for r in rows if _normalize_tree_status(r.get("status")) in DEAD_TREE_STATUSES)
+    needs_attention = sum(1 for r in rows if _normalize_tree_status(r.get("status")) in ATTENTION_TREE_STATUSES)
+    pending = sum(1 for r in rows if _normalize_tree_status(r.get("status")) == "pending_planting")
     survival_rate = round((alive / total) * 100, 1) if total else 0.0
     return {
         "total": total,
@@ -2815,18 +2948,12 @@ def export_work_report_pdf(
             z = zoom if zoom is not None else 13
             b = bearing or 0
             p = pitch or 0
-            status_colors = {
-                "alive": "22c55e",
-                "needs_attention": "f59e0b",
-                "dead": "ef4444",
-                "pending_planting": "3b82f6",
-            }
             import urllib.parse
             markers = []
             for r in map_rows[:120]:
                 if r["lng"] is None or r["lat"] is None:
                     continue
-                color = status_colors.get(str(r.get("status", "")).lower(), "22c55e")
+                color = _tree_status_color_hex(r.get("status"))
                 markers.append(f"pin-s+{color}({r['lng']},{r['lat']})")
             overlay = ",".join(markers) if markers else None
             overlay_part = f"{urllib.parse.quote(overlay, safe='(),:+')}/" if overlay else ""
