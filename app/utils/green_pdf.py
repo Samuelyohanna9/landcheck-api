@@ -107,18 +107,25 @@ def render_green_report_pdf(
     img_y = map_y
     img_w = map_w
     img_h = map_h
+    img = None
     if map_png:
-        from reportlab.lib.utils import ImageReader
-        import io
-        img = ImageReader(io.BytesIO(map_png))
-        src_w, src_h = img.getSize()
-        if src_w and src_h:
-            scale = min(map_w / src_w, map_h / src_h)
-            img_w = src_w * scale
-            img_h = src_h * scale
-            img_x = map_x
-            img_y = map_y + (map_h - img_h)
-        c.drawImage(img, img_x, img_y, img_w, img_h, preserveAspectRatio=True, anchor="sw")
+        try:
+            from reportlab.lib.utils import ImageReader
+            import io
+
+            img = ImageReader(io.BytesIO(map_png))
+            src_w, src_h = img.getSize()
+            if src_w and src_h:
+                scale = min(map_w / src_w, map_h / src_h)
+                img_w = src_w * scale
+                img_h = src_h * scale
+                img_x = map_x
+                img_y = map_y + (map_h - img_h)
+            c.drawImage(img, img_x, img_y, img_w, img_h, preserveAspectRatio=True, anchor="sw")
+        except Exception:
+            # Invalid/unsupported image payload; fallback to vector/point-only map frame.
+            img = None
+            map_png = None
 
     # Draw border around the actual map image area
     c.setStrokeColorRGB(0, 0, 0)
@@ -143,7 +150,7 @@ def render_green_report_pdf(
             y = (0.5 - math.log((1 + siny) / (1 - siny)) / (4 * math.pi)) * world_size
             return x, y
 
-        if map_png and map_view and map_view.get("zoom") is not None:
+        if map_png and img is not None and map_view and map_view.get("zoom") is not None:
             try:
                 import math
                 zoom = float(map_view.get("zoom"))

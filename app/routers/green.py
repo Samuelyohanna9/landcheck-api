@@ -1923,10 +1923,16 @@ def update_task(
     elif status is not None:
         # Task moved out of done-state; keep it editable.
         next_completed_at = None
-        if _normalize_name(next_review_state) in {"submitted", "rejected", "reopened"}:
-            next_review_state = "none"
-        next_submitted_at = None
-        clear_review_fields = True
+        current_review_state = _normalize_name(existing.get("review_state"))
+        if current_review_state == "rejected":
+            # Keep rejected state visible until staff explicitly resubmits.
+            next_review_state = "rejected"
+            clear_review_fields = False
+        else:
+            if _normalize_name(next_review_state) in {"submitted", "rejected", "reopened"}:
+                next_review_state = "none"
+            next_submitted_at = None
+            clear_review_fields = True
 
     row = db.execute(text("""
         UPDATE tree_tasks
@@ -3647,17 +3653,33 @@ def export_project_pdf(
     map_view = None
     if lng is not None and lat is not None and zoom is not None:
         map_view = {"lng": lng, "lat": lat, "zoom": zoom}
-    render_green_report_pdf(
-        pdf_path,
-        project,
-        rows,
-        map_png=map_png,
-        map_rows=map_rows,
-        map_view=map_view,
-        maintenance_rows=maintenance_rows,
-        donor_rows=_build_donor_report_rows(project_id, db),
-        kpi_snapshot=_compute_kpi_snapshot(project_id, db),
-    )
+    donor_rows = _build_donor_report_rows(project_id, db)
+    kpi_snapshot = _compute_kpi_snapshot(project_id, db)
+    try:
+        render_green_report_pdf(
+            pdf_path,
+            project,
+            rows,
+            map_png=map_png,
+            map_rows=map_rows,
+            map_view=map_view,
+            maintenance_rows=maintenance_rows,
+            donor_rows=donor_rows,
+            kpi_snapshot=kpi_snapshot,
+        )
+    except Exception:
+        # Hard fallback: regenerate without external map image bytes.
+        render_green_report_pdf(
+            pdf_path,
+            project,
+            rows,
+            map_png=None,
+            map_rows=map_rows,
+            map_view=map_view,
+            maintenance_rows=maintenance_rows,
+            donor_rows=donor_rows,
+            kpi_snapshot=kpi_snapshot,
+        )
     filename = f"project_{project_id}_report.pdf"
     return FileResponse(pdf_path, media_type="application/pdf", filename=filename)
 
@@ -3750,17 +3772,32 @@ def export_work_report_pdf(
     map_view = None
     if lng is not None and lat is not None and zoom is not None:
         map_view = {"lng": lng, "lat": lat, "zoom": zoom}
-    render_green_report_pdf(
-        pdf_path,
-        project_copy,
-        rows,
-        map_png=map_png,
-        map_rows=map_rows,
-        map_view=map_view,
-        maintenance_rows=maintenance_rows,
-        donor_rows=_build_donor_report_rows(project_id, db),
-        kpi_snapshot=_compute_kpi_snapshot(project_id, db),
-    )
+    donor_rows = _build_donor_report_rows(project_id, db)
+    kpi_snapshot = _compute_kpi_snapshot(project_id, db)
+    try:
+        render_green_report_pdf(
+            pdf_path,
+            project_copy,
+            rows,
+            map_png=map_png,
+            map_rows=map_rows,
+            map_view=map_view,
+            maintenance_rows=maintenance_rows,
+            donor_rows=donor_rows,
+            kpi_snapshot=kpi_snapshot,
+        )
+    except Exception:
+        render_green_report_pdf(
+            pdf_path,
+            project_copy,
+            rows,
+            map_png=None,
+            map_rows=map_rows,
+            map_view=map_view,
+            maintenance_rows=maintenance_rows,
+            donor_rows=donor_rows,
+            kpi_snapshot=kpi_snapshot,
+        )
     filename = (
         f"project_{project_id}_work_report_{assignee_name}.pdf"
         if assignee_name
