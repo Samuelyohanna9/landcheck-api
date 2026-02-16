@@ -1137,16 +1137,32 @@ def _build_report_map_png(
     if not map_rows:
         return None
 
+    def _coerce_optional_float(value: object) -> float | None:
+        if value is None:
+            return None
+        try:
+            if isinstance(value, bool):
+                return None
+            return float(value)
+        except Exception:
+            return None
+
+    lng_value = _coerce_optional_float(lng)
+    lat_value = _coerce_optional_float(lat)
+    zoom_value = _coerce_optional_float(zoom)
+    bearing_value = _coerce_optional_float(bearing)
+    pitch_value = _coerce_optional_float(pitch)
+
     lats = [r.get("lat") for r in map_rows if r.get("lat") is not None]
     lngs = [r.get("lng") for r in map_rows if r.get("lng") is not None]
     if not lats or not lngs:
         return None
 
-    center_lat = lat if lat is not None else sum(lats) / len(lats)
-    center_lng = lng if lng is not None else sum(lngs) / len(lngs)
-    z = zoom if zoom is not None else 13
-    b = bearing or 0
-    p = pitch or 0
+    center_lat = lat_value if lat_value is not None else sum(lats) / len(lats)
+    center_lng = lng_value if lng_value is not None else sum(lngs) / len(lngs)
+    z = zoom_value if zoom_value is not None else 13
+    b = bearing_value if bearing_value is not None else 0
+    p = pitch_value if pitch_value is not None else 0
 
     token = _load_env_token()
     if token:
@@ -3615,6 +3631,22 @@ def export_project_pdf(
     pitch: float | None = Query(default=0.0),
     db: Session = Depends(get_db),
 ):
+    def _coerce_optional_float(value: object) -> float | None:
+        if value is None:
+            return None
+        try:
+            if isinstance(value, bool):
+                return None
+            return float(value)
+        except Exception:
+            return None
+
+    lng_value = _coerce_optional_float(lng)
+    lat_value = _coerce_optional_float(lat)
+    zoom_value = _coerce_optional_float(zoom)
+    bearing_value = _coerce_optional_float(bearing)
+    pitch_value = _coerce_optional_float(pitch)
+
     project = get_project(project_id, db)
     rows = db.execute(text("""
         SELECT id, species, planting_date, status, notes,
@@ -3643,16 +3675,16 @@ def export_project_pdf(
 
     map_png = _build_report_map_png(
         map_rows=map_rows,
-        lng=lng,
-        lat=lat,
-        zoom=zoom,
-        bearing=bearing,
-        pitch=pitch,
+        lng=lng_value,
+        lat=lat_value,
+        zoom=zoom_value,
+        bearing=bearing_value,
+        pitch=pitch_value,
     )
 
     map_view = None
-    if lng is not None and lat is not None and zoom is not None:
-        map_view = {"lng": lng, "lat": lat, "zoom": zoom}
+    if lng_value is not None and lat_value is not None and zoom_value is not None:
+        map_view = {"lng": lng_value, "lat": lat_value, "zoom": zoom_value}
     donor_rows = _build_donor_report_rows(project_id, db)
     kpi_snapshot = _compute_kpi_snapshot(project_id, db)
     try:
@@ -3712,6 +3744,22 @@ def export_work_report_pdf(
     pitch: float | None = Query(default=0.0),
     db: Session = Depends(get_db),
 ):
+    def _coerce_optional_float(value: object) -> float | None:
+        if value is None:
+            return None
+        try:
+            if isinstance(value, bool):
+                return None
+            return float(value)
+        except Exception:
+            return None
+
+    lng_value = _coerce_optional_float(lng)
+    lat_value = _coerce_optional_float(lat)
+    zoom_value = _coerce_optional_float(zoom)
+    bearing_value = _coerce_optional_float(bearing)
+    pitch_value = _coerce_optional_float(pitch)
+
     project = get_project(project_id, db)
     if assignee_name:
         rows = db.execute(text("""
@@ -3762,16 +3810,16 @@ def export_work_report_pdf(
 
     map_png = _build_report_map_png(
         map_rows=map_rows,
-        lng=lng,
-        lat=lat,
-        zoom=zoom,
-        bearing=bearing,
-        pitch=pitch,
+        lng=lng_value,
+        lat=lat_value,
+        zoom=zoom_value,
+        bearing=bearing_value,
+        pitch=pitch_value,
     )
 
     map_view = None
-    if lng is not None and lat is not None and zoom is not None:
-        map_view = {"lng": lng, "lat": lat, "zoom": zoom}
+    if lng_value is not None and lat_value is not None and zoom_value is not None:
+        map_view = {"lng": lng_value, "lat": lat_value, "zoom": zoom_value}
     donor_rows = _build_donor_report_rows(project_id, db)
     kpi_snapshot = _compute_kpi_snapshot(project_id, db)
     try:
