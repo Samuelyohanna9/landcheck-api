@@ -1383,6 +1383,25 @@ async def upload_photo_to_r2(
         if not linked_tree_id:
             db.rollback()
             raise HTTPException(status_code=404, detail="Tree not found for photo link.")
+        linked_task_row = db.execute(
+            text("""
+                UPDATE tree_tasks
+                SET photo_url = :photo_url
+                WHERE id = (
+                    SELECT id
+                    FROM tree_tasks
+                    WHERE tree_id = :tree_id
+                      AND LOWER(COALESCE(task_type, '')) = 'planting'
+                      AND LOWER(COALESCE(review_state, 'none')) <> 'approved'
+                    ORDER BY created_at DESC, id DESC
+                    LIMIT 1
+                )
+                RETURNING id
+            """),
+            {"photo_url": proxy_url, "tree_id": tree_id},
+        ).mappings().first()
+        if linked_task_row:
+            linked_task_id = linked_task_row["id"]
         db.commit()
     elif task_id is not None:
         locked = db.execute(
