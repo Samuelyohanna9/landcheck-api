@@ -386,19 +386,56 @@ def _render_executive_summary(c, width, height, project, kpi_snapshot, carbon_da
     if trend_first_label or trend_last_label:
         c.drawString(40, left_base_y - 20, f"Period: {trend_first_label} to {trend_last_label}".strip())
 
-    # Top species by CO2 (right)
-    top_species = carbon_data.get("top_species", []) if carbon_data else []
-    if top_species:
-        bar_data = []
-        colors = ["#2e7d32", "#43a047", "#66bb6a", "#81c784", "#a5d6a7",
-                  "#c8e6c9", "#e8f5e9", "#b9f6ca", "#69f0ae", "#00e676"]
-        for i, sp in enumerate(top_species[:7]):
-            bar_data.append((sp["species"][:14], sp["co2_kg"], colors[i % len(colors)]))
-        _draw_bar_chart(c, 40 + chart_w + 20, y - 140, chart_w, 130, bar_data,
-                        title="Top Species by CO2 (kg)")
+    # Species-based age survival table (right)
+    species_breakdown = age_survival.get("species_breakdown", []) if isinstance(age_survival, dict) else []
+    right_x = 40 + chart_w + 20
+    if isinstance(species_breakdown, list) and len(species_breakdown) > 0:
+        c.setFont("Helvetica-Bold", 9)
+        c.setFillColorRGB(0.15, 0.15, 0.15)
+        c.drawString(right_x, y - 8, "Species Survival (30/90/180 days)")
+        header_y = y - 20
+        c.setFont("Helvetica-Bold", 6.8)
+        c.drawString(right_x, header_y, "Species")
+        c.drawString(right_x + 108, header_y, "30d")
+        c.drawString(right_x + 142, header_y, "90d")
+        c.drawString(right_x + 176, header_y, "180d")
+        c.drawString(right_x + 212, header_y, "Trees")
+        c.setStrokeColorRGB(0.82, 0.88, 0.84)
+        c.setLineWidth(0.5)
+        c.line(right_x, header_y - 3, right_x + chart_w - 4, header_y - 3)
+
+        def _fmt_rate(bucket):
+            eligible = int((bucket or {}).get("eligible_trees", 0) or 0)
+            rate = float((bucket or {}).get("survival_rate", 0) or 0)
+            return f"{rate:.0f}%" if eligible > 0 else "-"
+
+        row_y = header_y - 12
+        for row in species_breakdown[:8]:
+            species_label = str(row.get("species_label") or row.get("species_key") or "Unknown")[:22]
+            c.setFont("Helvetica", 6.6)
+            c.setFillColorRGB(0.22, 0.33, 0.27)
+            c.drawString(right_x, row_y, species_label)
+            c.drawString(right_x + 108, row_y, _fmt_rate(row.get("day_30")))
+            c.drawString(right_x + 142, row_y, _fmt_rate(row.get("day_90")))
+            c.drawString(right_x + 176, row_y, _fmt_rate(row.get("day_180")))
+            c.drawString(right_x + 212, row_y, str(int(row.get("trees_with_planting_date", 0) or 0)))
+            row_y -= 9
+
         c.setFont("Helvetica", 6.5)
         c.setFillColorRGB(0.45, 0.45, 0.45)
-        c.drawString(40 + chart_w + 20, y - 148, "Context: estimated current stock by species group.")
+        c.drawString(right_x, y - 148, "Context: age-based species cohorts from planting date; '-' means no eligible trees.")
+    else:
+        top_species = carbon_data.get("top_species", []) if carbon_data else []
+        if top_species:
+            bar_data = []
+            colors = ["#2e7d32", "#43a047", "#66bb6a", "#81c784", "#a5d6a7",
+                      "#c8e6c9", "#e8f5e9", "#b9f6ca", "#69f0ae", "#00e676"]
+            for i, sp in enumerate(top_species[:7]):
+                bar_data.append((sp["species"][:14], sp["co2_kg"], colors[i % len(colors)]))
+            _draw_bar_chart(c, right_x, y - 140, chart_w, 130, bar_data, title="Top Species by CO2 (kg)")
+            c.setFont("Helvetica", 6.5)
+            c.setFillColorRGB(0.45, 0.45, 0.45)
+            c.drawString(right_x, y - 148, "Context: estimated current stock by species group.")
 
     # CO2 projection chart (bottom, full width)
     co2_projection = carbon_data.get("projection", []) if carbon_data else []

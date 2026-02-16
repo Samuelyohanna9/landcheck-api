@@ -3339,7 +3339,7 @@ def _compute_age_based_survival(
     tree_rows = db.execute(
         text(
             """
-            SELECT id, planting_date, status
+            SELECT id, planting_date, status, species
             FROM trees
             WHERE project_id = :project_id
             """
@@ -3378,16 +3378,35 @@ def _compute_age_based_survival(
         }
         for day in checkpoints_days
     }
+    species_metrics: dict[str, dict] = {}
     missing_planting_date_trees = 0
 
     for row in tree_rows:
         tree_id = int(row.get("id") or 0)
         if tree_id <= 0:
             continue
+        species_label_raw = str(row.get("species") or "").strip()
+        species_key = _normalize_name(species_label_raw) or "__unknown__"
+        species_label = species_label_raw or "Unknown Species"
+        if species_key not in species_metrics:
+            species_metrics[species_key] = {
+                "species_key": species_key,
+                "species_label": species_label,
+                "trees_with_planting_date": 0,
+                "checkpoints": {
+                    int(day): {
+                        "eligible_trees": 0,
+                        "survived_trees": 0,
+                        "missing_status_trees": 0,
+                    }
+                    for day in checkpoints_days
+                },
+            }
         planting_ref = _parse_date_value(row.get("planting_date"))
         if planting_ref is None:
             missing_planting_date_trees += 1
             continue
+        species_metrics[species_key]["trees_with_planting_date"] += 1
         history = history_by_tree.get(tree_id) or []
         fallback_status = _normalize_tree_status(row.get("status"))
 
@@ -3398,7 +3417,9 @@ def _compute_age_based_survival(
                 continue
 
             metric = checkpoint_metrics[checkpoint]
+            species_metric = species_metrics[species_key]["checkpoints"][checkpoint]
             metric["eligible_trees"] += 1
+            species_metric["eligible_trees"] += 1
 
             status_at_target = None
             for status_date, status_value in history:
@@ -3408,9 +3429,11 @@ def _compute_age_based_survival(
                     break
             if status_at_target is None:
                 metric["missing_status_trees"] += 1
+                species_metric["missing_status_trees"] += 1
                 status_at_target = fallback_status
             if status_at_target in HEALTHY_TREE_STATUSES:
                 metric["survived_trees"] += 1
+                species_metric["survived_trees"] += 1
 
     result = {
         "as_of_date": as_of.isoformat(),
@@ -3429,6 +3452,34 @@ def _compute_age_based_survival(
             "survival_rate": rate,
             "missing_status_trees": missing,
         }
+    species_rows: list[dict] = []
+    for _, item in species_metrics.items():
+        checkpoints = item.get("checkpoints") or {}
+        row_payload = {
+            "species_key": item.get("species_key"),
+            "species_label": item.get("species_label"),
+            "trees_with_planting_date": int(item.get("trees_with_planting_date") or 0),
+        }
+        for day in checkpoints_days:
+            bucket = checkpoints.get(int(day)) or {}
+            eligible = int(bucket.get("eligible_trees") or 0)
+            survived = int(bucket.get("survived_trees") or 0)
+            missing = int(bucket.get("missing_status_trees") or 0)
+            rate = round((survived / eligible) * 100, 1) if eligible > 0 else 0.0
+            row_payload[f"day_{int(day)}"] = {
+                "eligible_trees": eligible,
+                "survived_trees": survived,
+                "survival_rate": rate,
+                "missing_status_trees": missing,
+            }
+        species_rows.append(row_payload)
+    species_rows.sort(
+        key=lambda row: (
+            -int(row.get("trees_with_planting_date") or 0),
+            str(row.get("species_label") or "").lower(),
+        )
+    )
+    result["species_breakdown"] = species_rows
     return result
 
 
