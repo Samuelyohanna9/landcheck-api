@@ -16,6 +16,17 @@ from botocore.exceptions import ClientError
 
 from app.db import SessionLocal
 from app.utils.green_pdf import render_green_report_pdf, render_green_work_report_pdf
+from app.utils.carbon import (
+    compute_project_carbon,
+    generate_co2_projection_table,
+    estimate_tree_co2_kg,
+    estimate_annual_co2_kg,
+    estimate_lifetime_co2_kg,
+    tree_age_years,
+    list_known_species,
+    _normalize_species_key,
+    _get_species_params,
+)
 
 router = APIRouter(prefix="/green", tags=["green"])
 
@@ -1509,6 +1520,13 @@ def get_project(project_id: int, db: Session = Depends(get_db)):
     needs_attention = sum(status_counts.get(status_key, 0) for status_key in ATTENTION_TREE_STATUSES)
     survival_rate = round((alive / total) * 100, 1) if total else 0.0
 
+    # Carbon summary
+    tree_rows_for_carbon = db.execute(text("""
+        SELECT id, species, planting_date, status
+        FROM trees WHERE project_id = :project_id
+    """), {"project_id": project_id}).mappings().all()
+    carbon = compute_project_carbon([dict(r) for r in tree_rows_for_carbon])
+
     return {
         **dict(project),
         "stats": {
@@ -1517,6 +1535,14 @@ def get_project(project_id: int, db: Session = Depends(get_db)):
             "dead": dead,
             "needs_attention": needs_attention,
             "survival_rate": survival_rate,
+        },
+        "carbon": {
+            "current_co2_kg": carbon["current_co2_kg"],
+            "current_co2_tonnes": carbon["current_co2_tonnes"],
+            "annual_co2_kg": carbon["annual_co2_kg"],
+            "annual_co2_tonnes": carbon["annual_co2_tonnes"],
+            "projected_lifetime_co2_tonnes": carbon["projected_lifetime_co2_tonnes"],
+            "co2_per_tree_avg_kg": carbon["co2_per_tree_avg_kg"],
         },
     }
 
@@ -1602,6 +1628,95 @@ def upsert_species_maturity(
     ).mappings().first()
     db.commit()
     return dict(row)
+
+
+# ---------------------------------------------------------------------------
+# Carbon / CO2 Endpoints
+# ---------------------------------------------------------------------------
+
+
+@router.get("/projects/{project_id}/carbon-summary")
+def carbon_summary(project_id: int, projection_years: int = Query(default=40), db: Session = Depends(get_db)):
+    """Get CO2 sequestration summary for a project."""
+    project = db.execute(
+        text("SELECT id FROM tree_projects WHERE id = :pid"), {"pid": project_id},
+    ).scalar()
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    tree_rows = db.execute(text("""
+        SELECT id, species, planting_date, status
+        FROM trees
+        WHERE project_id = :project_id
+    """), {"project_id": project_id}).mappings().all()
+    trees = [dict(r) for r in tree_rows]
+    summary = compute_project_carbon(trees, projection_years)
+    summary["project_id"] = project_id
+    return summary
+
+
+@router.get("/projects/{project_id}/carbon-projection")
+def carbon_projection(project_id: int, years: int = Query(default=30), db: Session = Depends(get_db)):
+    """Get year-by-year CO2 projection for a project."""
+    project = db.execute(
+        text("SELECT id FROM tree_projects WHERE id = :pid"), {"pid": project_id},
+    ).scalar()
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    tree_rows = db.execute(text("""
+        SELECT id, species, planting_date, status
+        FROM trees
+        WHERE project_id = :project_id
+    """), {"project_id": project_id}).mappings().all()
+    trees = [dict(r) for r in tree_rows]
+    projection = generate_co2_projection_table(trees, years)
+    return {"project_id": project_id, "projection": projection}
+
+
+@router.get("/trees/{tree_id}/carbon")
+def tree_carbon(tree_id: int, db: Session = Depends(get_db)):
+    """Get CO2 estimate for a single tree."""
+    tree = db.execute(text("""
+        SELECT id, species, planting_date, status
+        FROM trees
+        WHERE id = :tree_id
+    """), {"tree_id": tree_id}).mappings().first()
+    if not tree:
+        raise HTTPException(status_code=404, detail="Tree not found")
+
+    planting_date = tree.get("planting_date")
+    if isinstance(planting_date, str):
+        try:
+            planting_date = date.fromisoformat(planting_date[:10])
+        except (ValueError, TypeError):
+            planting_date = None
+
+    age = tree_age_years(planting_date)
+    species = tree.get("species")
+    params = _get_species_params(species)
+    current_co2 = estimate_tree_co2_kg(species, age)
+    annual_co2 = estimate_annual_co2_kg(species, age)
+    lifetime_co2 = estimate_lifetime_co2_kg(species, 40)
+
+    return {
+        "tree_id": tree_id,
+        "species": species,
+        "species_matched": params.get("label", "Unknown"),
+        "growth_class": params.get("growth_class", "medium"),
+        "age_years": round(age, 1),
+        "current_co2_kg": current_co2,
+        "annual_co2_kg": annual_co2,
+        "lifetime_co2_kg": lifetime_co2,
+        "lifetime_co2_tonnes": round(lifetime_co2 / 1000, 3),
+        "methodology": "Chave et al. (2014) pantropical allometric equation",
+    }
+
+
+@router.get("/carbon/species-database")
+def carbon_species_database():
+    """List all species in the carbon estimation database."""
+    return {"species": list_known_species()}
 
 
 @router.post("/trees")
@@ -3067,6 +3182,14 @@ def _compute_kpi_snapshot(project_id: int, db: Session) -> dict:
             evidence_complete += 1
 
     evidence_rate = round((evidence_complete / total_tasks) * 100, 1) if total_tasks else 0.0
+
+    # Carbon data for KPI
+    carbon_tree_rows = db.execute(text("""
+        SELECT id, species, planting_date, status
+        FROM trees WHERE project_id = :project_id
+    """), {"project_id": project_id}).mappings().all()
+    carbon = compute_project_carbon([dict(r) for r in carbon_tree_rows])
+
     return {
         "project_id": project_id,
         "snapshot_date": datetime.utcnow().isoformat(),
@@ -3083,6 +3206,9 @@ def _compute_kpi_snapshot(project_id: int, db: Session) -> dict:
         "tasks_rejected": rejected_tasks,
         "tasks_overdue": overdue_tasks,
         "evidence_complete_rate": evidence_rate,
+        "co2_current_tonnes": carbon["current_co2_tonnes"],
+        "co2_annual_tonnes": carbon["annual_co2_tonnes"],
+        "co2_projected_lifetime_tonnes": carbon["projected_lifetime_co2_tonnes"],
     }
 
 
@@ -3117,6 +3243,12 @@ def export_donor_report_csv(project_id: int, db: Session = Depends(get_db)):
 
     with open(csv_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
+        # Carbon summary for CSV header
+        carbon_trees_csv = db.execute(text("""
+            SELECT id, species, planting_date, status FROM trees WHERE project_id = :pid
+        """), {"pid": project_id}).mappings().all()
+        carbon_csv = compute_project_carbon([dict(r) for r in carbon_trees_csv])
+
         writer.writerow(["LandCheck Donor + Operations Report"])
         writer.writerow(["Project", project.get("name") or "", "Location", project.get("location_text") or "", "Sponsor", project.get("sponsor") or ""])
         writer.writerow([
@@ -3128,6 +3260,14 @@ def export_donor_report_csv(project_id: int, db: Session = Depends(get_db)):
             f"Submitted {kpi.get('tasks_submitted', 0)}",
             f"Rejected {kpi.get('tasks_rejected', 0)}",
             f"Overdue {kpi.get('tasks_overdue', 0)}",
+        ])
+        writer.writerow([
+            "Carbon Impact",
+            f"CO2 Sequestered: {carbon_csv.get('current_co2_tonnes', 0)} tonnes",
+            f"Annual Rate: {carbon_csv.get('annual_co2_tonnes', 0)} t/yr",
+            f"40-Year Projection: {carbon_csv.get('projected_lifetime_co2_tonnes', 0)} tonnes",
+            f"Avg per Tree: {carbon_csv.get('co2_per_tree_avg_kg', 0)} kg",
+            "Methodology: IPCC Tier 1 + Chave et al. (2014)",
         ])
         writer.writerow([])
         writer.writerow([
@@ -3829,6 +3969,17 @@ def export_project_pdf(
         map_view = {"lng": lng_value, "lat": lat_value, "zoom": zoom_value}
     donor_rows = _build_donor_report_rows(project_id, db)
     kpi_snapshot = _compute_kpi_snapshot(project_id, db)
+
+    # Carbon data for executive summary
+    carbon_trees = db.execute(text("""
+        SELECT id, species, planting_date, status FROM trees WHERE project_id = :pid
+    """), {"pid": project_id}).mappings().all()
+    carbon_data = compute_project_carbon([dict(r) for r in carbon_trees])
+    carbon_data["projection"] = generate_co2_projection_table([dict(r) for r in carbon_trees], 30)
+
+    # KPI trend for survival chart
+    kpi_trend = _fetch_kpi_trend(project_id, db, days=90)
+
     try:
         render_green_report_pdf(
             pdf_path,
@@ -3840,9 +3991,10 @@ def export_project_pdf(
             maintenance_rows=maintenance_rows,
             donor_rows=donor_rows,
             kpi_snapshot=kpi_snapshot,
+            carbon_data=carbon_data,
+            kpi_trend=kpi_trend,
         )
     except Exception:
-        # Hard fallback: regenerate without external map image bytes.
         render_green_report_pdf(
             pdf_path,
             project,
@@ -3853,9 +4005,22 @@ def export_project_pdf(
             maintenance_rows=maintenance_rows,
             donor_rows=donor_rows,
             kpi_snapshot=kpi_snapshot,
+            carbon_data=carbon_data,
+            kpi_trend=kpi_trend,
         )
     filename = f"project_{project_id}_report.pdf"
     return FileResponse(pdf_path, media_type="application/pdf", filename=filename)
+
+
+def _fetch_kpi_trend(project_id: int, db: Session, days: int = 90) -> list[dict]:
+    """Fetch recent KPI snapshots for trend charts."""
+    rows = db.execute(text("""
+        SELECT snapshot_at, metrics FROM green_kpi_snapshots
+        WHERE project_id = :pid AND snapshot_at >= NOW() - INTERVAL ':days days'
+        ORDER BY snapshot_at ASC
+        LIMIT 100
+    """.replace(":days", str(int(days)))), {"pid": project_id}).mappings().all()
+    return [dict(r) for r in rows]
 
 
 def _build_tree_stats(rows: list[dict]) -> dict:
@@ -3964,6 +4129,17 @@ def export_work_report_pdf(
         map_view = {"lng": lng_value, "lat": lat_value, "zoom": zoom_value}
     donor_rows = _build_donor_report_rows(project_id, db)
     kpi_snapshot = _compute_kpi_snapshot(project_id, db)
+
+    # Carbon data for executive summary
+    carbon_trees = db.execute(text("""
+        SELECT id, species, planting_date, status FROM trees WHERE project_id = :pid
+    """), {"pid": project_id}).mappings().all()
+    carbon_data = compute_project_carbon([dict(r) for r in carbon_trees])
+    carbon_data["projection"] = generate_co2_projection_table([dict(r) for r in carbon_trees], 30)
+
+    # KPI trend for survival chart
+    kpi_trend = _fetch_kpi_trend(project_id, db, days=90)
+
     try:
         render_green_report_pdf(
             pdf_path,
@@ -3975,6 +4151,8 @@ def export_work_report_pdf(
             maintenance_rows=maintenance_rows,
             donor_rows=donor_rows,
             kpi_snapshot=kpi_snapshot,
+            carbon_data=carbon_data,
+            kpi_trend=kpi_trend,
         )
     except Exception:
         render_green_report_pdf(
@@ -3987,6 +4165,8 @@ def export_work_report_pdf(
             maintenance_rows=maintenance_rows,
             donor_rows=donor_rows,
             kpi_snapshot=kpi_snapshot,
+            carbon_data=carbon_data,
+            kpi_trend=kpi_trend,
         )
     filename = (
         f"project_{project_id}_work_report_{assignee_name}.pdf"
