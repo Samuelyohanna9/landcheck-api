@@ -333,7 +333,7 @@ def _render_executive_summary(c, width, height, project, kpi_snapshot, carbon_da
     )
     c.setFont("Helvetica", 6.5)
     c.setFillColorRGB(0.45, 0.45, 0.45)
-    c.drawString(40, top_chart_y - 10, "Context: monthly cumulative healthy share across planting cohorts.")
+    c.drawString(40, top_chart_y - 10, "Context: monthly cumulative healthy share across planting cohorts (current status basis).")
     if trend_first_label or trend_last_label:
         c.drawRightString(40 + chart_w, top_chart_y - 10, f"{trend_first_label} to {trend_last_label}".strip())
 

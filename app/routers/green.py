@@ -2636,7 +2636,7 @@ def reports_kpi(
         "current": metrics,
         "trend_days": days,
         "trend_basis": {
-            "survival": "Monthly cumulative survival across planting cohorts (planting_date/created_at basis).",
+            "survival": "Monthly cumulative survival across planting cohorts using current tree statuses (planting_date/created_at basis).",
             "evidence": "Monthly cumulative proof completion across in-scope task activity records.",
         },
         "trend": trend,
