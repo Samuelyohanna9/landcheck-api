@@ -14,7 +14,7 @@ Biomass chain:
 """
 
 import math
-from datetime import date
+from datetime import date, datetime
 from typing import Optional
 
 # ---------------------------------------------------------------------------
@@ -392,6 +392,85 @@ def tree_age_years(planting_date: Optional[date], ref_date: Optional[date] = Non
     return max(delta.days / 365.25, 0.0)
 
 
+def _parse_date_like(value) -> Optional[date]:
+    """Parse date/datetime/ISO string into a date."""
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    if isinstance(value, str):
+        raw = value.strip()
+        if not raw:
+            return None
+        try:
+            normalized = raw.replace("Z", "+00:00") if raw.endswith("Z") else raw
+            return datetime.fromisoformat(normalized).date()
+        except Exception:
+            pass
+        try:
+            return date.fromisoformat(raw[:10])
+        except Exception:
+            return None
+    return None
+
+
+ALIVE_TREE_STATUSES = {
+    "alive",
+    "healthy",
+    "needs_attention",
+    "pest",
+    "disease",
+    "need_watering",
+    "need_protection",
+    "damaged",
+    "need_replacement",
+    "needs_replacement",
+    "pending_planting",
+}
+DEAD_TREE_STATUSES = {"dead", "removed"}
+
+
+def _normalize_tree_status(value: Optional[str]) -> str:
+    raw = (value or "").strip().lower().replace("-", "_").replace(" ", "_")
+    if raw in {"deseas", "diseased"}:
+        return "disease"
+    if raw in {"needreplacement", "needsreplacement"}:
+        return "need_replacement"
+    if not raw:
+        return "alive"
+    return raw
+
+
+def _is_alive_tree_status(value: Optional[str]) -> bool:
+    status = _normalize_tree_status(value)
+    if status in DEAD_TREE_STATUSES:
+        return False
+    if status in ALIVE_TREE_STATUSES:
+        return True
+    # Conservative fallback: unknown statuses are treated as living unless explicitly dead/removed.
+    return True
+
+
+def _infer_tree_reference_date(tree: dict) -> tuple[Optional[date], str]:
+    """
+    Infer best available reference date for tree age estimation.
+    Priority: planting_date -> reviewed_at -> submitted_at -> created_at
+    """
+    date_candidates = (
+        ("planting_date", tree.get("planting_date")),
+        ("reviewed_at", tree.get("reviewed_at")),
+        ("submitted_at", tree.get("submitted_at")),
+        ("created_at", tree.get("created_at")),
+    )
+    for source, raw_value in date_candidates:
+        parsed = _parse_date_like(raw_value)
+        if parsed:
+            return parsed, source
+    return None, "none"
+
+
 def compute_project_carbon(
     trees: list[dict],
     projection_years: int = 40,
@@ -409,11 +488,6 @@ def compute_project_carbon(
       - top_species: list of {species, count, co2_kg}
     """
     today = date.today()
-    alive_statuses = {
-        "alive", "healthy", "needs_attention", "pest", "disease",
-        "need_watering", "need_protection", "damaged",
-        "need_replacement", "needs_replacement",
-    }
 
     total_trees = len(trees)
     alive_trees = 0
@@ -421,24 +495,26 @@ def compute_project_carbon(
     annual_co2 = 0.0
     projected_co2 = 0.0
     species_agg: dict[str, dict] = {}
+    trees_missing_age_data = 0
+    trees_with_fallback_age = 0
+    trees_pending_review = 0
 
     for tree in trees:
-        status = (tree.get("status") or "alive").lower().strip()
+        status = _normalize_tree_status(tree.get("status"))
         species = tree.get("species")
-        planting_date = tree.get("planting_date")
+        ref_date, ref_source = _infer_tree_reference_date(tree)
 
-        # Parse planting_date if string
-        if isinstance(planting_date, str):
-            try:
-                planting_date = date.fromisoformat(planting_date[:10])
-            except (ValueError, TypeError):
-                planting_date = None
-
-        is_alive = status in alive_statuses
+        is_alive = _is_alive_tree_status(status)
         if is_alive:
             alive_trees += 1
+        if status == "pending_planting":
+            trees_pending_review += 1
+        if ref_date is None:
+            trees_missing_age_data += 1
+        elif ref_source != "planting_date":
+            trees_with_fallback_age += 1
 
-        age = tree_age_years(planting_date, today)
+        age = tree_age_years(ref_date, today)
 
         if is_alive and age > 0:
             tree_co2 = estimate_tree_co2_kg(species, age)
@@ -483,6 +559,9 @@ def compute_project_carbon(
         "projection_years": projection_years,
         "methodology": "IPCC Tier 1 + Chave et al. (2014) pantropical allometric equation",
         "top_species": top_species,
+        "trees_missing_age_data": trees_missing_age_data,
+        "trees_with_fallback_age": trees_with_fallback_age,
+        "trees_pending_review": trees_pending_review,
     }
 
 
@@ -496,23 +575,14 @@ def generate_co2_projection_table(
     """
     today = date.today()
     alive_trees_data = []
-    alive_statuses = {
-        "alive", "healthy", "needs_attention", "pest", "disease",
-        "need_watering", "need_protection", "damaged",
-    }
 
     for tree in trees:
-        status = (tree.get("status") or "alive").lower().strip()
-        if status not in alive_statuses:
+        status = _normalize_tree_status(tree.get("status"))
+        if not _is_alive_tree_status(status):
             continue
         species = tree.get("species")
-        planting_date = tree.get("planting_date")
-        if isinstance(planting_date, str):
-            try:
-                planting_date = date.fromisoformat(planting_date[:10])
-            except (ValueError, TypeError):
-                planting_date = None
-        age = tree_age_years(planting_date, today)
+        ref_date, _ = _infer_tree_reference_date(tree)
+        age = tree_age_years(ref_date, today)
         alive_trees_data.append({"species": species, "current_age": age})
 
     projection = []

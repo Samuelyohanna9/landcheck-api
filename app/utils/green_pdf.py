@@ -189,8 +189,23 @@ def _render_executive_summary(c, width, height, project, kpi_snapshot, carbon_da
     _draw_stat_card(c, start_x + 2 * (card_w + gap), y - card_h, card_w, card_h, "40-Year Projection", f"{co2_projected:.0f} t", sub="lifetime tonnes", color=HexColor("#e0f2f1"))
     _draw_stat_card(c, start_x + 3 * (card_w + gap), y - card_h, card_w, card_h, "Avg per Tree", f"{co2_per_tree:.1f} kg", sub="current CO2 / tree", color=HexColor("#e0f2f1"))
 
+    missing_age = int(carbon_data.get("trees_missing_age_data", 0)) if carbon_data else 0
+    fallback_age = int(carbon_data.get("trees_with_fallback_age", 0)) if carbon_data else 0
+    pending_review = int(carbon_data.get("trees_pending_review", 0)) if carbon_data else 0
+    if co2_current <= 0 or co2_projected <= 0:
+        warning_text = (
+            f"CO2 is low/zero. Missing age data: {missing_age} | "
+            f"Fallback age used: {fallback_age} | Pending review trees: {pending_review}"
+        )
+        c.setFillColor(HexColor("#fff3cd"))
+        c.setStrokeColor(HexColor("#f0ad4e"))
+        c.roundRect(40, y - card_h - 18, width - 80, 12, 3, fill=1, stroke=1)
+        c.setFillColor(HexColor("#7a4b00"))
+        c.setFont("Helvetica", 7.5)
+        c.drawString(44, y - card_h - 14, warning_text[:170])
+
     # Task & operations summary row
-    y -= card_h + 16
+    y -= card_h + 20
     c.setFont("Helvetica-Bold", 11)
     c.setFillColorRGB(0.1, 0.1, 0.1)
     c.drawString(40, y, "Operations Summary")
