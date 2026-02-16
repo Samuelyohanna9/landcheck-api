@@ -2801,7 +2801,7 @@ def reports_kpi(
         "current": metrics,
         "trend_days": days,
         "trend_basis": {
-            "survival": "Monthly cumulative survival across planting cohorts using current tree statuses (planting_date/created_at basis).",
+            "survival": "Monthly cumulative survival across planting cohorts using current tree statuses (starts from first planting_date).",
             "evidence": "Monthly cumulative proof completion across in-scope task activity records.",
         },
         "trend": trend,
@@ -3339,7 +3339,7 @@ def _compute_age_based_survival(
     tree_rows = db.execute(
         text(
             """
-            SELECT id, planting_date, created_at, status
+            SELECT id, planting_date, status
             FROM trees
             WHERE project_id = :project_id
             """
@@ -3378,13 +3378,15 @@ def _compute_age_based_survival(
         }
         for day in checkpoints_days
     }
+    missing_planting_date_trees = 0
 
     for row in tree_rows:
         tree_id = int(row.get("id") or 0)
         if tree_id <= 0:
             continue
-        planting_ref = _parse_date_value(row.get("planting_date")) or _parse_date_value(row.get("created_at"))
+        planting_ref = _parse_date_value(row.get("planting_date"))
         if planting_ref is None:
+            missing_planting_date_trees += 1
             continue
         history = history_by_tree.get(tree_id) or []
         fallback_status = _normalize_tree_status(row.get("status"))
@@ -3413,6 +3415,7 @@ def _compute_age_based_survival(
     result = {
         "as_of_date": as_of.isoformat(),
         "checkpoints_days": [int(day) for day in checkpoints_days],
+        "trees_missing_planting_date": int(missing_planting_date_trees),
     }
     for day in checkpoints_days:
         metric = checkpoint_metrics[int(day)]
@@ -3544,7 +3547,24 @@ def _build_kpi_trend_series(project_id: int, db: Session, days: int = 180) -> li
     window_days = max(int(days), 1)
     today = date.today()
     window_start = today - timedelta(days=window_days - 1)
-    start_month = _month_start(window_start)
+
+    earliest_planting = db.execute(
+        text(
+            """
+            SELECT MIN(planting_date) AS first_planting_date
+            FROM trees
+            WHERE project_id = :project_id
+              AND planting_date IS NOT NULL
+            """
+        ),
+        {"project_id": project_id},
+    ).scalar()
+    earliest_planting_date = _parse_date_value(earliest_planting)
+    trend_start_date = earliest_planting_date or window_start
+    if earliest_planting_date and earliest_planting_date > today:
+        trend_start_date = today
+
+    start_month = _month_start(trend_start_date)
     end_month = _month_start(today)
 
     months: list[date] = []
@@ -3556,7 +3576,7 @@ def _build_kpi_trend_series(project_id: int, db: Session, days: int = 180) -> li
     tree_rows = db.execute(
         text(
             """
-            SELECT planting_date, created_at, status
+            SELECT planting_date, status
             FROM trees
             WHERE project_id = :project_id
             """
@@ -3570,7 +3590,7 @@ def _build_kpi_trend_series(project_id: int, db: Session, days: int = 180) -> li
     baseline_tree_healthy = 0
 
     for row in tree_rows:
-        event_date = _parse_date_value(row.get("planting_date")) or _parse_date_value(row.get("created_at"))
+        event_date = _parse_date_value(row.get("planting_date"))
         if event_date is None:
             continue
         bucket = _month_start(event_date)

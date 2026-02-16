@@ -303,9 +303,14 @@ def _render_executive_summary(c, width, height, project, kpi_snapshot, carbon_da
             sub=sub_text,
             color=HexColor("#f2fbf5"),
         )
+    missing_planting = int(age_survival.get("trees_missing_planting_date", 0) or 0) if isinstance(age_survival, dict) else 0
+    if missing_planting > 0:
+        c.setFont("Helvetica", 6.5)
+        c.setFillColorRGB(0.45, 0.45, 0.45)
+        c.drawString(40, y - age_card_h - 10, f"Note: {missing_planting} tree(s) excluded from age-based cohorts due to missing planting date.")
 
     # Charts area - bottom half
-    y -= age_card_h + 18
+    y -= age_card_h + (28 if missing_planting > 0 else 18)
     chart_w = (width - 100) / 2
 
     # Survival + evidence trend charts (left)
@@ -360,7 +365,7 @@ def _render_executive_summary(c, width, height, project, kpi_snapshot, carbon_da
     )
     c.setFont("Helvetica", 6.5)
     c.setFillColorRGB(0.45, 0.45, 0.45)
-    c.drawString(40, top_chart_y - 10, "Context: monthly cumulative healthy share across planting cohorts (current status basis).")
+    c.drawString(40, top_chart_y - 10, "Context: monthly cumulative healthy share across planting cohorts from first planting date.")
     if trend_first_label or trend_last_label:
         c.drawString(40, top_chart_y - 18, f"Period: {trend_first_label} to {trend_last_label}".strip())
 
