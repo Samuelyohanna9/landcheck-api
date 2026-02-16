@@ -284,7 +284,28 @@ def _render_executive_summary(c, width, height, project, kpi_snapshot, carbon_da
     # Survival + evidence trend charts (left)
     survival_points = []
     evidence_points = []
+    trend_first_label = ""
+    trend_last_label = ""
+
+    def _trend_label(raw_value):
+        raw = str(raw_value or "").strip()
+        if not raw:
+            return ""
+        parsed = None
+        try:
+            parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except Exception:
+            try:
+                parsed = datetime.strptime(raw[:10], "%Y-%m-%d")
+            except Exception:
+                parsed = None
+        if not parsed:
+            return raw[:10]
+        return parsed.strftime("%b %Y")
+
     if kpi_trend and len(kpi_trend) >= 2:
+        trend_first_label = _trend_label(kpi_trend[0].get("snapshot_at"))
+        trend_last_label = _trend_label(kpi_trend[-1].get("snapshot_at"))
         for i, snap in enumerate(kpi_trend):
             metrics = snap.get("metrics", {})
             survival_points.append((i, float(metrics.get("survival_rate", 0) or 0)))
@@ -306,13 +327,15 @@ def _render_executive_summary(c, width, height, project, kpi_snapshot, carbon_da
         chart_w,
         mini_h,
         survival_points,
-        title="Survival Rate Trend",
+        title="Survival Trend (Planting Cohorts)",
         y_label="%",
         line_color="#16a34a",
     )
     c.setFont("Helvetica", 6.5)
     c.setFillColorRGB(0.45, 0.45, 0.45)
-    c.drawString(40, top_chart_y - 10, "Context: healthy trees / total trees (%).")
+    c.drawString(40, top_chart_y - 10, "Context: monthly cumulative healthy share across planting cohorts.")
+    if trend_first_label or trend_last_label:
+        c.drawRightString(40 + chart_w, top_chart_y - 10, f"{trend_first_label} to {trend_last_label}".strip())
 
     _draw_mini_line_chart(
         c,
@@ -321,13 +344,15 @@ def _render_executive_summary(c, width, height, project, kpi_snapshot, carbon_da
         chart_w,
         mini_h,
         evidence_points,
-        title="Evidence Rate Trend",
+        title="Evidence Trend (Task Activity)",
         y_label="%",
         line_color="#9a5800",
     )
     c.setFont("Helvetica", 6.5)
     c.setFillColorRGB(0.45, 0.45, 0.45)
-    c.drawString(40, left_base_y - 12, "Context: required-proof tasks with complete note + photo (%).")
+    c.drawString(40, left_base_y - 12, "Context: monthly cumulative completion of required-proof task evidence.")
+    if trend_first_label or trend_last_label:
+        c.drawRightString(40 + chart_w, left_base_y - 12, f"{trend_first_label} to {trend_last_label}".strip())
 
     # Top species by CO2 (right)
     top_species = carbon_data.get("top_species", []) if carbon_data else []

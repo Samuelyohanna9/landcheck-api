@@ -2630,21 +2630,15 @@ def reports_kpi(
         _store_kpi_snapshot(project_id, metrics, db)
         db.commit()
 
-    rows = db.execute(
-        text("""
-            SELECT id, project_id, snapshot_at, metrics
-            FROM green_kpi_snapshots
-            WHERE project_id = :project_id
-              AND snapshot_at >= NOW() - (:days || ' days')::interval
-            ORDER BY snapshot_at ASC
-        """),
-        {"project_id": project_id, "days": int(days)},
-    ).mappings().all()
-    trend = [dict(row) for row in rows]
+    trend = _build_kpi_trend_series(project_id, db, days=days)
     return {
         "project_id": project_id,
         "current": metrics,
         "trend_days": days,
+        "trend_basis": {
+            "survival": "Monthly cumulative survival across planting cohorts (planting_date/created_at basis).",
+            "evidence": "Monthly cumulative proof completion across in-scope task activity records.",
+        },
         "trend": trend,
     }
 
@@ -3258,6 +3252,149 @@ def _compute_kpi_snapshot(project_id: int, db: Session) -> dict:
         "co2_annual_tonnes": carbon["annual_co2_tonnes"],
         "co2_projected_lifetime_tonnes": carbon["projected_lifetime_co2_tonnes"],
     }
+
+
+def _month_start(value: date) -> date:
+    return date(value.year, value.month, 1)
+
+
+def _next_month_start(value: date) -> date:
+    if value.month == 12:
+        return date(value.year + 1, 1, 1)
+    return date(value.year, value.month + 1, 1)
+
+
+def _build_kpi_trend_series(project_id: int, db: Session, days: int = 180) -> list[dict]:
+    """
+    Build meaningful KPI trend points by month:
+    - Survival: cumulative healthy share across planting cohorts over time.
+    - Evidence: cumulative proof-complete share across in-scope task activity over time.
+    """
+    window_days = max(int(days), 1)
+    today = date.today()
+    window_start = today - timedelta(days=window_days - 1)
+    start_month = _month_start(window_start)
+    end_month = _month_start(today)
+
+    months: list[date] = []
+    cursor = start_month
+    while cursor <= end_month:
+        months.append(cursor)
+        cursor = _next_month_start(cursor)
+
+    tree_rows = db.execute(
+        text(
+            """
+            SELECT planting_date, created_at, status
+            FROM trees
+            WHERE project_id = :project_id
+            """
+        ),
+        {"project_id": project_id},
+    ).mappings().all()
+
+    tree_month_totals: dict[date, int] = {}
+    tree_month_healthy: dict[date, int] = {}
+    baseline_tree_total = 0
+    baseline_tree_healthy = 0
+
+    for row in tree_rows:
+        event_date = _parse_date_value(row.get("planting_date")) or _parse_date_value(row.get("created_at"))
+        if event_date is None:
+            continue
+        bucket = _month_start(event_date)
+        is_healthy = _normalize_tree_status(row.get("status")) in HEALTHY_TREE_STATUSES
+        if bucket < start_month:
+            baseline_tree_total += 1
+            if is_healthy:
+                baseline_tree_healthy += 1
+            continue
+        if bucket > end_month:
+            continue
+        tree_month_totals[bucket] = tree_month_totals.get(bucket, 0) + 1
+        if is_healthy:
+            tree_month_healthy[bucket] = tree_month_healthy.get(bucket, 0) + 1
+
+    task_rows = db.execute(
+        text(
+            """
+            SELECT t.task_type, t.status, t.review_state, t.notes, t.photo_url,
+                   COALESCE(t.completed_at::date, t.submitted_at::date, t.reviewed_at::date, t.created_at::date)
+                     AS activity_date
+            FROM tree_tasks t
+            JOIN trees tr ON tr.id = t.tree_id
+            WHERE tr.project_id = :project_id
+            """
+        ),
+        {"project_id": project_id},
+    ).mappings().all()
+
+    task_month_required: dict[date, int] = {}
+    task_month_complete: dict[date, int] = {}
+    baseline_task_required = 0
+    baseline_task_complete = 0
+
+    for task in task_rows:
+        policy = _task_needs_evidence(task.get("task_type"))
+        if not (policy.get("require_notes") or policy.get("require_photo")):
+            continue
+        state = _normalize_name(task.get("review_state") or "none")
+        status = _normalize_name(task.get("status") or "pending")
+        evidence_in_scope = _is_done_status(status) or state in {"submitted", "approved", "rejected"}
+        if not evidence_in_scope:
+            continue
+        activity_date = _parse_date_value(task.get("activity_date"))
+        if activity_date is None:
+            continue
+        evidence_ok, _ = _has_required_evidence(task.get("task_type"), task.get("notes"), task.get("photo_url"))
+        bucket = _month_start(activity_date)
+        if bucket < start_month:
+            baseline_task_required += 1
+            if evidence_ok:
+                baseline_task_complete += 1
+            continue
+        if bucket > end_month:
+            continue
+        task_month_required[bucket] = task_month_required.get(bucket, 0) + 1
+        if evidence_ok:
+            task_month_complete[bucket] = task_month_complete.get(bucket, 0) + 1
+
+    trend: list[dict] = []
+    cumulative_tree_total = baseline_tree_total
+    cumulative_tree_healthy = baseline_tree_healthy
+    cumulative_task_required = baseline_task_required
+    cumulative_task_complete = baseline_task_complete
+
+    for month in months:
+        cumulative_tree_total += tree_month_totals.get(month, 0)
+        cumulative_tree_healthy += tree_month_healthy.get(month, 0)
+        cumulative_task_required += task_month_required.get(month, 0)
+        cumulative_task_complete += task_month_complete.get(month, 0)
+
+        survival_rate = (
+            round((cumulative_tree_healthy / cumulative_tree_total) * 100, 1)
+            if cumulative_tree_total > 0
+            else 0.0
+        )
+        evidence_rate = (
+            round((cumulative_task_complete / cumulative_task_required) * 100, 1)
+            if cumulative_task_required > 0
+            else 0.0
+        )
+
+        trend.append(
+            {
+                "snapshot_at": month.isoformat(),
+                "metrics": {
+                    "survival_rate": survival_rate,
+                    "evidence_complete_rate": evidence_rate,
+                    "cohort_trees_total": cumulative_tree_total,
+                    "evidence_required_tasks": cumulative_task_required,
+                },
+            }
+        )
+
+    return trend
 
 
 def _store_kpi_snapshot(project_id: int, metrics: dict, db: Session):
@@ -5347,14 +5484,8 @@ def export_project_pdf(
 
 
 def _fetch_kpi_trend(project_id: int, db: Session, days: int = 90) -> list[dict]:
-    """Fetch recent KPI snapshots for trend charts."""
-    rows = db.execute(text("""
-        SELECT snapshot_at, metrics FROM green_kpi_snapshots
-        WHERE project_id = :pid AND snapshot_at >= NOW() - INTERVAL ':days days'
-        ORDER BY snapshot_at ASC
-        LIMIT 100
-    """.replace(":days", str(int(days)))), {"pid": project_id}).mappings().all()
-    return [dict(r) for r in rows]
+    """Fetch KPI trend series for charts using cohort/activity monthly basis."""
+    return _build_kpi_trend_series(project_id, db, days=days)
 
 
 def _build_tree_stats(rows: list[dict]) -> dict:
