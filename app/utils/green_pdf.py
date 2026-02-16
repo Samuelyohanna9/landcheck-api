@@ -309,6 +309,10 @@ def _render_executive_summary(c, width, height, project, kpi_snapshot, carbon_da
         y_label="%",
         line_color="#16a34a",
     )
+    c.setFont("Helvetica", 6.5)
+    c.setFillColorRGB(0.45, 0.45, 0.45)
+    c.drawString(40, left_base_y + mini_h + gap_h - 8, "Context: healthy trees / total trees (%).")
+
     _draw_mini_line_chart(
         c,
         40,
@@ -320,6 +324,9 @@ def _render_executive_summary(c, width, height, project, kpi_snapshot, carbon_da
         y_label="%",
         line_color="#9a5800",
     )
+    c.setFont("Helvetica", 6.5)
+    c.setFillColorRGB(0.45, 0.45, 0.45)
+    c.drawString(40, left_base_y - 8, "Context: required-proof tasks with complete note + photo (%).")
 
     # Top species by CO2 (right)
     top_species = carbon_data.get("top_species", []) if carbon_data else []
@@ -331,6 +338,9 @@ def _render_executive_summary(c, width, height, project, kpi_snapshot, carbon_da
             bar_data.append((sp["species"][:14], sp["co2_kg"], colors[i % len(colors)]))
         _draw_bar_chart(c, 40 + chart_w + 20, y - 140, chart_w, 130, bar_data,
                         title="Top Species by CO2 (kg)")
+        c.setFont("Helvetica", 6.5)
+        c.setFillColorRGB(0.45, 0.45, 0.45)
+        c.drawString(40 + chart_w + 20, y - 148, "Context: estimated current stock by species group.")
 
     # CO2 projection chart (bottom, full width)
     co2_projection = carbon_data.get("projection", []) if carbon_data else []
@@ -338,6 +348,9 @@ def _render_executive_summary(c, width, height, project, kpi_snapshot, carbon_da
         proj_points = [(p["year_offset"], p["cumulative_co2_tonnes"]) for p in co2_projection]
         _draw_mini_line_chart(c, 40, y - 310, width - 80, 140, proj_points,
                               title="CO2 Projection (tonnes, cumulative over 30 years)", y_label="tonnes")
+        c.setFont("Helvetica", 6.5)
+        c.setFillColorRGB(0.45, 0.45, 0.45)
+        c.drawString(40, y - 318, "Context: projection assumes current living trees continue modeled growth.")
 
     # Footer
     c.setFont("Helvetica", 7)
