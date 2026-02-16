@@ -388,6 +388,7 @@ def _render_executive_summary(c, width, height, project, kpi_snapshot, carbon_da
 
     # Species-based age survival table (right)
     species_breakdown = age_survival.get("species_breakdown", []) if isinstance(age_survival, dict) else []
+    top_species = carbon_data.get("top_species", []) if carbon_data else []
     right_x = 40 + chart_w + 20
     if isinstance(species_breakdown, list) and len(species_breakdown) > 0:
         c.setFont("Helvetica-Bold", 9)
@@ -410,7 +411,7 @@ def _render_executive_summary(c, width, height, project, kpi_snapshot, carbon_da
             return f"{rate:.0f}%" if eligible > 0 else None
 
         row_y = header_y - 12
-        for row in species_breakdown[:8]:
+        for row in species_breakdown[:6]:
             species_label = str(row.get("species_label") or row.get("species_key") or "Unknown")[:22]
             live_rate = float(row.get("current_survival_rate", 0) or 0)
             carry_rate = live_rate
@@ -445,9 +446,20 @@ def _render_executive_summary(c, width, height, project, kpi_snapshot, carbon_da
 
         c.setFont("Helvetica", 6.5)
         c.setFillColorRGB(0.45, 0.45, 0.45)
-        c.drawString(right_x, y - 148, "Context: age-based species cohorts from planting date; '~' denotes provisional carry-forward.")
+        c.drawString(right_x, y - 94, "Context: age-based species cohorts from planting date; '~' denotes provisional carry-forward.")
+
+        # Keep the CO2-by-species visual in executive summary alongside the species survival table.
+        if top_species:
+            bar_data = []
+            colors = ["#2e7d32", "#43a047", "#66bb6a", "#81c784", "#a5d6a7",
+                      "#c8e6c9", "#e8f5e9", "#b9f6ca", "#69f0ae", "#00e676"]
+            for i, sp in enumerate(top_species[:5]):
+                bar_data.append((sp["species"][:14], sp["co2_kg"], colors[i % len(colors)]))
+            _draw_bar_chart(c, right_x, y - 158, chart_w, 56, bar_data, title="Top Species by CO2 (kg)")
+            c.setFont("Helvetica", 6.5)
+            c.setFillColorRGB(0.45, 0.45, 0.45)
+            c.drawString(right_x, y - 166, "Context: estimated current stock by species group.")
     else:
-        top_species = carbon_data.get("top_species", []) if carbon_data else []
         if top_species:
             bar_data = []
             colors = ["#2e7d32", "#43a047", "#66bb6a", "#81c784", "#a5d6a7",
