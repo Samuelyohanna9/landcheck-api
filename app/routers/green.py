@@ -521,6 +521,9 @@ def _compute_live_maintenance_rows(
                 continue
 
         tree_status = _normalize_tree_status(tree.get("status") or "alive")
+        if tree_status == "pending_planting":
+            # Planting enters live maintenance model only after supervisor approval.
+            continue
         replacement_required = _is_replacement_trigger_status(tree_status)
         planting_date_obj = _parse_date_value(tree.get("planting_date"))
         replacement_key = f"{tree_id}:replacement"
@@ -1595,9 +1598,13 @@ def add_tree(
     photo_url: str = Body(default=""),
     created_by: str = Body(default=""),
 ):
-    normalized_status = _normalize_tree_status(status or "alive")
-    if normalized_status not in TREE_STATUS_VALUES:
+    requested_status = _normalize_tree_status(status or "alive")
+    if requested_status not in TREE_STATUS_VALUES:
         raise HTTPException(status_code=400, detail="Invalid status")
+    # New planting is supervisor-reviewed first; tree remains pending until approval.
+    normalized_status = "pending_planting"
+    created_by_clean = (created_by or "").strip()
+    reported_status = requested_status if requested_status != "pending_planting" else "alive"
     row = db.execute(text("""
         INSERT INTO trees (project_id, geom, species, planting_date, status, notes, photo_url, created_by)
         VALUES (
@@ -1620,25 +1627,82 @@ def add_tree(
         "status": normalized_status,
         "notes": notes or None,
         "photo_url": photo_url or None,
-        "created_by": created_by or None,
+        "created_by": created_by_clean or None,
     }).scalar()
+
+    review_task_id = None
+    if created_by_clean:
+        review_task_id = db.execute(
+            text(
+                """
+                INSERT INTO tree_tasks (
+                    tree_id, task_type, assignee_name, due_date, priority, status, notes, photo_url,
+                    review_state, submitted_at, completed_at, reported_tree_status
+                )
+                VALUES (
+                    :tree_id, 'planting', :assignee_name, :due_date, 'normal', 'done', :notes, :photo_url,
+                    'submitted', NOW(), NOW(), :reported_tree_status
+                )
+                RETURNING id
+                """
+            ),
+            {
+                "tree_id": int(row),
+                "assignee_name": created_by_clean,
+                "due_date": planting_date,
+                "notes": notes or None,
+                "photo_url": photo_url or None,
+                "reported_tree_status": reported_status,
+            },
+        ).scalar()
+        db.execute(
+            text(
+                """
+                INSERT INTO green_task_reviews (task_id, decision, reviewer_name, review_notes)
+                VALUES (:task_id, 'submitted', :reviewer_name, :review_notes)
+                """
+            ),
+            {"task_id": int(review_task_id), "reviewer_name": created_by_clean, "review_notes": notes or None},
+        )
+        _record_alert(
+            db,
+            project_id=project_id,
+            alert_type="task_submitted",
+            severity="warning",
+            message=f"Task #{int(review_task_id)} is awaiting supervisor review.",
+            tree_id=int(row),
+            task_id=int(review_task_id),
+        )
+        _log_audit_event(
+            db,
+            project_id=project_id,
+            entity_type="task",
+            entity_id=int(review_task_id),
+            action="task_submitted_for_review",
+            actor=created_by_clean,
+            details={"task_type": "planting", "status": "done", "review_state": "submitted"},
+        )
+
     _log_audit_event(
         db,
         project_id=project_id,
         entity_type="tree",
         entity_id=int(row),
         action="tree_created",
-        actor=created_by or None,
+        actor=created_by_clean or None,
         details={
             "species": species or None,
             "status": normalized_status,
+            "reported_status": reported_status,
             "planting_date": planting_date,
             "lng": lng,
             "lat": lat,
+            "review_task_id": int(review_task_id) if review_task_id else None,
         },
     )
+    _refresh_project_alerts(db, project_id)
     db.commit()
-    return {"id": row}
+    return {"id": row, "review_task_id": review_task_id, "status": "submitted_for_review" if review_task_id else "created"}
 
 
 @router.patch("/trees/{tree_id}")
@@ -2198,8 +2262,23 @@ def review_submitted_task(
                 "review_notes": review_notes or None,
             },
         )
+        task_type = _normalize_name(task.get("task_type"))
         reported_tree_status = _normalize_tree_status(task.get("reported_tree_status"))
-        if reported_tree_status in TREE_STATUS_VALUES:
+        if task_type == "planting":
+            approved_status = (
+                reported_tree_status
+                if reported_tree_status in TREE_STATUS_VALUES and reported_tree_status != "pending_planting"
+                else "alive"
+            )
+            db.execute(
+                text("""
+                    UPDATE trees
+                    SET status = :status
+                    WHERE id = :tree_id
+                """),
+                {"status": approved_status, "tree_id": int(task["tree_id"])},
+            )
+        elif reported_tree_status in TREE_STATUS_VALUES:
             db.execute(
                 text("""
                     UPDATE trees
@@ -3310,6 +3389,7 @@ def list_work_orders(
             SELECT LOWER(TRIM(created_by)) AS assignee_key, COUNT(*) AS planted
             FROM trees
             WHERE project_id = :project_id
+              AND LOWER(REPLACE(REPLACE(COALESCE(status, ''), '-', '_'), ' ', '_')) <> 'pending_planting'
             GROUP BY created_by
         )
         SELECT o.id, o.project_id, o.assignee_name, o.work_type, o.target_trees,
@@ -3347,6 +3427,7 @@ def update_work_order(
         planted_value = db.execute(text("""
             SELECT COUNT(*) FROM trees
             WHERE project_id = :project_id AND created_by = :assignee_name
+              AND LOWER(REPLACE(REPLACE(COALESCE(status, ''), '-', '_'), ' ', '_')) <> 'pending_planting'
         """), {"project_id": row["project_id"], "assignee_name": row["assignee_name"]}).scalar()
 
     existing_status = row.get("status") if row else None
