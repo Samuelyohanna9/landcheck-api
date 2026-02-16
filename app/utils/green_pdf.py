@@ -445,14 +445,25 @@ def _render_executive_summary(c, width, height, project, kpi_snapshot, carbon_da
         c.setFillColorRGB(0.45, 0.45, 0.45)
         c.drawString(40, y - age_card_h - 10, f"Note: {missing_planting} tree(s) excluded from age-based cohorts due to missing planting date.")
 
-    # Charts area - bottom half
-    y -= age_card_h + (28 if missing_planting > 0 else 18)
-    chart_w = (width - 100) / 2
+    c.setFont("Helvetica-Oblique", 7.3)
+    c.setFillColorRGB(0.45, 0.45, 0.45)
+    c.drawString(
+        40,
+        82,
+        "Detailed trend analytics (survival, species daily timeline, and carbon charts) continue on the next pages.",
+    )
 
-    # Survival + evidence trend charts (left)
-    survival_points = []
-    trend_first_label = ""
-    trend_last_label = ""
+    # Footer
+    c.setFont("Helvetica", 7)
+    c.setFillColorRGB(0.55, 0.55, 0.55)
+    c.drawString(40, 24, "Methodology: IPCC Tier 1 defaults + Chave et al. (2014) pantropical allometric equation")
+    c.drawRightString(width - 40, 24, f"LandCheck Green | {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}")
+
+
+def _render_trend_analytics_pages(c, width, height, kpi_snapshot, carbon_data, kpi_trend, species_daily_survival=None):
+    stats = kpi_snapshot or {}
+    age_survival = stats.get("age_survival", {}) if isinstance(stats.get("age_survival"), dict) else {}
+    species_breakdown = age_survival.get("species_breakdown", []) if isinstance(age_survival, dict) else []
 
     def _trend_label(raw_value):
         raw = str(raw_value or "").strip()
@@ -470,6 +481,20 @@ def _render_executive_summary(c, width, height, project, kpi_snapshot, carbon_da
             return raw[:10]
         return parsed.strftime("%b %Y")
 
+    # -----------------------------------------------------------------
+    # PAGE: Trend Analytics
+    # -----------------------------------------------------------------
+    c.showPage()
+    c.setFont("Helvetica-Bold", 16)
+    c.setFillColorRGB(0.1, 0.1, 0.1)
+    c.drawString(40, height - 50, "Trend Analytics")
+    c.setFont("Helvetica", 8.2)
+    c.setFillColorRGB(0.42, 0.42, 0.42)
+    c.drawString(40, height - 66, "Daily species timeline and cohort survival displayed with dedicated spacing.")
+
+    survival_points = []
+    trend_first_label = ""
+    trend_last_label = ""
     if kpi_trend and len(kpi_trend) >= 2:
         trend_first_label = _trend_label(kpi_trend[0].get("snapshot_at"))
         trend_last_label = _trend_label(kpi_trend[-1].get("snapshot_at"))
@@ -480,29 +505,24 @@ def _render_executive_summary(c, width, height, project, kpi_snapshot, carbon_da
         current_survival = float(stats.get("survival_rate", 0) or 0)
         survival_points = [(0, current_survival), (1, current_survival)]
 
-    mini_h = 86
-    top_chart_y = y - 128
+    survival_y = height - 275
+    survival_h = 160
     _draw_mini_line_chart(
         c,
         40,
-        top_chart_y,
-        chart_w,
-        mini_h,
+        survival_y,
+        width - 80,
+        survival_h,
         survival_points,
         title="Survival Trend (Planting Cohorts)",
         y_label="%",
         line_color="#16a34a",
     )
-    c.setFont("Helvetica", 6.5)
+    c.setFont("Helvetica", 6.8)
     c.setFillColorRGB(0.45, 0.45, 0.45)
-    c.drawString(40, top_chart_y - 10, "Context: monthly cumulative healthy share across planting cohorts from first planting date.")
+    c.drawString(40, survival_y - 10, "Context: monthly cumulative healthy share across planting cohorts from first planting date.")
     if trend_first_label or trend_last_label:
-        c.drawString(40, top_chart_y - 18, f"Period: {trend_first_label} to {trend_last_label}".strip())
-
-    # Species daily survival + species CO2 (right)
-    species_breakdown = age_survival.get("species_breakdown", []) if isinstance(age_survival, dict) else []
-    top_species = carbon_data.get("top_species", []) if carbon_data else []
-    right_x = 40 + chart_w + 20
+        c.drawString(40, survival_y - 18, f"Period: {trend_first_label} to {trend_last_label}".strip())
 
     has_daily_species = (
         isinstance(species_daily_survival, dict)
@@ -512,104 +532,110 @@ def _render_executive_summary(c, width, height, project, kpi_snapshot, carbon_da
     if has_daily_species:
         _draw_species_daily_line_chart(
             c,
-            right_x,
-            y - 98,
-            chart_w,
-            70,
+            40,
+            220,
+            width - 80,
+            220,
             species_daily_survival,
             title="Species Survival Trend (Daily)",
         )
-        c.setFont("Helvetica", 6.4)
+        c.setFont("Helvetica", 6.8)
         c.setFillColorRGB(0.45, 0.45, 0.45)
-        c.drawString(right_x, y - 106, "Context: daily species survival from planting date using status history.")
+        c.drawString(40, 206, "Context: daily species survival from planting date using maintenance/task-review status history.")
     elif isinstance(species_breakdown, list) and len(species_breakdown) > 0:
-        c.setFont("Helvetica-Bold", 9)
+        c.setFont("Helvetica-Bold", 10)
         c.setFillColorRGB(0.15, 0.15, 0.15)
-        c.drawString(right_x, y - 8, "Species Survival (30/90/180 days)")
-        header_y = y - 20
-        c.setFont("Helvetica-Bold", 6.8)
-        c.drawString(right_x, header_y, "Species")
-        c.drawString(right_x + 108, header_y, "30d")
-        c.drawString(right_x + 142, header_y, "90d")
-        c.drawString(right_x + 176, header_y, "180d")
-        c.drawString(right_x + 212, header_y, "Trees")
+        c.drawString(40, 430, "Species Survival (30/90/180 days)")
+        c.setFont("Helvetica-Bold", 7.2)
+        c.drawString(40, 415, "Species")
+        c.drawString(210, 415, "30d")
+        c.drawString(260, 415, "90d")
+        c.drawString(310, 415, "180d")
+        c.drawString(370, 415, "Trees")
         c.setStrokeColorRGB(0.82, 0.88, 0.84)
         c.setLineWidth(0.5)
-        c.line(right_x, header_y - 3, right_x + chart_w - 4, header_y - 3)
+        c.line(40, 410, width - 40, 410)
 
         def _fmt_rate(bucket):
             eligible = int((bucket or {}).get("eligible_trees", 0) or 0)
             rate = float((bucket or {}).get("survival_rate", 0) or 0)
-            return f"{rate:.0f}%" if eligible > 0 else None
+            return f"{rate:.0f}%" if eligible > 0 else "-"
 
-        row_y = header_y - 12
-        for row in species_breakdown[:6]:
-            species_label = str(row.get("species_label") or row.get("species_key") or "Unknown")[:22]
-            live_rate = float(row.get("current_survival_rate", 0) or 0)
-            carry_rate = live_rate
-            rate_30 = _fmt_rate(row.get("day_30"))
-            if rate_30 is None:
-                rate_30 = f"~{carry_rate:.0f}%"
-            else:
-                try:
-                    carry_rate = float(rate_30.replace("%", "").replace("~", ""))
-                except Exception:
-                    pass
-            rate_90 = _fmt_rate(row.get("day_90"))
-            if rate_90 is None:
-                rate_90 = f"~{carry_rate:.0f}%"
-            else:
-                try:
-                    carry_rate = float(rate_90.replace("%", "").replace("~", ""))
-                except Exception:
-                    pass
-            rate_180 = _fmt_rate(row.get("day_180"))
-            if rate_180 is None:
-                rate_180 = f"~{carry_rate:.0f}%"
-
-            c.setFont("Helvetica", 6.6)
-            c.setFillColorRGB(0.22, 0.33, 0.27)
-            c.drawString(right_x, row_y, species_label)
-            c.drawString(right_x + 108, row_y, rate_30)
-            c.drawString(right_x + 142, row_y, rate_90)
-            c.drawString(right_x + 176, row_y, rate_180)
-            c.drawString(right_x + 212, row_y, str(int(row.get("trees_with_planting_date", 0) or 0)))
-            row_y -= 9
-
-        c.setFont("Helvetica", 6.5)
+        row_y = 396
+        c.setFont("Helvetica", 7)
+        c.setFillColorRGB(0.22, 0.33, 0.27)
+        for row in species_breakdown[:16]:
+            c.drawString(40, row_y, str(row.get("species_label") or row.get("species_key") or "Unknown")[:26])
+            c.drawString(210, row_y, _fmt_rate(row.get("day_30")))
+            c.drawString(260, row_y, _fmt_rate(row.get("day_90")))
+            c.drawString(310, row_y, _fmt_rate(row.get("day_180")))
+            c.drawString(370, row_y, str(int(row.get("trees_with_planting_date", 0) or 0)))
+            row_y -= 11
+            if row_y < 120:
+                break
+    else:
+        c.setFont("Helvetica", 8)
         c.setFillColorRGB(0.45, 0.45, 0.45)
-        c.drawString(right_x, y - 94, "Context: age-based species cohorts from planting date; '~' denotes provisional carry-forward.")
+        c.drawString(40, 300, "No species trend data available yet.")
 
-    # Keep the CO2-by-species visual in executive summary.
+    c.setFont("Helvetica", 7)
+    c.setFillColorRGB(0.55, 0.55, 0.55)
+    c.drawString(40, 24, "LandCheck Green | Trend Analytics")
+    c.drawRightString(width - 40, 24, datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC"))
+
+    # -----------------------------------------------------------------
+    # PAGE: Carbon Analytics
+    # -----------------------------------------------------------------
+    c.showPage()
+    c.setFont("Helvetica-Bold", 16)
+    c.setFillColorRGB(0.1, 0.1, 0.1)
+    c.drawString(40, height - 50, "Carbon Analytics")
+    c.setFont("Helvetica", 8.2)
+    c.setFillColorRGB(0.42, 0.42, 0.42)
+    c.drawString(40, height - 66, "Species stock and projection charts on dedicated space to avoid overlaps.")
+
+    top_species = carbon_data.get("top_species", []) if carbon_data else []
     if top_species:
         bar_data = []
         colors = ["#2e7d32", "#43a047", "#66bb6a", "#81c784", "#a5d6a7",
                   "#c8e6c9", "#e8f5e9", "#b9f6ca", "#69f0ae", "#00e676"]
-        bar_limit = 5 if has_daily_species else 7
-        bar_height = 56 if has_daily_species else 130
-        bar_y = y - 158 if has_daily_species else y - 140
-        for i, sp in enumerate(top_species[:bar_limit]):
-            bar_data.append((sp["species"][:14], sp["co2_kg"], colors[i % len(colors)]))
-        _draw_bar_chart(c, right_x, bar_y, chart_w, bar_height, bar_data, title="Top Species by CO2 (kg)")
-        c.setFont("Helvetica", 6.5)
+        for i, sp in enumerate(top_species[:10]):
+            bar_data.append((sp["species"][:18], sp["co2_kg"], colors[i % len(colors)]))
+        _draw_bar_chart(c, 40, height - 360, width - 80, 190, bar_data, title="Top Species by CO2 (kg)")
+        c.setFont("Helvetica", 6.8)
         c.setFillColorRGB(0.45, 0.45, 0.45)
-        c.drawString(right_x, bar_y - 8, "Context: estimated current stock by species group.")
+        c.drawString(40, height - 368, "Context: estimated current stock by species group.")
+    else:
+        c.setFont("Helvetica", 8)
+        c.setFillColorRGB(0.45, 0.45, 0.45)
+        c.drawString(40, height - 240, "No species CO2 distribution available.")
 
-    # CO2 projection chart (bottom, full width)
     co2_projection = carbon_data.get("projection", []) if carbon_data else []
     if co2_projection and len(co2_projection) >= 2:
         proj_points = [(p["year_offset"], p["cumulative_co2_tonnes"]) for p in co2_projection]
-        _draw_mini_line_chart(c, 40, y - 310, width - 80, 140, proj_points,
-                              title="CO2 Projection (tonnes, cumulative over 30 years)", y_label="tonnes")
-        c.setFont("Helvetica", 6.5)
+        _draw_mini_line_chart(
+            c,
+            40,
+            160,
+            width - 80,
+            230,
+            proj_points,
+            title="CO2 Projection (tonnes, cumulative over 30 years)",
+            y_label="tonnes",
+            line_color="#16a34a",
+        )
+        c.setFont("Helvetica", 6.8)
         c.setFillColorRGB(0.45, 0.45, 0.45)
-        c.drawString(40, y - 318, "Context: projection assumes current living trees continue modeled growth.")
+        c.drawString(40, 148, "Context: projection assumes current living trees continue modeled growth.")
+    else:
+        c.setFont("Helvetica", 8)
+        c.setFillColorRGB(0.45, 0.45, 0.45)
+        c.drawString(40, 250, "No CO2 projection points available.")
 
-    # Footer
     c.setFont("Helvetica", 7)
     c.setFillColorRGB(0.55, 0.55, 0.55)
-    c.drawString(40, 24, "Methodology: IPCC Tier 1 defaults + Chave et al. (2014) pantropical allometric equation")
-    c.drawRightString(width - 40, 24, f"LandCheck Green | {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}")
+    c.drawString(40, 24, "LandCheck Green | Carbon Analytics")
+    c.drawRightString(width - 40, 24, datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC"))
 
 
 def render_green_report_pdf(
@@ -644,7 +670,20 @@ def render_green_report_pdf(
     )
 
     # =====================================================================
-    # PAGE 2: Tree Records + Maintenance
+    # PAGE 2-3: Trend + Carbon Analytics (dedicated pages for clean layout)
+    # =====================================================================
+    _render_trend_analytics_pages(
+        c,
+        width,
+        height,
+        kpi_snapshot,
+        carbon_data,
+        kpi_trend,
+        species_daily_survival=species_daily_survival,
+    )
+
+    # =====================================================================
+    # NEXT PAGE: Tree Records + Maintenance
     # =====================================================================
     c.showPage()
     c.setFont("Helvetica-Bold", 18)
