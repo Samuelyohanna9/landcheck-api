@@ -3299,6 +3299,12 @@ def _to_iso_text(value: object) -> str:
     return str(value)
 
 
+def _excel_csv_writer(target) -> csv.writer:
+    # Ensures Excel opens comma-separated exports in proper columns across locale settings.
+    target.write("sep=,\n")
+    return csv.writer(target)
+
+
 def _is_within_monitoring_period(
     candidate: date | None,
     monitoring_start: date | None,
@@ -3869,11 +3875,11 @@ def _build_verra_vcs_payload(
 
 def _write_csv_to_zip(zf: zipfile.ZipFile, filename: str, headers: list[str], rows: list[list[object]]):
     sio = io.StringIO()
-    writer = csv.writer(sio)
+    writer = _excel_csv_writer(sio)
     writer.writerow(headers)
     for row in rows:
         writer.writerow([_to_iso_text(value) for value in row])
-    zf.writestr(filename, sio.getvalue())
+    zf.writestr(filename, "\ufeff" + sio.getvalue())
 
 
 def _render_verra_vcs_zip(package: dict) -> io.BytesIO:
@@ -4216,6 +4222,133 @@ def _render_verra_vcs_zip(package: dict) -> io.BytesIO:
     return buffer
 
 
+def _render_verra_vcs_docx(package: dict) -> io.BytesIO:
+    try:
+        from docx import Document
+    except Exception as exc:
+        raise HTTPException(status_code=501, detail="DOCX export requires python-docx.") from exc
+
+    payload = package.get("payload") or {}
+    project_section = payload.get("section_1_project_identification") or {}
+    monitoring_section = payload.get("section_2_monitoring_summary") or {}
+    ghg_section = payload.get("section_3_ghg_quantification") or {}
+    annex_section = payload.get("section_6_annex_data_tables") or {}
+
+    trees = package.get("trees") or []
+    tasks = package.get("tasks") or []
+    donor_rows = package.get("donor_rows") or []
+    top_species = ghg_section.get("top_species_by_co2") or []
+    sources = payload.get("source_references") or []
+
+    document = Document()
+    document.add_heading("LandCheck Verra VCS Structured Report", level=0)
+    document.add_paragraph(
+        "\n".join(
+            [
+                f"Generated at: {_to_iso_text(payload.get('generated_at'))}",
+                f"Project ID: {_to_iso_text(project_section.get('project_id'))}",
+                f"Project name: {_to_iso_text(project_section.get('project_name'))}",
+                f"Location: {_to_iso_text(project_section.get('project_location'))}",
+                f"Monitoring period: {_to_iso_text(project_section.get('monitoring_period_start'))} to {_to_iso_text(project_section.get('monitoring_period_end'))}",
+                f"Methodology: {_to_iso_text(project_section.get('methodology_reference'))}",
+            ]
+        )
+    )
+
+    def add_kv_table(title: str, rows: list[tuple[str, object]]):
+        document.add_heading(title, level=2)
+        table = document.add_table(rows=len(rows) + 1, cols=2)
+        table.style = "Table Grid"
+        table.rows[0].cells[0].text = "Field"
+        table.rows[0].cells[1].text = "Value"
+        for idx, (label, value) in enumerate(rows, start=1):
+            table.rows[idx].cells[0].text = str(label)
+            table.rows[idx].cells[1].text = _to_iso_text(value)
+
+    add_kv_table(
+        "Monitoring Summary",
+        [
+            ("Trees total", monitoring_section.get("trees_total", 0)),
+            ("Trees healthy", monitoring_section.get("trees_healthy", 0)),
+            ("Trees attention", monitoring_section.get("trees_attention", 0)),
+            ("Trees dead/removed", monitoring_section.get("trees_dead_or_removed", 0)),
+            ("Open tasks", monitoring_section.get("tasks_open", 0)),
+            ("Submitted tasks", monitoring_section.get("tasks_submitted", 0)),
+            ("Approved tasks", monitoring_section.get("tasks_approved", 0)),
+            ("Rejected tasks", monitoring_section.get("tasks_rejected", 0)),
+            ("Overdue tasks", monitoring_section.get("tasks_overdue", 0)),
+            ("Evidence complete rate (%)", monitoring_section.get("evidence_complete_rate_percent", 0)),
+        ],
+    )
+
+    add_kv_table(
+        "GHG Quantification",
+        [
+            ("CO2 current (tonnes)", ghg_section.get("co2_current_tonnes", 0)),
+            ("CO2 annual (tonnes)", ghg_section.get("co2_annual_tonnes", 0)),
+            ("CO2 projected lifetime (tonnes)", ghg_section.get("co2_projected_lifetime_tonnes", 0)),
+            ("CO2 average per tree (kg)", ghg_section.get("co2_average_per_tree_kg", 0)),
+            ("Methodology", ghg_section.get("methodology", "")),
+        ],
+    )
+
+    add_kv_table(
+        "Annex Counts",
+        [
+            ("Tree inventory rows", annex_section.get("tree_inventory_count", len(trees))),
+            ("Task timeline rows", annex_section.get("task_timeline_count", len(tasks))),
+            ("Review timeline rows", len(donor_rows)),
+            ("Species summary rows", annex_section.get("species_summary_count", 0)),
+            ("Staff summary rows", annex_section.get("staff_summary_count", 0)),
+            ("Species maturity rows", annex_section.get("species_maturity_rules_count", 0)),
+        ],
+    )
+
+    if top_species:
+        document.add_heading("Top Species by CO2", level=2)
+        species_table = document.add_table(rows=min(len(top_species), 20) + 1, cols=4)
+        species_table.style = "Table Grid"
+        species_table.rows[0].cells[0].text = "Species input"
+        species_table.rows[0].cells[1].text = "Model species"
+        species_table.rows[0].cells[2].text = "Tree count"
+        species_table.rows[0].cells[3].text = "Current CO2 (kg)"
+        for idx, species_row in enumerate(top_species[:20], start=1):
+            species_table.rows[idx].cells[0].text = _to_iso_text(species_row.get("species"))
+            species_table.rows[idx].cells[1].text = _to_iso_text(species_row.get("model_species"))
+            species_table.rows[idx].cells[2].text = _to_iso_text(species_row.get("count"))
+            species_table.rows[idx].cells[3].text = _to_iso_text(species_row.get("co2_kg"))
+
+    if donor_rows:
+        document.add_heading("Recent Review Timeline (sample)", level=2)
+        review_table = document.add_table(rows=min(len(donor_rows), 25) + 1, cols=6)
+        review_table.style = "Table Grid"
+        review_table.rows[0].cells[0].text = "Task ID"
+        review_table.rows[0].cells[1].text = "Tree ID"
+        review_table.rows[0].cells[2].text = "Task type"
+        review_table.rows[0].cells[3].text = "Status"
+        review_table.rows[0].cells[4].text = "Review state"
+        review_table.rows[0].cells[5].text = "Reviewed at"
+        for idx, timeline_row in enumerate(donor_rows[:25], start=1):
+            review_table.rows[idx].cells[0].text = _to_iso_text(timeline_row.get("task_id"))
+            review_table.rows[idx].cells[1].text = _to_iso_text(timeline_row.get("tree_id"))
+            review_table.rows[idx].cells[2].text = _to_iso_text(timeline_row.get("task_type"))
+            review_table.rows[idx].cells[3].text = _to_iso_text(timeline_row.get("status"))
+            review_table.rows[idx].cells[4].text = _to_iso_text(timeline_row.get("review_state"))
+            review_table.rows[idx].cells[5].text = _to_iso_text(timeline_row.get("reviewed_at"))
+
+    if sources:
+        document.add_heading("Source References", level=2)
+        for source in sources:
+            label = _to_iso_text(source.get("label"))
+            url = _to_iso_text(source.get("url"))
+            document.add_paragraph(f"- {label}: {url}")
+
+    buffer = io.BytesIO()
+    document.save(buffer)
+    buffer.seek(0)
+    return buffer
+
+
 @router.get("/projects/{project_id}/export/verra-vcs")
 def export_project_verra_vcs(
     project_id: int,
@@ -4249,14 +4382,15 @@ def export_project_verra_vcs(
         verifier_notes=verifier_notes,
     )
     format_key = _normalize_name(output_format)
-    if format_key not in {"zip", "json"}:
+    if format_key not in {"zip", "json", "docx"}:
         format_key = "zip"
     project_token = f"project_{project_id}"
-    file_name = (
-        f"{project_token}_verra_vcs_template.json"
-        if format_key == "json"
-        else f"{project_token}_verra_vcs_package.zip"
-    )
+    if format_key == "json":
+        file_name = f"{project_token}_verra_vcs_template.json"
+    elif format_key == "docx":
+        file_name = f"{project_token}_verra_vcs_report.docx"
+    else:
+        file_name = f"{project_token}_verra_vcs_package.zip"
 
     payload = package.get("payload") or {}
     payload_summary = {
@@ -4301,6 +4435,15 @@ def export_project_verra_vcs(
         content = json.dumps(payload, indent=2, default=str).encode("utf-8")
         headers = {"Content-Disposition": f'attachment; filename="{file_name}"'}
         return StreamingResponse(io.BytesIO(content), media_type="application/json", headers=headers)
+
+    if format_key == "docx":
+        docx_buffer = _render_verra_vcs_docx(package)
+        headers = {"Content-Disposition": f'attachment; filename="{file_name}"'}
+        return StreamingResponse(
+            docx_buffer,
+            media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            headers=headers,
+        )
 
     zip_buffer = _render_verra_vcs_zip(package)
     headers = {"Content-Disposition": f'attachment; filename="{file_name}"'}
@@ -4375,8 +4518,8 @@ def export_donor_report_csv(project_id: int, db: Session = Depends(get_db)):
     csv_path = tmp_csv.name
     tmp_csv.close()
 
-    with open(csv_path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
+    with open(csv_path, "w", newline="", encoding="utf-8-sig") as f:
+        writer = _excel_csv_writer(f)
         # Carbon summary for CSV header
         carbon_trees_csv = db.execute(text("""
             SELECT id, species, planting_date, status, created_at FROM trees WHERE project_id = :pid
@@ -4857,8 +5000,8 @@ def export_work_stats_csv(project_id: int, db: Session = Depends(get_db)):
     csv_path = tmp_csv.name
     tmp_csv.close()
 
-    with open(csv_path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
+    with open(csv_path, "w", newline="", encoding="utf-8-sig") as f:
+        writer = _excel_csv_writer(f)
         writer.writerow(["assignee", "orders", "target_trees", "planted_count"])
         for r in stats["orders"]:
             writer.writerow([
@@ -4903,8 +5046,8 @@ def export_tasks_csv(project_id: int, db: Session = Depends(get_db)):
     csv_path = tmp_csv.name
     tmp_csv.close()
 
-    with open(csv_path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
+    with open(csv_path, "w", newline="", encoding="utf-8-sig") as f:
+        writer = _excel_csv_writer(f)
         writer.writerow([
             "task_id", "task_type", "assignee_name", "due_date", "priority", "status",
             "review_state", "submitted_at", "reviewed_at", "reviewed_by", "review_notes",
@@ -4955,8 +5098,8 @@ def export_project_csv(project_id: int, db: Session = Depends(get_db)):
     csv_path = tmp_csv.name
     tmp_csv.close()
 
-    with open(csv_path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
+    with open(csv_path, "w", newline="", encoding="utf-8-sig") as f:
+        writer = _excel_csv_writer(f)
         writer.writerow(["LandCheck Project Export"])
         writer.writerow([
             "KPI",
