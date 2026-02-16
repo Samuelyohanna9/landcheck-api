@@ -2,7 +2,8 @@ from fastapi import APIRouter, Body, Depends, HTTPException, Query, UploadFile, 
 from fastapi.responses import FileResponse, StreamingResponse
 from sqlalchemy.orm import Session
 from sqlalchemy import text
-from datetime import datetime
+from datetime import datetime, date, timedelta
+import json
 import os
 import tempfile
 import csv
@@ -20,6 +21,29 @@ router = APIRouter(prefix="/green", tags=["green"])
 
 BASE_DIR = os.path.dirname(os.path.dirname(__file__))
 REPORTS_DIR = os.path.join(BASE_DIR, "reports", "green")
+LIVE_SOURCE_REFERENCES = [
+    {
+        "label": "FAO - Forest restoration monitoring and maintenance sequence",
+        "url": "https://www.fao.org/sustainable-forest-management-toolbox/modules/forest-restoration/en",
+    },
+    {
+        "label": "FAO - Post-planting operations (watering, protection, replacement)",
+        "url": "https://www.fao.org/4/u2247e/u2247e0a.htm",
+    },
+    {
+        "label": "FAO - Savanna plantation field maintenance practices (Nigeria-relevant context)",
+        "url": "https://www.fao.org/4/93269e/93269e03.htm",
+    },
+    {
+        "label": "NiMet seasonal outlook context for local onset/dry-period planning",
+        "url": "https://www.nimet.gov.ng/news?id=94",
+    },
+]
+
+MAINTENANCE_ACTIVITY_ORDER = ("watering", "weeding", "protection", "inspection", "replacement")
+SEASON_VALUES = {"rainy", "dry"}
+TASK_STATUS_VALUES = {"pending", "done", "overdue"}
+REVIEW_STATE_VALUES = {"none", "submitted", "approved", "rejected", "reopened"}
 
 
 def get_db():
@@ -29,6 +53,677 @@ def get_db():
         yield db
     finally:
         db.close()
+
+
+def _normalize_name(value: str | None) -> str:
+    return (value or "").strip().lower()
+
+
+def _is_done_status(status: str | None) -> bool:
+    return _normalize_name(status) in {"done", "completed", "closed"}
+
+
+def _start_of_day(value: date | datetime) -> date:
+    if isinstance(value, datetime):
+        return value.date()
+    return value
+
+
+def _parse_date_value(value: str | datetime | date | None) -> date | None:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    raw = str(value).strip()
+    if not raw:
+        return None
+    try:
+        if len(raw) >= 10:
+            return date.fromisoformat(raw[:10])
+        return date.fromisoformat(raw)
+    except Exception:
+        return None
+
+
+def _to_date_input(value: date | None) -> str:
+    return value.isoformat() if value else ""
+
+
+def _add_days(value: date, days: int) -> date:
+    return value + timedelta(days=days)
+
+
+def _day_diff(target: date, reference: date) -> int:
+    return (_start_of_day(target) - _start_of_day(reference)).days
+
+
+def _safe_json(value: dict | list | None) -> str:
+    try:
+        return json.dumps(value or {}, default=str)
+    except Exception:
+        return "{}"
+
+
+def _get_maintenance_intervals(activity: str, tree_age_days: int, season: str) -> dict:
+    activity_key = _normalize_name(activity)
+    season_key = "dry" if _normalize_name(season) == "dry" else "rainy"
+    age = max(int(tree_age_days or 0), 0)
+
+    if activity_key == "watering":
+        if season_key == "rainy":
+            return {"first_days": 0, "repeat_days": 14 if age < 90 else 21}
+        return {"first_days": 0, "repeat_days": 5 if age < 90 else 7}
+
+    if activity_key == "weeding":
+        if season_key == "rainy":
+            if age < 365:
+                return {"first_days": 21, "repeat_days": 45}
+            if age < 730:
+                return {"first_days": 30, "repeat_days": 90}
+            return {"first_days": 30, "repeat_days": 150}
+        if age < 365:
+            return {"first_days": 35, "repeat_days": 90}
+        if age < 730:
+            return {"first_days": 45, "repeat_days": 150}
+        return {"first_days": 45, "repeat_days": 210}
+
+    if activity_key == "protection":
+        if season_key == "rainy":
+            return {"first_days": 0, "repeat_days": 45}
+        return {"first_days": 0, "repeat_days": 21}
+
+    if activity_key == "inspection":
+        if season_key == "rainy":
+            return {"first_days": 14, "repeat_days": 30 if age < 180 else 90}
+        return {"first_days": 7, "repeat_days": 21 if age < 180 else 60}
+
+    if activity_key == "replacement":
+        if season_key == "rainy":
+            return {"first_days": 42, "repeat_days": 180}
+        return {"first_days": 56, "repeat_days": 210}
+
+    return {"first_days": 30, "repeat_days": 90}
+
+
+def _get_lifecycle_start_date(planting_date_obj: date | None, replacement_done_obj: date | None) -> date | None:
+    if planting_date_obj and replacement_done_obj:
+        return replacement_done_obj if replacement_done_obj > planting_date_obj else planting_date_obj
+    return replacement_done_obj or planting_date_obj
+
+
+def _get_project_id_for_tree(db: Session, tree_id: int) -> int | None:
+    return db.execute(
+        text("SELECT project_id FROM trees WHERE id = :tree_id"),
+        {"tree_id": tree_id},
+    ).scalar()
+
+
+def _get_project_id_for_task(db: Session, task_id: int) -> int | None:
+    return db.execute(
+        text("""
+            SELECT tr.project_id
+            FROM tree_tasks t
+            JOIN trees tr ON tr.id = t.tree_id
+            WHERE t.id = :task_id
+        """),
+        {"task_id": task_id},
+    ).scalar()
+
+
+def _log_audit_event(
+    db: Session,
+    project_id: int | None,
+    entity_type: str,
+    entity_id: int | None,
+    action: str,
+    actor: str | None = None,
+    details: dict | None = None,
+):
+    db.execute(
+        text("""
+            INSERT INTO green_audit_events (
+                project_id, entity_type, entity_id, action, actor, details
+            )
+            VALUES (:project_id, :entity_type, :entity_id, :action, :actor, CAST(:details AS JSONB))
+        """),
+        {
+            "project_id": project_id,
+            "entity_type": entity_type,
+            "entity_id": entity_id,
+            "action": action,
+            "actor": actor,
+            "details": _safe_json(details),
+        },
+    )
+
+
+def _get_species_maturity_map(project_id: int, db: Session) -> dict[str, int]:
+    rows = db.execute(
+        text("""
+            SELECT species_key, maturity_years
+            FROM green_species_maturity
+            WHERE project_id = :project_id
+        """),
+        {"project_id": project_id},
+    ).mappings().all()
+    result: dict[str, int] = {}
+    for row in rows:
+        key = _normalize_name(row.get("species_key"))
+        years = int(row.get("maturity_years") or 0)
+        if key and years > 0:
+            result[key] = years
+    return result
+
+
+def _task_needs_evidence(task_type: str | None) -> dict:
+    # Premium default: every maintenance completion requires note + photo proof.
+    activity = _normalize_name(task_type)
+    if activity in MAINTENANCE_ACTIVITY_ORDER:
+        return {"require_notes": True, "require_photo": True}
+    return {"require_notes": False, "require_photo": False}
+
+
+def _has_required_evidence(task_type: str | None, notes: str | None, photo_url: str | None) -> tuple[bool, str]:
+    policy = _task_needs_evidence(task_type)
+    notes_ok = bool((notes or "").strip())
+    photo_ok = bool((photo_url or "").strip())
+    if policy["require_notes"] and not notes_ok:
+        return False, "Notes are required before submission."
+    if policy["require_photo"] and not photo_ok:
+        return False, "Photo proof is required before submission."
+    return True, ""
+
+
+def _record_alert(
+    db: Session,
+    project_id: int,
+    alert_type: str,
+    severity: str,
+    message: str,
+    tree_id: int | None = None,
+    task_id: int | None = None,
+    payload: dict | None = None,
+):
+    existing = db.execute(
+        text("""
+            SELECT id
+            FROM green_alerts
+            WHERE project_id = :project_id
+              AND COALESCE(tree_id, 0) = COALESCE(:tree_id, 0)
+              AND COALESCE(task_id, 0) = COALESCE(:task_id, 0)
+              AND alert_type = :alert_type
+              AND status = 'open'
+            LIMIT 1
+        """),
+        {
+            "project_id": project_id,
+            "tree_id": tree_id,
+            "task_id": task_id,
+            "alert_type": alert_type,
+        },
+    ).scalar()
+    if existing:
+        return existing
+    return db.execute(
+        text("""
+            INSERT INTO green_alerts (
+                project_id, tree_id, task_id, alert_type, severity, message, payload
+            )
+            VALUES (
+                :project_id, :tree_id, :task_id, :alert_type, :severity, :message, CAST(:payload AS JSONB)
+            )
+            RETURNING id
+        """),
+        {
+            "project_id": project_id,
+            "tree_id": tree_id,
+            "task_id": task_id,
+            "alert_type": alert_type,
+            "severity": severity,
+            "message": message,
+            "payload": _safe_json(payload),
+        },
+    ).scalar()
+
+
+def _resolve_task_alerts(db: Session, task_id: int):
+    db.execute(
+        text("""
+            UPDATE green_alerts
+            SET status = 'resolved',
+                resolved_at = NOW()
+            WHERE task_id = :task_id
+              AND status = 'open'
+        """),
+        {"task_id": task_id},
+    )
+
+
+def _refresh_project_alerts(db: Session, project_id: int):
+    db.execute(
+        text("""
+            DELETE FROM green_alerts
+            WHERE project_id = :project_id
+              AND status = 'open'
+              AND alert_type IN ('task_overdue', 'task_due_soon', 'task_submitted', 'missing_evidence')
+        """),
+        {"project_id": project_id},
+    )
+
+    rows = db.execute(
+        text("""
+            SELECT t.id AS task_id, t.tree_id, t.task_type, t.assignee_name, t.status, t.review_state,
+                   t.due_date, t.notes, t.photo_url, t.completed_at,
+                   tr.project_id
+            FROM tree_tasks t
+            JOIN trees tr ON tr.id = t.tree_id
+            WHERE tr.project_id = :project_id
+        """),
+        {"project_id": project_id},
+    ).mappings().all()
+
+    today = date.today()
+    due_soon_limit = today + timedelta(days=3)
+    for row in rows:
+        task_id = int(row["task_id"])
+        tree_id = int(row["tree_id"])
+        status = _normalize_name(row.get("status"))
+        review_state = _normalize_name(row.get("review_state"))
+        due_date = _parse_date_value(row.get("due_date"))
+        evidence_ok, _ = _has_required_evidence(row.get("task_type"), row.get("notes"), row.get("photo_url"))
+
+        if review_state == "submitted":
+            _record_alert(
+                db,
+                project_id=project_id,
+                alert_type="task_submitted",
+                severity="warning",
+                message=f"Task #{task_id} is awaiting supervisor review.",
+                tree_id=tree_id,
+                task_id=task_id,
+                payload={"review_state": review_state},
+            )
+
+        if status != "done" and due_date:
+            if due_date < today:
+                days = abs(_day_diff(due_date, today))
+                _record_alert(
+                    db,
+                    project_id=project_id,
+                    alert_type="task_overdue",
+                    severity="danger",
+                    message=f"Task #{task_id} overdue by {days} day{'s' if days != 1 else ''}.",
+                    tree_id=tree_id,
+                    task_id=task_id,
+                    payload={"due_date": _to_date_input(due_date)},
+                )
+            elif due_date <= due_soon_limit:
+                left_days = max(_day_diff(due_date, today), 0)
+                _record_alert(
+                    db,
+                    project_id=project_id,
+                    alert_type="task_due_soon",
+                    severity="warning",
+                    message=f"Task #{task_id} due in {left_days} day{'s' if left_days != 1 else ''}.",
+                    tree_id=tree_id,
+                    task_id=task_id,
+                    payload={"due_date": _to_date_input(due_date)},
+                )
+
+        if _is_done_status(status) and review_state == "submitted" and not evidence_ok:
+            _record_alert(
+                db,
+                project_id=project_id,
+                alert_type="missing_evidence",
+                severity="danger",
+                message=f"Task #{task_id} submitted without complete evidence.",
+                tree_id=tree_id,
+                task_id=task_id,
+                payload={"task_type": row.get("task_type")},
+            )
+
+
+def _compute_live_maintenance_rows(
+    db: Session,
+    project_id: int,
+    season_mode: str = "rainy",
+    assignee_name: str | None = None,
+) -> dict:
+    season = "dry" if _normalize_name(season_mode) == "dry" else "rainy"
+    assignee_key = _normalize_name(assignee_name)
+    trees = db.execute(
+        text("""
+            SELECT id, created_by, status, species, planting_date
+            FROM trees
+            WHERE project_id = :project_id
+            ORDER BY id ASC
+        """),
+        {"project_id": project_id},
+    ).mappings().all()
+    task_rows = db.execute(
+        text("""
+            SELECT t.id, t.tree_id, t.task_type, t.assignee_name, t.status, t.review_state, t.due_date,
+                   t.priority, t.notes, t.photo_url, t.created_at, t.completed_at
+            FROM tree_tasks t
+            JOIN trees tr ON tr.id = t.tree_id
+            WHERE tr.project_id = :project_id
+              AND (:assignee_name IS NULL OR t.assignee_name = :assignee_name)
+            ORDER BY t.created_at DESC
+        """),
+        {"project_id": project_id, "assignee_name": assignee_name},
+    ).mappings().all()
+
+    species_maturity_map = _get_species_maturity_map(project_id, db)
+    task_buckets: dict[str, list[dict]] = {}
+    for task in task_rows:
+        activity = _normalize_name(task.get("task_type"))
+        if activity not in MAINTENANCE_ACTIVITY_ORDER:
+            continue
+        key = f"{int(task['tree_id'])}:{activity}"
+        task_buckets.setdefault(key, []).append(dict(task))
+
+    today = date.today()
+    rows: list[dict] = []
+    for tree in trees:
+        tree_id = int(tree["id"])
+        tree_assignee = str(tree.get("created_by") or "-")
+        if assignee_key:
+            has_matching_task = any(
+                _normalize_name(str(task.get("assignee_name") or "")) == assignee_key and int(task["tree_id"]) == tree_id
+                for task in task_rows
+            )
+            if _normalize_name(tree_assignee) != assignee_key and not has_matching_task:
+                continue
+
+        tree_status = _normalize_name(tree.get("status") or "alive")
+        planting_date_obj = _parse_date_value(tree.get("planting_date"))
+        replacement_key = f"{tree_id}:replacement"
+        replacement_done = sorted(
+            [
+                _parse_date_value(task.get("completed_at") or task.get("due_date") or task.get("created_at"))
+                for task in task_buckets.get(replacement_key, [])
+                if _is_done_status(task.get("status")) and _normalize_name(task.get("review_state")) in {"approved", "none"}
+            ],
+            reverse=True,
+        )
+        latest_replacement_date = replacement_done[0] if replacement_done else None
+        lifecycle_start = _get_lifecycle_start_date(planting_date_obj, latest_replacement_date)
+        tree_age_days = _day_diff(today, lifecycle_start) if lifecycle_start else None
+        species_key = _normalize_name(tree.get("species"))
+        maturity_years = species_maturity_map.get(species_key) if species_key else None
+        maturity_reached = (
+            tree_status == "alive"
+            and maturity_years is not None
+            and tree_age_days is not None
+            and tree_age_days >= maturity_years * 365
+        )
+
+        for activity in MAINTENANCE_ACTIVITY_ORDER:
+            bucket = task_buckets.get(f"{tree_id}:{activity}", [])
+            done_tasks = [
+                task
+                for task in bucket
+                if _is_done_status(task.get("status")) and _normalize_name(task.get("review_state")) in {"approved", "none"}
+            ]
+            open_tasks = [task for task in bucket if not (_is_done_status(task.get("status")) and _normalize_name(task.get("review_state")) in {"approved", "none"})]
+            done_tasks.sort(
+                key=lambda task: _parse_date_value(task.get("completed_at") or task.get("due_date") or task.get("created_at")) or date.min,
+                reverse=True,
+            )
+            open_tasks.sort(
+                key=lambda task: _parse_date_value(task.get("due_date") or task.get("created_at")) or date.max,
+            )
+            latest_done = done_tasks[0] if done_tasks else None
+            active_task = open_tasks[0] if open_tasks else None
+
+            status_text = "No open task"
+            tone = "ok"
+            indicator = "On schedule"
+            model_due: date | None = None
+            assigned_due = _parse_date_value(active_task.get("due_date")) if active_task else None
+
+            if tree_status == "dead" and activity != "replacement":
+                tone = "danger"
+                status_text = "Paused"
+                indicator = "Tree marked dead. Replacement required."
+            elif tree_status == "dead" and activity == "replacement":
+                model_due = today
+                tone = "warning"
+                status_text = "Replacement required"
+                indicator = "Replacement due immediately."
+            elif maturity_reached:
+                tone = "info"
+                status_text = "Lifecycle complete"
+                indicator = f"Tree reached maturity (~{maturity_years} years)."
+            else:
+                intervals = _get_maintenance_intervals(activity, tree_age_days or 0, season)
+                latest_done_date = _parse_date_value(
+                    latest_done.get("completed_at") if latest_done else None
+                ) or _parse_date_value(latest_done.get("due_date") if latest_done else None) or _parse_date_value(
+                    latest_done.get("created_at") if latest_done else None
+                )
+                if latest_done_date:
+                    model_due = _add_days(latest_done_date, intervals["repeat_days"])
+                elif lifecycle_start:
+                    model_due = _add_days(lifecycle_start, intervals["first_days"])
+
+                if active_task:
+                    rs = _normalize_name(active_task.get("review_state"))
+                    if rs == "submitted":
+                        status_text = f"Task #{active_task['id']} submitted"
+                    elif rs == "rejected":
+                        status_text = f"Task #{active_task['id']} rejected"
+                    else:
+                        status_text = f"Task #{active_task['id']} {active_task.get('status') or 'pending'}"
+
+            effective_due: date | None = None
+            if model_due and assigned_due:
+                effective_due = model_due if model_due <= assigned_due else assigned_due
+            else:
+                effective_due = model_due or assigned_due
+
+            countdown_days = _day_diff(effective_due, today) if effective_due else None
+            if countdown_days is not None:
+                if countdown_days < 0:
+                    tone = "danger"
+                    indicator = f"Not done, overdue by {abs(countdown_days)} day{'s' if abs(countdown_days) != 1 else ''}."
+                elif countdown_days == 0:
+                    tone = "warning"
+                    indicator = "Due today."
+                elif countdown_days <= 7:
+                    tone = "warning"
+                    indicator = f"Due in {countdown_days} day{'s' if countdown_days != 1 else ''}."
+
+            overdue_open = 0
+            for task in open_tasks:
+                due = _parse_date_value(task.get("due_date"))
+                if due and due < today:
+                    overdue_open += 1
+
+            intervals = _get_maintenance_intervals(activity, tree_age_days or 0, season)
+            rows.append(
+                {
+                    "key": f"{tree_id}:{activity}",
+                    "treeId": tree_id,
+                    "assignee": tree_assignee,
+                    "activity": activity,
+                    "activityLabel": activity.replace("_", " ").title(),
+                    "plantingDate": _to_date_input(planting_date_obj),
+                    "treeAgeDays": tree_age_days,
+                    "lastDoneAt": _to_date_input(_parse_date_value(latest_done.get("completed_at") if latest_done else None) or _parse_date_value(latest_done.get("due_date") if latest_done else None)),
+                    "modelDueDate": _to_date_input(model_due),
+                    "assignedDueDate": _to_date_input(assigned_due),
+                    "effectiveDueDate": _to_date_input(effective_due),
+                    "countdownDays": countdown_days,
+                    "tone": tone,
+                    "indicator": indicator,
+                    "statusText": status_text,
+                    "doneCount": len(done_tasks),
+                    "pendingCount": len(open_tasks),
+                    "overdueCount": overdue_open,
+                    "openTaskId": int(active_task["id"]) if active_task else None,
+                    "modelRationale": f"{season.title()} season model: first {intervals['first_days']}d, repeat {intervals['repeat_days']}d.",
+                }
+            )
+
+    tone_order = {"danger": 0, "warning": 1, "info": 2, "ok": 3}
+    rows.sort(
+        key=lambda item: (
+            tone_order.get(item.get("tone"), 3),
+            item.get("countdownDays") if item.get("countdownDays") is not None else 999999,
+            int(item.get("treeId") or 0),
+        )
+    )
+
+    summary = {
+        "total": len(rows),
+        "danger": sum(1 for item in rows if item.get("tone") == "danger"),
+        "warning": sum(1 for item in rows if item.get("tone") == "warning"),
+        "ok": sum(1 for item in rows if item.get("tone") == "ok"),
+        "info": sum(1 for item in rows if item.get("tone") == "info"),
+        "dueSoon": sum(1 for item in rows if isinstance(item.get("countdownDays"), int) and 0 <= item["countdownDays"] <= 7),
+    }
+    return {"rows": rows, "summary": summary}
+
+
+def _auto_schedule_next_cycle(db: Session, task_id: int, season_hint: str | None = None) -> int | None:
+    task = db.execute(
+        text("""
+            SELECT t.id, t.tree_id, t.task_type, t.assignee_name, t.priority, t.status, t.review_state,
+                   t.completed_at, t.due_date, t.model_season,
+                   tr.project_id, tr.status AS tree_status, tr.species, tr.planting_date
+            FROM tree_tasks t
+            JOIN trees tr ON tr.id = t.tree_id
+            WHERE t.id = :task_id
+        """),
+        {"task_id": task_id},
+    ).mappings().first()
+    if not task:
+        return None
+
+    if _normalize_name(task.get("task_type")) not in MAINTENANCE_ACTIVITY_ORDER:
+        return None
+    if not _is_done_status(task.get("status")):
+        return None
+    if _normalize_name(task.get("review_state")) != "approved":
+        return None
+
+    tree_status = _normalize_name(task.get("tree_status") or "alive")
+    activity = _normalize_name(task.get("task_type"))
+    if tree_status == "dead" and activity != "replacement":
+        return None
+
+    season = _normalize_name(season_hint or task.get("model_season") or "rainy")
+    if season not in SEASON_VALUES:
+        season = "rainy"
+
+    project_id = int(task["project_id"])
+    tree_id = int(task["tree_id"])
+    today = date.today()
+    completed_date = _parse_date_value(task.get("completed_at")) or _parse_date_value(task.get("due_date")) or today
+
+    replacement_done = db.execute(
+        text("""
+            SELECT COALESCE(completed_at::date, due_date, created_at::date) AS stamp
+            FROM tree_tasks
+            WHERE tree_id = :tree_id
+              AND LOWER(task_type) = 'replacement'
+              AND LOWER(status) IN ('done', 'completed', 'closed')
+              AND LOWER(review_state) = 'approved'
+            ORDER BY stamp DESC
+            LIMIT 1
+        """),
+        {"tree_id": tree_id},
+    ).scalar()
+    lifecycle_start = _get_lifecycle_start_date(
+        _parse_date_value(task.get("planting_date")),
+        _parse_date_value(replacement_done),
+    )
+    tree_age_days = _day_diff(today, lifecycle_start) if lifecycle_start else 0
+    species_key = _normalize_name(task.get("species"))
+    maturity_map = _get_species_maturity_map(project_id, db)
+    maturity_years = maturity_map.get(species_key) if species_key else None
+    if tree_status == "alive" and maturity_years and tree_age_days >= maturity_years * 365:
+        return None
+
+    open_exists = db.execute(
+        text("""
+            SELECT id
+            FROM tree_tasks
+            WHERE tree_id = :tree_id
+              AND LOWER(task_type) = :task_type
+              AND (
+                LOWER(status) NOT IN ('done', 'completed', 'closed')
+                OR LOWER(review_state) IN ('submitted', 'rejected', 'reopened')
+              )
+            LIMIT 1
+        """),
+        {"tree_id": tree_id, "task_type": activity},
+    ).scalar()
+    if open_exists:
+        return None
+
+    intervals = _get_maintenance_intervals(activity, tree_age_days, season)
+    next_due = _add_days(completed_date, intervals["repeat_days"])
+    new_task_id = db.execute(
+        text("""
+            INSERT INTO tree_tasks (
+                tree_id, task_type, assignee_name, due_date, priority, status, notes,
+                auto_generated, model_season, source_task_id, review_state
+            )
+            VALUES (
+                :tree_id, :task_type, :assignee_name, :due_date, :priority, 'pending', :notes,
+                TRUE, :model_season, :source_task_id, 'none'
+            )
+            RETURNING id
+        """),
+        {
+            "tree_id": tree_id,
+            "task_type": activity,
+            "assignee_name": task.get("assignee_name"),
+            "due_date": next_due,
+            "priority": task.get("priority") or "normal",
+            "notes": f"Auto-generated next cycle from Task #{task_id}.",
+            "model_season": season,
+            "source_task_id": task_id,
+        },
+    ).scalar()
+
+    db.execute(
+        text("""
+            INSERT INTO green_maintenance_cycles (
+                project_id, tree_id, task_type, model_season, source_task_id, generated_task_id, due_date, status
+            )
+            VALUES (
+                :project_id, :tree_id, :task_type, :model_season, :source_task_id, :generated_task_id, :due_date, 'scheduled'
+            )
+        """),
+        {
+            "project_id": project_id,
+            "tree_id": tree_id,
+            "task_type": activity,
+            "model_season": season,
+            "source_task_id": task_id,
+            "generated_task_id": new_task_id,
+            "due_date": next_due,
+        },
+    )
+    _log_audit_event(
+        db,
+        project_id=project_id,
+        entity_type="task",
+        entity_id=int(new_task_id),
+        action="auto_cycle_generated",
+        actor="system",
+        details={
+            "source_task_id": task_id,
+            "season": season,
+            "due_date": _to_date_input(next_due),
+        },
+    )
+    return int(new_task_id)
 
 
 def ensure_green_tables(db: Session):
@@ -92,6 +787,14 @@ def ensure_green_tables(db: Session):
     """))
     try:
         db.execute(text("ALTER TABLE tree_tasks ADD COLUMN IF NOT EXISTS priority TEXT DEFAULT 'normal'"))
+        db.execute(text("ALTER TABLE tree_tasks ADD COLUMN IF NOT EXISTS review_state TEXT NOT NULL DEFAULT 'none'"))
+        db.execute(text("ALTER TABLE tree_tasks ADD COLUMN IF NOT EXISTS submitted_at TIMESTAMP"))
+        db.execute(text("ALTER TABLE tree_tasks ADD COLUMN IF NOT EXISTS reviewed_at TIMESTAMP"))
+        db.execute(text("ALTER TABLE tree_tasks ADD COLUMN IF NOT EXISTS reviewed_by TEXT"))
+        db.execute(text("ALTER TABLE tree_tasks ADD COLUMN IF NOT EXISTS review_notes TEXT"))
+        db.execute(text("ALTER TABLE tree_tasks ADD COLUMN IF NOT EXISTS auto_generated BOOLEAN NOT NULL DEFAULT FALSE"))
+        db.execute(text("ALTER TABLE tree_tasks ADD COLUMN IF NOT EXISTS model_season TEXT"))
+        db.execute(text("ALTER TABLE tree_tasks ADD COLUMN IF NOT EXISTS source_task_id INTEGER"))
     except Exception:
         db.rollback()
     db.execute(text("""
@@ -122,13 +825,70 @@ def ensure_green_tables(db: Session):
             UNIQUE(project_id, species_key)
         )
     """))
+    db.execute(text("""
+        CREATE TABLE IF NOT EXISTS green_task_reviews (
+            id SERIAL PRIMARY KEY,
+            task_id INTEGER NOT NULL REFERENCES tree_tasks(id) ON DELETE CASCADE,
+            decision TEXT NOT NULL,
+            reviewer_name TEXT,
+            review_notes TEXT,
+            created_at TIMESTAMP DEFAULT NOW()
+        )
+    """))
+    db.execute(text("""
+        CREATE TABLE IF NOT EXISTS green_audit_events (
+            id SERIAL PRIMARY KEY,
+            project_id INTEGER REFERENCES tree_projects(id) ON DELETE CASCADE,
+            entity_type TEXT NOT NULL,
+            entity_id INTEGER,
+            action TEXT NOT NULL,
+            actor TEXT,
+            details JSONB,
+            created_at TIMESTAMP DEFAULT NOW()
+        )
+    """))
+    db.execute(text("""
+        CREATE TABLE IF NOT EXISTS green_maintenance_cycles (
+            id SERIAL PRIMARY KEY,
+            project_id INTEGER NOT NULL REFERENCES tree_projects(id) ON DELETE CASCADE,
+            tree_id INTEGER NOT NULL REFERENCES trees(id) ON DELETE CASCADE,
+            task_type TEXT NOT NULL,
+            model_season TEXT,
+            source_task_id INTEGER REFERENCES tree_tasks(id) ON DELETE SET NULL,
+            generated_task_id INTEGER REFERENCES tree_tasks(id) ON DELETE SET NULL,
+            due_date DATE NOT NULL,
+            status TEXT NOT NULL DEFAULT 'scheduled',
+            created_at TIMESTAMP DEFAULT NOW(),
+            updated_at TIMESTAMP DEFAULT NOW()
+        )
+    """))
+    db.execute(text("""
+        CREATE TABLE IF NOT EXISTS green_alerts (
+            id SERIAL PRIMARY KEY,
+            project_id INTEGER NOT NULL REFERENCES tree_projects(id) ON DELETE CASCADE,
+            tree_id INTEGER REFERENCES trees(id) ON DELETE SET NULL,
+            task_id INTEGER REFERENCES tree_tasks(id) ON DELETE SET NULL,
+            alert_type TEXT NOT NULL,
+            severity TEXT NOT NULL DEFAULT 'warning',
+            message TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'open',
+            payload JSONB,
+            created_at TIMESTAMP DEFAULT NOW(),
+            resolved_at TIMESTAMP
+        )
+    """))
     db.execute(text("CREATE INDEX IF NOT EXISTS idx_trees_project_id ON trees(project_id)"))
     db.execute(text("CREATE INDEX IF NOT EXISTS idx_trees_geom ON trees USING GIST (geom)"))
     db.execute(text("CREATE INDEX IF NOT EXISTS idx_tree_visits_tree_id ON tree_visits(tree_id)"))
     db.execute(text("CREATE INDEX IF NOT EXISTS idx_tree_tasks_tree_id ON tree_tasks(tree_id)"))
+    db.execute(text("CREATE INDEX IF NOT EXISTS idx_tree_tasks_review_state ON tree_tasks(review_state)"))
     db.execute(text("CREATE INDEX IF NOT EXISTS idx_green_users_name ON green_users(full_name)"))
     db.execute(text("CREATE INDEX IF NOT EXISTS idx_work_orders_project_id ON green_work_orders(project_id)"))
     db.execute(text("CREATE INDEX IF NOT EXISTS idx_species_maturity_project_id ON green_species_maturity(project_id)"))
+    db.execute(text("CREATE INDEX IF NOT EXISTS idx_task_reviews_task_id ON green_task_reviews(task_id)"))
+    db.execute(text("CREATE INDEX IF NOT EXISTS idx_audit_project_created ON green_audit_events(project_id, created_at DESC)"))
+    db.execute(text("CREATE INDEX IF NOT EXISTS idx_cycles_project_due ON green_maintenance_cycles(project_id, due_date)"))
+    db.execute(text("CREATE INDEX IF NOT EXISTS idx_alerts_project_status ON green_alerts(project_id, status, created_at DESC)"))
     db.commit()
 
 
@@ -334,6 +1094,16 @@ async def upload_photo_to_r2(
             raise HTTPException(status_code=404, detail="Tree not found for photo link.")
         db.commit()
     elif task_id is not None:
+        locked = db.execute(
+            text("""
+                SELECT review_state
+                FROM tree_tasks
+                WHERE id = :task_id
+            """),
+            {"task_id": task_id},
+        ).scalar()
+        if locked and _normalize_name(str(locked)) == "approved":
+            raise HTTPException(status_code=409, detail="Task already approved and locked")
         task_row = db.execute(text("""
             UPDATE tree_tasks
             SET photo_url = :photo_url
@@ -376,8 +1146,17 @@ def create_project(
         """),
         {"name": name, "location_text": location_text, "sponsor": sponsor},
     ).mappings().first()
+    project = dict(row)
+    _log_audit_event(
+        db,
+        project_id=project["id"],
+        entity_type="project",
+        entity_id=project["id"],
+        action="project_created",
+        details={"name": project.get("name"), "location_text": project.get("location_text")},
+    )
     db.commit()
-    return dict(row)
+    return project
 
 
 @router.get("/projects")
@@ -550,6 +1329,21 @@ def add_tree(
         "photo_url": photo_url or None,
         "created_by": created_by or None,
     }).scalar()
+    _log_audit_event(
+        db,
+        project_id=project_id,
+        entity_type="tree",
+        entity_id=int(row),
+        action="tree_created",
+        actor=created_by or None,
+        details={
+            "species": species or None,
+            "status": status,
+            "planting_date": planting_date,
+            "lng": lng,
+            "lat": lat,
+        },
+    )
     db.commit()
     return {"id": row}
 
@@ -566,6 +1360,13 @@ def update_tree(
 ):
     if status and status not in {"alive", "dead", "needs_attention", "pending_planting"}:
         raise HTTPException(status_code=400, detail="Invalid status")
+    existing = db.execute(
+        text("SELECT project_id, species, planting_date, status, notes, photo_url FROM trees WHERE id = :tree_id"),
+        {"tree_id": tree_id},
+    ).mappings().first()
+    if not existing:
+        raise HTTPException(status_code=404, detail="Tree not found")
+
     db.execute(text("""
         UPDATE trees
         SET species = COALESCE(:species, species),
@@ -582,6 +1383,23 @@ def update_tree(
         "photo_url": photo_url,
         "tree_id": tree_id,
     })
+    _log_audit_event(
+        db,
+        project_id=int(existing["project_id"]),
+        entity_type="tree",
+        entity_id=tree_id,
+        action="tree_updated",
+        details={
+            "before": dict(existing),
+            "after": {
+                "species": species if species is not None else existing.get("species"),
+                "planting_date": planting_date if planting_date is not None else existing.get("planting_date"),
+                "status": status if status is not None else existing.get("status"),
+                "notes": notes if notes is not None else existing.get("notes"),
+                "photo_url": photo_url if photo_url is not None else existing.get("photo_url"),
+            },
+        },
+    )
     db.commit()
     return {"status": "ok"}
 
@@ -624,12 +1442,41 @@ def add_task(
     status: str = Body(default="pending"),
     notes: str = Body(default=""),
     photo_url: str = Body(default=""),
+    model_season: str | None = Body(default=None),
 ):
     if status not in {"pending", "done", "overdue"}:
         raise HTTPException(status_code=400, detail="Invalid status")
+    tree_row = db.execute(
+        text("SELECT project_id FROM trees WHERE id = :tree_id"),
+        {"tree_id": tree_id},
+    ).mappings().first()
+    if not tree_row:
+        raise HTTPException(status_code=404, detail="Tree not found")
+
+    normalized_season = _normalize_name(model_season)
+    if normalized_season and normalized_season not in SEASON_VALUES:
+        normalized_season = "rainy"
+
+    review_state = "none"
+    submitted_at = None
+    completed_at = None
+    if _is_done_status(status):
+        evidence_ok, detail = _has_required_evidence(task_type, notes, photo_url)
+        if not evidence_ok:
+            raise HTTPException(status_code=400, detail=detail)
+        review_state = "submitted"
+        submitted_at = datetime.utcnow()
+        completed_at = datetime.utcnow()
+
     row = db.execute(text("""
-        INSERT INTO tree_tasks (tree_id, task_type, assignee_name, due_date, priority, status, notes, photo_url)
-        VALUES (:tree_id, :task_type, :assignee_name, :due_date, :priority, :status, :notes, :photo_url)
+        INSERT INTO tree_tasks (
+            tree_id, task_type, assignee_name, due_date, priority, status, notes, photo_url,
+            review_state, submitted_at, completed_at, model_season
+        )
+        VALUES (
+            :tree_id, :task_type, :assignee_name, :due_date, :priority, :status, :notes, :photo_url,
+            :review_state, :submitted_at, :completed_at, :model_season
+        )
         RETURNING id
     """), {
         "tree_id": tree_id,
@@ -640,7 +1487,37 @@ def add_task(
         "status": status,
         "notes": notes or None,
         "photo_url": photo_url or None,
+        "review_state": review_state,
+        "submitted_at": submitted_at,
+        "completed_at": completed_at,
+        "model_season": normalized_season or None,
     }).scalar()
+    _log_audit_event(
+        db,
+        project_id=int(tree_row["project_id"]),
+        entity_type="task",
+        entity_id=int(row),
+        action="task_created",
+        actor=assignee_name,
+        details={
+            "task_type": task_type,
+            "due_date": due_date,
+            "priority": priority,
+            "status": status,
+            "review_state": review_state,
+            "model_season": normalized_season or None,
+        },
+    )
+    if review_state == "submitted":
+        _record_alert(
+            db,
+            project_id=int(tree_row["project_id"]),
+            alert_type="task_submitted",
+            severity="warning",
+            message=f"Task #{int(row)} is awaiting supervisor review.",
+            tree_id=tree_id,
+            task_id=int(row),
+        )
     db.commit()
     return {"id": row}
 
@@ -649,7 +1526,8 @@ def add_task(
 def list_tree_tasks(tree_id: int, db: Session = Depends(get_db)):
     rows = db.execute(text("""
         SELECT id, tree_id, task_type, assignee_name, due_date, priority,
-               status, notes, photo_url, created_at, completed_at
+               status, notes, photo_url, created_at, completed_at, review_state,
+               submitted_at, reviewed_at, reviewed_by, review_notes, auto_generated, model_season, source_task_id
         FROM tree_tasks
         WHERE tree_id = :tree_id
         ORDER BY created_at DESC
@@ -665,7 +1543,8 @@ def list_tasks(
 ):
     rows = db.execute(text("""
         SELECT t.id, t.tree_id, t.task_type, t.assignee_name, t.due_date, t.priority,
-               t.status, t.notes, t.photo_url, t.created_at, t.completed_at,
+               t.status, t.notes, t.photo_url, t.created_at, t.completed_at, t.review_state,
+               t.submitted_at, t.reviewed_at, t.reviewed_by, t.review_notes, t.auto_generated, t.model_season, t.source_task_id,
                tr.status AS tree_status, ST_X(tr.geom) AS lng, ST_Y(tr.geom) AS lat
         FROM tree_tasks t
         JOIN trees tr ON tr.id = t.tree_id
@@ -708,27 +1587,71 @@ def update_task(
     status: str | None = Body(default=None),
     notes: str | None = Body(default=None),
     photo_url: str | None = Body(default=None),
+    actor_name: str | None = Body(default=None),
 ):
-    if status and status not in {"pending", "done", "overdue"}:
+    if status and status not in TASK_STATUS_VALUES:
         raise HTTPException(status_code=400, detail="Invalid status")
     existing = db.execute(text("""
-        SELECT id, status
-        FROM tree_tasks
-        WHERE id = :task_id
+        SELECT t.id, t.tree_id, t.task_type, t.status, t.review_state, t.notes, t.photo_url,
+               t.completed_at,
+               t.submitted_at, t.reviewed_at, t.reviewed_by, t.review_notes,
+               tr.project_id
+        FROM tree_tasks t
+        JOIN trees tr ON tr.id = t.tree_id
+        WHERE t.id = :task_id
     """), {"task_id": task_id}).mappings().first()
     if not existing:
         raise HTTPException(status_code=404, detail="Task not found")
-    if existing["status"] == "done":
-        raise HTTPException(status_code=409, detail="Task already done and locked")
+    if _normalize_name(existing.get("review_state")) == "approved":
+        raise HTTPException(status_code=409, detail="Task already approved and locked")
+
+    next_status = status or existing.get("status")
+    next_notes = notes if notes is not None else existing.get("notes")
+    next_photo = photo_url if photo_url is not None else existing.get("photo_url")
+    next_review_state = existing.get("review_state") or "none"
+    next_submitted_at = existing.get("submitted_at")
+    next_completed_at = existing.get("completed_at")
+
+    clear_review_fields = False
+    if _is_done_status(next_status):
+        evidence_ok, detail = _has_required_evidence(existing.get("task_type"), next_notes, next_photo)
+        if not evidence_ok:
+            raise HTTPException(status_code=400, detail=detail)
+        next_review_state = "submitted"
+        next_submitted_at = datetime.utcnow()
+        next_completed_at = datetime.utcnow()
+        clear_review_fields = True
+    elif status is not None:
+        # Task moved out of done-state; keep it editable.
+        next_completed_at = None
+        if _normalize_name(next_review_state) in {"submitted", "rejected", "reopened"}:
+            next_review_state = "none"
+        next_submitted_at = None
+        clear_review_fields = True
+
     row = db.execute(text("""
         UPDATE tree_tasks
         SET status = COALESCE(:status, status),
             notes = COALESCE(:notes, notes),
             photo_url = COALESCE(:photo_url, photo_url),
-            completed_at = CASE WHEN :status = 'done' THEN NOW() ELSE completed_at END
+            review_state = :review_state,
+            submitted_at = :submitted_at,
+            reviewed_at = CASE WHEN :clear_review_fields THEN NULL ELSE reviewed_at END,
+            reviewed_by = CASE WHEN :clear_review_fields THEN NULL ELSE reviewed_by END,
+            review_notes = CASE WHEN :clear_review_fields THEN NULL ELSE review_notes END,
+            completed_at = :completed_at
         WHERE id = :task_id
-        RETURNING tree_id, photo_url
-    """), {"status": status, "notes": notes, "photo_url": photo_url, "task_id": task_id}).mappings().first()
+        RETURNING tree_id, photo_url, status, review_state
+    """), {
+        "status": status,
+        "notes": notes,
+        "photo_url": photo_url,
+        "review_state": next_review_state,
+        "submitted_at": next_submitted_at,
+        "clear_review_fields": clear_review_fields,
+        "completed_at": next_completed_at,
+        "task_id": task_id,
+    }).mappings().first()
     resolved_photo = row.get("photo_url")
     if resolved_photo:
         db.execute(text("""
@@ -736,8 +1659,524 @@ def update_task(
             SET photo_url = :photo_url
             WHERE id = :tree_id
         """), {"photo_url": resolved_photo, "tree_id": row["tree_id"]})
+
+    project_id = int(existing["project_id"])
+    _log_audit_event(
+        db,
+        project_id=project_id,
+        entity_type="task",
+        entity_id=task_id,
+        action="task_updated",
+        actor=actor_name,
+        details={
+            "before": {
+                "status": existing.get("status"),
+                "review_state": existing.get("review_state"),
+                "notes": existing.get("notes"),
+                "photo_url": existing.get("photo_url"),
+            },
+            "after": {
+                "status": row.get("status"),
+                "review_state": row.get("review_state"),
+                "notes": next_notes,
+                "photo_url": next_photo,
+            },
+        },
+    )
+    if _normalize_name(row.get("review_state")) == "submitted":
+        _record_alert(
+            db,
+            project_id=project_id,
+            alert_type="task_submitted",
+            severity="warning",
+            message=f"Task #{task_id} is awaiting supervisor review.",
+            tree_id=int(row["tree_id"]),
+            task_id=task_id,
+        )
+    else:
+        _resolve_task_alerts(db, task_id)
+    _refresh_project_alerts(db, project_id)
     db.commit()
     return {"status": "ok"}
+
+
+@router.get("/tasks/review-queue")
+def task_review_queue(
+    project_id: int,
+    assignee_name: str | None = None,
+    db: Session = Depends(get_db),
+):
+    rows = db.execute(
+        text("""
+            SELECT t.id, t.tree_id, t.task_type, t.assignee_name, t.status, t.review_state,
+                   t.priority, t.due_date, t.notes, t.photo_url, t.submitted_at, t.created_at,
+                   tr.project_id, tr.status AS tree_status
+            FROM tree_tasks t
+            JOIN trees tr ON tr.id = t.tree_id
+            WHERE tr.project_id = :project_id
+              AND LOWER(t.review_state) = 'submitted'
+              AND (:assignee_name IS NULL OR t.assignee_name = :assignee_name)
+            ORDER BY COALESCE(t.submitted_at, t.created_at) DESC, t.id DESC
+        """),
+        {"project_id": project_id, "assignee_name": assignee_name},
+    ).mappings().all()
+    return [dict(row) for row in rows]
+
+
+@router.post("/tasks/{task_id}/submit")
+def submit_task_for_review(
+    task_id: int,
+    db: Session = Depends(get_db),
+    notes: str | None = Body(default=None),
+    photo_url: str | None = Body(default=None),
+    actor_name: str | None = Body(default=None),
+):
+    task = db.execute(
+        text("""
+            SELECT t.id, t.tree_id, t.task_type, t.status, t.review_state, t.notes, t.photo_url,
+                   tr.project_id
+            FROM tree_tasks t
+            JOIN trees tr ON tr.id = t.tree_id
+            WHERE t.id = :task_id
+        """),
+        {"task_id": task_id},
+    ).mappings().first()
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    if _normalize_name(task.get("review_state")) == "approved":
+        raise HTTPException(status_code=409, detail="Task already approved and locked")
+
+    merged_notes = notes if notes is not None else task.get("notes")
+    merged_photo = photo_url if photo_url is not None else task.get("photo_url")
+    evidence_ok, detail = _has_required_evidence(task.get("task_type"), merged_notes, merged_photo)
+    if not evidence_ok:
+        raise HTTPException(status_code=400, detail=detail)
+
+    row = db.execute(
+        text("""
+            UPDATE tree_tasks
+            SET status = 'done',
+                notes = COALESCE(:notes, notes),
+                photo_url = COALESCE(:photo_url, photo_url),
+                review_state = 'submitted',
+                submitted_at = NOW(),
+                reviewed_at = NULL,
+                reviewed_by = NULL,
+                review_notes = NULL,
+                completed_at = COALESCE(completed_at, NOW())
+            WHERE id = :task_id
+            RETURNING id, tree_id, status, review_state
+        """),
+        {"task_id": task_id, "notes": notes, "photo_url": photo_url},
+    ).mappings().first()
+
+    project_id = int(task["project_id"])
+    db.execute(
+        text("""
+            INSERT INTO green_task_reviews (task_id, decision, reviewer_name, review_notes)
+            VALUES (:task_id, 'submitted', :reviewer_name, :review_notes)
+        """),
+        {"task_id": task_id, "reviewer_name": actor_name, "review_notes": merged_notes},
+    )
+    _log_audit_event(
+        db,
+        project_id=project_id,
+        entity_type="task",
+        entity_id=task_id,
+        action="task_submitted_for_review",
+        actor=actor_name,
+        details={"status": row.get("status"), "review_state": row.get("review_state")},
+    )
+    _record_alert(
+        db,
+        project_id=project_id,
+        alert_type="task_submitted",
+        severity="warning",
+        message=f"Task #{task_id} is awaiting supervisor review.",
+        tree_id=int(row["tree_id"]),
+        task_id=task_id,
+    )
+    _refresh_project_alerts(db, project_id)
+    db.commit()
+    return {"status": "submitted", "task_id": task_id}
+
+
+@router.post("/tasks/{task_id}/review")
+def review_submitted_task(
+    task_id: int,
+    db: Session = Depends(get_db),
+    decision: str = Body(...),
+    reviewer_name: str = Body(default=""),
+    review_notes: str = Body(default=""),
+    season_mode: str | None = Body(default=None),
+):
+    decision_key = _normalize_name(decision)
+    if decision_key not in {"approve", "reject"}:
+        raise HTTPException(status_code=400, detail="Decision must be approve or reject")
+
+    task = db.execute(
+        text("""
+            SELECT t.id, t.tree_id, t.task_type, t.assignee_name, t.status, t.review_state, t.model_season,
+                   tr.project_id
+            FROM tree_tasks t
+            JOIN trees tr ON tr.id = t.tree_id
+            WHERE t.id = :task_id
+        """),
+        {"task_id": task_id},
+    ).mappings().first()
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    if _normalize_name(task.get("review_state")) != "submitted":
+        raise HTTPException(status_code=409, detail="Task is not in submitted state")
+
+    project_id = int(task["project_id"])
+    auto_generated_task_id = None
+    if decision_key == "approve":
+        db.execute(
+            text("""
+                UPDATE tree_tasks
+                SET review_state = 'approved',
+                    reviewed_at = NOW(),
+                    reviewed_by = :reviewer_name,
+                    review_notes = :review_notes,
+                    completed_at = COALESCE(completed_at, NOW())
+                WHERE id = :task_id
+            """),
+            {
+                "task_id": task_id,
+                "reviewer_name": reviewer_name or None,
+                "review_notes": review_notes or None,
+            },
+        )
+        auto_generated_task_id = _auto_schedule_next_cycle(db, task_id, season_hint=season_mode or task.get("model_season"))
+        _resolve_task_alerts(db, task_id)
+        action_name = "task_review_approved"
+    else:
+        db.execute(
+            text("""
+                UPDATE tree_tasks
+                SET status = 'pending',
+                    review_state = 'rejected',
+                    submitted_at = NULL,
+                    completed_at = NULL,
+                    reviewed_at = NOW(),
+                    reviewed_by = :reviewer_name,
+                    review_notes = :review_notes
+                WHERE id = :task_id
+            """),
+            {
+                "task_id": task_id,
+                "reviewer_name": reviewer_name or None,
+                "review_notes": review_notes or None,
+            },
+        )
+        action_name = "task_review_rejected"
+
+    db.execute(
+        text("""
+            INSERT INTO green_task_reviews (task_id, decision, reviewer_name, review_notes)
+            VALUES (:task_id, :decision, :reviewer_name, :review_notes)
+        """),
+        {
+            "task_id": task_id,
+            "decision": "approved" if decision_key == "approve" else "rejected",
+            "reviewer_name": reviewer_name or None,
+            "review_notes": review_notes or None,
+        },
+    )
+    _log_audit_event(
+        db,
+        project_id=project_id,
+        entity_type="task",
+        entity_id=task_id,
+        action=action_name,
+        actor=reviewer_name or None,
+        details={
+            "decision": decision_key,
+            "auto_generated_task_id": auto_generated_task_id,
+            "review_notes": review_notes or None,
+        },
+    )
+    _refresh_project_alerts(db, project_id)
+    db.commit()
+    return {
+        "status": "ok",
+        "decision": "approved" if decision_key == "approve" else "rejected",
+        "auto_generated_task_id": auto_generated_task_id,
+    }
+
+
+@router.post("/tasks/{task_id}/reopen")
+def reopen_approved_task(
+    task_id: int,
+    db: Session = Depends(get_db),
+    reviewer_name: str = Body(default=""),
+    reason: str = Body(default=""),
+):
+    task = db.execute(
+        text("""
+            SELECT t.id, t.tree_id, t.review_state, tr.project_id
+            FROM tree_tasks t
+            JOIN trees tr ON tr.id = t.tree_id
+            WHERE t.id = :task_id
+        """),
+        {"task_id": task_id},
+    ).mappings().first()
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    if _normalize_name(task.get("review_state")) != "approved":
+        raise HTTPException(status_code=409, detail="Only approved tasks can be reopened")
+
+    db.execute(
+        text("""
+            UPDATE tree_tasks
+            SET status = 'pending',
+                review_state = 'reopened',
+                submitted_at = NULL,
+                completed_at = NULL,
+                reviewed_at = NOW(),
+                reviewed_by = :reviewer_name,
+                review_notes = :review_notes
+            WHERE id = :task_id
+        """),
+        {"task_id": task_id, "reviewer_name": reviewer_name or None, "review_notes": reason or None},
+    )
+    db.execute(
+        text("""
+            INSERT INTO green_task_reviews (task_id, decision, reviewer_name, review_notes)
+            VALUES (:task_id, 'reopened', :reviewer_name, :review_notes)
+        """),
+        {"task_id": task_id, "reviewer_name": reviewer_name or None, "review_notes": reason or None},
+    )
+    project_id = int(task["project_id"])
+    _log_audit_event(
+        db,
+        project_id=project_id,
+        entity_type="task",
+        entity_id=task_id,
+        action="task_reopened",
+        actor=reviewer_name or None,
+        details={"reason": reason or None},
+    )
+    _refresh_project_alerts(db, project_id)
+    db.commit()
+    return {"status": "ok"}
+
+
+@router.get("/projects/{project_id}/alerts")
+def project_alerts(
+    project_id: int,
+    refresh: bool = Query(default=True),
+    status: str = Query(default="open"),
+    db: Session = Depends(get_db),
+):
+    if refresh:
+        _refresh_project_alerts(db, project_id)
+        db.commit()
+    rows = db.execute(
+        text("""
+            SELECT id, project_id, tree_id, task_id, alert_type, severity, message, status,
+                   payload, created_at, resolved_at
+            FROM green_alerts
+            WHERE project_id = :project_id
+              AND (:status = 'all' OR status = :status)
+            ORDER BY created_at DESC, id DESC
+            LIMIT 300
+        """),
+        {"project_id": project_id, "status": status},
+    ).mappings().all()
+    items = [dict(row) for row in rows]
+    summary = {
+        "total": len(items),
+        "danger": sum(1 for item in items if _normalize_name(item.get("severity")) == "danger"),
+        "warning": sum(1 for item in items if _normalize_name(item.get("severity")) == "warning"),
+        "info": sum(1 for item in items if _normalize_name(item.get("severity")) == "info"),
+    }
+    return {"project_id": project_id, "status_filter": status, "summary": summary, "items": items}
+
+
+@router.get("/projects/{project_id}/audit-events")
+def project_audit_events(
+    project_id: int,
+    limit: int = Query(default=200, ge=1, le=1000),
+    db: Session = Depends(get_db),
+):
+    rows = db.execute(
+        text("""
+            SELECT id, project_id, entity_type, entity_id, action, actor, details, created_at
+            FROM green_audit_events
+            WHERE project_id = :project_id
+            ORDER BY created_at DESC, id DESC
+            LIMIT :limit
+        """),
+        {"project_id": project_id, "limit": limit},
+    ).mappings().all()
+    return [dict(row) for row in rows]
+
+
+@router.get("/projects/{project_id}/live-maintenance")
+def live_maintenance_rows(
+    project_id: int,
+    season_mode: str = Query(default="rainy"),
+    assignee_name: str | None = Query(default=None),
+    db: Session = Depends(get_db),
+):
+    payload = _compute_live_maintenance_rows(
+        db=db,
+        project_id=project_id,
+        season_mode=season_mode,
+        assignee_name=assignee_name,
+    )
+    return {
+        "project_id": project_id,
+        "season_mode": "dry" if _normalize_name(season_mode) == "dry" else "rainy",
+        "computed_at": datetime.utcnow().isoformat(),
+        "summary": payload["summary"],
+        "rows": payload["rows"],
+        "sources": LIVE_SOURCE_REFERENCES,
+    }
+
+
+def _build_donor_report_rows(project_id: int, db: Session) -> list[dict]:
+    rows = db.execute(
+        text("""
+            SELECT t.id AS task_id, t.tree_id, tr.species, t.assignee_name, t.task_type, t.priority,
+                   t.status, t.review_state, t.due_date, t.created_at, t.submitted_at, t.reviewed_at,
+                   t.reviewed_by, t.review_notes, t.completed_at, t.notes, t.photo_url
+            FROM tree_tasks t
+            JOIN trees tr ON tr.id = t.tree_id
+            WHERE tr.project_id = :project_id
+            ORDER BY COALESCE(t.reviewed_at, t.submitted_at, t.created_at) DESC, t.id DESC
+        """),
+        {"project_id": project_id},
+    ).mappings().all()
+    report_rows: list[dict] = []
+    today = date.today()
+    for row in rows:
+        due_date = _parse_date_value(row.get("due_date"))
+        completed_date = _parse_date_value(row.get("completed_at"))
+        if due_date and completed_date:
+            delay_days = _day_diff(completed_date, due_date)
+        elif due_date and not completed_date:
+            delay_days = _day_diff(today, due_date)
+        else:
+            delay_days = None
+        evidence_ok, _ = _has_required_evidence(row.get("task_type"), row.get("notes"), row.get("photo_url"))
+        item = dict(row)
+        item["evidence_status"] = "complete" if evidence_ok else "missing"
+        item["delay_days"] = delay_days
+        report_rows.append(item)
+    return report_rows
+
+
+@router.get("/projects/{project_id}/donor-report/csv")
+def export_donor_report_csv(project_id: int, db: Session = Depends(get_db)):
+    rows = _build_donor_report_rows(project_id, db)
+    os.makedirs(REPORTS_DIR, exist_ok=True)
+    tmp_csv = tempfile.NamedTemporaryFile(suffix="_donor_report.csv", delete=False)
+    csv_path = tmp_csv.name
+    tmp_csv.close()
+
+    with open(csv_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            "task_id",
+            "tree_id",
+            "species",
+            "assignee_name",
+            "task_type",
+            "priority",
+            "status",
+            "review_state",
+            "due_date",
+            "completed_at",
+            "submitted_at",
+            "reviewed_at",
+            "reviewed_by",
+            "review_notes",
+            "delay_days",
+            "evidence_status",
+            "photo_url",
+            "notes",
+        ])
+        for row in rows:
+            writer.writerow([
+                row.get("task_id"),
+                row.get("tree_id"),
+                row.get("species"),
+                row.get("assignee_name"),
+                row.get("task_type"),
+                row.get("priority"),
+                row.get("status"),
+                row.get("review_state"),
+                row.get("due_date"),
+                row.get("completed_at"),
+                row.get("submitted_at"),
+                row.get("reviewed_at"),
+                row.get("reviewed_by"),
+                row.get("review_notes"),
+                row.get("delay_days"),
+                row.get("evidence_status"),
+                row.get("photo_url"),
+                row.get("notes"),
+            ])
+
+    filename = f"project_{project_id}_donor_report.csv"
+    return FileResponse(csv_path, media_type="text/csv", filename=filename)
+
+
+@router.get("/projects/{project_id}/donor-report/pdf")
+def export_donor_report_pdf(project_id: int, db: Session = Depends(get_db)):
+    from reportlab.lib.pagesizes import A4
+    from reportlab.pdfgen import canvas
+
+    rows = _build_donor_report_rows(project_id, db)
+    project = get_project(project_id, db)
+    os.makedirs(REPORTS_DIR, exist_ok=True)
+    tmp_pdf = tempfile.NamedTemporaryFile(suffix="_donor_report.pdf", delete=False)
+    pdf_path = tmp_pdf.name
+    tmp_pdf.close()
+
+    c = canvas.Canvas(pdf_path, pagesize=A4)
+    width, height = A4
+    y = height - 40
+    c.setFont("Helvetica-Bold", 13)
+    c.drawString(36, y, f"LandCheck Donor Report - {project.get('name', f'Project {project_id}')}")
+    y -= 18
+    c.setFont("Helvetica", 9)
+    c.drawString(36, y, f"Generated: {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}")
+    y -= 22
+
+    headers = "Task  Tree  Assignee  Type  Status/Review  Due  Done  Delay  Evidence"
+    c.setFont("Helvetica-Bold", 8)
+    c.drawString(36, y, headers)
+    y -= 12
+    c.setFont("Helvetica", 8)
+    for row in rows:
+        line = (
+            f"#{row.get('task_id')}  "
+            f"#{row.get('tree_id')}  "
+            f"{str(row.get('assignee_name') or '-')[:18]}  "
+            f"{str(row.get('task_type') or '-')[:12]}  "
+            f"{str(row.get('status') or '-')}/{str(row.get('review_state') or '-')[:8]}  "
+            f"{str(row.get('due_date') or '-')[:10]}  "
+            f"{str(row.get('completed_at') or '-')[:10]}  "
+            f"{str(row.get('delay_days') if row.get('delay_days') is not None else '-')}  "
+            f"{row.get('evidence_status')}"
+        )
+        c.drawString(36, y, line)
+        y -= 11
+        if y < 45:
+            c.showPage()
+            y = height - 40
+            c.setFont("Helvetica-Bold", 8)
+            c.drawString(36, y, headers)
+            y -= 12
+            c.setFont("Helvetica", 8)
+
+    c.save()
+    filename = f"project_{project_id}_donor_report.pdf"
+    return FileResponse(pdf_path, media_type="application/pdf", filename=filename)
 
 
 @router.get("/trees/{tree_id}/timeline")
@@ -766,9 +2205,28 @@ def task_stats(project_id: int, db: Session = Depends(get_db)):
     rows = db.execute(text("""
         SELECT
             COUNT(*) AS total,
-            SUM(CASE WHEN status = 'done' THEN 1 ELSE 0 END) AS done,
-            SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END) AS pending,
-            SUM(CASE WHEN status = 'overdue' THEN 1 ELSE 0 END) AS overdue
+            SUM(
+                CASE
+                    WHEN LOWER(COALESCE(status, '')) IN ('done', 'completed', 'closed')
+                         AND LOWER(COALESCE(review_state, 'none')) IN ('approved', 'none')
+                    THEN 1 ELSE 0
+                END
+            ) AS done,
+            SUM(
+                CASE
+                    WHEN NOT (
+                        LOWER(COALESCE(status, '')) IN ('done', 'completed', 'closed')
+                        AND LOWER(COALESCE(review_state, 'none')) IN ('approved', 'none')
+                    ) AND LOWER(COALESCE(status, 'pending')) <> 'overdue'
+                    THEN 1 ELSE 0
+                END
+            ) AS pending,
+            SUM(
+                CASE
+                    WHEN LOWER(COALESCE(status, 'pending')) = 'overdue'
+                    THEN 1 ELSE 0
+                END
+            ) AS overdue
         FROM tree_tasks
         WHERE tree_id IN (SELECT id FROM trees WHERE project_id = :project_id)
     """), {"project_id": project_id}).mappings().first()
@@ -801,6 +2259,20 @@ def create_work_order(
         "maintenance_schedule": maintenance_schedule or None,
         "due_date": due_date,
     }).scalar()
+    _log_audit_event(
+        db,
+        project_id=project_id,
+        entity_type="work_order",
+        entity_id=int(row),
+        action="work_order_created",
+        actor=assignee_name,
+        details={
+            "work_type": work_type,
+            "target_trees": target_trees,
+            "maintenance_schedule": maintenance_schedule or None,
+            "due_date": due_date,
+        },
+    )
     db.commit()
     return {"id": row}
 
@@ -843,7 +2315,7 @@ def update_work_order(
 ):
     # Auto-calc planted_count from trees created by assignee for planting orders.
     row = db.execute(text("""
-        SELECT id, project_id, assignee_name, work_type
+        SELECT id, project_id, assignee_name, work_type, status
         FROM green_work_orders
         WHERE id = :work_id
     """), {"work_id": work_id}).mappings().first()
@@ -855,6 +2327,7 @@ def update_work_order(
             WHERE project_id = :project_id AND created_by = :assignee_name
         """), {"project_id": row["project_id"], "assignee_name": row["assignee_name"]}).scalar()
 
+    existing_status = row.get("status") if row else None
     db.execute(text("""
         UPDATE green_work_orders
         SET status = COALESCE(:status, status),
@@ -866,6 +2339,21 @@ def update_work_order(
         "planted_count": planted_value,
         "work_id": work_id,
     })
+    if row:
+        _log_audit_event(
+            db,
+            project_id=int(row["project_id"]),
+            entity_type="work_order",
+            entity_id=work_id,
+            action="work_order_updated",
+            actor=row.get("assignee_name"),
+            details={
+                "status": status,
+                "planted_count": planted_value,
+                "work_type": row.get("work_type"),
+                "existing_status": existing_status,
+            },
+        )
     db.commit()
     return {"status": "ok"}
 
@@ -897,8 +2385,22 @@ def work_stats(project_id: int, db: Session = Depends(get_db)):
     maintenance_by_assignee = db.execute(text("""
         SELECT t.assignee_name,
                COUNT(*) AS maintenance_total,
-               SUM(CASE WHEN t.status = 'done' THEN 1 ELSE 0 END) AS maintenance_done,
-               SUM(CASE WHEN t.status = 'pending' THEN 1 ELSE 0 END) AS maintenance_pending,
+               SUM(
+                   CASE
+                       WHEN LOWER(COALESCE(t.status, '')) IN ('done', 'completed', 'closed')
+                            AND LOWER(COALESCE(t.review_state, 'none')) IN ('approved', 'none')
+                       THEN 1 ELSE 0
+                   END
+               ) AS maintenance_done,
+               SUM(
+                   CASE
+                       WHEN NOT (
+                           LOWER(COALESCE(t.status, '')) IN ('done', 'completed', 'closed')
+                           AND LOWER(COALESCE(t.review_state, 'none')) IN ('approved', 'none')
+                       ) AND LOWER(COALESCE(t.status, 'pending')) <> 'overdue'
+                       THEN 1 ELSE 0
+                   END
+               ) AS maintenance_pending,
                SUM(CASE WHEN t.status = 'overdue' THEN 1 ELSE 0 END) AS maintenance_overdue,
                COALESCE(STRING_AGG(DISTINCT t.task_type, ', ' ORDER BY t.task_type), '') AS maintenance_types,
                MAX(COALESCE(t.completed_at::date, t.due_date, t.created_at::date)) AS last_maintenance_date
@@ -969,6 +2471,8 @@ def export_work_stats_pdf(project_id: int, db: Session = Depends(get_db)):
 def export_tasks_csv(project_id: int, db: Session = Depends(get_db)):
     rows = db.execute(text("""
         SELECT t.id, t.task_type, t.assignee_name, t.due_date, t.priority, t.status,
+               t.review_state, t.submitted_at, t.reviewed_at, t.reviewed_by, t.review_notes,
+               t.model_season, t.source_task_id, t.auto_generated,
                t.notes, t.photo_url, t.created_at, t.completed_at
         FROM tree_tasks t
         JOIN trees tr ON tr.id = t.tree_id
@@ -985,11 +2489,15 @@ def export_tasks_csv(project_id: int, db: Session = Depends(get_db)):
         writer = csv.writer(f)
         writer.writerow([
             "task_id", "task_type", "assignee_name", "due_date", "priority", "status",
+            "review_state", "submitted_at", "reviewed_at", "reviewed_by", "review_notes",
+            "model_season", "source_task_id", "auto_generated",
             "notes", "photo_url", "created_at", "completed_at"
         ])
         for r in rows:
             writer.writerow([
                 r["id"], r["task_type"], r["assignee_name"], r["due_date"], r["priority"], r["status"],
+                r["review_state"], r["submitted_at"], r["reviewed_at"], r["reviewed_by"], r["review_notes"],
+                r["model_season"], r["source_task_id"], r["auto_generated"],
                 r["notes"], r["photo_url"], r["created_at"], r["completed_at"],
             ])
 
@@ -1046,8 +2554,22 @@ def _maintenance_summary_by_tree(project_id: int, db: Session, assignee_name: st
     rows = db.execute(text("""
         SELECT tr.id AS tree_id,
                COUNT(t.id) AS maintenance_count,
-               SUM(CASE WHEN t.status = 'done' THEN 1 ELSE 0 END) AS maintenance_done,
-               SUM(CASE WHEN t.status = 'pending' THEN 1 ELSE 0 END) AS maintenance_pending,
+               SUM(
+                   CASE
+                       WHEN LOWER(COALESCE(t.status, '')) IN ('done', 'completed', 'closed')
+                            AND LOWER(COALESCE(t.review_state, 'none')) IN ('approved', 'none')
+                       THEN 1 ELSE 0
+                   END
+               ) AS maintenance_done,
+               SUM(
+                   CASE
+                       WHEN NOT (
+                           LOWER(COALESCE(t.status, '')) IN ('done', 'completed', 'closed')
+                           AND LOWER(COALESCE(t.review_state, 'none')) IN ('approved', 'none')
+                       ) AND LOWER(COALESCE(t.status, 'pending')) <> 'overdue'
+                       THEN 1 ELSE 0
+                   END
+               ) AS maintenance_pending,
                SUM(CASE WHEN t.status = 'overdue' THEN 1 ELSE 0 END) AS maintenance_overdue,
                COALESCE(STRING_AGG(DISTINCT t.task_type, ', ' ORDER BY t.task_type), '') AS maintenance_types,
                MAX(COALESCE(t.completed_at::date, t.due_date, t.created_at::date)) AS last_maintenance_date,
