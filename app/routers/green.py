@@ -6017,6 +6017,7 @@ def export_project_pdf(
 
     # KPI trend for survival chart
     kpi_trend = _fetch_kpi_trend(project_id, db, days=90)
+    species_daily_survival = _build_species_daily_survival_series(project_id, db)
 
     try:
         render_green_report_pdf(
@@ -6031,6 +6032,7 @@ def export_project_pdf(
             kpi_snapshot=kpi_snapshot,
             carbon_data=carbon_data,
             kpi_trend=kpi_trend,
+            species_daily_survival=species_daily_survival,
         )
     except Exception:
         render_green_report_pdf(
@@ -6045,6 +6047,7 @@ def export_project_pdf(
             kpi_snapshot=kpi_snapshot,
             carbon_data=carbon_data,
             kpi_trend=kpi_trend,
+            species_daily_survival=species_daily_survival,
         )
     filename = f"project_{project_id}_report.pdf"
     return FileResponse(pdf_path, media_type="application/pdf", filename=filename)
@@ -6176,6 +6179,7 @@ def export_work_report_pdf(
 
     # KPI trend for survival chart
     kpi_trend = _fetch_kpi_trend(project_id, db, days=90)
+    species_daily_survival = _build_species_daily_survival_series(project_id, db)
 
     try:
         render_green_report_pdf(
@@ -6190,6 +6194,7 @@ def export_work_report_pdf(
             kpi_snapshot=kpi_snapshot,
             carbon_data=carbon_data,
             kpi_trend=kpi_trend,
+            species_daily_survival=species_daily_survival,
         )
     except Exception:
         render_green_report_pdf(
@@ -6204,6 +6209,7 @@ def export_work_report_pdf(
             kpi_snapshot=kpi_snapshot,
             carbon_data=carbon_data,
             kpi_trend=kpi_trend,
+            species_daily_survival=species_daily_survival,
         )
     filename = (
         f"project_{project_id}_work_report_{assignee_name}.pdf"

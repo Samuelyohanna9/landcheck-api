@@ -124,6 +124,142 @@ def _draw_mini_line_chart(c, x, y, w, h, points, title="", y_label="", line_colo
         c.drawString(x, y + h - 6, y_label)
 
 
+def _draw_species_daily_line_chart(c, x, y, w, h, species_daily, title=""):
+    """Draw multi-species daily survival lines on a shared day axis."""
+    rows = species_daily.get("species", []) if isinstance(species_daily, dict) else []
+    if not isinstance(rows, list) or len(rows) == 0:
+        c.setFont("Helvetica", 7)
+        c.setFillColorRGB(0.45, 0.45, 0.45)
+        c.drawString(x, y + h * 0.5, "No species daily survival timeline yet.")
+        return
+
+    selected_rows = sorted(
+        rows,
+        key=lambda row: int(row.get("trees_with_planting_date", 0) or 0),
+        reverse=True,
+    )[:8]
+
+    c.setFont("Helvetica-Bold", 9)
+    c.setFillColorRGB(0.15, 0.15, 0.15)
+    c.drawString(x, y + h + 4, title)
+
+    cx = x + 28
+    cy = y + 14
+    cw = w - 36
+    ch = h - 24
+    if cw <= 20 or ch <= 20:
+        return
+
+    c.setStrokeColorRGB(0.85, 0.85, 0.85)
+    c.setLineWidth(0.5)
+    c.rect(cx, cy, cw, ch, stroke=1, fill=0)
+
+    # Horizontal grid and y labels.
+    for tick in (0, 20, 40, 60, 80, 100):
+        py = cy + (tick / 100.0) * ch
+        c.setStrokeColorRGB(0.92, 0.92, 0.92)
+        c.setLineWidth(0.3)
+        c.line(cx, py, cx + cw, py)
+        c.setFont("Helvetica", 5.8)
+        c.setFillColorRGB(0.5, 0.5, 0.5)
+        c.drawRightString(cx - 3, py - 2, str(tick))
+
+    processed = []
+    max_day = 0
+    for row in selected_rows:
+        point_map = {}
+        for point in row.get("points", []) or []:
+            try:
+                day = int(point.get("day_since_species_start", point.get("day", 0)) or 0)
+                rate = float(point.get("survival_rate", point.get("value", 0)) or 0)
+            except Exception:
+                continue
+            if day < 0:
+                continue
+            rate = min(max(rate, 0.0), 100.0)
+            point_map[day] = rate
+        if not point_map:
+            continue
+        line_points = sorted(point_map.items(), key=lambda item: item[0])
+        if len(line_points) > 120:
+            step = max(int(len(line_points) / 120), 1)
+            sampled = [line_points[i] for i in range(0, len(line_points), step)]
+            if sampled[-1][0] != line_points[-1][0]:
+                sampled.append(line_points[-1])
+            line_points = sampled
+        max_day = max(max_day, int(line_points[-1][0]))
+        processed.append((row, line_points))
+
+    if not processed:
+        c.setFont("Helvetica", 7)
+        c.setFillColorRGB(0.45, 0.45, 0.45)
+        c.drawString(x, y + h * 0.5, "No valid species points to render.")
+        return
+
+    day_domain = max(max_day, 30)
+    x_ticks = sorted(
+        set(([0, 7, 14, 21, 30] if day_domain <= 30 else [0, 30, 60, 90, 120, 150, 180]) + [max_day, day_domain])
+    )
+    x_ticks = [tick for tick in x_ticks if 0 <= tick <= day_domain]
+
+    for tick in x_ticks:
+        px = cx + (tick / max(day_domain, 1)) * cw
+        c.setStrokeColorRGB(0.90, 0.93, 0.91)
+        c.setLineWidth(0.25)
+        c.line(px, cy, px, cy + ch)
+        c.setFont("Helvetica", 5.6)
+        c.setFillColorRGB(0.46, 0.46, 0.46)
+        c.drawCentredString(px, y + 2, f"d{tick}")
+
+    colors = [
+        "#16a34a", "#0ea5e9", "#f97316", "#8b5cf6",
+        "#dc2626", "#0891b2", "#7c3aed", "#15803d",
+    ]
+    legend_items = []
+    for idx, (row, points) in enumerate(processed):
+        color = colors[idx % len(colors)]
+        c.setStrokeColor(HexColor(color))
+        c.setLineWidth(1.2)
+        path = c.beginPath()
+        first_px = cx + (points[0][0] / max(day_domain, 1)) * cw
+        first_py = cy + (points[0][1] / 100.0) * ch
+        path.moveTo(first_px, first_py)
+        for day, rate in points[1:]:
+            px = cx + (day / max(day_domain, 1)) * cw
+            py = cy + (rate / 100.0) * ch
+            path.lineTo(px, py)
+        c.drawPath(path, stroke=1, fill=0)
+
+        c.setFillColor(HexColor(color))
+        c.circle(first_px, first_py, 1.5, stroke=0, fill=1)
+        last_px = cx + (points[-1][0] / max(day_domain, 1)) * cw
+        last_py = cy + (points[-1][1] / 100.0) * ch
+        c.circle(last_px, last_py, 1.6, stroke=0, fill=1)
+
+        label = str(row.get("species_label") or row.get("species_key") or "Unknown")[:14]
+        trees = int(row.get("trees_with_planting_date", 0) or 0)
+        legend_items.append((label, trees, color))
+
+    # Compact legend below the chart.
+    legend_y = y - 8
+    legend_x = x
+    c.setFont("Helvetica", 6.2)
+    for label, trees, color in legend_items:
+        text = f"{label} ({trees})"
+        text_w = c.stringWidth(text, "Helvetica", 6.2)
+        block_w = 12 + text_w + 8
+        if legend_x + block_w > x + w:
+            legend_y -= 8
+            legend_x = x
+        if legend_y < y - 22:
+            break
+        c.setFillColor(HexColor(color))
+        c.circle(legend_x + 3, legend_y + 2, 1.8, stroke=0, fill=1)
+        c.setFillColorRGB(0.26, 0.35, 0.30)
+        c.drawString(legend_x + 8, legend_y, text)
+        legend_x += block_w
+
+
 def _format_delay_label(delay_days, delay_context=None):
     """Human-readable delay string. delay is measured in days."""
     try:
@@ -154,7 +290,7 @@ def _format_delay_label(delay_days, delay_context=None):
     return "0d"
 
 
-def _render_executive_summary(c, width, height, project, kpi_snapshot, carbon_data, kpi_trend):
+def _render_executive_summary(c, width, height, project, kpi_snapshot, carbon_data, kpi_trend, species_daily_survival=None):
     """Render the Executive Summary page - page 1 of the report."""
     # Header bar
     c.setFillColor(HexColor("#0b3d24"))
@@ -363,11 +499,30 @@ def _render_executive_summary(c, width, height, project, kpi_snapshot, carbon_da
     if trend_first_label or trend_last_label:
         c.drawString(40, top_chart_y - 18, f"Period: {trend_first_label} to {trend_last_label}".strip())
 
-    # Species-based age survival table (right)
+    # Species daily survival + species CO2 (right)
     species_breakdown = age_survival.get("species_breakdown", []) if isinstance(age_survival, dict) else []
     top_species = carbon_data.get("top_species", []) if carbon_data else []
     right_x = 40 + chart_w + 20
-    if isinstance(species_breakdown, list) and len(species_breakdown) > 0:
+
+    has_daily_species = (
+        isinstance(species_daily_survival, dict)
+        and isinstance(species_daily_survival.get("species"), list)
+        and len(species_daily_survival.get("species") or []) > 0
+    )
+    if has_daily_species:
+        _draw_species_daily_line_chart(
+            c,
+            right_x,
+            y - 98,
+            chart_w,
+            70,
+            species_daily_survival,
+            title="Species Survival Trend (Daily)",
+        )
+        c.setFont("Helvetica", 6.4)
+        c.setFillColorRGB(0.45, 0.45, 0.45)
+        c.drawString(right_x, y - 106, "Context: daily species survival from planting date using status history.")
+    elif isinstance(species_breakdown, list) and len(species_breakdown) > 0:
         c.setFont("Helvetica-Bold", 9)
         c.setFillColorRGB(0.15, 0.15, 0.15)
         c.drawString(right_x, y - 8, "Species Survival (30/90/180 days)")
@@ -425,28 +580,20 @@ def _render_executive_summary(c, width, height, project, kpi_snapshot, carbon_da
         c.setFillColorRGB(0.45, 0.45, 0.45)
         c.drawString(right_x, y - 94, "Context: age-based species cohorts from planting date; '~' denotes provisional carry-forward.")
 
-        # Keep the CO2-by-species visual in executive summary alongside the species survival table.
-        if top_species:
-            bar_data = []
-            colors = ["#2e7d32", "#43a047", "#66bb6a", "#81c784", "#a5d6a7",
-                      "#c8e6c9", "#e8f5e9", "#b9f6ca", "#69f0ae", "#00e676"]
-            for i, sp in enumerate(top_species[:5]):
-                bar_data.append((sp["species"][:14], sp["co2_kg"], colors[i % len(colors)]))
-            _draw_bar_chart(c, right_x, y - 158, chart_w, 56, bar_data, title="Top Species by CO2 (kg)")
-            c.setFont("Helvetica", 6.5)
-            c.setFillColorRGB(0.45, 0.45, 0.45)
-            c.drawString(right_x, y - 166, "Context: estimated current stock by species group.")
-    else:
-        if top_species:
-            bar_data = []
-            colors = ["#2e7d32", "#43a047", "#66bb6a", "#81c784", "#a5d6a7",
-                      "#c8e6c9", "#e8f5e9", "#b9f6ca", "#69f0ae", "#00e676"]
-            for i, sp in enumerate(top_species[:7]):
-                bar_data.append((sp["species"][:14], sp["co2_kg"], colors[i % len(colors)]))
-            _draw_bar_chart(c, right_x, y - 140, chart_w, 130, bar_data, title="Top Species by CO2 (kg)")
-            c.setFont("Helvetica", 6.5)
-            c.setFillColorRGB(0.45, 0.45, 0.45)
-            c.drawString(right_x, y - 148, "Context: estimated current stock by species group.")
+    # Keep the CO2-by-species visual in executive summary.
+    if top_species:
+        bar_data = []
+        colors = ["#2e7d32", "#43a047", "#66bb6a", "#81c784", "#a5d6a7",
+                  "#c8e6c9", "#e8f5e9", "#b9f6ca", "#69f0ae", "#00e676"]
+        bar_limit = 5 if has_daily_species else 7
+        bar_height = 56 if has_daily_species else 130
+        bar_y = y - 158 if has_daily_species else y - 140
+        for i, sp in enumerate(top_species[:bar_limit]):
+            bar_data.append((sp["species"][:14], sp["co2_kg"], colors[i % len(colors)]))
+        _draw_bar_chart(c, right_x, bar_y, chart_w, bar_height, bar_data, title="Top Species by CO2 (kg)")
+        c.setFont("Helvetica", 6.5)
+        c.setFillColorRGB(0.45, 0.45, 0.45)
+        c.drawString(right_x, bar_y - 8, "Context: estimated current stock by species group.")
 
     # CO2 projection chart (bottom, full width)
     co2_projection = carbon_data.get("projection", []) if carbon_data else []
@@ -477,6 +624,7 @@ def render_green_report_pdf(
     kpi_snapshot: dict | None = None,
     carbon_data: dict | None = None,
     kpi_trend: list[dict] | None = None,
+    species_daily_survival: dict | None = None,
 ):
     c = canvas.Canvas(output_path, pagesize=A4)
     width, height = A4
@@ -484,7 +632,16 @@ def render_green_report_pdf(
     # =====================================================================
     # PAGE 1: Executive Summary
     # =====================================================================
-    _render_executive_summary(c, width, height, project, kpi_snapshot, carbon_data, kpi_trend)
+    _render_executive_summary(
+        c,
+        width,
+        height,
+        project,
+        kpi_snapshot,
+        carbon_data,
+        kpi_trend,
+        species_daily_survival=species_daily_survival,
+    )
 
     # =====================================================================
     # PAGE 2: Tree Records + Maintenance
