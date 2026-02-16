@@ -10,6 +10,8 @@ def render_green_report_pdf(
     map_rows: list[dict] | None = None,
     map_view: dict | None = None,
     maintenance_rows: list[dict] | None = None,
+    donor_rows: list[dict] | None = None,
+    kpi_snapshot: dict | None = None,
 ):
     c = canvas.Canvas(output_path, pagesize=A4)
     width, height = A4
@@ -239,6 +241,87 @@ def render_green_report_pdf(
             c.drawString(376, y, (str(row.get("maintenance_types", "")) or "-")[:24])
             c.drawString(494, y, str(row.get("last_maintenance_date", "") or "-")[:16])
             y -= 11
+
+    if kpi_snapshot or donor_rows:
+        c.showPage()
+        c.setFont("Helvetica-Bold", 14)
+        c.drawString(40, height - 50, "Donor + Review Intelligence")
+        y = height - 74
+        if kpi_snapshot:
+            c.setFont("Helvetica-Bold", 10)
+            c.drawString(40, y, "KPI Snapshot")
+            y -= 14
+            c.setFont("Helvetica", 8.5)
+            c.drawString(
+                40,
+                y,
+                (
+                    f"Trees: {kpi_snapshot.get('trees_total', 0)} | "
+                    f"Healthy: {kpi_snapshot.get('trees_healthy', 0)} | "
+                    f"Attention: {kpi_snapshot.get('trees_attention', 0)} | "
+                    f"Pending Planting: {kpi_snapshot.get('trees_pending_planting', 0)} | "
+                    f"Survival: {kpi_snapshot.get('survival_rate', 0)}%"
+                ),
+            )
+            y -= 12
+            c.drawString(
+                40,
+                y,
+                (
+                    f"Tasks: {kpi_snapshot.get('tasks_total', 0)} | "
+                    f"Open: {kpi_snapshot.get('tasks_open', 0)} | "
+                    f"Submitted: {kpi_snapshot.get('tasks_submitted', 0)} | "
+                    f"Approved: {kpi_snapshot.get('tasks_approved', 0)} | "
+                    f"Rejected: {kpi_snapshot.get('tasks_rejected', 0)} | "
+                    f"Overdue: {kpi_snapshot.get('tasks_overdue', 0)}"
+                ),
+            )
+            y -= 12
+            c.drawString(40, y, f"Evidence completeness: {kpi_snapshot.get('evidence_complete_rate', 0)}%")
+            y -= 16
+
+        if donor_rows:
+            c.setFont("Helvetica-Bold", 10)
+            c.drawString(40, y, "Recent Review Timeline")
+            y -= 12
+            c.setFont("Helvetica-Bold", 7.5)
+            c.drawString(40, y, "Task")
+            c.drawString(78, y, "Tree")
+            c.drawString(110, y, "Assignee")
+            c.drawString(186, y, "Type")
+            c.drawString(248, y, "Status/Review")
+            c.drawString(332, y, "Due")
+            c.drawString(378, y, "Submitted")
+            c.drawString(436, y, "Reviewed")
+            c.drawString(494, y, "Delay")
+            y -= 11
+            c.setFont("Helvetica", 7.2)
+            for row in donor_rows[:170]:
+                if y < 50:
+                    c.showPage()
+                    y = height - 50
+                    c.setFont("Helvetica-Bold", 7.5)
+                    c.drawString(40, y, "Task")
+                    c.drawString(78, y, "Tree")
+                    c.drawString(110, y, "Assignee")
+                    c.drawString(186, y, "Type")
+                    c.drawString(248, y, "Status/Review")
+                    c.drawString(332, y, "Due")
+                    c.drawString(378, y, "Submitted")
+                    c.drawString(436, y, "Reviewed")
+                    c.drawString(494, y, "Delay")
+                    y -= 11
+                    c.setFont("Helvetica", 7.2)
+                c.drawString(40, y, f"#{row.get('task_id', '-')}")
+                c.drawString(78, y, f"#{row.get('tree_id', '-')}")
+                c.drawString(110, y, str(row.get("assignee_name", "-"))[:16])
+                c.drawString(186, y, str(row.get("task_type", "-"))[:12])
+                c.drawString(248, y, f"{str(row.get('status', '-'))[:7]}/{str(row.get('review_state', '-'))[:8]}")
+                c.drawString(332, y, str(row.get("due_date", "") or "-")[:10])
+                c.drawString(378, y, str(row.get("submitted_at", "") or "-")[:10])
+                c.drawString(436, y, str(row.get("reviewed_at", "") or "-")[:10])
+                c.drawString(494, y, str(row.get("delay_days", "-")))
+                y -= 10
 
     c.save()
 
