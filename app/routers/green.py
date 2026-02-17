@@ -11,6 +11,7 @@ import io
 import uuid
 import zipfile
 from pathlib import Path
+from threading import Lock
 from urllib.parse import quote, unquote, urlparse
 
 import boto3
@@ -31,6 +32,10 @@ from app.utils.carbon import (
 )
 
 router = APIRouter(prefix="/green", tags=["green"])
+
+_GREEN_SCHEMA_BOOTSTRAP_LOCK = Lock()
+_GREEN_SCHEMA_READY = False
+_GREEN_SCHEMA_ADVISORY_LOCK_ID = 903670421
 
 BASE_DIR = os.path.dirname(os.path.dirname(__file__))
 REPORTS_DIR = os.path.join(BASE_DIR, "reports", "green")
@@ -146,10 +151,46 @@ TREE_STATUS_COLOR_HEX = {
 def get_db():
     db = SessionLocal()
     try:
-        ensure_green_tables(db)
+        _ensure_green_schema_ready(db)
         yield db
     finally:
         db.close()
+
+
+def _ensure_green_schema_ready(db: Session):
+    global _GREEN_SCHEMA_READY
+    if _GREEN_SCHEMA_READY:
+        return
+
+    with _GREEN_SCHEMA_BOOTSTRAP_LOCK:
+        if _GREEN_SCHEMA_READY:
+            return
+
+        advisory_lock_acquired = False
+        try:
+            # Serialize bootstrap across multiple API workers/processes.
+            try:
+                db.execute(
+                    text("SELECT pg_advisory_lock(:lock_id)"),
+                    {"lock_id": _GREEN_SCHEMA_ADVISORY_LOCK_ID},
+                )
+                advisory_lock_acquired = True
+            except Exception:
+                # If advisory lock is unavailable, continue with best effort.
+                db.rollback()
+
+            ensure_green_tables(db)
+            _GREEN_SCHEMA_READY = True
+        finally:
+            if advisory_lock_acquired:
+                try:
+                    db.execute(
+                        text("SELECT pg_advisory_unlock(:lock_id)"),
+                        {"lock_id": _GREEN_SCHEMA_ADVISORY_LOCK_ID},
+                    )
+                    db.commit()
+                except Exception:
+                    db.rollback()
 
 
 def _normalize_name(value: str | None) -> str:
