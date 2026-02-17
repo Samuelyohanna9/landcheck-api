@@ -18,7 +18,11 @@ import boto3
 from botocore.exceptions import ClientError
 
 from app.db import SessionLocal
-from app.utils.green_pdf import render_green_report_pdf, render_green_work_report_pdf
+from app.utils.green_pdf import (
+    render_green_report_pdf,
+    render_green_work_report_pdf,
+    render_green_custodian_report_pdf,
+)
 from app.utils.carbon import (
     compute_project_carbon,
     generate_co2_projection_table,
@@ -726,9 +730,18 @@ def _compute_live_maintenance_rows(
     assignee_key = _normalize_name(assignee_name)
     trees = db.execute(
         text("""
-            SELECT id, created_by, status, species, planting_date
+            SELECT
+                id,
+                created_by,
+                status,
+                species,
+                planting_date,
+                tree_origin,
+                COALESCE(count_in_planting_kpis, TRUE) AS count_in_planting_kpis
             FROM trees
             WHERE project_id = :project_id
+              AND LOWER(COALESCE(tree_origin, 'new_planting')) = 'new_planting'
+              AND COALESCE(count_in_planting_kpis, TRUE) = TRUE
             ORDER BY id ASC
         """),
         {"project_id": project_id},
@@ -1184,10 +1197,15 @@ def ensure_green_tables(db: Session):
                 project_id INTEGER NOT NULL REFERENCES tree_projects(id) ON DELETE CASCADE,
                 custodian_type TEXT NOT NULL DEFAULT 'household',
                 name TEXT NOT NULL,
+                contact_person TEXT,
                 phone TEXT,
+                alt_phone TEXT,
+                email TEXT,
                 address_text TEXT,
+                local_government TEXT,
                 community_name TEXT,
                 verification_status TEXT NOT NULL DEFAULT 'pending',
+                notes TEXT,
                 created_by TEXT,
                 created_at TIMESTAMP DEFAULT NOW(),
                 updated_at TIMESTAMP DEFAULT NOW()
@@ -1195,6 +1213,14 @@ def ensure_green_tables(db: Session):
             """
         )
     )
+    try:
+        db.execute(text("ALTER TABLE green_custodians ADD COLUMN IF NOT EXISTS contact_person TEXT"))
+        db.execute(text("ALTER TABLE green_custodians ADD COLUMN IF NOT EXISTS alt_phone TEXT"))
+        db.execute(text("ALTER TABLE green_custodians ADD COLUMN IF NOT EXISTS email TEXT"))
+        db.execute(text("ALTER TABLE green_custodians ADD COLUMN IF NOT EXISTS local_government TEXT"))
+        db.execute(text("ALTER TABLE green_custodians ADD COLUMN IF NOT EXISTS notes TEXT"))
+    except Exception:
+        db.rollback()
     db.execute(
         text(
             """
@@ -2153,10 +2179,15 @@ def list_custodians(project_id: int, db: Session = Depends(get_db)):
                 project_id,
                 custodian_type,
                 name,
+                contact_person,
                 phone,
+                alt_phone,
+                email,
                 address_text,
+                local_government,
                 community_name,
                 verification_status,
+                notes,
                 created_by,
                 created_at,
                 updated_at
@@ -2176,10 +2207,15 @@ def create_custodian(
     db: Session = Depends(get_db),
     custodian_type: str = Body(default="household"),
     name: str = Body(...),
+    contact_person: str | None = Body(default=None),
     phone: str | None = Body(default=None),
+    alt_phone: str | None = Body(default=None),
+    email: str | None = Body(default=None),
     address_text: str | None = Body(default=None),
+    local_government: str | None = Body(default=None),
     community_name: str | None = Body(default=None),
     verification_status: str = Body(default="pending"),
+    notes: str | None = Body(default=None),
     created_by: str | None = Body(default=None),
 ):
     _get_project_settings(db, project_id)
@@ -2191,20 +2227,27 @@ def create_custodian(
         text(
             """
             INSERT INTO green_custodians (
-                project_id, custodian_type, name, phone, address_text, community_name, verification_status, created_by
+                project_id, custodian_type, name, contact_person, phone, alt_phone, email, address_text,
+                local_government, community_name, verification_status, notes, created_by
             )
             VALUES (
-                :project_id, :custodian_type, :name, :phone, :address_text, :community_name, :verification_status, :created_by
+                :project_id, :custodian_type, :name, :contact_person, :phone, :alt_phone, :email, :address_text,
+                :local_government, :community_name, :verification_status, :notes, :created_by
             )
             RETURNING
                 id,
                 project_id,
                 custodian_type,
                 name,
+                contact_person,
                 phone,
+                alt_phone,
+                email,
                 address_text,
+                local_government,
                 community_name,
                 verification_status,
+                notes,
                 created_by,
                 created_at,
                 updated_at
@@ -2214,10 +2257,15 @@ def create_custodian(
             "project_id": project_id,
             "custodian_type": _normalize_custodian_type(custodian_type),
             "name": clean_name,
+            "contact_person": (contact_person or "").strip() or None,
             "phone": (phone or "").strip() or None,
+            "alt_phone": (alt_phone or "").strip() or None,
+            "email": (email or "").strip() or None,
             "address_text": (address_text or "").strip() or None,
+            "local_government": (local_government or "").strip() or None,
             "community_name": (community_name or "").strip() or None,
             "verification_status": (_normalize_name(verification_status) or "pending"),
+            "notes": (notes or "").strip() or None,
             "created_by": (created_by or "").strip() or None,
         },
     ).mappings().first()
@@ -2231,6 +2279,8 @@ def create_custodian(
         details={
             "custodian_type": row.get("custodian_type"),
             "name": row.get("name"),
+            "contact_person": row.get("contact_person"),
+            "email": row.get("email"),
             "community_name": row.get("community_name"),
         },
     )
@@ -2244,16 +2294,22 @@ def update_custodian(
     db: Session = Depends(get_db),
     custodian_type: str | None = Body(default=None),
     name: str | None = Body(default=None),
+    contact_person: str | None = Body(default=None),
     phone: str | None = Body(default=None),
+    alt_phone: str | None = Body(default=None),
+    email: str | None = Body(default=None),
     address_text: str | None = Body(default=None),
+    local_government: str | None = Body(default=None),
     community_name: str | None = Body(default=None),
     verification_status: str | None = Body(default=None),
+    notes: str | None = Body(default=None),
 ):
     existing = db.execute(
         text(
             """
             SELECT
-                id, project_id, custodian_type, name, phone, address_text, community_name, verification_status
+                id, project_id, custodian_type, name, contact_person, phone, alt_phone, email,
+                address_text, local_government, community_name, verification_status, notes
             FROM green_custodians
             WHERE id = :custodian_id
             """
@@ -2274,10 +2330,15 @@ def update_custodian(
             SET
                 custodian_type = COALESCE(:custodian_type, custodian_type),
                 name = :name,
+                contact_person = COALESCE(:contact_person, contact_person),
                 phone = COALESCE(:phone, phone),
+                alt_phone = COALESCE(:alt_phone, alt_phone),
+                email = COALESCE(:email, email),
                 address_text = COALESCE(:address_text, address_text),
+                local_government = COALESCE(:local_government, local_government),
                 community_name = COALESCE(:community_name, community_name),
                 verification_status = COALESCE(:verification_status, verification_status),
+                notes = COALESCE(:notes, notes),
                 updated_at = NOW()
             WHERE id = :custodian_id
             RETURNING
@@ -2285,10 +2346,15 @@ def update_custodian(
                 project_id,
                 custodian_type,
                 name,
+                contact_person,
                 phone,
+                alt_phone,
+                email,
                 address_text,
+                local_government,
                 community_name,
                 verification_status,
+                notes,
                 created_by,
                 created_at,
                 updated_at
@@ -2298,10 +2364,15 @@ def update_custodian(
             "custodian_id": custodian_id,
             "custodian_type": _normalize_custodian_type(custodian_type) if custodian_type is not None else None,
             "name": next_name,
+            "contact_person": ((contact_person or "").strip() or None) if contact_person is not None else None,
             "phone": ((phone or "").strip() or None) if phone is not None else None,
+            "alt_phone": ((alt_phone or "").strip() or None) if alt_phone is not None else None,
+            "email": ((email or "").strip() or None) if email is not None else None,
             "address_text": ((address_text or "").strip() or None) if address_text is not None else None,
+            "local_government": ((local_government or "").strip() or None) if local_government is not None else None,
             "community_name": ((community_name or "").strip() or None) if community_name is not None else None,
             "verification_status": (_normalize_name(verification_status) or "pending") if verification_status is not None else None,
+            "notes": ((notes or "").strip() or None) if notes is not None else None,
         },
     ).mappings().first()
     _log_audit_event(
@@ -7320,6 +7391,136 @@ def export_work_stats_pdf(project_id: int, db: Session = Depends(get_db)):
     tmp_pdf.close()
     render_green_work_report_pdf(pdf_path, project, stats)
     filename = f"project_{project_id}_work_report.pdf"
+    return FileResponse(pdf_path, media_type="application/pdf", filename=filename)
+
+
+@router.get("/projects/{project_id}/custodians/export/pdf")
+def export_custodian_report_pdf(project_id: int, db: Session = Depends(get_db)):
+    project = get_project(project_id, db)
+    summary = db.execute(
+        text(
+            """
+            SELECT
+                (SELECT COUNT(*) FROM green_custodians WHERE project_id = :project_id) AS total_custodians,
+                (SELECT COUNT(*) FROM green_custodians WHERE project_id = :project_id
+                    AND LOWER(COALESCE(verification_status, 'pending')) = 'verified') AS verified_custodians,
+                (SELECT COUNT(*) FROM green_distribution_events WHERE project_id = :project_id) AS distribution_events,
+                (SELECT COALESCE(SUM(quantity), 0) FROM green_distribution_events WHERE project_id = :project_id) AS seedlings_distributed,
+                (SELECT COUNT(*) FROM green_distribution_allocations WHERE project_id = :project_id) AS distribution_allocations,
+                (SELECT COUNT(*) FROM trees
+                    WHERE project_id = :project_id
+                      AND LOWER(COALESCE(tree_origin, 'new_planting')) <> 'new_planting') AS existing_trees
+            """
+        ),
+        {"project_id": project_id},
+    ).mappings().first()
+
+    custodians = db.execute(
+        text(
+            """
+            SELECT
+                c.id,
+                c.project_id,
+                c.custodian_type,
+                c.name,
+                c.contact_person,
+                c.phone,
+                c.alt_phone,
+                c.email,
+                c.address_text,
+                c.local_government,
+                c.community_name,
+                c.verification_status,
+                c.notes,
+                c.created_at,
+                COALESCE(SUM(a.quantity_allocated), 0) AS allocated_seedlings,
+                COUNT(DISTINCT t.id) AS linked_trees,
+                SUM(CASE
+                      WHEN LOWER(COALESCE(t.status, '')) IN ('alive', 'healthy') THEN 1
+                      ELSE 0
+                    END) AS healthy_trees
+            FROM green_custodians c
+            LEFT JOIN green_distribution_allocations a ON a.custodian_id = c.id
+            LEFT JOIN trees t ON t.custodian_id = c.id AND t.project_id = c.project_id
+            WHERE c.project_id = :project_id
+            GROUP BY
+                c.id,
+                c.project_id,
+                c.custodian_type,
+                c.name,
+                c.contact_person,
+                c.phone,
+                c.alt_phone,
+                c.email,
+                c.address_text,
+                c.local_government,
+                c.community_name,
+                c.verification_status,
+                c.notes,
+                c.created_at
+            ORDER BY c.created_at DESC, c.id DESC
+            """
+        ),
+        {"project_id": project_id},
+    ).mappings().all()
+
+    distribution_events = db.execute(
+        text(
+            """
+            SELECT
+                id,
+                event_date,
+                species,
+                quantity,
+                source_batch_ref,
+                distributed_by,
+                notes,
+                created_at
+            FROM green_distribution_events
+            WHERE project_id = :project_id
+            ORDER BY event_date DESC, id DESC
+            LIMIT 500
+            """
+        ),
+        {"project_id": project_id},
+    ).mappings().all()
+
+    existing_trees = db.execute(
+        text(
+            """
+            SELECT
+                t.id,
+                t.species,
+                t.tree_height_m,
+                t.status,
+                t.created_by,
+                t.created_at,
+                c.name AS custodian_name
+            FROM trees t
+            LEFT JOIN green_custodians c ON c.id = t.custodian_id
+            WHERE t.project_id = :project_id
+              AND LOWER(COALESCE(t.tree_origin, 'new_planting')) <> 'new_planting'
+            ORDER BY t.created_at DESC, t.id DESC
+            LIMIT 800
+            """
+        ),
+        {"project_id": project_id},
+    ).mappings().all()
+
+    os.makedirs(REPORTS_DIR, exist_ok=True)
+    tmp_pdf = tempfile.NamedTemporaryFile(suffix="_custodian_report.pdf", delete=False)
+    pdf_path = tmp_pdf.name
+    tmp_pdf.close()
+
+    render_green_custodian_report_pdf(
+        output_path=pdf_path,
+        project=project,
+        summary=dict(summary or {}),
+        custodians=[dict(row) for row in custodians],
+        distribution_events=[dict(row) for row in distribution_events],
+        existing_trees=[dict(row) for row in existing_trees],
+    )
+    filename = f"project_{project_id}_custodian_report.pdf"
     return FileResponse(pdf_path, media_type="application/pdf", filename=filename)
 
 

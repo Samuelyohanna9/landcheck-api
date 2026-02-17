@@ -1160,3 +1160,211 @@ def render_green_work_report_pdf(output_path: str, project: dict, stats: dict):
             y -= 11
 
     c.save()
+
+
+def render_green_custodian_report_pdf(
+    output_path: str,
+    project: dict,
+    summary: dict,
+    custodians: list[dict],
+    distribution_events: list[dict],
+    existing_trees: list[dict],
+):
+    c = canvas.Canvas(output_path, pagesize=A4)
+    width, height = A4
+
+    def draw_report_header(subtitle: str):
+        c.setFillColor(HexColor("#0b3d24"))
+        c.rect(0, height - 70, width, 70, stroke=0, fill=1)
+        c.setFillColorRGB(1, 1, 1)
+        c.setFont("Helvetica-Bold", 18)
+        c.drawString(34, height - 40, "LandCheck Custodian Report")
+        c.setFont("Helvetica", 10)
+        c.drawString(34, height - 56, subtitle)
+        c.setFont("Helvetica", 8.5)
+        c.setFillColorRGB(0.82, 0.95, 0.86)
+        c.drawRightString(width - 34, height - 40, datetime.utcnow().strftime("Generated %d %b %Y %H:%M UTC"))
+
+    def reset_text():
+        c.setFillColorRGB(0.12, 0.12, 0.12)
+        c.setFont("Helvetica", 8.2)
+
+    draw_report_header("Custodians, distribution events, and existing-tree intake.")
+    c.setFillColorRGB(0.12, 0.12, 0.12)
+    c.setFont("Helvetica-Bold", 12)
+    c.drawString(34, height - 90, str(project.get("name") or "Project"))
+    c.setFont("Helvetica", 9)
+    c.setFillColorRGB(0.36, 0.36, 0.36)
+    c.drawString(
+        34,
+        height - 106,
+        f"Location: {project.get('location_text') or '-'} | Sponsor: {project.get('sponsor') or '-'}",
+    )
+
+    total_custodians = int(summary.get("total_custodians") or 0)
+    verified_custodians = int(summary.get("verified_custodians") or 0)
+    total_events = int(summary.get("distribution_events") or 0)
+    total_seedlings = int(summary.get("seedlings_distributed") or 0)
+    total_allocations = int(summary.get("distribution_allocations") or 0)
+    linked_existing_trees = int(summary.get("existing_trees") or 0)
+
+    card_y = height - 146
+    card_w = (width - 68 - 12) / 3
+    card_h = 44
+    cards = [
+        ("Custodians", f"{total_custodians} ({verified_custodians} verified)"),
+        ("Distribution Events", f"{total_events} events | {total_seedlings} seedlings"),
+        ("Allocations / Existing Trees", f"{total_allocations} allocations | {linked_existing_trees} trees"),
+    ]
+    cx = 34
+    for label, value in cards:
+        _draw_rounded_box(c, cx, card_y - card_h, card_w, card_h, 4, fill_color=HexColor("#f5fbf6"))
+        c.setFillColorRGB(0.22, 0.22, 0.22)
+        c.setFont("Helvetica-Bold", 8.5)
+        c.drawString(cx + 8, card_y - 15, label)
+        c.setFont("Helvetica", 8)
+        c.setFillColorRGB(0.33, 0.33, 0.33)
+        c.drawString(cx + 8, card_y - 29, value[:60])
+        cx += card_w + 6
+
+    c.setFont("Helvetica-Bold", 11)
+    c.setFillColorRGB(0.12, 0.12, 0.12)
+    c.drawString(34, height - 206, "Custodian Registry")
+
+    y = height - 222
+    c.setFont("Helvetica-Bold", 7.7)
+    c.drawString(34, y, "Name")
+    c.drawString(154, y, "Type")
+    c.drawString(218, y, "Contact")
+    c.drawString(332, y, "Verification")
+    c.drawString(398, y, "Trees")
+    c.drawString(430, y, "Healthy")
+    c.drawString(470, y, "Allocated")
+    c.drawString(528, y, "Community")
+    y -= 11
+    reset_text()
+
+    for row in custodians:
+        if y < 48:
+            c.showPage()
+            draw_report_header("Custodian registry (continued).")
+            y = height - 88
+            c.setFont("Helvetica-Bold", 7.7)
+            c.setFillColorRGB(0.12, 0.12, 0.12)
+            c.drawString(34, y, "Name")
+            c.drawString(154, y, "Type")
+            c.drawString(218, y, "Contact")
+            c.drawString(332, y, "Verification")
+            c.drawString(398, y, "Trees")
+            c.drawString(430, y, "Healthy")
+            c.drawString(470, y, "Allocated")
+            c.drawString(528, y, "Community")
+            y -= 11
+            reset_text()
+        contact = str(row.get("phone") or row.get("email") or "-")
+        c.drawString(34, y, str(row.get("name") or "-")[:28])
+        c.drawString(154, y, str(row.get("custodian_type") or "-").replace("_", " ")[:14])
+        c.drawString(218, y, contact[:20])
+        c.drawString(332, y, str(row.get("verification_status") or "pending")[:12])
+        c.drawRightString(424, y, str(int(row.get("linked_trees") or 0)))
+        c.drawRightString(464, y, str(int(row.get("healthy_trees") or 0)))
+        c.drawRightString(520, y, str(int(row.get("allocated_seedlings") or 0)))
+        c.drawString(528, y, str(row.get("community_name") or "-")[:10])
+        y -= 10
+
+    c.showPage()
+    draw_report_header("Distribution events and allocations")
+    c.setFont("Helvetica-Bold", 11)
+    c.setFillColorRGB(0.12, 0.12, 0.12)
+    c.drawString(34, height - 88, "Distribution Events")
+    y = height - 104
+    c.setFont("Helvetica-Bold", 8)
+    c.drawString(34, y, "Date")
+    c.drawString(104, y, "Species")
+    c.drawString(222, y, "Qty")
+    c.drawString(270, y, "Distributed By")
+    c.drawString(382, y, "Batch Ref")
+    c.drawString(474, y, "Notes")
+    y -= 11
+    reset_text()
+
+    if not distribution_events:
+        c.drawString(34, y, "No distribution events recorded.")
+        y -= 12
+    else:
+        for row in distribution_events:
+            if y < 46:
+                c.showPage()
+                draw_report_header("Distribution events (continued)")
+                y = height - 88
+                c.setFont("Helvetica-Bold", 8)
+                c.setFillColorRGB(0.12, 0.12, 0.12)
+                c.drawString(34, y, "Date")
+                c.drawString(104, y, "Species")
+                c.drawString(222, y, "Qty")
+                c.drawString(270, y, "Distributed By")
+                c.drawString(382, y, "Batch Ref")
+                c.drawString(474, y, "Notes")
+                y -= 11
+                reset_text()
+            c.drawString(34, y, str(row.get("event_date") or "-")[:12])
+            c.drawString(104, y, str(row.get("species") or "Mixed")[:20])
+            c.drawRightString(246, y, str(int(row.get("quantity") or 0)))
+            c.drawString(270, y, str(row.get("distributed_by") or "-")[:18])
+            c.drawString(382, y, str(row.get("source_batch_ref") or "-")[:14])
+            c.drawString(474, y, str(row.get("notes") or "-")[:20])
+            y -= 10
+
+    c.showPage()
+    draw_report_header("Existing tree intake in this project")
+    c.setFont("Helvetica-Bold", 11)
+    c.setFillColorRGB(0.12, 0.12, 0.12)
+    c.drawString(34, height - 88, "Existing Trees")
+    y = height - 104
+    c.setFont("Helvetica-Bold", 8)
+    c.drawString(34, y, "Tree ID")
+    c.drawString(80, y, "Species")
+    c.drawString(188, y, "Height")
+    c.drawString(236, y, "Status")
+    c.drawString(308, y, "Custodian")
+    c.drawString(412, y, "Created By")
+    c.drawString(498, y, "Date")
+    y -= 11
+    reset_text()
+
+    if not existing_trees:
+        c.drawString(34, y, "No existing trees captured yet.")
+    else:
+        for row in existing_trees:
+            if y < 46:
+                c.showPage()
+                draw_report_header("Existing trees (continued)")
+                y = height - 88
+                c.setFont("Helvetica-Bold", 8)
+                c.setFillColorRGB(0.12, 0.12, 0.12)
+                c.drawString(34, y, "Tree ID")
+                c.drawString(80, y, "Species")
+                c.drawString(188, y, "Height")
+                c.drawString(236, y, "Status")
+                c.drawString(308, y, "Custodian")
+                c.drawString(412, y, "Created By")
+                c.drawString(498, y, "Date")
+                y -= 11
+                reset_text()
+            height_val = row.get("tree_height_m")
+            height_label = "-"
+            try:
+                if height_val is not None and float(height_val) >= 0:
+                    height_label = f"{float(height_val):.2f}m"
+            except Exception:
+                height_label = "-"
+            c.drawString(34, y, str(row.get("id") or "-"))
+            c.drawString(80, y, str(row.get("species") or "-")[:20])
+            c.drawString(188, y, height_label)
+            c.drawString(236, y, str(row.get("status") or "-")[:12])
+            c.drawString(308, y, str(row.get("custodian_name") or "-")[:18])
+            c.drawString(412, y, str(row.get("created_by") or "-")[:16])
+            c.drawString(498, y, str(row.get("created_at") or "-")[:10])
+            y -= 10
+
+    c.save()
