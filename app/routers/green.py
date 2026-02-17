@@ -72,6 +72,14 @@ AGE_SURVIVAL_CHECKPOINTS_DAYS = (30, 90, 180)
 SEASON_VALUES = {"rainy", "dry"}
 TASK_STATUS_VALUES = {"pending", "done", "overdue"}
 REVIEW_STATE_VALUES = {"none", "submitted", "approved", "rejected", "reopened"}
+PLANTING_MODEL_VALUES = {"direct", "community_distributed", "mixed"}
+DEFAULT_PLANTING_MODEL = "direct"
+EXISTING_TREE_SCOPE_VALUES = {"exclude_from_planting_kpi", "include_in_planting_kpi"}
+DEFAULT_EXISTING_TREE_SCOPE = "exclude_from_planting_kpi"
+TREE_ORIGIN_VALUES = {"new_planting", "existing_inventory", "natural_regeneration"}
+TREE_ATTRIBUTION_SCOPE_VALUES = {"full", "monitor_only"}
+CUSTODIAN_TYPE_VALUES = {"household", "school", "community_group"}
+TREE_PROJECT_LINK_TYPE_VALUES = {"owner", "reference"}
 TREE_STATUS_VALUES = {
     "alive",
     "healthy",
@@ -148,6 +156,48 @@ def _normalize_name(value: str | None) -> str:
     return (value or "").strip().lower()
 
 
+def _normalize_planting_model(value: str | None) -> str:
+    normalized = _normalize_name(value)
+    if normalized in PLANTING_MODEL_VALUES:
+        return normalized
+    return DEFAULT_PLANTING_MODEL
+
+
+def _normalize_existing_tree_scope(value: str | None) -> str:
+    normalized = _normalize_name(value)
+    if normalized in EXISTING_TREE_SCOPE_VALUES:
+        return normalized
+    return DEFAULT_EXISTING_TREE_SCOPE
+
+
+def _normalize_tree_origin(value: str | None) -> str:
+    normalized = _normalize_name(value).replace("-", "_").replace(" ", "_")
+    if normalized in TREE_ORIGIN_VALUES:
+        return normalized
+    return "new_planting"
+
+
+def _normalize_tree_attribution_scope(value: str | None) -> str:
+    normalized = _normalize_name(value).replace("-", "_").replace(" ", "_")
+    if normalized in TREE_ATTRIBUTION_SCOPE_VALUES:
+        return normalized
+    return "full"
+
+
+def _normalize_custodian_type(value: str | None) -> str:
+    normalized = _normalize_name(value).replace("-", "_").replace(" ", "_")
+    if normalized in CUSTODIAN_TYPE_VALUES:
+        return normalized
+    return "household"
+
+
+def _normalize_tree_link_type(value: str | None) -> str:
+    normalized = _normalize_name(value)
+    if normalized in TREE_PROJECT_LINK_TYPE_VALUES:
+        return normalized
+    return "reference"
+
+
 def _normalize_tree_status(value: str | None) -> str:
     raw = _normalize_name(value).replace("-", "_")
     collapsed = raw.replace("_", "").replace(" ", "")
@@ -160,6 +210,45 @@ def _normalize_tree_status(value: str | None) -> str:
         if spaced in TREE_STATUS_ALIASES:
             return TREE_STATUS_ALIASES[spaced]
     return raw.replace(" ", "_")
+
+
+def _resolve_tree_scope_defaults(
+    *,
+    tree_origin: str,
+    attribution_scope: str | None = None,
+    count_in_planting_kpis: bool | None = None,
+    count_in_carbon_scope: bool | None = None,
+    project_existing_scope: str | None = None,
+) -> tuple[str, bool, bool]:
+    origin = _normalize_tree_origin(tree_origin)
+    resolved_scope = _normalize_tree_attribution_scope(attribution_scope)
+    resolved_existing_scope = _normalize_existing_tree_scope(project_existing_scope)
+
+    if origin == "existing_inventory":
+        default_scope = "monitor_only"
+        if count_in_planting_kpis is None:
+            default_planting_scope = resolved_existing_scope == "include_in_planting_kpi"
+        else:
+            default_planting_scope = bool(count_in_planting_kpis)
+        if count_in_carbon_scope is None:
+            default_carbon_scope = resolved_existing_scope == "include_in_planting_kpi"
+        else:
+            default_carbon_scope = bool(count_in_carbon_scope)
+    else:
+        default_scope = "full"
+        default_planting_scope = bool(count_in_planting_kpis) if count_in_planting_kpis is not None else True
+        default_carbon_scope = bool(count_in_carbon_scope) if count_in_carbon_scope is not None else True
+
+    if not attribution_scope:
+        resolved_scope = default_scope
+
+    if resolved_scope == "monitor_only":
+        if count_in_planting_kpis is None:
+            default_planting_scope = False
+        if count_in_carbon_scope is None:
+            default_carbon_scope = False
+
+    return resolved_scope, bool(default_planting_scope), bool(default_carbon_scope)
 
 
 def _is_done_status(status: str | None) -> bool:
@@ -261,6 +350,27 @@ def _get_project_id_for_tree(db: Session, tree_id: int) -> int | None:
         text("SELECT project_id FROM trees WHERE id = :tree_id"),
         {"tree_id": tree_id},
     ).scalar()
+
+
+def _get_project_settings(db: Session, project_id: int) -> dict:
+    row = db.execute(
+        text(
+            """
+            SELECT id, planting_model, allow_existing_tree_link, default_existing_tree_scope
+            FROM tree_projects
+            WHERE id = :project_id
+            """
+        ),
+        {"project_id": project_id},
+    ).mappings().first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Project not found")
+    return {
+        "id": int(row.get("id")),
+        "planting_model": _normalize_planting_model(row.get("planting_model")),
+        "allow_existing_tree_link": bool(row.get("allow_existing_tree_link")),
+        "default_existing_tree_scope": _normalize_existing_tree_scope(row.get("default_existing_tree_scope")),
+    }
 
 
 def _record_tree_status_history(
@@ -945,6 +1055,9 @@ def ensure_green_tables(db: Session):
             name TEXT NOT NULL,
             location_text TEXT,
             sponsor TEXT,
+            planting_model TEXT NOT NULL DEFAULT 'direct',
+            allow_existing_tree_link BOOLEAN NOT NULL DEFAULT FALSE,
+            default_existing_tree_scope TEXT NOT NULL DEFAULT 'exclude_from_planting_kpi',
             created_at TIMESTAMP DEFAULT NOW()
         )
     """))
@@ -959,6 +1072,14 @@ def ensure_green_tables(db: Session):
             notes TEXT,
             photo_url TEXT,
             created_by TEXT,
+            tree_origin TEXT NOT NULL DEFAULT 'new_planting',
+            custodian_id INTEGER,
+            custody_started_at DATE,
+            attribution_scope TEXT NOT NULL DEFAULT 'full',
+            count_in_planting_kpis BOOLEAN NOT NULL DEFAULT TRUE,
+            count_in_carbon_scope BOOLEAN NOT NULL DEFAULT TRUE,
+            source_project_id INTEGER REFERENCES tree_projects(id) ON DELETE SET NULL,
+            tree_height_m NUMERIC,
             created_at TIMESTAMP DEFAULT NOW()
         )
     """))
@@ -996,6 +1117,99 @@ def ensure_green_tables(db: Session):
             created_at TIMESTAMP DEFAULT NOW()
         )
     """))
+    try:
+        db.execute(text("ALTER TABLE tree_projects ADD COLUMN IF NOT EXISTS planting_model TEXT NOT NULL DEFAULT 'direct'"))
+        db.execute(text("ALTER TABLE tree_projects ADD COLUMN IF NOT EXISTS allow_existing_tree_link BOOLEAN NOT NULL DEFAULT FALSE"))
+        db.execute(
+            text(
+                "ALTER TABLE tree_projects ADD COLUMN IF NOT EXISTS default_existing_tree_scope TEXT NOT NULL DEFAULT 'exclude_from_planting_kpi'"
+            )
+        )
+        db.execute(text("ALTER TABLE trees ADD COLUMN IF NOT EXISTS tree_origin TEXT NOT NULL DEFAULT 'new_planting'"))
+        db.execute(text("ALTER TABLE trees ADD COLUMN IF NOT EXISTS custodian_id INTEGER"))
+        db.execute(text("ALTER TABLE trees ADD COLUMN IF NOT EXISTS custody_started_at DATE"))
+        db.execute(text("ALTER TABLE trees ADD COLUMN IF NOT EXISTS attribution_scope TEXT NOT NULL DEFAULT 'full'"))
+        db.execute(text("ALTER TABLE trees ADD COLUMN IF NOT EXISTS count_in_planting_kpis BOOLEAN NOT NULL DEFAULT TRUE"))
+        db.execute(text("ALTER TABLE trees ADD COLUMN IF NOT EXISTS count_in_carbon_scope BOOLEAN NOT NULL DEFAULT TRUE"))
+        db.execute(text("ALTER TABLE trees ADD COLUMN IF NOT EXISTS source_project_id INTEGER"))
+        db.execute(text("ALTER TABLE trees ADD COLUMN IF NOT EXISTS tree_height_m NUMERIC"))
+    except Exception:
+        db.rollback()
+    db.execute(
+        text(
+            """
+            CREATE TABLE IF NOT EXISTS green_custodians (
+                id SERIAL PRIMARY KEY,
+                project_id INTEGER NOT NULL REFERENCES tree_projects(id) ON DELETE CASCADE,
+                custodian_type TEXT NOT NULL DEFAULT 'household',
+                name TEXT NOT NULL,
+                phone TEXT,
+                address_text TEXT,
+                community_name TEXT,
+                verification_status TEXT NOT NULL DEFAULT 'pending',
+                created_by TEXT,
+                created_at TIMESTAMP DEFAULT NOW(),
+                updated_at TIMESTAMP DEFAULT NOW()
+            )
+            """
+        )
+    )
+    db.execute(
+        text(
+            """
+            CREATE TABLE IF NOT EXISTS green_distribution_events (
+                id SERIAL PRIMARY KEY,
+                project_id INTEGER NOT NULL REFERENCES tree_projects(id) ON DELETE CASCADE,
+                event_date DATE NOT NULL,
+                species TEXT,
+                quantity INTEGER NOT NULL DEFAULT 0,
+                source_batch_ref TEXT,
+                distributed_by TEXT,
+                notes TEXT,
+                created_at TIMESTAMP DEFAULT NOW(),
+                updated_at TIMESTAMP DEFAULT NOW()
+            )
+            """
+        )
+    )
+    db.execute(
+        text(
+            """
+            CREATE TABLE IF NOT EXISTS green_distribution_allocations (
+                id SERIAL PRIMARY KEY,
+                event_id INTEGER NOT NULL REFERENCES green_distribution_events(id) ON DELETE CASCADE,
+                project_id INTEGER NOT NULL REFERENCES tree_projects(id) ON DELETE CASCADE,
+                custodian_id INTEGER NOT NULL REFERENCES green_custodians(id) ON DELETE CASCADE,
+                quantity_allocated INTEGER NOT NULL DEFAULT 0,
+                expected_planting_start DATE,
+                expected_planting_end DATE,
+                followup_cycle_days INTEGER NOT NULL DEFAULT 30,
+                notes TEXT,
+                created_at TIMESTAMP DEFAULT NOW(),
+                updated_at TIMESTAMP DEFAULT NOW(),
+                UNIQUE(event_id, custodian_id)
+            )
+            """
+        )
+    )
+    db.execute(
+        text(
+            """
+            CREATE TABLE IF NOT EXISTS tree_project_links (
+                id SERIAL PRIMARY KEY,
+                source_project_id INTEGER NOT NULL REFERENCES tree_projects(id) ON DELETE CASCADE,
+                target_project_id INTEGER NOT NULL REFERENCES tree_projects(id) ON DELETE CASCADE,
+                source_tree_id INTEGER NOT NULL REFERENCES trees(id) ON DELETE CASCADE,
+                target_tree_id INTEGER NOT NULL REFERENCES trees(id) ON DELETE CASCADE,
+                link_type TEXT NOT NULL DEFAULT 'reference',
+                transfer_mode TEXT NOT NULL DEFAULT 'reference',
+                created_by TEXT,
+                created_at TIMESTAMP DEFAULT NOW(),
+                UNIQUE(source_project_id, target_project_id, source_tree_id, target_tree_id, link_type)
+            )
+            """
+        )
+    )
     db.execute(text("""
         CREATE TABLE IF NOT EXISTS tree_tasks (
             id SERIAL PRIMARY KEY,
@@ -1212,6 +1426,15 @@ def ensure_green_tables(db: Session):
     db.execute(text("CREATE INDEX IF NOT EXISTS idx_alert_events_project_time ON green_alert_events(project_id, triggered_at DESC)"))
     db.execute(text("CREATE INDEX IF NOT EXISTS idx_webhook_event ON green_webhook_deliveries(event_id, created_at DESC)"))
     db.execute(text("CREATE INDEX IF NOT EXISTS idx_verra_exports_project_time ON green_verra_exports(project_id, created_at DESC)"))
+    db.execute(text("CREATE INDEX IF NOT EXISTS idx_tree_projects_model ON tree_projects(planting_model)"))
+    db.execute(text("CREATE INDEX IF NOT EXISTS idx_trees_origin ON trees(tree_origin)"))
+    db.execute(text("CREATE INDEX IF NOT EXISTS idx_trees_scope_flags ON trees(project_id, count_in_planting_kpis, count_in_carbon_scope)"))
+    db.execute(text("CREATE INDEX IF NOT EXISTS idx_trees_custodian_id ON trees(custodian_id)"))
+    db.execute(text("CREATE INDEX IF NOT EXISTS idx_trees_source_project_id ON trees(source_project_id)"))
+    db.execute(text("CREATE INDEX IF NOT EXISTS idx_custodians_project ON green_custodians(project_id, created_at DESC)"))
+    db.execute(text("CREATE INDEX IF NOT EXISTS idx_dist_events_project ON green_distribution_events(project_id, event_date DESC)"))
+    db.execute(text("CREATE INDEX IF NOT EXISTS idx_dist_alloc_project ON green_distribution_allocations(project_id, created_at DESC)"))
+    db.execute(text("CREATE INDEX IF NOT EXISTS idx_tree_project_links_target ON tree_project_links(target_project_id, created_at DESC)"))
     db.execute(
         text(
             """
@@ -1599,14 +1822,30 @@ def create_project(
     name: str = Body(...),
     location_text: str = Body(default=""),
     sponsor: str = Body(default=""),
+    planting_model: str = Body(default=DEFAULT_PLANTING_MODEL),
+    allow_existing_tree_link: bool = Body(default=False),
+    default_existing_tree_scope: str = Body(default=DEFAULT_EXISTING_TREE_SCOPE),
 ):
+    normalized_model = _normalize_planting_model(planting_model)
+    normalized_existing_scope = _normalize_existing_tree_scope(default_existing_tree_scope)
     row = db.execute(
         text("""
-            INSERT INTO tree_projects (name, location_text, sponsor)
-            VALUES (:name, :location_text, :sponsor)
-            RETURNING id, name, location_text, sponsor, created_at
+            INSERT INTO tree_projects (
+                name, location_text, sponsor, planting_model, allow_existing_tree_link, default_existing_tree_scope
+            )
+            VALUES (
+                :name, :location_text, :sponsor, :planting_model, :allow_existing_tree_link, :default_existing_tree_scope
+            )
+            RETURNING id, name, location_text, sponsor, planting_model, allow_existing_tree_link, default_existing_tree_scope, created_at
         """),
-        {"name": name, "location_text": location_text, "sponsor": sponsor},
+        {
+            "name": name,
+            "location_text": location_text,
+            "sponsor": sponsor,
+            "planting_model": normalized_model,
+            "allow_existing_tree_link": bool(allow_existing_tree_link),
+            "default_existing_tree_scope": normalized_existing_scope,
+        },
     ).mappings().first()
     project = dict(row)
     _log_audit_event(
@@ -1615,16 +1854,93 @@ def create_project(
         entity_type="project",
         entity_id=project["id"],
         action="project_created",
-        details={"name": project.get("name"), "location_text": project.get("location_text")},
+        details={
+            "name": project.get("name"),
+            "location_text": project.get("location_text"),
+            "planting_model": project.get("planting_model"),
+            "allow_existing_tree_link": bool(project.get("allow_existing_tree_link")),
+            "default_existing_tree_scope": project.get("default_existing_tree_scope"),
+        },
     )
     db.commit()
     return project
 
 
+@router.patch("/projects/{project_id}/settings")
+def update_project_settings(
+    project_id: int,
+    db: Session = Depends(get_db),
+    planting_model: str | None = Body(default=None),
+    allow_existing_tree_link: bool | None = Body(default=None),
+    default_existing_tree_scope: str | None = Body(default=None),
+):
+    existing = db.execute(
+        text(
+            """
+            SELECT id, planting_model, allow_existing_tree_link, default_existing_tree_scope
+            FROM tree_projects
+            WHERE id = :project_id
+            """
+        ),
+        {"project_id": project_id},
+    ).mappings().first()
+    if not existing:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    next_model = _normalize_planting_model(planting_model) if planting_model is not None else _normalize_planting_model(existing.get("planting_model"))
+    next_allow_existing = (
+        bool(allow_existing_tree_link)
+        if allow_existing_tree_link is not None
+        else bool(existing.get("allow_existing_tree_link"))
+    )
+    next_scope = (
+        _normalize_existing_tree_scope(default_existing_tree_scope)
+        if default_existing_tree_scope is not None
+        else _normalize_existing_tree_scope(existing.get("default_existing_tree_scope"))
+    )
+
+    row = db.execute(
+        text(
+            """
+            UPDATE tree_projects
+            SET planting_model = :planting_model,
+                allow_existing_tree_link = :allow_existing_tree_link,
+                default_existing_tree_scope = :default_existing_tree_scope
+            WHERE id = :project_id
+            RETURNING id, name, location_text, sponsor, planting_model, allow_existing_tree_link, default_existing_tree_scope, created_at
+            """
+        ),
+        {
+            "project_id": project_id,
+            "planting_model": next_model,
+            "allow_existing_tree_link": next_allow_existing,
+            "default_existing_tree_scope": next_scope,
+        },
+    ).mappings().first()
+    _log_audit_event(
+        db,
+        project_id=project_id,
+        entity_type="project",
+        entity_id=project_id,
+        action="project_settings_updated",
+        details={
+            "before": dict(existing),
+            "after": {
+                "planting_model": next_model,
+                "allow_existing_tree_link": next_allow_existing,
+                "default_existing_tree_scope": next_scope,
+            },
+        },
+    )
+    db.commit()
+    return dict(row)
+
+
 @router.get("/projects")
 def list_projects(db: Session = Depends(get_db)):
     rows = db.execute(text("""
-        SELECT id, name, location_text, sponsor, created_at
+        SELECT
+            id, name, location_text, sponsor, planting_model, allow_existing_tree_link, default_existing_tree_scope, created_at
         FROM tree_projects
         ORDER BY created_at DESC
     """)).mappings().all()
@@ -1634,7 +1950,8 @@ def list_projects(db: Session = Depends(get_db)):
 @router.get("/projects/{project_id}")
 def get_project(project_id: int, db: Session = Depends(get_db)):
     project = db.execute(text("""
-        SELECT id, name, location_text, sponsor, created_at
+        SELECT
+            id, name, location_text, sponsor, planting_model, allow_existing_tree_link, default_existing_tree_scope, created_at
         FROM tree_projects
         WHERE id = :project_id
     """), {"project_id": project_id}).mappings().first()
@@ -1643,39 +1960,101 @@ def get_project(project_id: int, db: Session = Depends(get_db)):
 
     stats_rows = db.execute(
         text("""
-            SELECT status, COUNT(*) AS count
+            SELECT status, COALESCE(count_in_planting_kpis, TRUE) AS in_scope, COUNT(*) AS count
             FROM trees
             WHERE project_id = :project_id
-            GROUP BY status
+            GROUP BY status, COALESCE(count_in_planting_kpis, TRUE)
         """),
         {"project_id": project_id},
     ).mappings().all()
     status_counts: dict[str, int] = {}
+    status_counts_all: dict[str, int] = {}
     for row in stats_rows:
         status_key = _normalize_tree_status(row.get("status"))
-        status_counts[status_key] = status_counts.get(status_key, 0) + int(row.get("count") or 0)
+        row_count = int(row.get("count") or 0)
+        status_counts_all[status_key] = status_counts_all.get(status_key, 0) + row_count
+        if bool(row.get("in_scope")):
+            status_counts[status_key] = status_counts.get(status_key, 0) + row_count
 
     total = sum(status_counts.values())
     alive = sum(status_counts.get(status_key, 0) for status_key in HEALTHY_TREE_STATUSES)
     dead = sum(status_counts.get(status_key, 0) for status_key in DEAD_TREE_STATUSES)
     needs_attention = sum(status_counts.get(status_key, 0) for status_key in ATTENTION_TREE_STATUSES)
     survival_rate = round((alive / total) * 100, 1) if total else 0.0
+    total_all = sum(status_counts_all.values())
 
     # Carbon summary
     tree_rows_for_carbon = db.execute(text("""
         SELECT id, species, planting_date, status, created_at
-        FROM trees WHERE project_id = :project_id
+        FROM trees
+        WHERE project_id = :project_id
+          AND COALESCE(count_in_carbon_scope, TRUE) = TRUE
     """), {"project_id": project_id}).mappings().all()
     carbon = compute_project_carbon([dict(r) for r in tree_rows_for_carbon])
+
+    custodian_summary = db.execute(
+        text(
+            """
+            SELECT
+                COUNT(*) AS total_custodians,
+                SUM(CASE WHEN LOWER(COALESCE(custodian_type, '')) = 'household' THEN 1 ELSE 0 END) AS households,
+                SUM(CASE WHEN LOWER(COALESCE(custodian_type, '')) = 'school' THEN 1 ELSE 0 END) AS schools,
+                SUM(CASE WHEN LOWER(COALESCE(custodian_type, '')) = 'community_group' THEN 1 ELSE 0 END) AS community_groups
+            FROM green_custodians
+            WHERE project_id = :project_id
+            """
+        ),
+        {"project_id": project_id},
+    ).mappings().first() or {}
+    distribution_summary = db.execute(
+        text(
+            """
+            SELECT
+                COUNT(*) AS events_total,
+                COALESCE(SUM(quantity), 0) AS seedlings_distributed
+            FROM green_distribution_events
+            WHERE project_id = :project_id
+            """
+        ),
+        {"project_id": project_id},
+    ).mappings().first() or {}
+    allocations_summary = db.execute(
+        text(
+            """
+            SELECT
+                COUNT(*) AS allocations_total,
+                COALESCE(SUM(quantity_allocated), 0) AS allocated_seedlings
+            FROM green_distribution_allocations
+            WHERE project_id = :project_id
+            """
+        ),
+        {"project_id": project_id},
+    ).mappings().first() or {}
 
     return {
         **dict(project),
         "stats": {
             "total": total,
+            "total_all": total_all,
             "alive": alive,
             "dead": dead,
             "needs_attention": needs_attention,
             "survival_rate": survival_rate,
+        },
+        "settings": {
+            "planting_model": _normalize_planting_model(project.get("planting_model")),
+            "allow_existing_tree_link": bool(project.get("allow_existing_tree_link")),
+            "default_existing_tree_scope": _normalize_existing_tree_scope(project.get("default_existing_tree_scope")),
+        },
+        "community": {
+            "custodians_total": int(custodian_summary.get("total_custodians") or 0),
+            "households": int(custodian_summary.get("households") or 0),
+            "schools": int(custodian_summary.get("schools") or 0),
+            "community_groups": int(custodian_summary.get("community_groups") or 0),
+            "distribution_events": int(distribution_summary.get("events_total") or 0),
+            "seedlings_distributed": int(distribution_summary.get("seedlings_distributed") or 0),
+            "distribution_allocations": int(allocations_summary.get("allocations_total") or 0),
+            "seedlings_allocated": int(allocations_summary.get("allocated_seedlings") or 0),
         },
         "carbon": {
             "current_co2_kg": carbon["current_co2_kg"],
@@ -1694,13 +2073,780 @@ def get_project(project_id: int, db: Session = Depends(get_db)):
 @router.get("/projects/{project_id}/trees")
 def list_trees(project_id: int, db: Session = Depends(get_db)):
     rows = db.execute(text("""
-        SELECT id, project_id, species, planting_date, status, notes, photo_url, created_by, created_at,
+        SELECT
+               t.id,
+               t.project_id,
+               t.species,
+               t.planting_date,
+               t.status,
+               t.notes,
+               t.photo_url,
+               t.created_by,
+               t.created_at,
+               t.tree_origin,
+               t.custodian_id,
+               c.name AS custodian_name,
+               t.custody_started_at,
+               t.attribution_scope,
+               t.count_in_planting_kpis,
+               t.count_in_carbon_scope,
+               t.source_project_id,
+               t.tree_height_m,
                ST_X(geom) AS lng, ST_Y(geom) AS lat
-        FROM trees
-        WHERE project_id = :project_id
-        ORDER BY created_at DESC
+        FROM trees t
+        LEFT JOIN green_custodians c ON c.id = t.custodian_id
+        WHERE t.project_id = :project_id
+        ORDER BY t.created_at DESC
     """), {"project_id": project_id}).mappings().all()
     return [dict(r) for r in rows]
+
+
+@router.get("/projects/{project_id}/custodians")
+def list_custodians(project_id: int, db: Session = Depends(get_db)):
+    _get_project_settings(db, project_id)
+    rows = db.execute(
+        text(
+            """
+            SELECT
+                id,
+                project_id,
+                custodian_type,
+                name,
+                phone,
+                address_text,
+                community_name,
+                verification_status,
+                created_by,
+                created_at,
+                updated_at
+            FROM green_custodians
+            WHERE project_id = :project_id
+            ORDER BY created_at DESC, id DESC
+            """
+        ),
+        {"project_id": project_id},
+    ).mappings().all()
+    return [dict(row) for row in rows]
+
+
+@router.post("/projects/{project_id}/custodians")
+def create_custodian(
+    project_id: int,
+    db: Session = Depends(get_db),
+    custodian_type: str = Body(default="household"),
+    name: str = Body(...),
+    phone: str | None = Body(default=None),
+    address_text: str | None = Body(default=None),
+    community_name: str | None = Body(default=None),
+    verification_status: str = Body(default="pending"),
+    created_by: str | None = Body(default=None),
+):
+    _get_project_settings(db, project_id)
+    clean_name = (name or "").strip()
+    if not clean_name:
+        raise HTTPException(status_code=400, detail="Custodian name is required")
+
+    row = db.execute(
+        text(
+            """
+            INSERT INTO green_custodians (
+                project_id, custodian_type, name, phone, address_text, community_name, verification_status, created_by
+            )
+            VALUES (
+                :project_id, :custodian_type, :name, :phone, :address_text, :community_name, :verification_status, :created_by
+            )
+            RETURNING
+                id,
+                project_id,
+                custodian_type,
+                name,
+                phone,
+                address_text,
+                community_name,
+                verification_status,
+                created_by,
+                created_at,
+                updated_at
+            """
+        ),
+        {
+            "project_id": project_id,
+            "custodian_type": _normalize_custodian_type(custodian_type),
+            "name": clean_name,
+            "phone": (phone or "").strip() or None,
+            "address_text": (address_text or "").strip() or None,
+            "community_name": (community_name or "").strip() or None,
+            "verification_status": (_normalize_name(verification_status) or "pending"),
+            "created_by": (created_by or "").strip() or None,
+        },
+    ).mappings().first()
+    _log_audit_event(
+        db,
+        project_id=project_id,
+        entity_type="custodian",
+        entity_id=int(row.get("id")),
+        action="custodian_created",
+        actor=(created_by or "").strip() or None,
+        details={
+            "custodian_type": row.get("custodian_type"),
+            "name": row.get("name"),
+            "community_name": row.get("community_name"),
+        },
+    )
+    db.commit()
+    return dict(row)
+
+
+@router.patch("/custodians/{custodian_id}")
+def update_custodian(
+    custodian_id: int,
+    db: Session = Depends(get_db),
+    custodian_type: str | None = Body(default=None),
+    name: str | None = Body(default=None),
+    phone: str | None = Body(default=None),
+    address_text: str | None = Body(default=None),
+    community_name: str | None = Body(default=None),
+    verification_status: str | None = Body(default=None),
+):
+    existing = db.execute(
+        text(
+            """
+            SELECT
+                id, project_id, custodian_type, name, phone, address_text, community_name, verification_status
+            FROM green_custodians
+            WHERE id = :custodian_id
+            """
+        ),
+        {"custodian_id": custodian_id},
+    ).mappings().first()
+    if not existing:
+        raise HTTPException(status_code=404, detail="Custodian not found")
+
+    next_name = (name or "").strip() if name is not None else str(existing.get("name") or "").strip()
+    if not next_name:
+        raise HTTPException(status_code=400, detail="Custodian name is required")
+
+    row = db.execute(
+        text(
+            """
+            UPDATE green_custodians
+            SET
+                custodian_type = COALESCE(:custodian_type, custodian_type),
+                name = :name,
+                phone = COALESCE(:phone, phone),
+                address_text = COALESCE(:address_text, address_text),
+                community_name = COALESCE(:community_name, community_name),
+                verification_status = COALESCE(:verification_status, verification_status),
+                updated_at = NOW()
+            WHERE id = :custodian_id
+            RETURNING
+                id,
+                project_id,
+                custodian_type,
+                name,
+                phone,
+                address_text,
+                community_name,
+                verification_status,
+                created_by,
+                created_at,
+                updated_at
+            """
+        ),
+        {
+            "custodian_id": custodian_id,
+            "custodian_type": _normalize_custodian_type(custodian_type) if custodian_type is not None else None,
+            "name": next_name,
+            "phone": ((phone or "").strip() or None) if phone is not None else None,
+            "address_text": ((address_text or "").strip() or None) if address_text is not None else None,
+            "community_name": ((community_name or "").strip() or None) if community_name is not None else None,
+            "verification_status": (_normalize_name(verification_status) or "pending") if verification_status is not None else None,
+        },
+    ).mappings().first()
+    _log_audit_event(
+        db,
+        project_id=int(existing.get("project_id")),
+        entity_type="custodian",
+        entity_id=custodian_id,
+        action="custodian_updated",
+        details={"before": dict(existing), "after": dict(row)},
+    )
+    db.commit()
+    return dict(row)
+
+
+@router.get("/projects/{project_id}/distribution-events")
+def list_distribution_events(project_id: int, db: Session = Depends(get_db)):
+    _get_project_settings(db, project_id)
+    rows = db.execute(
+        text(
+            """
+            SELECT
+                id,
+                project_id,
+                event_date,
+                species,
+                quantity,
+                source_batch_ref,
+                distributed_by,
+                notes,
+                created_at,
+                updated_at
+            FROM green_distribution_events
+            WHERE project_id = :project_id
+            ORDER BY event_date DESC, id DESC
+            """
+        ),
+        {"project_id": project_id},
+    ).mappings().all()
+    return [dict(row) for row in rows]
+
+
+@router.post("/projects/{project_id}/distribution-events")
+def create_distribution_event(
+    project_id: int,
+    db: Session = Depends(get_db),
+    event_date: str = Body(...),
+    species: str | None = Body(default=None),
+    quantity: int = Body(default=0),
+    source_batch_ref: str | None = Body(default=None),
+    distributed_by: str | None = Body(default=None),
+    notes: str | None = Body(default=None),
+):
+    _get_project_settings(db, project_id)
+    event_date_value = _parse_date_value(event_date)
+    if event_date_value is None:
+        raise HTTPException(status_code=400, detail="event_date is required")
+    if int(quantity or 0) < 0:
+        raise HTTPException(status_code=400, detail="quantity cannot be negative")
+
+    row = db.execute(
+        text(
+            """
+            INSERT INTO green_distribution_events (
+                project_id, event_date, species, quantity, source_batch_ref, distributed_by, notes
+            )
+            VALUES (
+                :project_id, :event_date, :species, :quantity, :source_batch_ref, :distributed_by, :notes
+            )
+            RETURNING
+                id,
+                project_id,
+                event_date,
+                species,
+                quantity,
+                source_batch_ref,
+                distributed_by,
+                notes,
+                created_at,
+                updated_at
+            """
+        ),
+        {
+            "project_id": project_id,
+            "event_date": event_date_value,
+            "species": (species or "").strip() or None,
+            "quantity": int(quantity or 0),
+            "source_batch_ref": (source_batch_ref or "").strip() or None,
+            "distributed_by": (distributed_by or "").strip() or None,
+            "notes": (notes or "").strip() or None,
+        },
+    ).mappings().first()
+    _log_audit_event(
+        db,
+        project_id=project_id,
+        entity_type="distribution_event",
+        entity_id=int(row.get("id")),
+        action="distribution_event_created",
+        actor=(distributed_by or "").strip() or None,
+        details={
+            "event_date": _to_date_input(event_date_value),
+            "species": row.get("species"),
+            "quantity": int(row.get("quantity") or 0),
+        },
+    )
+    db.commit()
+    return dict(row)
+
+
+@router.get("/projects/{project_id}/distribution-allocations")
+def list_distribution_allocations(project_id: int, db: Session = Depends(get_db)):
+    _get_project_settings(db, project_id)
+    rows = db.execute(
+        text(
+            """
+            SELECT
+                a.id,
+                a.event_id,
+                a.project_id,
+                a.custodian_id,
+                c.name AS custodian_name,
+                c.custodian_type,
+                e.event_date,
+                e.species,
+                e.quantity AS event_quantity,
+                a.quantity_allocated,
+                a.expected_planting_start,
+                a.expected_planting_end,
+                a.followup_cycle_days,
+                a.notes,
+                a.created_at,
+                a.updated_at
+            FROM green_distribution_allocations a
+            JOIN green_distribution_events e ON e.id = a.event_id
+            JOIN green_custodians c ON c.id = a.custodian_id
+            WHERE a.project_id = :project_id
+            ORDER BY e.event_date DESC, a.created_at DESC, a.id DESC
+            """
+        ),
+        {"project_id": project_id},
+    ).mappings().all()
+    return [dict(row) for row in rows]
+
+
+@router.post("/distribution-events/{event_id}/allocations")
+def upsert_distribution_allocation(
+    event_id: int,
+    db: Session = Depends(get_db),
+    custodian_id: int = Body(...),
+    quantity_allocated: int = Body(default=0),
+    expected_planting_start: str | None = Body(default=None),
+    expected_planting_end: str | None = Body(default=None),
+    followup_cycle_days: int = Body(default=30),
+    notes: str | None = Body(default=None),
+):
+    event_row = db.execute(
+        text("SELECT id, project_id, event_date FROM green_distribution_events WHERE id = :event_id"),
+        {"event_id": event_id},
+    ).mappings().first()
+    if not event_row:
+        raise HTTPException(status_code=404, detail="Distribution event not found")
+
+    custodian_row = db.execute(
+        text("SELECT id, project_id, name FROM green_custodians WHERE id = :custodian_id"),
+        {"custodian_id": custodian_id},
+    ).mappings().first()
+    if not custodian_row:
+        raise HTTPException(status_code=404, detail="Custodian not found")
+    if int(custodian_row.get("project_id") or 0) != int(event_row.get("project_id") or 0):
+        raise HTTPException(status_code=400, detail="Custodian and event must belong to the same project")
+
+    if int(quantity_allocated or 0) < 0:
+        raise HTTPException(status_code=400, detail="quantity_allocated cannot be negative")
+    if int(followup_cycle_days or 0) < 1 or int(followup_cycle_days or 0) > 365:
+        raise HTTPException(status_code=400, detail="followup_cycle_days must be between 1 and 365")
+
+    start_date = _parse_date_value(expected_planting_start)
+    end_date = _parse_date_value(expected_planting_end)
+    if start_date and end_date and end_date < start_date:
+        raise HTTPException(status_code=400, detail="expected_planting_end cannot be before expected_planting_start")
+
+    row = db.execute(
+        text(
+            """
+            INSERT INTO green_distribution_allocations (
+                event_id, project_id, custodian_id, quantity_allocated,
+                expected_planting_start, expected_planting_end, followup_cycle_days, notes
+            )
+            VALUES (
+                :event_id, :project_id, :custodian_id, :quantity_allocated,
+                :expected_planting_start, :expected_planting_end, :followup_cycle_days, :notes
+            )
+            ON CONFLICT (event_id, custodian_id)
+            DO UPDATE SET
+                quantity_allocated = EXCLUDED.quantity_allocated,
+                expected_planting_start = COALESCE(EXCLUDED.expected_planting_start, green_distribution_allocations.expected_planting_start),
+                expected_planting_end = COALESCE(EXCLUDED.expected_planting_end, green_distribution_allocations.expected_planting_end),
+                followup_cycle_days = EXCLUDED.followup_cycle_days,
+                notes = COALESCE(EXCLUDED.notes, green_distribution_allocations.notes),
+                updated_at = NOW()
+            RETURNING
+                id,
+                event_id,
+                project_id,
+                custodian_id,
+                quantity_allocated,
+                expected_planting_start,
+                expected_planting_end,
+                followup_cycle_days,
+                notes,
+                created_at,
+                updated_at
+            """
+        ),
+        {
+            "event_id": event_id,
+            "project_id": int(event_row.get("project_id")),
+            "custodian_id": int(custodian_id),
+            "quantity_allocated": int(quantity_allocated or 0),
+            "expected_planting_start": start_date,
+            "expected_planting_end": end_date,
+            "followup_cycle_days": int(followup_cycle_days or 30),
+            "notes": (notes or "").strip() or None,
+        },
+    ).mappings().first()
+    _log_audit_event(
+        db,
+        project_id=int(event_row.get("project_id")),
+        entity_type="distribution_allocation",
+        entity_id=int(row.get("id")),
+        action="distribution_allocation_upserted",
+        details={
+            "event_id": int(event_id),
+            "custodian_id": int(custodian_id),
+            "quantity_allocated": int(row.get("quantity_allocated") or 0),
+            "followup_cycle_days": int(row.get("followup_cycle_days") or 0),
+        },
+    )
+    db.commit()
+    return dict(row)
+
+
+@router.get("/projects/{project_id}/existing-tree-candidates")
+def list_existing_tree_candidates(
+    project_id: int,
+    source_project_id: int = Query(...),
+    limit: int = Query(default=500, ge=1, le=2000),
+    db: Session = Depends(get_db),
+):
+    _get_project_settings(db, project_id)
+    _get_project_settings(db, source_project_id)
+    if int(project_id) == int(source_project_id):
+        return {"source_project_id": source_project_id, "target_project_id": project_id, "items": []}
+
+    rows = db.execute(
+        text(
+            """
+            SELECT
+                t.id,
+                t.project_id,
+                t.species,
+                t.planting_date,
+                t.status,
+                t.tree_origin,
+                t.tree_height_m,
+                t.created_by,
+                t.created_at,
+                t.source_project_id,
+                ST_X(t.geom) AS lng,
+                ST_Y(t.geom) AS lat
+            FROM trees t
+            WHERE t.project_id = :source_project_id
+            ORDER BY t.created_at DESC, t.id DESC
+            LIMIT :limit
+            """
+        ),
+        {"source_project_id": source_project_id, "limit": int(limit)},
+    ).mappings().all()
+    linked_rows = db.execute(
+        text(
+            """
+            SELECT source_tree_id
+            FROM tree_project_links
+            WHERE source_project_id = :source_project_id
+              AND target_project_id = :target_project_id
+              AND link_type = 'reference'
+            """
+        ),
+        {"source_project_id": source_project_id, "target_project_id": project_id},
+    ).mappings().all()
+    linked_tree_ids = {int(row.get("source_tree_id") or 0) for row in linked_rows}
+    items = []
+    for row in rows:
+        item = dict(row)
+        item["already_referenced"] = int(item.get("id") or 0) in linked_tree_ids
+        items.append(item)
+    return {
+        "source_project_id": source_project_id,
+        "target_project_id": project_id,
+        "items": items,
+    }
+
+
+@router.post("/projects/{project_id}/existing-trees/import")
+def import_existing_trees(
+    project_id: int,
+    db: Session = Depends(get_db),
+    source_project_id: int = Body(...),
+    tree_ids: list[int] = Body(...),
+    mode: str = Body(default="reference"),
+    actor_name: str | None = Body(default=None),
+    attribution_scope: str | None = Body(default=None),
+    count_in_planting_kpis: bool | None = Body(default=None),
+    count_in_carbon_scope: bool | None = Body(default=None),
+):
+    target_settings = _get_project_settings(db, project_id)
+    _get_project_settings(db, source_project_id)
+    if int(project_id) == int(source_project_id):
+        raise HTTPException(status_code=400, detail="source_project_id must be different from target project")
+    if not bool(target_settings.get("allow_existing_tree_link")):
+        raise HTTPException(status_code=400, detail="Target project does not allow existing tree import/linking.")
+
+    mode_key = _normalize_name(mode)
+    if mode_key not in {"transfer", "reference"}:
+        raise HTTPException(status_code=400, detail="mode must be 'transfer' or 'reference'")
+
+    normalized_tree_ids = sorted({int(item) for item in (tree_ids or []) if int(item) > 0})
+    if not normalized_tree_ids:
+        raise HTTPException(status_code=400, detail="tree_ids is required")
+
+    source_rows = db.execute(
+        text(
+            """
+            SELECT
+                id,
+                project_id,
+                geom,
+                species,
+                planting_date,
+                status,
+                notes,
+                photo_url,
+                created_by,
+                created_at,
+                tree_origin,
+                tree_height_m,
+                source_project_id
+            FROM trees
+            WHERE project_id = :source_project_id
+              AND id = ANY(:tree_ids)
+            ORDER BY id
+            """
+        ),
+        {"source_project_id": source_project_id, "tree_ids": normalized_tree_ids},
+    ).mappings().all()
+    if not source_rows:
+        raise HTTPException(status_code=404, detail="No matching trees found in source project")
+
+    referenced_lookup = set()
+    if mode_key == "reference":
+        linked = db.execute(
+            text(
+                """
+                SELECT source_tree_id
+                FROM tree_project_links
+                WHERE source_project_id = :source_project_id
+                  AND target_project_id = :target_project_id
+                  AND link_type = 'reference'
+                """
+            ),
+            {"source_project_id": source_project_id, "target_project_id": project_id},
+        ).mappings().all()
+        referenced_lookup = {int(row.get("source_tree_id") or 0) for row in linked}
+
+    imported_items: list[dict] = []
+    moved_count = 0
+    referenced_count = 0
+    skipped_count = 0
+
+    resolved_scope, default_planting_scope, default_carbon_scope = _resolve_tree_scope_defaults(
+        tree_origin="existing_inventory",
+        attribution_scope=attribution_scope,
+        count_in_planting_kpis=count_in_planting_kpis,
+        count_in_carbon_scope=count_in_carbon_scope,
+        project_existing_scope=target_settings.get("default_existing_tree_scope"),
+    )
+    actor_clean = (actor_name or "").strip() or None
+
+    for row in source_rows:
+        source_tree_id = int(row.get("id") or 0)
+        if source_tree_id <= 0:
+            continue
+        if mode_key == "reference" and source_tree_id in referenced_lookup:
+            skipped_count += 1
+            imported_items.append(
+                {
+                    "source_tree_id": source_tree_id,
+                    "target_tree_id": None,
+                    "mode": "reference",
+                    "status": "skipped_already_referenced",
+                }
+            )
+            continue
+
+        if mode_key == "transfer":
+            target_tree_id = db.execute(
+                text(
+                    """
+                    UPDATE trees
+                    SET
+                        project_id = :target_project_id,
+                        tree_origin = 'existing_inventory',
+                        custodian_id = NULL,
+                        custody_started_at = COALESCE(custody_started_at, CURRENT_DATE),
+                        attribution_scope = :attribution_scope,
+                        count_in_planting_kpis = :count_in_planting_kpis,
+                        count_in_carbon_scope = :count_in_carbon_scope,
+                        source_project_id = COALESCE(source_project_id, :source_project_id)
+                    WHERE id = :tree_id
+                    RETURNING id
+                    """
+                ),
+                {
+                    "target_project_id": project_id,
+                    "attribution_scope": resolved_scope,
+                    "count_in_planting_kpis": default_planting_scope,
+                    "count_in_carbon_scope": default_carbon_scope,
+                    "source_project_id": source_project_id,
+                    "tree_id": source_tree_id,
+                },
+            ).scalar()
+            if not target_tree_id:
+                skipped_count += 1
+                continue
+            moved_count += 1
+            imported_items.append(
+                {
+                    "source_tree_id": source_tree_id,
+                    "target_tree_id": int(target_tree_id),
+                    "mode": "transfer",
+                    "status": "moved",
+                }
+            )
+            db.execute(
+                text(
+                    """
+                    INSERT INTO tree_project_links (
+                        source_project_id, target_project_id, source_tree_id, target_tree_id, link_type, transfer_mode, created_by
+                    )
+                    VALUES (
+                        :source_project_id, :target_project_id, :source_tree_id, :target_tree_id, :link_type, 'transfer', :created_by
+                    )
+                    ON CONFLICT DO NOTHING
+                    """
+                ),
+                {
+                    "source_project_id": source_project_id,
+                    "target_project_id": project_id,
+                    "source_tree_id": source_tree_id,
+                    "target_tree_id": int(target_tree_id),
+                    "link_type": "owner",
+                    "created_by": actor_clean,
+                },
+            )
+            _record_tree_status_history(
+                db,
+                tree_id=int(target_tree_id),
+                project_id=int(project_id),
+                status=_normalize_tree_status(row.get("status")),
+                status_date=date.today(),
+                source="existing_transfer",
+                changed_by=actor_clean,
+                notes=f"Transferred from project {source_project_id}",
+            )
+        else:
+            target_tree_id = db.execute(
+                text(
+                    """
+                    INSERT INTO trees (
+                        project_id, geom, species, planting_date, status, notes, photo_url, created_by,
+                        tree_origin, custodian_id, custody_started_at, attribution_scope,
+                        count_in_planting_kpis, count_in_carbon_scope, source_project_id, tree_height_m
+                    )
+                    SELECT
+                        :target_project_id,
+                        geom,
+                        species,
+                        planting_date,
+                        status,
+                        notes,
+                        photo_url,
+                        created_by,
+                        'existing_inventory',
+                        NULL,
+                        CURRENT_DATE,
+                        :attribution_scope,
+                        :count_in_planting_kpis,
+                        :count_in_carbon_scope,
+                        :source_project_id,
+                        tree_height_m
+                    FROM trees
+                    WHERE id = :tree_id
+                    RETURNING id
+                    """
+                ),
+                {
+                    "target_project_id": project_id,
+                    "attribution_scope": resolved_scope,
+                    "count_in_planting_kpis": default_planting_scope,
+                    "count_in_carbon_scope": default_carbon_scope,
+                    "source_project_id": source_project_id,
+                    "tree_id": source_tree_id,
+                },
+            ).scalar()
+            if not target_tree_id:
+                skipped_count += 1
+                continue
+            referenced_count += 1
+            imported_items.append(
+                {
+                    "source_tree_id": source_tree_id,
+                    "target_tree_id": int(target_tree_id),
+                    "mode": "reference",
+                    "status": "referenced",
+                }
+            )
+            db.execute(
+                text(
+                    """
+                    INSERT INTO tree_project_links (
+                        source_project_id, target_project_id, source_tree_id, target_tree_id, link_type, transfer_mode, created_by
+                    )
+                    VALUES (
+                        :source_project_id, :target_project_id, :source_tree_id, :target_tree_id, 'reference', 'reference', :created_by
+                    )
+                    ON CONFLICT DO NOTHING
+                    """
+                ),
+                {
+                    "source_project_id": source_project_id,
+                    "target_project_id": project_id,
+                    "source_tree_id": source_tree_id,
+                    "target_tree_id": int(target_tree_id),
+                    "created_by": actor_clean,
+                },
+            )
+            _record_tree_status_history(
+                db,
+                tree_id=int(target_tree_id),
+                project_id=int(project_id),
+                status=_normalize_tree_status(row.get("status")),
+                status_date=_parse_date_value(row.get("planting_date")) or date.today(),
+                source="existing_reference",
+                changed_by=actor_clean,
+                notes=f"Referenced from project {source_project_id}, tree {source_tree_id}",
+            )
+
+    _log_audit_event(
+        db,
+        project_id=project_id,
+        entity_type="tree_import",
+        entity_id=None,
+        action="existing_trees_imported",
+        actor=actor_clean,
+        details={
+            "source_project_id": source_project_id,
+            "mode": mode_key,
+            "requested_count": len(normalized_tree_ids),
+            "moved_count": moved_count,
+            "referenced_count": referenced_count,
+            "skipped_count": skipped_count,
+            "attribution_scope": resolved_scope,
+            "count_in_planting_kpis": default_planting_scope,
+            "count_in_carbon_scope": default_carbon_scope,
+        },
+    )
+    _refresh_project_alerts(db, project_id)
+    db.commit()
+    return {
+        "target_project_id": project_id,
+        "source_project_id": source_project_id,
+        "mode": mode_key,
+        "moved_count": moved_count,
+        "referenced_count": referenced_count,
+        "skipped_count": skipped_count,
+        "items": imported_items,
+    }
 
 
 @router.get("/projects/{project_id}/species-maturity")
@@ -1792,6 +2938,7 @@ def carbon_summary(project_id: int, projection_years: int = Query(default=40), d
         SELECT id, species, planting_date, status, created_at
         FROM trees
         WHERE project_id = :project_id
+          AND COALESCE(count_in_carbon_scope, TRUE) = TRUE
     """), {"project_id": project_id}).mappings().all()
     trees = [dict(r) for r in tree_rows]
     summary = compute_project_carbon(trees, projection_years)
@@ -1812,6 +2959,7 @@ def carbon_projection(project_id: int, years: int = Query(default=30), db: Sessi
         SELECT id, species, planting_date, status, created_at
         FROM trees
         WHERE project_id = :project_id
+          AND COALESCE(count_in_carbon_scope, TRUE) = TRUE
     """), {"project_id": project_id}).mappings().all()
     trees = [dict(r) for r in tree_rows]
     projection = generate_co2_projection_table(trees, years)
@@ -1870,16 +3018,77 @@ def add_tree(
     notes: str = Body(default=""),
     photo_url: str = Body(default=""),
     created_by: str = Body(default=""),
+    tree_origin: str = Body(default="new_planting"),
+    custodian_id: int | None = Body(default=None),
+    custody_started_at: str | None = Body(default=None),
+    attribution_scope: str | None = Body(default=None),
+    count_in_planting_kpis: bool | None = Body(default=None),
+    count_in_carbon_scope: bool | None = Body(default=None),
+    source_project_id: int | None = Body(default=None),
+    tree_height_m: float | None = Body(default=None),
 ):
+    project_settings = _get_project_settings(db, int(project_id))
+    origin = _normalize_tree_origin(tree_origin)
+    if origin not in TREE_ORIGIN_VALUES:
+        raise HTTPException(status_code=400, detail="Invalid tree_origin")
+
+    if tree_height_m is not None:
+        try:
+            tree_height_value = float(tree_height_m)
+        except Exception:
+            raise HTTPException(status_code=400, detail="tree_height_m must be numeric")
+        if tree_height_value < 0 or tree_height_value > 120:
+            raise HTTPException(status_code=400, detail="tree_height_m must be between 0 and 120")
+    else:
+        tree_height_value = None
+
+    resolved_scope, planting_scope_flag, carbon_scope_flag = _resolve_tree_scope_defaults(
+        tree_origin=origin,
+        attribution_scope=attribution_scope,
+        count_in_planting_kpis=count_in_planting_kpis,
+        count_in_carbon_scope=count_in_carbon_scope,
+        project_existing_scope=project_settings.get("default_existing_tree_scope"),
+    )
+
+    custodian_id_value = int(custodian_id) if custodian_id is not None else None
+    if custodian_id_value is not None:
+        custodian_row = db.execute(
+            text(
+                """
+                SELECT id, project_id
+                FROM green_custodians
+                WHERE id = :custodian_id
+                """
+            ),
+            {"custodian_id": custodian_id_value},
+        ).mappings().first()
+        if not custodian_row:
+            raise HTTPException(status_code=404, detail="Custodian not found")
+        if int(custodian_row.get("project_id") or 0) != int(project_id):
+            raise HTTPException(status_code=400, detail="Custodian belongs to a different project")
+
+    source_project_id_value = int(source_project_id) if source_project_id is not None else None
+    if source_project_id_value is not None and source_project_id_value > 0:
+        source_project_exists = db.execute(
+            text("SELECT 1 FROM tree_projects WHERE id = :project_id"),
+            {"project_id": source_project_id_value},
+        ).scalar()
+        if not source_project_exists:
+            raise HTTPException(status_code=404, detail="source_project_id not found")
+
     requested_status = _normalize_tree_status(status or "alive")
     if requested_status not in TREE_STATUS_VALUES:
         raise HTTPException(status_code=400, detail="Invalid status")
     # New planting is supervisor-reviewed first; tree remains pending until approval.
-    normalized_status = "pending_planting"
+    normalized_status = "pending_planting" if origin == "new_planting" else requested_status
     created_by_clean = (created_by or "").strip()
     reported_status = requested_status if requested_status != "pending_planting" else "alive"
     row = db.execute(text("""
-        INSERT INTO trees (project_id, geom, species, planting_date, status, notes, photo_url, created_by)
+        INSERT INTO trees (
+            project_id, geom, species, planting_date, status, notes, photo_url, created_by,
+            tree_origin, custodian_id, custody_started_at, attribution_scope,
+            count_in_planting_kpis, count_in_carbon_scope, source_project_id, tree_height_m
+        )
         VALUES (
             :project_id,
             ST_SetSRID(ST_MakePoint(:lng, :lat), 4326),
@@ -1888,7 +3097,15 @@ def add_tree(
             :status,
             :notes,
             :photo_url,
-            :created_by
+            :created_by,
+            :tree_origin,
+            :custodian_id,
+            :custody_started_at,
+            :attribution_scope,
+            :count_in_planting_kpis,
+            :count_in_carbon_scope,
+            :source_project_id,
+            :tree_height_m
         )
         RETURNING id
     """), {
@@ -1901,6 +3118,14 @@ def add_tree(
         "notes": notes or None,
         "photo_url": photo_url or None,
         "created_by": created_by_clean or None,
+        "tree_origin": origin,
+        "custodian_id": custodian_id_value,
+        "custody_started_at": custody_started_at,
+        "attribution_scope": resolved_scope,
+        "count_in_planting_kpis": planting_scope_flag,
+        "count_in_carbon_scope": carbon_scope_flag,
+        "source_project_id": source_project_id_value,
+        "tree_height_m": tree_height_value,
     }).scalar()
 
     _record_tree_status_history(
@@ -1909,13 +3134,13 @@ def add_tree(
         project_id=int(project_id),
         status=normalized_status,
         status_date=_parse_date_value(planting_date) or date.today(),
-        source="tree_created",
+        source="tree_created_existing" if origin != "new_planting" else "tree_created",
         changed_by=created_by_clean or None,
         notes="Initial tree record created",
     )
 
     review_task_id = None
-    if created_by_clean:
+    if created_by_clean and origin == "new_planting":
         review_task_id = db.execute(
             text(
                 """
@@ -1981,6 +3206,14 @@ def add_tree(
             "planting_date": planting_date,
             "lng": lng,
             "lat": lat,
+            "tree_origin": origin,
+            "custodian_id": custodian_id_value,
+            "custody_started_at": custody_started_at,
+            "attribution_scope": resolved_scope,
+            "count_in_planting_kpis": planting_scope_flag,
+            "count_in_carbon_scope": carbon_scope_flag,
+            "source_project_id": source_project_id_value,
+            "tree_height_m": tree_height_value,
             "review_task_id": int(review_task_id) if review_task_id else None,
         },
     )
@@ -1999,16 +3232,108 @@ def update_tree(
     notes: str | None = Body(default=None),
     photo_url: str | None = Body(default=None),
     actor_name: str | None = Body(default=None),
+    tree_origin: str | None = Body(default=None),
+    custodian_id: int | None = Body(default=None),
+    custody_started_at: str | None = Body(default=None),
+    attribution_scope: str | None = Body(default=None),
+    count_in_planting_kpis: bool | None = Body(default=None),
+    count_in_carbon_scope: bool | None = Body(default=None),
+    source_project_id: int | None = Body(default=None),
+    tree_height_m: float | None = Body(default=None),
 ):
     normalized_status = _normalize_tree_status(status) if status is not None else None
     if normalized_status is not None and normalized_status not in TREE_STATUS_VALUES:
         raise HTTPException(status_code=400, detail="Invalid status")
+    normalized_origin = _normalize_tree_origin(tree_origin) if tree_origin is not None else None
+    if normalized_origin is not None and normalized_origin not in TREE_ORIGIN_VALUES:
+        raise HTTPException(status_code=400, detail="Invalid tree_origin")
+    normalized_attribution_scope = (
+        _normalize_tree_attribution_scope(attribution_scope) if attribution_scope is not None else None
+    )
+    if normalized_attribution_scope is not None and normalized_attribution_scope not in TREE_ATTRIBUTION_SCOPE_VALUES:
+        raise HTTPException(status_code=400, detail="Invalid attribution_scope")
+
+    tree_height_value = None
+    if tree_height_m is not None:
+        try:
+            tree_height_value = float(tree_height_m)
+        except Exception:
+            raise HTTPException(status_code=400, detail="tree_height_m must be numeric")
+        if tree_height_value < 0 or tree_height_value > 120:
+            raise HTTPException(status_code=400, detail="tree_height_m must be between 0 and 120")
+
+    source_project_id_value = None
+    if source_project_id is not None:
+        source_project_id_value = int(source_project_id)
+        if source_project_id_value <= 0:
+            raise HTTPException(status_code=400, detail="source_project_id must be positive")
+        source_project_exists = db.execute(
+            text("SELECT 1 FROM tree_projects WHERE id = :project_id"),
+            {"project_id": source_project_id_value},
+        ).scalar()
+        if not source_project_exists:
+            raise HTTPException(status_code=404, detail="source_project_id not found")
+
     existing = db.execute(
-        text("SELECT project_id, species, planting_date, status, notes, photo_url FROM trees WHERE id = :tree_id"),
+        text(
+            """
+            SELECT
+                project_id,
+                species,
+                planting_date,
+                status,
+                notes,
+                photo_url,
+                tree_origin,
+                custodian_id,
+                custody_started_at,
+                attribution_scope,
+                count_in_planting_kpis,
+                count_in_carbon_scope,
+                source_project_id,
+                tree_height_m
+            FROM trees
+            WHERE id = :tree_id
+            """
+        ),
         {"tree_id": tree_id},
     ).mappings().first()
     if not existing:
         raise HTTPException(status_code=404, detail="Tree not found")
+
+    custodian_id_value = int(custodian_id) if custodian_id is not None else None
+    if custodian_id_value is not None:
+        custodian_row = db.execute(
+            text("SELECT id, project_id FROM green_custodians WHERE id = :custodian_id"),
+            {"custodian_id": custodian_id_value},
+        ).mappings().first()
+        if not custodian_row:
+            raise HTTPException(status_code=404, detail="Custodian not found")
+        if int(custodian_row.get("project_id") or 0) != int(existing["project_id"]):
+            raise HTTPException(status_code=400, detail="Custodian belongs to a different project")
+
+    origin_for_scope = normalized_origin if normalized_origin is not None else _normalize_tree_origin(existing.get("tree_origin"))
+    scope_for_resolve = normalized_attribution_scope if normalized_attribution_scope is not None else existing.get("attribution_scope")
+    project_settings = _get_project_settings(db, int(existing["project_id"]))
+    resolved_scope, resolved_count_in_planting_kpis, resolved_count_in_carbon_scope = _resolve_tree_scope_defaults(
+        tree_origin=origin_for_scope,
+        attribution_scope=scope_for_resolve,
+        count_in_planting_kpis=count_in_planting_kpis
+        if count_in_planting_kpis is not None
+        else (
+            bool(existing.get("count_in_planting_kpis"))
+            if normalized_origin is None and normalized_attribution_scope is None
+            else None
+        ),
+        count_in_carbon_scope=count_in_carbon_scope
+        if count_in_carbon_scope is not None
+        else (
+            bool(existing.get("count_in_carbon_scope"))
+            if normalized_origin is None and normalized_attribution_scope is None
+            else None
+        ),
+        project_existing_scope=project_settings.get("default_existing_tree_scope"),
+    )
 
     db.execute(text("""
         UPDATE trees
@@ -2016,7 +3341,15 @@ def update_tree(
             planting_date = COALESCE(:planting_date, planting_date),
             status = COALESCE(:status, status),
             notes = COALESCE(:notes, notes),
-            photo_url = COALESCE(:photo_url, photo_url)
+            photo_url = COALESCE(:photo_url, photo_url),
+            tree_origin = COALESCE(:tree_origin, tree_origin),
+            custodian_id = COALESCE(:custodian_id, custodian_id),
+            custody_started_at = COALESCE(:custody_started_at, custody_started_at),
+            attribution_scope = COALESCE(:attribution_scope, attribution_scope),
+            count_in_planting_kpis = COALESCE(:count_in_planting_kpis, count_in_planting_kpis),
+            count_in_carbon_scope = COALESCE(:count_in_carbon_scope, count_in_carbon_scope),
+            source_project_id = COALESCE(:source_project_id, source_project_id),
+            tree_height_m = COALESCE(:tree_height_m, tree_height_m)
         WHERE id = :tree_id
     """), {
         "species": species,
@@ -2024,6 +3357,14 @@ def update_tree(
         "status": normalized_status,
         "notes": notes,
         "photo_url": photo_url,
+        "tree_origin": normalized_origin,
+        "custodian_id": custodian_id_value,
+        "custody_started_at": custody_started_at,
+        "attribution_scope": resolved_scope if (normalized_attribution_scope is not None or normalized_origin is not None) else None,
+        "count_in_planting_kpis": resolved_count_in_planting_kpis if (count_in_planting_kpis is not None or normalized_origin is not None or normalized_attribution_scope is not None) else None,
+        "count_in_carbon_scope": resolved_count_in_carbon_scope if (count_in_carbon_scope is not None or normalized_origin is not None or normalized_attribution_scope is not None) else None,
+        "source_project_id": source_project_id_value,
+        "tree_height_m": tree_height_value,
         "tree_id": tree_id,
     })
     previous_status = _normalize_tree_status(existing.get("status"))
@@ -2053,6 +3394,26 @@ def update_tree(
                 "status": normalized_status if normalized_status is not None else existing.get("status"),
                 "notes": notes if notes is not None else existing.get("notes"),
                 "photo_url": photo_url if photo_url is not None else existing.get("photo_url"),
+                "tree_origin": normalized_origin if normalized_origin is not None else existing.get("tree_origin"),
+                "custodian_id": custodian_id_value if custodian_id is not None else existing.get("custodian_id"),
+                "custody_started_at": custody_started_at if custody_started_at is not None else existing.get("custody_started_at"),
+                "attribution_scope": (
+                    resolved_scope
+                    if (normalized_attribution_scope is not None or normalized_origin is not None)
+                    else existing.get("attribution_scope")
+                ),
+                "count_in_planting_kpis": (
+                    resolved_count_in_planting_kpis
+                    if (count_in_planting_kpis is not None or normalized_origin is not None or normalized_attribution_scope is not None)
+                    else existing.get("count_in_planting_kpis")
+                ),
+                "count_in_carbon_scope": (
+                    resolved_count_in_carbon_scope
+                    if (count_in_carbon_scope is not None or normalized_origin is not None or normalized_attribution_scope is not None)
+                    else existing.get("count_in_carbon_scope")
+                ),
+                "source_project_id": source_project_id_value if source_project_id is not None else existing.get("source_project_id"),
+                "tree_height_m": tree_height_value if tree_height_m is not None else existing.get("tree_height_m"),
             },
         },
     )
@@ -3260,12 +4621,26 @@ def live_maintenance_rows(
 def _build_donor_report_rows(project_id: int, db: Session) -> list[dict]:
     rows = db.execute(
         text("""
-            SELECT t.id AS task_id, t.tree_id, tr.species, t.assignee_name, t.task_type, t.priority,
+            SELECT
+                   t.id AS task_id,
+                   t.tree_id,
+                   tr.species,
+                   tr.tree_origin,
+                   tr.attribution_scope,
+                   tr.tree_height_m,
+                   tr.count_in_planting_kpis,
+                   tr.count_in_carbon_scope,
+                   tr.custodian_id,
+                   c.name AS custodian_name,
+                   t.assignee_name,
+                   t.task_type,
+                   t.priority,
                    t.status, t.review_state, t.due_date, t.created_at, t.submitted_at, t.reviewed_at,
                    t.reviewed_by, t.review_notes, t.completed_at, t.notes, t.photo_url,
                    t.reported_tree_status, tr.status AS tree_status
             FROM tree_tasks t
             JOIN trees tr ON tr.id = t.tree_id
+            LEFT JOIN green_custodians c ON c.id = tr.custodian_id
             WHERE tr.project_id = :project_id
             ORDER BY COALESCE(t.reviewed_at, t.submitted_at, t.created_at) DESC, t.id DESC
         """),
@@ -3344,6 +4719,7 @@ def _compute_age_based_survival(
             SELECT id, planting_date, status, species
             FROM trees
             WHERE project_id = :project_id
+              AND COALESCE(count_in_planting_kpis, TRUE) = TRUE
             """
         ),
         {"project_id": project_id},
@@ -3504,7 +4880,17 @@ def _compute_age_based_survival(
 
 def _compute_kpi_snapshot(project_id: int, db: Session) -> dict:
     tree_rows = db.execute(
-        text("SELECT status FROM trees WHERE project_id = :project_id"),
+        text(
+            """
+            SELECT
+                status,
+                tree_origin,
+                COALESCE(count_in_planting_kpis, TRUE) AS in_planting_scope,
+                COALESCE(count_in_carbon_scope, TRUE) AS in_carbon_scope
+            FROM trees
+            WHERE project_id = :project_id
+            """
+        ),
         {"project_id": project_id},
     ).mappings().all()
     task_rows = db.execute(
@@ -3517,11 +4903,13 @@ def _compute_kpi_snapshot(project_id: int, db: Session) -> dict:
         {"project_id": project_id},
     ).mappings().all()
 
-    total_trees = len(tree_rows)
-    healthy_trees = sum(1 for row in tree_rows if _normalize_tree_status(row.get("status")) in HEALTHY_TREE_STATUSES)
-    dead_trees = sum(1 for row in tree_rows if _normalize_tree_status(row.get("status")) in DEAD_TREE_STATUSES)
-    attention_trees = sum(1 for row in tree_rows if _normalize_tree_status(row.get("status")) in ATTENTION_TREE_STATUSES)
-    pending_planting = sum(1 for row in tree_rows if _normalize_tree_status(row.get("status")) == "pending_planting")
+    total_trees_all = len(tree_rows)
+    in_scope_tree_rows = [row for row in tree_rows if bool(row.get("in_planting_scope"))]
+    total_trees = len(in_scope_tree_rows)
+    healthy_trees = sum(1 for row in in_scope_tree_rows if _normalize_tree_status(row.get("status")) in HEALTHY_TREE_STATUSES)
+    dead_trees = sum(1 for row in in_scope_tree_rows if _normalize_tree_status(row.get("status")) in DEAD_TREE_STATUSES)
+    attention_trees = sum(1 for row in in_scope_tree_rows if _normalize_tree_status(row.get("status")) in ATTENTION_TREE_STATUSES)
+    pending_planting = sum(1 for row in in_scope_tree_rows if _normalize_tree_status(row.get("status")) == "pending_planting")
     survival_rate = round((healthy_trees / total_trees) * 100, 1) if total_trees else 0.0
 
     today = date.today()
@@ -3565,7 +4953,9 @@ def _compute_kpi_snapshot(project_id: int, db: Session) -> dict:
     # Carbon data for KPI
     carbon_tree_rows = db.execute(text("""
         SELECT id, species, planting_date, status, created_at
-        FROM trees WHERE project_id = :project_id
+        FROM trees
+        WHERE project_id = :project_id
+          AND COALESCE(count_in_carbon_scope, TRUE) = TRUE
     """), {"project_id": project_id}).mappings().all()
     carbon = compute_project_carbon([dict(r) for r in carbon_tree_rows])
     age_survival = _compute_age_based_survival(project_id, db)
@@ -3574,6 +4964,7 @@ def _compute_kpi_snapshot(project_id: int, db: Session) -> dict:
         "project_id": project_id,
         "snapshot_date": datetime.utcnow().isoformat(),
         "trees_total": total_trees,
+        "trees_total_all": total_trees_all,
         "trees_healthy": healthy_trees,
         "trees_dead_or_removed": dead_trees,
         "trees_attention": attention_trees,
@@ -3633,6 +5024,7 @@ def _build_species_daily_survival_series(project_id: int, db: Session) -> dict:
             SELECT id, species, planting_date, status
             FROM trees
             WHERE project_id = :project_id
+              AND COALESCE(count_in_planting_kpis, TRUE) = TRUE
             """
         ),
         {"project_id": project_id},
@@ -3830,6 +5222,7 @@ def _build_kpi_trend_series(project_id: int, db: Session, days: int = 180) -> li
             SELECT MIN(planting_date) AS first_planting_date
             FROM trees
             WHERE project_id = :project_id
+              AND COALESCE(count_in_planting_kpis, TRUE) = TRUE
               AND planting_date IS NOT NULL
             """
         ),
@@ -3855,6 +5248,7 @@ def _build_kpi_trend_series(project_id: int, db: Session, days: int = 180) -> li
             SELECT planting_date, status
             FROM trees
             WHERE project_id = :project_id
+              AND COALESCE(count_in_planting_kpis, TRUE) = TRUE
             """
         ),
         {"project_id": project_id},
@@ -4040,12 +5434,30 @@ def _build_verra_vcs_payload(
     tree_rows_raw = db.execute(
         text(
             """
-            SELECT id, project_id, species, planting_date, status, notes, photo_url, created_by, created_at,
-                   ST_X(geom) AS lng, ST_Y(geom) AS lat
-            FROM trees
-            WHERE project_id = :project_id
-              AND (:assignee_name IS NULL OR created_by = :assignee_name)
-            ORDER BY created_at ASC, id ASC
+            SELECT
+                   t.id,
+                   t.project_id,
+                   t.species,
+                   t.planting_date,
+                   t.status,
+                   t.notes,
+                   t.photo_url,
+                   t.created_by,
+                   t.created_at,
+                   t.tree_origin,
+                   t.tree_height_m,
+                   t.attribution_scope,
+                   t.count_in_planting_kpis,
+                   t.count_in_carbon_scope,
+                   t.custodian_id,
+                   c.name AS custodian_name,
+                   ST_X(t.geom) AS lng,
+                   ST_Y(t.geom) AS lat
+            FROM trees t
+            LEFT JOIN green_custodians c ON c.id = t.custodian_id
+            WHERE t.project_id = :project_id
+              AND (:assignee_name IS NULL OR t.created_by = :assignee_name)
+            ORDER BY t.created_at ASC, t.id ASC
             """
         ),
         {"project_id": project_id, "assignee_name": assignee_clean},
@@ -4187,22 +5599,24 @@ def _build_verra_vcs_payload(
             "created_at": row.get("created_at"),
         }
         for row in tree_rows
+        if bool(row.get("count_in_carbon_scope", True))
     ]
     carbon = compute_project_carbon(scope_tree_rows_for_carbon, projection_years=40)
     carbon_projection = generate_co2_projection_table(scope_tree_rows_for_carbon, years=40)
 
-    total_trees = len(tree_rows)
+    in_scope_tree_rows = [row for row in tree_rows if bool(row.get("count_in_planting_kpis", True))]
+    total_trees = len(in_scope_tree_rows)
     trees_healthy = sum(
-        1 for row in tree_rows if _normalize_tree_status(row.get("status")) in HEALTHY_TREE_STATUSES
+        1 for row in in_scope_tree_rows if _normalize_tree_status(row.get("status")) in HEALTHY_TREE_STATUSES
     )
     trees_dead_or_removed = sum(
-        1 for row in tree_rows if _normalize_tree_status(row.get("status")) in DEAD_TREE_STATUSES
+        1 for row in in_scope_tree_rows if _normalize_tree_status(row.get("status")) in DEAD_TREE_STATUSES
     )
     trees_attention = sum(
-        1 for row in tree_rows if _normalize_tree_status(row.get("status")) in ATTENTION_TREE_STATUSES
+        1 for row in in_scope_tree_rows if _normalize_tree_status(row.get("status")) in ATTENTION_TREE_STATUSES
     )
     trees_pending_planting = sum(
-        1 for row in tree_rows if _normalize_tree_status(row.get("status")) == "pending_planting"
+        1 for row in in_scope_tree_rows if _normalize_tree_status(row.get("status")) == "pending_planting"
     )
     survival_rate = round((trees_healthy / total_trees) * 100, 1) if total_trees else 0.0
 
@@ -4244,7 +5658,7 @@ def _build_verra_vcs_payload(
         evidence_complete_rate = 0.0
 
     monitoring_start_candidates: list[date] = []
-    for row in tree_rows:
+    for row in in_scope_tree_rows:
         planting_date = _parse_date_value(row.get("planting_date"))
         created_stamp = _parse_date_value(row.get("created_at"))
         if planting_date:
@@ -4254,7 +5668,7 @@ def _build_verra_vcs_payload(
     monitoring_start = min(monitoring_start_candidates) if monitoring_start_candidates else None
 
     species_map: dict[str, dict] = {}
-    for row in tree_rows:
+    for row in in_scope_tree_rows:
         raw_species = (row.get("species") or "").strip()
         species_label = raw_species if raw_species else "Unspecified"
         species_key = f"{species_label.lower()}::{_normalize_species_key(raw_species)}"
@@ -4373,7 +5787,7 @@ def _build_verra_vcs_payload(
             }
         return staff_map[key]
 
-    for row in tree_rows:
+    for row in in_scope_tree_rows:
         name = str(row.get("created_by") or "Unassigned")
         entry = _staff_entry(name)
         entry["trees_recorded"] += 1
@@ -4493,12 +5907,14 @@ def _build_verra_vcs_payload(
         },
         "section_1_project_identification": {
             "project_summary": {
+                "total_trees_all": len(tree_rows),
                 "total_trees": total_trees,
                 "trees_healthy": trees_healthy,
                 "trees_dead_or_removed": trees_dead_or_removed,
                 "trees_attention": trees_attention,
                 "trees_pending_planting": trees_pending_planting,
                 "survival_rate_percent": survival_rate,
+                "attribution_scope_note": "Trees counted in planting KPIs use count_in_planting_kpis=true scope.",
             },
             "species_count": len(species_summary),
             "staff_count": len(staff_summary),
@@ -4629,6 +6045,13 @@ def _render_verra_vcs_zip(package: dict) -> io.BytesIO:
                 "tree_id",
                 "project_id",
                 "created_by",
+                "tree_origin",
+                "attribution_scope",
+                "count_in_planting_kpis",
+                "count_in_carbon_scope",
+                "custodian_id",
+                "custodian_name",
+                "tree_height_m",
                 "species",
                 "planting_date",
                 "status",
@@ -4657,6 +6080,13 @@ def _render_verra_vcs_zip(package: dict) -> io.BytesIO:
                     row.get("id"),
                     row.get("project_id"),
                     row.get("created_by"),
+                    row.get("tree_origin"),
+                    row.get("attribution_scope"),
+                    row.get("count_in_planting_kpis"),
+                    row.get("count_in_carbon_scope"),
+                    row.get("custodian_id"),
+                    row.get("custodian_name"),
+                    row.get("tree_height_m"),
                     row.get("species"),
                     row.get("planting_date"),
                     row.get("status"),
@@ -4737,6 +6167,13 @@ def _render_verra_vcs_zip(package: dict) -> io.BytesIO:
                 "task_id",
                 "tree_id",
                 "species",
+                "tree_origin",
+                "attribution_scope",
+                "count_in_planting_kpis",
+                "count_in_carbon_scope",
+                "custodian_id",
+                "custodian_name",
+                "tree_height_m",
                 "assignee_name",
                 "task_type",
                 "priority",
@@ -4761,6 +6198,13 @@ def _render_verra_vcs_zip(package: dict) -> io.BytesIO:
                     row.get("task_id"),
                     row.get("tree_id"),
                     row.get("species"),
+                    row.get("tree_origin"),
+                    row.get("attribution_scope"),
+                    row.get("count_in_planting_kpis"),
+                    row.get("count_in_carbon_scope"),
+                    row.get("custodian_id"),
+                    row.get("custodian_name"),
+                    row.get("tree_height_m"),
                     row.get("assignee_name"),
                     row.get("task_type"),
                     row.get("priority"),
@@ -5207,11 +6651,29 @@ def list_verra_export_history(
 def export_donor_report_csv(project_id: int, db: Session = Depends(get_db)):
     project = get_project(project_id, db)
     rows = db.execute(text("""
-        SELECT id, project_id, species, planting_date, status, notes, photo_url, created_by, created_at,
-               ST_X(geom) AS lng, ST_Y(geom) AS lat
-        FROM trees
-        WHERE project_id = :project_id
-        ORDER BY created_at DESC
+        SELECT
+            t.id,
+            t.project_id,
+            t.species,
+            t.planting_date,
+            t.status,
+            t.notes,
+            t.photo_url,
+            t.created_by,
+            t.created_at,
+            t.tree_origin,
+            t.attribution_scope,
+            t.count_in_planting_kpis,
+            t.count_in_carbon_scope,
+            t.custodian_id,
+            c.name AS custodian_name,
+            t.tree_height_m,
+            ST_X(t.geom) AS lng,
+            ST_Y(t.geom) AS lat
+        FROM trees t
+        LEFT JOIN green_custodians c ON c.id = t.custodian_id
+        WHERE t.project_id = :project_id
+        ORDER BY t.created_at DESC
     """), {"project_id": project_id}).mappings().all()
     maintenance_rows = _maintenance_summary_by_tree(project_id, db)
     rows = _attach_maintenance_to_tree_rows(rows, maintenance_rows)
@@ -5226,7 +6688,10 @@ def export_donor_report_csv(project_id: int, db: Session = Depends(get_db)):
         writer = _excel_csv_writer(f)
         # Carbon summary for CSV header
         carbon_trees_csv = db.execute(text("""
-            SELECT id, species, planting_date, status, created_at FROM trees WHERE project_id = :pid
+            SELECT id, species, planting_date, status, created_at
+            FROM trees
+            WHERE project_id = :pid
+              AND COALESCE(count_in_carbon_scope, TRUE) = TRUE
         """), {"pid": project_id}).mappings().all()
         carbon_csv = compute_project_carbon([dict(r) for r in carbon_trees_csv])
 
@@ -5273,6 +6738,13 @@ def export_donor_report_csv(project_id: int, db: Session = Depends(get_db)):
             "project_id",
             "lng",
             "lat",
+            "tree_origin",
+            "attribution_scope",
+            "count_in_planting_kpis",
+            "count_in_carbon_scope",
+            "custodian_id",
+            "custodian_name",
+            "tree_height_m",
             "species",
             "planting_date",
             "tree_status",
@@ -5303,6 +6775,13 @@ def export_donor_report_csv(project_id: int, db: Session = Depends(get_db)):
                 row.get("project_id"),
                 row.get("lng"),
                 row.get("lat"),
+                row.get("tree_origin"),
+                row.get("attribution_scope"),
+                row.get("count_in_planting_kpis"),
+                row.get("count_in_carbon_scope"),
+                row.get("custodian_id"),
+                row.get("custodian_name"),
+                row.get("tree_height_m"),
                 row.get("species"),
                 row.get("planting_date"),
                 row.get("status"),
@@ -5332,6 +6811,13 @@ def export_donor_report_csv(project_id: int, db: Session = Depends(get_db)):
             "task_id",
             "tree_id",
             "species",
+            "tree_origin",
+            "attribution_scope",
+            "count_in_planting_kpis",
+            "count_in_carbon_scope",
+            "custodian_id",
+            "custodian_name",
+            "tree_height_m",
             "assignee_name",
             "task_type",
             "priority",
@@ -5357,6 +6843,13 @@ def export_donor_report_csv(project_id: int, db: Session = Depends(get_db)):
                 row.get("task_id"),
                 row.get("tree_id"),
                 row.get("species"),
+                row.get("tree_origin"),
+                row.get("attribution_scope"),
+                row.get("count_in_planting_kpis"),
+                row.get("count_in_carbon_scope"),
+                row.get("custodian_id"),
+                row.get("custodian_name"),
+                row.get("tree_height_m"),
                 row.get("assignee_name"),
                 row.get("task_type"),
                 row.get("priority"),
@@ -5439,9 +6932,27 @@ def export_donor_report_pdf_alias(
 @router.get("/trees/{tree_id}/timeline")
 def tree_timeline(tree_id: int, db: Session = Depends(get_db)):
     tree = db.execute(text("""
-        SELECT id, species, planting_date, status, notes, photo_url, created_by, created_at
-        FROM trees
-        WHERE id = :tree_id
+        SELECT
+            t.id,
+            t.species,
+            t.planting_date,
+            t.status,
+            t.notes,
+            t.photo_url,
+            t.created_by,
+            t.created_at,
+            t.tree_origin,
+            t.custodian_id,
+            c.name AS custodian_name,
+            t.custody_started_at,
+            t.attribution_scope,
+            t.count_in_planting_kpis,
+            t.count_in_carbon_scope,
+            t.source_project_id,
+            t.tree_height_m
+        FROM trees t
+        LEFT JOIN green_custodians c ON c.id = t.custodian_id
+        WHERE t.id = :tree_id
     """), {"tree_id": tree_id}).mappings().first()
     tasks = list_tree_tasks(tree_id, db)
     visits = db.execute(text("""
@@ -5584,6 +7095,8 @@ def list_work_orders(
             SELECT LOWER(TRIM(created_by)) AS assignee_key, COUNT(*) AS planted
             FROM trees
             WHERE project_id = :project_id
+              AND LOWER(COALESCE(tree_origin, 'new_planting')) = 'new_planting'
+              AND COALESCE(count_in_planting_kpis, TRUE) = TRUE
               AND LOWER(REPLACE(REPLACE(COALESCE(status, ''), '-', '_'), ' ', '_')) <> 'pending_planting'
             GROUP BY created_by
         )
@@ -5622,6 +7135,8 @@ def update_work_order(
         planted_value = db.execute(text("""
             SELECT COUNT(*) FROM trees
             WHERE project_id = :project_id AND created_by = :assignee_name
+              AND LOWER(COALESCE(tree_origin, 'new_planting')) = 'new_planting'
+              AND COALESCE(count_in_planting_kpis, TRUE) = TRUE
               AND LOWER(REPLACE(REPLACE(COALESCE(status, ''), '-', '_'), ' ', '_')) <> 'pending_planting'
         """), {"project_id": row["project_id"], "assignee_name": row["assignee_name"]}).scalar()
 
@@ -5671,6 +7186,8 @@ def work_stats(project_id: int, db: Session = Depends(get_db)):
         SELECT created_by AS assignee_name, COUNT(*) AS trees_logged
         FROM trees
         WHERE project_id = :project_id
+          AND LOWER(COALESCE(tree_origin, 'new_planting')) = 'new_planting'
+          AND COALESCE(count_in_planting_kpis, TRUE) = TRUE
         GROUP BY created_by
     """), {"project_id": project_id}).mappings().all()
     tree_map = {r["assignee_name"]: r["trees_logged"] for r in tree_counts}
@@ -5819,11 +7336,29 @@ def export_tasks_pdf(project_id: int, db: Session = Depends(get_db)):
 @router.get("/projects/{project_id}/export/csv")
 def export_project_csv(project_id: int, db: Session = Depends(get_db)):
     rows = db.execute(text("""
-        SELECT id, project_id, species, planting_date, status, notes, photo_url, created_by, created_at,
-               ST_X(geom) AS lng, ST_Y(geom) AS lat
-        FROM trees
-        WHERE project_id = :project_id
-        ORDER BY created_at DESC
+        SELECT
+            t.id,
+            t.project_id,
+            t.species,
+            t.planting_date,
+            t.status,
+            t.notes,
+            t.photo_url,
+            t.created_by,
+            t.created_at,
+            t.tree_origin,
+            t.attribution_scope,
+            t.count_in_planting_kpis,
+            t.count_in_carbon_scope,
+            t.custodian_id,
+            c.name AS custodian_name,
+            t.tree_height_m,
+            ST_X(t.geom) AS lng,
+            ST_Y(t.geom) AS lat
+        FROM trees t
+        LEFT JOIN green_custodians c ON c.id = t.custodian_id
+        WHERE t.project_id = :project_id
+        ORDER BY t.created_at DESC
     """), {"project_id": project_id}).mappings().all()
     maintenance_rows = _maintenance_summary_by_tree(project_id, db)
     rows = _attach_maintenance_to_tree_rows(rows, maintenance_rows)
@@ -5849,7 +7384,9 @@ def export_project_csv(project_id: int, db: Session = Depends(get_db)):
         ])
         writer.writerow([])
         writer.writerow([
-            "tree_id", "project_id", "lng", "lat", "species", "planting_date",
+            "tree_id", "project_id", "lng", "lat", "tree_origin", "attribution_scope",
+            "count_in_planting_kpis", "count_in_carbon_scope", "custodian_id", "custodian_name", "tree_height_m",
+            "species", "planting_date",
             "status", "notes", "photo_url", "created_by", "created_at",
             "maintenance_count", "maintenance_done", "maintenance_pending", "maintenance_overdue",
             "maintenance_types", "last_maintenance_type", "last_maintenance_date",
@@ -5859,7 +7396,8 @@ def export_project_csv(project_id: int, db: Session = Depends(get_db)):
         for r in rows:
             review = review_summary.get(int(r["id"]), {})
             writer.writerow([
-                r["id"], r["project_id"], r["lng"], r["lat"], r["species"],
+                r["id"], r["project_id"], r["lng"], r["lat"], r.get("tree_origin"), r.get("attribution_scope"),
+                r.get("count_in_planting_kpis"), r.get("count_in_carbon_scope"), r.get("custodian_id"), r.get("custodian_name"), r.get("tree_height_m"), r["species"],
                 r["planting_date"], r["status"], r["notes"], r["photo_url"],
                 r["created_by"], r["created_at"],
                 r.get("maintenance_count", 0), r.get("maintenance_done", 0), r.get("maintenance_pending", 0), r.get("maintenance_overdue", 0),
@@ -5964,19 +7502,47 @@ def export_project_pdf(
 
     project = get_project(project_id, db)
     rows = db.execute(text("""
-        SELECT id, species, planting_date, status, notes,
-               ST_X(geom) AS lng, ST_Y(geom) AS lat
-        FROM trees
-        WHERE project_id = :project_id
-        ORDER BY created_at DESC
+        SELECT
+               t.id,
+               t.species,
+               t.planting_date,
+               t.status,
+               t.notes,
+               t.tree_origin,
+               t.tree_height_m,
+               t.attribution_scope,
+               t.count_in_planting_kpis,
+               t.count_in_carbon_scope,
+               t.custodian_id,
+               c.name AS custodian_name,
+               ST_X(t.geom) AS lng,
+               ST_Y(t.geom) AS lat
+        FROM trees t
+        LEFT JOIN green_custodians c ON c.id = t.custodian_id
+        WHERE t.project_id = :project_id
+        ORDER BY t.created_at DESC
         LIMIT 200
     """), {"project_id": project_id}).mappings().all()
     map_rows = db.execute(text("""
-        SELECT id, species, planting_date, status, notes,
-               ST_X(geom) AS lng, ST_Y(geom) AS lat
-        FROM trees
-        WHERE project_id = :project_id
-        ORDER BY created_at DESC
+        SELECT
+               t.id,
+               t.species,
+               t.planting_date,
+               t.status,
+               t.notes,
+               t.tree_origin,
+               t.tree_height_m,
+               t.attribution_scope,
+               t.count_in_planting_kpis,
+               t.count_in_carbon_scope,
+               t.custodian_id,
+               c.name AS custodian_name,
+               ST_X(t.geom) AS lng,
+               ST_Y(t.geom) AS lat
+        FROM trees t
+        LEFT JOIN green_custodians c ON c.id = t.custodian_id
+        WHERE t.project_id = :project_id
+        ORDER BY t.created_at DESC
         LIMIT 1000
     """), {"project_id": project_id}).mappings().all()
     maintenance_rows = _maintenance_summary_by_tree(project_id, db)
@@ -6010,7 +7576,10 @@ def export_project_pdf(
 
     # Carbon data for executive summary
     carbon_trees = db.execute(text("""
-        SELECT id, species, planting_date, status, created_at FROM trees WHERE project_id = :pid
+        SELECT id, species, planting_date, status, created_at
+        FROM trees
+        WHERE project_id = :pid
+          AND COALESCE(count_in_carbon_scope, TRUE) = TRUE
     """), {"pid": project_id}).mappings().all()
     carbon_data = compute_project_carbon([dict(r) for r in carbon_trees])
     carbon_data["projection"] = generate_co2_projection_table([dict(r) for r in carbon_trees], 30)
@@ -6059,14 +7628,16 @@ def _fetch_kpi_trend(project_id: int, db: Session, days: int = 90) -> list[dict]
 
 
 def _build_tree_stats(rows: list[dict]) -> dict:
-    total = len(rows)
-    alive = sum(1 for r in rows if _normalize_tree_status(r.get("status")) in HEALTHY_TREE_STATUSES)
-    dead = sum(1 for r in rows if _normalize_tree_status(r.get("status")) in DEAD_TREE_STATUSES)
-    needs_attention = sum(1 for r in rows if _normalize_tree_status(r.get("status")) in ATTENTION_TREE_STATUSES)
-    pending = sum(1 for r in rows if _normalize_tree_status(r.get("status")) == "pending_planting")
+    scoped_rows = [r for r in rows if bool(r.get("count_in_planting_kpis", True))]
+    total = len(scoped_rows)
+    alive = sum(1 for r in scoped_rows if _normalize_tree_status(r.get("status")) in HEALTHY_TREE_STATUSES)
+    dead = sum(1 for r in scoped_rows if _normalize_tree_status(r.get("status")) in DEAD_TREE_STATUSES)
+    needs_attention = sum(1 for r in scoped_rows if _normalize_tree_status(r.get("status")) in ATTENTION_TREE_STATUSES)
+    pending = sum(1 for r in scoped_rows if _normalize_tree_status(r.get("status")) == "pending_planting")
     survival_rate = round((alive / total) * 100, 1) if total else 0.0
     return {
         "total": total,
+        "total_all": len(rows),
         "alive": alive,
         "dead": dead,
         "needs_attention": needs_attention,
@@ -6105,36 +7676,92 @@ def export_work_report_pdf(
     project = get_project(project_id, db)
     if assignee_name:
         rows = db.execute(text("""
-            SELECT id, species, planting_date, status, notes,
-                   ST_X(geom) AS lng, ST_Y(geom) AS lat
-            FROM trees
-            WHERE project_id = :project_id AND created_by = :assignee_name
-            ORDER BY created_at DESC
+            SELECT
+                   t.id,
+                   t.species,
+                   t.planting_date,
+                   t.status,
+                   t.notes,
+                   t.tree_origin,
+                   t.tree_height_m,
+                   t.attribution_scope,
+                   t.count_in_planting_kpis,
+                   t.count_in_carbon_scope,
+                   t.custodian_id,
+                   c.name AS custodian_name,
+                   ST_X(t.geom) AS lng,
+                   ST_Y(t.geom) AS lat
+            FROM trees t
+            LEFT JOIN green_custodians c ON c.id = t.custodian_id
+            WHERE t.project_id = :project_id AND t.created_by = :assignee_name
+            ORDER BY t.created_at DESC
             LIMIT 200
         """), {"project_id": project_id, "assignee_name": assignee_name}).mappings().all()
         map_rows = db.execute(text("""
-            SELECT id, species, planting_date, status, notes,
-                   ST_X(geom) AS lng, ST_Y(geom) AS lat
-            FROM trees
-            WHERE project_id = :project_id AND created_by = :assignee_name
-            ORDER BY created_at DESC
+            SELECT
+                   t.id,
+                   t.species,
+                   t.planting_date,
+                   t.status,
+                   t.notes,
+                   t.tree_origin,
+                   t.tree_height_m,
+                   t.attribution_scope,
+                   t.count_in_planting_kpis,
+                   t.count_in_carbon_scope,
+                   t.custodian_id,
+                   c.name AS custodian_name,
+                   ST_X(t.geom) AS lng,
+                   ST_Y(t.geom) AS lat
+            FROM trees t
+            LEFT JOIN green_custodians c ON c.id = t.custodian_id
+            WHERE t.project_id = :project_id AND t.created_by = :assignee_name
+            ORDER BY t.created_at DESC
             LIMIT 1000
         """), {"project_id": project_id, "assignee_name": assignee_name}).mappings().all()
     else:
         rows = db.execute(text("""
-            SELECT id, species, planting_date, status, notes,
-                   ST_X(geom) AS lng, ST_Y(geom) AS lat
-            FROM trees
-            WHERE project_id = :project_id
-            ORDER BY created_at DESC
+            SELECT
+                   t.id,
+                   t.species,
+                   t.planting_date,
+                   t.status,
+                   t.notes,
+                   t.tree_origin,
+                   t.tree_height_m,
+                   t.attribution_scope,
+                   t.count_in_planting_kpis,
+                   t.count_in_carbon_scope,
+                   t.custodian_id,
+                   c.name AS custodian_name,
+                   ST_X(t.geom) AS lng,
+                   ST_Y(t.geom) AS lat
+            FROM trees t
+            LEFT JOIN green_custodians c ON c.id = t.custodian_id
+            WHERE t.project_id = :project_id
+            ORDER BY t.created_at DESC
             LIMIT 200
         """), {"project_id": project_id}).mappings().all()
         map_rows = db.execute(text("""
-            SELECT id, species, planting_date, status, notes,
-                   ST_X(geom) AS lng, ST_Y(geom) AS lat
-            FROM trees
-            WHERE project_id = :project_id
-            ORDER BY created_at DESC
+            SELECT
+                   t.id,
+                   t.species,
+                   t.planting_date,
+                   t.status,
+                   t.notes,
+                   t.tree_origin,
+                   t.tree_height_m,
+                   t.attribution_scope,
+                   t.count_in_planting_kpis,
+                   t.count_in_carbon_scope,
+                   t.custodian_id,
+                   c.name AS custodian_name,
+                   ST_X(t.geom) AS lng,
+                   ST_Y(t.geom) AS lat
+            FROM trees t
+            LEFT JOIN green_custodians c ON c.id = t.custodian_id
+            WHERE t.project_id = :project_id
+            ORDER BY t.created_at DESC
             LIMIT 1000
         """), {"project_id": project_id}).mappings().all()
 
@@ -6172,7 +7799,10 @@ def export_work_report_pdf(
 
     # Carbon data for executive summary
     carbon_trees = db.execute(text("""
-        SELECT id, species, planting_date, status, created_at FROM trees WHERE project_id = :pid
+        SELECT id, species, planting_date, status, created_at
+        FROM trees
+        WHERE project_id = :pid
+          AND COALESCE(count_in_carbon_scope, TRUE) = TRUE
     """), {"pid": project_id}).mappings().all()
     carbon_data = compute_project_carbon([dict(r) for r in carbon_trees])
     carbon_data["projection"] = generate_co2_projection_table([dict(r) for r in carbon_trees], 30)
