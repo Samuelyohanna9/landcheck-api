@@ -1,7 +1,13 @@
 from reportlab.lib.pagesizes import A4
 from reportlab.pdfgen import canvas
 from reportlab.lib.colors import HexColor
+from reportlab.lib.utils import ImageReader
 from datetime import datetime
+import io
+import os
+import ssl
+from urllib.parse import urlparse
+from urllib.request import Request, urlopen
 
 
 def _draw_rounded_box(c, x, y, w, h, r, fill_color=None, stroke_color=None):
@@ -288,6 +294,161 @@ def _format_delay_label(delay_days, delay_context=None):
     if days < 0:
         return f"-{abs(days)}d"
     return "0d"
+
+
+def _load_photo_reader(photo_url, image_cache):
+    raw = str(photo_url or "").strip()
+    if not raw:
+        return None
+    if raw.startswith("//"):
+        raw = f"https:{raw}"
+    if raw in image_cache:
+        return image_cache[raw]
+
+    data = None
+    reader = None
+    parsed = urlparse(raw)
+    try:
+        if parsed.scheme in {"http", "https"}:
+            req = Request(raw, headers={"User-Agent": "LandCheck-Green-Report/1.0"})
+            try:
+                with urlopen(req, timeout=8) as response:
+                    data = response.read()
+            except Exception:
+                if parsed.scheme == "https":
+                    context = ssl._create_unverified_context()
+                    with urlopen(req, timeout=8, context=context) as response:
+                        data = response.read()
+        else:
+            if raw.startswith("/"):
+                base_url = (os.getenv("GREEN_REPORT_PHOTO_BASE_URL") or os.getenv("BACKEND_URL") or "").strip().rstrip("/")
+                if base_url:
+                    remote_url = f"{base_url}{raw}"
+                    req = Request(remote_url, headers={"User-Agent": "LandCheck-Green-Report/1.0"})
+                    try:
+                        with urlopen(req, timeout=8) as response:
+                            data = response.read()
+                    except Exception:
+                        pass
+            candidate_paths = []
+            if raw.startswith("file://"):
+                candidate_paths.append(raw.replace("file://", "", 1))
+            candidate_paths.append(raw)
+            if raw.startswith("/"):
+                candidate_paths.append(os.path.join("/app", raw.lstrip("/")))
+            else:
+                candidate_paths.append(os.path.join("/app", raw))
+            for path in candidate_paths:
+                if path and os.path.exists(path):
+                    with open(path, "rb") as f:
+                        data = f.read()
+                    break
+        if data:
+            reader = ImageReader(io.BytesIO(data))
+    except Exception:
+        reader = None
+
+    image_cache[raw] = reader
+    return reader
+
+
+def _draw_photo_card(c, x, y, w, h, row, image_cache):
+    _draw_rounded_box(c, x, y, w, h, 5, fill_color=HexColor("#f8faf9"), stroke_color=HexColor("#d7e5db"))
+
+    pad = 6
+    meta_h = 40
+    img_x = x + pad
+    img_y = y + meta_h + pad
+    img_w = max(w - (pad * 2), 20)
+    img_h = max(h - meta_h - (pad * 2), 20)
+
+    reader = _load_photo_reader(row.get("photo_url"), image_cache)
+    if reader is not None:
+        try:
+            src_w, src_h = reader.getSize()
+            if src_w and src_h:
+                scale = min(img_w / src_w, img_h / src_h)
+                draw_w = max(src_w * scale, 2)
+                draw_h = max(src_h * scale, 2)
+                draw_x = img_x + (img_w - draw_w) / 2
+                draw_y = img_y + (img_h - draw_h) / 2
+                c.drawImage(reader, draw_x, draw_y, draw_w, draw_h, preserveAspectRatio=True, anchor="c")
+            else:
+                raise ValueError("Invalid source image dimensions")
+        except Exception:
+            c.setStrokeColorRGB(0.8, 0.8, 0.8)
+            c.rect(img_x, img_y, img_w, img_h, stroke=1, fill=0)
+            c.setFont("Helvetica-Oblique", 7)
+            c.setFillColorRGB(0.45, 0.45, 0.45)
+            c.drawCentredString(img_x + img_w / 2, img_y + img_h / 2, "Photo unavailable")
+    else:
+        c.setStrokeColorRGB(0.8, 0.8, 0.8)
+        c.rect(img_x, img_y, img_w, img_h, stroke=1, fill=0)
+        c.setFont("Helvetica-Oblique", 7)
+        c.setFillColorRGB(0.45, 0.45, 0.45)
+        c.drawCentredString(img_x + img_w / 2, img_y + img_h / 2, "Photo unavailable")
+
+    tree_id = row.get("id", "-")
+    species = str(row.get("species") or "-")[:22]
+    status = str(row.get("status") or "-")[:14]
+    planting_date = str(row.get("planting_date") or "-")[:10]
+    owner = str(row.get("created_by") or "-")[:16]
+    custodian_name = str(row.get("custodian_name") or "-")[:16]
+
+    text_y = y + 26
+    c.setFont("Helvetica-Bold", 7.4)
+    c.setFillColorRGB(0.16, 0.16, 0.16)
+    c.drawString(x + pad, text_y, f"Tree #{tree_id} | {species}")
+    c.setFont("Helvetica", 6.8)
+    c.setFillColorRGB(0.35, 0.35, 0.35)
+    c.drawString(x + pad, text_y - 10, f"Status: {status} | Date: {planting_date}")
+    c.drawString(x + pad, text_y - 19, f"By: {owner} | Custodian: {custodian_name}")
+
+
+def _render_photo_appendix_pages(c, width, height, project, photo_rows, assignee_name=None):
+    if not photo_rows:
+        c.showPage()
+        c.setFont("Helvetica-Bold", 15)
+        c.drawString(40, height - 50, "Tree Photo Appendix")
+        c.setFont("Helvetica", 9)
+        c.setFillColorRGB(0.4, 0.4, 0.4)
+        c.drawString(40, height - 70, "No tree photos available for the selected report scope.")
+        return
+
+    image_cache = {}
+    per_page = 6
+    card_cols = 2
+    card_rows = 3
+    margin_x = 36
+    top_y = height - 82
+    bottom_y = 44
+    col_gap = 12
+    row_gap = 12
+    card_w = (width - (margin_x * 2) - col_gap) / card_cols
+    card_h = (top_y - bottom_y - (row_gap * (card_rows - 1))) / card_rows
+    total_pages = (len(photo_rows) + per_page - 1) // per_page
+
+    for page_index, start in enumerate(range(0, len(photo_rows), per_page), start=1):
+        c.showPage()
+        c.setFont("Helvetica-Bold", 15)
+        c.setFillColorRGB(0.1, 0.1, 0.1)
+        c.drawString(40, height - 50, "Tree Photo Appendix")
+        c.setFont("Helvetica", 8)
+        c.setFillColorRGB(0.4, 0.4, 0.4)
+        scope_text = f"Project: {project.get('name', '-')}"
+        if assignee_name:
+            scope_text += f" | Assignee: {assignee_name}"
+        c.drawString(40, height - 66, scope_text[:100])
+        c.drawRightString(width - 40, height - 66, f"Page {page_index}/{total_pages}")
+
+        page_rows = photo_rows[start : start + per_page]
+        for idx, row in enumerate(page_rows):
+            col = idx % card_cols
+            row_idx = idx // card_cols
+            x = margin_x + col * (card_w + col_gap)
+            card_top = top_y - row_idx * (card_h + row_gap)
+            y = card_top - card_h
+            _draw_photo_card(c, x, y, card_w, card_h, row, image_cache)
 
 
 def _render_executive_summary(c, width, height, project, kpi_snapshot, carbon_data, kpi_trend, species_daily_survival=None):
@@ -651,6 +812,8 @@ def render_green_report_pdf(
     carbon_data: dict | None = None,
     kpi_trend: list[dict] | None = None,
     species_daily_survival: dict | None = None,
+    photo_rows: list[dict] | None = None,
+    include_photos: bool = False,
 ):
     c = canvas.Canvas(output_path, pagesize=A4)
     width, height = A4
@@ -1030,6 +1193,17 @@ def render_green_report_pdf(
                 c.drawString(436, y, str(row.get("reviewed_at", "") or "-")[:10])
                 c.drawString(494, y, _format_delay_label(row.get("delay_days"), row.get("delay_context")))
                 y -= 10
+
+    if include_photos:
+        scoped_photo_rows = [dict(row) for row in (photo_rows or rows) if str(row.get("photo_url") or "").strip()]
+        _render_photo_appendix_pages(
+            c,
+            width,
+            height,
+            project,
+            scoped_photo_rows,
+            assignee_name=project.get("report_assignee"),
+        )
 
     c.save()
 

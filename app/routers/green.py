@@ -6990,6 +6990,7 @@ def export_donor_report_csv(project_id: int, db: Session = Depends(get_db)):
 def export_donor_report_pdf(
     project_id: int,
     assignee_name: str | None = Query(default=None),
+    include_photos: bool = Query(default=False),
     lng: float | None = Query(default=None),
     lat: float | None = Query(default=None),
     zoom: float | None = Query(default=None),
@@ -7001,6 +7002,7 @@ def export_donor_report_pdf(
     return export_work_report_pdf(
         project_id=project_id,
         assignee_name=assignee_name,
+        include_photos=include_photos,
         lng=lng,
         lat=lat,
         zoom=zoom,
@@ -7022,6 +7024,7 @@ def export_donor_report_csv_alias(
 def export_donor_report_pdf_alias(
     project_id: int = Query(...),
     assignee_name: str | None = Query(default=None),
+    include_photos: bool = Query(default=False),
     lng: float | None = Query(default=None),
     lat: float | None = Query(default=None),
     zoom: float | None = Query(default=None),
@@ -7032,6 +7035,7 @@ def export_donor_report_pdf_alias(
     return export_donor_report_pdf(
         project_id=project_id,
         assignee_name=assignee_name,
+        include_photos=include_photos,
         lng=lng,
         lat=lat,
         zoom=zoom,
@@ -7892,6 +7896,7 @@ def _build_tree_stats(rows: list[dict]) -> dict:
 def export_work_report_pdf(
     project_id: int,
     assignee_name: str | None = None,
+    include_photos: bool = Query(default=False),
     lng: float | None = Query(default=None),
     lat: float | None = Query(default=None),
     zoom: float | None = Query(default=None),
@@ -7924,6 +7929,8 @@ def export_work_report_pdf(
                    t.planting_date,
                    t.status,
                    t.notes,
+                   t.photo_url,
+                   t.created_by,
                    t.tree_origin,
                    t.tree_height_m,
                    t.attribution_scope,
@@ -7946,6 +7953,8 @@ def export_work_report_pdf(
                    t.planting_date,
                    t.status,
                    t.notes,
+                   t.photo_url,
+                   t.created_by,
                    t.tree_origin,
                    t.tree_height_m,
                    t.attribution_scope,
@@ -7969,6 +7978,8 @@ def export_work_report_pdf(
                    t.planting_date,
                    t.status,
                    t.notes,
+                   t.photo_url,
+                   t.created_by,
                    t.tree_origin,
                    t.tree_height_m,
                    t.attribution_scope,
@@ -7991,6 +8002,8 @@ def export_work_report_pdf(
                    t.planting_date,
                    t.status,
                    t.notes,
+                   t.photo_url,
+                   t.created_by,
                    t.tree_origin,
                    t.tree_height_m,
                    t.attribution_scope,
@@ -8007,12 +8020,57 @@ def export_work_report_pdf(
             LIMIT 1000
         """), {"project_id": project_id}).mappings().all()
 
+    photo_rows: list[dict] = []
+    if include_photos:
+        if assignee_name:
+            photo_rows = db.execute(text("""
+                SELECT
+                       t.id,
+                       t.species,
+                       t.planting_date,
+                       t.status,
+                       t.tree_origin,
+                       t.tree_height_m,
+                       t.attribution_scope,
+                       t.created_by,
+                       t.custodian_id,
+                       c.name AS custodian_name,
+                       t.photo_url
+                FROM trees t
+                LEFT JOIN green_custodians c ON c.id = t.custodian_id
+                WHERE t.project_id = :project_id
+                  AND t.created_by = :assignee_name
+                  AND COALESCE(TRIM(t.photo_url), '') <> ''
+                ORDER BY t.created_at DESC, t.id DESC
+            """), {"project_id": project_id, "assignee_name": assignee_name}).mappings().all()
+        else:
+            photo_rows = db.execute(text("""
+                SELECT
+                       t.id,
+                       t.species,
+                       t.planting_date,
+                       t.status,
+                       t.tree_origin,
+                       t.tree_height_m,
+                       t.attribution_scope,
+                       t.created_by,
+                       t.custodian_id,
+                       c.name AS custodian_name,
+                       t.photo_url
+                FROM trees t
+                LEFT JOIN green_custodians c ON c.id = t.custodian_id
+                WHERE t.project_id = :project_id
+                  AND COALESCE(TRIM(t.photo_url), '') <> ''
+                ORDER BY t.created_at DESC, t.id DESC
+            """), {"project_id": project_id}).mappings().all()
+
     maintenance_rows = _maintenance_summary_by_tree(project_id, db, assignee_name)
     rows = _attach_maintenance_to_tree_rows(rows, maintenance_rows)
     map_rows = _attach_maintenance_to_tree_rows(map_rows, maintenance_rows)
 
     project_copy = dict(project)
     project_copy["stats"] = _build_tree_stats(map_rows)
+    project_copy["report_assignee"] = assignee_name
 
     os.makedirs(REPORTS_DIR, exist_ok=True)
     tmp_pdf = tempfile.NamedTemporaryFile(suffix="_work_map_report.pdf", delete=False)
@@ -8067,6 +8125,8 @@ def export_work_report_pdf(
             carbon_data=carbon_data,
             kpi_trend=kpi_trend,
             species_daily_survival=species_daily_survival,
+            photo_rows=photo_rows,
+            include_photos=include_photos,
         )
     except Exception:
         render_green_report_pdf(
@@ -8082,6 +8142,8 @@ def export_work_report_pdf(
             carbon_data=carbon_data,
             kpi_trend=kpi_trend,
             species_daily_survival=species_daily_survival,
+            photo_rows=photo_rows,
+            include_photos=include_photos,
         )
     filename = (
         f"project_{project_id}_work_report_{assignee_name}.pdf"
