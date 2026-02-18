@@ -2010,6 +2010,109 @@ def create_project(
     return project
 
 
+@router.delete("/projects/{project_id}")
+def delete_project(
+    project_id: int,
+    db: Session = Depends(get_db),
+    confirm_name: str = Body(..., embed=True),
+):
+    project = db.execute(
+        text(
+            """
+            SELECT id, name
+            FROM tree_projects
+            WHERE id = :project_id
+            """
+        ),
+        {"project_id": project_id},
+    ).mappings().first()
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    expected_name = str(project.get("name") or "").strip()
+    provided_name = str(confirm_name or "").strip()
+    if not provided_name:
+        raise HTTPException(status_code=400, detail="Project name confirmation is required")
+    if provided_name != expected_name:
+        raise HTTPException(status_code=400, detail="Project name confirmation does not match")
+
+    tree_count = int(
+        db.execute(
+            text(
+                """
+                SELECT COUNT(*) AS total
+                FROM trees
+                WHERE project_id = :project_id
+                """
+            ),
+            {"project_id": project_id},
+        ).scalar()
+        or 0
+    )
+    task_count = int(
+        db.execute(
+            text(
+                """
+                SELECT COUNT(*) AS total
+                FROM tree_tasks
+                WHERE tree_id IN (
+                    SELECT id
+                    FROM trees
+                    WHERE project_id = :project_id
+                )
+                """
+            ),
+            {"project_id": project_id},
+        ).scalar()
+        or 0
+    )
+    work_order_count = int(
+        db.execute(
+            text(
+                """
+                SELECT COUNT(*) AS total
+                FROM green_work_orders
+                WHERE project_id = :project_id
+                """
+            ),
+            {"project_id": project_id},
+        ).scalar()
+        or 0
+    )
+
+    try:
+        deleted = db.execute(
+            text(
+                """
+                DELETE FROM tree_projects
+                WHERE id = :project_id
+                RETURNING id
+                """
+            ),
+            {"project_id": project_id},
+        ).scalar()
+        if not deleted:
+            db.rollback()
+            raise HTTPException(status_code=404, detail="Project not found")
+        db.commit()
+    except HTTPException:
+        raise
+    except Exception:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="Project could not be deleted. Please retry.")
+
+    return {
+        "status": "ok",
+        "deleted_project_id": project_id,
+        "deleted_project_name": expected_name,
+        "deleted_summary": {
+            "trees": tree_count,
+            "tasks": task_count,
+            "work_orders": work_order_count,
+        },
+    }
+
+
 @router.patch("/projects/{project_id}/settings")
 def update_project_settings(
     project_id: int,
