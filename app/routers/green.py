@@ -343,6 +343,74 @@ def _safe_json(value: dict | list | None) -> str:
         return "{}"
 
 
+def _is_valid_linear_ring(ring: object) -> bool:
+    if not isinstance(ring, list) or len(ring) < 4:
+        return False
+    for point in ring:
+        if not isinstance(point, (list, tuple)) or len(point) < 2:
+            return False
+        try:
+            float(point[0])
+            float(point[1])
+        except Exception:
+            return False
+    return True
+
+
+def _normalize_work_area_geojson(value: dict | str | None) -> dict | None:
+    if value is None:
+        return None
+
+    raw: object = value
+    if isinstance(raw, str):
+        raw = raw.strip()
+        if not raw:
+            return None
+        try:
+            raw = json.loads(raw)
+        except Exception:
+            return None
+
+    if not isinstance(raw, dict):
+        return None
+
+    geometry = raw.get("geometry") if str(raw.get("type") or "").strip() == "Feature" else raw
+    if not isinstance(geometry, dict):
+        return None
+
+    geom_type = str(geometry.get("type") or "").strip()
+    coords = geometry.get("coordinates")
+
+    if geom_type == "Polygon":
+        if not isinstance(coords, list) or len(coords) == 0:
+            return None
+        normalized_rings: list[list[list[float]]] = []
+        for ring in coords:
+            if not _is_valid_linear_ring(ring):
+                return None
+            normalized_ring = [[float(point[0]), float(point[1])] for point in ring]
+            normalized_rings.append(normalized_ring)
+        return {"type": "Polygon", "coordinates": normalized_rings}
+
+    if geom_type == "MultiPolygon":
+        if not isinstance(coords, list) or len(coords) == 0:
+            return None
+        normalized_polygons: list[list[list[list[float]]]] = []
+        for polygon in coords:
+            if not isinstance(polygon, list) or len(polygon) == 0:
+                return None
+            normalized_rings: list[list[list[float]]] = []
+            for ring in polygon:
+                if not _is_valid_linear_ring(ring):
+                    return None
+                normalized_ring = [[float(point[0]), float(point[1])] for point in ring]
+                normalized_rings.append(normalized_ring)
+            normalized_polygons.append(normalized_rings)
+        return {"type": "MultiPolygon", "coordinates": normalized_polygons}
+
+    return None
+
+
 def _get_maintenance_intervals(activity: str, tree_age_days: int, season: str) -> dict:
     activity_key = _normalize_name(activity)
     season_key = "dry" if _normalize_name(season) == "dry" else "rainy"
@@ -1314,6 +1382,9 @@ def ensure_green_tables(db: Session):
             target_trees INTEGER DEFAULT 0,
             maintenance_schedule TEXT,
             due_date DATE,
+            area_enabled BOOLEAN NOT NULL DEFAULT FALSE,
+            area_label TEXT,
+            area_geojson JSONB,
             status TEXT NOT NULL DEFAULT 'assigned',
             planted_count INTEGER DEFAULT 0,
             visits_done INTEGER DEFAULT 0,
@@ -1321,6 +1392,12 @@ def ensure_green_tables(db: Session):
             created_at TIMESTAMP DEFAULT NOW()
         )
     """))
+    try:
+        db.execute(text("ALTER TABLE green_work_orders ADD COLUMN IF NOT EXISTS area_enabled BOOLEAN NOT NULL DEFAULT FALSE"))
+        db.execute(text("ALTER TABLE green_work_orders ADD COLUMN IF NOT EXISTS area_label TEXT"))
+        db.execute(text("ALTER TABLE green_work_orders ADD COLUMN IF NOT EXISTS area_geojson JSONB"))
+    except Exception:
+        db.rollback()
     db.execute(text("""
         CREATE TABLE IF NOT EXISTS green_species_maturity (
             id SERIAL PRIMARY KEY,
@@ -7126,6 +7203,9 @@ def create_work_order(
     target_trees: int = Body(default=0),
     maintenance_schedule: str = Body(default=""),
     due_date: str | None = Body(default=None),
+    area_enabled: bool = Body(default=False),
+    area_label: str | None = Body(default=None),
+    area_geojson: dict | str | None = Body(default=None),
 ):
     if work_type not in {"planting", "maintenance"}:
         raise HTTPException(status_code=400, detail="Invalid work_type")
@@ -7134,22 +7214,40 @@ def create_work_order(
         raise HTTPException(status_code=400, detail="Assignee name required")
     if work_type == "planting" and int(target_trees or 0) <= 0:
         raise HTTPException(status_code=400, detail="Target trees must be greater than 0 for planting orders")
+    if area_enabled and work_type != "planting":
+        raise HTTPException(status_code=400, detail="Area assignment is only available for planting orders")
 
-    existing_id = db.execute(
-        text(
-            """
-            SELECT id
-            FROM green_work_orders
-            WHERE project_id = :project_id
-              AND LOWER(TRIM(assignee_name)) = LOWER(TRIM(:assignee_name))
-              AND work_type = :work_type
-              AND LOWER(COALESCE(status, 'assigned')) NOT IN ('done', 'completed', 'closed', 'cancelled')
-            ORDER BY created_at DESC, id DESC
-            LIMIT 1
-            """
-        ),
-        {"project_id": project_id, "assignee_name": assignee_clean, "work_type": work_type},
-    ).scalar()
+    normalized_area_geojson = _normalize_work_area_geojson(area_geojson)
+    area_label_clean = (area_label or "").strip() or None
+    if area_enabled and normalized_area_geojson is None:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid planting area polygon. Draw a valid Polygon/MultiPolygon before assigning.",
+        )
+    if not area_enabled:
+        area_label_clean = None
+        normalized_area_geojson = None
+
+    can_accumulate = work_type == "planting" and not area_enabled and normalized_area_geojson is None
+    existing_id = None
+    if can_accumulate:
+        existing_id = db.execute(
+            text(
+                """
+                SELECT id
+                FROM green_work_orders
+                WHERE project_id = :project_id
+                  AND LOWER(TRIM(assignee_name)) = LOWER(TRIM(:assignee_name))
+                  AND work_type = :work_type
+                  AND COALESCE(area_enabled, FALSE) = FALSE
+                  AND area_geojson IS NULL
+                  AND LOWER(COALESCE(status, 'assigned')) NOT IN ('done', 'completed', 'closed', 'cancelled')
+                ORDER BY created_at DESC, id DESC
+                LIMIT 1
+                """
+            ),
+            {"project_id": project_id, "assignee_name": assignee_clean, "work_type": work_type},
+        ).scalar()
 
     if existing_id and work_type == "planting":
         row = db.execute(
@@ -7169,9 +7267,13 @@ def create_work_order(
     else:
         row = db.execute(text("""
             INSERT INTO green_work_orders (
-                project_id, assignee_name, work_type, target_trees, maintenance_schedule, due_date
+                project_id, assignee_name, work_type, target_trees, maintenance_schedule, due_date,
+                area_enabled, area_label, area_geojson
             )
-            VALUES (:project_id, :assignee_name, :work_type, :target_trees, :maintenance_schedule, :due_date)
+            VALUES (
+                :project_id, :assignee_name, :work_type, :target_trees, :maintenance_schedule, :due_date,
+                :area_enabled, :area_label, CAST(:area_geojson AS JSONB)
+            )
             RETURNING id
         """), {
             "project_id": project_id,
@@ -7180,6 +7282,9 @@ def create_work_order(
             "target_trees": target_trees,
             "maintenance_schedule": maintenance_schedule or None,
             "due_date": due_date,
+            "area_enabled": bool(area_enabled),
+            "area_label": area_label_clean,
+            "area_geojson": _safe_json(normalized_area_geojson) if normalized_area_geojson else None,
         }).scalar()
         action_name = "work_order_created"
     _log_audit_event(
@@ -7194,6 +7299,9 @@ def create_work_order(
             "target_trees": target_trees,
             "maintenance_schedule": maintenance_schedule or None,
             "due_date": due_date,
+            "area_enabled": bool(area_enabled),
+            "area_label": area_label_clean,
+            "area_geojson": normalized_area_geojson,
         },
     )
     db.commit()
@@ -7218,6 +7326,8 @@ def list_work_orders(
         )
         SELECT o.id, o.project_id, o.assignee_name, o.work_type, o.target_trees,
                o.maintenance_schedule, o.due_date, o.status,
+               COALESCE(o.area_enabled, FALSE) AS area_enabled,
+               o.area_label, o.area_geojson,
                CASE
                    WHEN o.work_type = 'planting' THEN COALESCE(t.planted, 0)
                    ELSE o.planted_count
@@ -7229,7 +7339,21 @@ def list_work_orders(
           AND (:assignee_name IS NULL OR LOWER(TRIM(o.assignee_name)) = LOWER(TRIM(:assignee_name)))
         ORDER BY o.created_at DESC
     """), {"project_id": project_id, "assignee_name": assignee_name}).mappings().all()
-    return [dict(r) for r in rows]
+    payload: list[dict] = []
+    for row in rows:
+        item = dict(row)
+        raw_geojson = item.get("area_geojson")
+        if isinstance(raw_geojson, str):
+            try:
+                item["area_geojson"] = json.loads(raw_geojson)
+            except Exception:
+                item["area_geojson"] = None
+        item["area_enabled"] = bool(item.get("area_enabled")) and item.get("work_type") == "planting"
+        if not item["area_enabled"]:
+            item["area_geojson"] = None
+            item["area_label"] = None
+        payload.append(item)
+    return payload
 
 
 @router.patch("/work-orders/{work_id}")
