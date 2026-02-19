@@ -77,6 +77,8 @@ VERRA_VCS_REFERENCES = [
 ]
 
 MAINTENANCE_ACTIVITY_ORDER = ("watering", "weeding", "protection", "inspection", "replacement")
+SUPERVISION_TASK_TYPE = "supervision"
+ASSIGNABLE_TASK_TYPES = set(MAINTENANCE_ACTIVITY_ORDER) | {SUPERVISION_TASK_TYPE}
 AGE_SURVIVAL_CHECKPOINTS_DAYS = (30, 90, 180)
 SEASON_VALUES = {"rainy", "dry"}
 TASK_STATUS_VALUES = {"pending", "done", "overdue"}
@@ -389,6 +391,41 @@ def _safe_json(value: dict | list | None) -> str:
         return "{}"
 
 
+def _normalize_photo_urls(value: object) -> list[str]:
+    raw: object = value
+    if isinstance(raw, str):
+        text_value = raw.strip()
+        if not text_value:
+            return []
+        try:
+            parsed = json.loads(text_value)
+            raw = parsed
+        except Exception:
+            raw = [text_value]
+    if isinstance(raw, tuple):
+        raw = list(raw)
+    if not isinstance(raw, list):
+        return []
+    seen: set[str] = set()
+    items: list[str] = []
+    for item in raw:
+        url = str(item or "").strip()
+        if not url or url in seen:
+            continue
+        seen.add(url)
+        items.append(url)
+    return items[:30]
+
+
+def _merge_photo_evidence(photo_url: str | None, photo_urls: object) -> tuple[str | None, list[str]]:
+    merged = _normalize_photo_urls(photo_urls)
+    single = (photo_url or "").strip()
+    if single and single not in merged:
+        merged.append(single)
+    primary = merged[-1] if merged else None
+    return primary, merged
+
+
 def _is_valid_linear_ring(ring: object) -> bool:
     if not isinstance(ring, list) or len(ring) < 4:
         return False
@@ -661,15 +698,21 @@ def _get_species_maturity_map(project_id: int, db: Session) -> dict[str, int]:
 def _task_needs_evidence(task_type: str | None) -> dict:
     # Premium default: every maintenance completion requires note + photo proof.
     activity = _normalize_name(task_type)
-    if activity in MAINTENANCE_ACTIVITY_ORDER:
+    if activity in ASSIGNABLE_TASK_TYPES:
         return {"require_notes": True, "require_photo": True}
     return {"require_notes": False, "require_photo": False}
 
 
-def _has_required_evidence(task_type: str | None, notes: str | None, photo_url: str | None) -> tuple[bool, str]:
+def _has_required_evidence(
+    task_type: str | None,
+    notes: str | None,
+    photo_url: str | None,
+    photo_urls: object = None,
+) -> tuple[bool, str]:
     policy = _task_needs_evidence(task_type)
     notes_ok = bool((notes or "").strip())
-    photo_ok = bool((photo_url or "").strip())
+    merged_primary, merged_urls = _merge_photo_evidence(photo_url, photo_urls)
+    photo_ok = bool(merged_primary) or bool(merged_urls)
     if policy["require_notes"] and not notes_ok:
         return False, "Notes are required before submission."
     if policy["require_photo"] and not photo_ok:
@@ -1362,6 +1405,7 @@ def ensure_green_tables(db: Session):
                 project_id INTEGER NOT NULL REFERENCES tree_projects(id) ON DELETE CASCADE,
                 custodian_id INTEGER NOT NULL REFERENCES green_custodians(id) ON DELETE CASCADE,
                 quantity_allocated INTEGER NOT NULL DEFAULT 0,
+                supervision_target INTEGER NOT NULL DEFAULT 0,
                 expected_planting_start DATE,
                 expected_planting_end DATE,
                 followup_cycle_days INTEGER NOT NULL DEFAULT 30,
@@ -1373,6 +1417,10 @@ def ensure_green_tables(db: Session):
             """
         )
     )
+    try:
+        db.execute(text("ALTER TABLE green_distribution_allocations ADD COLUMN IF NOT EXISTS supervision_target INTEGER NOT NULL DEFAULT 0"))
+    except Exception:
+        db.rollback()
     db.execute(
         text(
             """
@@ -1420,6 +1468,11 @@ def ensure_green_tables(db: Session):
         db.execute(text("ALTER TABLE tree_tasks ADD COLUMN IF NOT EXISTS activity_lng DOUBLE PRECISION"))
         db.execute(text("ALTER TABLE tree_tasks ADD COLUMN IF NOT EXISTS activity_lat DOUBLE PRECISION"))
         db.execute(text("ALTER TABLE tree_tasks ADD COLUMN IF NOT EXISTS activity_recorded_at TIMESTAMP"))
+        db.execute(text("ALTER TABLE tree_tasks ADD COLUMN IF NOT EXISTS photo_urls JSONB"))
+        db.execute(text("ALTER TABLE tree_tasks ADD COLUMN IF NOT EXISTS custodian_id INTEGER"))
+        db.execute(text("ALTER TABLE tree_tasks ADD COLUMN IF NOT EXISTS distribution_allocation_id INTEGER"))
+        db.execute(text("ALTER TABLE tree_tasks ADD COLUMN IF NOT EXISTS supervision_visit_no INTEGER"))
+        db.execute(text("ALTER TABLE tree_tasks ADD COLUMN IF NOT EXISTS supervision_total_visits INTEGER"))
     except Exception:
         db.rollback()
     db.execute(text("""
@@ -1608,6 +1661,8 @@ def ensure_green_tables(db: Session):
     db.execute(text("CREATE INDEX IF NOT EXISTS idx_tree_status_history_project_date ON green_tree_status_history(project_id, status_date DESC, id DESC)"))
     db.execute(text("CREATE INDEX IF NOT EXISTS idx_tree_tasks_tree_id ON tree_tasks(tree_id)"))
     db.execute(text("CREATE INDEX IF NOT EXISTS idx_tree_tasks_review_state ON tree_tasks(review_state)"))
+    db.execute(text("CREATE INDEX IF NOT EXISTS idx_tree_tasks_allocation ON tree_tasks(distribution_allocation_id, task_type, review_state)"))
+    db.execute(text("CREATE INDEX IF NOT EXISTS idx_tree_tasks_custodian ON tree_tasks(custodian_id)"))
     db.execute(text("CREATE INDEX IF NOT EXISTS idx_green_users_name ON green_users(full_name)"))
     db.execute(text("CREATE INDEX IF NOT EXISTS idx_work_orders_project_id ON green_work_orders(project_id)"))
     db.execute(text("CREATE INDEX IF NOT EXISTS idx_species_maturity_project_id ON green_species_maturity(project_id)"))
@@ -1629,6 +1684,7 @@ def ensure_green_tables(db: Session):
     db.execute(text("CREATE INDEX IF NOT EXISTS idx_custodians_project ON green_custodians(project_id, created_at DESC)"))
     db.execute(text("CREATE INDEX IF NOT EXISTS idx_dist_events_project ON green_distribution_events(project_id, event_date DESC)"))
     db.execute(text("CREATE INDEX IF NOT EXISTS idx_dist_alloc_project ON green_distribution_allocations(project_id, created_at DESC)"))
+    db.execute(text("CREATE INDEX IF NOT EXISTS idx_dist_alloc_custodian ON green_distribution_allocations(custodian_id, created_at DESC)"))
     db.execute(text("CREATE INDEX IF NOT EXISTS idx_tree_project_links_target ON tree_project_links(target_project_id, created_at DESC)"))
     db.execute(
         text(
@@ -1953,43 +2009,62 @@ async def upload_photo_to_r2(
         if not linked_tree_id:
             db.rollback()
             raise HTTPException(status_code=404, detail="Tree not found for photo link.")
-        linked_task_row = db.execute(
+        linked_task_candidate = db.execute(
             text("""
-                UPDATE tree_tasks
-                SET photo_url = :photo_url
-                WHERE id = (
-                    SELECT id
-                    FROM tree_tasks
-                    WHERE tree_id = :tree_id
-                      AND LOWER(COALESCE(task_type, '')) = 'planting'
-                      AND LOWER(COALESCE(review_state, 'none')) <> 'approved'
-                    ORDER BY created_at DESC, id DESC
-                    LIMIT 1
-                )
-                RETURNING id
+                SELECT id, photo_urls
+                FROM tree_tasks
+                WHERE tree_id = :tree_id
+                  AND LOWER(COALESCE(task_type, '')) = 'planting'
+                  AND LOWER(COALESCE(review_state, 'none')) <> 'approved'
+                ORDER BY created_at DESC, id DESC
+                LIMIT 1
             """),
-            {"photo_url": proxy_url, "tree_id": tree_id},
+            {"tree_id": tree_id},
         ).mappings().first()
-        if linked_task_row:
-            linked_task_id = linked_task_row["id"]
+        if linked_task_candidate:
+            merged_urls = _normalize_photo_urls(linked_task_candidate.get("photo_urls"))
+            if proxy_url not in merged_urls:
+                merged_urls.append(proxy_url)
+            linked_task_row = db.execute(
+                text(
+                    """
+                    UPDATE tree_tasks
+                    SET photo_url = :photo_url,
+                        photo_urls = CAST(:photo_urls AS JSONB)
+                    WHERE id = :task_id
+                    RETURNING id
+                    """
+                ),
+                {
+                    "photo_url": proxy_url,
+                    "photo_urls": _safe_json(merged_urls),
+                    "task_id": int(linked_task_candidate.get("id") or 0),
+                },
+            ).mappings().first()
+            if linked_task_row:
+                linked_task_id = linked_task_row["id"]
         db.commit()
     elif task_id is not None:
         locked = db.execute(
             text("""
-                SELECT review_state
+                SELECT review_state, photo_urls
                 FROM tree_tasks
                 WHERE id = :task_id
             """),
             {"task_id": task_id},
-        ).scalar()
-        if locked and _normalize_name(str(locked)) == "approved":
+        ).mappings().first()
+        if locked and _normalize_name(str(locked.get("review_state"))) == "approved":
             raise HTTPException(status_code=409, detail="Task already approved and locked")
+        merged_urls = _normalize_photo_urls((locked or {}).get("photo_urls"))
+        if proxy_url not in merged_urls:
+            merged_urls.append(proxy_url)
         task_row = db.execute(text("""
             UPDATE tree_tasks
-            SET photo_url = :photo_url
+            SET photo_url = :photo_url,
+                photo_urls = CAST(:photo_urls AS JSONB)
             WHERE id = :task_id
             RETURNING id, tree_id
-        """), {"photo_url": proxy_url, "task_id": task_id}).mappings().first()
+        """), {"photo_url": proxy_url, "photo_urls": _safe_json(merged_urls), "task_id": task_id}).mappings().first()
         if not task_row:
             db.rollback()
             raise HTTPException(status_code=404, detail="Task not found for photo link.")
@@ -2729,20 +2804,54 @@ def list_distribution_allocations(project_id: int, db: Session = Depends(get_db)
                 e.species,
                 e.quantity AS event_quantity,
                 a.quantity_allocated,
+                a.supervision_target,
                 a.expected_planting_start,
                 a.expected_planting_end,
                 a.followup_cycle_days,
                 a.notes,
+                COALESCE(s.supervision_assigned, 0) AS supervision_assigned,
+                COALESCE(s.supervision_done, 0) AS supervision_done,
+                COALESCE(s.supervision_live, 0) AS supervision_live,
+                GREATEST(COALESCE(a.supervision_target, 0) - COALESCE(s.supervision_done, 0), 0) AS supervision_remaining,
                 a.created_at,
                 a.updated_at
             FROM green_distribution_allocations a
             JOIN green_distribution_events e ON e.id = a.event_id
             JOIN green_custodians c ON c.id = a.custodian_id
+            LEFT JOIN (
+                SELECT
+                    t.distribution_allocation_id,
+                    COUNT(*) AS supervision_assigned,
+                    SUM(
+                        CASE
+                            WHEN LOWER(COALESCE(t.review_state, 'none')) = 'approved'
+                                 OR (
+                                     LOWER(COALESCE(t.status, '')) IN ('done', 'completed', 'closed')
+                                     AND LOWER(COALESCE(t.review_state, 'none')) = 'none'
+                                 )
+                            THEN 1 ELSE 0
+                        END
+                    ) AS supervision_done,
+                    SUM(
+                        CASE
+                            WHEN LOWER(COALESCE(t.review_state, 'none')) = 'approved'
+                                 OR (
+                                     LOWER(COALESCE(t.status, '')) IN ('done', 'completed', 'closed')
+                                     AND LOWER(COALESCE(t.review_state, 'none')) = 'none'
+                                 )
+                            THEN 0 ELSE 1
+                        END
+                    ) AS supervision_live
+                FROM tree_tasks t
+                WHERE LOWER(COALESCE(t.task_type, '')) = :supervision_type
+                  AND t.distribution_allocation_id IS NOT NULL
+                GROUP BY t.distribution_allocation_id
+            ) s ON s.distribution_allocation_id = a.id
             WHERE a.project_id = :project_id
             ORDER BY e.event_date DESC, a.created_at DESC, a.id DESC
             """
         ),
-        {"project_id": project_id},
+        {"project_id": project_id, "supervision_type": SUPERVISION_TASK_TYPE},
     ).mappings().all()
     return [dict(row) for row in rows]
 
@@ -2753,6 +2862,7 @@ def upsert_distribution_allocation(
     db: Session = Depends(get_db),
     custodian_id: int = Body(...),
     quantity_allocated: int = Body(default=0),
+    supervision_target: int = Body(default=0),
     expected_planting_start: str | None = Body(default=None),
     expected_planting_end: str | None = Body(default=None),
     followup_cycle_days: int = Body(default=30),
@@ -2776,6 +2886,10 @@ def upsert_distribution_allocation(
 
     if int(quantity_allocated or 0) < 0:
         raise HTTPException(status_code=400, detail="quantity_allocated cannot be negative")
+    if int(supervision_target or 0) < 0:
+        raise HTTPException(status_code=400, detail="supervision_target cannot be negative")
+    if int(supervision_target or 0) > 365:
+        raise HTTPException(status_code=400, detail="supervision_target cannot be greater than 365")
     if int(followup_cycle_days or 0) < 1 or int(followup_cycle_days or 0) > 365:
         raise HTTPException(status_code=400, detail="followup_cycle_days must be between 1 and 365")
 
@@ -2789,15 +2903,16 @@ def upsert_distribution_allocation(
             """
             INSERT INTO green_distribution_allocations (
                 event_id, project_id, custodian_id, quantity_allocated,
-                expected_planting_start, expected_planting_end, followup_cycle_days, notes
+                supervision_target, expected_planting_start, expected_planting_end, followup_cycle_days, notes
             )
             VALUES (
                 :event_id, :project_id, :custodian_id, :quantity_allocated,
-                :expected_planting_start, :expected_planting_end, :followup_cycle_days, :notes
+                :supervision_target, :expected_planting_start, :expected_planting_end, :followup_cycle_days, :notes
             )
             ON CONFLICT (event_id, custodian_id)
             DO UPDATE SET
                 quantity_allocated = EXCLUDED.quantity_allocated,
+                supervision_target = EXCLUDED.supervision_target,
                 expected_planting_start = COALESCE(EXCLUDED.expected_planting_start, green_distribution_allocations.expected_planting_start),
                 expected_planting_end = COALESCE(EXCLUDED.expected_planting_end, green_distribution_allocations.expected_planting_end),
                 followup_cycle_days = EXCLUDED.followup_cycle_days,
@@ -2809,6 +2924,7 @@ def upsert_distribution_allocation(
                 project_id,
                 custodian_id,
                 quantity_allocated,
+                supervision_target,
                 expected_planting_start,
                 expected_planting_end,
                 followup_cycle_days,
@@ -2822,6 +2938,7 @@ def upsert_distribution_allocation(
             "project_id": int(event_row.get("project_id")),
             "custodian_id": int(custodian_id),
             "quantity_allocated": int(quantity_allocated or 0),
+            "supervision_target": int(supervision_target or 0),
             "expected_planting_start": start_date,
             "expected_planting_end": end_date,
             "followup_cycle_days": int(followup_cycle_days or 30),
@@ -2838,11 +2955,212 @@ def upsert_distribution_allocation(
             "event_id": int(event_id),
             "custodian_id": int(custodian_id),
             "quantity_allocated": int(row.get("quantity_allocated") or 0),
+            "supervision_target": int(row.get("supervision_target") or 0),
             "followup_cycle_days": int(row.get("followup_cycle_days") or 0),
         },
     )
     db.commit()
     return dict(row)
+
+
+@router.post("/distribution-allocations/{allocation_id}/assign-supervision")
+def assign_distribution_supervision(
+    allocation_id: int,
+    db: Session = Depends(get_db),
+    assignee_name: str = Body(...),
+    visits_to_assign: int = Body(default=1),
+    due_date: str | None = Body(default=None),
+    priority: str = Body(default="normal"),
+    actor_name: str | None = Body(default=None),
+):
+    assignee_clean = (assignee_name or "").strip()
+    if not assignee_clean:
+        raise HTTPException(status_code=400, detail="Assignee name is required")
+    requested_visits = int(visits_to_assign or 0)
+    if requested_visits <= 0:
+        raise HTTPException(status_code=400, detail="visits_to_assign must be greater than 0")
+    if requested_visits > 30:
+        raise HTTPException(status_code=400, detail="visits_to_assign cannot be greater than 30 at once")
+
+    allocation = db.execute(
+        text(
+            """
+            SELECT
+                a.id,
+                a.project_id,
+                a.custodian_id,
+                a.supervision_target,
+                a.followup_cycle_days,
+                a.expected_planting_start,
+                a.expected_planting_end,
+                c.name AS custodian_name,
+                c.custodian_type,
+                c.contact_person,
+                c.phone,
+                c.email,
+                c.community_name,
+                e.event_date,
+                e.species AS event_species
+            FROM green_distribution_allocations a
+            JOIN green_custodians c ON c.id = a.custodian_id
+            JOIN green_distribution_events e ON e.id = a.event_id
+            WHERE a.id = :allocation_id
+            """
+        ),
+        {"allocation_id": allocation_id},
+    ).mappings().first()
+    if not allocation:
+        raise HTTPException(status_code=404, detail="Allocation not found")
+
+    supervision_target = int(allocation.get("supervision_target") or 0)
+    if supervision_target <= 0:
+        raise HTTPException(status_code=400, detail="Set supervision target in allocation before assigning visits")
+
+    tree_rows = db.execute(
+        text(
+            """
+            SELECT id, species, status, planting_date, ST_X(geom) AS lng, ST_Y(geom) AS lat
+            FROM trees
+            WHERE project_id = :project_id
+              AND custodian_id = :custodian_id
+            ORDER BY created_at ASC, id ASC
+            """
+        ),
+        {
+            "project_id": int(allocation.get("project_id") or 0),
+            "custodian_id": int(allocation.get("custodian_id") or 0),
+        },
+    ).mappings().all()
+    if not tree_rows:
+        raise HTTPException(status_code=400, detail="No trees linked to this custodian yet. Capture at least one tree first.")
+
+    task_counts = db.execute(
+        text(
+            """
+            SELECT
+                COUNT(*) AS assigned_count,
+                SUM(
+                    CASE
+                        WHEN LOWER(COALESCE(review_state, 'none')) = 'approved'
+                             OR (
+                                 LOWER(COALESCE(status, '')) IN ('done', 'completed', 'closed')
+                                 AND LOWER(COALESCE(review_state, 'none')) = 'none'
+                             )
+                        THEN 1 ELSE 0
+                    END
+                ) AS done_count
+            FROM tree_tasks
+            WHERE distribution_allocation_id = :allocation_id
+              AND LOWER(COALESCE(task_type, '')) = :task_type
+            """
+        ),
+        {"allocation_id": allocation_id, "task_type": SUPERVISION_TASK_TYPE},
+    ).mappings().first()
+    assigned_count = int((task_counts or {}).get("assigned_count") or 0)
+    done_count = int((task_counts or {}).get("done_count") or 0)
+    remaining_assignable = max(supervision_target - assigned_count, 0)
+    if remaining_assignable <= 0:
+        raise HTTPException(status_code=409, detail="All supervision visits for this allocation are already assigned")
+
+    create_count = min(requested_visits, remaining_assignable)
+    due_date_value = _parse_date_value(due_date)
+    cycle_days = int(allocation.get("followup_cycle_days") or 14)
+    baseline_due = (
+        _parse_date_value(allocation.get("expected_planting_start"))
+        or _parse_date_value(allocation.get("event_date"))
+        or date.today()
+    )
+    custodian_name = str(allocation.get("custodian_name") or "").strip()
+    contact_text = str(allocation.get("phone") or allocation.get("email") or allocation.get("contact_person") or "-").strip()
+    community_text = str(allocation.get("community_name") or "-").strip()
+
+    created_tasks: list[dict] = []
+    for index in range(create_count):
+        visit_no = assigned_count + index + 1
+        target_tree = tree_rows[(assigned_count + index) % len(tree_rows)]
+        task_due_date = due_date_value or (baseline_due + timedelta(days=max(cycle_days * visit_no, 1)))
+        task_notes = (
+            f"Custodian supervision visit {visit_no}/{supervision_target}. "
+            f"Custodian: {custodian_name or '-'} ({str(allocation.get('custodian_type') or '-').replace('_', ' ')}). "
+            f"Community: {community_text}. Contact: {contact_text}. "
+            f"Check tree condition, capture GPS, upload visit photos, and document support actions."
+        )
+        row = db.execute(
+            text(
+                """
+                INSERT INTO tree_tasks (
+                    tree_id, task_type, assignee_name, due_date, priority, status, notes, photo_url, photo_urls,
+                    review_state, submitted_at, completed_at, model_season,
+                    custodian_id, distribution_allocation_id, supervision_visit_no, supervision_total_visits
+                )
+                VALUES (
+                    :tree_id, :task_type, :assignee_name, :due_date, :priority, 'pending', :notes, NULL, CAST(:photo_urls AS JSONB),
+                    'none', NULL, NULL, NULL,
+                    :custodian_id, :distribution_allocation_id, :supervision_visit_no, :supervision_total_visits
+                )
+                RETURNING id, tree_id, due_date
+                """
+            ),
+            {
+                "tree_id": int(target_tree.get("id") or 0),
+                "task_type": SUPERVISION_TASK_TYPE,
+                "assignee_name": assignee_clean,
+                "due_date": task_due_date,
+                "priority": priority or "normal",
+                "notes": task_notes,
+                "photo_urls": _safe_json([]),
+                "custodian_id": int(allocation.get("custodian_id") or 0),
+                "distribution_allocation_id": allocation_id,
+                "supervision_visit_no": visit_no,
+                "supervision_total_visits": supervision_target,
+            },
+        ).mappings().first()
+        created_tasks.append(
+            {
+                "task_id": int(row.get("id") or 0),
+                "tree_id": int(row.get("tree_id") or 0),
+                "tree_species": target_tree.get("species"),
+                "tree_status": target_tree.get("status"),
+                "tree_lng": target_tree.get("lng"),
+                "tree_lat": target_tree.get("lat"),
+                "due_date": _to_date_input(row.get("due_date")),
+                "visit_no": visit_no,
+                "supervision_total_visits": supervision_target,
+                "custodian_name": custodian_name,
+                "custodian_contact": contact_text,
+                "custodian_community": community_text,
+            }
+        )
+
+    _log_audit_event(
+        db,
+        project_id=int(allocation.get("project_id") or 0),
+        entity_type="distribution_allocation",
+        entity_id=allocation_id,
+        action="custodian_supervision_assigned",
+        actor=(actor_name or "").strip() or None,
+        details={
+            "assignee_name": assignee_clean,
+            "created_count": len(created_tasks),
+            "supervision_target": supervision_target,
+            "previous_assigned": assigned_count,
+            "supervision_done": done_count,
+        },
+    )
+    db.commit()
+    return {
+        "allocation_id": allocation_id,
+        "project_id": int(allocation.get("project_id") or 0),
+        "custodian_id": int(allocation.get("custodian_id") or 0),
+        "custodian_name": custodian_name,
+        "supervision_target": supervision_target,
+        "supervision_assigned": assigned_count + len(created_tasks),
+        "supervision_done": done_count,
+        "supervision_live": max((assigned_count + len(created_tasks)) - done_count, 0),
+        "supervision_remaining": max(supervision_target - (assigned_count + len(created_tasks)), 0),
+        "created_count": len(created_tasks),
+        "tasks": created_tasks,
+    }
 
 
 @router.get("/projects/{project_id}/existing-tree-candidates")
@@ -3814,13 +4132,18 @@ def add_task(
     status: str = Body(default="pending"),
     notes: str = Body(default=""),
     photo_url: str = Body(default=""),
+    photo_urls: list[str] | None = Body(default=None),
     model_season: str | None = Body(default=None),
+    custodian_id: int | None = Body(default=None),
+    distribution_allocation_id: int | None = Body(default=None),
+    supervision_visit_no: int | None = Body(default=None),
+    supervision_total_visits: int | None = Body(default=None),
 ):
     if status not in {"pending", "done", "overdue"}:
         raise HTTPException(status_code=400, detail="Invalid status")
     activity = _normalize_name(task_type)
-    if activity not in MAINTENANCE_ACTIVITY_ORDER:
-        raise HTTPException(status_code=400, detail="Invalid maintenance type")
+    if activity not in ASSIGNABLE_TASK_TYPES:
+        raise HTTPException(status_code=400, detail="Invalid task type")
     tree_row = db.execute(
         text("SELECT project_id, status FROM trees WHERE id = :tree_id"),
         {"tree_id": tree_id},
@@ -3834,21 +4157,46 @@ def add_task(
             status_code=400,
             detail="Replacement can only be assigned when tree status is dead, damaged, removed, or needs replacement.",
         )
-    if replacement_required and activity != "replacement":
+    if replacement_required and activity not in {"replacement", SUPERVISION_TASK_TYPE}:
         raise HTTPException(
             status_code=400,
             detail="This tree currently requires replacement. Assign and complete replacement first.",
         )
 
+    if activity == SUPERVISION_TASK_TYPE:
+        if distribution_allocation_id is None:
+            raise HTTPException(status_code=400, detail="distribution_allocation_id is required for supervision tasks")
+        allocation = db.execute(
+            text(
+                """
+                SELECT id, project_id, custodian_id, supervision_target
+                FROM green_distribution_allocations
+                WHERE id = :allocation_id
+                """
+            ),
+            {"allocation_id": int(distribution_allocation_id)},
+        ).mappings().first()
+        if not allocation:
+            raise HTTPException(status_code=404, detail="Distribution allocation not found")
+        if int(allocation.get("project_id") or 0) != int(tree_row.get("project_id") or 0):
+            raise HTTPException(status_code=400, detail="Allocation and tree must belong to the same project")
+        if custodian_id is None:
+            custodian_id = int(allocation.get("custodian_id") or 0)
+        if int(custodian_id or 0) != int(allocation.get("custodian_id") or 0):
+            raise HTTPException(status_code=400, detail="custodian_id must match distribution allocation")
+        if supervision_total_visits is None:
+            supervision_total_visits = int(allocation.get("supervision_target") or 0) or None
+
     normalized_season = _normalize_name(model_season)
     if normalized_season and normalized_season not in SEASON_VALUES:
         normalized_season = "rainy"
+    normalized_photo_url, normalized_photo_urls = _merge_photo_evidence(photo_url, photo_urls)
 
     review_state = "none"
     submitted_at = None
     completed_at = None
     if _is_done_status(status):
-        evidence_ok, detail = _has_required_evidence(activity, notes, photo_url)
+        evidence_ok, detail = _has_required_evidence(activity, notes, normalized_photo_url, normalized_photo_urls)
         if not evidence_ok:
             raise HTTPException(status_code=400, detail=detail)
         review_state = "submitted"
@@ -3858,11 +4206,13 @@ def add_task(
     row = db.execute(text("""
         INSERT INTO tree_tasks (
             tree_id, task_type, assignee_name, due_date, priority, status, notes, photo_url,
-            review_state, submitted_at, completed_at, model_season
+            photo_urls, review_state, submitted_at, completed_at, model_season,
+            custodian_id, distribution_allocation_id, supervision_visit_no, supervision_total_visits
         )
         VALUES (
             :tree_id, :task_type, :assignee_name, :due_date, :priority, :status, :notes, :photo_url,
-            :review_state, :submitted_at, :completed_at, :model_season
+            CAST(:photo_urls AS JSONB), :review_state, :submitted_at, :completed_at, :model_season,
+            :custodian_id, :distribution_allocation_id, :supervision_visit_no, :supervision_total_visits
         )
         RETURNING id
     """), {
@@ -3873,11 +4223,16 @@ def add_task(
         "priority": priority,
         "status": status,
         "notes": notes or None,
-        "photo_url": photo_url or None,
+        "photo_url": normalized_photo_url,
+        "photo_urls": _safe_json(normalized_photo_urls),
         "review_state": review_state,
         "submitted_at": submitted_at,
         "completed_at": completed_at,
         "model_season": normalized_season or None,
+        "custodian_id": int(custodian_id) if custodian_id is not None else None,
+        "distribution_allocation_id": int(distribution_allocation_id) if distribution_allocation_id is not None else None,
+        "supervision_visit_no": int(supervision_visit_no) if supervision_visit_no is not None else None,
+        "supervision_total_visits": int(supervision_total_visits) if supervision_total_visits is not None else None,
     }).scalar()
     _log_audit_event(
         db,
@@ -3913,9 +4268,10 @@ def add_task(
 def list_tree_tasks(tree_id: int, db: Session = Depends(get_db)):
     rows = db.execute(text("""
         SELECT id, tree_id, task_type, assignee_name, due_date, priority,
-               status, notes, photo_url, created_at, completed_at, review_state,
+               status, notes, photo_url, photo_urls, created_at, completed_at, review_state,
                submitted_at, reviewed_at, reviewed_by, review_notes, auto_generated, model_season, source_task_id,
-               reported_tree_status, activity_lng, activity_lat, activity_recorded_at
+               reported_tree_status, activity_lng, activity_lat, activity_recorded_at,
+               custodian_id, distribution_allocation_id, supervision_visit_no, supervision_total_visits
         FROM tree_tasks
         WHERE tree_id = :tree_id
           AND COALESCE(auto_generated, FALSE) = FALSE
@@ -3932,12 +4288,20 @@ def list_tasks(
 ):
     rows = db.execute(text("""
         SELECT t.id, t.tree_id, t.task_type, t.assignee_name, t.due_date, t.priority,
-               t.status, t.notes, t.photo_url, t.created_at, t.completed_at, t.review_state,
+               t.status, t.notes, t.photo_url, t.photo_urls, t.created_at, t.completed_at, t.review_state,
                t.submitted_at, t.reviewed_at, t.reviewed_by, t.review_notes, t.auto_generated, t.model_season, t.source_task_id,
                t.reported_tree_status, t.activity_lng, t.activity_lat, t.activity_recorded_at,
-               tr.status AS tree_status, ST_X(tr.geom) AS lng, ST_Y(tr.geom) AS lat
+               t.custodian_id, t.distribution_allocation_id, t.supervision_visit_no, t.supervision_total_visits,
+               tr.status AS tree_status, tr.species AS tree_species, tr.planting_date AS tree_planting_date,
+               ST_X(tr.geom) AS lng, ST_Y(tr.geom) AS lat,
+               c.name AS custodian_name, c.custodian_type, c.community_name AS custodian_community_name,
+               c.contact_person AS custodian_contact_person, c.phone AS custodian_phone, c.email AS custodian_email,
+               a.supervision_target, a.followup_cycle_days, e.event_date AS allocation_event_date, e.species AS allocation_species
         FROM tree_tasks t
         JOIN trees tr ON tr.id = t.tree_id
+        LEFT JOIN green_custodians c ON c.id = COALESCE(t.custodian_id, tr.custodian_id)
+        LEFT JOIN green_distribution_allocations a ON a.id = t.distribution_allocation_id
+        LEFT JOIN green_distribution_events e ON e.id = a.event_id
         WHERE tr.project_id = :project_id
           AND COALESCE(t.auto_generated, FALSE) = FALSE
           AND (:assignee_name IS NULL OR t.assignee_name = :assignee_name)
@@ -3978,6 +4342,7 @@ def update_task(
     status: str | None = Body(default=None),
     notes: str | None = Body(default=None),
     photo_url: str | None = Body(default=None),
+    photo_urls: list[str] | None = Body(default=None),
     tree_status: str | None = Body(default=None),
     activity_lng: float | None = Body(default=None),
     activity_lat: float | None = Body(default=None),
@@ -4001,7 +4366,7 @@ def update_task(
     if activity_lng is not None and activity_lat is not None and activity_recorded_at_value is None:
         activity_recorded_at_value = datetime.utcnow()
     existing = db.execute(text("""
-        SELECT t.id, t.tree_id, t.task_type, t.status, t.review_state, t.notes, t.photo_url,
+        SELECT t.id, t.tree_id, t.task_type, t.status, t.review_state, t.notes, t.photo_url, t.photo_urls,
                t.completed_at, t.activity_lng, t.activity_lat, t.activity_recorded_at,
                t.submitted_at, t.reviewed_at, t.reviewed_by, t.review_notes, t.reported_tree_status,
                tr.project_id, tr.status AS tree_status
@@ -4015,14 +4380,26 @@ def update_task(
         raise HTTPException(status_code=409, detail="Task already approved and locked")
     next_status = status or existing.get("status")
     next_notes = notes if notes is not None else existing.get("notes")
-    next_photo = photo_url if photo_url is not None else existing.get("photo_url")
+    existing_photo, existing_photo_urls = _merge_photo_evidence(existing.get("photo_url"), existing.get("photo_urls"))
+    photo_update_requested = photo_url is not None or photo_urls is not None
+    next_photo_urls = list(existing_photo_urls)
+    if photo_urls is not None:
+        next_photo_urls = _normalize_photo_urls(photo_urls)
+    if photo_url is not None:
+        explicit_photo = str(photo_url or "").strip()
+        if explicit_photo and explicit_photo not in next_photo_urls:
+            next_photo_urls.append(explicit_photo)
+    if photo_update_requested:
+        next_photo = next_photo_urls[-1] if next_photo_urls else None
+    else:
+        next_photo = existing_photo
     next_review_state = existing.get("review_state") or "none"
     next_submitted_at = existing.get("submitted_at")
     next_completed_at = existing.get("completed_at")
 
     clear_review_fields = False
     if _is_done_status(next_status):
-        evidence_ok, detail = _has_required_evidence(existing.get("task_type"), next_notes, next_photo)
+        evidence_ok, detail = _has_required_evidence(existing.get("task_type"), next_notes, next_photo, next_photo_urls)
         if not evidence_ok:
             raise HTTPException(status_code=400, detail=detail)
         next_review_state = "submitted"
@@ -4048,6 +4425,7 @@ def update_task(
         SET status = COALESCE(:status, status),
             notes = COALESCE(:notes, notes),
             photo_url = COALESCE(:photo_url, photo_url),
+            photo_urls = COALESCE(CAST(:photo_urls AS JSONB), photo_urls),
             reported_tree_status = COALESCE(:reported_tree_status, reported_tree_status),
             activity_lng = COALESCE(:activity_lng, activity_lng),
             activity_lat = COALESCE(:activity_lat, activity_lat),
@@ -4059,11 +4437,12 @@ def update_task(
             review_notes = CASE WHEN :clear_review_fields THEN NULL ELSE review_notes END,
             completed_at = :completed_at
         WHERE id = :task_id
-        RETURNING tree_id, photo_url, status, review_state, reported_tree_status, activity_lng, activity_lat, activity_recorded_at
+        RETURNING tree_id, photo_url, photo_urls, status, review_state, reported_tree_status, activity_lng, activity_lat, activity_recorded_at
     """), {
         "status": status,
         "notes": notes,
-        "photo_url": photo_url,
+        "photo_url": next_photo if photo_update_requested else photo_url,
+        "photo_urls": _safe_json(next_photo_urls) if photo_update_requested else None,
         "reported_tree_status": normalized_tree_status,
         "activity_lng": activity_lng,
         "activity_lat": activity_lat,
@@ -4096,6 +4475,7 @@ def update_task(
                 "review_state": existing.get("review_state"),
                 "notes": existing.get("notes"),
                 "photo_url": existing.get("photo_url"),
+                "photo_urls": existing_photo_urls,
                 "tree_status": existing.get("tree_status"),
                 "reported_tree_status": existing.get("reported_tree_status"),
                 "activity_lng": existing.get("activity_lng"),
@@ -4107,6 +4487,7 @@ def update_task(
                 "review_state": row.get("review_state"),
                 "notes": next_notes,
                 "photo_url": next_photo,
+                "photo_urls": next_photo_urls,
                 "tree_status": existing.get("tree_status"),
                 "reported_tree_status": row.get("reported_tree_status"),
                 "activity_lng": row.get("activity_lng"),
@@ -4141,11 +4522,16 @@ def task_review_queue(
     rows = db.execute(
         text("""
             SELECT t.id, t.tree_id, t.task_type, t.assignee_name, t.status, t.review_state,
-                   t.priority, t.due_date, t.notes, t.photo_url, t.submitted_at, t.created_at,
+                   t.priority, t.due_date, t.notes, t.photo_url, t.photo_urls, t.submitted_at, t.created_at,
                    t.reported_tree_status, t.review_notes, t.activity_lng, t.activity_lat, t.activity_recorded_at,
-                   tr.project_id, tr.status AS tree_status, ST_X(tr.geom) AS tree_lng, ST_Y(tr.geom) AS tree_lat
+                   t.custodian_id, t.distribution_allocation_id, t.supervision_visit_no, t.supervision_total_visits,
+                   tr.project_id, tr.status AS tree_status, tr.species AS tree_species,
+                   ST_X(tr.geom) AS tree_lng, ST_Y(tr.geom) AS tree_lat,
+                   c.name AS custodian_name, c.custodian_type, c.community_name AS custodian_community_name,
+                   c.contact_person AS custodian_contact_person, c.phone AS custodian_phone, c.email AS custodian_email
             FROM tree_tasks t
             JOIN trees tr ON tr.id = t.tree_id
+            LEFT JOIN green_custodians c ON c.id = COALESCE(t.custodian_id, tr.custodian_id)
             WHERE tr.project_id = :project_id
               AND LOWER(t.review_state) = 'submitted'
               AND (:assignee_name IS NULL OR t.assignee_name = :assignee_name)
@@ -4162,6 +4548,7 @@ def submit_task_for_review(
     db: Session = Depends(get_db),
     notes: str | None = Body(default=None),
     photo_url: str | None = Body(default=None),
+    photo_urls: list[str] | None = Body(default=None),
     tree_status: str | None = Body(default=None),
     activity_lng: float | None = Body(default=None),
     activity_lat: float | None = Body(default=None),
@@ -4184,7 +4571,7 @@ def submit_task_for_review(
         activity_recorded_at_value = datetime.utcnow()
     task = db.execute(
         text("""
-            SELECT t.id, t.tree_id, t.task_type, t.status, t.review_state, t.notes, t.photo_url,
+            SELECT t.id, t.tree_id, t.task_type, t.status, t.review_state, t.notes, t.photo_url, t.photo_urls,
                    t.reported_tree_status, t.activity_lng, t.activity_lat, t.activity_recorded_at,
                    tr.project_id
             FROM tree_tasks t
@@ -4198,8 +4585,16 @@ def submit_task_for_review(
     if _normalize_name(task.get("review_state")) == "approved":
         raise HTTPException(status_code=409, detail="Task already approved and locked")
     merged_notes = notes if notes is not None else task.get("notes")
-    merged_photo = photo_url if photo_url is not None else task.get("photo_url")
-    evidence_ok, detail = _has_required_evidence(task.get("task_type"), merged_notes, merged_photo)
+    existing_photo, existing_photo_urls = _merge_photo_evidence(task.get("photo_url"), task.get("photo_urls"))
+    merged_photo_urls = list(existing_photo_urls)
+    if photo_urls is not None:
+        merged_photo_urls = _normalize_photo_urls(photo_urls)
+    if photo_url is not None:
+        explicit_photo = str(photo_url or "").strip()
+        if explicit_photo and explicit_photo not in merged_photo_urls:
+            merged_photo_urls.append(explicit_photo)
+    merged_photo = merged_photo_urls[-1] if merged_photo_urls else existing_photo
+    evidence_ok, detail = _has_required_evidence(task.get("task_type"), merged_notes, merged_photo, merged_photo_urls)
     if not evidence_ok:
         raise HTTPException(status_code=400, detail=detail)
 
@@ -4209,6 +4604,7 @@ def submit_task_for_review(
             SET status = 'done',
                 notes = COALESCE(:notes, notes),
                 photo_url = COALESCE(:photo_url, photo_url),
+                photo_urls = COALESCE(CAST(:photo_urls AS JSONB), photo_urls),
                 reported_tree_status = COALESCE(:reported_tree_status, reported_tree_status),
                 activity_lng = COALESCE(:activity_lng, activity_lng),
                 activity_lat = COALESCE(:activity_lat, activity_lat),
@@ -4225,7 +4621,8 @@ def submit_task_for_review(
         {
             "task_id": task_id,
             "notes": notes,
-            "photo_url": photo_url,
+            "photo_url": merged_photo,
+            "photo_urls": _safe_json(merged_photo_urls),
             "reported_tree_status": normalized_tree_status,
             "activity_lng": activity_lng,
             "activity_lat": activity_lat,
@@ -7763,12 +8160,36 @@ def export_custodian_report_pdf(project_id: int, db: Session = Depends(get_db)):
                 (SELECT COUNT(*) FROM green_distribution_events WHERE project_id = :project_id) AS distribution_events,
                 (SELECT COALESCE(SUM(quantity), 0) FROM green_distribution_events WHERE project_id = :project_id) AS seedlings_distributed,
                 (SELECT COUNT(*) FROM green_distribution_allocations WHERE project_id = :project_id) AS distribution_allocations,
+                (SELECT COALESCE(SUM(supervision_target), 0) FROM green_distribution_allocations WHERE project_id = :project_id) AS supervision_target_total,
+                (
+                    SELECT COUNT(*)
+                    FROM tree_tasks t
+                    JOIN green_distribution_allocations a ON a.id = t.distribution_allocation_id
+                    WHERE a.project_id = :project_id
+                      AND LOWER(COALESCE(t.task_type, '')) = :supervision_type
+                ) AS supervision_assigned,
+                (
+                    SELECT COALESCE(SUM(
+                        CASE
+                            WHEN LOWER(COALESCE(t.review_state, 'none')) = 'approved'
+                                 OR (
+                                     LOWER(COALESCE(t.status, '')) IN ('done', 'completed', 'closed')
+                                     AND LOWER(COALESCE(t.review_state, 'none')) = 'none'
+                                 )
+                            THEN 1 ELSE 0
+                        END
+                    ), 0)
+                    FROM tree_tasks t
+                    JOIN green_distribution_allocations a ON a.id = t.distribution_allocation_id
+                    WHERE a.project_id = :project_id
+                      AND LOWER(COALESCE(t.task_type, '')) = :supervision_type
+                ) AS supervision_done,
                 (SELECT COUNT(*) FROM trees
                     WHERE project_id = :project_id
                       AND LOWER(COALESCE(tree_origin, 'new_planting')) <> 'new_planting') AS existing_trees
             """
         ),
-        {"project_id": project_id},
+        {"project_id": project_id, "supervision_type": SUPERVISION_TASK_TYPE},
     ).mappings().first()
 
     custodians = db.execute(
@@ -7790,14 +8211,38 @@ def export_custodian_report_pdf(project_id: int, db: Session = Depends(get_db)):
                 c.notes,
                 c.created_at,
                 COALESCE(SUM(a.quantity_allocated), 0) AS allocated_seedlings,
+                COALESCE(SUM(a.supervision_target), 0) AS supervision_target,
                 COUNT(DISTINCT t.id) AS linked_trees,
-                SUM(CASE
+                COALESCE(SUM(CASE
                       WHEN LOWER(COALESCE(t.status, '')) IN ('alive', 'healthy') THEN 1
                       ELSE 0
-                    END) AS healthy_trees
+                    END), 0) AS healthy_trees,
+                COALESCE(MAX(s.supervision_assigned), 0) AS supervision_assigned,
+                COALESCE(MAX(s.supervision_done), 0) AS supervision_done
             FROM green_custodians c
             LEFT JOIN green_distribution_allocations a ON a.custodian_id = c.id
             LEFT JOIN trees t ON t.custodian_id = c.id AND t.project_id = c.project_id
+            LEFT JOIN (
+                SELECT
+                    t.custodian_id,
+                    COUNT(*) AS supervision_assigned,
+                    SUM(
+                        CASE
+                            WHEN LOWER(COALESCE(t.review_state, 'none')) = 'approved'
+                                 OR (
+                                     LOWER(COALESCE(t.status, '')) IN ('done', 'completed', 'closed')
+                                     AND LOWER(COALESCE(t.review_state, 'none')) = 'none'
+                                 )
+                            THEN 1 ELSE 0
+                        END
+                    ) AS supervision_done
+                FROM tree_tasks t
+                JOIN trees tr ON tr.id = t.tree_id
+                WHERE tr.project_id = :project_id
+                  AND LOWER(COALESCE(t.task_type, '')) = :supervision_type
+                  AND t.custodian_id IS NOT NULL
+                GROUP BY t.custodian_id
+            ) s ON s.custodian_id = c.id
             WHERE c.project_id = :project_id
             GROUP BY
                 c.id,
@@ -7817,7 +8262,7 @@ def export_custodian_report_pdf(project_id: int, db: Session = Depends(get_db)):
             ORDER BY c.created_at DESC, c.id DESC
             """
         ),
-        {"project_id": project_id},
+        {"project_id": project_id, "supervision_type": SUPERVISION_TASK_TYPE},
     ).mappings().all()
 
     distribution_events = db.execute(
@@ -7863,6 +8308,69 @@ def export_custodian_report_pdf(project_id: int, db: Session = Depends(get_db)):
         {"project_id": project_id},
     ).mappings().all()
 
+    supervision_photo_task_rows = db.execute(
+        text(
+            """
+            SELECT
+                t.id AS task_id,
+                t.tree_id,
+                t.task_type,
+                t.assignee_name,
+                t.notes,
+                t.photo_url,
+                t.photo_urls,
+                t.supervision_visit_no,
+                t.supervision_total_visits,
+                t.created_at,
+                t.submitted_at,
+                t.reviewed_at,
+                tr.species,
+                tr.status,
+                tr.planting_date,
+                c.name AS custodian_name
+            FROM tree_tasks t
+            JOIN trees tr ON tr.id = t.tree_id
+            LEFT JOIN green_custodians c ON c.id = COALESCE(t.custodian_id, tr.custodian_id)
+            WHERE tr.project_id = :project_id
+              AND LOWER(COALESCE(t.task_type, '')) = :supervision_type
+              AND (
+                    COALESCE(TRIM(t.photo_url), '') <> ''
+                    OR COALESCE(
+                        CASE
+                            WHEN jsonb_typeof(t.photo_urls) = 'array' THEN jsonb_array_length(t.photo_urls)
+                            ELSE 0
+                        END,
+                        0
+                    ) > 0
+                  )
+            ORDER BY COALESCE(t.reviewed_at, t.submitted_at, t.created_at) DESC, t.id DESC
+            LIMIT 1200
+            """
+        ),
+        {"project_id": project_id, "supervision_type": SUPERVISION_TASK_TYPE},
+    ).mappings().all()
+    supervision_photo_rows: list[dict] = []
+    for row in supervision_photo_task_rows:
+        photo_urls = _normalize_photo_urls(row.get("photo_urls"))
+        photo_url = str(row.get("photo_url") or "").strip()
+        if photo_url and photo_url not in photo_urls:
+            photo_urls.append(photo_url)
+        for idx, url in enumerate(photo_urls):
+            supervision_photo_rows.append(
+                {
+                    "id": row.get("tree_id"),
+                    "species": row.get("species"),
+                    "status": row.get("status"),
+                    "planting_date": row.get("planting_date"),
+                    "created_by": row.get("assignee_name"),
+                    "custodian_name": row.get("custodian_name"),
+                    "photo_url": url,
+                    "visit_label": f"Visit {int(row.get('supervision_visit_no') or 0)}/{int(row.get('supervision_total_visits') or 0)}",
+                    "task_id": row.get("task_id"),
+                    "photo_index": idx + 1,
+                }
+            )
+
     os.makedirs(REPORTS_DIR, exist_ok=True)
     tmp_pdf = tempfile.NamedTemporaryFile(suffix="_custodian_report.pdf", delete=False)
     pdf_path = tmp_pdf.name
@@ -7875,6 +8383,7 @@ def export_custodian_report_pdf(project_id: int, db: Session = Depends(get_db)):
         custodians=[dict(row) for row in custodians],
         distribution_events=[dict(row) for row in distribution_events],
         existing_trees=[dict(row) for row in existing_trees],
+        supervision_photo_rows=supervision_photo_rows,
     )
     filename = f"project_{project_id}_custodian_report.pdf"
     return FileResponse(pdf_path, media_type="application/pdf", filename=filename)

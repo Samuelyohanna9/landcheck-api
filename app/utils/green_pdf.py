@@ -356,7 +356,7 @@ def _draw_photo_card(c, x, y, w, h, row, image_cache):
     _draw_rounded_box(c, x, y, w, h, 5, fill_color=HexColor("#f8faf9"), stroke_color=HexColor("#d7e5db"))
 
     pad = 6
-    meta_h = 40
+    meta_h = 48
     img_x = x + pad
     img_y = y + meta_h + pad
     img_w = max(w - (pad * 2), 20)
@@ -394,6 +394,8 @@ def _draw_photo_card(c, x, y, w, h, row, image_cache):
     planting_date = str(row.get("planting_date") or "-")[:10]
     owner = str(row.get("created_by") or "-")[:16]
     custodian_name = str(row.get("custodian_name") or "-")[:16]
+    visit_label = str(row.get("visit_label") or "").strip()[:26]
+    task_id = str(row.get("task_id") or "").strip()
 
     text_y = y + 26
     c.setFont("Helvetica-Bold", 7.4)
@@ -403,6 +405,9 @@ def _draw_photo_card(c, x, y, w, h, row, image_cache):
     c.setFillColorRGB(0.35, 0.35, 0.35)
     c.drawString(x + pad, text_y - 10, f"Status: {status} | Date: {planting_date}")
     c.drawString(x + pad, text_y - 19, f"By: {owner} | Custodian: {custodian_name}")
+    if visit_label:
+        task_suffix = f" | Task #{task_id}" if task_id else ""
+        c.drawString(x + pad, text_y - 28, f"{visit_label}{task_suffix}"[:44])
 
 
 def _render_photo_appendix_pages(c, width, height, project, photo_rows, assignee_name=None):
@@ -1343,6 +1348,7 @@ def render_green_custodian_report_pdf(
     custodians: list[dict],
     distribution_events: list[dict],
     existing_trees: list[dict],
+    supervision_photo_rows: list[dict] | None = None,
 ):
     c = canvas.Canvas(output_path, pagesize=A4)
     width, height = A4
@@ -1363,7 +1369,7 @@ def render_green_custodian_report_pdf(
         c.setFillColorRGB(0.12, 0.12, 0.12)
         c.setFont("Helvetica", 8.2)
 
-    draw_report_header("Custodians, distribution events, and existing-tree intake.")
+    draw_report_header("Custodians, distribution events, supervision, and existing-tree intake.")
     c.setFillColorRGB(0.12, 0.12, 0.12)
     c.setFont("Helvetica-Bold", 12)
     c.drawString(34, height - 90, str(project.get("name") or "Project"))
@@ -1380,6 +1386,10 @@ def render_green_custodian_report_pdf(
     total_events = int(summary.get("distribution_events") or 0)
     total_seedlings = int(summary.get("seedlings_distributed") or 0)
     total_allocations = int(summary.get("distribution_allocations") or 0)
+    supervision_target_total = int(summary.get("supervision_target_total") or 0)
+    supervision_assigned_total = int(summary.get("supervision_assigned") or 0)
+    supervision_done_total = int(summary.get("supervision_done") or 0)
+    supervision_live_total = max(supervision_assigned_total - supervision_done_total, 0)
     linked_existing_trees = int(summary.get("existing_trees") or 0)
 
     card_y = height - 146
@@ -1388,7 +1398,10 @@ def render_green_custodian_report_pdf(
     cards = [
         ("Custodians", f"{total_custodians} ({verified_custodians} verified)"),
         ("Distribution Events", f"{total_events} events | {total_seedlings} seedlings"),
-        ("Allocations / Existing Trees", f"{total_allocations} allocations | {linked_existing_trees} trees"),
+        (
+            "Allocations / Supervision",
+            f"{total_allocations} allocations | Sup {supervision_done_total}/{supervision_target_total} done ({supervision_live_total} live)",
+        ),
     ]
     cx = 34
     for label, value in cards:
@@ -1408,13 +1421,14 @@ def render_green_custodian_report_pdf(
     y = height - 222
     c.setFont("Helvetica-Bold", 7.7)
     c.drawString(34, y, "Name")
-    c.drawString(154, y, "Type")
-    c.drawString(218, y, "Contact")
-    c.drawString(332, y, "Verification")
-    c.drawString(398, y, "Trees")
-    c.drawString(430, y, "Healthy")
-    c.drawString(470, y, "Allocated")
-    c.drawString(528, y, "Community")
+    c.drawString(124, y, "Type")
+    c.drawString(174, y, "Contact")
+    c.drawString(246, y, "Verify")
+    c.drawString(292, y, "Allocated")
+    c.drawString(344, y, "Trees")
+    c.drawString(378, y, "Healthy")
+    c.drawString(426, y, "Sup L/T/D")
+    c.drawString(504, y, "Community")
     y -= 11
     reset_text()
 
@@ -1426,24 +1440,30 @@ def render_green_custodian_report_pdf(
             c.setFont("Helvetica-Bold", 7.7)
             c.setFillColorRGB(0.12, 0.12, 0.12)
             c.drawString(34, y, "Name")
-            c.drawString(154, y, "Type")
-            c.drawString(218, y, "Contact")
-            c.drawString(332, y, "Verification")
-            c.drawString(398, y, "Trees")
-            c.drawString(430, y, "Healthy")
-            c.drawString(470, y, "Allocated")
-            c.drawString(528, y, "Community")
+            c.drawString(124, y, "Type")
+            c.drawString(174, y, "Contact")
+            c.drawString(246, y, "Verify")
+            c.drawString(292, y, "Allocated")
+            c.drawString(344, y, "Trees")
+            c.drawString(378, y, "Healthy")
+            c.drawString(426, y, "Sup L/T/D")
+            c.drawString(504, y, "Community")
             y -= 11
             reset_text()
         contact = str(row.get("phone") or row.get("email") or "-")
+        supervision_target = int(row.get("supervision_target") or 0)
+        supervision_done = int(row.get("supervision_done") or 0)
+        supervision_assigned = int(row.get("supervision_assigned") or 0)
+        supervision_live = max(supervision_assigned - supervision_done, 0)
         c.drawString(34, y, str(row.get("name") or "-")[:28])
-        c.drawString(154, y, str(row.get("custodian_type") or "-").replace("_", " ")[:14])
-        c.drawString(218, y, contact[:20])
-        c.drawString(332, y, str(row.get("verification_status") or "pending")[:12])
-        c.drawRightString(424, y, str(int(row.get("linked_trees") or 0)))
-        c.drawRightString(464, y, str(int(row.get("healthy_trees") or 0)))
-        c.drawRightString(520, y, str(int(row.get("allocated_seedlings") or 0)))
-        c.drawString(528, y, str(row.get("community_name") or "-")[:10])
+        c.drawString(124, y, str(row.get("custodian_type") or "-").replace("_", " ")[:10])
+        c.drawString(174, y, contact[:14])
+        c.drawString(246, y, str(row.get("verification_status") or "pending")[:8])
+        c.drawRightString(334, y, str(int(row.get("allocated_seedlings") or 0)))
+        c.drawRightString(368, y, str(int(row.get("linked_trees") or 0)))
+        c.drawRightString(414, y, str(int(row.get("healthy_trees") or 0)))
+        c.drawString(426, y, f"{supervision_live}/{supervision_target}/{supervision_done}"[:12])
+        c.drawString(504, y, str(row.get("community_name") or "-")[:12])
         y -= 10
 
     c.showPage()
@@ -1540,5 +1560,15 @@ def render_green_custodian_report_pdf(
             c.drawString(412, y, str(row.get("created_by") or "-")[:16])
             c.drawString(498, y, str(row.get("created_at") or "-")[:10])
             y -= 10
+
+    if supervision_photo_rows:
+        _render_photo_appendix_pages(
+            c,
+            width,
+            height,
+            project,
+            [dict(row) for row in supervision_photo_rows if str(row.get("photo_url") or "").strip()],
+            assignee_name=None,
+        )
 
     c.save()
