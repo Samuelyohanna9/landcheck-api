@@ -4116,7 +4116,7 @@ def task_review_queue(
             SELECT t.id, t.tree_id, t.task_type, t.assignee_name, t.status, t.review_state,
                    t.priority, t.due_date, t.notes, t.photo_url, t.submitted_at, t.created_at,
                    t.reported_tree_status, t.review_notes, t.activity_lng, t.activity_lat, t.activity_recorded_at,
-                   tr.project_id, tr.status AS tree_status
+                   tr.project_id, tr.status AS tree_status, ST_X(tr.geom) AS tree_lng, ST_Y(tr.geom) AS tree_lat
             FROM tree_tasks t
             JOIN trees tr ON tr.id = t.tree_id
             WHERE tr.project_id = :project_id
