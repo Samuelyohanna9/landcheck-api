@@ -2,7 +2,7 @@ from fastapi import APIRouter, Body, Depends, HTTPException, Query, UploadFile, 
 from fastapi.responses import FileResponse, StreamingResponse
 from sqlalchemy.orm import Session
 from sqlalchemy import text
-from datetime import datetime, date, timedelta
+from datetime import datetime, date, timedelta, timezone
 import json
 import os
 import tempfile
@@ -322,6 +322,27 @@ def _parse_date_value(value: str | datetime | date | None) -> date | None:
         return date.fromisoformat(raw)
     except Exception:
         return None
+
+
+def _parse_datetime_value(value: str | datetime | None) -> datetime | None:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        dt_value = value
+    else:
+        raw = str(value).strip()
+        if not raw:
+            return None
+        candidate = raw
+        if candidate.endswith("Z"):
+            candidate = candidate[:-1] + "+00:00"
+        try:
+            dt_value = datetime.fromisoformat(candidate)
+        except Exception:
+            return None
+    if dt_value.tzinfo is not None:
+        dt_value = dt_value.astimezone(timezone.utc).replace(tzinfo=None)
+    return dt_value
 
 
 def _to_date_input(value: date | None) -> str:
@@ -1371,6 +1392,9 @@ def ensure_green_tables(db: Session):
         db.execute(text("ALTER TABLE tree_tasks ADD COLUMN IF NOT EXISTS model_season TEXT"))
         db.execute(text("ALTER TABLE tree_tasks ADD COLUMN IF NOT EXISTS source_task_id INTEGER"))
         db.execute(text("ALTER TABLE tree_tasks ADD COLUMN IF NOT EXISTS reported_tree_status TEXT"))
+        db.execute(text("ALTER TABLE tree_tasks ADD COLUMN IF NOT EXISTS activity_lng DOUBLE PRECISION"))
+        db.execute(text("ALTER TABLE tree_tasks ADD COLUMN IF NOT EXISTS activity_lat DOUBLE PRECISION"))
+        db.execute(text("ALTER TABLE tree_tasks ADD COLUMN IF NOT EXISTS activity_recorded_at TIMESTAMP"))
     except Exception:
         db.rollback()
     db.execute(text("""
@@ -3864,7 +3888,7 @@ def list_tree_tasks(tree_id: int, db: Session = Depends(get_db)):
         SELECT id, tree_id, task_type, assignee_name, due_date, priority,
                status, notes, photo_url, created_at, completed_at, review_state,
                submitted_at, reviewed_at, reviewed_by, review_notes, auto_generated, model_season, source_task_id,
-               reported_tree_status
+               reported_tree_status, activity_lng, activity_lat, activity_recorded_at
         FROM tree_tasks
         WHERE tree_id = :tree_id
           AND COALESCE(auto_generated, FALSE) = FALSE
@@ -3883,7 +3907,7 @@ def list_tasks(
         SELECT t.id, t.tree_id, t.task_type, t.assignee_name, t.due_date, t.priority,
                t.status, t.notes, t.photo_url, t.created_at, t.completed_at, t.review_state,
                t.submitted_at, t.reviewed_at, t.reviewed_by, t.review_notes, t.auto_generated, t.model_season, t.source_task_id,
-               t.reported_tree_status,
+               t.reported_tree_status, t.activity_lng, t.activity_lat, t.activity_recorded_at,
                tr.status AS tree_status, ST_X(tr.geom) AS lng, ST_Y(tr.geom) AS lat
         FROM tree_tasks t
         JOIN trees tr ON tr.id = t.tree_id
@@ -3928,6 +3952,9 @@ def update_task(
     notes: str | None = Body(default=None),
     photo_url: str | None = Body(default=None),
     tree_status: str | None = Body(default=None),
+    activity_lng: float | None = Body(default=None),
+    activity_lat: float | None = Body(default=None),
+    activity_recorded_at: str | None = Body(default=None),
     actor_name: str | None = Body(default=None),
 ):
     if status and status not in TASK_STATUS_VALUES:
@@ -3935,9 +3962,20 @@ def update_task(
     normalized_tree_status = _normalize_tree_status(tree_status) if tree_status is not None else None
     if normalized_tree_status is not None and normalized_tree_status not in TREE_STATUS_VALUES:
         raise HTTPException(status_code=400, detail="Invalid tree status")
+    if (activity_lng is None) != (activity_lat is None):
+        raise HTTPException(status_code=400, detail="Both activity_lng and activity_lat are required together")
+    if activity_lng is not None and not (-180 <= float(activity_lng) <= 180):
+        raise HTTPException(status_code=400, detail="Invalid activity_lng")
+    if activity_lat is not None and not (-90 <= float(activity_lat) <= 90):
+        raise HTTPException(status_code=400, detail="Invalid activity_lat")
+    activity_recorded_at_value = _parse_datetime_value(activity_recorded_at)
+    if activity_recorded_at is not None and activity_recorded_at_value is None:
+        raise HTTPException(status_code=400, detail="Invalid activity_recorded_at")
+    if activity_lng is not None and activity_lat is not None and activity_recorded_at_value is None:
+        activity_recorded_at_value = datetime.utcnow()
     existing = db.execute(text("""
         SELECT t.id, t.tree_id, t.task_type, t.status, t.review_state, t.notes, t.photo_url,
-               t.completed_at,
+               t.completed_at, t.activity_lng, t.activity_lat, t.activity_recorded_at,
                t.submitted_at, t.reviewed_at, t.reviewed_by, t.review_notes, t.reported_tree_status,
                tr.project_id, tr.status AS tree_status
         FROM tree_tasks t
@@ -3984,6 +4022,9 @@ def update_task(
             notes = COALESCE(:notes, notes),
             photo_url = COALESCE(:photo_url, photo_url),
             reported_tree_status = COALESCE(:reported_tree_status, reported_tree_status),
+            activity_lng = COALESCE(:activity_lng, activity_lng),
+            activity_lat = COALESCE(:activity_lat, activity_lat),
+            activity_recorded_at = COALESCE(:activity_recorded_at, activity_recorded_at),
             review_state = :review_state,
             submitted_at = :submitted_at,
             reviewed_at = CASE WHEN :clear_review_fields THEN NULL ELSE reviewed_at END,
@@ -3991,12 +4032,15 @@ def update_task(
             review_notes = CASE WHEN :clear_review_fields THEN NULL ELSE review_notes END,
             completed_at = :completed_at
         WHERE id = :task_id
-        RETURNING tree_id, photo_url, status, review_state, reported_tree_status
+        RETURNING tree_id, photo_url, status, review_state, reported_tree_status, activity_lng, activity_lat, activity_recorded_at
     """), {
         "status": status,
         "notes": notes,
         "photo_url": photo_url,
         "reported_tree_status": normalized_tree_status,
+        "activity_lng": activity_lng,
+        "activity_lat": activity_lat,
+        "activity_recorded_at": activity_recorded_at_value,
         "review_state": next_review_state,
         "submitted_at": next_submitted_at,
         "clear_review_fields": clear_review_fields,
@@ -4027,6 +4071,9 @@ def update_task(
                 "photo_url": existing.get("photo_url"),
                 "tree_status": existing.get("tree_status"),
                 "reported_tree_status": existing.get("reported_tree_status"),
+                "activity_lng": existing.get("activity_lng"),
+                "activity_lat": existing.get("activity_lat"),
+                "activity_recorded_at": _to_iso_text(existing.get("activity_recorded_at")),
             },
             "after": {
                 "status": row.get("status"),
@@ -4035,6 +4082,9 @@ def update_task(
                 "photo_url": next_photo,
                 "tree_status": existing.get("tree_status"),
                 "reported_tree_status": row.get("reported_tree_status"),
+                "activity_lng": row.get("activity_lng"),
+                "activity_lat": row.get("activity_lat"),
+                "activity_recorded_at": _to_iso_text(row.get("activity_recorded_at")),
             },
         },
     )
@@ -4065,7 +4115,7 @@ def task_review_queue(
         text("""
             SELECT t.id, t.tree_id, t.task_type, t.assignee_name, t.status, t.review_state,
                    t.priority, t.due_date, t.notes, t.photo_url, t.submitted_at, t.created_at,
-                   t.reported_tree_status, t.review_notes,
+                   t.reported_tree_status, t.review_notes, t.activity_lng, t.activity_lat, t.activity_recorded_at,
                    tr.project_id, tr.status AS tree_status
             FROM tree_tasks t
             JOIN trees tr ON tr.id = t.tree_id
@@ -4086,15 +4136,29 @@ def submit_task_for_review(
     notes: str | None = Body(default=None),
     photo_url: str | None = Body(default=None),
     tree_status: str | None = Body(default=None),
+    activity_lng: float | None = Body(default=None),
+    activity_lat: float | None = Body(default=None),
+    activity_recorded_at: str | None = Body(default=None),
     actor_name: str | None = Body(default=None),
 ):
     normalized_tree_status = _normalize_tree_status(tree_status) if tree_status is not None else None
     if normalized_tree_status is not None and normalized_tree_status not in TREE_STATUS_VALUES:
         raise HTTPException(status_code=400, detail="Invalid tree status")
+    if (activity_lng is None) != (activity_lat is None):
+        raise HTTPException(status_code=400, detail="Both activity_lng and activity_lat are required together")
+    if activity_lng is not None and not (-180 <= float(activity_lng) <= 180):
+        raise HTTPException(status_code=400, detail="Invalid activity_lng")
+    if activity_lat is not None and not (-90 <= float(activity_lat) <= 90):
+        raise HTTPException(status_code=400, detail="Invalid activity_lat")
+    activity_recorded_at_value = _parse_datetime_value(activity_recorded_at)
+    if activity_recorded_at is not None and activity_recorded_at_value is None:
+        raise HTTPException(status_code=400, detail="Invalid activity_recorded_at")
+    if activity_lng is not None and activity_lat is not None and activity_recorded_at_value is None:
+        activity_recorded_at_value = datetime.utcnow()
     task = db.execute(
         text("""
             SELECT t.id, t.tree_id, t.task_type, t.status, t.review_state, t.notes, t.photo_url,
-                   t.reported_tree_status,
+                   t.reported_tree_status, t.activity_lng, t.activity_lat, t.activity_recorded_at,
                    tr.project_id
             FROM tree_tasks t
             JOIN trees tr ON tr.id = t.tree_id
@@ -4119,6 +4183,9 @@ def submit_task_for_review(
                 notes = COALESCE(:notes, notes),
                 photo_url = COALESCE(:photo_url, photo_url),
                 reported_tree_status = COALESCE(:reported_tree_status, reported_tree_status),
+                activity_lng = COALESCE(:activity_lng, activity_lng),
+                activity_lat = COALESCE(:activity_lat, activity_lat),
+                activity_recorded_at = COALESCE(:activity_recorded_at, activity_recorded_at),
                 review_state = 'submitted',
                 submitted_at = NOW(),
                 reviewed_at = NULL,
@@ -4126,13 +4193,16 @@ def submit_task_for_review(
                 review_notes = NULL,
                 completed_at = COALESCE(completed_at, NOW())
             WHERE id = :task_id
-            RETURNING id, tree_id, status, review_state, reported_tree_status
+            RETURNING id, tree_id, status, review_state, reported_tree_status, activity_lng, activity_lat, activity_recorded_at
         """),
         {
             "task_id": task_id,
             "notes": notes,
             "photo_url": photo_url,
             "reported_tree_status": normalized_tree_status,
+            "activity_lng": activity_lng,
+            "activity_lat": activity_lat,
+            "activity_recorded_at": activity_recorded_at_value,
         },
     ).mappings().first()
     if merged_photo:
@@ -4160,7 +4230,13 @@ def submit_task_for_review(
         entity_id=task_id,
         action="task_submitted_for_review",
         actor=actor_name,
-        details={"status": row.get("status"), "review_state": row.get("review_state")},
+        details={
+            "status": row.get("status"),
+            "review_state": row.get("review_state"),
+            "activity_lng": row.get("activity_lng"),
+            "activity_lat": row.get("activity_lat"),
+            "activity_recorded_at": _to_iso_text(row.get("activity_recorded_at")),
+        },
     )
     _record_alert(
         db,
