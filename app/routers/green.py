@@ -229,6 +229,31 @@ def _normalize_tree_attribution_scope(value: str | None) -> str:
     return "full"
 
 
+def _normalize_species_allocations(value: object) -> list[dict]:
+    if not isinstance(value, list):
+        return []
+    merged: dict[str, dict] = {}
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        species_raw = str(item.get("species") or "").strip()
+        if not species_raw:
+            continue
+        try:
+            count_value = int(item.get("count") or 0)
+        except Exception:
+            continue
+        if count_value <= 0:
+            continue
+        key = _normalize_name(species_raw)
+        if not key:
+            continue
+        if key not in merged:
+            merged[key] = {"species": species_raw, "count": 0}
+        merged[key]["count"] = int(merged[key]["count"]) + count_value
+    return list(merged.values())
+
+
 def _normalize_custodian_type(value: str | None) -> str:
     normalized = _normalize_name(value).replace("-", "_").replace(" ", "_")
     if normalized in CUSTODIAN_TYPE_VALUES:
@@ -1404,6 +1429,7 @@ def ensure_green_tables(db: Session):
             assignee_name TEXT NOT NULL,
             work_type TEXT NOT NULL,
             target_trees INTEGER DEFAULT 0,
+            species_allocations JSONB,
             maintenance_schedule TEXT,
             due_date DATE,
             area_enabled BOOLEAN NOT NULL DEFAULT FALSE,
@@ -1420,6 +1446,7 @@ def ensure_green_tables(db: Session):
         db.execute(text("ALTER TABLE green_work_orders ADD COLUMN IF NOT EXISTS area_enabled BOOLEAN NOT NULL DEFAULT FALSE"))
         db.execute(text("ALTER TABLE green_work_orders ADD COLUMN IF NOT EXISTS area_label TEXT"))
         db.execute(text("ALTER TABLE green_work_orders ADD COLUMN IF NOT EXISTS area_geojson JSONB"))
+        db.execute(text("ALTER TABLE green_work_orders ADD COLUMN IF NOT EXISTS species_allocations JSONB"))
     except Exception:
         db.rollback()
     db.execute(text("""
@@ -7380,6 +7407,7 @@ def create_work_order(
     assignee_name: str = Body(...),
     work_type: str = Body(...),
     target_trees: int = Body(default=0),
+    species_allocations: list[dict] | None = Body(default=None),
     maintenance_schedule: str = Body(default=""),
     due_date: str | None = Body(default=None),
     area_enabled: bool = Body(default=False),
@@ -7391,10 +7419,15 @@ def create_work_order(
     assignee_clean = (assignee_name or "").strip()
     if not assignee_clean:
         raise HTTPException(status_code=400, detail="Assignee name required")
-    if work_type == "planting" and int(target_trees or 0) <= 0:
-        raise HTTPException(status_code=400, detail="Target trees must be greater than 0 for planting orders")
     if area_enabled and work_type != "planting":
         raise HTTPException(status_code=400, detail="Area assignment is only available for planting orders")
+    normalized_species_allocations = _normalize_species_allocations(species_allocations)
+    if work_type != "planting" and normalized_species_allocations:
+        raise HTTPException(status_code=400, detail="Species-based allocation is only available for planting orders")
+    if work_type == "planting" and normalized_species_allocations:
+        target_trees = int(sum(int(item.get("count") or 0) for item in normalized_species_allocations))
+    if work_type == "planting" and int(target_trees or 0) <= 0:
+        raise HTTPException(status_code=400, detail="Target trees must be greater than 0 for planting orders")
 
     normalized_area_geojson = _normalize_work_area_geojson(area_geojson)
     area_label_clean = (area_label or "").strip() or None
@@ -7407,7 +7440,12 @@ def create_work_order(
         area_label_clean = None
         normalized_area_geojson = None
 
-    can_accumulate = work_type == "planting" and not area_enabled and normalized_area_geojson is None
+    can_accumulate = (
+        work_type == "planting"
+        and not area_enabled
+        and normalized_area_geojson is None
+        and not normalized_species_allocations
+    )
     existing_id = None
     if can_accumulate:
         existing_id = db.execute(
@@ -7420,6 +7458,7 @@ def create_work_order(
                   AND work_type = :work_type
                   AND COALESCE(area_enabled, FALSE) = FALSE
                   AND area_geojson IS NULL
+                  AND COALESCE(species_allocations, '[]'::jsonb) = '[]'::jsonb
                   AND LOWER(COALESCE(status, 'assigned')) NOT IN ('done', 'completed', 'closed', 'cancelled')
                 ORDER BY created_at DESC, id DESC
                 LIMIT 1
@@ -7446,11 +7485,11 @@ def create_work_order(
     else:
         row = db.execute(text("""
             INSERT INTO green_work_orders (
-                project_id, assignee_name, work_type, target_trees, maintenance_schedule, due_date,
+                project_id, assignee_name, work_type, target_trees, species_allocations, maintenance_schedule, due_date,
                 area_enabled, area_label, area_geojson
             )
             VALUES (
-                :project_id, :assignee_name, :work_type, :target_trees, :maintenance_schedule, :due_date,
+                :project_id, :assignee_name, :work_type, :target_trees, CAST(:species_allocations AS JSONB), :maintenance_schedule, :due_date,
                 :area_enabled, :area_label, CAST(:area_geojson AS JSONB)
             )
             RETURNING id
@@ -7459,6 +7498,7 @@ def create_work_order(
             "assignee_name": assignee_clean,
             "work_type": work_type,
             "target_trees": target_trees,
+            "species_allocations": _safe_json(normalized_species_allocations) if normalized_species_allocations else None,
             "maintenance_schedule": maintenance_schedule or None,
             "due_date": due_date,
             "area_enabled": bool(area_enabled),
@@ -7476,6 +7516,7 @@ def create_work_order(
         details={
             "work_type": work_type,
             "target_trees": target_trees,
+            "species_allocations": normalized_species_allocations,
             "maintenance_schedule": maintenance_schedule or None,
             "due_date": due_date,
             "area_enabled": bool(area_enabled),
@@ -7504,6 +7545,7 @@ def list_work_orders(
             GROUP BY created_by
         )
         SELECT o.id, o.project_id, o.assignee_name, o.work_type, o.target_trees,
+               o.species_allocations,
                o.maintenance_schedule, o.due_date, o.status,
                COALESCE(o.area_enabled, FALSE) AS area_enabled,
                o.area_label, o.area_geojson,
@@ -7527,6 +7569,13 @@ def list_work_orders(
                 item["area_geojson"] = json.loads(raw_geojson)
             except Exception:
                 item["area_geojson"] = None
+        raw_species_allocations = item.get("species_allocations")
+        if isinstance(raw_species_allocations, str):
+            try:
+                raw_species_allocations = json.loads(raw_species_allocations)
+            except Exception:
+                raw_species_allocations = []
+        item["species_allocations"] = _normalize_species_allocations(raw_species_allocations)
         item["area_enabled"] = bool(item.get("area_enabled")) and item.get("work_type") == "planting"
         if not item["area_enabled"]:
             item["area_geojson"] = None
