@@ -2,6 +2,7 @@
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware  # Added for speed
 
 from app.routers import health, plots, analytics, feedback, hazards, green
 from app.db_init import init_db
@@ -13,12 +14,26 @@ app = FastAPI(title="LandCheck API")
 def startup_event():
     init_db()
 
-# CORS (relaxed for MVP - allow all origins)
+# ✅ SPEED OPTIMIZATION: Gzip Compression
+# This shrinks large JSON/Report data (like your 210MB I/O) before sending it
+# through the Cloudflare Tunnel, making it up to 10x faster.
+app.add_middleware(GZipMiddleware, minimum_size=1000)
+
+# ✅ SECURITY OPTIMIZATION: Custom Domain CORS
+# Replacing "*" with specific origins allows you to set allow_credentials=True
+# which is required if you ever add logins or cookies.
+origins = [
+    "https://landcheck.online",
+    "https://www.landcheck.online",
+    "https://landcheck-web.pages.dev",  # Keep for testing
+    "http://localhost:3000",             # Keep for local dev if needed
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=False,  # Must be False when allow_origins is "*"
-    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"],
+    allow_origins=origins,
+    allow_credentials=True,  # Now allowed because we specified origins
+    allow_methods=["*"],
     allow_headers=["*"],
     expose_headers=["*"],
 )
