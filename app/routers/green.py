@@ -4082,6 +4082,51 @@ def update_tree(
     return {"status": "ok"}
 
 
+@router.delete("/trees/{tree_id}")
+def delete_tree(
+    tree_id: int,
+    confirm_tree_id: int | None = Query(default=None),
+    project_id: int | None = Query(default=None),
+    actor_name: str | None = Query(default=None),
+    db: Session = Depends(get_db),
+):
+    row = db.execute(
+        text(
+            """
+            SELECT id, project_id, species, status, created_by
+            FROM trees
+            WHERE id = :tree_id
+            """
+        ),
+        {"tree_id": tree_id},
+    ).mappings().first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Tree not found")
+
+    project_id_value = int(row.get("project_id") or 0)
+    if project_id is not None and int(project_id) != project_id_value:
+        raise HTTPException(status_code=400, detail="Project mismatch for selected tree")
+    if confirm_tree_id is not None and int(confirm_tree_id) != int(tree_id):
+        raise HTTPException(status_code=400, detail="Confirmation tree id does not match")
+
+    db.execute(text("DELETE FROM trees WHERE id = :tree_id"), {"tree_id": tree_id})
+    _log_audit_event(
+        db,
+        project_id=project_id_value,
+        entity_type="tree",
+        entity_id=int(tree_id),
+        action="tree_deleted",
+        actor=(actor_name or row.get("created_by") or None),
+        details={
+            "species": row.get("species"),
+            "status": row.get("status"),
+        },
+    )
+    _refresh_project_alerts(db, project_id_value)
+    db.commit()
+    return {"status": "deleted", "id": int(tree_id), "project_id": project_id_value}
+
+
 @router.post("/trees/{tree_id}/visits")
 def add_visit(
     tree_id: int,
@@ -8148,7 +8193,11 @@ def export_work_stats_pdf(project_id: int, db: Session = Depends(get_db)):
 
 
 @router.get("/projects/{project_id}/custodians/export/pdf")
-def export_custodian_report_pdf(project_id: int, db: Session = Depends(get_db)):
+def export_custodian_report_pdf(
+    project_id: int,
+    include_photos: bool = Query(default=True),
+    db: Session = Depends(get_db),
+):
     project = get_project(project_id, db)
     summary = db.execute(
         text(
@@ -8308,68 +8357,69 @@ def export_custodian_report_pdf(project_id: int, db: Session = Depends(get_db)):
         {"project_id": project_id},
     ).mappings().all()
 
-    supervision_photo_task_rows = db.execute(
-        text(
-            """
-            SELECT
-                t.id AS task_id,
-                t.tree_id,
-                t.task_type,
-                t.assignee_name,
-                t.notes,
-                t.photo_url,
-                t.photo_urls,
-                t.supervision_visit_no,
-                t.supervision_total_visits,
-                t.created_at,
-                t.submitted_at,
-                t.reviewed_at,
-                tr.species,
-                tr.status,
-                tr.planting_date,
-                c.name AS custodian_name
-            FROM tree_tasks t
-            JOIN trees tr ON tr.id = t.tree_id
-            LEFT JOIN green_custodians c ON c.id = COALESCE(t.custodian_id, tr.custodian_id)
-            WHERE tr.project_id = :project_id
-              AND LOWER(COALESCE(t.task_type, '')) = :supervision_type
-              AND (
-                    COALESCE(TRIM(t.photo_url), '') <> ''
-                    OR COALESCE(
-                        CASE
-                            WHEN jsonb_typeof(t.photo_urls) = 'array' THEN jsonb_array_length(t.photo_urls)
-                            ELSE 0
-                        END,
-                        0
-                    ) > 0
-                  )
-            ORDER BY COALESCE(t.reviewed_at, t.submitted_at, t.created_at) DESC, t.id DESC
-            LIMIT 1200
-            """
-        ),
-        {"project_id": project_id, "supervision_type": SUPERVISION_TASK_TYPE},
-    ).mappings().all()
     supervision_photo_rows: list[dict] = []
-    for row in supervision_photo_task_rows:
-        photo_urls = _normalize_photo_urls(row.get("photo_urls"))
-        photo_url = str(row.get("photo_url") or "").strip()
-        if photo_url and photo_url not in photo_urls:
-            photo_urls.append(photo_url)
-        for idx, url in enumerate(photo_urls):
-            supervision_photo_rows.append(
-                {
-                    "id": row.get("tree_id"),
-                    "species": row.get("species"),
-                    "status": row.get("status"),
-                    "planting_date": row.get("planting_date"),
-                    "created_by": row.get("assignee_name"),
-                    "custodian_name": row.get("custodian_name"),
-                    "photo_url": url,
-                    "visit_label": f"Visit {int(row.get('supervision_visit_no') or 0)}/{int(row.get('supervision_total_visits') or 0)}",
-                    "task_id": row.get("task_id"),
-                    "photo_index": idx + 1,
-                }
-            )
+    if include_photos:
+        supervision_photo_task_rows = db.execute(
+            text(
+                """
+                SELECT
+                    t.id AS task_id,
+                    t.tree_id,
+                    t.task_type,
+                    t.assignee_name,
+                    t.notes,
+                    t.photo_url,
+                    t.photo_urls,
+                    t.supervision_visit_no,
+                    t.supervision_total_visits,
+                    t.created_at,
+                    t.submitted_at,
+                    t.reviewed_at,
+                    tr.species,
+                    tr.status,
+                    tr.planting_date,
+                    c.name AS custodian_name
+                FROM tree_tasks t
+                JOIN trees tr ON tr.id = t.tree_id
+                LEFT JOIN green_custodians c ON c.id = COALESCE(t.custodian_id, tr.custodian_id)
+                WHERE tr.project_id = :project_id
+                  AND LOWER(COALESCE(t.task_type, '')) = :supervision_type
+                  AND (
+                        COALESCE(TRIM(t.photo_url), '') <> ''
+                        OR COALESCE(
+                            CASE
+                                WHEN jsonb_typeof(t.photo_urls) = 'array' THEN jsonb_array_length(t.photo_urls)
+                                ELSE 0
+                            END,
+                            0
+                        ) > 0
+                      )
+                ORDER BY COALESCE(t.reviewed_at, t.submitted_at, t.created_at) DESC, t.id DESC
+                LIMIT 1200
+                """
+            ),
+            {"project_id": project_id, "supervision_type": SUPERVISION_TASK_TYPE},
+        ).mappings().all()
+        for row in supervision_photo_task_rows:
+            photo_urls = _normalize_photo_urls(row.get("photo_urls"))
+            photo_url = str(row.get("photo_url") or "").strip()
+            if photo_url and photo_url not in photo_urls:
+                photo_urls.append(photo_url)
+            for idx, url in enumerate(photo_urls):
+                supervision_photo_rows.append(
+                    {
+                        "id": row.get("tree_id"),
+                        "species": row.get("species"),
+                        "status": row.get("status"),
+                        "planting_date": row.get("planting_date"),
+                        "created_by": row.get("assignee_name"),
+                        "custodian_name": row.get("custodian_name"),
+                        "photo_url": url,
+                        "visit_label": f"Visit {int(row.get('supervision_visit_no') or 0)}/{int(row.get('supervision_total_visits') or 0)}",
+                        "task_id": row.get("task_id"),
+                        "photo_index": idx + 1,
+                    }
+                )
 
     os.makedirs(REPORTS_DIR, exist_ok=True)
     tmp_pdf = tempfile.NamedTemporaryFile(suffix="_custodian_report.pdf", delete=False)
