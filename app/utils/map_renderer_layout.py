@@ -338,7 +338,10 @@ def draw_key_box(fig, has_buildings: bool, has_roads: bool, has_rivers: bool, ha
 
     w = 0.30
     x = 0.50 - w / 2.0
-    y = 0.065  # moved down a bit (you asked)
+    # Keep the key below scale-bar labels (which sit just under the map frame).
+    # We target a stable top edge and let the box height vary/fix beneath it.
+    key_top_target = 0.198
+    y = max(0.045, key_top_target - h)
 
     fig.add_artist(
         patches.Rectangle((x, y), w, h, transform=fig.transFigure, fill=False, lw=0.9*font_scale)
