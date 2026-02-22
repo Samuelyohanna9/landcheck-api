@@ -3,7 +3,7 @@
 from fastapi import APIRouter, Depends, Body, HTTPException, BackgroundTasks
 from sqlalchemy.orm import Session
 from geoalchemy2.shape import from_shape
-from shapely.geometry import Polygon, shape
+from shapely.geometry import Polygon, shape, Point
 from sqlalchemy import text
 from fastapi.responses import FileResponse
 from app.schemas.plot_create import PlotCreateRequest
@@ -1090,41 +1090,101 @@ def download_survey_plan_shapefile(
 
     meta = get_plot_meta(db, plot_id)
     plot_geom = wkb.loads(plot_wkb)
+    feature_sets = get_plot_features_geojson(plot_id, db)
 
     tmp_dir = tempfile.mkdtemp(prefix=f"plot_{plot_id}_shp_")
     base_name = f"plot_{plot_id}_survey_plan"
-    shp_path = os.path.join(tmp_dir, f"{base_name}.shp")
     zip_path = os.path.join(tmp_dir, f"{base_name}_shapefile.zip")
 
-    # Shapefile field names should be short (<=10 chars recommended).
-    gdf = gpd.GeoDataFrame(
-        [
-            {
-                "plot_id": int(plot_id),
-                "title": (meta.get("title_text") or "SURVEY PLAN")[:80],
-                "loc_text": (meta.get("location_text") or "")[:80],
-                "lga_text": (meta.get("lga_text") or "")[:80],
-                "state_txt": (meta.get("state_text") or "")[:80],
-                "surveyr": (meta.get("surveyor_name") or "")[:80],
-                "rank_txt": (meta.get("surveyor_rank") or "")[:80],
-                "scale_txt": (meta.get("scale_text") or "")[:40],
-                "geometry": plot_geom,
-            }
-        ],
-        crs="EPSG:4326",
-    )
-
     try:
-        gdf.to_file(shp_path, driver="ESRI Shapefile")
+        def station_name(idx: int) -> str:
+            name = ""
+            num = idx
+            while True:
+                name = chr(65 + (num % 26)) + name
+                num = (num // 26) - 1
+                if num < 0:
+                    break
+            return name
+
+        def write_layer(layer_suffix: str, records: list[dict]):
+            if not records:
+                return
+            layer_base = f"plot_{plot_id}_{layer_suffix}"
+            layer_path = os.path.join(tmp_dir, f"{layer_base}.shp")
+            gdf = gpd.GeoDataFrame(records, crs="EPSG:4326")
+            if gdf.empty:
+                return
+            gdf.to_file(layer_path, driver="ESRI Shapefile")
+
+        # 1) Plot boundary polygon (main parcel geometry)
+        write_layer("boundary", [{
+            "plot_id": int(plot_id),
+            "title": (meta.get("title_text") or "SURVEY PLAN")[:80],
+            "loc_text": (meta.get("location_text") or "")[:80],
+            "lga_text": (meta.get("lga_text") or "")[:80],
+            "state_txt": (meta.get("state_text") or "")[:80],
+            "surveyr": (meta.get("surveyor_name") or "")[:80],
+            "rank_txt": (meta.get("surveyor_rank") or "")[:80],
+            "scale_txt": (meta.get("scale_text") or "")[:40],
+            "geometry": plot_geom,
+        }])
+
+        # 2) Station/vertex points (A, B, C...)
+        vertex_records = []
+        coords = list(getattr(plot_geom, "exterior", plot_geom).coords)
+        if coords and len(coords) > 1 and coords[0] == coords[-1]:
+            coords = coords[:-1]
+        for idx, (lng, lat, *_) in enumerate(coords):
+            vertex_records.append({
+                "plot_id": int(plot_id),
+                "stn": station_name(idx),
+                "ord_no": idx + 1,
+                "lng": float(lng),
+                "lat": float(lat),
+                "geometry": Point(float(lng), float(lat)),
+            })
+        write_layer("stations", vertex_records)
+
+        # 3) Map features shown in plan (roads/buildings/rivers/fences)
+        layer_map = [
+            ("roads", feature_sets.get("roads", {}), "road"),
+            ("buildings", feature_sets.get("buildings", {}), "building"),
+            ("rivers", feature_sets.get("rivers", {}), "river"),
+            ("fences", feature_sets.get("fences", {}), "fence"),
+        ]
+        for suffix, collection, default_type in layer_map:
+            feat_records = []
+            for feat in (collection or {}).get("features", []):
+                geom_json = feat.get("geometry")
+                if not geom_json:
+                    continue
+                try:
+                    geom_obj = shape(geom_json)
+                except Exception:
+                    continue
+                props = feat.get("properties") or {}
+                feat_records.append({
+                    "plot_id": int(plot_id),
+                    "ftype": default_type[:10],
+                    "src": str(props.get("source") or "")[:20],
+                    "name": str(props.get("name") or "")[:80],
+                    "width_m": float(props.get("width_m")) if props.get("width_m") is not None else None,
+                    "geometry": geom_obj,
+                })
+            write_layer(suffix, feat_records)
     except Exception as e:
         safe_rmtree(tmp_dir)
         raise HTTPException(status_code=500, detail=f"Failed to generate shapefile: {e}")
 
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
-        for ext in (".shp", ".shx", ".dbf", ".prj", ".cpg"):
-            fp = os.path.join(tmp_dir, f"{base_name}{ext}")
-            if os.path.exists(fp):
-                zf.write(fp, arcname=os.path.basename(fp))
+        zip_name = os.path.basename(zip_path)
+        for fname in os.listdir(tmp_dir):
+            if fname == zip_name:
+                continue
+            fp = os.path.join(tmp_dir, fname)
+            if os.path.isfile(fp):
+                zf.write(fp, arcname=fname)
 
     if background_tasks is None:
         background_tasks = BackgroundTasks()

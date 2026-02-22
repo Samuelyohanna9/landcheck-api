@@ -77,35 +77,17 @@ def generate_plot_report_pdf(report_data, filepath, map_image_path, paper_size="
 
     # ---------- PAGE 2 : MAP ----------
 
-    # Load image size
+    # Draw the rendered survey page image full-page (same approach used by orthophoto export)
+    # so the page frame occupies the sheet without extra outer margins.
     img = Image.open(map_image_path)
     img_width_px, img_height_px = img.size
-
-    # Calculate target size to fit the page with margins
-    max_width = page_width - (2 * margin)
-    max_height = page_height - (2 * margin)
-
-    aspect_ratio = img_height_px / img_width_px
-
-    # Fit to page while maintaining aspect ratio
-    if max_width * aspect_ratio <= max_height:
-        target_width = max_width
-        target_height = max_width * aspect_ratio
-    else:
-        target_height = max_height
-        target_width = max_height / aspect_ratio
-
-    # Center position
-    x = (page_width - target_width) / 2
-    y = (page_height - target_height) / 2
-
     c.drawImage(
         map_image_path,
-        x,
-        y,
-        width=target_width,
-        height=target_height,
-        preserveAspectRatio=True,
+        0,
+        0,
+        width=page_width,
+        height=page_height,
+        preserveAspectRatio=False,
         mask='auto'
     )
 
