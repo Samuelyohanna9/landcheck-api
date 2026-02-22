@@ -16,6 +16,7 @@ from shapely.geometry import LineString, Point, shape
 from shapely.ops import snap
 import matplotlib.patches as patches
 import matplotlib.lines as mlines
+from matplotlib.font_manager import FontProperties
 from datetime import datetime
 from matplotlib.backends.backend_agg import FigureCanvasAgg as FigureCanvas
 
@@ -152,6 +153,56 @@ def draw_footer(fig, crs_text, source_text, surveyor, rank, font_scale=1.0):
     fig.text(0.94, y_bot_source, str(source_text), fontsize=int(8*font_scale), ha="right")
 
 
+def _draw_figure_text_justified(fig, x, y, text, width_fig, fontsize, fontweight="normal"):
+    words = (text or "").split()
+    if len(words) <= 1:
+        fig.text(x, y, text, transform=fig.transFigure, fontsize=fontsize, va="top", ha="left", weight=fontweight)
+        return
+
+    try:
+        renderer = fig.canvas.get_renderer()
+    except Exception:
+        fig.canvas.draw()
+        renderer = fig.canvas.get_renderer()
+
+    fp = FontProperties(size=fontsize, weight=fontweight)
+
+    def px_width(s: str) -> float:
+        try:
+            w, _, _ = renderer.get_text_width_height_descent(s, fp, ismath=False)
+            return float(w)
+        except Exception:
+            return float(len(s) * fontsize * 0.6)
+
+    fig_w_px = max(float(fig.bbox.width), 1.0)
+    target_px = max(width_fig * fig_w_px, 1.0)
+    word_widths = [px_width(w) for w in words]
+    base_space_px = px_width(" ")
+    natural_px = sum(word_widths) + base_space_px * (len(words) - 1)
+
+    # If the line is already wider than the target (or too close), fall back to normal text.
+    if natural_px >= target_px * 0.98:
+        fig.text(x, y, text, transform=fig.transFigure, fontsize=fontsize, va="top", ha="left", weight=fontweight)
+        return
+
+    gap_px = base_space_px + (target_px - natural_px) / max(1, (len(words) - 1))
+    cursor_x = x
+    for idx, (word, ww) in enumerate(zip(words, word_widths)):
+        fig.text(
+            cursor_x,
+            y,
+            word,
+            transform=fig.transFigure,
+            fontsize=fontsize,
+            va="top",
+            ha="left",
+            weight=fontweight,
+        )
+        cursor_x += ww / fig_w_px
+        if idx < len(words) - 1:
+            cursor_x += gap_px / fig_w_px
+
+
 def draw_certification_box(fig, certification_statement: str, surveyor_name: str, key_bounds=None, font_scale=1.0):
     """
     Draw certification text block beside the key (no surrounding box).
@@ -184,16 +235,23 @@ def draw_certification_box(fig, certification_statement: str, surveyor_name: str
 
     line_step = 0.019
     start_y = top_y - 0.024
+    text_width_fig = max(0.12, min(0.27, 0.94 - x - 0.01))
     for idx, line in enumerate(lines):
-        fig.text(
-            x,
-            start_y - idx * line_step,
-            line,
-            transform=fig.transFigure,
-            fontsize=max(5, int(6 * font_scale)),
-            va="top",
-            ha="left",
-        )
+        yy = start_y - idx * line_step
+        is_last_line = idx == len(lines) - 1
+        fs = max(5, int(6 * font_scale))
+        if is_last_line:
+            fig.text(
+                x,
+                yy,
+                line,
+                transform=fig.transFigure,
+                fontsize=fs,
+                va="top",
+                ha="left",
+            )
+        else:
+            _draw_figure_text_justified(fig, x, yy, line, text_width_fig, fs)
 
     cert_name = (surveyor_name or "").strip() or "________________"
     fig.text(
