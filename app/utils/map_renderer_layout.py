@@ -236,6 +236,16 @@ def draw_certification_box(fig, certification_statement: str, surveyor_name: str
     line_step = 0.019
     start_y = top_y - 0.024
     text_width_fig = max(0.12, min(0.27, 0.94 - x - 0.01))
+
+    # Prevent overlap with footer/source text when the key is short (fewer legend items).
+    # This issue can look "device-specific" because different plots may have different key heights.
+    min_certified_y = 0.075
+    projected_certified_y = start_y - max(4, len(lines)) * line_step - 0.006
+    if projected_certified_y < min_certified_y:
+        lift = (min_certified_y - projected_certified_y)
+        top_y += lift
+        start_y += lift
+
     for idx, line in enumerate(lines):
         yy = start_y - idx * line_step
         is_last_line = idx == len(lines) - 1
@@ -316,10 +326,13 @@ def draw_key_box(fig, has_buildings: bool, has_roads: bool, has_rivers: bool, ha
         items.append(("FENCE", "fence_line", "black", 1))
 
     # box sizing based on number of items
+    # Keep a minimum height so certification/footer layout stays stable across
+    # plots that have fewer detected legend items (prevents visual shifts).
     row_h = 0.022
     header_h = 0.028
     padding = 0.015
-    h = header_h + len(items) * row_h + padding
+    min_rows = 5  # perimeter + up to 4 common feature rows
+    h = header_h + max(len(items), min_rows) * row_h + padding
 
     w = 0.30
     x = 0.50 - w / 2.0
