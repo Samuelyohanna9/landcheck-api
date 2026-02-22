@@ -13,6 +13,8 @@ import os
 import tempfile
 import glob
 import re
+import shutil
+import zipfile
 
 from app.db import SessionLocal
 from app.models.plot import Plot
@@ -264,6 +266,13 @@ def safe_remove(path: str):
         os.remove(path)
     except FileNotFoundError:
         pass
+    except Exception:
+        pass
+
+
+def safe_rmtree(path: str):
+    try:
+        shutil.rmtree(path, ignore_errors=True)
     except Exception:
         pass
 
@@ -1066,6 +1075,66 @@ def download_survey_plan_dwg(plot_id: int, db: Session = Depends(get_db)):
         dxf_path,
         media_type="application/dxf",
         filename=f"plot_{plot_id}_survey_plan.dxf"
+    )
+
+
+@router.get("/{plot_id}/survey-plan/shapefile")
+def download_survey_plan_shapefile(
+    plot_id: int,
+    db: Session = Depends(get_db),
+    background_tasks: BackgroundTasks = None,
+):
+    plot_wkb = db.execute(text("SELECT geom FROM plots WHERE id=:id"), {"id": plot_id}).scalar()
+    if not plot_wkb:
+        raise HTTPException(status_code=404, detail="Plot not found")
+
+    meta = get_plot_meta(db, plot_id)
+    plot_geom = wkb.loads(plot_wkb)
+
+    tmp_dir = tempfile.mkdtemp(prefix=f"plot_{plot_id}_shp_")
+    base_name = f"plot_{plot_id}_survey_plan"
+    shp_path = os.path.join(tmp_dir, f"{base_name}.shp")
+    zip_path = os.path.join(tmp_dir, f"{base_name}_shapefile.zip")
+
+    # Shapefile field names should be short (<=10 chars recommended).
+    gdf = gpd.GeoDataFrame(
+        [
+            {
+                "plot_id": int(plot_id),
+                "title": (meta.get("title_text") or "SURVEY PLAN")[:80],
+                "loc_text": (meta.get("location_text") or "")[:80],
+                "lga_text": (meta.get("lga_text") or "")[:80],
+                "state_txt": (meta.get("state_text") or "")[:80],
+                "surveyr": (meta.get("surveyor_name") or "")[:80],
+                "rank_txt": (meta.get("surveyor_rank") or "")[:80],
+                "scale_txt": (meta.get("scale_text") or "")[:40],
+                "geometry": plot_geom,
+            }
+        ],
+        crs="EPSG:4326",
+    )
+
+    try:
+        gdf.to_file(shp_path, driver="ESRI Shapefile")
+    except Exception as e:
+        safe_rmtree(tmp_dir)
+        raise HTTPException(status_code=500, detail=f"Failed to generate shapefile: {e}")
+
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+        for ext in (".shp", ".shx", ".dbf", ".prj", ".cpg"):
+            fp = os.path.join(tmp_dir, f"{base_name}{ext}")
+            if os.path.exists(fp):
+                zf.write(fp, arcname=os.path.basename(fp))
+
+    if background_tasks is None:
+        background_tasks = BackgroundTasks()
+    background_tasks.add_task(safe_rmtree, tmp_dir)
+
+    return FileResponse(
+        zip_path,
+        media_type="application/zip",
+        filename=f"{base_name}_shapefile.zip",
+        background=background_tasks,
     )
 
 

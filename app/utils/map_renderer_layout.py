@@ -1381,5 +1381,6 @@ def render_plot_map_layout(
     ax.axis("off")
 
     fig.canvas.draw()
-    plt.savefig(output_path, dpi=dpi, bbox_inches=None)
+    # Match orthophoto save behavior so the page frame fills the preview consistently.
+    fig.savefig(output_path, dpi=dpi)
     plt.close(fig)
