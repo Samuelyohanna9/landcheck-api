@@ -151,74 +151,87 @@ def draw_footer(fig, crs_text, source_text, surveyor, rank, font_scale=1.0):
     fig.text(0.94, y_bot, str(source_text), fontsize=int(8*font_scale), ha="right")
 
 
-def draw_certification_box(fig, certification_statement: str, surveyor_name: str, font_scale=1.0):
-    x, y, w, h = 0.67, 0.165, 0.27, 0.12
-    fig.add_artist(
-        patches.Rectangle(
-            (x, y), w, h,
-            transform=fig.transFigure,
-            fill=False,
-            lw=max(0.8, 0.9 * font_scale),
-        )
-    )
+def draw_certification_box(fig, certification_statement: str, surveyor_name: str, key_bounds=None, font_scale=1.0):
+    """
+    Draw certification text block beside the key (no surrounding box).
+    """
+    if key_bounds:
+        key_x, key_y, key_w, key_h = key_bounds
+        x = min(0.94, key_x + key_w + 0.03)
+        top_y = key_y + key_h - 0.002
+    else:
+        x = 0.67
+        top_y = 0.215
+
     fig.text(
-        x + 0.012, y + h - 0.017, "CERTIFICATION",
+        x,
+        top_y,
+        "CERTIFICATION",
         transform=fig.transFigure,
         fontsize=max(6, int(7 * font_scale)),
         weight="bold",
         va="top",
+        ha="left",
     )
 
     statement = (certification_statement or "").strip() or DEFAULT_CERTIFICATION_STATEMENT
-    wrap_width = max(40, int(58 / max(font_scale, 0.8)))
+    wrap_width = max(38, int(54 / max(font_scale, 0.8)))
     wrapped_lines = textwrap.wrap(statement, width=wrap_width)
     lines = wrapped_lines[:4]
     if wrapped_lines[4:] and lines:
-        lines[-1] = (lines[-1][: max(0, len(lines[-1]) - 3)] + "...") if lines else "..."
+        lines[-1] = lines[-1][: max(0, len(lines[-1]) - 3)] + "..."
 
-    start_y = y + h - 0.034
-    line_step = 0.018
+    line_step = 0.019
+    start_y = top_y - 0.024
     for idx, line in enumerate(lines):
         fig.text(
-            x + 0.012,
+            x,
             start_y - idx * line_step,
             line,
             transform=fig.transFigure,
             fontsize=max(5, int(6 * font_scale)),
             va="top",
+            ha="left",
         )
 
     cert_name = (surveyor_name or "").strip() or "________________"
     fig.text(
-        x + 0.012,
-        y + 0.016,
+        x,
+        start_y - max(4, len(lines)) * line_step - 0.006,
         f"Certified by: {cert_name}",
         transform=fig.transFigure,
         fontsize=max(5, int(6 * font_scale)),
         weight="bold",
-        va="bottom",
+        va="top",
+        ha="left",
     )
 
 
 def draw_fence_symbol(fig, x0, x1, y, color="black", lw=1.0):
-    fig.add_artist(
-        mlines.Line2D([x0, x1], [y, y], transform=fig.transFigure, color=color, lw=lw)
-    )
+    """
+    Stair-step fence symbol similar to the uploaded plan sample.
+    """
     span = max(x1 - x0, 0.0001)
-    tick_count = 6
-    tick_len = 0.007
-    for i in range(1, tick_count + 1):
-        t = i / (tick_count + 1)
-        px = x0 + span * t
-        fig.add_artist(
-            mlines.Line2D(
-                [px, px - 0.0045],
-                [y, y + tick_len],
-                transform=fig.transFigure,
-                color=color,
-                lw=max(0.6, lw * 0.9),
-            )
-        )
+    steps = 6
+    dx = span / (steps * 2.0)
+    amp = 0.006
+    pts_x = [x0]
+    pts_y = [y]
+    cx = x0
+    for _ in range(steps):
+        cx += dx
+        pts_x.append(cx)
+        pts_y.append(pts_y[-1])
+        pts_x.append(cx)
+        pts_y.append(y + amp)
+        cx += dx
+        pts_x.append(cx)
+        pts_y.append(pts_y[-1])
+        pts_x.append(cx)
+        pts_y.append(y)
+    fig.add_artist(
+        mlines.Line2D(pts_x, pts_y, transform=fig.transFigure, color=color, lw=max(0.8, lw))
+    )
 
 
 def draw_key_box(fig, has_buildings: bool, has_roads: bool, has_rivers: bool, has_fences: bool = False, font_scale=1.0):
@@ -309,6 +322,7 @@ def draw_key_box(fig, has_buildings: bool, has_roads: bool, has_rivers: bool, ha
 
         fig.text(x + 0.12, yy, lbl, fontsize=int(7*font_scale), va="center")
         yy -= row_h
+    return (x, y, w, h)
 
 
 # ======================
@@ -901,52 +915,78 @@ def _draw_fence_line(ax, line_geom, scale_ratio: int, font_scale=1.0):
     except Exception:
         return
 
-    ax.plot(x_vals, y_vals, color="black", lw=0.8 * font_scale, zorder=7)
-
     length = getattr(line_geom, "length", 0.0) or 0.0
     if length <= 0:
+        ax.plot(x_vals, y_vals, color="black", lw=0.8 * font_scale, zorder=7)
         return
 
-    spacing = max(2.0, (8.0 / 1000.0) * max(scale_ratio, 100))
-    tick_len = max(1.2, (4.0 / 1000.0) * max(scale_ratio, 100))
-    probe = max(0.4, spacing * 0.18)
+    step_span = max(2.5, (9.0 / 1000.0) * max(scale_ratio, 100))
+    tooth_amp = max(1.2, (3.0 / 1000.0) * max(scale_ratio, 100))
+    probe = max(0.4, step_span * 0.2)
+    if length < step_span * 1.2:
+        ax.plot(x_vals, y_vals, color="black", lw=0.8 * font_scale, zorder=7)
+        return
 
-    d = min(spacing * 0.5, max(length * 0.5, 0.0))
+    points_x = []
+    points_y = []
+    d = 0.0
     while d < length:
+        d1 = min(length, d + step_span * 0.35)
+        d2 = min(length, d + step_span * 0.70)
         try:
-            p = line_geom.interpolate(d)
-            p_prev = line_geom.interpolate(max(0.0, d - probe))
-            p_next = line_geom.interpolate(min(length, d + probe))
+            p0 = line_geom.interpolate(d)
+            p1 = line_geom.interpolate(d1)
+            p2 = line_geom.interpolate(d2)
+            p_prev = line_geom.interpolate(max(0.0, d1 - probe))
+            p_next = line_geom.interpolate(min(length, d1 + probe))
         except Exception:
-            d += spacing
+            d += step_span
             continue
 
         tx = p_next.x - p_prev.x
         ty = p_next.y - p_prev.y
         mag = math.hypot(tx, ty)
         if mag == 0:
-            d += spacing
+            d += step_span
             continue
         tx /= mag
         ty /= mag
-
         nx = -ty
         ny = tx
-        # Slight backward skew so the fence hatch looks closer to the uploaded symbol style.
-        vx = nx - 0.55 * tx
-        vy = ny - 0.55 * ty
-        vmag = math.hypot(vx, vy) or 1.0
-        vx /= vmag
-        vy /= vmag
+        side = 1.0
 
-        ax.plot(
-            [p.x, p.x + vx * tick_len],
-            [p.y, p.y + vy * tick_len],
-            color="black",
-            lw=0.7 * font_scale,
-            zorder=7,
-        )
-        d += spacing
+        # Build a small rectangular "tooth" segment (stair-step look).
+        b0x, b0y = p0.x, p0.y
+        b1x, b1y = p1.x, p1.y
+        t1x, t1y = b1x + side * nx * tooth_amp, b1y + side * ny * tooth_amp
+        t2x, t2y = p2.x + side * nx * tooth_amp, p2.y + side * ny * tooth_amp
+        b2x, b2y = p2.x, p2.y
+
+        if not points_x:
+            points_x.append(b0x)
+            points_y.append(b0y)
+        else:
+            points_x.append(b0x)
+            points_y.append(b0y)
+
+        points_x.extend([b1x, t1x, t2x, b2x])
+        points_y.extend([b1y, t1y, t2y, b2y])
+
+        d += step_span
+
+    if len(points_x) < 2:
+        ax.plot(x_vals, y_vals, color="black", lw=0.8 * font_scale, zorder=7)
+        return
+
+    # Ensure the jagged fence reaches the line end.
+    try:
+        pend = line_geom.interpolate(length)
+        points_x.append(pend.x)
+        points_y.append(pend.y)
+    except Exception:
+        pass
+
+    ax.plot(points_x, points_y, color="black", lw=0.8 * font_scale, zorder=7)
 
 
 def draw_fences(ax, fence_geoms, display_epsg: int, scale_ratio: int, font_scale=1.0):
@@ -1105,7 +1145,6 @@ def render_plot_map_layout(
     draw_sheet_frame(fig)
     draw_title_block(fig, title_text, plot_id, area_m2, scale_text, location_text, lga_text, state_text, font_scale)
     draw_footer(fig, crs_footer_text, source_footer_text, surveyor_name, surveyor_rank, font_scale)
-    draw_certification_box(fig, certification_statement or DEFAULT_CERTIFICATION_STATEMENT, surveyor_name, font_scale)
 
     scale_ratio = parse_scale_ratio(scale_text)
     apply_true_scale(ax, poly, scale_ratio, fig_width * map_width, fig_height * map_height)
@@ -1202,12 +1241,19 @@ def render_plot_map_layout(
             continue
 
     has_roads = len(road_rows) > 0 or len(road_add_geoms) > 0
-    draw_key_box(
+    key_bounds = draw_key_box(
         fig,
         has_buildings=has_buildings,
         has_roads=has_roads,
         has_rivers=has_rivers,
         has_fences=has_fences,
+        font_scale=font_scale,
+    )
+    draw_certification_box(
+        fig,
+        certification_statement or DEFAULT_CERTIFICATION_STATEMENT,
+        surveyor_name,
+        key_bounds=key_bounds,
         font_scale=font_scale,
     )
 
