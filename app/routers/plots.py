@@ -57,6 +57,11 @@ COORDINATE_SYSTEM_NAMES = {
     "minna_33": "Minna Datum Zone 33",
 }
 
+DEFAULT_CERTIFICATION_STATEMENT = (
+    "I hereby certify that this survey plan is a true representation of the survey "
+    "executed by me and conforms with the regulations of surveying profession."
+)
+
 
 def get_db():
     db = SessionLocal()
@@ -78,6 +83,7 @@ def ensure_plot_meta_table(db: Session):
             state_text TEXT,
             surveyor_name TEXT,
             surveyor_rank TEXT,
+            certification_statement TEXT,
             scale_text VARCHAR(50),
             paper_size VARCHAR(10),
             coordinate_system VARCHAR(20),
@@ -93,6 +99,7 @@ def ensure_plot_meta_table(db: Session):
         ("state_text", "TEXT"),
         ("surveyor_name", "TEXT"),
         ("surveyor_rank", "TEXT"),
+        ("certification_statement", "TEXT"),
         ("scale_text", "VARCHAR(50)"),
         ("paper_size", "VARCHAR(10)"),
         ("coordinate_system", "VARCHAR(20)"),
@@ -121,7 +128,7 @@ def ensure_plot_feature_overrides_table(db: Session):
         CREATE TABLE IF NOT EXISTS plot_feature_overrides (
             id SERIAL PRIMARY KEY,
             plot_id INTEGER NOT NULL REFERENCES plots(id) ON DELETE CASCADE,
-            feature_type TEXT NOT NULL CHECK (feature_type IN ('road', 'building', 'river')),
+            feature_type TEXT NOT NULL CHECK (feature_type IN ('road', 'building', 'river', 'fence')),
             action TEXT NOT NULL CHECK (action IN ('add', 'delete', 'update')),
             name TEXT,
             width_m DOUBLE PRECISION,
@@ -132,6 +139,32 @@ def ensure_plot_feature_overrides_table(db: Session):
     """))
     try:
         db.execute(text("ALTER TABLE plot_feature_overrides ADD COLUMN IF NOT EXISTS width_m DOUBLE PRECISION"))
+        # Upgrade legacy CHECK constraints that do not include fence
+        check_rows = db.execute(text("""
+            SELECT c.conname AS name, pg_get_constraintdef(c.oid) AS definition
+            FROM pg_constraint c
+            JOIN pg_class t ON t.oid = c.conrelid
+            JOIN pg_namespace n ON n.oid = t.relnamespace
+            WHERE t.relname = 'plot_feature_overrides'
+              AND c.contype = 'c'
+        """)).mappings().all()
+        has_fence_check = False
+        for row in check_rows:
+            definition = (row.get("definition") or "").lower()
+            if "feature_type" not in definition:
+                continue
+            if "fence" in definition:
+                has_fence_check = True
+                continue
+            constraint_name = (row.get("name") or "").replace('"', '""')
+            if constraint_name:
+                db.execute(text(f'ALTER TABLE plot_feature_overrides DROP CONSTRAINT IF EXISTS "{constraint_name}"'))
+        if not has_fence_check:
+            db.execute(text("""
+                ALTER TABLE plot_feature_overrides
+                ADD CONSTRAINT plot_feature_overrides_feature_type_check
+                CHECK (feature_type IN ('road', 'building', 'river', 'fence'))
+            """))
         db.execute(text("CREATE INDEX IF NOT EXISTS idx_plot_feature_overrides_plot_id ON plot_feature_overrides(plot_id)"))
         db.execute(text("CREATE INDEX IF NOT EXISTS idx_plot_feature_overrides_geom ON plot_feature_overrides USING GIST (geom)"))
         db.commit()
@@ -148,6 +181,7 @@ def upsert_plot_meta(
     state_text: Optional[str] = None,
     surveyor_name: Optional[str] = None,
     surveyor_rank: Optional[str] = None,
+    certification_statement: Optional[str] = None,
     scale_text: Optional[str] = None,
     paper_size: Optional[str] = None,
     coordinate_system: Optional[str] = None,
@@ -157,11 +191,11 @@ def upsert_plot_meta(
     db.execute(text("""
         INSERT INTO plot_meta (
             plot_id, title_text, location_text, lga_text, state_text,
-            surveyor_name, surveyor_rank, scale_text, paper_size, coordinate_system
+            surveyor_name, surveyor_rank, certification_statement, scale_text, paper_size, coordinate_system
         )
         VALUES (
             :plot_id, :title_text, :location_text, :lga_text, :state_text,
-            :surveyor_name, :surveyor_rank, :scale_text, :paper_size, :coordinate_system
+            :surveyor_name, :surveyor_rank, :certification_statement, :scale_text, :paper_size, :coordinate_system
         )
         ON CONFLICT (plot_id) DO UPDATE SET
             title_text = COALESCE(NULLIF(EXCLUDED.title_text, ''), plot_meta.title_text),
@@ -170,6 +204,7 @@ def upsert_plot_meta(
             state_text = COALESCE(NULLIF(EXCLUDED.state_text, ''), plot_meta.state_text),
             surveyor_name = COALESCE(NULLIF(EXCLUDED.surveyor_name, ''), plot_meta.surveyor_name),
             surveyor_rank = COALESCE(NULLIF(EXCLUDED.surveyor_rank, ''), plot_meta.surveyor_rank),
+            certification_statement = COALESCE(NULLIF(EXCLUDED.certification_statement, ''), plot_meta.certification_statement),
             scale_text = COALESCE(NULLIF(EXCLUDED.scale_text, ''), plot_meta.scale_text),
             paper_size = COALESCE(NULLIF(EXCLUDED.paper_size, ''), plot_meta.paper_size),
             coordinate_system = COALESCE(NULLIF(EXCLUDED.coordinate_system, ''), plot_meta.coordinate_system),
@@ -182,6 +217,7 @@ def upsert_plot_meta(
         "state_text": state_text,
         "surveyor_name": surveyor_name,
         "surveyor_rank": surveyor_rank,
+        "certification_statement": certification_statement,
         "scale_text": scale_text,
         "paper_size": paper_size,
         "coordinate_system": coordinate_system,
@@ -192,7 +228,7 @@ def upsert_plot_meta(
 def get_plot_meta(db: Session, plot_id: int) -> dict:
     row = db.execute(text("""
         SELECT title_text, location_text, lga_text, state_text,
-               surveyor_name, surveyor_rank, scale_text, paper_size, coordinate_system
+               surveyor_name, surveyor_rank, certification_statement, scale_text, paper_size, coordinate_system
         FROM plot_meta
         WHERE plot_id = :plot_id
     """), {"plot_id": plot_id}).mappings().first()
@@ -204,6 +240,7 @@ def get_plot_meta(db: Session, plot_id: int) -> dict:
             "state_text": "",
             "surveyor_name": "",
             "surveyor_rank": "",
+            "certification_statement": DEFAULT_CERTIFICATION_STATEMENT,
             "scale_text": "1 : 1000",
             "paper_size": "A4",
             "coordinate_system": "wgs84",
@@ -215,6 +252,7 @@ def get_plot_meta(db: Session, plot_id: int) -> dict:
         "state_text": row.get("state_text") or "",
         "surveyor_name": row.get("surveyor_name") or "",
         "surveyor_rank": row.get("surveyor_rank") or "",
+        "certification_statement": row.get("certification_statement") or DEFAULT_CERTIFICATION_STATEMENT,
         "scale_text": row.get("scale_text") or "1 : 1000",
         "paper_size": row.get("paper_size") or "A4",
         "coordinate_system": row.get("coordinate_system") or "wgs84",
@@ -460,6 +498,7 @@ def get_plot_features_geojson(plot_id: int, db: Session = Depends(get_db)):
 
     buildings = []
     rivers = []
+    fences = []
     for r in feature_rows:
         if not r.geojson:
             continue
@@ -467,6 +506,8 @@ def get_plot_features_geojson(plot_id: int, db: Session = Depends(get_db)):
             buildings.append(to_feature(r.geojson, {"source": "detected"}))
         elif r.feature_type == "river":
             rivers.append(to_feature(r.geojson, {"source": "detected"}))
+        elif r.feature_type == "fence":
+            fences.append(to_feature(r.geojson, {"source": "detected"}))
 
     roads = []
     for r in road_rows:
@@ -486,11 +527,14 @@ def get_plot_features_geojson(plot_id: int, db: Session = Depends(get_db)):
             buildings.append(feat)
         elif r.feature_type == "river":
             rivers.append(feat)
+        elif r.feature_type == "fence":
+            fences.append(feat)
 
     return {
         "roads": {"type": "FeatureCollection", "features": roads},
         "buildings": {"type": "FeatureCollection", "features": buildings},
         "rivers": {"type": "FeatureCollection", "features": rivers},
+        "fences": {"type": "FeatureCollection", "features": fences},
     }
 
 
@@ -531,7 +575,7 @@ def add_feature_override(
     wkt: str | None = Body(default=None),
     geojson: dict | None = Body(default=None),
 ):
-    if feature_type not in {"road", "building", "river"}:
+    if feature_type not in {"road", "building", "river", "fence"}:
         raise HTTPException(status_code=400, detail="Invalid feature_type")
     if action not in {"add", "delete", "update"}:
         raise HTTPException(status_code=400, detail="Invalid action")
@@ -631,6 +675,7 @@ def download_plot_report_pdf(plot_id: int, db: Session = Depends(get_db), backgr
     scale_text: str = Body("1 : 1000"),
     surveyor_name: str = Body(""),
     surveyor_rank: str = Body(""),
+    certification_statement: str = Body(DEFAULT_CERTIFICATION_STATEMENT),
     station_names: list[str] = Body(default=[]),
     coordinate_system: str = Body("wgs84"),
     paper_size: str = Body("A4"),
@@ -661,6 +706,7 @@ def download_plot_report_pdf(plot_id: int, db: Session = Depends(get_db), backgr
         state_text=state_text,
         surveyor_name=surveyor_name,
         surveyor_rank=surveyor_rank,
+        certification_statement=certification_statement,
         scale_text=scale_text,
         paper_size=paper_size,
         coordinate_system=coordinate_system,
@@ -681,6 +727,7 @@ def download_plot_report_pdf(plot_id: int, db: Session = Depends(get_db), backgr
         scale_text=scale_text,
         surveyor_name=surveyor_name,
         surveyor_rank=surveyor_rank,
+        certification_statement=certification_statement,
         station_names=station_names if station_names else None,
         coordinate_system=coordinate_system,
         epsg_code=epsg_code,
@@ -754,6 +801,7 @@ def preview_plot_map(plot_id: int, db: Session = Depends(get_db), background_tas
     scale_text: str = Body("1 : 1000"),
     surveyor_name: str = Body(""),
     surveyor_rank: str = Body(""),
+    certification_statement: str = Body(DEFAULT_CERTIFICATION_STATEMENT),
     station_names: list[str] = Body(default=[]),
     coordinate_system: str = Body("wgs84"),
     paper_size: str = Body("A4"),
@@ -778,6 +826,7 @@ def preview_plot_map(plot_id: int, db: Session = Depends(get_db), background_tas
         state_text=state_text,
         surveyor_name=surveyor_name,
         surveyor_rank=surveyor_rank,
+        certification_statement=certification_statement,
         scale_text=scale_text,
         paper_size=paper_size,
         coordinate_system=coordinate_system,
@@ -798,6 +847,7 @@ def preview_plot_map(plot_id: int, db: Session = Depends(get_db), background_tas
         scale_text=scale_text,
         surveyor_name=surveyor_name,
         surveyor_rank=surveyor_rank,
+        certification_statement=certification_statement,
         station_names=station_names if station_names else None,
         coordinate_system=coordinate_system,
         epsg_code=epsg_code,
@@ -1047,6 +1097,7 @@ def get_saved_survey_plan_pdf(plot_id: int, refresh: bool = False, db: Session =
             scale_text=meta["scale_text"],
             surveyor_name=meta["surveyor_name"],
             surveyor_rank=meta["surveyor_rank"],
+            certification_statement=meta.get("certification_statement"),
             station_names=None,
             coordinate_system=meta["coordinate_system"],
             epsg_code=epsg_code,

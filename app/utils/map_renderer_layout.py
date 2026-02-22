@@ -6,6 +6,7 @@ import matplotlib
 matplotlib.use("Agg")
 
 import math
+import textwrap
 import numpy as np
 import geopandas as gpd
 import matplotlib.pyplot as plt
@@ -38,6 +39,11 @@ SCALE_FACTORS = {
     "A1": 1.8,
     "A0": 2.2,
 }
+
+DEFAULT_CERTIFICATION_STATEMENT = (
+    "I hereby certify that this survey plan is a true representation of the survey "
+    "executed by me and conforms with the regulations of surveying profession."
+)
 
 def get_paper_config(paper_size: str):
     """Get paper dimensions and scale factor"""
@@ -145,7 +151,77 @@ def draw_footer(fig, crs_text, source_text, surveyor, rank, font_scale=1.0):
     fig.text(0.94, y_bot, str(source_text), fontsize=int(8*font_scale), ha="right")
 
 
-def draw_key_box(fig, has_buildings: bool, has_roads: bool, has_rivers: bool, font_scale=1.0):
+def draw_certification_box(fig, certification_statement: str, surveyor_name: str, font_scale=1.0):
+    x, y, w, h = 0.67, 0.165, 0.27, 0.12
+    fig.add_artist(
+        patches.Rectangle(
+            (x, y), w, h,
+            transform=fig.transFigure,
+            fill=False,
+            lw=max(0.8, 0.9 * font_scale),
+        )
+    )
+    fig.text(
+        x + 0.012, y + h - 0.017, "CERTIFICATION",
+        transform=fig.transFigure,
+        fontsize=max(6, int(7 * font_scale)),
+        weight="bold",
+        va="top",
+    )
+
+    statement = (certification_statement or "").strip() or DEFAULT_CERTIFICATION_STATEMENT
+    wrap_width = max(40, int(58 / max(font_scale, 0.8)))
+    wrapped_lines = textwrap.wrap(statement, width=wrap_width)
+    lines = wrapped_lines[:4]
+    if wrapped_lines[4:] and lines:
+        lines[-1] = (lines[-1][: max(0, len(lines[-1]) - 3)] + "...") if lines else "..."
+
+    start_y = y + h - 0.034
+    line_step = 0.018
+    for idx, line in enumerate(lines):
+        fig.text(
+            x + 0.012,
+            start_y - idx * line_step,
+            line,
+            transform=fig.transFigure,
+            fontsize=max(5, int(6 * font_scale)),
+            va="top",
+        )
+
+    cert_name = (surveyor_name or "").strip() or "________________"
+    fig.text(
+        x + 0.012,
+        y + 0.016,
+        f"Certified by: {cert_name}",
+        transform=fig.transFigure,
+        fontsize=max(5, int(6 * font_scale)),
+        weight="bold",
+        va="bottom",
+    )
+
+
+def draw_fence_symbol(fig, x0, x1, y, color="black", lw=1.0):
+    fig.add_artist(
+        mlines.Line2D([x0, x1], [y, y], transform=fig.transFigure, color=color, lw=lw)
+    )
+    span = max(x1 - x0, 0.0001)
+    tick_count = 6
+    tick_len = 0.007
+    for i in range(1, tick_count + 1):
+        t = i / (tick_count + 1)
+        px = x0 + span * t
+        fig.add_artist(
+            mlines.Line2D(
+                [px, px - 0.0045],
+                [y, y + tick_len],
+                transform=fig.transFigure,
+                color=color,
+                lw=max(0.6, lw * 0.9),
+            )
+        )
+
+
+def draw_key_box(fig, has_buildings: bool, has_roads: bool, has_rivers: bool, has_fences: bool = False, font_scale=1.0):
     """
     KEY shows ONLY features that exist on map.
     Buildings symbol is a rectangle (not a line).
@@ -163,6 +239,9 @@ def draw_key_box(fig, has_buildings: bool, has_roads: bool, has_rivers: bool, fo
 
     if has_rivers:
         items.append(("RIVERS", "line", "blue", 1))
+
+    if has_fences:
+        items.append(("FENCE", "fence_line", "black", 1))
 
     # box sizing based on number of items
     row_h = 0.022
@@ -225,6 +304,8 @@ def draw_key_box(fig, has_buildings: bool, has_roads: bool, has_rivers: bool, fo
                     lw=1.2,
                 )
             )
+        elif sym == "fence_line":
+            draw_fence_symbol(fig, x + 0.03, x + 0.10, yy, color=col, lw=lw * font_scale)
 
         fig.text(x + 0.12, yy, lbl, fontsize=int(7*font_scale), va="center")
         yy -= row_h
@@ -794,6 +875,91 @@ def draw_skipped_table(ax, entries, font_scale=1.0):
             cell.set_text_props(weight="bold")
         cell.set_linewidth(0.5)
 
+
+def _iter_line_geometries(geom):
+    if geom is None or geom.is_empty:
+        return
+    gtype = getattr(geom, "geom_type", "")
+    if gtype in ("LineString", "LinearRing"):
+        yield LineString(list(geom.coords))
+        return
+    if gtype == "Polygon":
+        yield geom.exterior
+        for ring in geom.interiors:
+            yield ring
+        return
+    if hasattr(geom, "geoms"):
+        for part in geom.geoms:
+            yield from _iter_line_geometries(part)
+
+
+def _draw_fence_line(ax, line_geom, scale_ratio: int, font_scale=1.0):
+    if line_geom is None or line_geom.is_empty:
+        return
+    try:
+        x_vals, y_vals = line_geom.xy
+    except Exception:
+        return
+
+    ax.plot(x_vals, y_vals, color="black", lw=0.8 * font_scale, zorder=7)
+
+    length = getattr(line_geom, "length", 0.0) or 0.0
+    if length <= 0:
+        return
+
+    spacing = max(2.0, (8.0 / 1000.0) * max(scale_ratio, 100))
+    tick_len = max(1.2, (4.0 / 1000.0) * max(scale_ratio, 100))
+    probe = max(0.4, spacing * 0.18)
+
+    d = min(spacing * 0.5, max(length * 0.5, 0.0))
+    while d < length:
+        try:
+            p = line_geom.interpolate(d)
+            p_prev = line_geom.interpolate(max(0.0, d - probe))
+            p_next = line_geom.interpolate(min(length, d + probe))
+        except Exception:
+            d += spacing
+            continue
+
+        tx = p_next.x - p_prev.x
+        ty = p_next.y - p_prev.y
+        mag = math.hypot(tx, ty)
+        if mag == 0:
+            d += spacing
+            continue
+        tx /= mag
+        ty /= mag
+
+        nx = -ty
+        ny = tx
+        # Slight backward skew so the fence hatch looks closer to the uploaded symbol style.
+        vx = nx - 0.55 * tx
+        vy = ny - 0.55 * ty
+        vmag = math.hypot(vx, vy) or 1.0
+        vx /= vmag
+        vy /= vmag
+
+        ax.plot(
+            [p.x, p.x + vx * tick_len],
+            [p.y, p.y + vy * tick_len],
+            color="black",
+            lw=0.7 * font_scale,
+            zorder=7,
+        )
+        d += spacing
+
+
+def draw_fences(ax, fence_geoms, display_epsg: int, scale_ratio: int, font_scale=1.0):
+    if not fence_geoms:
+        return
+    for geom in fence_geoms:
+        try:
+            projected = gpd.GeoSeries([geom], crs="EPSG:4326").to_crs(epsg=display_epsg).iloc[0]
+        except Exception:
+            continue
+        for line_part in _iter_line_geometries(projected):
+            _draw_fence_line(ax, line_part, scale_ratio=scale_ratio, font_scale=font_scale)
+
 # ======================
 # Main Renderer Function
 # ======================
@@ -811,6 +977,7 @@ def render_plot_map_layout(
     source_footer_text: str = "SOURCE: LandCheck",
     surveyor_name: str = "SURV",
     surveyor_rank: str = "RANK",
+    certification_statement: str | None = None,
     station_names=None,
     coordinate_system: str = "wgs84",
     epsg_code: int = 4326,
@@ -845,13 +1012,15 @@ def render_plot_map_layout(
     ).scalar() or 0
 
     plot_geom = wkb.loads(plot_wkb)
-    buildings, rivers = [], []
+    buildings, rivers, fences = [], [], []
     for r in rows:
         g = wkb.loads(r.geom)
         if r.feature_type == "building":
             buildings.append(g)
         elif r.feature_type == "river":
             rivers.append(g)
+        elif r.feature_type == "fence":
+            fences.append(g)
 
     overrides = []
     import json
@@ -898,6 +1067,7 @@ def render_plot_map_layout(
 
     buildings, added_buildings = apply_overrides(buildings, "building")
     rivers, added_rivers = apply_overrides(rivers, "river")
+    fences, added_fences = apply_overrides(fences, "fence")
 
     # Use user's selected coordinate system for rendering
     # If WGS84 selected, use appropriate UTM zone for projected display
@@ -935,6 +1105,7 @@ def render_plot_map_layout(
     draw_sheet_frame(fig)
     draw_title_block(fig, title_text, plot_id, area_m2, scale_text, location_text, lga_text, state_text, font_scale)
     draw_footer(fig, crs_footer_text, source_footer_text, surveyor_name, surveyor_rank, font_scale)
+    draw_certification_box(fig, certification_statement or DEFAULT_CERTIFICATION_STATEMENT, surveyor_name, font_scale)
 
     scale_ratio = parse_scale_ratio(scale_text)
     apply_true_scale(ax, poly, scale_ratio, fig_width * map_width, fig_height * map_height)
@@ -947,6 +1118,7 @@ def render_plot_map_layout(
     # flags for KEY (only show what exists)
     has_buildings = len(buildings) > 0
     has_rivers = len(rivers) > 0
+    has_fences = len(fences) > 0
 
     if rivers:
         gpd.GeoDataFrame(geometry=rivers, crs="EPSG:4326").to_crs(epsg=display_epsg).plot(
@@ -1029,8 +1201,15 @@ def render_plot_map_layout(
         except Exception:
             continue
 
-    has_roads = len(road_rows) > 0
-    draw_key_box(fig, has_buildings=has_buildings, has_roads=has_roads, has_rivers=has_rivers, font_scale=font_scale)
+    has_roads = len(road_rows) > 0 or len(road_add_geoms) > 0
+    draw_key_box(
+        fig,
+        has_buildings=has_buildings,
+        has_roads=has_roads,
+        has_rivers=has_rivers,
+        has_fences=has_fences,
+        font_scale=font_scale,
+    )
 
     if road_polys:
         try:
@@ -1057,6 +1236,8 @@ def render_plot_map_layout(
         gpd.GeoDataFrame(geometry=added_buildings, crs="EPSG:4326").to_crs(epsg=display_epsg).plot(
             ax=ax, facecolor="none", edgecolor="black", lw=1*font_scale, zorder=9
         )
+    if fences or added_fences:
+        draw_fences(ax, fences, display_epsg, scale_ratio=scale_ratio, font_scale=font_scale)
 
     # Boundary thickness in mm based on common drafting line weights
     paper_name = paper_config["name"]
