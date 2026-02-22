@@ -140,6 +140,7 @@ def draw_title_block(fig, title_text, plot_id, area_m2, scale_text, location_tex
 def draw_footer(fig, crs_text, source_text, surveyor, rank, font_scale=1.0):
     y_top = 0.155
     y_bot = 0.055
+    y_bot_source = 0.045
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
 
     fig.text(0.06, y_top, f"SURVEYOR: {surveyor}", fontsize=int(9*font_scale))
@@ -148,7 +149,7 @@ def draw_footer(fig, crs_text, source_text, surveyor, rank, font_scale=1.0):
     fig.text(0.06, y_top - 0.075, f"DATE PRINTED: {now}", fontsize=int(9*font_scale))
 
     fig.text(0.06, y_bot, str(crs_text), fontsize=int(8*font_scale), color="blue")
-    fig.text(0.94, y_bot, str(source_text), fontsize=int(8*font_scale), ha="right")
+    fig.text(0.94, y_bot_source, str(source_text), fontsize=int(8*font_scale), ha="right")
 
 
 def draw_certification_box(fig, certification_statement: str, surveyor_name: str, key_bounds=None, font_scale=1.0):
