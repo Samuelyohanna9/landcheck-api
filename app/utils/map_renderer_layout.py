@@ -209,8 +209,10 @@ def draw_certification_box(fig, certification_statement: str, surveyor_name: str
     """
     if key_bounds:
         key_x, key_y, key_w, key_h = key_bounds
-        x = min(0.94, key_x + key_w + 0.03)
-        top_y = key_y + key_h - 0.002
+        # Keep certification visually aligned with the key, but give it a
+        # slightly larger text column and lower header baseline for readability.
+        x = min(0.90, max(0.64, key_x + key_w + 0.02))
+        top_y = key_y + key_h - 0.018
     else:
         x = 0.67
         top_y = 0.215
@@ -235,11 +237,11 @@ def draw_certification_box(fig, certification_statement: str, surveyor_name: str
 
     line_step = 0.019
     start_y = top_y - 0.024
-    text_width_fig = max(0.12, min(0.27, 0.94 - x - 0.01))
+    text_width_fig = max(0.16, min(0.29, 0.95 - x - 0.012))
 
     # Prevent overlap with footer/source text when the key is short (fewer legend items).
     # This issue can look "device-specific" because different plots may have different key heights.
-    min_certified_y = 0.075
+    min_certified_y = 0.085
     projected_certified_y = start_y - max(4, len(lines)) * line_step - 0.006
     if projected_certified_y < min_certified_y:
         lift = (min_certified_y - projected_certified_y)
