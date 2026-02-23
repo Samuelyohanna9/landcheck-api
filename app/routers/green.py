@@ -11,6 +11,9 @@ import io
 import uuid
 import zipfile
 import re
+import hashlib
+import hmac
+import secrets
 from pathlib import Path
 from threading import Lock
 from urllib.parse import quote, unquote, urlparse
@@ -338,6 +341,30 @@ def _ensure_unique_role_key(db: Session, key_or_name: str | None, exclude_role_i
             return candidate
         candidate = f"{base}_{suffix}"
         suffix += 1
+
+
+def _hash_password_value(password: str) -> str:
+    raw = str(password or "")
+    if len(raw) < 6:
+        raise HTTPException(status_code=400, detail="Password must be at least 6 characters")
+    iterations = 260000
+    salt = secrets.token_hex(16)
+    digest = hashlib.pbkdf2_hmac("sha256", raw.encode("utf-8"), salt.encode("utf-8"), iterations)
+    return f"pbkdf2_sha256${iterations}${salt}${digest.hex()}"
+
+
+def _verify_password_value(password: str, encoded: str | None) -> bool:
+    if not encoded:
+        return False
+    try:
+        algo, iter_str, salt, digest_hex = str(encoded).split("$", 3)
+        if algo != "pbkdf2_sha256":
+            return False
+        iterations = int(iter_str)
+        derived = hashlib.pbkdf2_hmac("sha256", str(password or "").encode("utf-8"), salt.encode("utf-8"), iterations)
+        return hmac.compare_digest(derived.hex(), digest_hex)
+    except Exception:
+        return False
 
 
 def _normalize_planting_model(value: str | None) -> str:
@@ -1635,6 +1662,7 @@ def ensure_green_tables(db: Session):
             name TEXT NOT NULL,
             slug TEXT NOT NULL UNIQUE,
             short_name TEXT,
+            logo_url TEXT,
             status TEXT NOT NULL DEFAULT 'pilot',
             contact_email TEXT,
             contact_phone TEXT,
@@ -1739,9 +1767,14 @@ def ensure_green_tables(db: Session):
         db.execute(text("ALTER TABLE green_users ADD COLUMN IF NOT EXISTS phone TEXT"))
         db.execute(text("ALTER TABLE green_users ADD COLUMN IF NOT EXISTS organization_id INTEGER"))
         db.execute(text("ALTER TABLE green_users ADD COLUMN IF NOT EXISTS role_id INTEGER"))
+        db.execute(text("ALTER TABLE green_users ADD COLUMN IF NOT EXISTS allow_green BOOLEAN NOT NULL DEFAULT TRUE"))
+        db.execute(text("ALTER TABLE green_users ADD COLUMN IF NOT EXISTS allow_work BOOLEAN NOT NULL DEFAULT FALSE"))
+        db.execute(text("ALTER TABLE green_users ADD COLUMN IF NOT EXISTS work_username TEXT"))
+        db.execute(text("ALTER TABLE green_users ADD COLUMN IF NOT EXISTS work_password_hash TEXT"))
         db.execute(text("ALTER TABLE green_users ADD COLUMN IF NOT EXISTS notes TEXT"))
         db.execute(text("ALTER TABLE green_users ADD COLUMN IF NOT EXISTS is_active BOOLEAN NOT NULL DEFAULT TRUE"))
         db.execute(text("ALTER TABLE green_users ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW()"))
+        db.execute(text("ALTER TABLE green_organizations ADD COLUMN IF NOT EXISTS logo_url TEXT"))
         db.execute(text("ALTER TABLE green_roles ADD COLUMN IF NOT EXISTS role_uid TEXT"))
         db.execute(text("ALTER TABLE green_roles ADD COLUMN IF NOT EXISTS role_key TEXT"))
         db.execute(text("ALTER TABLE green_roles ADD COLUMN IF NOT EXISTS role_name TEXT"))
@@ -2094,6 +2127,7 @@ def ensure_green_tables(db: Session):
     db.execute(text("CREATE INDEX IF NOT EXISTS idx_tree_tasks_custodian ON tree_tasks(custodian_id)"))
     db.execute(text("CREATE INDEX IF NOT EXISTS idx_green_users_name ON green_users(full_name)"))
     db.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS idx_green_users_uid ON green_users(UPPER(user_uid))"))
+    db.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS idx_green_users_work_username ON green_users(LOWER(work_username))"))
     db.execute(text("CREATE INDEX IF NOT EXISTS idx_green_users_org ON green_users(organization_id)"))
     db.execute(text("CREATE INDEX IF NOT EXISTS idx_green_users_role_id ON green_users(role_id)"))
     db.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS idx_green_roles_uid ON green_roles(UPPER(role_uid))"))
@@ -2245,6 +2279,16 @@ def ensure_green_tables(db: Session):
                 text("UPDATE green_users SET role_id = :role_id, updated_at = COALESCE(updated_at, NOW()) WHERE id = :id"),
                 {"id": int(user_row["id"]), "role_id": int(role_id_val)},
             )
+    db.execute(
+        text(
+            """
+            UPDATE green_users
+            SET allow_work = TRUE
+            WHERE allow_work = FALSE
+              AND LOWER(COALESCE(role, '')) IN ('admin', 'supervisor')
+            """
+        )
+    )
     db.execute(
         text(
             """
@@ -2706,13 +2750,14 @@ def create_project(
     )
     if project.get("organization_id"):
         org_meta = db.execute(
-            text("SELECT name, slug, status FROM green_organizations WHERE id = :org_id"),
+            text("SELECT name, slug, status, logo_url FROM green_organizations WHERE id = :org_id"),
             {"org_id": int(project["organization_id"])},
         ).mappings().first()
         if org_meta:
             project["organization_name"] = org_meta.get("name")
             project["organization_slug"] = org_meta.get("slug")
             project["organization_status"] = org_meta.get("status")
+            project["organization_logo_url"] = org_meta.get("logo_url")
     db.commit()
     return project
 
@@ -2906,7 +2951,7 @@ def assign_project_organization(
     org_row = None
     if org_id_value is not None:
         org_row = db.execute(
-            text("SELECT id, name, slug, status FROM green_organizations WHERE id = :org_id"),
+            text("SELECT id, name, slug, status, logo_url FROM green_organizations WHERE id = :org_id"),
             {"org_id": org_id_value},
         ).mappings().first()
         if not org_row:
@@ -2941,10 +2986,12 @@ def assign_project_organization(
         payload["organization_name"] = org_row.get("name")
         payload["organization_slug"] = org_row.get("slug")
         payload["organization_status"] = org_row.get("status")
+        payload["organization_logo_url"] = org_row.get("logo_url")
     else:
         payload["organization_name"] = None
         payload["organization_slug"] = None
         payload["organization_status"] = None
+        payload["organization_logo_url"] = None
     return payload
 
 
@@ -2954,7 +3001,7 @@ def list_admin_organizations(db: Session = Depends(get_db)):
         text(
             """
             SELECT
-                o.id, o.name, o.slug, o.short_name, o.status, o.contact_email, o.contact_phone, o.website_url,
+                o.id, o.name, o.slug, o.short_name, o.logo_url, o.status, o.contact_email, o.contact_phone, o.website_url,
                 o.country, o.state_region, o.city, o.address_text, o.notes, COALESCE(o.is_active, TRUE) AS is_active,
                 o.created_at, o.updated_at,
                 COALESCE((
@@ -3004,6 +3051,7 @@ def create_admin_organization(
     name: str = Body(...),
     slug: str | None = Body(default=None),
     short_name: str | None = Body(default=None),
+    logo_url: str | None = Body(default=None),
     status: str = Body(default="pilot"),
     contact_email: str | None = Body(default=None),
     contact_phone: str | None = Body(default=None),
@@ -3025,11 +3073,11 @@ def create_admin_organization(
             """
             INSERT INTO green_organizations (
                 name, slug, short_name, status, contact_email, contact_phone, website_url,
-                country, state_region, city, address_text, notes, is_active
+                country, state_region, city, address_text, notes, logo_url, is_active
             )
             VALUES (
                 :name, :slug, :short_name, :status, :contact_email, :contact_phone, :website_url,
-                :country, :state_region, :city, :address_text, :notes, :is_active
+                :country, :state_region, :city, :address_text, :notes, :logo_url, :is_active
             )
             RETURNING *
             """
@@ -3047,6 +3095,7 @@ def create_admin_organization(
             "city": (city or "").strip() or None,
             "address_text": (address_text or "").strip() or None,
             "notes": (notes or "").strip() or None,
+            "logo_url": (logo_url or "").strip() or None,
             "is_active": bool(is_active),
         },
     ).mappings().first()
@@ -3071,6 +3120,7 @@ def update_admin_organization(
     name: str | None = Body(default=None),
     slug: str | None = Body(default=None),
     short_name: str | None = Body(default=None),
+    logo_url: str | None = Body(default=None),
     status: str | None = Body(default=None),
     contact_email: str | None = Body(default=None),
     contact_phone: str | None = Body(default=None),
@@ -3104,6 +3154,7 @@ def update_admin_organization(
             SET name = :name,
                 slug = :slug,
                 short_name = :short_name,
+                logo_url = :logo_url,
                 status = :status,
                 contact_email = :contact_email,
                 contact_phone = :contact_phone,
@@ -3124,6 +3175,7 @@ def update_admin_organization(
             "name": next_name,
             "slug": next_slug,
             "short_name": (short_name.strip() if isinstance(short_name, str) else (existing.get("short_name") or None)) or None,
+            "logo_url": (logo_url.strip() if isinstance(logo_url, str) else (existing.get("logo_url") or None)) or None,
             "status": next_status,
             "contact_email": (contact_email.strip() if isinstance(contact_email, str) else (existing.get("contact_email") or None)) or None,
             "contact_phone": (contact_phone.strip() if isinstance(contact_phone, str) else (existing.get("contact_phone") or None)) or None,
@@ -3362,7 +3414,8 @@ def list_projects(db: Session = Depends(get_db)):
         SELECT
             p.id, p.organization_id, p.name, p.location_text, p.sponsor,
             p.planting_model, p.allow_existing_tree_link, p.default_existing_tree_scope, p.created_at,
-            o.name AS organization_name, o.slug AS organization_slug, o.status AS organization_status
+            o.name AS organization_name, o.slug AS organization_slug, o.status AS organization_status,
+            o.logo_url AS organization_logo_url
         FROM tree_projects p
         LEFT JOIN green_organizations o ON o.id = p.organization_id
         ORDER BY p.created_at DESC
@@ -3376,7 +3429,8 @@ def get_project(project_id: int, db: Session = Depends(get_db)):
         SELECT
             p.id, p.organization_id, p.name, p.location_text, p.sponsor,
             p.planting_model, p.allow_existing_tree_link, p.default_existing_tree_scope, p.created_at,
-            o.name AS organization_name, o.slug AS organization_slug, o.status AS organization_status
+            o.name AS organization_name, o.slug AS organization_slug, o.status AS organization_status,
+            o.logo_url AS organization_logo_url
         FROM tree_projects p
         LEFT JOIN green_organizations o ON o.id = p.organization_id
         WHERE p.id = :project_id
@@ -5472,6 +5526,10 @@ def create_user(
     role_id: int | None = Body(default=None),
     email: str | None = Body(default=None),
     phone: str | None = Body(default=None),
+    allow_green: bool = Body(default=True),
+    allow_work: bool = Body(default=False),
+    work_username: str | None = Body(default=None),
+    work_password: str | None = Body(default=None),
     notes: str | None = Body(default=None),
     is_active: bool = Body(default=True),
 ):
@@ -5505,11 +5563,31 @@ def create_user(
             {"role_key": role_value},
         ).mappings().first()
         role_id_value = int(role_row["id"]) if role_row else None
+    work_username_clean = (work_username or "").strip().lower() or None
+    if work_username_clean:
+        existing_work_username = db.execute(
+            text("SELECT id FROM green_users WHERE LOWER(COALESCE(work_username, '')) = LOWER(:work_username) LIMIT 1"),
+            {"work_username": work_username_clean},
+        ).scalar()
+        if existing_work_username:
+            raise HTTPException(status_code=409, detail="Work username already exists")
+    password_hash = _hash_password_value(work_password) if (work_password or "").strip() else None
+    if bool(allow_work) and (not work_username_clean or not password_hash):
+        raise HTTPException(status_code=400, detail="Work-enabled users require work_username and work_password")
     user_uid_value = _ensure_unique_user_uid(db, user_uid)
     row = db.execute(text("""
-        INSERT INTO green_users (full_name, role, user_uid, organization_id, role_id, email, phone, notes, is_active, updated_at)
-        VALUES (:full_name, :role, :user_uid, :organization_id, :role_id, :email, :phone, :notes, :is_active, NOW())
-        RETURNING id, user_uid, full_name, role, organization_id, role_id, email, phone, notes, is_active, created_at, updated_at
+        INSERT INTO green_users (
+            full_name, role, user_uid, organization_id, role_id, email, phone,
+            allow_green, allow_work, work_username, work_password_hash,
+            notes, is_active, updated_at
+        )
+        VALUES (
+            :full_name, :role, :user_uid, :organization_id, :role_id, :email, :phone,
+            :allow_green, :allow_work, :work_username, :work_password_hash,
+            :notes, :is_active, NOW()
+        )
+        RETURNING id, user_uid, full_name, role, organization_id, role_id, email, phone,
+                  allow_green, allow_work, work_username, notes, is_active, created_at, updated_at
     """), {
         "full_name": full_name_clean,
         "role": role_value,
@@ -5518,6 +5596,10 @@ def create_user(
         "role_id": role_id_value,
         "email": (email or "").strip() or None,
         "phone": (phone or "").strip() or None,
+        "allow_green": bool(allow_green),
+        "allow_work": bool(allow_work),
+        "work_username": work_username_clean,
+        "work_password_hash": password_hash,
         "notes": (notes or "").strip() or None,
         "is_active": bool(is_active),
     }).mappings().first()
@@ -5532,6 +5614,8 @@ def create_user(
             "user_uid": row.get("user_uid"),
             "role": row.get("role"),
             "organization_id": row.get("organization_id"),
+            "allow_green": bool(row.get("allow_green")),
+            "allow_work": bool(row.get("allow_work")),
         },
     )
     db.commit()
@@ -5549,9 +5633,13 @@ def list_users(
     rows = db.execute(text("""
         SELECT
             u.id, u.user_uid, u.full_name, u.role, u.organization_id, u.role_id,
-            u.email, u.phone, u.notes, COALESCE(u.is_active, TRUE) AS is_active,
+            u.email, u.phone,
+            COALESCE(u.allow_green, TRUE) AS allow_green,
+            COALESCE(u.allow_work, FALSE) AS allow_work,
+            u.work_username,
+            u.notes, COALESCE(u.is_active, TRUE) AS is_active,
             u.created_at, u.updated_at,
-            o.name AS organization_name, o.slug AS organization_slug,
+            o.name AS organization_name, o.slug AS organization_slug, o.logo_url AS organization_logo_url,
             r.role_uid, r.role_key, r.role_name
         FROM green_users u
         LEFT JOIN green_organizations o ON o.id = u.organization_id
@@ -5581,13 +5669,21 @@ def update_user(
     role_id: int | None = Body(default=None),
     email: str | None = Body(default=None),
     phone: str | None = Body(default=None),
+    allow_green: bool | None = Body(default=None),
+    allow_work: bool | None = Body(default=None),
+    work_username: str | None = Body(default=None),
+    work_password: str | None = Body(default=None),
     notes: str | None = Body(default=None),
     is_active: bool | None = Body(default=None),
 ):
     existing = db.execute(
         text(
             """
-            SELECT id, user_uid, full_name, role, organization_id, role_id, email, phone, notes, COALESCE(is_active, TRUE) AS is_active
+            SELECT id, user_uid, full_name, role, organization_id, role_id, email, phone,
+                   COALESCE(allow_green, TRUE) AS allow_green,
+                   COALESCE(allow_work, FALSE) AS allow_work,
+                   work_username, work_password_hash,
+                   notes, COALESCE(is_active, TRUE) AS is_active
             FROM green_users
             WHERE id = :user_id
             """
@@ -5626,6 +5722,30 @@ def update_user(
         if role_row:
             role_id_value = int(role_row["id"])
             role_value = str(role_row.get("role_key") or role_value)
+    work_username_value = existing.get("work_username")
+    if work_username is not None:
+        proposed_work_username = str(work_username or "").strip().lower()
+        work_username_value = proposed_work_username or None
+        if work_username_value:
+            clash = db.execute(
+                text(
+                    """
+                    SELECT id FROM green_users
+                    WHERE LOWER(COALESCE(work_username, '')) = LOWER(:work_username)
+                      AND id <> :user_id
+                    LIMIT 1
+                    """
+                ),
+                {"work_username": work_username_value, "user_id": user_id},
+            ).scalar()
+            if clash:
+                raise HTTPException(status_code=409, detail="Work username already exists")
+    work_password_hash_value = existing.get("work_password_hash")
+    if work_password is not None:
+        work_password_hash_value = _hash_password_value(work_password) if str(work_password).strip() else None
+    next_allow_work = bool(allow_work) if allow_work is not None else bool(existing.get("allow_work", False))
+    if next_allow_work and (not work_username_value or not work_password_hash_value):
+        raise HTTPException(status_code=400, detail="Work-enabled users require work_username and work_password")
     user_uid_value = (
         _ensure_unique_user_uid(db, user_uid, exclude_user_id=user_id)
         if user_uid is not None
@@ -5645,6 +5765,10 @@ def update_user(
                 role_id = :role_id,
                 email = :email,
                 phone = :phone,
+                allow_green = :allow_green,
+                allow_work = :allow_work,
+                work_username = :work_username,
+                work_password_hash = :work_password_hash,
                 notes = :notes,
                 is_active = :is_active,
                 updated_at = NOW()
@@ -5661,6 +5785,10 @@ def update_user(
             "role_id": role_id_value,
             "email": (email.strip() if isinstance(email, str) else existing.get("email")) or None,
             "phone": (phone.strip() if isinstance(phone, str) else existing.get("phone")) or None,
+            "allow_green": bool(allow_green) if allow_green is not None else bool(existing.get("allow_green", True)),
+            "allow_work": next_allow_work,
+            "work_username": work_username_value,
+            "work_password_hash": work_password_hash_value,
             "notes": (notes.strip() if isinstance(notes, str) else existing.get("notes")) or None,
             "is_active": bool(is_active) if is_active is not None else bool(existing.get("is_active", True)),
         },
@@ -5676,12 +5804,103 @@ def update_user(
             "user_uid": user_uid_value,
             "role": role_value or "field_officer",
             "organization_id": org_id_value,
+            "allow_green": bool(allow_green) if allow_green is not None else bool(existing.get("allow_green", True)),
+            "allow_work": next_allow_work,
             "is_active": bool(is_active) if is_active is not None else bool(existing.get("is_active", True)),
         },
     )
     db.commit()
     result = list_users(db=db, include_inactive=True, user_id_filter=user_id)
     return result[0] if result else {"id": user_id}
+
+
+@router.post("/work-auth/login")
+def work_auth_login(
+    db: Session = Depends(get_db),
+    username: str = Body(...),
+    password: str = Body(...),
+    organization_id: int | None = Body(default=None),
+):
+    username_clean = str(username or "").strip()
+    if not username_clean:
+        raise HTTPException(status_code=400, detail="Username is required")
+
+    # Preserve existing env-based admin login as a fallback.
+    env_username = str(os.getenv("WORK_USERNAME") or os.getenv("VITE_WORK_USERNAME") or "admin").strip()
+    env_password = str(os.getenv("WORK_PASSWORD") or os.getenv("VITE_WORK_PASSWORD") or "landcheckwork")
+    if username_clean == env_username and str(password or "") == env_password:
+        return {
+            "ok": True,
+            "auth_mode": "env_admin",
+            "user": {
+                "id": 0,
+                "user_uid": "SYS-ADMIN",
+                "full_name": "System Admin",
+                "role": "super_admin",
+                "role_key": "super_admin",
+                "role_name": "Super Admin",
+                "allow_work": True,
+                "allow_green": True,
+                "organization_id": None,
+                "organization_name": None,
+                "organization_logo_url": None,
+            },
+        }
+
+    org_id_filter = int(organization_id) if organization_id is not None else None
+    if org_id_filter is not None and org_id_filter <= 0:
+        org_id_filter = None
+    user_row = db.execute(
+        text(
+            """
+            SELECT
+                u.id, u.user_uid, u.full_name, u.role, u.role_id,
+                COALESCE(u.allow_green, TRUE) AS allow_green,
+                COALESCE(u.allow_work, FALSE) AS allow_work,
+                COALESCE(u.is_active, TRUE) AS is_active,
+                u.work_username, u.work_password_hash,
+                u.organization_id,
+                o.name AS organization_name, o.slug AS organization_slug, o.logo_url AS organization_logo_url,
+                r.role_key, r.role_name, r.role_uid
+            FROM green_users u
+            LEFT JOIN green_organizations o ON o.id = u.organization_id
+            LEFT JOIN green_roles r ON r.id = u.role_id
+            WHERE LOWER(COALESCE(u.work_username, '')) = LOWER(:username)
+              AND (:organization_id IS NULL OR u.organization_id = :organization_id)
+            LIMIT 1
+            """
+        ),
+        {"username": username_clean, "organization_id": org_id_filter},
+    ).mappings().first()
+    if not user_row:
+        raise HTTPException(status_code=401, detail="Invalid username or password")
+    if not bool(user_row.get("is_active", True)):
+        raise HTTPException(status_code=403, detail="User account is inactive")
+    if not bool(user_row.get("allow_work", False)):
+        raise HTTPException(status_code=403, detail="This user is not enabled for LandCheck Work")
+    if not _verify_password_value(password, user_row.get("work_password_hash")):
+        raise HTTPException(status_code=401, detail="Invalid username or password")
+
+    return {
+        "ok": True,
+        "auth_mode": "partner_user",
+        "user": {
+            "id": int(user_row["id"]),
+            "user_uid": user_row.get("user_uid"),
+            "full_name": user_row.get("full_name"),
+            "role": user_row.get("role"),
+            "role_id": user_row.get("role_id"),
+            "role_uid": user_row.get("role_uid"),
+            "role_key": user_row.get("role_key") or user_row.get("role"),
+            "role_name": user_row.get("role_name") or user_row.get("role"),
+            "allow_work": bool(user_row.get("allow_work")),
+            "allow_green": bool(user_row.get("allow_green")),
+            "organization_id": user_row.get("organization_id"),
+            "organization_name": user_row.get("organization_name"),
+            "organization_slug": user_row.get("organization_slug"),
+            "organization_logo_url": user_row.get("organization_logo_url"),
+        },
+    }
 
 
 @router.patch("/tasks/{task_id}")
