@@ -910,7 +910,7 @@ def _compute_live_maintenance_rows(
     task_rows = db.execute(
         text("""
             SELECT t.id, t.tree_id, t.task_type, t.assignee_name, t.status, t.review_state, t.due_date,
-                   t.priority, t.notes, t.photo_url, t.created_at, t.completed_at
+                   t.priority, t.notes, t.photo_url, t.created_at, t.completed_at, t.submitted_at
             FROM tree_tasks t
             JOIN trees tr ON tr.id = t.tree_id
             WHERE tr.project_id = :project_id
@@ -922,12 +922,17 @@ def _compute_live_maintenance_rows(
 
     species_maturity_map = _get_species_maturity_map(project_id, db)
     task_buckets: dict[str, list[dict]] = {}
+    planting_task_buckets: dict[int, list[dict]] = {}
     for task in task_rows:
-        activity = _normalize_name(task.get("task_type"))
-        if activity not in MAINTENANCE_ACTIVITY_ORDER:
+        task_type_key = _normalize_name(task.get("task_type"))
+        tree_id = int(task.get("tree_id") or 0)
+        task_item = dict(task)
+        if task_type_key == "planting" and tree_id > 0:
+            planting_task_buckets.setdefault(tree_id, []).append(task_item)
+        if task_type_key not in MAINTENANCE_ACTIVITY_ORDER:
             continue
-        key = f"{int(task['tree_id'])}:{activity}"
-        task_buckets.setdefault(key, []).append(dict(task))
+        key = f"{tree_id}:{task_type_key}"
+        task_buckets.setdefault(key, []).append(task_item)
 
     today = date.today()
     rows: list[dict] = []
@@ -943,9 +948,23 @@ def _compute_live_maintenance_rows(
                 continue
 
         tree_status = _normalize_tree_status(tree.get("status") or "alive")
+        planting_submission_task = None
         if tree_status == "pending_planting":
-            # Planting enters live maintenance model only after supervisor approval.
-            continue
+            planting_rows = planting_task_buckets.get(tree_id, [])
+            submitted_plantings = [
+                task
+                for task in planting_rows
+                if _is_done_status(task.get("status")) and _normalize_name(task.get("review_state")) == "submitted"
+            ]
+            submitted_plantings.sort(
+                key=lambda task: _parse_date_value(task.get("submitted_at") or task.get("created_at") or task.get("due_date")) or date.min,
+                reverse=True,
+            )
+            planting_submission_task = submitted_plantings[0] if submitted_plantings else None
+            if not planting_submission_task:
+                # No submitted planting evidence yet, so no provisional maintenance preview.
+                continue
+        provisional_pending_approval = tree_status == "pending_planting" and planting_submission_task is not None
         replacement_required = _is_replacement_trigger_status(tree_status)
         planting_date_obj = _parse_date_value(tree.get("planting_date"))
         replacement_key = f"{tree_id}:replacement"
@@ -1077,6 +1096,33 @@ def _compute_live_maintenance_rows(
                 )
             else:
                 rationale = f"{season.title()} season model: first {intervals['first_days']}d, repeat {intervals['repeat_days']}d."
+
+            if provisional_pending_approval:
+                planting_task_label = f"Planting task #{int(planting_submission_task['id'])}" if planting_submission_task else "Planting task"
+                status_text = f"{planting_task_label} submitted (awaiting supervisor approval)"
+                if countdown_days is None:
+                    tone = "warning"
+                    indicator = "Provisional preview while planting approval is pending."
+                elif countdown_days < 0:
+                    tone = "danger"
+                    indicator = (
+                        f"Provisional: due from planting date and now {abs(countdown_days)} day"
+                        f"{'s' if abs(countdown_days) != 1 else ''} overdue while approval is pending."
+                    )
+                elif countdown_days == 0:
+                    tone = "warning"
+                    indicator = "Provisional: due today from planting date once approved."
+                elif countdown_days <= 7:
+                    tone = "warning"
+                    indicator = f"Provisional: due in {countdown_days} day{'s' if countdown_days != 1 else ''} from planting date."
+                else:
+                    tone = "info"
+                    indicator = f"Provisional: scheduled from planting date in {countdown_days} day{'s' if countdown_days != 1 else ''}."
+                rationale = (
+                    f"{rationale} Provisional preview only: planting submission is awaiting supervisor approval. "
+                    "Rows are shown for planning visibility, but maintenance workflow becomes active after approval."
+                )
+
             rows.append(
                 {
                     "key": f"{tree_id}:{activity}",
