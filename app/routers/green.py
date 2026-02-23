@@ -367,6 +367,12 @@ def _verify_password_value(password: str, encoded: str | None) -> bool:
         return False
 
 
+def _generate_temporary_login_password(length: int = 12) -> str:
+    alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789"
+    size = max(8, int(length or 12))
+    return "".join(secrets.choice(alphabet) for _ in range(size))
+
+
 def _normalize_planting_model(value: str | None) -> str:
     normalized = _normalize_name(value)
     if normalized in PLANTING_MODEL_VALUES:
@@ -5581,7 +5587,10 @@ def create_user(
         ).scalar()
         if existing_work_username:
             raise HTTPException(status_code=409, detail="Work username already exists")
-    password_hash = _hash_password_value(work_password) if (work_password or "").strip() else None
+    generated_password: str | None = None
+    if login_enabled and not str(work_password or "").strip():
+        generated_password = _generate_temporary_login_password()
+    password_hash = _hash_password_value(generated_password or work_password or "") if login_enabled else None
     if login_enabled and (not work_username_clean or not password_hash):
         raise HTTPException(
             status_code=400,
@@ -5631,7 +5640,11 @@ def create_user(
         },
     )
     db.commit()
-    return list_users(db=db, include_inactive=True, user_id_filter=int(row["id"]))[0]
+    payload = list_users(db=db, include_inactive=True, user_id_filter=int(row["id"]))[0]
+    if generated_password:
+        payload["generated_password"] = generated_password
+        payload["generated_login_username"] = work_username_clean
+    return payload
 
 
 @router.get("/users")
