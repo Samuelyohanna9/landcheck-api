@@ -471,6 +471,42 @@ def _infer_tree_reference_date(tree: dict) -> tuple[Optional[date], str]:
     return None, "none"
 
 
+def _coerce_tree_age_months(value) -> Optional[float]:
+    if value is None or value == "":
+        return None
+    try:
+        months = float(value)
+    except Exception:
+        return None
+    if months < 0:
+        return None
+    return months
+
+
+def _infer_tree_age_years(tree: dict, ref_date: Optional[date] = None) -> tuple[float, str]:
+    """
+    Infer tree age in years using:
+    1) planting_date (preferred)
+    2) explicit tree_age_months (+ elapsed time since created_at if available)
+    3) fallback sources from _infer_tree_reference_date
+    """
+    today = ref_date or date.today()
+    planting_date = _parse_date_like(tree.get("planting_date"))
+    if planting_date:
+        return tree_age_years(planting_date, today), "planting_date"
+
+    age_months = _coerce_tree_age_months(tree.get("tree_age_months"))
+    if age_months is not None:
+        capture_ref = _parse_date_like(tree.get("created_at")) or _parse_date_like(tree.get("submitted_at")) or _parse_date_like(tree.get("reviewed_at"))
+        elapsed_years = tree_age_years(capture_ref, today) if capture_ref else 0.0
+        return max((age_months / 12.0) + elapsed_years, 0.0), "tree_age_months"
+
+    inferred_ref, inferred_source = _infer_tree_reference_date(tree)
+    if inferred_ref is None:
+        return 0.0, "none"
+    return tree_age_years(inferred_ref, today), inferred_source
+
+
 def compute_project_carbon(
     trees: list[dict],
     projection_years: int = 40,
@@ -502,19 +538,17 @@ def compute_project_carbon(
     for tree in trees:
         status = _normalize_tree_status(tree.get("status"))
         species = tree.get("species")
-        ref_date, ref_source = _infer_tree_reference_date(tree)
+        age, ref_source = _infer_tree_age_years(tree, today)
 
         is_alive = _is_alive_tree_status(status)
         if is_alive:
             alive_trees += 1
         if status == "pending_planting":
             trees_pending_review += 1
-        if ref_date is None:
+        if ref_source == "none":
             trees_missing_age_data += 1
         elif ref_source != "planting_date":
             trees_with_fallback_age += 1
-
-        age = tree_age_years(ref_date, today)
 
         if is_alive and age > 0:
             tree_co2 = estimate_tree_co2_kg(species, age)
@@ -593,8 +627,7 @@ def generate_co2_projection_table(
         if not _is_alive_tree_status(status):
             continue
         species = tree.get("species")
-        ref_date, _ = _infer_tree_reference_date(tree)
-        age = tree_age_years(ref_date, today)
+        age, _ = _infer_tree_age_years(tree, today)
         alive_trees_data.append({"species": species, "current_age": age})
 
     projection = []

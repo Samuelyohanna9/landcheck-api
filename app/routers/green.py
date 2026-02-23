@@ -1295,6 +1295,7 @@ def ensure_green_tables(db: Session):
             count_in_carbon_scope BOOLEAN NOT NULL DEFAULT TRUE,
             source_project_id INTEGER REFERENCES tree_projects(id) ON DELETE SET NULL,
             tree_height_m NUMERIC,
+            tree_age_months NUMERIC,
             created_at TIMESTAMP DEFAULT NOW()
         )
     """))
@@ -1348,6 +1349,7 @@ def ensure_green_tables(db: Session):
         db.execute(text("ALTER TABLE trees ADD COLUMN IF NOT EXISTS count_in_carbon_scope BOOLEAN NOT NULL DEFAULT TRUE"))
         db.execute(text("ALTER TABLE trees ADD COLUMN IF NOT EXISTS source_project_id INTEGER"))
         db.execute(text("ALTER TABLE trees ADD COLUMN IF NOT EXISTS tree_height_m NUMERIC"))
+        db.execute(text("ALTER TABLE trees ADD COLUMN IF NOT EXISTS tree_age_months NUMERIC"))
     except Exception:
         db.rollback()
     db.execute(
@@ -2362,7 +2364,7 @@ def get_project(project_id: int, db: Session = Depends(get_db)):
 
     # Carbon summary
     tree_rows_for_carbon = db.execute(text("""
-        SELECT id, species, planting_date, status, created_at
+        SELECT id, species, planting_date, status, created_at, tree_age_months
         FROM trees
         WHERE project_id = :project_id
           AND COALESCE(count_in_carbon_scope, TRUE) = TRUE
@@ -2469,6 +2471,7 @@ def list_trees(project_id: int, db: Session = Depends(get_db)):
                t.count_in_carbon_scope,
                t.source_project_id,
                t.tree_height_m,
+               t.tree_age_months,
                ST_X(geom) AS lng, ST_Y(geom) AS lat
         FROM trees t
         LEFT JOIN green_custodians c ON c.id = t.custodian_id
@@ -3190,6 +3193,7 @@ def list_existing_tree_candidates(
                 t.status,
                 t.tree_origin,
                 t.tree_height_m,
+                t.tree_age_months,
                 t.created_by,
                 t.created_at,
                 t.source_project_id,
@@ -3406,7 +3410,7 @@ def import_existing_trees(
                     INSERT INTO trees (
                         project_id, geom, species, planting_date, status, notes, photo_url, created_by,
                         tree_origin, custodian_id, custody_started_at, attribution_scope,
-                        count_in_planting_kpis, count_in_carbon_scope, source_project_id, tree_height_m
+                        count_in_planting_kpis, count_in_carbon_scope, source_project_id, tree_height_m, tree_age_months
                     )
                     SELECT
                         :target_project_id,
@@ -3424,7 +3428,8 @@ def import_existing_trees(
                         :count_in_planting_kpis,
                         :count_in_carbon_scope,
                         :source_project_id,
-                        tree_height_m
+                        tree_height_m,
+                        tree_age_months
                     FROM trees
                     WHERE id = :tree_id
                     RETURNING id
@@ -3600,7 +3605,7 @@ def carbon_summary(project_id: int, projection_years: int = Query(default=40), d
         raise HTTPException(status_code=404, detail="Project not found")
 
     tree_rows = db.execute(text("""
-        SELECT id, species, planting_date, status, created_at
+        SELECT id, species, planting_date, status, created_at, tree_age_months
         FROM trees
         WHERE project_id = :project_id
           AND COALESCE(count_in_carbon_scope, TRUE) = TRUE
@@ -3621,7 +3626,7 @@ def carbon_projection(project_id: int, years: int = Query(default=30), db: Sessi
         raise HTTPException(status_code=404, detail="Project not found")
 
     tree_rows = db.execute(text("""
-        SELECT id, species, planting_date, status, created_at
+        SELECT id, species, planting_date, status, created_at, tree_age_months
         FROM trees
         WHERE project_id = :project_id
           AND COALESCE(count_in_carbon_scope, TRUE) = TRUE
@@ -3635,7 +3640,7 @@ def carbon_projection(project_id: int, years: int = Query(default=30), db: Sessi
 def tree_carbon(tree_id: int, db: Session = Depends(get_db)):
     """Get CO2 estimate for a single tree."""
     tree = db.execute(text("""
-        SELECT id, species, planting_date, status, created_at, tree_height_m, count_in_carbon_scope
+        SELECT id, species, planting_date, status, created_at, tree_height_m, tree_age_months, count_in_carbon_scope
         FROM trees
         WHERE id = :tree_id
     """), {"tree_id": tree_id}).mappings().first()
@@ -3659,6 +3664,7 @@ def tree_carbon(tree_id: int, db: Session = Depends(get_db)):
         "height_used_for_co2": bool(metrics.get("height_used_for_co2")),
         "co2_height_source": metrics.get("co2_height_source", "modeled_height"),
         "tree_height_m": tree.get("tree_height_m"),
+        "tree_age_months": tree.get("tree_age_months"),
         "methodology": metrics.get("co2_methodology", "Chave et al. (2014) pantropical allometric equation"),
     }
 
@@ -3689,6 +3695,7 @@ def add_tree(
     count_in_carbon_scope: bool | None = Body(default=None),
     source_project_id: int | None = Body(default=None),
     tree_height_m: float | None = Body(default=None),
+    tree_age_months: float | None = Body(default=None),
 ):
     project_settings = _get_project_settings(db, int(project_id))
     origin = _normalize_tree_origin(tree_origin)
@@ -3704,6 +3711,16 @@ def add_tree(
             raise HTTPException(status_code=400, detail="tree_height_m must be between 0 and 120")
     else:
         tree_height_value = None
+
+    if tree_age_months is not None:
+        try:
+            tree_age_months_value = float(tree_age_months)
+        except Exception:
+            raise HTTPException(status_code=400, detail="tree_age_months must be numeric")
+        if tree_age_months_value < 0 or tree_age_months_value > 2400:
+            raise HTTPException(status_code=400, detail="tree_age_months must be between 0 and 2400")
+    else:
+        tree_age_months_value = None
 
     resolved_scope, planting_scope_flag, carbon_scope_flag = _resolve_tree_scope_defaults(
         tree_origin=origin,
@@ -3750,7 +3767,7 @@ def add_tree(
         INSERT INTO trees (
             project_id, geom, species, planting_date, status, notes, photo_url, created_by,
             tree_origin, custodian_id, custody_started_at, attribution_scope,
-            count_in_planting_kpis, count_in_carbon_scope, source_project_id, tree_height_m
+            count_in_planting_kpis, count_in_carbon_scope, source_project_id, tree_height_m, tree_age_months
         )
         VALUES (
             :project_id,
@@ -3768,7 +3785,8 @@ def add_tree(
             :count_in_planting_kpis,
             :count_in_carbon_scope,
             :source_project_id,
-            :tree_height_m
+            :tree_height_m,
+            :tree_age_months
         )
         RETURNING id
     """), {
@@ -3789,6 +3807,7 @@ def add_tree(
         "count_in_carbon_scope": carbon_scope_flag,
         "source_project_id": source_project_id_value,
         "tree_height_m": tree_height_value,
+        "tree_age_months": tree_age_months_value,
     }).scalar()
 
     _record_tree_status_history(
@@ -3877,6 +3896,7 @@ def add_tree(
             "count_in_carbon_scope": carbon_scope_flag,
             "source_project_id": source_project_id_value,
             "tree_height_m": tree_height_value,
+            "tree_age_months": tree_age_months_value,
             "review_task_id": int(review_task_id) if review_task_id else None,
         },
     )
@@ -3903,6 +3923,7 @@ def update_tree(
     count_in_carbon_scope: bool | None = Body(default=None),
     source_project_id: int | None = Body(default=None),
     tree_height_m: float | None = Body(default=None),
+    tree_age_months: float | None = Body(default=None),
 ):
     normalized_status = _normalize_tree_status(status) if status is not None else None
     if normalized_status is not None and normalized_status not in TREE_STATUS_VALUES:
@@ -3924,6 +3945,15 @@ def update_tree(
             raise HTTPException(status_code=400, detail="tree_height_m must be numeric")
         if tree_height_value < 0 or tree_height_value > 120:
             raise HTTPException(status_code=400, detail="tree_height_m must be between 0 and 120")
+
+    tree_age_months_value = None
+    if tree_age_months is not None:
+        try:
+            tree_age_months_value = float(tree_age_months)
+        except Exception:
+            raise HTTPException(status_code=400, detail="tree_age_months must be numeric")
+        if tree_age_months_value < 0 or tree_age_months_value > 2400:
+            raise HTTPException(status_code=400, detail="tree_age_months must be between 0 and 2400")
 
     source_project_id_value = None
     if source_project_id is not None:
@@ -3954,7 +3984,8 @@ def update_tree(
                 count_in_planting_kpis,
                 count_in_carbon_scope,
                 source_project_id,
-                tree_height_m
+                tree_height_m,
+                tree_age_months
             FROM trees
             WHERE id = :tree_id
             """
@@ -4012,7 +4043,8 @@ def update_tree(
             count_in_planting_kpis = COALESCE(:count_in_planting_kpis, count_in_planting_kpis),
             count_in_carbon_scope = COALESCE(:count_in_carbon_scope, count_in_carbon_scope),
             source_project_id = COALESCE(:source_project_id, source_project_id),
-            tree_height_m = COALESCE(:tree_height_m, tree_height_m)
+            tree_height_m = COALESCE(:tree_height_m, tree_height_m),
+            tree_age_months = COALESCE(:tree_age_months, tree_age_months)
         WHERE id = :tree_id
     """), {
         "species": species,
@@ -4028,6 +4060,7 @@ def update_tree(
         "count_in_carbon_scope": resolved_count_in_carbon_scope if (count_in_carbon_scope is not None or normalized_origin is not None or normalized_attribution_scope is not None) else None,
         "source_project_id": source_project_id_value,
         "tree_height_m": tree_height_value,
+        "tree_age_months": tree_age_months_value,
         "tree_id": tree_id,
     })
     previous_status = _normalize_tree_status(existing.get("status"))
@@ -4077,6 +4110,7 @@ def update_tree(
                 ),
                 "source_project_id": source_project_id_value if source_project_id is not None else existing.get("source_project_id"),
                 "tree_height_m": tree_height_value if tree_height_m is not None else existing.get("tree_height_m"),
+                "tree_age_months": tree_age_months_value if tree_age_months is not None else existing.get("tree_age_months"),
             },
         },
     )
@@ -5791,7 +5825,7 @@ def _compute_kpi_snapshot(project_id: int, db: Session) -> dict:
 
     # Carbon data for KPI
     carbon_tree_rows = db.execute(text("""
-        SELECT id, species, planting_date, status, created_at
+        SELECT id, species, planting_date, status, created_at, tree_age_months
         FROM trees
         WHERE project_id = :project_id
           AND COALESCE(count_in_carbon_scope, TRUE) = TRUE
@@ -7527,7 +7561,7 @@ def export_donor_report_csv(project_id: int, db: Session = Depends(get_db)):
         writer = _excel_csv_writer(f)
         # Carbon summary for CSV header
         carbon_trees_csv = db.execute(text("""
-            SELECT id, species, planting_date, status, created_at
+            SELECT id, species, planting_date, status, created_at, tree_age_months
             FROM trees
             WHERE project_id = :pid
               AND COALESCE(count_in_carbon_scope, TRUE) = TRUE
@@ -8523,6 +8557,41 @@ def _estimate_tree_co2_height_aware_kg(
         return estimate_tree_co2_kg(species, age_years), False
 
 
+def _coerce_tree_age_months(value: object) -> float | None:
+    try:
+        if value is None or value == "":
+            return None
+        months = float(value)
+    except Exception:
+        return None
+    if months < 0:
+        return None
+    return months
+
+
+def _infer_tree_age_for_carbon(tree_row: dict) -> tuple[float, str]:
+    """Infer tree age in years, preferring planting_date and falling back to tree_age_months."""
+    tree = dict(tree_row)
+    today = date.today()
+    planting_ref = _parse_date_value(tree.get("planting_date"))
+    if planting_ref is not None:
+        return tree_age_years(planting_ref, today), "planting_date"
+
+    age_months = _coerce_tree_age_months(tree.get("tree_age_months"))
+    if age_months is None:
+        ref_date, ref_source = _infer_tree_reference_date(tree)
+        if ref_date is None:
+            return 0.0, "none"
+        return tree_age_years(ref_date, today), ref_source
+
+    elapsed_years = 0.0
+    capture_ref = _parse_date_value(tree.get("created_at")) or _parse_date_value(tree.get("submitted_at")) or _parse_date_value(tree.get("reviewed_at"))
+    if capture_ref is not None:
+        elapsed_years = tree_age_years(capture_ref, today)
+    age_years = max((age_months / 12.0) + elapsed_years, 0.0)
+    return age_years, "tree_age_months"
+
+
 def _build_tree_carbon_metrics(
     tree_row: dict,
     projection_years: int = 40,
@@ -8530,9 +8599,7 @@ def _build_tree_carbon_metrics(
 ) -> dict:
     """Per-tree CO2 metrics with measured-height preference for current stock."""
     tree = dict(tree_row)
-    today = date.today()
-    ref_date, ref_source = _infer_tree_reference_date(tree)
-    age_years = tree_age_years(ref_date, today) if ref_date else 0.0
+    age_years, ref_source = _infer_tree_age_for_carbon(tree)
     species = tree.get("species")
     params = _get_species_params(species)
     status_key = _normalize_tree_status(tree.get("status"))
@@ -8599,6 +8666,7 @@ def _fetch_existing_tree_export_rows(project_id: int, db: Session) -> list[dict]
                 t.count_in_planting_kpis,
                 t.count_in_carbon_scope,
                 t.source_project_id,
+                t.tree_age_months,
                 t.custodian_id,
                 c.name AS custodian_name,
                 t.tree_height_m,
@@ -8729,6 +8797,34 @@ def _summarize_existing_tree_export_rows(rows: list[dict]) -> dict:
     }
 
 
+@router.get("/projects/{project_id}/existing-trees/metrics")
+def get_existing_tree_metrics(project_id: int, db: Session = Depends(get_db)):
+    _get_project_settings(db, project_id)
+    rows = _fetch_existing_tree_export_rows(project_id, db)
+    items = []
+    for row in rows:
+        items.append(
+            {
+                "tree_id": int(row.get("id") or 0),
+                "tree_age_months": row.get("tree_age_months"),
+                "age_years": row.get("age_years"),
+                "age_source": row.get("age_source"),
+                "current_co2_kg": row.get("current_co2_kg"),
+                "annual_co2_kg": row.get("annual_co2_kg"),
+                "lifetime_co2_kg": row.get("lifetime_co2_kg"),
+                "co2_in_scope": bool(row.get("co2_in_scope", True)),
+                "co2_height_source": row.get("co2_height_source"),
+                "height_used_for_co2": bool(row.get("height_used_for_co2")),
+            }
+        )
+    return {
+        "project_id": project_id,
+        "count": len(items),
+        "items": items,
+        "generated_at": datetime.utcnow().isoformat(),
+    }
+
+
 @router.get("/projects/{project_id}/existing-trees/export/csv")
 def export_existing_trees_csv(project_id: int, db: Session = Depends(get_db)):
     project = get_project(project_id, db)
@@ -8771,6 +8867,7 @@ def export_existing_trees_csv(project_id: int, db: Session = Depends(get_db)):
             "age_source",
             "status",
             "tree_height_m",
+            "tree_age_months",
             "height_used_for_co2",
             "co2_height_source",
             "count_in_carbon_scope",
@@ -8816,6 +8913,7 @@ def export_existing_trees_csv(project_id: int, db: Session = Depends(get_db)):
                 row.get("age_source"),
                 row.get("status"),
                 row.get("tree_height_m"),
+                row.get("tree_age_months"),
                 row.get("height_used_for_co2"),
                 row.get("co2_height_source"),
                 row.get("count_in_carbon_scope"),
@@ -9123,7 +9221,7 @@ def export_project_pdf(
 
     # Carbon data for executive summary
     carbon_trees = db.execute(text("""
-        SELECT id, species, planting_date, status, created_at
+        SELECT id, species, planting_date, status, created_at, tree_age_months
         FROM trees
         WHERE project_id = :pid
           AND COALESCE(count_in_carbon_scope, TRUE) = TRUE
@@ -9400,7 +9498,7 @@ def export_work_report_pdf(
 
     # Carbon data for executive summary
     carbon_trees = db.execute(text("""
-        SELECT id, species, planting_date, status, created_at
+        SELECT id, species, planting_date, status, created_at, tree_age_months
         FROM trees
         WHERE project_id = :pid
           AND COALESCE(count_in_carbon_scope, TRUE) = TRUE

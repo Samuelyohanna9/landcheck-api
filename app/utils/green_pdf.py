@@ -1739,7 +1739,7 @@ def render_green_existing_trees_report_pdf(
         c.drawString(52, y_head, "Species")
         c.drawString(156, y_head, "Status")
         c.drawString(214, y_head, "Date")
-        c.drawRightString(287, y_head, "Age")
+        c.drawRightString(287, y_head, "Age y/m")
         c.drawRightString(323, y_head, "H(m)")
         c.drawRightString(381, y_head, "CO2 Now")
         c.drawRightString(433, y_head, "Annual")
@@ -1769,7 +1769,21 @@ def render_green_existing_trees_report_pdf(
         c.drawString(52, y, str(row.get("species") or "-")[:24])
         c.drawString(156, y, str(row.get("status") or "-")[:13])
         c.drawString(214, y, str(row.get("planting_date") or "-")[:10])
-        age_label = "-" if str(row.get("age_source") or "none") == "none" else _fmt_num(row.get("age_years"), 1)
+        age_source = str(row.get("age_source") or "none")
+        age_months_raw = row.get("tree_age_months")
+        age_months_label = ""
+        try:
+            if age_months_raw is not None:
+                age_months_value = float(age_months_raw)
+                if age_months_value >= 0:
+                    age_months_label = str(int(round(age_months_value)))
+        except Exception:
+            age_months_label = ""
+        if age_source == "none":
+            age_label = "-"
+        else:
+            age_years_label = _fmt_num(row.get("age_years"), 1)
+            age_label = f"{age_years_label}/{age_months_label}" if age_months_label else age_years_label
         c.drawRightString(287, y, age_label)
         c.drawRightString(323, y, height_val)
         c.drawRightString(381, y, _fmt_num(row.get("current_co2_kg"), 1))
