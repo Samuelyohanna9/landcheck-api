@@ -5932,6 +5932,8 @@ def work_auth_login(
         raise HTTPException(status_code=403, detail="User account is inactive")
     if not bool(user_row.get("allow_work", False)):
         raise HTTPException(status_code=403, detail="This user is not enabled for LandCheck Work")
+    if user_row.get("organization_id") is None:
+        raise HTTPException(status_code=403, detail="This user is not linked to an organization")
     if not _verify_password_value(password, user_row.get("work_password_hash")):
         raise HTTPException(status_code=401, detail="Invalid username or password")
 
@@ -6024,6 +6026,8 @@ def green_auth_login(
         raise HTTPException(status_code=403, detail="User account is inactive")
     if not bool(user_row.get("allow_green", True)):
         raise HTTPException(status_code=403, detail="This user is not enabled for LandCheck Green")
+    if user_row.get("organization_id") is None:
+        raise HTTPException(status_code=403, detail="This user is not linked to an organization")
     if not _verify_password_value(password, user_row.get("work_password_hash")):
         raise HTTPException(status_code=401, detail="Invalid username or password")
 
