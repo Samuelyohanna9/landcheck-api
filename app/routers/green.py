@@ -3409,7 +3409,10 @@ def admin_overview(db: Session = Depends(get_db), recent_limit: int = Query(defa
 
 
 @router.get("/projects")
-def list_projects(db: Session = Depends(get_db)):
+def list_projects(
+    db: Session = Depends(get_db),
+    organization_id: int | None = Query(default=None),
+):
     rows = db.execute(text("""
         SELECT
             p.id, p.organization_id, p.name, p.location_text, p.sponsor,
@@ -3418,8 +3421,11 @@ def list_projects(db: Session = Depends(get_db)):
             o.logo_url AS organization_logo_url
         FROM tree_projects p
         LEFT JOIN green_organizations o ON o.id = p.organization_id
+        WHERE (:organization_id IS NULL OR p.organization_id = :organization_id)
         ORDER BY p.created_at DESC
-    """)).mappings().all()
+    """), {
+        "organization_id": int(organization_id) if organization_id is not None else None,
+    }).mappings().all()
     return [dict(r) for r in rows]
 
 
@@ -5878,6 +5884,95 @@ def work_auth_login(
         raise HTTPException(status_code=403, detail="User account is inactive")
     if not bool(user_row.get("allow_work", False)):
         raise HTTPException(status_code=403, detail="This user is not enabled for LandCheck Work")
+    if not _verify_password_value(password, user_row.get("work_password_hash")):
+        raise HTTPException(status_code=401, detail="Invalid username or password")
+
+    return {
+        "ok": True,
+        "auth_mode": "partner_user",
+        "user": {
+            "id": int(user_row["id"]),
+            "user_uid": user_row.get("user_uid"),
+            "full_name": user_row.get("full_name"),
+            "role": user_row.get("role"),
+            "role_id": user_row.get("role_id"),
+            "role_uid": user_row.get("role_uid"),
+            "role_key": user_row.get("role_key") or user_row.get("role"),
+            "role_name": user_row.get("role_name") or user_row.get("role"),
+            "allow_work": bool(user_row.get("allow_work")),
+            "allow_green": bool(user_row.get("allow_green")),
+            "organization_id": user_row.get("organization_id"),
+            "organization_name": user_row.get("organization_name"),
+            "organization_slug": user_row.get("organization_slug"),
+            "organization_logo_url": user_row.get("organization_logo_url"),
+        },
+    }
+
+
+@router.post("/green-auth/login")
+def green_auth_login(
+    db: Session = Depends(get_db),
+    username: str = Body(...),
+    password: str = Body(...),
+    organization_id: int | None = Body(default=None),
+):
+    username_clean = str(username or "").strip()
+    if not username_clean:
+        raise HTTPException(status_code=400, detail="Username is required")
+
+    # Preserve env admin fallback for setup/support access.
+    env_username = str(os.getenv("WORK_USERNAME") or os.getenv("VITE_WORK_USERNAME") or "admin").strip()
+    env_password = str(os.getenv("WORK_PASSWORD") or os.getenv("VITE_WORK_PASSWORD") or "landcheckwork")
+    if username_clean == env_username and str(password or "") == env_password:
+        return {
+            "ok": True,
+            "auth_mode": "env_admin",
+            "user": {
+                "id": 0,
+                "user_uid": "SYS-ADMIN",
+                "full_name": "System Admin",
+                "role": "super_admin",
+                "role_key": "super_admin",
+                "role_name": "Super Admin",
+                "allow_work": True,
+                "allow_green": True,
+                "organization_id": None,
+                "organization_name": None,
+                "organization_logo_url": None,
+            },
+        }
+
+    org_id_filter = int(organization_id) if organization_id is not None else None
+    if org_id_filter is not None and org_id_filter <= 0:
+        org_id_filter = None
+    user_row = db.execute(
+        text(
+            """
+            SELECT
+                u.id, u.user_uid, u.full_name, u.role, u.role_id,
+                COALESCE(u.allow_green, TRUE) AS allow_green,
+                COALESCE(u.allow_work, FALSE) AS allow_work,
+                COALESCE(u.is_active, TRUE) AS is_active,
+                u.work_username, u.work_password_hash,
+                u.organization_id,
+                o.name AS organization_name, o.slug AS organization_slug, o.logo_url AS organization_logo_url,
+                r.role_key, r.role_name, r.role_uid
+            FROM green_users u
+            LEFT JOIN green_organizations o ON o.id = u.organization_id
+            LEFT JOIN green_roles r ON r.id = u.role_id
+            WHERE LOWER(COALESCE(u.work_username, '')) = LOWER(:username)
+              AND (:organization_id IS NULL OR u.organization_id = :organization_id)
+            LIMIT 1
+            """
+        ),
+        {"username": username_clean, "organization_id": org_id_filter},
+    ).mappings().first()
+    if not user_row:
+        raise HTTPException(status_code=401, detail="Invalid username or password")
+    if not bool(user_row.get("is_active", True)):
+        raise HTTPException(status_code=403, detail="User account is inactive")
+    if not bool(user_row.get("allow_green", True)):
+        raise HTTPException(status_code=403, detail="This user is not enabled for LandCheck Green")
     if not _verify_password_value(password, user_row.get("work_password_hash")):
         raise HTTPException(status_code=401, detail="Invalid username or password")
 
