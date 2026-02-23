@@ -22,6 +22,7 @@ from app.utils.green_pdf import (
     render_green_report_pdf,
     render_green_work_report_pdf,
     render_green_custodian_report_pdf,
+    render_green_existing_trees_report_pdf,
 )
 from app.utils.carbon import (
     compute_project_carbon,
@@ -33,6 +34,9 @@ from app.utils.carbon import (
     _normalize_species_key,
     _get_species_params,
     _infer_tree_reference_date,
+    tree_age_years,
+    project_dbh,
+    calculate_agb_chave,
 )
 
 router = APIRouter(prefix="/green", tags=["green"])
@@ -3631,33 +3635,31 @@ def carbon_projection(project_id: int, years: int = Query(default=30), db: Sessi
 def tree_carbon(tree_id: int, db: Session = Depends(get_db)):
     """Get CO2 estimate for a single tree."""
     tree = db.execute(text("""
-        SELECT id, species, planting_date, status, created_at
+        SELECT id, species, planting_date, status, created_at, tree_height_m, count_in_carbon_scope
         FROM trees
         WHERE id = :tree_id
     """), {"tree_id": tree_id}).mappings().first()
     if not tree:
         raise HTTPException(status_code=404, detail="Tree not found")
 
-    ref_date, ref_source = _infer_tree_reference_date(dict(tree))
-    age = max(((date.today() - ref_date).days / 365.25), 0.0) if ref_date else 0.0
+    metrics = _build_tree_carbon_metrics(dict(tree), projection_years=40, enforce_carbon_scope=False)
     species = tree.get("species")
-    params = _get_species_params(species)
-    current_co2 = estimate_tree_co2_kg(species, age)
-    annual_co2 = estimate_annual_co2_kg(species, age)
-    lifetime_co2 = estimate_lifetime_co2_kg(species, 40)
 
     return {
         "tree_id": tree_id,
         "species": species,
-        "species_matched": params.get("label", "Unknown"),
-        "growth_class": params.get("growth_class", "medium"),
-        "age_years": round(age, 1),
-        "age_source": ref_source,
-        "current_co2_kg": current_co2,
-        "annual_co2_kg": annual_co2,
-        "lifetime_co2_kg": lifetime_co2,
-        "lifetime_co2_tonnes": round(lifetime_co2 / 1000, 3),
-        "methodology": "Chave et al. (2014) pantropical allometric equation",
+        "species_matched": metrics.get("species_matched", "Unknown"),
+        "growth_class": metrics.get("growth_class", "medium"),
+        "age_years": round(float(metrics.get("age_years") or 0.0), 1),
+        "age_source": metrics.get("age_source", "none"),
+        "current_co2_kg": metrics.get("current_co2_kg", 0.0),
+        "annual_co2_kg": metrics.get("annual_co2_kg", 0.0),
+        "lifetime_co2_kg": metrics.get("lifetime_co2_kg", 0.0),
+        "lifetime_co2_tonnes": metrics.get("lifetime_co2_tonnes", 0.0),
+        "height_used_for_co2": bool(metrics.get("height_used_for_co2")),
+        "co2_height_source": metrics.get("co2_height_source", "modeled_height"),
+        "tree_height_m": tree.get("tree_height_m"),
+        "methodology": metrics.get("co2_methodology", "Chave et al. (2014) pantropical allometric equation"),
     }
 
 
@@ -8487,6 +8489,394 @@ def export_tasks_pdf(project_id: int, db: Session = Depends(get_db)):
     tmp_pdf.close()
     render_green_work_report_pdf(pdf_path, project, {"orders": [], **stats})
     filename = f"project_{project_id}_tasks_report.pdf"
+    return FileResponse(pdf_path, media_type="application/pdf", filename=filename)
+
+
+def _estimate_tree_co2_height_aware_kg(
+    species: str | None,
+    age_years: float,
+    tree_height_m: float | None,
+) -> tuple[float, bool]:
+    """Estimate current tree CO2, preferring measured height where available."""
+    if age_years <= 0:
+        return 0.0, False
+
+    try:
+        measured_height = float(tree_height_m) if tree_height_m is not None else None
+    except Exception:
+        measured_height = None
+    if measured_height is None or measured_height <= 0:
+        return estimate_tree_co2_kg(species, age_years), False
+
+    try:
+        params = _get_species_params(species)
+        dbh_cm = project_dbh(params, age_years)
+        agb = calculate_agb_chave(params["wood_density"], dbh_cm, measured_height)
+        if agb <= 0:
+            return estimate_tree_co2_kg(species, age_years), False
+        bgb = agb * float(params.get("root_shoot_ratio", 0.24))
+        total_biomass = agb + bgb
+        carbon_kg = total_biomass * float(params.get("carbon_fraction", 0.47))
+        co2_kg = carbon_kg * (44.0 / 12.0)
+        return round(max(co2_kg, 0.0), 2), True
+    except Exception:
+        return estimate_tree_co2_kg(species, age_years), False
+
+
+def _build_tree_carbon_metrics(
+    tree_row: dict,
+    projection_years: int = 40,
+    enforce_carbon_scope: bool = False,
+) -> dict:
+    """Per-tree CO2 metrics with measured-height preference for current stock."""
+    tree = dict(tree_row)
+    today = date.today()
+    ref_date, ref_source = _infer_tree_reference_date(tree)
+    age_years = tree_age_years(ref_date, today) if ref_date else 0.0
+    species = tree.get("species")
+    params = _get_species_params(species)
+    status_key = _normalize_tree_status(tree.get("status"))
+    is_alive = status_key not in DEAD_TREE_STATUSES
+    raw_carbon_scope = tree.get("count_in_carbon_scope")
+    in_carbon_scope = True if raw_carbon_scope is None else bool(raw_carbon_scope)
+    scope_applies = in_carbon_scope or not enforce_carbon_scope
+
+    current_co2_kg = 0.0
+    annual_co2_kg = 0.0
+    lifetime_co2_kg = 0.0
+    height_used = False
+
+    if scope_applies and age_years > 0:
+        current_co2_kg, height_used = _estimate_tree_co2_height_aware_kg(
+            species,
+            age_years,
+            tree.get("tree_height_m"),
+        )
+        if is_alive:
+            if height_used and age_years > 1:
+                previous_modeled = estimate_tree_co2_kg(species, max(age_years - 1.0, 0.0))
+                annual_co2_kg = round(max(current_co2_kg - previous_modeled, 0.0), 2)
+            else:
+                annual_co2_kg = estimate_annual_co2_kg(species, age_years)
+            lifetime_co2_kg = estimate_lifetime_co2_kg(species, projection_years)
+
+    return {
+        "species_matched": params.get("label", "Unknown"),
+        "growth_class": params.get("growth_class", "medium"),
+        "age_years": round(age_years, 2),
+        "age_source": ref_source,
+        "current_co2_kg": round(current_co2_kg, 2),
+        "annual_co2_kg": round(max(annual_co2_kg, 0.0), 2),
+        "lifetime_co2_kg": round(max(lifetime_co2_kg, 0.0), 2),
+        "lifetime_co2_tonnes": round(max(lifetime_co2_kg, 0.0) / 1000.0, 4),
+        "height_used_for_co2": height_used,
+        "co2_height_source": "measured_tree_height_m" if height_used else "modeled_height",
+        "co2_in_scope": in_carbon_scope,
+        "is_alive_for_co2": is_alive,
+        "co2_methodology": (
+            "IPCC Tier 1 + Chave et al. (2014); measured height used for current stock where available, "
+            "otherwise modeled height from species curve"
+        ),
+    }
+
+
+def _fetch_existing_tree_export_rows(project_id: int, db: Session) -> list[dict]:
+    rows = db.execute(
+        text(
+            """
+            SELECT
+                t.id,
+                t.project_id,
+                t.species,
+                t.planting_date,
+                t.status,
+                t.notes,
+                t.photo_url,
+                t.created_by,
+                t.created_at,
+                t.tree_origin,
+                t.attribution_scope,
+                t.count_in_planting_kpis,
+                t.count_in_carbon_scope,
+                t.source_project_id,
+                t.custodian_id,
+                c.name AS custodian_name,
+                t.tree_height_m,
+                ST_X(t.geom) AS lng,
+                ST_Y(t.geom) AS lat
+            FROM trees t
+            LEFT JOIN green_custodians c ON c.id = t.custodian_id
+            WHERE t.project_id = :project_id
+              AND (
+                    (
+                        LOWER(REPLACE(COALESCE(t.tree_origin, ''), ' ', '_')) <> ''
+                        AND LOWER(REPLACE(COALESCE(t.tree_origin, ''), ' ', '_')) <> 'new_planting'
+                    )
+                    OR LOWER(REPLACE(COALESCE(t.attribution_scope, ''), ' ', '_')) = 'monitor_only'
+                    OR COALESCE(t.count_in_planting_kpis, TRUE) = FALSE
+                    OR COALESCE(t.source_project_id, 0) > 0
+                  )
+            ORDER BY t.created_at DESC, t.id DESC
+            """
+        ),
+        {"project_id": project_id},
+    ).mappings().all()
+
+    merged_rows = _attach_maintenance_to_tree_rows(rows, _maintenance_summary_by_tree(project_id, db))
+    review_summary = _review_summary_by_tree(project_id, db)
+
+    enriched: list[dict] = []
+    for row in merged_rows:
+        item = dict(row)
+        item.update(review_summary.get(int(item.get("id") or 0), {}))
+        item.update(_build_tree_carbon_metrics(item, projection_years=40, enforce_carbon_scope=True))
+        enriched.append(item)
+    return enriched
+
+
+def _summarize_existing_tree_export_rows(rows: list[dict]) -> dict:
+    total_rows = len(rows)
+    alive_rows = 0
+    dead_rows = 0
+    attention_rows = 0
+    pending_rows = 0
+    rows_with_height = 0
+    rows_missing_height = 0
+    trees_missing_age_data = 0
+    trees_with_fallback_age = 0
+    carbon_scope_rows = 0
+    carbon_excluded_rows = 0
+    current_co2_kg = 0.0
+    annual_co2_kg = 0.0
+    lifetime_co2_kg = 0.0
+    species_agg: dict[str, dict] = {}
+
+    for row in rows:
+        status_key = _normalize_tree_status(row.get("status"))
+        if status_key in HEALTHY_TREE_STATUSES:
+            alive_rows += 1
+        elif status_key in DEAD_TREE_STATUSES:
+            dead_rows += 1
+        elif status_key in ATTENTION_TREE_STATUSES:
+            attention_rows += 1
+        elif status_key == "pending_planting":
+            pending_rows += 1
+
+        try:
+            height_val = float(row.get("tree_height_m")) if row.get("tree_height_m") is not None else None
+        except Exception:
+            height_val = None
+        if height_val is not None and height_val > 0:
+            rows_with_height += 1
+        else:
+            rows_missing_height += 1
+
+        age_source = str(row.get("age_source") or "")
+        if age_source == "none":
+            trees_missing_age_data += 1
+        elif age_source and age_source != "planting_date":
+            trees_with_fallback_age += 1
+
+        in_scope = bool(row.get("co2_in_scope", True))
+        if in_scope:
+            carbon_scope_rows += 1
+            current_co2_kg += float(row.get("current_co2_kg") or 0.0)
+            annual_co2_kg += float(row.get("annual_co2_kg") or 0.0)
+            lifetime_co2_kg += float(row.get("lifetime_co2_kg") or 0.0)
+        else:
+            carbon_excluded_rows += 1
+
+        species_label = str(row.get("species") or "").strip() or str(row.get("species_matched") or "Unknown")
+        species_key = species_label.lower()
+        if species_key not in species_agg:
+            species_agg[species_key] = {"species": species_label, "count": 0, "co2_kg": 0.0}
+        species_agg[species_key]["count"] += 1
+        if in_scope:
+            species_agg[species_key]["co2_kg"] += float(row.get("current_co2_kg") or 0.0)
+
+    top_species = sorted(
+        species_agg.values(),
+        key=lambda item: (float(item.get("co2_kg") or 0.0), int(item.get("count") or 0)),
+        reverse=True,
+    )[:12]
+    for item in top_species:
+        item["co2_kg"] = round(float(item.get("co2_kg") or 0.0), 2)
+
+    return {
+        "total_existing_trees": total_rows,
+        "alive_trees": alive_rows,
+        "dead_trees": dead_rows,
+        "attention_trees": attention_rows,
+        "pending_trees": pending_rows,
+        "rows_with_height": rows_with_height,
+        "rows_missing_height": rows_missing_height,
+        "trees_missing_age_data": trees_missing_age_data,
+        "trees_with_fallback_age": trees_with_fallback_age,
+        "carbon_scope_rows": carbon_scope_rows,
+        "carbon_excluded_rows": carbon_excluded_rows,
+        "current_co2_kg": round(current_co2_kg, 2),
+        "current_co2_tonnes": round(current_co2_kg / 1000.0, 3),
+        "annual_co2_kg": round(annual_co2_kg, 2),
+        "annual_co2_tonnes": round(annual_co2_kg / 1000.0, 3),
+        "projected_lifetime_co2_kg": round(lifetime_co2_kg, 2),
+        "projected_lifetime_co2_tonnes": round(lifetime_co2_kg / 1000.0, 3),
+        "projection_years": 40,
+        "methodology": (
+            "IPCC Tier 1 + Chave et al. (2014); per-tree current CO2 uses measured height where available "
+            "(tree_height_m), otherwise modeled height. Annual and 40-year values use species-age growth model."
+        ),
+        "top_species": top_species,
+    }
+
+
+@router.get("/projects/{project_id}/existing-trees/export/csv")
+def export_existing_trees_csv(project_id: int, db: Session = Depends(get_db)):
+    project = get_project(project_id, db)
+    rows = _fetch_existing_tree_export_rows(project_id, db)
+    summary = _summarize_existing_tree_export_rows(rows)
+
+    os.makedirs(REPORTS_DIR, exist_ok=True)
+    tmp_csv = tempfile.NamedTemporaryFile(suffix="_existing_trees_detailed.csv", delete=False)
+    csv_path = tmp_csv.name
+    tmp_csv.close()
+
+    with open(csv_path, "w", newline="", encoding="utf-8-sig") as f:
+        writer = _excel_csv_writer(f)
+        writer.writerow(["LandCheck Existing Trees Detailed Export"])
+        writer.writerow(["Project", project.get("name", "")])
+        writer.writerow(["Location", project.get("location_text", "")])
+        writer.writerow(["Generated At (UTC)", datetime.utcnow().isoformat()])
+        writer.writerow([])
+        writer.writerow([
+            "Summary",
+            f"Existing Trees {summary.get('total_existing_trees', 0)}",
+            f"Carbon Scope {summary.get('carbon_scope_rows', 0)}",
+            f"Excluded {summary.get('carbon_excluded_rows', 0)}",
+            f"Current CO2 {summary.get('current_co2_tonnes', 0)} t",
+            f"Annual CO2 {summary.get('annual_co2_tonnes', 0)} t/yr",
+            f"40Y Projection {summary.get('projected_lifetime_co2_tonnes', 0)} t",
+        ])
+        writer.writerow(["Methodology", summary.get("methodology", "")])
+        writer.writerow([])
+        writer.writerow([
+            "tree_id",
+            "project_id",
+            "lng",
+            "lat",
+            "species",
+            "species_matched",
+            "growth_class",
+            "planting_date",
+            "age_years",
+            "age_source",
+            "status",
+            "tree_height_m",
+            "height_used_for_co2",
+            "co2_height_source",
+            "count_in_carbon_scope",
+            "current_co2_kg",
+            "annual_co2_kg",
+            "lifetime_co2_kg_40y",
+            "tree_origin",
+            "attribution_scope",
+            "count_in_planting_kpis",
+            "source_project_id",
+            "custodian_id",
+            "custodian_name",
+            "created_by",
+            "created_at",
+            "notes",
+            "photo_url",
+            "maintenance_count",
+            "maintenance_done",
+            "maintenance_pending",
+            "maintenance_overdue",
+            "maintenance_types",
+            "last_maintenance_type",
+            "last_maintenance_date",
+            "review_submitted",
+            "review_approved",
+            "review_rejected",
+            "last_review_state",
+            "last_review_note",
+            "last_submitted_at",
+            "last_reviewed_at",
+        ])
+        for row in rows:
+            writer.writerow([
+                row.get("id"),
+                row.get("project_id"),
+                row.get("lng"),
+                row.get("lat"),
+                row.get("species"),
+                row.get("species_matched"),
+                row.get("growth_class"),
+                _to_iso_text(row.get("planting_date")),
+                row.get("age_years"),
+                row.get("age_source"),
+                row.get("status"),
+                row.get("tree_height_m"),
+                row.get("height_used_for_co2"),
+                row.get("co2_height_source"),
+                row.get("count_in_carbon_scope"),
+                row.get("current_co2_kg"),
+                row.get("annual_co2_kg"),
+                row.get("lifetime_co2_kg"),
+                row.get("tree_origin"),
+                row.get("attribution_scope"),
+                row.get("count_in_planting_kpis"),
+                row.get("source_project_id"),
+                row.get("custodian_id"),
+                row.get("custodian_name"),
+                row.get("created_by"),
+                _to_iso_text(row.get("created_at")),
+                row.get("notes"),
+                row.get("photo_url"),
+                row.get("maintenance_count", 0),
+                row.get("maintenance_done", 0),
+                row.get("maintenance_pending", 0),
+                row.get("maintenance_overdue", 0),
+                row.get("maintenance_types", ""),
+                row.get("last_maintenance_type", ""),
+                _to_iso_text(row.get("last_maintenance_date")),
+                row.get("review_submitted", 0),
+                row.get("review_approved", 0),
+                row.get("review_rejected", 0),
+                row.get("last_review_state", ""),
+                row.get("last_review_note", ""),
+                _to_iso_text(row.get("last_submitted_at")),
+                _to_iso_text(row.get("last_reviewed_at")),
+            ])
+
+    filename = f"project_{project_id}_existing_trees_detailed.csv"
+    return FileResponse(csv_path, media_type="text/csv", filename=filename)
+
+
+@router.get("/projects/{project_id}/existing-trees/export/pdf")
+def export_existing_trees_pdf(
+    project_id: int,
+    include_photos: bool = Query(default=False),
+    db: Session = Depends(get_db),
+):
+    project = get_project(project_id, db)
+    rows = _fetch_existing_tree_export_rows(project_id, db)
+    summary = _summarize_existing_tree_export_rows(rows)
+
+    os.makedirs(REPORTS_DIR, exist_ok=True)
+    tmp_pdf = tempfile.NamedTemporaryFile(suffix="_existing_trees_detailed.pdf", delete=False)
+    pdf_path = tmp_pdf.name
+    tmp_pdf.close()
+
+    photo_rows = [dict(row) for row in rows if str(row.get("photo_url") or "").strip()] if include_photos else []
+    render_green_existing_trees_report_pdf(
+        pdf_path,
+        project=project,
+        rows=[dict(r) for r in rows],
+        summary=summary,
+        include_photos=include_photos,
+        photo_rows=photo_rows,
+    )
+    filename = f"project_{project_id}_existing_trees_detailed.pdf"
     return FileResponse(pdf_path, media_type="application/pdf", filename=filename)
 
 

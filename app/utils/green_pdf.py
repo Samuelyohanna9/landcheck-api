@@ -1572,3 +1572,273 @@ def render_green_custodian_report_pdf(
         )
 
     c.save()
+
+
+def render_green_existing_trees_report_pdf(
+    output_path: str,
+    project: dict,
+    rows: list[dict],
+    summary: dict,
+    include_photos: bool = False,
+    photo_rows: list[dict] | None = None,
+):
+    c = canvas.Canvas(output_path, pagesize=A4)
+    width, height = A4
+
+    def _fmt_num(value, digits=2):
+        try:
+            return f"{float(value):,.{digits}f}"
+        except Exception:
+            return "0.00"
+
+    def _wrap_text(text: str, font_name: str, font_size: float, max_width: float) -> list[str]:
+        words = str(text or "").split()
+        if not words:
+            return [""]
+        lines: list[str] = []
+        current = words[0]
+        for word in words[1:]:
+            candidate = f"{current} {word}"
+            if c.stringWidth(candidate, font_name, font_size) <= max_width:
+                current = candidate
+            else:
+                lines.append(current)
+                current = word
+        lines.append(current)
+        return lines
+
+    # ------------------------------------------------------------------
+    # PAGE 1: Executive summary for Existing Trees + CO2
+    # ------------------------------------------------------------------
+    c.setFillColor(HexColor("#0b3d24"))
+    c.rect(0, height - 78, width, 78, stroke=0, fill=1)
+    c.setFillColorRGB(1, 1, 1)
+    c.setFont("Helvetica-Bold", 20)
+    c.drawString(34, height - 42, "LandCheck Existing Trees Report")
+    c.setFont("Helvetica", 10)
+    c.drawString(34, height - 59, "Detailed existing-tree inventory with per-tree CO2 estimates and optional photo appendix")
+    c.setFont("Helvetica", 8.5)
+    c.setFillColorRGB(0.82, 0.95, 0.86)
+    c.drawRightString(width - 34, height - 42, datetime.utcnow().strftime("Generated %d %b %Y %H:%M UTC"))
+
+    c.setFillColorRGB(0.12, 0.12, 0.12)
+    c.setFont("Helvetica-Bold", 12)
+    c.drawString(34, height - 98, str(project.get("name") or "Project"))
+    c.setFont("Helvetica", 9)
+    c.setFillColorRGB(0.36, 0.36, 0.36)
+    project_meta = []
+    if project.get("location_text"):
+        project_meta.append(f"Location: {project.get('location_text')}")
+    if project.get("sponsor"):
+        project_meta.append(f"Sponsor: {project.get('sponsor')}")
+    project_meta.append(f"Existing trees in report: {int(summary.get('total_existing_trees', 0) or 0)}")
+    c.drawString(34, height - 114, " | ".join(project_meta)[:130])
+
+    card_y = height - 186
+    card_w = (width - 34 - 34 - 10 - 10) / 3
+    card_h = 58
+    _draw_stat_card(
+        c, 34, card_y, card_w, card_h,
+        "Existing Trees",
+        int(summary.get("total_existing_trees", 0) or 0),
+        sub=f"Carbon scope: {int(summary.get('carbon_scope_rows', 0) or 0)}",
+        color=HexColor("#eef7f0"),
+    )
+    _draw_stat_card(
+        c, 34 + card_w + 10, card_y, card_w, card_h,
+        "Current CO2 (t)",
+        _fmt_num(summary.get("current_co2_tonnes", 0), 3),
+        sub="Height-aware current stock where available",
+        color=HexColor("#f3faf5"),
+    )
+    _draw_stat_card(
+        c, 34 + (card_w + 10) * 2, card_y, card_w, card_h,
+        "Annual CO2 (t/yr)",
+        _fmt_num(summary.get("annual_co2_tonnes", 0), 3),
+        sub=f"40Y proj: {_fmt_num(summary.get('projected_lifetime_co2_tonnes', 0), 2)} t",
+        color=HexColor("#f8faf9"),
+    )
+
+    card_y2 = card_y - 70
+    _draw_stat_card(
+        c, 34, card_y2, card_w, card_h,
+        "Healthy / Alive",
+        int(summary.get("alive_trees", 0) or 0),
+        sub=f"Attention {int(summary.get('attention_trees', 0) or 0)} | Dead {int(summary.get('dead_trees', 0) or 0)}",
+        color=HexColor("#f7fbf8"),
+    )
+    _draw_stat_card(
+        c, 34 + card_w + 10, card_y2, card_w, card_h,
+        "Height Data",
+        int(summary.get("rows_with_height", 0) or 0),
+        sub=f"Missing height: {int(summary.get('rows_missing_height', 0) or 0)}",
+        color=HexColor("#f8faf9"),
+    )
+    _draw_stat_card(
+        c, 34 + (card_w + 10) * 2, card_y2, card_w, card_h,
+        "Age Data Quality",
+        int(summary.get("trees_missing_age_data", 0) or 0),
+        sub=f"Fallback age source: {int(summary.get('trees_with_fallback_age', 0) or 0)}",
+        color=HexColor("#fffaf2"),
+    )
+
+    top_species = summary.get("top_species") or []
+    if top_species:
+        bar_data = []
+        colors = ["#2e7d32", "#43a047", "#66bb6a", "#81c784", "#0ea5e9", "#f97316", "#8b5cf6", "#dc2626"]
+        for idx, item in enumerate(top_species[:8]):
+            label = str(item.get("species") or "Unknown")
+            bar_data.append((label[:18], float(item.get("co2_kg") or 0.0), colors[idx % len(colors)]))
+        _draw_bar_chart(c, 34, height - 470, width - 68, 150, bar_data, title="Top Existing Species by Current CO2 (kg)")
+        c.setFont("Helvetica", 7)
+        c.setFillColorRGB(0.42, 0.42, 0.42)
+        c.drawString(34, height - 480, "Context: current existing-tree CO2 totals by species (rows excluded from carbon scope contribute 0).")
+    else:
+        c.setFont("Helvetica", 8)
+        c.setFillColorRGB(0.45, 0.45, 0.45)
+        c.drawString(34, height - 360, "No species CO2 summary available for the current existing-tree scope.")
+
+    c.setFont("Helvetica-Bold", 9)
+    c.setFillColorRGB(0.18, 0.18, 0.18)
+    c.drawString(34, 134, "Methodology / Interpretation")
+    c.setFont("Helvetica", 7.6)
+    c.setFillColorRGB(0.34, 0.34, 0.34)
+    line_y = 120
+    for line in _wrap_text(str(summary.get("methodology") or ""), "Helvetica", 7.6, width - 68):
+        c.drawString(34, line_y, line)
+        line_y -= 10
+    notes = [
+        f"Projection years: {int(summary.get('projection_years', 40) or 40)} (modeled future growth for living trees in carbon scope).",
+        "Current CO2 uses measured tree height (tree_height_m) when available; otherwise the species growth model estimates height.",
+        "Rows with count_in_carbon_scope = false remain listed for traceability but CO2 values are reported as 0 in this export.",
+    ]
+    for note in notes:
+        for line in _wrap_text(note, "Helvetica", 7.4, width - 68):
+            c.drawString(34, line_y, line)
+            line_y -= 9
+
+    c.setFont("Helvetica", 7)
+    c.setFillColorRGB(0.55, 0.55, 0.55)
+    c.drawString(34, 24, "LandCheck Green | Existing Trees Detailed Export")
+    c.drawRightString(width - 34, 24, f"Rows: {len(rows)}")
+
+    # ------------------------------------------------------------------
+    # PAGE 2+: Carbon detail table
+    # ------------------------------------------------------------------
+    def _draw_carbon_table_page_header(title: str):
+        c.setFont("Helvetica-Bold", 13)
+        c.setFillColorRGB(0.12, 0.12, 0.12)
+        c.drawString(28, height - 46, title)
+        c.setFont("Helvetica", 8)
+        c.setFillColorRGB(0.45, 0.45, 0.45)
+        c.drawString(28, height - 60, "Per-tree CO2 columns are zero where the tree is excluded from carbon scope.")
+        c.setFont("Helvetica-Bold", 7.2)
+        y_head = height - 78
+        c.setFillColorRGB(0.16, 0.16, 0.16)
+        c.drawString(28, y_head, "Tree")
+        c.drawString(52, y_head, "Species")
+        c.drawString(156, y_head, "Status")
+        c.drawString(214, y_head, "Date")
+        c.drawRightString(287, y_head, "Age")
+        c.drawRightString(323, y_head, "H(m)")
+        c.drawRightString(381, y_head, "CO2 Now")
+        c.drawRightString(433, y_head, "Annual")
+        c.drawRightString(491, y_head, "40Y CO2")
+        c.drawString(498, y_head, "Scope")
+        c.line(28, y_head - 3, width - 28, y_head - 3)
+        return y_head - 14
+
+    c.showPage()
+    y = _draw_carbon_table_page_header("Existing Trees CO2 Detail")
+    c.setFont("Helvetica", 6.6)
+
+    for row in rows:
+        if y < 44:
+            c.showPage()
+            y = _draw_carbon_table_page_header("Existing Trees CO2 Detail (continued)")
+            c.setFont("Helvetica", 6.6)
+
+        height_val = "-"
+        try:
+            if row.get("tree_height_m") is not None:
+                height_val = f"{float(row.get('tree_height_m')):.1f}"
+        except Exception:
+            height_val = "-"
+        c.setFillColorRGB(0.14, 0.14, 0.14)
+        c.drawString(28, y, f"#{row.get('id', '-')}")
+        c.drawString(52, y, str(row.get("species") or "-")[:24])
+        c.drawString(156, y, str(row.get("status") or "-")[:13])
+        c.drawString(214, y, str(row.get("planting_date") or "-")[:10])
+        age_label = "-" if str(row.get("age_source") or "none") == "none" else _fmt_num(row.get("age_years"), 1)
+        c.drawRightString(287, y, age_label)
+        c.drawRightString(323, y, height_val)
+        c.drawRightString(381, y, _fmt_num(row.get("current_co2_kg"), 1))
+        c.drawRightString(433, y, _fmt_num(row.get("annual_co2_kg"), 1))
+        c.drawRightString(491, y, _fmt_num(row.get("lifetime_co2_kg"), 0))
+        c.drawString(498, y, "in" if bool(row.get("co2_in_scope", True)) else "out")
+        y -= 10
+
+    # ------------------------------------------------------------------
+    # PAGE: Operational metadata detail
+    # ------------------------------------------------------------------
+    def _draw_meta_table_page_header(title: str):
+        c.setFont("Helvetica-Bold", 13)
+        c.setFillColorRGB(0.12, 0.12, 0.12)
+        c.drawString(28, height - 46, title)
+        c.setFont("Helvetica", 8)
+        c.setFillColorRGB(0.45, 0.45, 0.45)
+        c.drawString(28, height - 60, "Operational details for traceability (custodian/source/review/maintenance/photo).")
+        c.setFont("Helvetica-Bold", 7.1)
+        y_head = height - 78
+        c.setFillColorRGB(0.16, 0.16, 0.16)
+        c.drawString(28, y_head, "Tree")
+        c.drawString(52, y_head, "Origin")
+        c.drawString(118, y_head, "Attr")
+        c.drawString(156, y_head, "Custodian")
+        c.drawString(250, y_head, "Created By")
+        c.drawRightString(364, y_head, "Maint")
+        c.drawString(372, y_head, "Review")
+        c.drawString(430, y_head, "Photo")
+        c.drawString(462, y_head, "Source Link")
+        c.drawString(522, y_head, "Date")
+        c.line(28, y_head - 3, width - 28, y_head - 3)
+        return y_head - 14
+
+    c.showPage()
+    y = _draw_meta_table_page_header("Existing Trees Operational Detail")
+    c.setFont("Helvetica", 6.4)
+
+    for row in rows:
+        if y < 44:
+            c.showPage()
+            y = _draw_meta_table_page_header("Existing Trees Operational Detail (continued)")
+            c.setFont("Helvetica", 6.4)
+
+        review_state = str(row.get("last_review_state") or "-")[:8]
+        photo_flag = "Y" if str(row.get("photo_url") or "").strip() else "-"
+        source_link = str(row.get("source_project_id") or "")
+        source_label = f"#{source_link}" if source_link and source_link not in {"0", ""} else "-"
+        c.setFillColorRGB(0.14, 0.14, 0.14)
+        c.drawString(28, y, f"#{row.get('id', '-')}")
+        c.drawString(52, y, str(row.get("tree_origin") or "-")[:11])
+        c.drawString(118, y, str(row.get("attribution_scope") or "-")[:6])
+        c.drawString(156, y, str(row.get("custodian_name") or "-")[:20])
+        c.drawString(250, y, str(row.get("created_by") or "-")[:18])
+        c.drawRightString(364, y, str(int(row.get("maintenance_count") or 0)))
+        c.drawString(372, y, review_state)
+        c.drawString(430, y, photo_flag)
+        c.drawString(462, y, source_label)
+        c.drawString(522, y, str(row.get("created_at") or "-")[:10])
+        y -= 10
+
+    if include_photos:
+        _render_photo_appendix_pages(
+            c,
+            width,
+            height,
+            project,
+            [dict(row) for row in (photo_rows or []) if str(row.get("photo_url") or "").strip()],
+            assignee_name=None,
+        )
+
+    c.save()
