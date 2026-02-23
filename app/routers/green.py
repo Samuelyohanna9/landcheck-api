@@ -5569,7 +5569,11 @@ def create_user(
             {"role_key": role_value},
         ).mappings().first()
         role_id_value = int(role_row["id"]) if role_row else None
+    user_uid_value = _ensure_unique_user_uid(db, user_uid)
+    login_enabled = bool(allow_green) or bool(allow_work)
     work_username_clean = (work_username or "").strip().lower() or None
+    if not work_username_clean and login_enabled:
+        work_username_clean = str(user_uid_value or "").strip().lower() or None
     if work_username_clean:
         existing_work_username = db.execute(
             text("SELECT id FROM green_users WHERE LOWER(COALESCE(work_username, '')) = LOWER(:work_username) LIMIT 1"),
@@ -5578,9 +5582,11 @@ def create_user(
         if existing_work_username:
             raise HTTPException(status_code=409, detail="Work username already exists")
     password_hash = _hash_password_value(work_password) if (work_password or "").strip() else None
-    if bool(allow_work) and (not work_username_clean or not password_hash):
-        raise HTTPException(status_code=400, detail="Work-enabled users require work_username and work_password")
-    user_uid_value = _ensure_unique_user_uid(db, user_uid)
+    if login_enabled and (not work_username_clean or not password_hash):
+        raise HTTPException(
+            status_code=400,
+            detail="Green/Work-enabled users require login username and password",
+        )
     row = db.execute(text("""
         INSERT INTO green_users (
             full_name, role, user_uid, organization_id, role_id, email, phone,
@@ -5728,35 +5734,41 @@ def update_user(
         if role_row:
             role_id_value = int(role_row["id"])
             role_value = str(role_row.get("role_key") or role_value)
-    work_username_value = existing.get("work_username")
-    if work_username is not None:
-        proposed_work_username = str(work_username or "").strip().lower()
-        work_username_value = proposed_work_username or None
-        if work_username_value:
-            clash = db.execute(
-                text(
-                    """
-                    SELECT id FROM green_users
-                    WHERE LOWER(COALESCE(work_username, '')) = LOWER(:work_username)
-                      AND id <> :user_id
-                    LIMIT 1
-                    """
-                ),
-                {"work_username": work_username_value, "user_id": user_id},
-            ).scalar()
-            if clash:
-                raise HTTPException(status_code=409, detail="Work username already exists")
-    work_password_hash_value = existing.get("work_password_hash")
-    if work_password is not None:
-        work_password_hash_value = _hash_password_value(work_password) if str(work_password).strip() else None
     next_allow_work = bool(allow_work) if allow_work is not None else bool(existing.get("allow_work", False))
-    if next_allow_work and (not work_username_value or not work_password_hash_value):
-        raise HTTPException(status_code=400, detail="Work-enabled users require work_username and work_password")
+    next_allow_green = bool(allow_green) if allow_green is not None else bool(existing.get("allow_green", True))
     user_uid_value = (
         _ensure_unique_user_uid(db, user_uid, exclude_user_id=user_id)
         if user_uid is not None
         else str(existing.get("user_uid") or _ensure_unique_user_uid(db))
     )
+    work_username_value = existing.get("work_username")
+    if work_username is not None:
+        proposed_work_username = str(work_username or "").strip().lower()
+        work_username_value = proposed_work_username or None
+    if (next_allow_green or next_allow_work) and not work_username_value:
+        work_username_value = str(user_uid_value or "").strip().lower() or None
+    if work_username_value:
+        clash = db.execute(
+            text(
+                """
+                SELECT id FROM green_users
+                WHERE LOWER(COALESCE(work_username, '')) = LOWER(:work_username)
+                  AND id <> :user_id
+                LIMIT 1
+                """
+            ),
+            {"work_username": work_username_value, "user_id": user_id},
+        ).scalar()
+        if clash:
+            raise HTTPException(status_code=409, detail="Work username already exists")
+    work_password_hash_value = existing.get("work_password_hash")
+    if work_password is not None:
+        work_password_hash_value = _hash_password_value(work_password) if str(work_password).strip() else None
+    if (next_allow_green or next_allow_work) and (not work_username_value or not work_password_hash_value):
+        raise HTTPException(
+            status_code=400,
+            detail="Green/Work-enabled users require login username and password",
+        )
     next_full_name = (full_name.strip() if isinstance(full_name, str) else str(existing.get("full_name") or "").strip())
     if not next_full_name:
         raise HTTPException(status_code=400, detail="Full name required")
@@ -5791,7 +5803,7 @@ def update_user(
             "role_id": role_id_value,
             "email": (email.strip() if isinstance(email, str) else existing.get("email")) or None,
             "phone": (phone.strip() if isinstance(phone, str) else existing.get("phone")) or None,
-            "allow_green": bool(allow_green) if allow_green is not None else bool(existing.get("allow_green", True)),
+            "allow_green": next_allow_green,
             "allow_work": next_allow_work,
             "work_username": work_username_value,
             "work_password_hash": work_password_hash_value,
@@ -5810,7 +5822,7 @@ def update_user(
             "user_uid": user_uid_value,
             "role": role_value or "field_officer",
             "organization_id": org_id_value,
-            "allow_green": bool(allow_green) if allow_green is not None else bool(existing.get("allow_green", True)),
+            "allow_green": next_allow_green,
             "allow_work": next_allow_work,
             "is_active": bool(is_active) if is_active is not None else bool(existing.get("is_active", True)),
         },
@@ -5871,7 +5883,10 @@ def work_auth_login(
             FROM green_users u
             LEFT JOIN green_organizations o ON o.id = u.organization_id
             LEFT JOIN green_roles r ON r.id = u.role_id
-            WHERE LOWER(COALESCE(u.work_username, '')) = LOWER(:username)
+            WHERE (
+                LOWER(COALESCE(u.work_username, '')) = LOWER(:username)
+                OR LOWER(COALESCE(u.user_uid, '')) = LOWER(:username)
+            )
               AND (:organization_id IS NULL OR u.organization_id = :organization_id)
             LIMIT 1
             """
@@ -5960,7 +5975,10 @@ def green_auth_login(
             FROM green_users u
             LEFT JOIN green_organizations o ON o.id = u.organization_id
             LEFT JOIN green_roles r ON r.id = u.role_id
-            WHERE LOWER(COALESCE(u.work_username, '')) = LOWER(:username)
+            WHERE (
+                LOWER(COALESCE(u.work_username, '')) = LOWER(:username)
+                OR LOWER(COALESCE(u.user_uid, '')) = LOWER(:username)
+            )
               AND (:organization_id IS NULL OR u.organization_id = :organization_id)
             LIMIT 1
             """
