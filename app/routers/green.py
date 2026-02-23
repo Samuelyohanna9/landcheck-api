@@ -10,6 +10,7 @@ import csv
 import io
 import uuid
 import zipfile
+import re
 from pathlib import Path
 from threading import Lock
 from urllib.parse import quote, unquote, urlparse
@@ -205,6 +206,138 @@ def _ensure_green_schema_ready(db: Session):
 
 def _normalize_name(value: str | None) -> str:
     return (value or "").strip().lower()
+
+
+def _slugify_text(value: str | None, fallback: str = "organization") -> str:
+    raw = (value or "").strip().lower()
+    raw = re.sub(r"[^a-z0-9]+", "-", raw).strip("-")
+    return raw or fallback
+
+
+def _ensure_unique_org_slug(db: Session, slug_base: str, exclude_org_id: int | None = None) -> str:
+    base = _slugify_text(slug_base)
+    candidate = base
+    suffix = 2
+    while True:
+        params = {"slug": candidate}
+        if exclude_org_id is None:
+            row = db.execute(
+                text("SELECT id FROM green_organizations WHERE LOWER(slug) = LOWER(:slug) LIMIT 1"),
+                params,
+            ).first()
+        else:
+            row = db.execute(
+                text(
+                    """
+                    SELECT id FROM green_organizations
+                    WHERE LOWER(slug) = LOWER(:slug)
+                      AND id <> :exclude_org_id
+                    LIMIT 1
+                    """
+                ),
+                {**params, "exclude_org_id": int(exclude_org_id)},
+            ).first()
+        if not row:
+            return candidate
+        candidate = f"{base}-{suffix}"
+        suffix += 1
+
+
+def _generate_prefixed_uid(prefix: str) -> str:
+    token = uuid.uuid4().hex[:8].upper()
+    return f"{prefix}-{token}"
+
+
+def _ensure_unique_user_uid(db: Session, candidate: str | None = None, exclude_user_id: int | None = None) -> str:
+    base = (candidate or "").strip().upper()
+    if not base:
+        base = _generate_prefixed_uid("USR")
+    if not re.fullmatch(r"[A-Z0-9][A-Z0-9._-]{2,63}", base):
+        base = re.sub(r"[^A-Z0-9._-]+", "-", base.upper()).strip("-")
+        if not base:
+            base = _generate_prefixed_uid("USR")
+    value = base
+    while True:
+        if exclude_user_id is None:
+            found = db.execute(
+                text("SELECT id FROM green_users WHERE UPPER(COALESCE(user_uid, '')) = :uid LIMIT 1"),
+                {"uid": value},
+            ).first()
+        else:
+            found = db.execute(
+                text(
+                    """
+                    SELECT id FROM green_users
+                    WHERE UPPER(COALESCE(user_uid, '')) = :uid
+                      AND id <> :user_id
+                    LIMIT 1
+                    """
+                ),
+                {"uid": value, "user_id": int(exclude_user_id)},
+            ).first()
+        if not found:
+            return value
+        value = _generate_prefixed_uid("USR")
+
+
+def _ensure_unique_role_uid(db: Session, candidate: str | None = None, exclude_role_id: int | None = None) -> str:
+    base = (candidate or "").strip().upper()
+    if not base:
+        base = _generate_prefixed_uid("ROL")
+    if not re.fullmatch(r"[A-Z0-9][A-Z0-9._-]{2,63}", base):
+        base = re.sub(r"[^A-Z0-9._-]+", "-", base.upper()).strip("-")
+        if not base:
+            base = _generate_prefixed_uid("ROL")
+    value = base
+    while True:
+        if exclude_role_id is None:
+            found = db.execute(
+                text("SELECT id FROM green_roles WHERE UPPER(COALESCE(role_uid, '')) = :uid LIMIT 1"),
+                {"uid": value},
+            ).first()
+        else:
+            found = db.execute(
+                text(
+                    """
+                    SELECT id FROM green_roles
+                    WHERE UPPER(COALESCE(role_uid, '')) = :uid
+                      AND id <> :role_id
+                    LIMIT 1
+                    """
+                ),
+                {"uid": value, "role_id": int(exclude_role_id)},
+            ).first()
+        if not found:
+            return value
+        value = _generate_prefixed_uid("ROL")
+
+
+def _ensure_unique_role_key(db: Session, key_or_name: str | None, exclude_role_id: int | None = None) -> str:
+    base = _slugify_text(key_or_name or "role", fallback="role").replace("-", "_")
+    candidate = base
+    suffix = 2
+    while True:
+        if exclude_role_id is None:
+            found = db.execute(
+                text("SELECT id FROM green_roles WHERE LOWER(COALESCE(role_key, '')) = LOWER(:role_key) LIMIT 1"),
+                {"role_key": candidate},
+            ).first()
+        else:
+            found = db.execute(
+                text(
+                    """
+                    SELECT id FROM green_roles
+                    WHERE LOWER(COALESCE(role_key, '')) = LOWER(:role_key)
+                      AND id <> :role_id
+                    LIMIT 1
+                    """
+                ),
+                {"role_key": candidate, "role_id": int(exclude_role_id)},
+            ).first()
+        if not found:
+            return candidate
+        candidate = f"{base}_{suffix}"
+        suffix += 1
 
 
 def _normalize_planting_model(value: str | None) -> str:
@@ -1497,8 +1630,29 @@ def _auto_schedule_next_cycle(db: Session, task_id: int, season_hint: str | None
 
 def ensure_green_tables(db: Session):
     db.execute(text("""
+        CREATE TABLE IF NOT EXISTS green_organizations (
+            id SERIAL PRIMARY KEY,
+            name TEXT NOT NULL,
+            slug TEXT NOT NULL UNIQUE,
+            short_name TEXT,
+            status TEXT NOT NULL DEFAULT 'pilot',
+            contact_email TEXT,
+            contact_phone TEXT,
+            website_url TEXT,
+            country TEXT,
+            state_region TEXT,
+            city TEXT,
+            address_text TEXT,
+            notes TEXT,
+            is_active BOOLEAN NOT NULL DEFAULT TRUE,
+            created_at TIMESTAMP DEFAULT NOW(),
+            updated_at TIMESTAMP DEFAULT NOW()
+        )
+    """))
+    db.execute(text("""
         CREATE TABLE IF NOT EXISTS tree_projects (
             id SERIAL PRIMARY KEY,
+            organization_id INTEGER REFERENCES green_organizations(id) ON DELETE SET NULL,
             name TEXT NOT NULL,
             location_text TEXT,
             sponsor TEXT,
@@ -1565,7 +1719,38 @@ def ensure_green_tables(db: Session):
             created_at TIMESTAMP DEFAULT NOW()
         )
     """))
+    db.execute(text("""
+        CREATE TABLE IF NOT EXISTS green_roles (
+            id SERIAL PRIMARY KEY,
+            role_uid TEXT NOT NULL,
+            role_key TEXT NOT NULL,
+            role_name TEXT NOT NULL,
+            description TEXT,
+            scope TEXT NOT NULL DEFAULT 'platform',
+            is_system BOOLEAN NOT NULL DEFAULT FALSE,
+            is_active BOOLEAN NOT NULL DEFAULT TRUE,
+            created_at TIMESTAMP DEFAULT NOW(),
+            updated_at TIMESTAMP DEFAULT NOW()
+        )
+    """))
     try:
+        db.execute(text("ALTER TABLE green_users ADD COLUMN IF NOT EXISTS user_uid TEXT"))
+        db.execute(text("ALTER TABLE green_users ADD COLUMN IF NOT EXISTS email TEXT"))
+        db.execute(text("ALTER TABLE green_users ADD COLUMN IF NOT EXISTS phone TEXT"))
+        db.execute(text("ALTER TABLE green_users ADD COLUMN IF NOT EXISTS organization_id INTEGER"))
+        db.execute(text("ALTER TABLE green_users ADD COLUMN IF NOT EXISTS role_id INTEGER"))
+        db.execute(text("ALTER TABLE green_users ADD COLUMN IF NOT EXISTS notes TEXT"))
+        db.execute(text("ALTER TABLE green_users ADD COLUMN IF NOT EXISTS is_active BOOLEAN NOT NULL DEFAULT TRUE"))
+        db.execute(text("ALTER TABLE green_users ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW()"))
+        db.execute(text("ALTER TABLE green_roles ADD COLUMN IF NOT EXISTS role_uid TEXT"))
+        db.execute(text("ALTER TABLE green_roles ADD COLUMN IF NOT EXISTS role_key TEXT"))
+        db.execute(text("ALTER TABLE green_roles ADD COLUMN IF NOT EXISTS role_name TEXT"))
+        db.execute(text("ALTER TABLE green_roles ADD COLUMN IF NOT EXISTS description TEXT"))
+        db.execute(text("ALTER TABLE green_roles ADD COLUMN IF NOT EXISTS scope TEXT NOT NULL DEFAULT 'platform'"))
+        db.execute(text("ALTER TABLE green_roles ADD COLUMN IF NOT EXISTS is_system BOOLEAN NOT NULL DEFAULT FALSE"))
+        db.execute(text("ALTER TABLE green_roles ADD COLUMN IF NOT EXISTS is_active BOOLEAN NOT NULL DEFAULT TRUE"))
+        db.execute(text("ALTER TABLE green_roles ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW()"))
+        db.execute(text("ALTER TABLE tree_projects ADD COLUMN IF NOT EXISTS organization_id INTEGER"))
         db.execute(text("ALTER TABLE tree_projects ADD COLUMN IF NOT EXISTS planting_model TEXT NOT NULL DEFAULT 'direct'"))
         db.execute(text("ALTER TABLE tree_projects ADD COLUMN IF NOT EXISTS allow_existing_tree_link BOOLEAN NOT NULL DEFAULT FALSE"))
         db.execute(
@@ -1908,6 +2093,14 @@ def ensure_green_tables(db: Session):
     db.execute(text("CREATE INDEX IF NOT EXISTS idx_tree_tasks_allocation ON tree_tasks(distribution_allocation_id, task_type, review_state)"))
     db.execute(text("CREATE INDEX IF NOT EXISTS idx_tree_tasks_custodian ON tree_tasks(custodian_id)"))
     db.execute(text("CREATE INDEX IF NOT EXISTS idx_green_users_name ON green_users(full_name)"))
+    db.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS idx_green_users_uid ON green_users(UPPER(user_uid))"))
+    db.execute(text("CREATE INDEX IF NOT EXISTS idx_green_users_org ON green_users(organization_id)"))
+    db.execute(text("CREATE INDEX IF NOT EXISTS idx_green_users_role_id ON green_users(role_id)"))
+    db.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS idx_green_roles_uid ON green_roles(UPPER(role_uid))"))
+    db.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS idx_green_roles_key ON green_roles(LOWER(role_key))"))
+    db.execute(text("CREATE INDEX IF NOT EXISTS idx_green_roles_active ON green_roles(is_active)"))
+    db.execute(text("CREATE INDEX IF NOT EXISTS idx_green_orgs_name ON green_organizations(name)"))
+    db.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS idx_green_orgs_slug ON green_organizations(LOWER(slug))"))
     db.execute(text("CREATE INDEX IF NOT EXISTS idx_work_orders_project_id ON green_work_orders(project_id)"))
     db.execute(text("CREATE INDEX IF NOT EXISTS idx_species_maturity_project_id ON green_species_maturity(project_id)"))
     db.execute(text("CREATE INDEX IF NOT EXISTS idx_task_reviews_task_id ON green_task_reviews(task_id)"))
@@ -1921,6 +2114,7 @@ def ensure_green_tables(db: Session):
     db.execute(text("CREATE INDEX IF NOT EXISTS idx_webhook_event ON green_webhook_deliveries(event_id, created_at DESC)"))
     db.execute(text("CREATE INDEX IF NOT EXISTS idx_verra_exports_project_time ON green_verra_exports(project_id, created_at DESC)"))
     db.execute(text("CREATE INDEX IF NOT EXISTS idx_tree_projects_model ON tree_projects(planting_model)"))
+    db.execute(text("CREATE INDEX IF NOT EXISTS idx_tree_projects_org ON tree_projects(organization_id)"))
     db.execute(text("CREATE INDEX IF NOT EXISTS idx_trees_origin ON trees(tree_origin)"))
     db.execute(text("CREATE INDEX IF NOT EXISTS idx_trees_scope_flags ON trees(project_id, count_in_planting_kpis, count_in_carbon_scope)"))
     db.execute(text("CREATE INDEX IF NOT EXISTS idx_trees_custodian_id ON trees(custodian_id)"))
@@ -1930,6 +2124,127 @@ def ensure_green_tables(db: Session):
     db.execute(text("CREATE INDEX IF NOT EXISTS idx_dist_alloc_project ON green_distribution_allocations(project_id, created_at DESC)"))
     db.execute(text("CREATE INDEX IF NOT EXISTS idx_dist_alloc_custodian ON green_distribution_allocations(custodian_id, created_at DESC)"))
     db.execute(text("CREATE INDEX IF NOT EXISTS idx_tree_project_links_target ON tree_project_links(target_project_id, created_at DESC)"))
+    for role_key, role_name, is_system in [
+        ("admin", "Admin", True),
+        ("supervisor", "Supervisor", True),
+        ("field_officer", "Field Officer", True),
+        ("volunteer", "Volunteer", True),
+        ("viewer", "Viewer", True),
+    ]:
+        existing_role = db.execute(
+            text("SELECT id, role_uid FROM green_roles WHERE LOWER(role_key) = LOWER(:role_key) LIMIT 1"),
+            {"role_key": role_key},
+        ).mappings().first()
+        if existing_role:
+            if not existing_role.get("role_uid"):
+                db.execute(
+                    text(
+                        """
+                        UPDATE green_roles
+                        SET role_uid = :role_uid,
+                            role_name = COALESCE(NULLIF(role_name, ''), :role_name),
+                            is_system = TRUE,
+                            updated_at = NOW()
+                        WHERE id = :id
+                        """
+                    ),
+                    {
+                        "id": int(existing_role["id"]),
+                        "role_uid": _ensure_unique_role_uid(db),
+                        "role_name": role_name,
+                    },
+                )
+        else:
+            db.execute(
+                text(
+                    """
+                    INSERT INTO green_roles (role_uid, role_key, role_name, is_system, is_active)
+                    VALUES (:role_uid, :role_key, :role_name, :is_system, TRUE)
+                    """
+                ),
+                {
+                    "role_uid": _ensure_unique_role_uid(db),
+                    "role_key": role_key,
+                    "role_name": role_name,
+                    "is_system": bool(is_system),
+                },
+            )
+    legacy_roles = db.execute(
+        text(
+            """
+            SELECT DISTINCT TRIM(role) AS role_value
+            FROM green_users
+            WHERE COALESCE(TRIM(role), '') <> ''
+            """
+        )
+    ).scalars().all()
+    for role_value in legacy_roles:
+        role_value_str = str(role_value or "").strip()
+        if not role_value_str:
+            continue
+        role_key = _ensure_unique_role_key(db, role_value_str)
+        existing = db.execute(
+            text("SELECT id FROM green_roles WHERE LOWER(role_key) = LOWER(:role_key) LIMIT 1"),
+            {"role_key": role_key},
+        ).scalar()
+        if not existing:
+            db.execute(
+                text(
+                    """
+                    INSERT INTO green_roles (role_uid, role_key, role_name, is_system, is_active)
+                    VALUES (:role_uid, :role_key, :role_name, FALSE, TRUE)
+                    """
+                ),
+                {
+                    "role_uid": _ensure_unique_role_uid(db),
+                    "role_key": role_key,
+                    "role_name": role_value_str.replace("_", " ").title(),
+                },
+            )
+    missing_user_rows = db.execute(
+        text(
+            """
+            SELECT id
+            FROM green_users
+            WHERE COALESCE(TRIM(user_uid), '') = ''
+            ORDER BY id ASC
+            """
+        )
+    ).scalars().all()
+    for user_id in missing_user_rows:
+        db.execute(
+            text("UPDATE green_users SET user_uid = :user_uid, updated_at = COALESCE(updated_at, NOW()) WHERE id = :id"),
+            {"id": int(user_id), "user_uid": _ensure_unique_user_uid(db)},
+        )
+    users_missing_role_fk = db.execute(
+        text(
+            """
+            SELECT u.id, u.role
+            FROM green_users u
+            WHERE u.role_id IS NULL
+            """
+        )
+    ).mappings().all()
+    for user_row in users_missing_role_fk:
+        raw_role = str(user_row.get("role") or "").strip()
+        if not raw_role:
+            raw_role = "field_officer"
+        direct_match = db.execute(
+            text("SELECT id FROM green_roles WHERE LOWER(role_key) = LOWER(:rk) LIMIT 1"),
+            {"rk": raw_role},
+        ).scalar()
+        role_id_val = direct_match
+        if not role_id_val:
+            normalized_key = _slugify_text(raw_role, fallback="role").replace("-", "_")
+            role_id_val = db.execute(
+                text("SELECT id FROM green_roles WHERE LOWER(role_key) = LOWER(:rk) LIMIT 1"),
+                {"rk": normalized_key},
+            ).scalar()
+        if role_id_val:
+            db.execute(
+                text("UPDATE green_users SET role_id = :role_id, updated_at = COALESCE(updated_at, NOW()) WHERE id = :id"),
+                {"id": int(user_row["id"]), "role_id": int(role_id_val)},
+            )
     db.execute(
         text(
             """
@@ -2336,23 +2651,35 @@ def create_project(
     name: str = Body(...),
     location_text: str = Body(default=""),
     sponsor: str = Body(default=""),
+    organization_id: int | None = Body(default=None),
     planting_model: str = Body(default=DEFAULT_PLANTING_MODEL),
     allow_existing_tree_link: bool = Body(default=False),
     default_existing_tree_scope: str = Body(default=DEFAULT_EXISTING_TREE_SCOPE),
 ):
     normalized_model = _normalize_planting_model(planting_model)
     normalized_existing_scope = _normalize_existing_tree_scope(default_existing_tree_scope)
+    org_id_value = int(organization_id) if organization_id is not None else None
+    if org_id_value is not None and org_id_value <= 0:
+        org_id_value = None
+    if org_id_value is not None:
+        org_exists = db.execute(
+            text("SELECT id FROM green_organizations WHERE id = :org_id AND COALESCE(is_active, TRUE) = TRUE"),
+            {"org_id": org_id_value},
+        ).scalar()
+        if not org_exists:
+            raise HTTPException(status_code=400, detail="Selected organization not found or inactive")
     row = db.execute(
         text("""
             INSERT INTO tree_projects (
-                name, location_text, sponsor, planting_model, allow_existing_tree_link, default_existing_tree_scope
+                organization_id, name, location_text, sponsor, planting_model, allow_existing_tree_link, default_existing_tree_scope
             )
             VALUES (
-                :name, :location_text, :sponsor, :planting_model, :allow_existing_tree_link, :default_existing_tree_scope
+                :organization_id, :name, :location_text, :sponsor, :planting_model, :allow_existing_tree_link, :default_existing_tree_scope
             )
-            RETURNING id, name, location_text, sponsor, planting_model, allow_existing_tree_link, default_existing_tree_scope, created_at
+            RETURNING id, organization_id, name, location_text, sponsor, planting_model, allow_existing_tree_link, default_existing_tree_scope, created_at
         """),
         {
+            "organization_id": org_id_value,
             "name": name,
             "location_text": location_text,
             "sponsor": sponsor,
@@ -2371,11 +2698,21 @@ def create_project(
         details={
             "name": project.get("name"),
             "location_text": project.get("location_text"),
+            "organization_id": project.get("organization_id"),
             "planting_model": project.get("planting_model"),
             "allow_existing_tree_link": bool(project.get("allow_existing_tree_link")),
             "default_existing_tree_scope": project.get("default_existing_tree_scope"),
         },
     )
+    if project.get("organization_id"):
+        org_meta = db.execute(
+            text("SELECT name, slug, status FROM green_organizations WHERE id = :org_id"),
+            {"org_id": int(project["organization_id"])},
+        ).mappings().first()
+        if org_meta:
+            project["organization_name"] = org_meta.get("name")
+            project["organization_slug"] = org_meta.get("slug")
+            project["organization_status"] = org_meta.get("status")
     db.commit()
     return project
 
@@ -2553,13 +2890,482 @@ def update_project_settings(
     return dict(row)
 
 
+@router.patch("/projects/{project_id}/organization")
+def assign_project_organization(
+    project_id: int,
+    db: Session = Depends(get_db),
+    organization_id: int | None = Body(default=None),
+):
+    project_row = db.execute(
+        text("SELECT id, name, organization_id FROM tree_projects WHERE id = :project_id"),
+        {"project_id": project_id},
+    ).mappings().first()
+    if not project_row:
+        raise HTTPException(status_code=404, detail="Project not found")
+    org_id_value = int(organization_id) if organization_id is not None else None
+    org_row = None
+    if org_id_value is not None:
+        org_row = db.execute(
+            text("SELECT id, name, slug, status FROM green_organizations WHERE id = :org_id"),
+            {"org_id": org_id_value},
+        ).mappings().first()
+        if not org_row:
+            raise HTTPException(status_code=404, detail="Organization not found")
+    updated = db.execute(
+        text(
+            """
+            UPDATE tree_projects
+            SET organization_id = :organization_id
+            WHERE id = :project_id
+            RETURNING id, organization_id, name
+            """
+        ),
+        {"organization_id": org_id_value, "project_id": project_id},
+    ).mappings().first()
+    _log_audit_event(
+        db,
+        project_id=project_id,
+        entity_type="project",
+        entity_id=project_id,
+        action="project_organization_assigned",
+        actor="super_admin",
+        details={
+            "before_organization_id": project_row.get("organization_id"),
+            "after_organization_id": org_id_value,
+            "after_organization_name": (org_row or {}).get("name") if org_row else None,
+        },
+    )
+    db.commit()
+    payload = dict(updated)
+    if org_row:
+        payload["organization_name"] = org_row.get("name")
+        payload["organization_slug"] = org_row.get("slug")
+        payload["organization_status"] = org_row.get("status")
+    else:
+        payload["organization_name"] = None
+        payload["organization_slug"] = None
+        payload["organization_status"] = None
+    return payload
+
+
+@router.get("/admin/organizations")
+def list_admin_organizations(db: Session = Depends(get_db)):
+    rows = db.execute(
+        text(
+            """
+            SELECT
+                o.id, o.name, o.slug, o.short_name, o.status, o.contact_email, o.contact_phone, o.website_url,
+                o.country, o.state_region, o.city, o.address_text, o.notes, COALESCE(o.is_active, TRUE) AS is_active,
+                o.created_at, o.updated_at,
+                COALESCE((
+                    SELECT COUNT(*) FROM tree_projects p WHERE p.organization_id = o.id
+                ), 0) AS projects_count,
+                COALESCE((
+                    SELECT COUNT(*) FROM trees t
+                    JOIN tree_projects p ON p.id = t.project_id
+                    WHERE p.organization_id = o.id
+                ), 0) AS trees_count,
+                COALESCE((
+                    SELECT COUNT(*) FROM tree_tasks tt
+                    JOIN trees t ON t.id = tt.tree_id
+                    JOIN tree_projects p ON p.id = t.project_id
+                    WHERE p.organization_id = o.id
+                ), 0) AS tasks_count,
+                COALESCE((
+                    SELECT COUNT(*) FROM tree_tasks tt
+                    JOIN trees t ON t.id = tt.tree_id
+                    JOIN tree_projects p ON p.id = t.project_id
+                    WHERE p.organization_id = o.id
+                      AND LOWER(COALESCE(tt.review_state, 'none')) = 'submitted'
+                ), 0) AS pending_review_count,
+                COALESCE((
+                    SELECT COUNT(*) FROM green_alerts ga
+                    JOIN tree_projects p ON p.id = ga.project_id
+                    WHERE p.organization_id = o.id
+                      AND LOWER(COALESCE(ga.status, 'open')) = 'open'
+                ), 0) AS open_alert_count,
+                (
+                    SELECT MAX(a.created_at)
+                    FROM green_audit_events a
+                    JOIN tree_projects p ON p.id = a.project_id
+                    WHERE p.organization_id = o.id
+                ) AS last_activity_at
+            FROM green_organizations o
+            ORDER BY COALESCE(o.updated_at, o.created_at) DESC, o.id DESC
+            """
+        )
+    ).mappings().all()
+    return [dict(r) for r in rows]
+
+
+@router.post("/admin/organizations")
+def create_admin_organization(
+    db: Session = Depends(get_db),
+    name: str = Body(...),
+    slug: str | None = Body(default=None),
+    short_name: str | None = Body(default=None),
+    status: str = Body(default="pilot"),
+    contact_email: str | None = Body(default=None),
+    contact_phone: str | None = Body(default=None),
+    website_url: str | None = Body(default=None),
+    country: str | None = Body(default=None),
+    state_region: str | None = Body(default=None),
+    city: str | None = Body(default=None),
+    address_text: str | None = Body(default=None),
+    notes: str | None = Body(default=None),
+    is_active: bool = Body(default=True),
+):
+    name_clean = (name or "").strip()
+    if not name_clean:
+        raise HTTPException(status_code=400, detail="Organization name is required")
+    status_clean = _normalize_name(status) or "pilot"
+    final_slug = _ensure_unique_org_slug(db, (slug or "").strip() or name_clean)
+    row = db.execute(
+        text(
+            """
+            INSERT INTO green_organizations (
+                name, slug, short_name, status, contact_email, contact_phone, website_url,
+                country, state_region, city, address_text, notes, is_active
+            )
+            VALUES (
+                :name, :slug, :short_name, :status, :contact_email, :contact_phone, :website_url,
+                :country, :state_region, :city, :address_text, :notes, :is_active
+            )
+            RETURNING *
+            """
+        ),
+        {
+            "name": name_clean,
+            "slug": final_slug,
+            "short_name": (short_name or "").strip() or None,
+            "status": status_clean,
+            "contact_email": (contact_email or "").strip() or None,
+            "contact_phone": (contact_phone or "").strip() or None,
+            "website_url": (website_url or "").strip() or None,
+            "country": (country or "").strip() or None,
+            "state_region": (state_region or "").strip() or None,
+            "city": (city or "").strip() or None,
+            "address_text": (address_text or "").strip() or None,
+            "notes": (notes or "").strip() or None,
+            "is_active": bool(is_active),
+        },
+    ).mappings().first()
+    org = dict(row)
+    _log_audit_event(
+        db,
+        project_id=None,
+        entity_type="organization",
+        entity_id=int(org["id"]),
+        action="organization_created",
+        actor="super_admin",
+        details={"name": org.get("name"), "slug": org.get("slug"), "status": org.get("status")},
+    )
+    db.commit()
+    return org
+
+
+@router.patch("/admin/organizations/{org_id}")
+def update_admin_organization(
+    org_id: int,
+    db: Session = Depends(get_db),
+    name: str | None = Body(default=None),
+    slug: str | None = Body(default=None),
+    short_name: str | None = Body(default=None),
+    status: str | None = Body(default=None),
+    contact_email: str | None = Body(default=None),
+    contact_phone: str | None = Body(default=None),
+    website_url: str | None = Body(default=None),
+    country: str | None = Body(default=None),
+    state_region: str | None = Body(default=None),
+    city: str | None = Body(default=None),
+    address_text: str | None = Body(default=None),
+    notes: str | None = Body(default=None),
+    is_active: bool | None = Body(default=None),
+):
+    existing = db.execute(
+        text("SELECT * FROM green_organizations WHERE id = :org_id"),
+        {"org_id": org_id},
+    ).mappings().first()
+    if not existing:
+        raise HTTPException(status_code=404, detail="Organization not found")
+
+    next_name = (name.strip() if isinstance(name, str) else str(existing.get("name") or "").strip())
+    if not next_name:
+        raise HTTPException(status_code=400, detail="Organization name is required")
+    next_slug_source = (slug or "").strip() if slug is not None else str(existing.get("slug") or next_name)
+    next_slug = _ensure_unique_org_slug(db, next_slug_source or next_name, exclude_org_id=org_id)
+    next_status = _normalize_name(status) if status is not None else _normalize_name(existing.get("status"))
+    if not next_status:
+        next_status = "pilot"
+    row = db.execute(
+        text(
+            """
+            UPDATE green_organizations
+            SET name = :name,
+                slug = :slug,
+                short_name = :short_name,
+                status = :status,
+                contact_email = :contact_email,
+                contact_phone = :contact_phone,
+                website_url = :website_url,
+                country = :country,
+                state_region = :state_region,
+                city = :city,
+                address_text = :address_text,
+                notes = :notes,
+                is_active = :is_active,
+                updated_at = NOW()
+            WHERE id = :org_id
+            RETURNING *
+            """
+        ),
+        {
+            "org_id": org_id,
+            "name": next_name,
+            "slug": next_slug,
+            "short_name": (short_name.strip() if isinstance(short_name, str) else (existing.get("short_name") or None)) or None,
+            "status": next_status,
+            "contact_email": (contact_email.strip() if isinstance(contact_email, str) else (existing.get("contact_email") or None)) or None,
+            "contact_phone": (contact_phone.strip() if isinstance(contact_phone, str) else (existing.get("contact_phone") or None)) or None,
+            "website_url": (website_url.strip() if isinstance(website_url, str) else (existing.get("website_url") or None)) or None,
+            "country": (country.strip() if isinstance(country, str) else (existing.get("country") or None)) or None,
+            "state_region": (state_region.strip() if isinstance(state_region, str) else (existing.get("state_region") or None)) or None,
+            "city": (city.strip() if isinstance(city, str) else (existing.get("city") or None)) or None,
+            "address_text": (address_text.strip() if isinstance(address_text, str) else (existing.get("address_text") or None)) or None,
+            "notes": (notes.strip() if isinstance(notes, str) else (existing.get("notes") or None)) or None,
+            "is_active": bool(is_active) if is_active is not None else bool(existing.get("is_active", True)),
+        },
+    ).mappings().first()
+    _log_audit_event(
+        db,
+        project_id=None,
+        entity_type="organization",
+        entity_id=org_id,
+        action="organization_updated",
+        actor="super_admin",
+        details={
+            "before": {"name": existing.get("name"), "slug": existing.get("slug"), "status": existing.get("status")},
+            "after": {"name": next_name, "slug": next_slug, "status": next_status},
+        },
+    )
+    db.commit()
+    return dict(row)
+
+
+@router.get("/admin/roles")
+def list_admin_roles(db: Session = Depends(get_db), include_inactive: bool = Query(default=True)):
+    rows = db.execute(
+        text(
+            """
+            SELECT id, role_uid, role_key, role_name, description, scope, is_system,
+                   COALESCE(is_active, TRUE) AS is_active, created_at, updated_at
+            FROM green_roles
+            WHERE (:include_inactive = TRUE OR COALESCE(is_active, TRUE) = TRUE)
+            ORDER BY COALESCE(is_system, FALSE) DESC, role_name ASC, id ASC
+            """
+        ),
+        {"include_inactive": bool(include_inactive)},
+    ).mappings().all()
+    return [dict(r) for r in rows]
+
+
+@router.post("/admin/roles")
+def create_admin_role(
+    db: Session = Depends(get_db),
+    role_name: str = Body(...),
+    role_key: str | None = Body(default=None),
+    role_uid: str | None = Body(default=None),
+    description: str | None = Body(default=None),
+    scope: str = Body(default="platform"),
+    is_active: bool = Body(default=True),
+):
+    role_name_clean = (role_name or "").strip()
+    if not role_name_clean:
+        raise HTTPException(status_code=400, detail="Role name is required")
+    final_role_key = _ensure_unique_role_key(db, (role_key or "").strip() or role_name_clean)
+    final_role_uid = _ensure_unique_role_uid(db, role_uid)
+    row = db.execute(
+        text(
+            """
+            INSERT INTO green_roles (role_uid, role_key, role_name, description, scope, is_system, is_active)
+            VALUES (:role_uid, :role_key, :role_name, :description, :scope, FALSE, :is_active)
+            RETURNING id, role_uid, role_key, role_name, description, scope, is_system, is_active, created_at, updated_at
+            """
+        ),
+        {
+            "role_uid": final_role_uid,
+            "role_key": final_role_key,
+            "role_name": role_name_clean,
+            "description": (description or "").strip() or None,
+            "scope": _normalize_name(scope) or "platform",
+            "is_active": bool(is_active),
+        },
+    ).mappings().first()
+    _log_audit_event(
+        db,
+        project_id=None,
+        entity_type="role",
+        entity_id=int(row["id"]),
+        action="role_created",
+        actor="super_admin",
+        details={"role_key": row.get("role_key"), "role_uid": row.get("role_uid"), "role_name": row.get("role_name")},
+    )
+    db.commit()
+    return dict(row)
+
+
+@router.patch("/admin/roles/{role_id}")
+def update_admin_role(
+    role_id: int,
+    db: Session = Depends(get_db),
+    role_name: str | None = Body(default=None),
+    role_key: str | None = Body(default=None),
+    role_uid: str | None = Body(default=None),
+    description: str | None = Body(default=None),
+    scope: str | None = Body(default=None),
+    is_active: bool | None = Body(default=None),
+):
+    existing = db.execute(
+        text("SELECT * FROM green_roles WHERE id = :role_id"),
+        {"role_id": role_id},
+    ).mappings().first()
+    if not existing:
+        raise HTTPException(status_code=404, detail="Role not found")
+    if bool(existing.get("is_system")) and role_key is not None:
+        # Keep system role keys stable to avoid breaking existing workflows.
+        role_key = None
+    next_role_name = (role_name.strip() if isinstance(role_name, str) else str(existing.get("role_name") or "").strip())
+    if not next_role_name:
+        raise HTTPException(status_code=400, detail="Role name is required")
+    next_role_key = (
+        _ensure_unique_role_key(db, role_key.strip(), exclude_role_id=role_id)
+        if isinstance(role_key, str)
+        else str(existing.get("role_key") or "")
+    )
+    next_role_uid = (
+        _ensure_unique_role_uid(db, role_uid, exclude_role_id=role_id)
+        if role_uid is not None
+        else str(existing.get("role_uid") or _ensure_unique_role_uid(db))
+    )
+    next_scope = _normalize_name(scope) if scope is not None else _normalize_name(existing.get("scope"))
+    if not next_scope:
+        next_scope = "platform"
+    row = db.execute(
+        text(
+            """
+            UPDATE green_roles
+            SET role_uid = :role_uid,
+                role_key = :role_key,
+                role_name = :role_name,
+                description = :description,
+                scope = :scope,
+                is_active = :is_active,
+                updated_at = NOW()
+            WHERE id = :role_id
+            RETURNING id, role_uid, role_key, role_name, description, scope, is_system, is_active, created_at, updated_at
+            """
+        ),
+        {
+            "role_id": role_id,
+            "role_uid": next_role_uid,
+            "role_key": next_role_key,
+            "role_name": next_role_name,
+            "description": (description.strip() if isinstance(description, str) else existing.get("description")) or None,
+            "scope": next_scope,
+            "is_active": bool(is_active) if is_active is not None else bool(existing.get("is_active", True)),
+        },
+    ).mappings().first()
+    if not bool(existing.get("is_system")) and str(existing.get("role_key") or "") != str(row.get("role_key") or ""):
+        db.execute(
+            text(
+                """
+                UPDATE green_users
+                SET role = :role_key, updated_at = NOW()
+                WHERE role_id = :role_id
+                """
+            ),
+            {"role_id": role_id, "role_key": row.get("role_key")},
+        )
+    _log_audit_event(
+        db,
+        project_id=None,
+        entity_type="role",
+        entity_id=role_id,
+        action="role_updated",
+        actor="super_admin",
+        details={"before_role_key": existing.get("role_key"), "after_role_key": row.get("role_key")},
+    )
+    db.commit()
+    return dict(row)
+
+
+@router.get("/admin/overview")
+def admin_overview(db: Session = Depends(get_db), recent_limit: int = Query(default=40, ge=1, le=200)):
+    organization_count = int(db.execute(text("SELECT COUNT(*) FROM green_organizations")).scalar() or 0)
+    active_organization_count = int(
+        db.execute(text("SELECT COUNT(*) FROM green_organizations WHERE COALESCE(is_active, TRUE) = TRUE")).scalar() or 0
+    )
+    project_count = int(db.execute(text("SELECT COUNT(*) FROM tree_projects")).scalar() or 0)
+    unassigned_project_count = int(
+        db.execute(text("SELECT COUNT(*) FROM tree_projects WHERE organization_id IS NULL")).scalar() or 0
+    )
+    tree_count = int(db.execute(text("SELECT COUNT(*) FROM trees")).scalar() or 0)
+    task_count = int(db.execute(text("SELECT COUNT(*) FROM tree_tasks")).scalar() or 0)
+    pending_review_count = int(
+        db.execute(text("SELECT COUNT(*) FROM tree_tasks WHERE LOWER(COALESCE(review_state, 'none')) = 'submitted'")).scalar() or 0
+    )
+    open_alert_count = int(
+        db.execute(text("SELECT COUNT(*) FROM green_alerts WHERE LOWER(COALESCE(status, 'open')) = 'open'")).scalar() or 0
+    )
+    users_count = int(db.execute(text("SELECT COUNT(*) FROM green_users")).scalar() or 0)
+    roles_count = int(db.execute(text("SELECT COUNT(*) FROM green_roles")).scalar() or 0)
+
+    org_rows = list_admin_organizations(db)
+    recent_rows = db.execute(
+        text(
+            """
+            SELECT
+                a.id, a.project_id, a.entity_type, a.entity_id, a.action, a.actor, a.created_at,
+                p.name AS project_name, p.organization_id,
+                o.name AS organization_name, o.slug AS organization_slug
+            FROM green_audit_events a
+            LEFT JOIN tree_projects p ON p.id = a.project_id
+            LEFT JOIN green_organizations o ON o.id = p.organization_id
+            ORDER BY a.created_at DESC, a.id DESC
+            LIMIT :recent_limit
+            """
+        ),
+        {"recent_limit": int(recent_limit)},
+    ).mappings().all()
+
+    return {
+        "totals": {
+            "organizations": organization_count,
+            "active_organizations": active_organization_count,
+            "projects": project_count,
+            "unassigned_projects": unassigned_project_count,
+            "trees": tree_count,
+            "tasks": task_count,
+            "pending_reviews": pending_review_count,
+            "open_alerts": open_alert_count,
+            "users": users_count,
+            "roles": roles_count,
+        },
+        "organizations": org_rows,
+        "recent_activity": [dict(r) for r in recent_rows],
+    }
+
+
 @router.get("/projects")
 def list_projects(db: Session = Depends(get_db)):
     rows = db.execute(text("""
         SELECT
-            id, name, location_text, sponsor, planting_model, allow_existing_tree_link, default_existing_tree_scope, created_at
-        FROM tree_projects
-        ORDER BY created_at DESC
+            p.id, p.organization_id, p.name, p.location_text, p.sponsor,
+            p.planting_model, p.allow_existing_tree_link, p.default_existing_tree_scope, p.created_at,
+            o.name AS organization_name, o.slug AS organization_slug, o.status AS organization_status
+        FROM tree_projects p
+        LEFT JOIN green_organizations o ON o.id = p.organization_id
+        ORDER BY p.created_at DESC
     """)).mappings().all()
     return [dict(r) for r in rows]
 
@@ -2568,9 +3374,12 @@ def list_projects(db: Session = Depends(get_db)):
 def get_project(project_id: int, db: Session = Depends(get_db)):
     project = db.execute(text("""
         SELECT
-            id, name, location_text, sponsor, planting_model, allow_existing_tree_link, default_existing_tree_scope, created_at
-        FROM tree_projects
-        WHERE id = :project_id
+            p.id, p.organization_id, p.name, p.location_text, p.sponsor,
+            p.planting_model, p.allow_existing_tree_link, p.default_existing_tree_scope, p.created_at,
+            o.name AS organization_name, o.slug AS organization_slug, o.status AS organization_status
+        FROM tree_projects p
+        LEFT JOIN green_organizations o ON o.id = p.organization_id
+        WHERE p.id = :project_id
     """), {"project_id": project_id}).mappings().first()
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
@@ -4658,24 +5467,221 @@ def create_user(
     db: Session = Depends(get_db),
     full_name: str = Body(...),
     role: str = Body(default="field_officer"),
+    user_uid: str | None = Body(default=None),
+    organization_id: int | None = Body(default=None),
+    role_id: int | None = Body(default=None),
+    email: str | None = Body(default=None),
+    phone: str | None = Body(default=None),
+    notes: str | None = Body(default=None),
+    is_active: bool = Body(default=True),
 ):
+    full_name_clean = (full_name or "").strip()
+    if not full_name_clean:
+        raise HTTPException(status_code=400, detail="Full name required")
+    org_id_value = int(organization_id) if organization_id is not None else None
+    if org_id_value is not None:
+        org_exists = db.execute(
+            text("SELECT id FROM green_organizations WHERE id = :org_id"),
+            {"org_id": org_id_value},
+        ).scalar()
+        if not org_exists:
+            raise HTTPException(status_code=404, detail="Organization not found")
+    role_value = _normalize_name(role) or "field_officer"
+    role_id_value = int(role_id) if role_id is not None else None
+    if role_id_value is not None and role_id_value <= 0:
+        role_id_value = None
+    role_row = None
+    if role_id_value is not None:
+        role_row = db.execute(
+            text("SELECT id, role_key, role_name FROM green_roles WHERE id = :role_id"),
+            {"role_id": role_id_value},
+        ).mappings().first()
+        if not role_row:
+            raise HTTPException(status_code=404, detail="Role not found")
+        role_value = str(role_row.get("role_key") or role_value or "field_officer")
+    else:
+        role_row = db.execute(
+            text("SELECT id, role_key, role_name FROM green_roles WHERE LOWER(role_key) = LOWER(:role_key) LIMIT 1"),
+            {"role_key": role_value},
+        ).mappings().first()
+        role_id_value = int(role_row["id"]) if role_row else None
+    user_uid_value = _ensure_unique_user_uid(db, user_uid)
     row = db.execute(text("""
-        INSERT INTO green_users (full_name, role)
-        VALUES (:full_name, :role)
-        RETURNING id, full_name, role, created_at
-    """), {"full_name": full_name, "role": role}).mappings().first()
+        INSERT INTO green_users (full_name, role, user_uid, organization_id, role_id, email, phone, notes, is_active, updated_at)
+        VALUES (:full_name, :role, :user_uid, :organization_id, :role_id, :email, :phone, :notes, :is_active, NOW())
+        RETURNING id, user_uid, full_name, role, organization_id, role_id, email, phone, notes, is_active, created_at, updated_at
+    """), {
+        "full_name": full_name_clean,
+        "role": role_value,
+        "user_uid": user_uid_value,
+        "organization_id": org_id_value,
+        "role_id": role_id_value,
+        "email": (email or "").strip() or None,
+        "phone": (phone or "").strip() or None,
+        "notes": (notes or "").strip() or None,
+        "is_active": bool(is_active),
+    }).mappings().first()
+    _log_audit_event(
+        db,
+        project_id=None,
+        entity_type="user",
+        entity_id=int(row["id"]),
+        action="user_created",
+        actor="super_admin",
+        details={
+            "user_uid": row.get("user_uid"),
+            "role": row.get("role"),
+            "organization_id": row.get("organization_id"),
+        },
+    )
     db.commit()
-    return dict(row)
+    return list_users(db=db, include_inactive=True, user_id_filter=int(row["id"]))[0]
 
 
 @router.get("/users")
-def list_users(db: Session = Depends(get_db)):
+def list_users(
+    db: Session = Depends(get_db),
+    include_inactive: bool = Query(default=False),
+    organization_id: int | None = Query(default=None),
+    role_id: int | None = Query(default=None),
+    user_id_filter: int | None = None,
+):
     rows = db.execute(text("""
-        SELECT id, full_name, role, created_at
-        FROM green_users
-        ORDER BY created_at DESC
-    """)).mappings().all()
+        SELECT
+            u.id, u.user_uid, u.full_name, u.role, u.organization_id, u.role_id,
+            u.email, u.phone, u.notes, COALESCE(u.is_active, TRUE) AS is_active,
+            u.created_at, u.updated_at,
+            o.name AS organization_name, o.slug AS organization_slug,
+            r.role_uid, r.role_key, r.role_name
+        FROM green_users u
+        LEFT JOIN green_organizations o ON o.id = u.organization_id
+        LEFT JOIN green_roles r ON r.id = u.role_id
+        WHERE (:include_inactive = TRUE OR COALESCE(u.is_active, TRUE) = TRUE)
+          AND (:organization_id IS NULL OR u.organization_id = :organization_id)
+          AND (:role_id IS NULL OR u.role_id = :role_id)
+          AND (:user_id_filter IS NULL OR u.id = :user_id_filter)
+        ORDER BY COALESCE(u.updated_at, u.created_at) DESC, u.id DESC
+    """), {
+        "include_inactive": bool(include_inactive),
+        "organization_id": int(organization_id) if organization_id is not None else None,
+        "role_id": int(role_id) if role_id is not None else None,
+        "user_id_filter": int(user_id_filter) if user_id_filter is not None else None,
+    }).mappings().all()
     return [dict(r) for r in rows]
+
+
+@router.patch("/users/{user_id}")
+def update_user(
+    user_id: int,
+    db: Session = Depends(get_db),
+    full_name: str | None = Body(default=None),
+    role: str | None = Body(default=None),
+    user_uid: str | None = Body(default=None),
+    organization_id: int | None = Body(default=None),
+    role_id: int | None = Body(default=None),
+    email: str | None = Body(default=None),
+    phone: str | None = Body(default=None),
+    notes: str | None = Body(default=None),
+    is_active: bool | None = Body(default=None),
+):
+    existing = db.execute(
+        text(
+            """
+            SELECT id, user_uid, full_name, role, organization_id, role_id, email, phone, notes, COALESCE(is_active, TRUE) AS is_active
+            FROM green_users
+            WHERE id = :user_id
+            """
+        ),
+        {"user_id": user_id},
+    ).mappings().first()
+    if not existing:
+        raise HTTPException(status_code=404, detail="User not found")
+    org_id_value = None
+    if organization_id is None:
+        org_id_value = existing.get("organization_id")
+    else:
+        org_id_value = int(organization_id) if organization_id else None
+        if org_id_value is not None:
+            org_exists = db.execute(text("SELECT id FROM green_organizations WHERE id = :org_id"), {"org_id": org_id_value}).scalar()
+            if not org_exists:
+                raise HTTPException(status_code=404, detail="Organization not found")
+    role_value = _normalize_name(role) if role is not None else _normalize_name(existing.get("role"))
+    role_id_value = int(role_id) if role_id is not None else (int(existing["role_id"]) if existing.get("role_id") else None)
+    if role_id is not None:
+        if role_id_value:
+            role_row = db.execute(
+                text("SELECT id, role_key FROM green_roles WHERE id = :role_id"),
+                {"role_id": role_id_value},
+            ).mappings().first()
+            if not role_row:
+                raise HTTPException(status_code=404, detail="Role not found")
+            role_value = str(role_row.get("role_key") or role_value or "field_officer")
+        else:
+            role_id_value = None
+    elif role_value:
+        role_row = db.execute(
+            text("SELECT id, role_key FROM green_roles WHERE LOWER(role_key)=LOWER(:role_key) LIMIT 1"),
+            {"role_key": role_value},
+        ).mappings().first()
+        if role_row:
+            role_id_value = int(role_row["id"])
+            role_value = str(role_row.get("role_key") or role_value)
+    user_uid_value = (
+        _ensure_unique_user_uid(db, user_uid, exclude_user_id=user_id)
+        if user_uid is not None
+        else str(existing.get("user_uid") or _ensure_unique_user_uid(db))
+    )
+    next_full_name = (full_name.strip() if isinstance(full_name, str) else str(existing.get("full_name") or "").strip())
+    if not next_full_name:
+        raise HTTPException(status_code=400, detail="Full name required")
+    row = db.execute(
+        text(
+            """
+            UPDATE green_users
+            SET user_uid = :user_uid,
+                full_name = :full_name,
+                role = :role,
+                organization_id = :organization_id,
+                role_id = :role_id,
+                email = :email,
+                phone = :phone,
+                notes = :notes,
+                is_active = :is_active,
+                updated_at = NOW()
+            WHERE id = :user_id
+            RETURNING id
+            """
+        ),
+        {
+            "user_id": user_id,
+            "user_uid": user_uid_value,
+            "full_name": next_full_name,
+            "role": role_value or "field_officer",
+            "organization_id": org_id_value,
+            "role_id": role_id_value,
+            "email": (email.strip() if isinstance(email, str) else existing.get("email")) or None,
+            "phone": (phone.strip() if isinstance(phone, str) else existing.get("phone")) or None,
+            "notes": (notes.strip() if isinstance(notes, str) else existing.get("notes")) or None,
+            "is_active": bool(is_active) if is_active is not None else bool(existing.get("is_active", True)),
+        },
+    ).scalar()
+    _log_audit_event(
+        db,
+        project_id=None,
+        entity_type="user",
+        entity_id=int(row),
+        action="user_updated",
+        actor="super_admin",
+        details={
+            "user_uid": user_uid_value,
+            "role": role_value or "field_officer",
+            "organization_id": org_id_value,
+            "is_active": bool(is_active) if is_active is not None else bool(existing.get("is_active", True)),
+        },
+    )
+    db.commit()
+    result = list_users(db=db, include_inactive=True, user_id_filter=user_id)
+    return result[0] if result else {"id": user_id}
 
 
 @router.patch("/tasks/{task_id}")
