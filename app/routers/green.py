@@ -539,6 +539,192 @@ def _get_maintenance_intervals(activity: str, tree_age_days: int, season: str) -
     return {"first_days": 30, "repeat_days": 90}
 
 
+def _point_in_ring(lng: float, lat: float, ring: list[list[float]]) -> bool:
+    if not isinstance(ring, list) or len(ring) < 4:
+        return False
+    inside = False
+    j = len(ring) - 1
+    for i in range(len(ring)):
+        try:
+            xi, yi = float(ring[i][0]), float(ring[i][1])
+            xj, yj = float(ring[j][0]), float(ring[j][1])
+        except Exception:
+            j = i
+            continue
+        intersects = ((yi > lat) != (yj > lat)) and (
+            lng < ((xj - xi) * (lat - yi) / ((yj - yi) or 1e-12) + xi)
+        )
+        if intersects:
+            inside = not inside
+        j = i
+    return inside
+
+
+def _point_in_polygon_geojson(lng: float, lat: float, geometry: dict | None) -> bool:
+    if not isinstance(geometry, dict):
+        return False
+    geom_type = str(geometry.get("type") or "").strip()
+    coordinates = geometry.get("coordinates")
+    if geom_type == "Polygon":
+        polygons = [coordinates]
+    elif geom_type == "MultiPolygon":
+        polygons = coordinates if isinstance(coordinates, list) else []
+    else:
+        return False
+    for polygon in polygons:
+        if not isinstance(polygon, list) or not polygon:
+            continue
+        outer = polygon[0]
+        holes = polygon[1:] if len(polygon) > 1 else []
+        if not _point_in_ring(lng, lat, outer):
+            continue
+        if any(_point_in_ring(lng, lat, hole) for hole in holes if isinstance(hole, list)):
+            continue
+        return True
+    return False
+
+
+def _find_matching_auto_first_cycle_work_order(
+    db: Session,
+    *,
+    project_id: int,
+    assignee_name: str,
+    species: str | None,
+    lng: float,
+    lat: float,
+) -> dict | None:
+    assignee_clean = (assignee_name or "").strip()
+    if not assignee_clean:
+        return None
+    rows = db.execute(
+        text(
+            """
+            SELECT id, assignee_name, maintenance_schedule, species_allocations,
+                   COALESCE(area_enabled, FALSE) AS area_enabled, area_geojson,
+                   status, created_at
+            FROM green_work_orders
+            WHERE project_id = :project_id
+              AND work_type = 'planting'
+              AND COALESCE(auto_assign_first_cycle_maintenance, FALSE) = TRUE
+              AND LOWER(TRIM(assignee_name)) = LOWER(TRIM(:assignee_name))
+              AND LOWER(COALESCE(status, 'assigned')) NOT IN ('done', 'completed', 'closed', 'cancelled')
+            ORDER BY created_at DESC, id DESC
+            """
+        ),
+        {"project_id": int(project_id), "assignee_name": assignee_clean},
+    ).mappings().all()
+    species_key = _normalize_name(species)
+    for raw in rows:
+        item = dict(raw)
+        raw_species_allocations = item.get("species_allocations")
+        if isinstance(raw_species_allocations, str):
+            try:
+                raw_species_allocations = json.loads(raw_species_allocations)
+            except Exception:
+                raw_species_allocations = []
+        normalized_species_allocations = _normalize_species_allocations(raw_species_allocations)
+        if normalized_species_allocations:
+            allowed_keys = {
+                _normalize_name(entry.get("species"))
+                for entry in normalized_species_allocations
+                if str(entry.get("species") or "").strip()
+            }
+            if not species_key or species_key not in allowed_keys:
+                continue
+
+        area_enabled = bool(item.get("area_enabled"))
+        if area_enabled:
+            raw_geojson = item.get("area_geojson")
+            if isinstance(raw_geojson, str):
+                try:
+                    raw_geojson = json.loads(raw_geojson)
+                except Exception:
+                    raw_geojson = None
+            normalized_geojson = _normalize_work_area_geojson(raw_geojson) if raw_geojson else None
+            if not normalized_geojson or not _point_in_polygon_geojson(lng, lat, normalized_geojson):
+                continue
+        return item
+    return None
+
+
+def _auto_assign_first_cycle_maintenance_from_order(
+    db: Session,
+    *,
+    project_id: int,
+    tree_id: int,
+    assignee_name: str,
+    planting_date_value: str | None,
+    order_row: dict,
+) -> list[int]:
+    assignee_clean = (assignee_name or "").strip()
+    if not assignee_clean:
+        return []
+    base_date = _parse_date_value(planting_date_value) or date.today()
+    season_key = _normalize_name(order_row.get("maintenance_schedule"))
+    if season_key not in SEASON_VALUES:
+        season_key = "rainy"
+    created_task_ids: list[int] = []
+    for activity in ("watering", "weeding", "protection", "inspection"):
+        existing_task_id = db.execute(
+            text(
+                """
+                SELECT id
+                FROM tree_tasks
+                WHERE tree_id = :tree_id
+                  AND LOWER(task_type) = :task_type
+                LIMIT 1
+                """
+            ),
+            {"tree_id": int(tree_id), "task_type": activity},
+        ).scalar()
+        if existing_task_id:
+            continue
+        intervals = _get_maintenance_intervals(activity, 0, season_key)
+        due_date = _add_days(base_date, int(intervals.get("first_days") or 0))
+        task_id = db.execute(
+            text(
+                """
+                INSERT INTO tree_tasks (
+                    tree_id, task_type, assignee_name, due_date, priority, status, notes,
+                    review_state, auto_generated, model_season
+                )
+                VALUES (
+                    :tree_id, :task_type, :assignee_name, :due_date, 'normal', 'pending', :notes,
+                    'none', FALSE, :model_season
+                )
+                RETURNING id
+                """
+            ),
+            {
+                "tree_id": int(tree_id),
+                "task_type": activity,
+                "assignee_name": assignee_clean,
+                "due_date": _to_date_input(due_date),
+                "notes": f"Auto-assigned first-cycle maintenance from planting order #{int(order_row.get('id') or 0)}.",
+                "model_season": season_key,
+            },
+        ).scalar()
+        if not task_id:
+            continue
+        created_task_ids.append(int(task_id))
+        _log_audit_event(
+            db,
+            project_id=int(project_id),
+            entity_type="task",
+            entity_id=int(task_id),
+            action="first_cycle_task_auto_assigned",
+            actor="system",
+            details={
+                "tree_id": int(tree_id),
+                "source_work_order_id": int(order_row.get("id") or 0),
+                "task_type": activity,
+                "due_date": _to_date_input(due_date),
+                "season": season_key,
+            },
+        )
+    return created_task_ids
+
+
 def _get_lifecycle_start_date(planting_date_obj: date | None, replacement_done_obj: date | None) -> date | None:
     if planting_date_obj and replacement_done_obj:
         return replacement_done_obj if replacement_done_obj > planting_date_obj else planting_date_obj
@@ -1536,6 +1722,7 @@ def ensure_green_tables(db: Session):
             target_trees INTEGER DEFAULT 0,
             species_allocations JSONB,
             maintenance_schedule TEXT,
+            auto_assign_first_cycle_maintenance BOOLEAN NOT NULL DEFAULT FALSE,
             due_date DATE,
             area_enabled BOOLEAN NOT NULL DEFAULT FALSE,
             area_label TEXT,
@@ -1552,6 +1739,11 @@ def ensure_green_tables(db: Session):
         db.execute(text("ALTER TABLE green_work_orders ADD COLUMN IF NOT EXISTS area_label TEXT"))
         db.execute(text("ALTER TABLE green_work_orders ADD COLUMN IF NOT EXISTS area_geojson JSONB"))
         db.execute(text("ALTER TABLE green_work_orders ADD COLUMN IF NOT EXISTS species_allocations JSONB"))
+        db.execute(
+            text(
+                "ALTER TABLE green_work_orders ADD COLUMN IF NOT EXISTS auto_assign_first_cycle_maintenance BOOLEAN NOT NULL DEFAULT FALSE"
+            )
+        )
     except Exception:
         db.rollback()
     db.execute(text("""
@@ -3868,6 +4060,7 @@ def add_tree(
     )
 
     review_task_id = None
+    auto_first_cycle_task_ids: list[int] = []
     if created_by_clean and origin == "new_planting":
         review_task_id = db.execute(
             text(
@@ -3919,6 +4112,23 @@ def add_tree(
             actor=created_by_clean,
             details={"task_type": "planting", "status": "done", "review_state": "submitted"},
         )
+        matching_auto_order = _find_matching_auto_first_cycle_work_order(
+            db,
+            project_id=int(project_id),
+            assignee_name=created_by_clean,
+            species=species or None,
+            lng=float(lng),
+            lat=float(lat),
+        )
+        if matching_auto_order:
+            auto_first_cycle_task_ids = _auto_assign_first_cycle_maintenance_from_order(
+                db,
+                project_id=int(project_id),
+                tree_id=int(row),
+                assignee_name=created_by_clean,
+                planting_date_value=planting_date,
+                order_row=matching_auto_order,
+            )
 
     _log_audit_event(
         db,
@@ -3944,11 +4154,17 @@ def add_tree(
             "tree_height_m": tree_height_value,
             "tree_age_months": tree_age_months_value,
             "review_task_id": int(review_task_id) if review_task_id else None,
+            "auto_first_cycle_task_ids": auto_first_cycle_task_ids,
         },
     )
     _refresh_project_alerts(db, project_id)
     db.commit()
-    return {"id": row, "review_task_id": review_task_id, "status": "submitted_for_review" if review_task_id else "created"}
+    return {
+        "id": row,
+        "review_task_id": review_task_id,
+        "auto_first_cycle_task_ids": auto_first_cycle_task_ids,
+        "status": "submitted_for_review" if review_task_id else "created",
+    }
 
 
 @router.patch("/trees/{tree_id}")
@@ -7933,6 +8149,7 @@ def create_work_order(
     target_trees: int = Body(default=0),
     species_allocations: list[dict] | None = Body(default=None),
     maintenance_schedule: str = Body(default=""),
+    auto_assign_first_cycle_maintenance: bool = Body(default=False),
     due_date: str | None = Body(default=None),
     area_enabled: bool = Body(default=False),
     area_label: str | None = Body(default=None),
@@ -7952,6 +8169,7 @@ def create_work_order(
         target_trees = int(sum(int(item.get("count") or 0) for item in normalized_species_allocations))
     if work_type == "planting" and int(target_trees or 0) <= 0:
         raise HTTPException(status_code=400, detail="Target trees must be greater than 0 for planting orders")
+    auto_assign_first_cycle_maintenance = bool(auto_assign_first_cycle_maintenance) and work_type == "planting"
 
     normalized_area_geojson = _normalize_work_area_geojson(area_geojson)
     area_label_clean = (area_label or "").strip() or None
@@ -7983,12 +8201,18 @@ def create_work_order(
                   AND COALESCE(area_enabled, FALSE) = FALSE
                   AND area_geojson IS NULL
                   AND COALESCE(species_allocations, '[]'::jsonb) = '[]'::jsonb
+                  AND COALESCE(auto_assign_first_cycle_maintenance, FALSE) = :auto_assign_first_cycle_maintenance
                   AND LOWER(COALESCE(status, 'assigned')) NOT IN ('done', 'completed', 'closed', 'cancelled')
                 ORDER BY created_at DESC, id DESC
                 LIMIT 1
                 """
             ),
-            {"project_id": project_id, "assignee_name": assignee_clean, "work_type": work_type},
+            {
+                "project_id": project_id,
+                "assignee_name": assignee_clean,
+                "work_type": work_type,
+                "auto_assign_first_cycle_maintenance": auto_assign_first_cycle_maintenance,
+            },
         ).scalar()
 
     if existing_id and work_type == "planting":
@@ -8009,11 +8233,13 @@ def create_work_order(
     else:
         row = db.execute(text("""
             INSERT INTO green_work_orders (
-                project_id, assignee_name, work_type, target_trees, species_allocations, maintenance_schedule, due_date,
+                project_id, assignee_name, work_type, target_trees, species_allocations, maintenance_schedule,
+                auto_assign_first_cycle_maintenance, due_date,
                 area_enabled, area_label, area_geojson
             )
             VALUES (
-                :project_id, :assignee_name, :work_type, :target_trees, CAST(:species_allocations AS JSONB), :maintenance_schedule, :due_date,
+                :project_id, :assignee_name, :work_type, :target_trees, CAST(:species_allocations AS JSONB), :maintenance_schedule,
+                :auto_assign_first_cycle_maintenance, :due_date,
                 :area_enabled, :area_label, CAST(:area_geojson AS JSONB)
             )
             RETURNING id
@@ -8024,6 +8250,7 @@ def create_work_order(
             "target_trees": target_trees,
             "species_allocations": _safe_json(normalized_species_allocations) if normalized_species_allocations else None,
             "maintenance_schedule": maintenance_schedule or None,
+            "auto_assign_first_cycle_maintenance": auto_assign_first_cycle_maintenance,
             "due_date": due_date,
             "area_enabled": bool(area_enabled),
             "area_label": area_label_clean,
@@ -8042,6 +8269,7 @@ def create_work_order(
             "target_trees": target_trees,
             "species_allocations": normalized_species_allocations,
             "maintenance_schedule": maintenance_schedule or None,
+            "auto_assign_first_cycle_maintenance": auto_assign_first_cycle_maintenance,
             "due_date": due_date,
             "area_enabled": bool(area_enabled),
             "area_label": area_label_clean,
@@ -8070,7 +8298,9 @@ def list_work_orders(
         )
         SELECT o.id, o.project_id, o.assignee_name, o.work_type, o.target_trees,
                o.species_allocations,
-               o.maintenance_schedule, o.due_date, o.status,
+               o.maintenance_schedule,
+               COALESCE(o.auto_assign_first_cycle_maintenance, FALSE) AS auto_assign_first_cycle_maintenance,
+               o.due_date, o.status,
                COALESCE(o.area_enabled, FALSE) AS area_enabled,
                o.area_label, o.area_geojson,
                CASE
@@ -8100,6 +8330,7 @@ def list_work_orders(
             except Exception:
                 raw_species_allocations = []
         item["species_allocations"] = _normalize_species_allocations(raw_species_allocations)
+        item["auto_assign_first_cycle_maintenance"] = bool(item.get("auto_assign_first_cycle_maintenance"))
         item["area_enabled"] = bool(item.get("area_enabled")) and item.get("work_type") == "planting"
         if not item["area_enabled"]:
             item["area_geojson"] = None
