@@ -5640,7 +5640,13 @@ def create_user(
         },
     )
     db.commit()
-    payload = list_users(db=db, include_inactive=True, user_id_filter=int(row["id"]))[0]
+    payload = list_users(
+        db=db,
+        include_inactive=True,
+        organization_id=None,
+        role_id=None,
+        user_id_filter=int(row["id"]),
+    )[0]
     if generated_password:
         payload["generated_password"] = generated_password
         payload["generated_login_username"] = work_username_clean
@@ -5655,6 +5661,14 @@ def list_users(
     role_id: int | None = Query(default=None),
     user_id_filter: int | None = None,
 ):
+    def _safe_int_or_none(value):
+        if value is None:
+            return None
+        try:
+            return int(value)
+        except Exception:
+            return None
+
     rows = db.execute(text("""
         SELECT
             u.id, u.user_uid, u.full_name, u.role, u.organization_id, u.role_id,
@@ -5676,9 +5690,9 @@ def list_users(
         ORDER BY COALESCE(u.updated_at, u.created_at) DESC, u.id DESC
     """), {
         "include_inactive": bool(include_inactive),
-        "organization_id": int(organization_id) if organization_id is not None else None,
-        "role_id": int(role_id) if role_id is not None else None,
-        "user_id_filter": int(user_id_filter) if user_id_filter is not None else None,
+        "organization_id": _safe_int_or_none(organization_id),
+        "role_id": _safe_int_or_none(role_id),
+        "user_id_filter": _safe_int_or_none(user_id_filter),
     }).mappings().all()
     return [dict(r) for r in rows]
 
@@ -5841,7 +5855,13 @@ def update_user(
         },
     )
     db.commit()
-    result = list_users(db=db, include_inactive=True, user_id_filter=user_id)
+    result = list_users(
+        db=db,
+        include_inactive=True,
+        organization_id=None,
+        role_id=None,
+        user_id_filter=user_id,
+    )
     return result[0] if result else {"id": user_id}
 
 
