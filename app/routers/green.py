@@ -5865,6 +5865,58 @@ def update_user(
     return result[0] if result else {"id": user_id}
 
 
+@router.delete("/users/{user_id}")
+def delete_user(
+    user_id: int,
+    db: Session = Depends(get_db),
+):
+    existing = db.execute(
+        text(
+            """
+            SELECT id, user_uid, full_name, role, organization_id, role_id,
+                   email, phone,
+                   COALESCE(allow_green, TRUE) AS allow_green,
+                   COALESCE(allow_work, FALSE) AS allow_work,
+                   work_username,
+                   notes, COALESCE(is_active, TRUE) AS is_active
+            FROM green_users
+            WHERE id = :user_id
+            """
+        ),
+        {"user_id": user_id},
+    ).mappings().first()
+    if not existing:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    deleted_id = db.execute(
+        text("DELETE FROM green_users WHERE id = :user_id RETURNING id"),
+        {"user_id": user_id},
+    ).scalar()
+    if not deleted_id:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    _log_audit_event(
+        db,
+        project_id=None,
+        entity_type="user",
+        entity_id=int(deleted_id),
+        action="user_deleted",
+        actor="super_admin",
+        details={
+            "user_uid": existing.get("user_uid"),
+            "full_name": existing.get("full_name"),
+            "role": existing.get("role"),
+            "organization_id": existing.get("organization_id"),
+            "allow_green": bool(existing.get("allow_green", True)),
+            "allow_work": bool(existing.get("allow_work", False)),
+            "work_username": existing.get("work_username"),
+            "is_active": bool(existing.get("is_active", True)),
+        },
+    )
+    db.commit()
+    return {"ok": True, "id": int(deleted_id)}
+
+
 @router.post("/work-auth/login")
 def work_auth_login(
     db: Session = Depends(get_db),
