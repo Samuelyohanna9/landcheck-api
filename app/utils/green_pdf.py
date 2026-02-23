@@ -10,6 +10,94 @@ from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
 
+def render_green_org_credentials_pdf(organization: dict, users: list[dict]) -> bytes:
+    buffer = io.BytesIO()
+    c = canvas.Canvas(buffer, pagesize=A4)
+    page_w, page_h = A4
+
+    def draw_header(page_no: int):
+        c.setFillColor(HexColor("#0f172a"))
+        c.setFont("Helvetica-Bold", 16)
+        c.drawString(36, page_h - 42, "LandCheck Work - Organization User Credentials")
+        c.setFont("Helvetica", 9)
+        c.setFillColorRGB(0.35, 0.35, 0.35)
+        c.drawString(36, page_h - 58, f"Organization: {organization.get('name') or '-'}")
+        c.drawString(36, page_h - 72, f"Generated: {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}")
+        c.drawRightString(page_w - 36, page_h - 58, f"Org ID: {organization.get('id') or '-'}")
+        c.drawRightString(page_w - 36, page_h - 72, f"Page {page_no}")
+        c.setFont("Helvetica-Oblique", 8)
+        c.setFillColorRGB(0.45, 0.45, 0.45)
+        c.drawString(36, page_h - 88, "Passwords are not retrievable; only login usernames and access details are printed.")
+
+    def draw_table_header(y: float):
+        c.setFillColor(HexColor("#e8f5eb"))
+        c.rect(36, y - 16, page_w - 72, 18, stroke=0, fill=1)
+        c.setFillColorRGB(0.12, 0.25, 0.16)
+        c.setFont("Helvetica-Bold", 8)
+        for x, label in [
+            (40, "User ID"),
+            (102, "Name"),
+            (250, "Role"),
+            (325, "Access"),
+            (382, "Login Username"),
+            (506, "Status"),
+        ]:
+            c.drawString(x, y - 10, label)
+
+    def trunc(value: str, max_len: int) -> str:
+        text = str(value or "").strip()
+        if len(text) <= max_len:
+            return text
+        return text[: max_len - 1] + "..."
+
+    page_no = 1
+    draw_header(page_no)
+    y = page_h - 108
+    draw_table_header(y)
+    y -= 26
+    row_h = 16
+    rows_drawn = 0
+    c.setFont("Helvetica", 7.5)
+    for user in users:
+        if y < 64:
+            c.showPage()
+            page_no += 1
+            draw_header(page_no)
+            y = page_h - 108
+            draw_table_header(y)
+            y -= 26
+            c.setFont("Helvetica", 7.5)
+        if rows_drawn % 2 == 0:
+            c.setFillColorRGB(0.98, 0.99, 0.985)
+            c.rect(36, y - 12, page_w - 72, row_h, stroke=0, fill=1)
+        c.setFillColorRGB(0.14, 0.14, 0.14)
+        access_parts = []
+        if user.get("allow_green", True):
+            access_parts.append("Green")
+        if user.get("allow_work", False):
+            access_parts.append("Work")
+        access = " / ".join(access_parts) if access_parts else "-"
+        status = "Inactive" if user.get("is_active") is False else "Active"
+        c.drawString(40, y - 2, trunc(user.get("user_uid") or "-", 12))
+        c.drawString(102, y - 2, trunc(user.get("full_name") or "-", 28))
+        c.drawString(250, y - 2, trunc(user.get("role_name") or user.get("role") or "-", 14))
+        c.drawString(325, y - 2, trunc(access, 12))
+        c.drawString(382, y - 2, trunc(user.get("work_username") or "-", 24))
+        c.drawString(506, y - 2, status)
+        y -= row_h
+        rows_drawn += 1
+
+    if rows_drawn == 0:
+        c.setFont("Helvetica", 9)
+        c.setFillColorRGB(0.4, 0.4, 0.4)
+        c.drawString(36, y, "No users found for this organization.")
+
+    c.showPage()
+    c.save()
+    buffer.seek(0)
+    return buffer.getvalue()
+
+
 def _draw_rounded_box(c, x, y, w, h, r, fill_color=None, stroke_color=None):
     """Draw a rounded rectangle."""
     c.saveState()

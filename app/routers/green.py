@@ -27,6 +27,7 @@ from app.utils.green_pdf import (
     render_green_work_report_pdf,
     render_green_custodian_report_pdf,
     render_green_existing_trees_report_pdf,
+    render_green_org_credentials_pdf,
 )
 from app.utils.carbon import (
     compute_project_carbon,
@@ -371,6 +372,19 @@ def _generate_temporary_login_password(length: int = 12) -> str:
     alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789"
     size = max(8, int(length or 12))
     return "".join(secrets.choice(alphabet) for _ in range(size))
+
+
+def _next_project_tree_no(db: Session, project_id: int) -> int:
+    # Lock the project row so concurrent inserts don't issue the same local tree number.
+    db.execute(text("SELECT id FROM tree_projects WHERE id = :project_id FOR UPDATE"), {"project_id": int(project_id)})
+    next_no = db.execute(
+        text("SELECT COALESCE(MAX(project_tree_no), 0) + 1 FROM trees WHERE project_id = :project_id"),
+        {"project_id": int(project_id)},
+    ).scalar()
+    try:
+        return int(next_no or 1)
+    except Exception:
+        return 1
 
 
 def _normalize_planting_model(value: str | None) -> str:
@@ -1700,6 +1714,7 @@ def ensure_green_tables(db: Session):
         CREATE TABLE IF NOT EXISTS trees (
             id SERIAL PRIMARY KEY,
             project_id INTEGER NOT NULL REFERENCES tree_projects(id) ON DELETE CASCADE,
+            project_tree_no INTEGER,
             geom GEOMETRY(POINT, 4326),
             species TEXT,
             planting_date DATE,
@@ -1806,6 +1821,30 @@ def ensure_green_tables(db: Session):
         db.execute(text("ALTER TABLE trees ADD COLUMN IF NOT EXISTS source_project_id INTEGER"))
         db.execute(text("ALTER TABLE trees ADD COLUMN IF NOT EXISTS tree_height_m NUMERIC"))
         db.execute(text("ALTER TABLE trees ADD COLUMN IF NOT EXISTS tree_age_months NUMERIC"))
+        db.execute(text("ALTER TABLE trees ADD COLUMN IF NOT EXISTS project_tree_no INTEGER"))
+    except Exception:
+        db.rollback()
+    try:
+        db.execute(
+            text(
+                """
+                WITH ranked AS (
+                    SELECT
+                        id,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY project_id
+                            ORDER BY COALESCE(created_at, NOW()), id
+                        ) AS rn
+                    FROM trees
+                )
+                UPDATE trees t
+                SET project_tree_no = ranked.rn
+                FROM ranked
+                WHERE t.id = ranked.id
+                  AND (t.project_tree_no IS NULL OR t.project_tree_no <> ranked.rn)
+                """
+            )
+        )
     except Exception:
         db.rollback()
     db.execute(
@@ -2123,6 +2162,7 @@ def ensure_green_tables(db: Session):
         )
     """))
     db.execute(text("CREATE INDEX IF NOT EXISTS idx_trees_project_id ON trees(project_id)"))
+    db.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS idx_trees_project_tree_no ON trees(project_id, project_tree_no)"))
     db.execute(text("CREATE INDEX IF NOT EXISTS idx_trees_geom ON trees USING GIST (geom)"))
     db.execute(text("CREATE INDEX IF NOT EXISTS idx_tree_visits_tree_id ON tree_visits(tree_id)"))
     db.execute(text("CREATE INDEX IF NOT EXISTS idx_tree_status_history_tree_date ON green_tree_status_history(tree_id, status_date DESC, id DESC)"))
@@ -3414,6 +3454,55 @@ def admin_overview(db: Session = Depends(get_db), recent_limit: int = Query(defa
     }
 
 
+@router.get("/admin/organizations/{organization_id}/credentials/export/pdf")
+def export_admin_org_credentials_pdf(
+    organization_id: int,
+    include_inactive: bool = Query(default=True),
+    db: Session = Depends(get_db),
+):
+    org_row = db.execute(
+        text(
+            """
+            SELECT id, name, slug, short_name, status
+            FROM green_organizations
+            WHERE id = :organization_id
+            """
+        ),
+        {"organization_id": organization_id},
+    ).mappings().first()
+    if not org_row:
+        raise HTTPException(status_code=404, detail="Organization not found")
+
+    user_rows = db.execute(
+        text(
+            """
+            SELECT
+                u.id, u.user_uid, u.full_name, u.role,
+                COALESCE(u.allow_green, TRUE) AS allow_green,
+                COALESCE(u.allow_work, FALSE) AS allow_work,
+                COALESCE(u.is_active, TRUE) AS is_active,
+                u.work_username,
+                r.role_name, r.role_key
+            FROM green_users u
+            LEFT JOIN green_roles r ON r.id = u.role_id
+            WHERE u.organization_id = :organization_id
+              AND (:include_inactive = TRUE OR COALESCE(u.is_active, TRUE) = TRUE)
+            ORDER BY COALESCE(u.updated_at, u.created_at) DESC, u.id DESC
+            """
+        ),
+        {"organization_id": organization_id, "include_inactive": bool(include_inactive)},
+    ).mappings().all()
+
+    content = render_green_org_credentials_pdf(dict(org_row), [dict(row) for row in user_rows])
+    safe_slug = re.sub(r"[^a-z0-9_-]+", "-", str(org_row.get("slug") or org_row.get("name") or "organization").lower()).strip("-")
+    safe_slug = safe_slug or f"organization-{organization_id}"
+    filename = f"landcheck-user-credentials-{safe_slug}.pdf"
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+        tmp.write(content)
+        pdf_path = tmp.name
+    return FileResponse(pdf_path, media_type="application/pdf", filename=filename)
+
+
 @router.get("/projects")
 def list_projects(
     db: Session = Depends(get_db),
@@ -3568,6 +3657,7 @@ def list_trees(project_id: int, db: Session = Depends(get_db)):
         SELECT
                t.id,
                t.project_id,
+               t.project_tree_no,
                t.species,
                t.planting_date,
                t.status,
@@ -4446,6 +4536,8 @@ def import_existing_trees(
             )
             continue
 
+        target_project_tree_no = _next_project_tree_no(db, int(project_id))
+
         if mode_key == "transfer":
             target_tree_id = db.execute(
                 text(
@@ -4453,6 +4545,7 @@ def import_existing_trees(
                     UPDATE trees
                     SET
                         project_id = :target_project_id,
+                        project_tree_no = :project_tree_no,
                         tree_origin = 'existing_inventory',
                         custodian_id = NULL,
                         custody_started_at = COALESCE(custody_started_at, CURRENT_DATE),
@@ -4466,6 +4559,7 @@ def import_existing_trees(
                 ),
                 {
                     "target_project_id": project_id,
+                    "project_tree_no": target_project_tree_no,
                     "attribution_scope": resolved_scope,
                     "count_in_planting_kpis": default_planting_scope,
                     "count_in_carbon_scope": default_carbon_scope,
@@ -4521,12 +4615,13 @@ def import_existing_trees(
                 text(
                     """
                     INSERT INTO trees (
-                        project_id, geom, species, planting_date, status, notes, photo_url, created_by,
+                        project_id, project_tree_no, geom, species, planting_date, status, notes, photo_url, created_by,
                         tree_origin, custodian_id, custody_started_at, attribution_scope,
                         count_in_planting_kpis, count_in_carbon_scope, source_project_id, tree_height_m, tree_age_months
                     )
                     SELECT
                         :target_project_id,
+                        :project_tree_no,
                         geom,
                         species,
                         planting_date,
@@ -4550,6 +4645,7 @@ def import_existing_trees(
                 ),
                 {
                     "target_project_id": project_id,
+                    "project_tree_no": target_project_tree_no,
                     "attribution_scope": resolved_scope,
                     "count_in_planting_kpis": default_planting_scope,
                     "count_in_carbon_scope": default_carbon_scope,
@@ -4876,14 +4972,16 @@ def add_tree(
     normalized_status = "pending_planting" if origin == "new_planting" else requested_status
     created_by_clean = (created_by or "").strip()
     reported_status = requested_status if requested_status != "pending_planting" else "alive"
+    project_tree_no = _next_project_tree_no(db, int(project_id))
     row = db.execute(text("""
         INSERT INTO trees (
-            project_id, geom, species, planting_date, status, notes, photo_url, created_by,
+            project_id, project_tree_no, geom, species, planting_date, status, notes, photo_url, created_by,
             tree_origin, custodian_id, custody_started_at, attribution_scope,
             count_in_planting_kpis, count_in_carbon_scope, source_project_id, tree_height_m, tree_age_months
         )
         VALUES (
             :project_id,
+            :project_tree_no,
             ST_SetSRID(ST_MakePoint(:lng, :lat), 4326),
             :species,
             :planting_date,
@@ -4904,6 +5002,7 @@ def add_tree(
         RETURNING id
     """), {
         "project_id": project_id,
+        "project_tree_no": project_tree_no,
         "lng": lng,
         "lat": lat,
         "species": species or None,
@@ -5028,6 +5127,7 @@ def add_tree(
             "source_project_id": source_project_id_value,
             "tree_height_m": tree_height_value,
             "tree_age_months": tree_age_months_value,
+            "project_tree_no": project_tree_no,
             "review_task_id": int(review_task_id) if review_task_id else None,
             "auto_first_cycle_task_ids": auto_first_cycle_task_ids,
         },
@@ -5036,6 +5136,7 @@ def add_tree(
     db.commit()
     return {
         "id": row,
+        "project_tree_no": project_tree_no,
         "review_task_id": review_task_id,
         "auto_first_cycle_task_ids": auto_first_cycle_task_ids,
         "status": "submitted_for_review" if review_task_id else "created",
