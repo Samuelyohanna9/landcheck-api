@@ -14,9 +14,11 @@ import re
 import hashlib
 import hmac
 import secrets
+import smtplib
 from pathlib import Path
 from threading import Lock
 from urllib.parse import quote, unquote, urlparse
+from email.message import EmailMessage
 
 import boto3
 from botocore.exceptions import ClientError
@@ -372,6 +374,91 @@ def _generate_temporary_login_password(length: int = 12) -> str:
     alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789"
     size = max(8, int(length or 12))
     return "".join(secrets.choice(alphabet) for _ in range(size))
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = str(os.getenv(name) or "").strip().lower()
+    if not raw:
+        return bool(default)
+    return raw in {"1", "true", "yes", "on"}
+
+
+def _send_new_user_credentials_email(
+    *,
+    to_email: str,
+    full_name: str,
+    organization_name: str | None,
+    username: str,
+    password: str,
+    allow_green: bool,
+    allow_work: bool,
+):
+    smtp_host = str(os.getenv("SMTP_HOST") or "").strip()
+    if not smtp_host:
+        raise RuntimeError("SMTP_HOST is not configured")
+    smtp_port = int(str(os.getenv("SMTP_PORT") or "587").strip() or "587")
+    smtp_user = str(os.getenv("SMTP_USERNAME") or "").strip()
+    smtp_pass = str(os.getenv("SMTP_PASSWORD") or "").strip()
+    smtp_from_email = str(os.getenv("SMTP_FROM_EMAIL") or smtp_user or "").strip()
+    smtp_from_name = str(os.getenv("SMTP_FROM_NAME") or "LandCheck").strip()
+    if not smtp_from_email:
+        raise RuntimeError("SMTP_FROM_EMAIL (or SMTP_USERNAME) is not configured")
+    use_ssl = _env_bool("SMTP_USE_SSL", False)
+    use_tls = _env_bool("SMTP_USE_TLS", not use_ssl)
+    green_url = str(os.getenv("LANDCHECK_GREEN_URL") or "").strip() or "https://landcheck.online/green/login"
+    work_url = str(os.getenv("LANDCHECK_WORK_URL") or "").strip() or "https://landcheck.online/green-work/login"
+
+    access_lines = []
+    if allow_green:
+        access_lines.append(f"- LandCheck Green: {green_url}")
+    if allow_work:
+        access_lines.append(f"- LandCheck Work: {work_url}")
+    if not access_lines:
+        access_lines.append("- No app access enabled")
+
+    recipient_name = (full_name or "").strip() or "User"
+    org_line = f"Organization: {organization_name}\n" if organization_name else ""
+    body = (
+        f"Hello {recipient_name},\n\n"
+        "Your LandCheck account has been created.\n\n"
+        f"{org_line}"
+        "Login details:\n"
+        f"Username: {username}\n"
+        f"Temporary Password: {password}\n\n"
+        "Access:\n"
+        f"{chr(10).join(access_lines)}\n\n"
+        "Please log in and change/reset your password through your administrator after first access.\n\n"
+        "Regards,\n"
+        "LandCheck"
+    )
+
+    msg = EmailMessage()
+    msg["Subject"] = "Your LandCheck Login Credentials"
+    msg["From"] = f"{smtp_from_name} <{smtp_from_email}>" if smtp_from_name else smtp_from_email
+    msg["To"] = to_email
+    msg.set_content(body)
+
+    if use_ssl:
+        with smtplib.SMTP_SSL(smtp_host, smtp_port, timeout=20) as server:
+            if smtp_user:
+                server.login(smtp_user, smtp_pass)
+            server.send_message(msg)
+        return
+
+    with smtplib.SMTP(smtp_host, smtp_port, timeout=20) as server:
+        try:
+            server.ehlo()
+        except Exception:
+            pass
+        if use_tls:
+            server.starttls()
+            try:
+                server.ehlo()
+            except Exception:
+                pass
+        if smtp_user:
+            server.login(smtp_user, smtp_pass)
+        server.send_message(msg)
 
 
 def _next_project_tree_no(db: Session, project_id: int) -> int:
@@ -5643,6 +5730,7 @@ def create_user(
     allow_work: bool = Body(default=False),
     work_username: str | None = Body(default=None),
     work_password: str | None = Body(default=None),
+    send_credentials_email: bool = Body(default=True),
     notes: str | None = Body(default=None),
     is_active: bool = Body(default=True),
 ):
@@ -5650,13 +5738,15 @@ def create_user(
     if not full_name_clean:
         raise HTTPException(status_code=400, detail="Full name required")
     org_id_value = int(organization_id) if organization_id is not None else None
+    org_name_value: str | None = None
     if org_id_value is not None:
         org_exists = db.execute(
-            text("SELECT id FROM green_organizations WHERE id = :org_id"),
+            text("SELECT id, name FROM green_organizations WHERE id = :org_id"),
             {"org_id": org_id_value},
-        ).scalar()
+        ).mappings().first()
         if not org_exists:
             raise HTTPException(status_code=404, detail="Organization not found")
+        org_name_value = str(org_exists.get("name") or "").strip() or None
     role_value = _normalize_name(role) or "field_officer"
     role_id_value = int(role_id) if role_id is not None else None
     if role_id_value is not None and role_id_value <= 0:
@@ -5689,14 +5779,19 @@ def create_user(
         if existing_work_username:
             raise HTTPException(status_code=409, detail="Work username already exists")
     generated_password: str | None = None
-    if login_enabled and not str(work_password or "").strip():
+    explicit_password_clean = str(work_password or "").strip()
+    if login_enabled and not explicit_password_clean:
         generated_password = _generate_temporary_login_password()
-    password_hash = _hash_password_value(generated_password or work_password or "") if login_enabled else None
+    plain_login_password = generated_password or explicit_password_clean
+    password_hash = _hash_password_value(plain_login_password or "") if login_enabled else None
+    email_clean = (email or "").strip() or None
     if login_enabled and (not work_username_clean or not password_hash):
         raise HTTPException(
             status_code=400,
             detail="Green/Work-enabled users require login username and password",
         )
+    if login_enabled and bool(send_credentials_email) and not email_clean:
+        raise HTTPException(status_code=400, detail="Email is required to send login credentials")
     row = db.execute(text("""
         INSERT INTO green_users (
             full_name, role, user_uid, organization_id, role_id, email, phone,
@@ -5716,7 +5811,7 @@ def create_user(
         "user_uid": user_uid_value,
         "organization_id": org_id_value,
         "role_id": role_id_value,
-        "email": (email or "").strip() or None,
+        "email": email_clean,
         "phone": (phone or "").strip() or None,
         "allow_green": bool(allow_green),
         "allow_work": bool(allow_work),
@@ -5751,6 +5846,24 @@ def create_user(
     if generated_password:
         payload["generated_password"] = generated_password
         payload["generated_login_username"] = work_username_clean
+    payload["credentials_email_attempted"] = False
+    payload["credentials_email_sent"] = False
+    payload["credentials_email_error"] = None
+    if login_enabled and bool(send_credentials_email) and email_clean and work_username_clean and plain_login_password:
+        payload["credentials_email_attempted"] = True
+        try:
+            _send_new_user_credentials_email(
+                to_email=email_clean,
+                full_name=full_name_clean,
+                organization_name=org_name_value,
+                username=work_username_clean,
+                password=plain_login_password,
+                allow_green=bool(allow_green),
+                allow_work=bool(allow_work),
+            )
+            payload["credentials_email_sent"] = True
+        except Exception as exc:
+            payload["credentials_email_error"] = str(exc)
     return payload
 
 
@@ -6016,6 +6129,136 @@ def delete_user(
     )
     db.commit()
     return {"ok": True, "id": int(deleted_id)}
+
+
+@router.post("/users/{user_id}/reset-password")
+def reset_user_password(
+    user_id: int,
+    db: Session = Depends(get_db),
+    send_credentials_email: bool = Body(default=True),
+    password_length: int = Body(default=12),
+):
+    existing = db.execute(
+        text(
+            """
+            SELECT
+                u.id, u.user_uid, u.full_name, u.role, u.organization_id, u.email,
+                COALESCE(u.allow_green, TRUE) AS allow_green,
+                COALESCE(u.allow_work, FALSE) AS allow_work,
+                COALESCE(u.is_active, TRUE) AS is_active,
+                u.work_username,
+                o.name AS organization_name
+            FROM green_users u
+            LEFT JOIN green_organizations o ON o.id = u.organization_id
+            WHERE u.id = :user_id
+            """
+        ),
+        {"user_id": user_id},
+    ).mappings().first()
+    if not existing:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    allow_green_value = bool(existing.get("allow_green", True))
+    allow_work_value = bool(existing.get("allow_work", False))
+    if not (allow_green_value or allow_work_value):
+        raise HTTPException(status_code=400, detail="User has no Green/Work access enabled")
+
+    user_uid_value = str(existing.get("user_uid") or "").strip()
+    if not user_uid_value:
+        user_uid_value = _ensure_unique_user_uid(db, None, exclude_user_id=user_id)
+
+    login_username = str(existing.get("work_username") or "").strip().lower()
+    if not login_username:
+        login_username = user_uid_value.strip().lower()
+    if not login_username:
+        raise HTTPException(status_code=400, detail="Unable to determine login username")
+
+    clash = db.execute(
+        text(
+            """
+            SELECT id FROM green_users
+            WHERE LOWER(COALESCE(work_username, '')) = LOWER(:work_username)
+              AND id <> :user_id
+            LIMIT 1
+            """
+        ),
+        {"work_username": login_username, "user_id": user_id},
+    ).scalar()
+    if clash:
+        raise HTTPException(status_code=409, detail="Login username already exists on another user")
+
+    generated_password = _generate_temporary_login_password(password_length)
+    password_hash = _hash_password_value(generated_password)
+
+    db.execute(
+        text(
+            """
+            UPDATE green_users
+            SET user_uid = :user_uid,
+                work_username = :work_username,
+                work_password_hash = :work_password_hash,
+                updated_at = NOW()
+            WHERE id = :user_id
+            """
+        ),
+        {
+            "user_id": user_id,
+            "user_uid": user_uid_value,
+            "work_username": login_username,
+            "work_password_hash": password_hash,
+        },
+    )
+
+    _log_audit_event(
+        db,
+        project_id=None,
+        entity_type="user",
+        entity_id=int(user_id),
+        action="user_password_reset",
+        actor="super_admin",
+        details={
+            "user_uid": user_uid_value,
+            "work_username": login_username,
+            "allow_green": allow_green_value,
+            "allow_work": allow_work_value,
+            "send_credentials_email": bool(send_credentials_email),
+        },
+    )
+    db.commit()
+
+    payload = list_users(
+        db=db,
+        include_inactive=True,
+        organization_id=None,
+        role_id=None,
+        user_id_filter=user_id,
+    )[0]
+    payload["generated_password"] = generated_password
+    payload["generated_login_username"] = login_username
+    payload["credentials_email_attempted"] = bool(send_credentials_email)
+    payload["credentials_email_sent"] = False
+    payload["credentials_email_error"] = None
+
+    email_clean = str(existing.get("email") or "").strip()
+    if send_credentials_email:
+        if not email_clean:
+            payload["credentials_email_error"] = "User has no email address"
+        else:
+            try:
+                _send_new_user_credentials_email(
+                    to_email=email_clean,
+                    full_name=str(existing.get("full_name") or ""),
+                    organization_name=str(existing.get("organization_name") or "").strip() or None,
+                    username=login_username,
+                    password=generated_password,
+                    allow_green=allow_green_value,
+                    allow_work=allow_work_value,
+                )
+                payload["credentials_email_sent"] = True
+            except Exception as exc:
+                payload["credentials_email_error"] = str(exc)
+
+    return payload
 
 
 @router.post("/work-auth/login")
