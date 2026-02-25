@@ -461,6 +461,100 @@ def _send_new_user_credentials_email(
         server.send_message(msg)
 
 
+def _send_organization_welcome_email(
+    *,
+    to_email: str,
+    organization_name: str,
+    organization_slug: str | None = None,
+    status: str | None = None,
+    short_name: str | None = None,
+    website_url: str | None = None,
+    contact_phone: str | None = None,
+    country: str | None = None,
+    state_region: str | None = None,
+    city: str | None = None,
+):
+    smtp_host = str(os.getenv("SMTP_HOST") or "").strip()
+    if not smtp_host:
+        raise RuntimeError("SMTP_HOST is not configured")
+    smtp_port = int(str(os.getenv("SMTP_PORT") or "587").strip() or "587")
+    smtp_user = str(os.getenv("SMTP_USERNAME") or "").strip()
+    smtp_pass = str(os.getenv("SMTP_PASSWORD") or "").strip()
+    smtp_from_email = str(os.getenv("SMTP_FROM_EMAIL") or smtp_user or "").strip()
+    smtp_from_name = str(os.getenv("SMTP_FROM_NAME") or "LandCheck").strip()
+    if not smtp_from_email:
+        raise RuntimeError("SMTP_FROM_EMAIL (or SMTP_USERNAME) is not configured")
+    use_ssl = _env_bool("SMTP_USE_SSL", False)
+    use_tls = _env_bool("SMTP_USE_TLS", not use_ssl)
+    green_url = str(os.getenv("LANDCHECK_GREEN_URL") or "").strip() or "https://landcheck.online/green/login"
+    work_url = str(os.getenv("LANDCHECK_WORK_URL") or "").strip() or "https://landcheck.online/green-work/login"
+
+    detail_lines: list[str] = []
+    detail_lines.append(f"Organization: {organization_name}")
+    if short_name:
+        detail_lines.append(f"Short name: {short_name}")
+    if organization_slug:
+        detail_lines.append(f"Slug: {organization_slug}")
+    if status:
+        detail_lines.append(f"Partnership status: {status}")
+    location_parts = [part for part in [city, state_region, country] if str(part or "").strip()]
+    if location_parts:
+        detail_lines.append(f"Location: {', '.join(location_parts)}")
+    if contact_phone:
+        detail_lines.append(f"Contact phone: {contact_phone}")
+    if website_url:
+        detail_lines.append(f"Website: {website_url}")
+
+    body = (
+        f"Hello {organization_name},\n\n"
+        "Welcome to the LandCheck partnership.\n\n"
+        "Your organization has been created on LandCheck and onboarding can begin.\n\n"
+        "Organization details:\n"
+        f"{chr(10).join(f'- {line}' for line in detail_lines)}\n\n"
+        "What LandCheck does:\n"
+        "- LandCheck Green helps field teams capture tree planting and maintenance activities with GPS and photo evidence.\n"
+        "- LandCheck Work helps supervisors assign tasks, review submissions, monitor progress, and export reports.\n"
+        "- The platform supports project-based monitoring for planting, survival tracking, and operational reporting.\n\n"
+        "Next step:\n"
+        "- Your administrator can create staff accounts and share login details for Green and Work.\n\n"
+        "Regards,\n"
+        "Samuel Yohanna\n"
+        "Founder\n"
+        "LandCheck Geospatial Technologies Limited\n"
+        "RC: 9350241\n\n"
+        f"LandCheck Green: {green_url}\n"
+        f"LandCheck Work: {work_url}\n"
+    )
+
+    msg = EmailMessage()
+    msg["Subject"] = f"Welcome to LandCheck Partnership - {organization_name}"
+    msg["From"] = f"{smtp_from_name} <{smtp_from_email}>" if smtp_from_name else smtp_from_email
+    msg["To"] = to_email
+    msg.set_content(body)
+
+    if use_ssl:
+        with smtplib.SMTP_SSL(smtp_host, smtp_port, timeout=20) as server:
+            if smtp_user:
+                server.login(smtp_user, smtp_pass)
+            server.send_message(msg)
+        return
+
+    with smtplib.SMTP(smtp_host, smtp_port, timeout=20) as server:
+        try:
+            server.ehlo()
+        except Exception:
+            pass
+        if use_tls:
+            server.starttls()
+            try:
+                server.ehlo()
+            except Exception:
+                pass
+        if smtp_user:
+            server.login(smtp_user, smtp_pass)
+        server.send_message(msg)
+
+
 def _next_project_tree_no(db: Session, project_id: int) -> int:
     # Lock the project row so concurrent inserts don't issue the same local tree number.
     db.execute(text("SELECT id FROM tree_projects WHERE id = :project_id FOR UPDATE"), {"project_id": int(project_id)})
@@ -3243,6 +3337,28 @@ def create_admin_organization(
         details={"name": org.get("name"), "slug": org.get("slug"), "status": org.get("status")},
     )
     db.commit()
+    org["welcome_email_attempted"] = False
+    org["welcome_email_sent"] = False
+    org["welcome_email_error"] = None
+    org_contact_email = str(org.get("contact_email") or "").strip()
+    if org_contact_email:
+        org["welcome_email_attempted"] = True
+        try:
+            _send_organization_welcome_email(
+                to_email=org_contact_email,
+                organization_name=str(org.get("name") or "Organization"),
+                organization_slug=str(org.get("slug") or "").strip() or None,
+                status=str(org.get("status") or "").strip() or None,
+                short_name=str(org.get("short_name") or "").strip() or None,
+                website_url=str(org.get("website_url") or "").strip() or None,
+                contact_phone=str(org.get("contact_phone") or "").strip() or None,
+                country=str(org.get("country") or "").strip() or None,
+                state_region=str(org.get("state_region") or "").strip() or None,
+                city=str(org.get("city") or "").strip() or None,
+            )
+            org["welcome_email_sent"] = True
+        except Exception as exc:
+            org["welcome_email_error"] = str(exc)
     return org
 
 
