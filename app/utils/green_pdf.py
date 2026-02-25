@@ -112,6 +112,80 @@ def _draw_rounded_box(c, x, y, w, h, r, fill_color=None, stroke_color=None):
     c.restoreState()
 
 
+def _draw_project_logo(c, project: dict, x: float, y: float, size: float) -> float:
+    """Draw organization logo if available and return horizontal space used."""
+    logo_url = str(project.get("organization_logo_url") or "").strip()
+    if not logo_url or size <= 0:
+        return 0
+    reader = _load_photo_reader(logo_url, {})
+    if reader is None:
+        return 0
+    try:
+        c.saveState()
+        c.setFillColorRGB(1, 1, 1)
+        c.setStrokeColorRGB(1, 1, 1)
+        c.roundRect(x, y, size, size, 5, stroke=0, fill=1)
+        c.drawImage(reader, x, y, size, size, preserveAspectRatio=True, anchor="c", mask="auto")
+        c.restoreState()
+        return size + 10
+    except Exception:
+        try:
+            c.restoreState()
+        except Exception:
+            pass
+        return 0
+
+
+def _draw_project_brand_header_bar(
+    c,
+    width: float,
+    height: float,
+    project: dict,
+    *,
+    report_label: str,
+    subtitle: str | None = None,
+    bar_height: float = 80,
+    bar_color: str = "#0b3d24",
+):
+    """Draw report header bar with organization/project branding and logo."""
+    left = 34
+    right = 34
+    top = height
+    bar_h = float(bar_height)
+    c.setFillColor(HexColor(bar_color))
+    c.rect(0, top - bar_h, width, bar_h, stroke=0, fill=1)
+
+    org_name = str(project.get("organization_name") or "").strip()
+    project_name = str(project.get("name") or "").strip() or "Project"
+    heading = org_name or project_name
+    line_parts: list[str] = []
+    if project_name and project_name != heading:
+        line_parts.append(project_name)
+    if report_label:
+        line_parts.append(report_label)
+    line2 = " | ".join(line_parts) if line_parts else (report_label or project_name)
+
+    logo_size = 28 if bar_h <= 72 else 32
+    logo_y = top - bar_h + max((bar_h - logo_size) / 2, 4)
+    logo_dx = _draw_project_logo(c, project, left, logo_y, logo_size)
+    text_x = left + logo_dx
+
+    c.setFillColorRGB(1, 1, 1)
+    c.setFont("Helvetica-Bold", 16 if bar_h <= 72 else 18)
+    c.drawString(text_x, top - 28, heading[:64])
+
+    c.setFont("Helvetica", 9.5)
+    c.setFillColorRGB(0.88, 0.96, 0.9)
+    c.drawString(text_x, top - 43, line2[:96])
+    c.setFont("Helvetica-Oblique", 8)
+    powered_text = f"Powered by LandCheck{f' | {subtitle}' if subtitle else ''}"
+    c.drawString(text_x, top - (58 if bar_h > 72 else 55), powered_text[:120])
+
+    c.setFont("Helvetica", 8.5)
+    c.setFillColorRGB(0.82, 0.95, 0.86)
+    c.drawRightString(width - right, top - 28, datetime.utcnow().strftime("Generated %d %b %Y %H:%M UTC"))
+
+
 def _draw_stat_card(c, x, y, w, h, label, value, sub=None, color=None):
     """Draw a metric card with large value and label."""
     bg = HexColor("#f8faf9") if not color else color
@@ -546,17 +620,15 @@ def _render_photo_appendix_pages(c, width, height, project, photo_rows, assignee
 
 def _render_executive_summary(c, width, height, project, kpi_snapshot, carbon_data, kpi_trend, species_daily_survival=None):
     """Render the Executive Summary page - page 1 of the report."""
-    # Header bar
-    c.setFillColor(HexColor("#0b3d24"))
-    c.rect(0, height - 80, width, 80, stroke=0, fill=1)
-    c.setFillColorRGB(1, 1, 1)
-    c.setFont("Helvetica-Bold", 22)
-    c.drawString(40, height - 42, "LandCheck Green")
-    c.setFont("Helvetica", 11)
-    c.drawString(40, height - 60, "Executive Donor Report")
-    c.setFont("Helvetica", 9)
-    c.setFillColorRGB(0.8, 0.95, 0.85)
-    c.drawRightString(width - 40, height - 42, f"Generated: {datetime.utcnow().strftime('%d %B %Y')}")
+    _draw_project_brand_header_bar(
+        c,
+        width,
+        height,
+        project,
+        report_label="Executive Donor Report",
+        subtitle=None,
+        bar_height=80,
+    )
 
     # Project info
     y = height - 110
@@ -711,7 +783,7 @@ def _render_executive_summary(c, width, height, project, kpi_snapshot, carbon_da
     c.setFont("Helvetica", 7)
     c.setFillColorRGB(0.55, 0.55, 0.55)
     c.drawString(40, 24, "Methodology: IPCC Tier 1 defaults + Chave et al. (2014) pantropical allometric equation")
-    c.drawRightString(width - 40, 24, f"LandCheck Green | {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}")
+    c.drawRightString(width - 40, 24, f"Powered by LandCheck | {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}")
 
 
 def _render_trend_analytics_pages(c, width, height, kpi_snapshot, carbon_data, kpi_trend, species_daily_survival=None):
@@ -834,7 +906,7 @@ def _render_trend_analytics_pages(c, width, height, kpi_snapshot, carbon_data, k
 
     c.setFont("Helvetica", 7)
     c.setFillColorRGB(0.55, 0.55, 0.55)
-    c.drawString(40, 24, "LandCheck Green | Trend Analytics")
+    c.drawString(40, 24, "Powered by LandCheck | Trend Analytics")
     c.drawRightString(width - 40, 24, datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC"))
 
     # -----------------------------------------------------------------
@@ -888,7 +960,7 @@ def _render_trend_analytics_pages(c, width, height, kpi_snapshot, carbon_data, k
 
     c.setFont("Helvetica", 7)
     c.setFillColorRGB(0.55, 0.55, 0.55)
-    c.drawString(40, 24, "LandCheck Green | Carbon Analytics")
+    c.drawString(40, 24, "Powered by LandCheck | Carbon Analytics")
     c.drawRightString(width - 40, 24, datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC"))
 
 
@@ -942,27 +1014,34 @@ def render_green_report_pdf(
     # NEXT PAGE: Tree Records + Maintenance
     # =====================================================================
     c.showPage()
-    c.setFont("Helvetica-Bold", 18)
-    c.drawString(40, height - 50, "LandCheck Green Report")
+    c.setFont("Helvetica-Bold", 16)
+    org_title = str(project.get("organization_name") or "").strip()
+    project_title = str(project.get("name") or "").strip() or "Project"
+    section_heading = org_title or project_title
+    c.drawString(40, height - 50, section_heading[:64])
+    c.setFont("Helvetica", 9)
+    c.setFillColorRGB(0.38, 0.38, 0.38)
+    c.drawString(40, height - 64, f"Project: {project_title} | Tree Records Report | Powered by LandCheck"[:110])
+    c.setFillColorRGB(0, 0, 0)
 
     c.setFont("Helvetica", 11)
-    c.drawString(40, height - 80, f"Project: {project.get('name', '')}")
-    c.drawString(40, height - 98, f"Location: {project.get('location_text', '')}")
-    c.drawString(40, height - 116, f"Sponsor: {project.get('sponsor', '')}")
-    c.drawString(40, height - 134, f"Created: {project.get('created_at', '')}")
+    c.drawString(40, height - 88, f"Project: {project.get('name', '')}")
+    c.drawString(40, height - 106, f"Location: {project.get('location_text', '')}")
+    c.drawString(40, height - 124, f"Sponsor: {project.get('sponsor', '')}")
+    c.drawString(40, height - 142, f"Created: {project.get('created_at', '')}")
 
     stats = project.get("stats", {})
     c.setFont("Helvetica-Bold", 12)
-    c.drawString(40, height - 170, "Summary")
+    c.drawString(40, height - 178, "Summary")
     c.setFont("Helvetica", 10)
-    c.drawString(40, height - 188, f"Total: {stats.get('total', 0)}")
-    c.drawString(120, height - 188, f"Alive: {stats.get('alive', 0)}")
-    c.drawString(200, height - 188, f"Dead: {stats.get('dead', 0)}")
-    c.drawString(280, height - 188, f"Needs Attention: {stats.get('needs_attention', 0)}")
-    c.drawString(420, height - 188, f"Survival: {stats.get('survival_rate', 0)}%")
+    c.drawString(40, height - 196, f"Total: {stats.get('total', 0)}")
+    c.drawString(120, height - 196, f"Alive: {stats.get('alive', 0)}")
+    c.drawString(200, height - 196, f"Dead: {stats.get('dead', 0)}")
+    c.drawString(280, height - 196, f"Needs Attention: {stats.get('needs_attention', 0)}")
+    c.drawString(420, height - 196, f"Survival: {stats.get('survival_rate', 0)}%")
 
     c.setFont("Helvetica-Bold", 12)
-    c.drawString(40, height - 220, "Tree Records + Maintenance (latest 200)")
+    c.drawString(40, height - 228, "Tree Records + Maintenance (latest 200)")
 
     def draw_tree_header(y_pos: float):
         c.setFont("Helvetica-Bold", 8)
@@ -974,7 +1053,7 @@ def render_green_report_pdf(
         c.drawString(344, y_pos, "Maint Type(s)")
         c.drawString(474, y_pos, "Last Maint Date")
 
-    y = height - 240
+    y = height - 248
     draw_tree_header(y)
     y -= 12
     c.setFont("Helvetica", 7.5)
@@ -1305,13 +1384,20 @@ def render_green_work_report_pdf(output_path: str, project: dict, stats: dict):
     c = canvas.Canvas(output_path, pagesize=A4)
     width, height = A4
 
-    c.setFont("Helvetica-Bold", 18)
-    c.drawString(40, height - 50, "LandCheck Work Report")
+    _draw_project_brand_header_bar(
+        c,
+        width,
+        height,
+        project,
+        report_label="Work Report",
+        subtitle="Assignments, progress, and maintenance operations summary",
+        bar_height=80,
+    )
 
     c.setFont("Helvetica", 11)
-    c.drawString(40, height - 80, f"Project: {project.get('name', '')}")
-    c.drawString(40, height - 98, f"Location: {project.get('location_text', '')}")
-    c.drawString(40, height - 116, f"Sponsor: {project.get('sponsor', '')}")
+    c.drawString(40, height - 92, f"Project: {project.get('name', '')}")
+    c.drawString(40, height - 110, f"Location: {project.get('location_text', '')}")
+    c.drawString(40, height - 128, f"Sponsor: {project.get('sponsor', '')}")
 
     maintenance_by_assignee = {
         str(r.get("assignee_name", "")): dict(r)
@@ -1346,9 +1432,9 @@ def render_green_work_report_pdf(output_path: str, project: dict, stats: dict):
         row["last_maintenance_date"] = extra.get("last_maintenance_date", row.get("last_maintenance_date"))
 
     c.setFont("Helvetica-Bold", 12)
-    c.drawString(40, height - 150, "Assignee Summary + Maintenance")
+    c.drawString(40, height - 162, "Assignee Summary + Maintenance")
 
-    y = height - 170
+    y = height - 182
     c.setFont("Helvetica-Bold", 8)
     c.drawString(40, y, "Assignee")
     c.drawString(130, y, "Orders")
@@ -1442,16 +1528,15 @@ def render_green_custodian_report_pdf(
     width, height = A4
 
     def draw_report_header(subtitle: str):
-        c.setFillColor(HexColor("#0b3d24"))
-        c.rect(0, height - 70, width, 70, stroke=0, fill=1)
-        c.setFillColorRGB(1, 1, 1)
-        c.setFont("Helvetica-Bold", 18)
-        c.drawString(34, height - 40, "LandCheck Custodian Report")
-        c.setFont("Helvetica", 10)
-        c.drawString(34, height - 56, subtitle)
-        c.setFont("Helvetica", 8.5)
-        c.setFillColorRGB(0.82, 0.95, 0.86)
-        c.drawRightString(width - 34, height - 40, datetime.utcnow().strftime("Generated %d %b %Y %H:%M UTC"))
+        _draw_project_brand_header_bar(
+            c,
+            width,
+            height,
+            project,
+            report_label="Custodian Report",
+            subtitle=subtitle,
+            bar_height=70,
+        )
 
     def reset_text():
         c.setFillColorRGB(0.12, 0.12, 0.12)
@@ -1698,16 +1783,15 @@ def render_green_existing_trees_report_pdf(
     # ------------------------------------------------------------------
     # PAGE 1: Executive summary for Existing Trees + CO2
     # ------------------------------------------------------------------
-    c.setFillColor(HexColor("#0b3d24"))
-    c.rect(0, height - 78, width, 78, stroke=0, fill=1)
-    c.setFillColorRGB(1, 1, 1)
-    c.setFont("Helvetica-Bold", 20)
-    c.drawString(34, height - 42, "LandCheck Existing Trees Report")
-    c.setFont("Helvetica", 10)
-    c.drawString(34, height - 59, "Detailed existing-tree inventory with per-tree CO2 estimates and optional photo appendix")
-    c.setFont("Helvetica", 8.5)
-    c.setFillColorRGB(0.82, 0.95, 0.86)
-    c.drawRightString(width - 34, height - 42, datetime.utcnow().strftime("Generated %d %b %Y %H:%M UTC"))
+    _draw_project_brand_header_bar(
+        c,
+        width,
+        height,
+        project,
+        report_label="Existing Trees Report",
+        subtitle="Detailed existing-tree inventory with per-tree CO2 estimates and optional photo appendix",
+        bar_height=78,
+    )
 
     c.setFillColorRGB(0.12, 0.12, 0.12)
     c.setFont("Helvetica-Bold", 12)
@@ -1807,7 +1891,7 @@ def render_green_existing_trees_report_pdf(
 
     c.setFont("Helvetica", 7)
     c.setFillColorRGB(0.55, 0.55, 0.55)
-    c.drawString(34, 24, "LandCheck Green | Existing Trees Detailed Export")
+    c.drawString(34, 24, "Powered by LandCheck | Existing Trees Detailed Export")
     c.drawRightString(width - 34, 24, f"Rows: {len(rows)}")
 
     # ------------------------------------------------------------------
