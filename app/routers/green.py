@@ -6512,7 +6512,9 @@ def work_auth_login(
                 COALESCE(u.is_active, TRUE) AS is_active,
                 u.work_username, u.work_password_hash,
                 u.organization_id,
-                o.name AS organization_name, o.slug AS organization_slug, o.logo_url AS organization_logo_url,
+                o.name AS organization_name, o.slug AS organization_slug, o.status AS organization_status,
+                COALESCE(o.is_active, TRUE) AS organization_is_active,
+                o.logo_url AS organization_logo_url,
                 r.role_key, r.role_name, r.role_uid
             FROM green_users u
             LEFT JOIN green_organizations o ON o.id = u.organization_id
@@ -6535,6 +6537,11 @@ def work_auth_login(
         raise HTTPException(status_code=403, detail="This user is not enabled for LandCheck Work")
     if user_row.get("organization_id") is None:
         raise HTTPException(status_code=403, detail="This user is not linked to an organization")
+    if not bool(user_row.get("organization_is_active", True)):
+        raise HTTPException(status_code=403, detail="This organization is inactive")
+    org_status = _normalize_name(user_row.get("organization_status"))
+    if org_status == "suspended":
+        raise HTTPException(status_code=403, detail="This organization is suspended")
     if not _verify_password_value(password, user_row.get("work_password_hash")):
         raise HTTPException(status_code=401, detail="Invalid username or password")
 
@@ -6555,6 +6562,8 @@ def work_auth_login(
             "organization_id": user_row.get("organization_id"),
             "organization_name": user_row.get("organization_name"),
             "organization_slug": user_row.get("organization_slug"),
+            "organization_status": user_row.get("organization_status"),
+            "organization_is_active": bool(user_row.get("organization_is_active", True)),
             "organization_logo_url": user_row.get("organization_logo_url"),
         },
     }
@@ -6606,7 +6615,9 @@ def green_auth_login(
                 COALESCE(u.is_active, TRUE) AS is_active,
                 u.work_username, u.work_password_hash,
                 u.organization_id,
-                o.name AS organization_name, o.slug AS organization_slug, o.logo_url AS organization_logo_url,
+                o.name AS organization_name, o.slug AS organization_slug, o.status AS organization_status,
+                COALESCE(o.is_active, TRUE) AS organization_is_active,
+                o.logo_url AS organization_logo_url,
                 r.role_key, r.role_name, r.role_uid
             FROM green_users u
             LEFT JOIN green_organizations o ON o.id = u.organization_id
@@ -6629,6 +6640,11 @@ def green_auth_login(
         raise HTTPException(status_code=403, detail="This user is not enabled for LandCheck Green")
     if user_row.get("organization_id") is None:
         raise HTTPException(status_code=403, detail="This user is not linked to an organization")
+    if not bool(user_row.get("organization_is_active", True)):
+        raise HTTPException(status_code=403, detail="This organization is inactive")
+    org_status = _normalize_name(user_row.get("organization_status"))
+    if org_status == "suspended":
+        raise HTTPException(status_code=403, detail="This organization is suspended")
     if not _verify_password_value(password, user_row.get("work_password_hash")):
         raise HTTPException(status_code=401, detail="Invalid username or password")
 
@@ -6649,6 +6665,8 @@ def green_auth_login(
             "organization_id": user_row.get("organization_id"),
             "organization_name": user_row.get("organization_name"),
             "organization_slug": user_row.get("organization_slug"),
+            "organization_status": user_row.get("organization_status"),
+            "organization_is_active": bool(user_row.get("organization_is_active", True)),
             "organization_logo_url": user_row.get("organization_logo_url"),
         },
     }
