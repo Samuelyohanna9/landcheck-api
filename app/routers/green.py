@@ -6261,6 +6261,95 @@ def reset_user_password(
     return payload
 
 
+@router.post("/auth/change-password")
+def change_own_password(
+    db: Session = Depends(get_db),
+    user_id: int = Body(...),
+    current_password: str = Body(...),
+    new_password: str = Body(...),
+    app: str | None = Body(default=None),
+):
+    try:
+        user_id_value = int(user_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid user id")
+    if user_id_value <= 0:
+        raise HTTPException(status_code=400, detail="Password change is not available for this account")
+
+    current_password_value = str(current_password or "")
+    new_password_value = str(new_password or "")
+    if not current_password_value:
+        raise HTTPException(status_code=400, detail="Current password is required")
+    if not new_password_value:
+        raise HTTPException(status_code=400, detail="New password is required")
+
+    app_scope = str(app or "").strip().lower()
+    if app_scope not in {"", "green", "work"}:
+        raise HTTPException(status_code=400, detail="Invalid app scope")
+
+    user_row = db.execute(
+        text(
+            """
+            SELECT
+                u.id, u.user_uid, u.full_name, u.work_username, u.work_password_hash,
+                COALESCE(u.allow_green, TRUE) AS allow_green,
+                COALESCE(u.allow_work, FALSE) AS allow_work,
+                COALESCE(u.is_active, TRUE) AS is_active,
+                u.organization_id
+            FROM green_users u
+            WHERE u.id = :user_id
+            LIMIT 1
+            """
+        ),
+        {"user_id": user_id_value},
+    ).mappings().first()
+    if not user_row:
+        raise HTTPException(status_code=404, detail="User not found")
+    if not bool(user_row.get("is_active", True)):
+        raise HTTPException(status_code=403, detail="User account is inactive")
+    if user_row.get("organization_id") is None:
+        raise HTTPException(status_code=403, detail="This user is not linked to an organization")
+    if app_scope == "green" and not bool(user_row.get("allow_green", True)):
+        raise HTTPException(status_code=403, detail="This user is not enabled for LandCheck Green")
+    if app_scope == "work" and not bool(user_row.get("allow_work", False)):
+        raise HTTPException(status_code=403, detail="This user is not enabled for LandCheck Work")
+
+    stored_hash = user_row.get("work_password_hash")
+    if not _verify_password_value(current_password_value, stored_hash):
+        raise HTTPException(status_code=401, detail="Current password is incorrect")
+    if _verify_password_value(new_password_value, stored_hash):
+        raise HTTPException(status_code=400, detail="New password must be different from the current password")
+
+    next_hash = _hash_password_value(new_password_value)
+    db.execute(
+        text(
+            """
+            UPDATE green_users
+            SET work_password_hash = :work_password_hash,
+                updated_at = NOW()
+            WHERE id = :user_id
+            """
+        ),
+        {"user_id": user_id_value, "work_password_hash": next_hash},
+    )
+
+    actor_label = str(user_row.get("user_uid") or user_row.get("work_username") or f"user:{user_id_value}")
+    _log_audit_event(
+        db,
+        project_id=None,
+        entity_type="user",
+        entity_id=user_id_value,
+        action="user_password_changed_self",
+        actor=actor_label,
+        details={
+            "app": app_scope or None,
+            "work_username": user_row.get("work_username"),
+        },
+    )
+    db.commit()
+    return {"ok": True}
+
+
 @router.post("/work-auth/login")
 def work_auth_login(
     db: Session = Depends(get_db),
