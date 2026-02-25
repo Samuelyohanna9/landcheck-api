@@ -122,10 +122,21 @@ def _draw_project_logo(c, project: dict, x: float, y: float, size: float) -> flo
         return 0
     try:
         c.saveState()
-        c.setFillColorRGB(1, 1, 1)
-        c.setStrokeColorRGB(1, 1, 1)
-        c.roundRect(x, y, size, size, 5, stroke=0, fill=1)
-        c.drawImage(reader, x, y, size, size, preserveAspectRatio=True, anchor="c", mask="auto")
+        c.setFillColorRGB(0.05, 0.05, 0.05)
+        c.setStrokeColorRGB(0.88, 0.95, 0.9)
+        c.setLineWidth(0.4)
+        c.roundRect(x, y, size, size, 5, stroke=1, fill=1)
+        pad = max(1.5, size * 0.06)
+        c.drawImage(
+            reader,
+            x + pad,
+            y + pad,
+            max(size - (pad * 2), 2),
+            max(size - (pad * 2), 2),
+            preserveAspectRatio=True,
+            anchor="c",
+            mask="auto",
+        )
         c.restoreState()
         return size + 10
     except Exception:
@@ -1882,7 +1893,6 @@ def render_green_existing_trees_report_pdf(
     notes = [
         f"Projection years: {int(summary.get('projection_years', 40) or 40)} (modeled future growth for living trees in carbon scope).",
         "Current CO2 uses measured tree height (tree_height_m) when available; otherwise the species growth model estimates height.",
-        "Rows with count_in_carbon_scope = false remain listed for traceability but CO2 values are reported as 0 in this export.",
     ]
     for note in notes:
         for line in _wrap_text(note, "Helvetica", 7.4, width - 68):
