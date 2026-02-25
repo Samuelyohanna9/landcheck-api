@@ -508,15 +508,14 @@ def _send_organization_welcome_email(
     body = (
         f"Hello {organization_name},\n\n"
         "Welcome to the LandCheck partnership.\n\n"
-        "Your organization has been created on LandCheck and onboarding can begin.\n\n"
+        "Your organization has been created on LandCheck and onboarding has been completed.\n\n"
         "Organization details:\n"
         f"{chr(10).join(f'- {line}' for line in detail_lines)}\n\n"
         "What LandCheck does:\n"
         "- LandCheck Green helps field teams capture tree planting and maintenance activities with GPS and photo evidence.\n"
         "- LandCheck Work helps supervisors assign tasks, review submissions, monitor progress, and export reports.\n"
         "- The platform supports project-based monitoring for planting, survival tracking, and operational reporting.\n\n"
-        "Next step:\n"
-        "- Your administrator can create staff accounts and share login details for Green and Work.\n\n"
+        "We value your commitment to environmental stewardship and climate action. Welcome onboard!\n\n"
         "Regards,\n"
         "Samuel Yohanna\n"
         "Founder\n"
@@ -524,6 +523,7 @@ def _send_organization_welcome_email(
         "RC: 9350241\n\n"
         f"LandCheck Green: {green_url}\n"
         f"LandCheck Work: {work_url}\n"
+        "WhatsApp: +49 1776732638\n"
     )
 
     msg = EmailMessage()
