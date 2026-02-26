@@ -1841,7 +1841,7 @@ def render_green_existing_trees_report_pdf(
         c, 34 + card_w + 10, card_y, card_w, card_h,
         "Current CO2 (t)",
         _fmt_num(summary.get("current_co2_tonnes", 0), 3),
-        sub="Height-aware current stock where available",
+        sub="current stock",
         color=HexColor("#f3faf5"),
     )
     _draw_stat_card(
