@@ -1902,6 +1902,7 @@ def ensure_green_tables(db: Session):
             status TEXT NOT NULL DEFAULT 'alive',
             notes TEXT,
             photo_url TEXT,
+            photo_urls JSONB,
             created_by TEXT,
             tree_origin TEXT NOT NULL DEFAULT 'new_planting',
             custodian_id INTEGER,
@@ -1912,6 +1913,9 @@ def ensure_green_tables(db: Session):
             source_project_id INTEGER REFERENCES tree_projects(id) ON DELETE SET NULL,
             tree_height_m NUMERIC,
             tree_age_months NUMERIC,
+            inventory_tree_count INTEGER NOT NULL DEFAULT 1,
+            existing_area_geojson JSONB,
+            existing_area_sqm NUMERIC,
             created_at TIMESTAMP DEFAULT NOW()
         )
     """))
@@ -2003,6 +2007,10 @@ def ensure_green_tables(db: Session):
         db.execute(text("ALTER TABLE trees ADD COLUMN IF NOT EXISTS tree_height_m NUMERIC"))
         db.execute(text("ALTER TABLE trees ADD COLUMN IF NOT EXISTS tree_age_months NUMERIC"))
         db.execute(text("ALTER TABLE trees ADD COLUMN IF NOT EXISTS project_tree_no INTEGER"))
+        db.execute(text("ALTER TABLE trees ADD COLUMN IF NOT EXISTS photo_urls JSONB"))
+        db.execute(text("ALTER TABLE trees ADD COLUMN IF NOT EXISTS inventory_tree_count INTEGER NOT NULL DEFAULT 1"))
+        db.execute(text("ALTER TABLE trees ADD COLUMN IF NOT EXISTS existing_area_geojson JSONB"))
+        db.execute(text("ALTER TABLE trees ADD COLUMN IF NOT EXISTS existing_area_sqm NUMERIC"))
     except Exception:
         db.rollback()
     try:
@@ -2830,12 +2838,29 @@ async def upload_photo_to_r2(
     linked_task_id = None
 
     if tree_id is not None:
+        tree_row = db.execute(
+            text(
+                """
+                SELECT id, photo_urls
+                FROM trees
+                WHERE id = :tree_id
+                """
+            ),
+            {"tree_id": tree_id},
+        ).mappings().first()
+        if not tree_row:
+            db.rollback()
+            raise HTTPException(status_code=404, detail="Tree not found for photo link.")
+        merged_tree_urls = _normalize_photo_urls(tree_row.get("photo_urls"))
+        if proxy_url not in merged_tree_urls:
+            merged_tree_urls.append(proxy_url)
         linked_tree_id = db.execute(text("""
             UPDATE trees
-            SET photo_url = :photo_url
+            SET photo_url = :photo_url,
+                photo_urls = CAST(:photo_urls AS JSONB)
             WHERE id = :tree_id
             RETURNING id
-        """), {"photo_url": proxy_url, "tree_id": tree_id}).scalar()
+        """), {"photo_url": proxy_url, "photo_urls": _safe_json(merged_tree_urls), "tree_id": tree_id}).scalar()
         if not linked_tree_id:
             db.rollback()
             raise HTTPException(status_code=404, detail="Tree not found for photo link.")
@@ -2900,11 +2925,19 @@ async def upload_photo_to_r2(
             raise HTTPException(status_code=404, detail="Task not found for photo link.")
         linked_task_id = task_row["id"]
         linked_tree_id = task_row["tree_id"]
+        existing_tree_photo_urls = db.execute(
+            text("SELECT photo_urls FROM trees WHERE id = :tree_id"),
+            {"tree_id": linked_tree_id},
+        ).scalar()
+        merged_tree_urls = _normalize_photo_urls(existing_tree_photo_urls)
+        if proxy_url not in merged_tree_urls:
+            merged_tree_urls.append(proxy_url)
         db.execute(text("""
             UPDATE trees
-            SET photo_url = :photo_url
+            SET photo_url = :photo_url,
+                photo_urls = CAST(:photo_urls AS JSONB)
             WHERE id = :tree_id
-        """), {"photo_url": proxy_url, "tree_id": linked_tree_id})
+        """), {"photo_url": proxy_url, "photo_urls": _safe_json(merged_tree_urls), "tree_id": linked_tree_id})
         db.commit()
 
     return {
@@ -3769,7 +3802,7 @@ def get_project(project_id: int, db: Session = Depends(get_db)):
 
     # Carbon summary
     tree_rows_for_carbon = db.execute(text("""
-        SELECT id, species, planting_date, status, created_at, tree_age_months
+        SELECT id, species, planting_date, status, created_at, tree_age_months, COALESCE(inventory_tree_count, 1) AS inventory_tree_count
         FROM trees
         WHERE project_id = :project_id
           AND COALESCE(count_in_carbon_scope, TRUE) = TRUE
@@ -3866,6 +3899,7 @@ def list_trees(project_id: int, db: Session = Depends(get_db)):
                t.status,
                t.notes,
                t.photo_url,
+               t.photo_urls,
                t.created_by,
                t.created_at,
                t.tree_origin,
@@ -3878,6 +3912,9 @@ def list_trees(project_id: int, db: Session = Depends(get_db)):
                t.source_project_id,
                t.tree_height_m,
                t.tree_age_months,
+               COALESCE(t.inventory_tree_count, 1) AS inventory_tree_count,
+               t.existing_area_geojson,
+               t.existing_area_sqm,
                ST_X(geom) AS lng, ST_Y(geom) AS lat
         FROM trees t
         LEFT JOIN green_custodians c ON c.id = t.custodian_id
@@ -5017,7 +5054,7 @@ def carbon_summary(project_id: int, projection_years: int = Query(default=40), d
         raise HTTPException(status_code=404, detail="Project not found")
 
     tree_rows = db.execute(text("""
-        SELECT id, species, planting_date, status, created_at, tree_age_months
+        SELECT id, species, planting_date, status, created_at, tree_age_months, COALESCE(inventory_tree_count, 1) AS inventory_tree_count
         FROM trees
         WHERE project_id = :project_id
           AND COALESCE(count_in_carbon_scope, TRUE) = TRUE
@@ -5038,7 +5075,7 @@ def carbon_projection(project_id: int, years: int = Query(default=30), db: Sessi
         raise HTTPException(status_code=404, detail="Project not found")
 
     tree_rows = db.execute(text("""
-        SELECT id, species, planting_date, status, created_at, tree_age_months
+        SELECT id, species, planting_date, status, created_at, tree_age_months, COALESCE(inventory_tree_count, 1) AS inventory_tree_count
         FROM trees
         WHERE project_id = :project_id
           AND COALESCE(count_in_carbon_scope, TRUE) = TRUE
@@ -5052,7 +5089,8 @@ def carbon_projection(project_id: int, years: int = Query(default=30), db: Sessi
 def tree_carbon(tree_id: int, db: Session = Depends(get_db)):
     """Get CO2 estimate for a single tree."""
     tree = db.execute(text("""
-        SELECT id, species, planting_date, status, created_at, tree_height_m, tree_age_months, count_in_carbon_scope
+        SELECT id, species, planting_date, status, created_at, tree_height_m, tree_age_months, count_in_carbon_scope,
+               COALESCE(inventory_tree_count, 1) AS inventory_tree_count
         FROM trees
         WHERE id = :tree_id
     """), {"tree_id": tree_id}).mappings().first()
@@ -5077,6 +5115,7 @@ def tree_carbon(tree_id: int, db: Session = Depends(get_db)):
         "co2_height_source": metrics.get("co2_height_source", "modeled_height"),
         "tree_height_m": tree.get("tree_height_m"),
         "tree_age_months": tree.get("tree_age_months"),
+        "inventory_tree_count": metrics.get("inventory_tree_count", 1),
         "methodology": metrics.get("co2_methodology", "Chave et al. (2014) pantropical allometric equation"),
     }
 
@@ -5098,6 +5137,7 @@ def add_tree(
     status: str = Body(default="alive"),
     notes: str = Body(default=""),
     photo_url: str = Body(default=""),
+    photo_urls: list[str] | None = Body(default=None),
     created_by: str = Body(default=""),
     tree_origin: str = Body(default="new_planting"),
     custodian_id: int | None = Body(default=None),
@@ -5108,6 +5148,8 @@ def add_tree(
     source_project_id: int | None = Body(default=None),
     tree_height_m: float | None = Body(default=None),
     tree_age_months: float | None = Body(default=None),
+    inventory_tree_count: int | None = Body(default=None),
+    existing_area_geojson: dict | str | None = Body(default=None),
 ):
     project_settings = _get_project_settings(db, int(project_id))
     origin = _normalize_tree_origin(tree_origin)
@@ -5133,6 +5175,47 @@ def add_tree(
             raise HTTPException(status_code=400, detail="tree_age_months must be between 0 and 2400")
     else:
         tree_age_months_value = None
+
+    try:
+        inventory_tree_count_value = int(inventory_tree_count) if inventory_tree_count is not None else 1
+    except Exception:
+        raise HTTPException(status_code=400, detail="inventory_tree_count must be a whole number")
+    if inventory_tree_count_value < 1 or inventory_tree_count_value > 1000000:
+        raise HTTPException(status_code=400, detail="inventory_tree_count must be between 1 and 1000000")
+
+    normalized_existing_area_geojson = _normalize_work_area_geojson(existing_area_geojson)
+    if origin != "existing_inventory":
+        if normalized_existing_area_geojson is not None:
+            raise HTTPException(status_code=400, detail="existing_area_geojson is only allowed for Existing Tree records")
+        inventory_tree_count_value = 1
+    else:
+        if inventory_tree_count_value > 1 and normalized_existing_area_geojson is None:
+            raise HTTPException(
+                status_code=400,
+                detail="Draw a polygon area when capturing more than one existing tree in a single record",
+            )
+
+    existing_area_sqm_value = None
+    if normalized_existing_area_geojson is not None:
+        try:
+            existing_area_sqm_value = float(
+                db.execute(
+                    text(
+                        """
+                        SELECT ST_Area(
+                            ST_Transform(
+                                ST_SetSRID(ST_GeomFromGeoJSON(:geojson), 4326),
+                                3857
+                            )
+                        )
+                        """
+                    ),
+                    {"geojson": _safe_json(normalized_existing_area_geojson)},
+                ).scalar()
+                or 0.0
+            )
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid existing_area_geojson")
 
     resolved_scope, planting_scope_flag, carbon_scope_flag = _resolve_tree_scope_defaults(
         tree_origin=origin,
@@ -5174,13 +5257,15 @@ def add_tree(
     # New planting is supervisor-reviewed first; tree remains pending until approval.
     normalized_status = "pending_planting" if origin == "new_planting" else requested_status
     created_by_clean = (created_by or "").strip()
+    normalized_photo_url, normalized_photo_urls = _merge_photo_evidence(photo_url, photo_urls)
     reported_status = requested_status if requested_status != "pending_planting" else "alive"
     project_tree_no = _next_project_tree_no(db, int(project_id))
     row = db.execute(text("""
         INSERT INTO trees (
-            project_id, project_tree_no, geom, species, planting_date, status, notes, photo_url, created_by,
+            project_id, project_tree_no, geom, species, planting_date, status, notes, photo_url, photo_urls, created_by,
             tree_origin, custodian_id, custody_started_at, attribution_scope,
-            count_in_planting_kpis, count_in_carbon_scope, source_project_id, tree_height_m, tree_age_months
+            count_in_planting_kpis, count_in_carbon_scope, source_project_id, tree_height_m, tree_age_months,
+            inventory_tree_count, existing_area_geojson, existing_area_sqm
         )
         VALUES (
             :project_id,
@@ -5191,6 +5276,7 @@ def add_tree(
             :status,
             :notes,
             :photo_url,
+            CAST(:photo_urls AS JSONB),
             :created_by,
             :tree_origin,
             :custodian_id,
@@ -5200,7 +5286,10 @@ def add_tree(
             :count_in_carbon_scope,
             :source_project_id,
             :tree_height_m,
-            :tree_age_months
+            :tree_age_months,
+            :inventory_tree_count,
+            CAST(:existing_area_geojson AS JSONB),
+            :existing_area_sqm
         )
         RETURNING id
     """), {
@@ -5212,7 +5301,8 @@ def add_tree(
         "planting_date": planting_date,
         "status": normalized_status,
         "notes": notes or None,
-        "photo_url": photo_url or None,
+        "photo_url": normalized_photo_url,
+        "photo_urls": _safe_json(normalized_photo_urls),
         "created_by": created_by_clean or None,
         "tree_origin": origin,
         "custodian_id": custodian_id_value,
@@ -5223,6 +5313,9 @@ def add_tree(
         "source_project_id": source_project_id_value,
         "tree_height_m": tree_height_value,
         "tree_age_months": tree_age_months_value,
+        "inventory_tree_count": inventory_tree_count_value,
+        "existing_area_geojson": _safe_json(normalized_existing_area_geojson),
+        "existing_area_sqm": existing_area_sqm_value,
     }).scalar()
 
     _record_tree_status_history(
@@ -5330,6 +5423,10 @@ def add_tree(
             "source_project_id": source_project_id_value,
             "tree_height_m": tree_height_value,
             "tree_age_months": tree_age_months_value,
+            "inventory_tree_count": inventory_tree_count_value,
+            "existing_area_geojson": normalized_existing_area_geojson,
+            "existing_area_sqm": existing_area_sqm_value,
+            "photo_urls_count": len(normalized_photo_urls),
             "project_tree_no": project_tree_no,
             "review_task_id": int(review_task_id) if review_task_id else None,
             "auto_first_cycle_task_ids": auto_first_cycle_task_ids,
@@ -5355,6 +5452,7 @@ def update_tree(
     status: str | None = Body(default=None),
     notes: str | None = Body(default=None),
     photo_url: str | None = Body(default=None),
+    photo_urls: list[str] | None = Body(default=None),
     actor_name: str | None = Body(default=None),
     tree_origin: str | None = Body(default=None),
     custodian_id: int | None = Body(default=None),
@@ -5365,6 +5463,8 @@ def update_tree(
     source_project_id: int | None = Body(default=None),
     tree_height_m: float | None = Body(default=None),
     tree_age_months: float | None = Body(default=None),
+    inventory_tree_count: int | None = Body(default=None),
+    existing_area_geojson: dict | str | None = Body(default=None),
 ):
     normalized_status = _normalize_tree_status(status) if status is not None else None
     if normalized_status is not None and normalized_status not in TREE_STATUS_VALUES:
@@ -5418,6 +5518,7 @@ def update_tree(
                 status,
                 notes,
                 photo_url,
+                photo_urls,
                 tree_origin,
                 custodian_id,
                 custody_started_at,
@@ -5426,7 +5527,10 @@ def update_tree(
                 count_in_carbon_scope,
                 source_project_id,
                 tree_height_m,
-                tree_age_months
+                tree_age_months,
+                COALESCE(inventory_tree_count, 1) AS inventory_tree_count,
+                existing_area_geojson,
+                existing_area_sqm
             FROM trees
             WHERE id = :tree_id
             """
@@ -5470,6 +5574,59 @@ def update_tree(
         project_existing_scope=project_settings.get("default_existing_tree_scope"),
     )
 
+    if origin_for_scope != "existing_inventory":
+        if inventory_tree_count_value is not None and inventory_tree_count_value != 1:
+            raise HTTPException(status_code=400, detail="inventory_tree_count > 1 is only allowed for Existing Tree records")
+        if normalized_existing_area_geojson is not None:
+            raise HTTPException(status_code=400, detail="existing_area_geojson is only allowed for Existing Tree records")
+        inventory_tree_count_value = 1 if inventory_tree_count is not None else None
+    else:
+        next_inventory_count = (
+            inventory_tree_count_value
+            if inventory_tree_count_value is not None
+            else max(int(existing.get("inventory_tree_count") or 1), 1)
+        )
+        next_area_geojson = normalized_existing_area_geojson if existing_area_geojson is not None else existing.get("existing_area_geojson")
+        if next_inventory_count > 1 and not next_area_geojson:
+            raise HTTPException(
+                status_code=400,
+                detail="Draw a polygon area when capturing more than one existing tree in a single record",
+            )
+
+    effective_existing_area_geojson = (
+        normalized_existing_area_geojson if existing_area_geojson is not None else existing.get("existing_area_geojson")
+    )
+    existing_area_sqm_value = None
+    if existing_area_geojson is not None and normalized_existing_area_geojson is not None:
+        try:
+            existing_area_sqm_value = float(
+                db.execute(
+                    text(
+                        """
+                        SELECT ST_Area(
+                            ST_Transform(
+                                ST_SetSRID(ST_GeomFromGeoJSON(:geojson), 4326),
+                                3857
+                            )
+                        )
+                        """
+                    ),
+                    {"geojson": _safe_json(normalized_existing_area_geojson)},
+                ).scalar()
+                or 0.0
+            )
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid existing_area_geojson")
+
+    effective_photo_url = None
+    effective_photo_urls_json = None
+    if photo_url is not None or photo_urls is not None:
+        base_photo_url = photo_url if photo_url is not None else str(existing.get("photo_url") or "")
+        base_photo_urls = photo_urls if photo_urls is not None else existing.get("photo_urls")
+        merged_photo_url, merged_photo_urls = _merge_photo_evidence(base_photo_url, base_photo_urls)
+        effective_photo_url = merged_photo_url
+        effective_photo_urls_json = _safe_json(merged_photo_urls)
+
     db.execute(text("""
         UPDATE trees
         SET species = COALESCE(:species, species),
@@ -5477,6 +5634,7 @@ def update_tree(
             status = COALESCE(:status, status),
             notes = COALESCE(:notes, notes),
             photo_url = COALESCE(:photo_url, photo_url),
+            photo_urls = COALESCE(CAST(:photo_urls AS JSONB), photo_urls),
             tree_origin = COALESCE(:tree_origin, tree_origin),
             custodian_id = COALESCE(:custodian_id, custodian_id),
             custody_started_at = COALESCE(:custody_started_at, custody_started_at),
@@ -5485,14 +5643,18 @@ def update_tree(
             count_in_carbon_scope = COALESCE(:count_in_carbon_scope, count_in_carbon_scope),
             source_project_id = COALESCE(:source_project_id, source_project_id),
             tree_height_m = COALESCE(:tree_height_m, tree_height_m),
-            tree_age_months = COALESCE(:tree_age_months, tree_age_months)
+            tree_age_months = COALESCE(:tree_age_months, tree_age_months),
+            inventory_tree_count = COALESCE(:inventory_tree_count, inventory_tree_count),
+            existing_area_geojson = COALESCE(CAST(:existing_area_geojson AS JSONB), existing_area_geojson),
+            existing_area_sqm = COALESCE(:existing_area_sqm, existing_area_sqm)
         WHERE id = :tree_id
     """), {
         "species": species,
         "planting_date": planting_date,
         "status": normalized_status,
         "notes": notes,
-        "photo_url": photo_url,
+        "photo_url": effective_photo_url,
+        "photo_urls": effective_photo_urls_json,
         "tree_origin": normalized_origin,
         "custodian_id": custodian_id_value,
         "custody_started_at": custody_started_at,
@@ -5502,6 +5664,9 @@ def update_tree(
         "source_project_id": source_project_id_value,
         "tree_height_m": tree_height_value,
         "tree_age_months": tree_age_months_value,
+        "inventory_tree_count": inventory_tree_count_value,
+        "existing_area_geojson": _safe_json(normalized_existing_area_geojson) if existing_area_geojson is not None else None,
+        "existing_area_sqm": existing_area_sqm_value,
         "tree_id": tree_id,
     })
     previous_status = _normalize_tree_status(existing.get("status"))
@@ -5530,7 +5695,12 @@ def update_tree(
                 "planting_date": planting_date if planting_date is not None else existing.get("planting_date"),
                 "status": normalized_status if normalized_status is not None else existing.get("status"),
                 "notes": notes if notes is not None else existing.get("notes"),
-                "photo_url": photo_url if photo_url is not None else existing.get("photo_url"),
+                "photo_url": effective_photo_url if (photo_url is not None or photo_urls is not None) else existing.get("photo_url"),
+                "photo_urls": (
+                    _normalize_photo_urls(effective_photo_urls_json)
+                    if (photo_url is not None or photo_urls is not None)
+                    else _normalize_photo_urls(existing.get("photo_urls"))
+                ),
                 "tree_origin": normalized_origin if normalized_origin is not None else existing.get("tree_origin"),
                 "custodian_id": custodian_id_value if custodian_id is not None else existing.get("custodian_id"),
                 "custody_started_at": custody_started_at if custody_started_at is not None else existing.get("custody_started_at"),
@@ -5552,6 +5722,15 @@ def update_tree(
                 "source_project_id": source_project_id_value if source_project_id is not None else existing.get("source_project_id"),
                 "tree_height_m": tree_height_value if tree_height_m is not None else existing.get("tree_height_m"),
                 "tree_age_months": tree_age_months_value if tree_age_months is not None else existing.get("tree_age_months"),
+                "inventory_tree_count": (
+                    inventory_tree_count_value if inventory_tree_count is not None else existing.get("inventory_tree_count")
+                ),
+                "existing_area_geojson": (
+                    effective_existing_area_geojson if existing_area_geojson is not None else existing.get("existing_area_geojson")
+                ),
+                "existing_area_sqm": (
+                    existing_area_sqm_value if existing_area_geojson is not None else existing.get("existing_area_sqm")
+                ),
             },
         },
     )
@@ -8081,7 +8260,7 @@ def _compute_kpi_snapshot(project_id: int, db: Session) -> dict:
 
     # Carbon data for KPI
     carbon_tree_rows = db.execute(text("""
-        SELECT id, species, planting_date, status, created_at, tree_age_months
+        SELECT id, species, planting_date, status, created_at, tree_age_months, COALESCE(inventory_tree_count, 1) AS inventory_tree_count
         FROM trees
         WHERE project_id = :project_id
           AND COALESCE(count_in_carbon_scope, TRUE) = TRUE
@@ -8568,11 +8747,12 @@ def _build_verra_vcs_payload(
                    t.project_id,
                    t.species,
                    t.planting_date,
-                   t.status,
-                   t.notes,
-                   t.photo_url,
-                   t.created_by,
-                   t.created_at,
+              t.status,
+              t.notes,
+              t.photo_url,
+              t.photo_urls,
+              t.created_by,
+              t.created_at,
                    t.tree_origin,
                    t.tree_height_m,
                    t.attribution_scope,
@@ -9817,7 +9997,7 @@ def export_donor_report_csv(project_id: int, db: Session = Depends(get_db)):
         writer = _excel_csv_writer(f)
         # Carbon summary for CSV header
         carbon_trees_csv = db.execute(text("""
-            SELECT id, species, planting_date, status, created_at, tree_age_months
+            SELECT id, species, planting_date, status, created_at, tree_age_months, COALESCE(inventory_tree_count, 1) AS inventory_tree_count
             FROM trees
             WHERE project_id = :pid
               AND COALESCE(count_in_carbon_scope, TRUE) = TRUE
@@ -10079,11 +10259,15 @@ def tree_timeline(tree_id: int, db: Session = Depends(get_db)):
             c.name AS custodian_name,
             t.custody_started_at,
             t.attribution_scope,
-            t.count_in_planting_kpis,
-            t.count_in_carbon_scope,
-            t.source_project_id,
-            t.tree_height_m
-        FROM trees t
+              t.count_in_planting_kpis,
+              t.count_in_carbon_scope,
+              t.source_project_id,
+              t.tree_height_m,
+              t.tree_age_months,
+              COALESCE(t.inventory_tree_count, 1) AS inventory_tree_count,
+              t.existing_area_geojson,
+              t.existing_area_sqm
+          FROM trees t
         LEFT JOIN green_custodians c ON c.id = t.custodian_id
         WHERE t.id = :tree_id
     """), {"tree_id": tree_id}).mappings().first()
@@ -10878,14 +11062,19 @@ def _build_tree_carbon_metrics(
     raw_carbon_scope = tree.get("count_in_carbon_scope")
     in_carbon_scope = True if raw_carbon_scope is None else bool(raw_carbon_scope)
     scope_applies = in_carbon_scope or not enforce_carbon_scope
+    try:
+        inventory_tree_count = int(tree.get("inventory_tree_count") or 1)
+    except Exception:
+        inventory_tree_count = 1
+    inventory_tree_count = max(inventory_tree_count, 1)
 
-    current_co2_kg = 0.0
-    annual_co2_kg = 0.0
-    lifetime_co2_kg = 0.0
+    current_co2_per_tree_kg = 0.0
+    annual_co2_per_tree_kg = 0.0
+    lifetime_co2_per_tree_kg = 0.0
     height_used = False
 
     if scope_applies and age_years > 0:
-        current_co2_kg, height_used = _estimate_tree_co2_height_aware_kg(
+        current_co2_per_tree_kg, height_used = _estimate_tree_co2_height_aware_kg(
             species,
             age_years,
             tree.get("tree_height_m"),
@@ -10893,16 +11082,24 @@ def _build_tree_carbon_metrics(
         if is_alive:
             if height_used and age_years > 1:
                 previous_modeled = estimate_tree_co2_kg(species, max(age_years - 1.0, 0.0))
-                annual_co2_kg = round(max(current_co2_kg - previous_modeled, 0.0), 2)
+                annual_co2_per_tree_kg = round(max(current_co2_per_tree_kg - previous_modeled, 0.0), 2)
             else:
-                annual_co2_kg = estimate_annual_co2_kg(species, age_years)
-            lifetime_co2_kg = estimate_lifetime_co2_kg(species, projection_years)
+                annual_co2_per_tree_kg = estimate_annual_co2_kg(species, age_years)
+            lifetime_co2_per_tree_kg = estimate_lifetime_co2_kg(species, projection_years)
+
+    current_co2_kg = max(current_co2_per_tree_kg, 0.0) * inventory_tree_count
+    annual_co2_kg = max(annual_co2_per_tree_kg, 0.0) * inventory_tree_count
+    lifetime_co2_kg = max(lifetime_co2_per_tree_kg, 0.0) * inventory_tree_count
 
     return {
         "species_matched": params.get("label", "Unknown"),
         "growth_class": params.get("growth_class", "medium"),
         "age_years": round(age_years, 2),
         "age_source": ref_source,
+        "inventory_tree_count": inventory_tree_count,
+        "current_co2_per_tree_kg": round(max(current_co2_per_tree_kg, 0.0), 2),
+        "annual_co2_per_tree_kg": round(max(annual_co2_per_tree_kg, 0.0), 2),
+        "lifetime_co2_per_tree_kg": round(max(lifetime_co2_per_tree_kg, 0.0), 2),
         "current_co2_kg": round(current_co2_kg, 2),
         "annual_co2_kg": round(max(annual_co2_kg, 0.0), 2),
         "lifetime_co2_kg": round(max(lifetime_co2_kg, 0.0), 2),
@@ -10925,11 +11122,13 @@ def _fetch_existing_tree_export_rows(project_id: int, db: Session) -> list[dict]
             SELECT
                 t.id,
                 t.project_id,
+                t.project_tree_no,
                 t.species,
                 t.planting_date,
                 t.status,
                 t.notes,
                 t.photo_url,
+                t.photo_urls,
                 t.created_by,
                 t.created_at,
                 t.tree_origin,
@@ -10941,6 +11140,9 @@ def _fetch_existing_tree_export_rows(project_id: int, db: Session) -> list[dict]
                 t.custodian_id,
                 c.name AS custodian_name,
                 t.tree_height_m,
+                COALESCE(t.inventory_tree_count, 1) AS inventory_tree_count,
+                t.existing_area_geojson,
+                t.existing_area_sqm,
                 ST_X(t.geom) AS lng,
                 ST_Y(t.geom) AS lat
             FROM trees t
@@ -10967,6 +11169,22 @@ def _fetch_existing_tree_export_rows(project_id: int, db: Session) -> list[dict]
     enriched: list[dict] = []
     for row in merged_rows:
         item = dict(row)
+        item["photo_urls"] = _normalize_photo_urls(item.get("photo_urls"))
+        try:
+            item["inventory_tree_count"] = max(int(item.get("inventory_tree_count") or 1), 1)
+        except Exception:
+            item["inventory_tree_count"] = 1
+        try:
+            item["existing_area_sqm"] = (
+                round(float(item.get("existing_area_sqm")), 2) if item.get("existing_area_sqm") is not None else None
+            )
+        except Exception:
+            item["existing_area_sqm"] = None
+        item["existing_area_ha"] = (
+            round(float(item.get("existing_area_sqm") or 0.0) / 10000.0, 4)
+            if item.get("existing_area_sqm") is not None
+            else None
+        )
         item.update(review_summary.get(int(item.get("id") or 0), {}))
         item.update(_build_tree_carbon_metrics(item, projection_years=40, enforce_carbon_scope=True))
         enriched.append(item)
@@ -10975,6 +11193,7 @@ def _fetch_existing_tree_export_rows(project_id: int, db: Session) -> list[dict]
 
 def _summarize_existing_tree_export_rows(rows: list[dict]) -> dict:
     total_rows = len(rows)
+    total_existing_trees = 0
     alive_rows = 0
     dead_rows = 0
     attention_rows = 0
@@ -10988,18 +11207,26 @@ def _summarize_existing_tree_export_rows(rows: list[dict]) -> dict:
     current_co2_kg = 0.0
     annual_co2_kg = 0.0
     lifetime_co2_kg = 0.0
+    total_existing_area_sqm = 0.0
+    rows_with_existing_area = 0
     species_agg: dict[str, dict] = {}
 
     for row in rows:
+        try:
+            tree_units = max(int(row.get("inventory_tree_count") or 1), 1)
+        except Exception:
+            tree_units = 1
+        total_existing_trees += tree_units
+
         status_key = _normalize_tree_status(row.get("status"))
         if status_key in HEALTHY_TREE_STATUSES:
-            alive_rows += 1
+            alive_rows += tree_units
         elif status_key in DEAD_TREE_STATUSES:
-            dead_rows += 1
+            dead_rows += tree_units
         elif status_key in ATTENTION_TREE_STATUSES:
-            attention_rows += 1
+            attention_rows += tree_units
         elif status_key == "pending_planting":
-            pending_rows += 1
+            pending_rows += tree_units
 
         try:
             height_val = float(row.get("tree_height_m")) if row.get("tree_height_m") is not None else None
@@ -11018,18 +11245,26 @@ def _summarize_existing_tree_export_rows(rows: list[dict]) -> dict:
 
         in_scope = bool(row.get("co2_in_scope", True))
         if in_scope:
-            carbon_scope_rows += 1
+            carbon_scope_rows += tree_units
             current_co2_kg += float(row.get("current_co2_kg") or 0.0)
             annual_co2_kg += float(row.get("annual_co2_kg") or 0.0)
             lifetime_co2_kg += float(row.get("lifetime_co2_kg") or 0.0)
         else:
-            carbon_excluded_rows += 1
+            carbon_excluded_rows += tree_units
+
+        try:
+            area_sqm = float(row.get("existing_area_sqm")) if row.get("existing_area_sqm") is not None else None
+        except Exception:
+            area_sqm = None
+        if area_sqm is not None and area_sqm > 0:
+            total_existing_area_sqm += area_sqm
+            rows_with_existing_area += 1
 
         species_label = str(row.get("species") or "").strip() or str(row.get("species_matched") or "Unknown")
         species_key = species_label.lower()
         if species_key not in species_agg:
             species_agg[species_key] = {"species": species_label, "count": 0, "co2_kg": 0.0}
-        species_agg[species_key]["count"] += 1
+        species_agg[species_key]["count"] += tree_units
         if in_scope:
             species_agg[species_key]["co2_kg"] += float(row.get("current_co2_kg") or 0.0)
 
@@ -11042,13 +11277,17 @@ def _summarize_existing_tree_export_rows(rows: list[dict]) -> dict:
         item["co2_kg"] = round(float(item.get("co2_kg") or 0.0), 2)
 
     return {
-        "total_existing_trees": total_rows,
+        "total_existing_trees": total_existing_trees,
+        "total_existing_rows": total_rows,
         "alive_trees": alive_rows,
         "dead_trees": dead_rows,
         "attention_trees": attention_rows,
         "pending_trees": pending_rows,
         "rows_with_height": rows_with_height,
         "rows_missing_height": rows_missing_height,
+        "rows_with_existing_area": rows_with_existing_area,
+        "total_existing_area_sqm": round(total_existing_area_sqm, 2),
+        "total_existing_area_ha": round(total_existing_area_sqm / 10000.0, 4),
         "trees_missing_age_data": trees_missing_age_data,
         "trees_with_fallback_age": trees_with_fallback_age,
         "carbon_scope_rows": carbon_scope_rows,
@@ -11077,6 +11316,11 @@ def get_existing_tree_metrics(project_id: int, db: Session = Depends(get_db)):
         items.append(
             {
                 "tree_id": int(row.get("id") or 0),
+                "project_tree_no": row.get("project_tree_no"),
+                "inventory_tree_count": row.get("inventory_tree_count"),
+                "existing_area_sqm": row.get("existing_area_sqm"),
+                "existing_area_ha": row.get("existing_area_ha"),
+                "photo_count": len(_normalize_photo_urls(row.get("photo_urls"))),
                 "tree_age_months": row.get("tree_age_months"),
                 "age_years": row.get("age_years"),
                 "age_source": row.get("age_source"),
@@ -11117,6 +11361,8 @@ def export_existing_trees_csv(project_id: int, db: Session = Depends(get_db)):
         writer.writerow([
             "Summary",
             f"Existing Trees {summary.get('total_existing_trees', 0)}",
+            f"Rows {summary.get('total_existing_rows', len(rows))}",
+            f"Area {summary.get('total_existing_area_ha', 0)} ha",
             f"Carbon Scope {summary.get('carbon_scope_rows', 0)}",
             f"Excluded {summary.get('carbon_excluded_rows', 0)}",
             f"Current CO2 {summary.get('current_co2_tonnes', 0)} t",
@@ -11127,9 +11373,13 @@ def export_existing_trees_csv(project_id: int, db: Session = Depends(get_db)):
         writer.writerow([])
         writer.writerow([
             "tree_id",
+            "project_tree_no",
             "project_id",
             "lng",
             "lat",
+            "inventory_tree_count",
+            "existing_area_sqm",
+            "existing_area_ha",
             "species",
             "species_matched",
             "growth_class",
@@ -11155,6 +11405,8 @@ def export_existing_trees_csv(project_id: int, db: Session = Depends(get_db)):
             "created_at",
             "notes",
             "photo_url",
+            "photo_urls",
+            "existing_area_geojson",
             "maintenance_count",
             "maintenance_done",
             "maintenance_pending",
@@ -11173,9 +11425,13 @@ def export_existing_trees_csv(project_id: int, db: Session = Depends(get_db)):
         for row in rows:
             writer.writerow([
                 row.get("id"),
+                row.get("project_tree_no"),
                 row.get("project_id"),
                 row.get("lng"),
                 row.get("lat"),
+                row.get("inventory_tree_count"),
+                row.get("existing_area_sqm"),
+                row.get("existing_area_ha"),
                 row.get("species"),
                 row.get("species_matched"),
                 row.get("growth_class"),
@@ -11201,6 +11457,8 @@ def export_existing_trees_csv(project_id: int, db: Session = Depends(get_db)):
                 _to_iso_text(row.get("created_at")),
                 row.get("notes"),
                 row.get("photo_url"),
+                json.dumps(_normalize_photo_urls(row.get("photo_urls"))),
+                _safe_json(row.get("existing_area_geojson")) if row.get("existing_area_geojson") is not None else "",
                 row.get("maintenance_count", 0),
                 row.get("maintenance_done", 0),
                 row.get("maintenance_pending", 0),
@@ -11236,7 +11494,20 @@ def export_existing_trees_pdf(
     pdf_path = tmp_pdf.name
     tmp_pdf.close()
 
-    photo_rows = [dict(row) for row in rows if str(row.get("photo_url") or "").strip()] if include_photos else []
+    photo_rows: list[dict] = []
+    if include_photos:
+        for row in rows:
+            merged_urls = _normalize_photo_urls(row.get("photo_urls"))
+            if not merged_urls and str(row.get("photo_url") or "").strip():
+                merged_urls = [str(row.get("photo_url") or "").strip()]
+            if not merged_urls:
+                continue
+            for index, photo_url in enumerate(merged_urls, start=1):
+                item = dict(row)
+                item["photo_url"] = photo_url
+                item["photo_index"] = index
+                item["photo_total"] = len(merged_urls)
+                photo_rows.append(item)
     render_green_existing_trees_report_pdf(
         pdf_path,
         project=project,
@@ -11492,7 +11763,7 @@ def export_project_pdf(
 
     # Carbon data for executive summary
     carbon_trees = db.execute(text("""
-        SELECT id, species, planting_date, status, created_at, tree_age_months
+        SELECT id, species, planting_date, status, created_at, tree_age_months, COALESCE(inventory_tree_count, 1) AS inventory_tree_count
         FROM trees
         WHERE project_id = :pid
           AND COALESCE(count_in_carbon_scope, TRUE) = TRUE
@@ -11769,7 +12040,7 @@ def export_work_report_pdf(
 
     # Carbon data for executive summary
     carbon_trees = db.execute(text("""
-        SELECT id, species, planting_date, status, created_at, tree_age_months
+        SELECT id, species, planting_date, status, created_at, tree_age_months, COALESCE(inventory_tree_count, 1) AS inventory_tree_count
         FROM trees
         WHERE project_id = :pid
           AND COALESCE(count_in_carbon_scope, TRUE) = TRUE

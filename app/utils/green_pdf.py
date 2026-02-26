@@ -1815,6 +1815,9 @@ def render_green_existing_trees_report_pdf(
     if project.get("sponsor"):
         project_meta.append(f"Sponsor: {project.get('sponsor')}")
     project_meta.append(f"Existing trees in report: {int(summary.get('total_existing_trees', 0) or 0)}")
+    project_meta.append(f"Rows: {int(summary.get('total_existing_rows', len(rows)) or 0)}")
+    if float(summary.get("total_existing_area_sqm", 0) or 0) > 0:
+        project_meta.append(f"Area: {_fmt_num(summary.get('total_existing_area_ha', 0), 4)} ha")
     c.drawString(34, height - 114, " | ".join(project_meta)[:130])
 
     card_y = height - 186
@@ -1824,7 +1827,14 @@ def render_green_existing_trees_report_pdf(
         c, 34, card_y, card_w, card_h,
         "Existing Trees",
         int(summary.get("total_existing_trees", 0) or 0),
-        sub=f"Carbon scope: {int(summary.get('carbon_scope_rows', 0) or 0)}",
+        sub=(
+            f"Rows: {int(summary.get('total_existing_rows', len(rows)) or 0)}"
+            + (
+                f" | Area: {_fmt_num(summary.get('total_existing_area_ha', 0), 3)} ha"
+                if float(summary.get("total_existing_area_sqm", 0) or 0) > 0
+                else ""
+            )
+        ),
         color=HexColor("#eef7f0"),
     )
     _draw_stat_card(
@@ -1913,7 +1923,7 @@ def render_green_existing_trees_report_pdf(
         c.drawString(28, height - 46, title)
         c.setFont("Helvetica", 8)
         c.setFillColorRGB(0.45, 0.45, 0.45)
-        c.drawString(28, height - 60, "Per-tree CO2 columns are zero where the tree is excluded from carbon scope.")
+        c.drawString(28, height - 60, "CO2 columns are zero where the row is excluded from carbon scope. Rows may represent multiple trees.")
         c.setFont("Helvetica-Bold", 7.2)
         y_head = height - 78
         c.setFillColorRGB(0.16, 0.16, 0.16)
@@ -1947,7 +1957,14 @@ def render_green_existing_trees_report_pdf(
         except Exception:
             height_val = "-"
         c.setFillColorRGB(0.14, 0.14, 0.14)
-        c.drawString(28, y, f"#{row.get('id', '-')}")
+        count_label = ""
+        try:
+            row_count = max(int(row.get("inventory_tree_count") or 1), 1)
+            if row_count > 1:
+                count_label = f" x{row_count}"
+        except Exception:
+            count_label = ""
+        c.drawString(28, y, f"#{row.get('id', '-')}{count_label}")
         c.drawString(52, y, str(row.get("species") or "-")[:24])
         c.drawString(156, y, str(row.get("status") or "-")[:13])
         c.drawString(214, y, str(row.get("planting_date") or "-")[:10])
@@ -1983,7 +2000,7 @@ def render_green_existing_trees_report_pdf(
         c.drawString(28, height - 46, title)
         c.setFont("Helvetica", 8)
         c.setFillColorRGB(0.45, 0.45, 0.45)
-        c.drawString(28, height - 60, "Operational details for traceability (custodian/source/review/maintenance/photo).")
+        c.drawString(28, height - 60, "Operational details for traceability (origin, custodian, batch count/area, review, maintenance, photos).")
         c.setFont("Helvetica-Bold", 7.1)
         y_head = height - 78
         c.setFillColorRGB(0.16, 0.16, 0.16)
@@ -1992,11 +2009,11 @@ def render_green_existing_trees_report_pdf(
         c.drawString(118, y_head, "Attr")
         c.drawString(156, y_head, "Custodian")
         c.drawString(250, y_head, "Created By")
-        c.drawRightString(364, y_head, "Maint")
-        c.drawString(372, y_head, "Review")
-        c.drawString(430, y_head, "Photo")
-        c.drawString(462, y_head, "Source Link")
-        c.drawString(522, y_head, "Date")
+        c.drawString(344, y_head, "Cnt/Area")
+        c.drawRightString(414, y_head, "Maint")
+        c.drawString(420, y_head, "Review")
+        c.drawString(462, y_head, "Photo")
+        c.drawString(495, y_head, "Date")
         c.line(28, y_head - 3, width - 28, y_head - 3)
         return y_head - 14
 
@@ -2012,19 +2029,29 @@ def render_green_existing_trees_report_pdf(
 
         review_state = str(row.get("last_review_state") or "-")[:8]
         photo_flag = "Y" if str(row.get("photo_url") or "").strip() else "-"
-        source_link = str(row.get("source_project_id") or "")
-        source_label = f"#{source_link}" if source_link and source_link not in {"0", ""} else "-"
+        try:
+            row_count = max(int(row.get("inventory_tree_count") or 1), 1)
+        except Exception:
+            row_count = 1
+        area_sqm = None
+        try:
+            area_sqm = float(row.get("existing_area_sqm")) if row.get("existing_area_sqm") is not None else None
+        except Exception:
+            area_sqm = None
+        count_area_label = f"{row_count}"
+        if area_sqm is not None and area_sqm > 0:
+            count_area_label += f" / {int(round(area_sqm))}m2"
         c.setFillColorRGB(0.14, 0.14, 0.14)
         c.drawString(28, y, f"#{row.get('id', '-')}")
         c.drawString(52, y, str(row.get("tree_origin") or "-")[:11])
         c.drawString(118, y, str(row.get("attribution_scope") or "-")[:6])
         c.drawString(156, y, str(row.get("custodian_name") or "-")[:20])
         c.drawString(250, y, str(row.get("created_by") or "-")[:18])
-        c.drawRightString(364, y, str(int(row.get("maintenance_count") or 0)))
-        c.drawString(372, y, review_state)
-        c.drawString(430, y, photo_flag)
-        c.drawString(462, y, source_label)
-        c.drawString(522, y, str(row.get("created_at") or "-")[:10])
+        c.drawString(344, y, count_area_label[:11])
+        c.drawRightString(414, y, str(int(row.get("maintenance_count") or 0)))
+        c.drawString(420, y, review_state)
+        c.drawString(462, y, photo_flag)
+        c.drawString(495, y, str(row.get("created_at") or "-")[:10])
         y -= 10
 
     if include_photos:

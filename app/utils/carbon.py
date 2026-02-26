@@ -525,7 +525,7 @@ def compute_project_carbon(
     """
     today = date.today()
 
-    total_trees = len(trees)
+    total_trees = 0
     alive_trees = 0
     current_co2 = 0.0
     annual_co2 = 0.0
@@ -536,19 +536,26 @@ def compute_project_carbon(
     trees_pending_review = 0
 
     for tree in trees:
+        try:
+            tree_count = int(tree.get("inventory_tree_count") or 1)
+        except Exception:
+            tree_count = 1
+        tree_count = max(tree_count, 1)
+        total_trees += tree_count
+
         status = _normalize_tree_status(tree.get("status"))
         species = tree.get("species")
         age, ref_source = _infer_tree_age_years(tree, today)
 
         is_alive = _is_alive_tree_status(status)
         if is_alive:
-            alive_trees += 1
+            alive_trees += tree_count
         if status == "pending_planting":
-            trees_pending_review += 1
+            trees_pending_review += tree_count
         if ref_source == "none":
-            trees_missing_age_data += 1
+            trees_missing_age_data += tree_count
         elif ref_source != "planting_date":
-            trees_with_fallback_age += 1
+            trees_with_fallback_age += tree_count
 
         if is_alive and age > 0:
             tree_co2 = estimate_tree_co2_kg(species, age)
@@ -561,12 +568,12 @@ def compute_project_carbon(
             tree_co2 = estimate_tree_co2_kg(species, age) if age > 0 else 0.0
             tree_annual = 0.0
 
-        current_co2 += tree_co2
-        annual_co2 += tree_annual
+        current_co2 += tree_co2 * tree_count
+        annual_co2 += tree_annual * tree_count
 
         # Projected lifetime only for alive trees
         if is_alive:
-            projected_co2 += estimate_lifetime_co2_kg(species, projection_years)
+            projected_co2 += estimate_lifetime_co2_kg(species, projection_years) * tree_count
 
         # Species aggregation:
         # keep operator-entered species label visible, while also exposing matched model species.
@@ -585,8 +592,8 @@ def compute_project_carbon(
                 "count": 0,
                 "co2_kg": 0.0,
             }
-        species_agg[sp_key]["count"] += 1
-        species_agg[sp_key]["co2_kg"] += tree_co2
+        species_agg[sp_key]["count"] += tree_count
+        species_agg[sp_key]["co2_kg"] += tree_co2 * tree_count
 
     top_species = sorted(species_agg.values(), key=lambda x: x["co2_kg"], reverse=True)[:10]
     for sp in top_species:
@@ -628,20 +635,24 @@ def generate_co2_projection_table(
             continue
         species = tree.get("species")
         age, _ = _infer_tree_age_years(tree, today)
-        alive_trees_data.append({"species": species, "current_age": age})
+        try:
+            tree_count = int(tree.get("inventory_tree_count") or 1)
+        except Exception:
+            tree_count = 1
+        alive_trees_data.append({"species": species, "current_age": age, "count": max(tree_count, 1)})
 
     projection = []
     for yr_offset in range(0, years + 1):
         total_co2 = 0.0
         for tree_data in alive_trees_data:
             future_age = tree_data["current_age"] + yr_offset
-            total_co2 += estimate_tree_co2_kg(tree_data["species"], future_age)
+            total_co2 += estimate_tree_co2_kg(tree_data["species"], future_age) * float(tree_data.get("count") or 1)
 
         prev_co2 = 0.0
         if yr_offset > 0:
             for tree_data in alive_trees_data:
                 prev_age = tree_data["current_age"] + yr_offset - 1
-                prev_co2 += estimate_tree_co2_kg(tree_data["species"], prev_age)
+                prev_co2 += estimate_tree_co2_kg(tree_data["species"], prev_age) * float(tree_data.get("count") or 1)
 
         projection.append({
             "year_offset": yr_offset,
