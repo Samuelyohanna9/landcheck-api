@@ -5331,7 +5331,9 @@ def add_tree(
 
     review_task_id = None
     auto_first_cycle_task_ids: list[int] = []
-    if created_by_clean and origin == "new_planting":
+    initial_review_task_type: str | None = None
+    if created_by_clean and origin in {"new_planting", "existing_inventory"}:
+        initial_review_task_type = "planting" if origin == "new_planting" else "existing_inventory_intake"
         review_task_id = db.execute(
             text(
                 """
@@ -5340,7 +5342,7 @@ def add_tree(
                     review_state, submitted_at, completed_at, reported_tree_status
                 )
                 VALUES (
-                    :tree_id, 'planting', :assignee_name, :due_date, 'normal', 'done', :notes, :photo_url,
+                    :tree_id, :task_type, :assignee_name, :due_date, 'normal', 'done', :notes, :photo_url,
                     'submitted', NOW(), NOW(), :reported_tree_status
                 )
                 RETURNING id
@@ -5348,6 +5350,7 @@ def add_tree(
             ),
             {
                 "tree_id": int(row),
+                "task_type": initial_review_task_type,
                 "assignee_name": created_by_clean,
                 "due_date": planting_date,
                 "notes": notes or None,
@@ -5380,25 +5383,26 @@ def add_tree(
             entity_id=int(review_task_id),
             action="task_submitted_for_review",
             actor=created_by_clean,
-            details={"task_type": "planting", "status": "done", "review_state": "submitted"},
+            details={"task_type": initial_review_task_type, "status": "done", "review_state": "submitted"},
         )
-        matching_auto_order = _find_matching_auto_first_cycle_work_order(
-            db,
-            project_id=int(project_id),
-            assignee_name=created_by_clean,
-            species=species or None,
-            lng=float(lng),
-            lat=float(lat),
-        )
-        if matching_auto_order:
-            auto_first_cycle_task_ids = _auto_assign_first_cycle_maintenance_from_order(
+        if origin == "new_planting":
+            matching_auto_order = _find_matching_auto_first_cycle_work_order(
                 db,
                 project_id=int(project_id),
-                tree_id=int(row),
                 assignee_name=created_by_clean,
-                planting_date_value=planting_date,
-                order_row=matching_auto_order,
+                species=species or None,
+                lng=float(lng),
+                lat=float(lat),
             )
+            if matching_auto_order:
+                auto_first_cycle_task_ids = _auto_assign_first_cycle_maintenance_from_order(
+                    db,
+                    project_id=int(project_id),
+                    tree_id=int(row),
+                    assignee_name=created_by_clean,
+                    planting_date_value=planting_date,
+                    order_row=matching_auto_order,
+                )
 
     _log_audit_event(
         db,
