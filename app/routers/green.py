@@ -11029,14 +11029,26 @@ def _coerce_tree_age_months(value: object) -> float | None:
 
 
 def _infer_tree_age_for_carbon(tree_row: dict) -> tuple[float, str]:
-    """Infer tree age in years, preferring planting_date and falling back to tree_age_months."""
+    """Infer tree age in years with existing-tree age-months priority."""
     tree = dict(tree_row)
     today = date.today()
+    origin_key = _normalize_tree_origin(tree.get("tree_origin"))
+    age_months = _coerce_tree_age_months(tree.get("tree_age_months"))
+
+    # Existing Tree records often store a survey/reference date in planting_date.
+    # When explicit age months is provided, prefer it to avoid zero-age CO2 from a recent reference date.
+    if origin_key == "existing_inventory" and age_months is not None:
+        elapsed_years = 0.0
+        capture_ref = _parse_date_value(tree.get("created_at")) or _parse_date_value(tree.get("submitted_at")) or _parse_date_value(tree.get("reviewed_at"))
+        if capture_ref is not None:
+            elapsed_years = tree_age_years(capture_ref, today)
+        age_years = max((age_months / 12.0) + elapsed_years, 0.0)
+        return age_years, "tree_age_months"
+
     planting_ref = _parse_date_value(tree.get("planting_date"))
     if planting_ref is not None:
         return tree_age_years(planting_ref, today), "planting_date"
 
-    age_months = _coerce_tree_age_months(tree.get("tree_age_months"))
     if age_months is None:
         ref_date, ref_source = _infer_tree_reference_date(tree)
         if ref_date is None:

@@ -486,16 +486,23 @@ def _coerce_tree_age_months(value) -> Optional[float]:
 def _infer_tree_age_years(tree: dict, ref_date: Optional[date] = None) -> tuple[float, str]:
     """
     Infer tree age in years using:
-    1) planting_date (preferred)
-    2) explicit tree_age_months (+ elapsed time since created_at if available)
-    3) fallback sources from _infer_tree_reference_date
+    1) explicit tree_age_months for existing_inventory (+ elapsed time since created_at if available)
+    2) planting_date (preferred for new planting / direct records)
+    3) explicit tree_age_months (+ elapsed time since created_at if available)
+    4) fallback sources from _infer_tree_reference_date
     """
     today = ref_date or date.today()
+    tree_origin = str(tree.get("tree_origin") or "").strip().lower()
+    age_months = _coerce_tree_age_months(tree.get("tree_age_months"))
+    if tree_origin == "existing_inventory" and age_months is not None:
+        capture_ref = _parse_date_like(tree.get("created_at")) or _parse_date_like(tree.get("submitted_at")) or _parse_date_like(tree.get("reviewed_at"))
+        elapsed_years = tree_age_years(capture_ref, today) if capture_ref else 0.0
+        return max((age_months / 12.0) + elapsed_years, 0.0), "tree_age_months"
+
     planting_date = _parse_date_like(tree.get("planting_date"))
     if planting_date:
         return tree_age_years(planting_date, today), "planting_date"
 
-    age_months = _coerce_tree_age_months(tree.get("tree_age_months"))
     if age_months is not None:
         capture_ref = _parse_date_like(tree.get("created_at")) or _parse_date_like(tree.get("submitted_at")) or _parse_date_like(tree.get("reviewed_at"))
         elapsed_years = tree_age_years(capture_ref, today) if capture_ref else 0.0
