@@ -5533,6 +5533,17 @@ def update_tree(
         if tree_age_months_value < 0 or tree_age_months_value > 2400:
             raise HTTPException(status_code=400, detail="tree_age_months must be between 0 and 2400")
 
+    inventory_tree_count_value = None
+    if inventory_tree_count is not None:
+        try:
+            inventory_tree_count_value = int(inventory_tree_count)
+        except Exception:
+            raise HTTPException(status_code=400, detail="inventory_tree_count must be a whole number")
+        if inventory_tree_count_value < 1 or inventory_tree_count_value > 1000000:
+            raise HTTPException(status_code=400, detail="inventory_tree_count must be between 1 and 1000000")
+
+    normalized_existing_area_geojson = _normalize_work_area_geojson(existing_area_geojson)
+
     source_project_id_value = None
     if source_project_id is not None:
         source_project_id_value = int(source_project_id)
