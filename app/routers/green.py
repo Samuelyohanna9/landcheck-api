@@ -93,7 +93,7 @@ ASSIGNABLE_TASK_TYPES = set(MAINTENANCE_ACTIVITY_ORDER) | {SUPERVISION_TASK_TYPE
 AGE_SURVIVAL_CHECKPOINTS_DAYS = (30, 90, 180)
 SEASON_VALUES = {"rainy", "dry"}
 TASK_STATUS_VALUES = {"pending", "done", "overdue"}
-REVIEW_STATE_VALUES = {"none", "submitted", "approved", "rejected", "reopened"}
+REVIEW_STATE_VALUES = {"none", "submitted", "approved", "rejected", "reopened", "metadata_edit"}
 PLANTING_MODEL_VALUES = {"direct", "community_distributed", "mixed"}
 DEFAULT_PLANTING_MODEL = "direct"
 EXISTING_TREE_SCOPE_VALUES = {"exclude_from_planting_kpi", "include_in_planting_kpi"}
@@ -1433,9 +1433,13 @@ def _compute_live_maintenance_rows(
     project_id: int,
     season_mode: str = "rainy",
     assignee_name: str | None = None,
+    tree_scope: str = "new_planting",
 ) -> dict:
     season = "dry" if _normalize_name(season_mode) == "dry" else "rainy"
     assignee_key = _normalize_name(assignee_name)
+    scope_key = _normalize_name(tree_scope or "new_planting")
+    if scope_key not in {"new_planting", "existing_inventory", "all"}:
+        scope_key = "new_planting"
     trees = db.execute(
         text("""
             SELECT
@@ -1445,15 +1449,26 @@ def _compute_live_maintenance_rows(
                 species,
                 planting_date,
                 tree_origin,
+                created_at,
+                tree_age_months,
                 COALESCE(count_in_planting_kpis, TRUE) AS count_in_planting_kpis
             FROM trees
             WHERE project_id = :project_id
-              AND LOWER(COALESCE(tree_origin, 'new_planting')) = 'new_planting'
-              AND COALESCE(count_in_planting_kpis, TRUE) = TRUE
             ORDER BY id ASC
         """),
         {"project_id": project_id},
     ).mappings().all()
+    filtered_trees: list[dict] = []
+    for row in trees:
+        item = dict(row)
+        origin_key = _normalize_tree_origin(item.get("tree_origin"))
+        in_new_scope = origin_key == "new_planting" and bool(item.get("count_in_planting_kpis", True))
+        in_existing_scope = origin_key != "new_planting"
+        if scope_key == "new_planting" and not in_new_scope:
+            continue
+        if scope_key == "existing_inventory" and not in_existing_scope:
+            continue
+        filtered_trees.append(item)
     task_rows = db.execute(
         text("""
             SELECT t.id, t.tree_id, t.task_type, t.assignee_name, t.status, t.review_state, t.due_date,
@@ -1483,7 +1498,7 @@ def _compute_live_maintenance_rows(
 
     today = date.today()
     rows: list[dict] = []
-    for tree in trees:
+    for tree in filtered_trees:
         tree_id = int(tree["id"])
         tree_assignee = str(tree.get("created_by") or "-")
         if assignee_key:
@@ -1514,6 +1529,7 @@ def _compute_live_maintenance_rows(
         provisional_pending_approval = tree_status == "pending_planting" and planting_submission_task is not None
         replacement_required = _is_replacement_trigger_status(tree_status)
         planting_date_obj = _parse_date_value(tree.get("planting_date"))
+        inferred_tree_age_days = _infer_tree_age_days_for_maintenance(tree, today)
         replacement_key = f"{tree_id}:replacement"
         replacement_done = sorted(
             [
@@ -1524,8 +1540,11 @@ def _compute_live_maintenance_rows(
             reverse=True,
         )
         latest_replacement_date = replacement_done[0] if replacement_done else None
-        lifecycle_start = _get_lifecycle_start_date(planting_date_obj, latest_replacement_date)
-        tree_age_days = _day_diff(today, lifecycle_start) if lifecycle_start else None
+        base_lifecycle_start = planting_date_obj
+        if base_lifecycle_start is None and inferred_tree_age_days is not None:
+            base_lifecycle_start = _add_days(today, -int(inferred_tree_age_days))
+        lifecycle_start = _get_lifecycle_start_date(base_lifecycle_start, latest_replacement_date)
+        tree_age_days = _day_diff(today, lifecycle_start) if lifecycle_start else inferred_tree_age_days
         species_key = _normalize_name(tree.get("species"))
         maturity_years = species_maturity_map.get(species_key) if species_key else None
         maturity_reached = (
@@ -2179,6 +2198,7 @@ def ensure_green_tables(db: Session):
             area_enabled BOOLEAN NOT NULL DEFAULT FALSE,
             area_label TEXT,
             area_geojson JSONB,
+            allow_existing_tree_area_reuse BOOLEAN NOT NULL DEFAULT FALSE,
             status TEXT NOT NULL DEFAULT 'assigned',
             planted_count INTEGER DEFAULT 0,
             visits_done INTEGER DEFAULT 0,
@@ -2194,6 +2214,11 @@ def ensure_green_tables(db: Session):
         db.execute(
             text(
                 "ALTER TABLE green_work_orders ADD COLUMN IF NOT EXISTS auto_assign_first_cycle_maintenance BOOLEAN NOT NULL DEFAULT FALSE"
+            )
+        )
+        db.execute(
+            text(
+                "ALTER TABLE green_work_orders ADD COLUMN IF NOT EXISTS allow_existing_tree_area_reuse BOOLEAN NOT NULL DEFAULT FALSE"
             )
         )
     except Exception:
@@ -5451,6 +5476,8 @@ def add_tree(
 def update_tree(
     tree_id: int,
     db: Session = Depends(get_db),
+    lng: float | None = Body(default=None),
+    lat: float | None = Body(default=None),
     species: str | None = Body(default=None),
     planting_date: str | None = Body(default=None),
     status: str | None = Body(default=None),
@@ -5470,6 +5497,12 @@ def update_tree(
     inventory_tree_count: int | None = Body(default=None),
     existing_area_geojson: dict | str | None = Body(default=None),
 ):
+    if (lng is None) != (lat is None):
+        raise HTTPException(status_code=400, detail="Both lng and lat are required together")
+    if lng is not None and not (-180 <= float(lng) <= 180):
+        raise HTTPException(status_code=400, detail="Invalid lng")
+    if lat is not None and not (-90 <= float(lat) <= 90):
+        raise HTTPException(status_code=400, detail="Invalid lat")
     normalized_status = _normalize_tree_status(status) if status is not None else None
     if normalized_status is not None and normalized_status not in TREE_STATUS_VALUES:
         raise HTTPException(status_code=400, detail="Invalid status")
@@ -5517,6 +5550,8 @@ def update_tree(
             """
             SELECT
                 project_id,
+                ST_X(geom) AS lng,
+                ST_Y(geom) AS lat,
                 species,
                 planting_date,
                 status,
@@ -5633,7 +5668,11 @@ def update_tree(
 
     db.execute(text("""
         UPDATE trees
-        SET species = COALESCE(:species, species),
+        SET geom = CASE
+                WHEN :lng IS NOT NULL AND :lat IS NOT NULL THEN ST_SetSRID(ST_MakePoint(:lng, :lat), 4326)
+                ELSE geom
+            END,
+            species = COALESCE(:species, species),
             planting_date = COALESCE(:planting_date, planting_date),
             status = COALESCE(:status, status),
             notes = COALESCE(:notes, notes),
@@ -5653,6 +5692,8 @@ def update_tree(
             existing_area_sqm = COALESCE(:existing_area_sqm, existing_area_sqm)
         WHERE id = :tree_id
     """), {
+        "lng": lng,
+        "lat": lat,
         "species": species,
         "planting_date": planting_date,
         "status": normalized_status,
@@ -5696,6 +5737,8 @@ def update_tree(
             "before": dict(existing),
             "after": {
                 "species": species if species is not None else existing.get("species"),
+                "lng": lng if lng is not None else existing.get("lng"),
+                "lat": lat if lat is not None else existing.get("lat"),
                 "planting_date": planting_date if planting_date is not None else existing.get("planting_date"),
                 "status": normalized_status if normalized_status is not None else existing.get("status"),
                 "notes": notes if notes is not None else existing.get("notes"),
@@ -7206,10 +7249,10 @@ def review_submitted_task(
     season_mode: str | None = Body(default=None),
 ):
     decision_key = _normalize_name(decision)
-    if decision_key not in {"approve", "reject"}:
-        raise HTTPException(status_code=400, detail="Decision must be approve or reject")
-    if decision_key == "reject" and not (review_notes or "").strip():
-        raise HTTPException(status_code=400, detail="Review note is required when rejecting a task")
+    if decision_key not in {"approve", "reject", "metadata_edit"}:
+        raise HTTPException(status_code=400, detail="Decision must be approve, reject, or metadata_edit")
+    if decision_key in {"reject", "metadata_edit"} and not (review_notes or "").strip():
+        raise HTTPException(status_code=400, detail="Review note is required for reject or metadata edit request")
 
     task = db.execute(
         text("""
@@ -7297,7 +7340,7 @@ def review_submitted_task(
         auto_generated_task_id = None
         _resolve_task_alerts(db, task_id)
         action_name = "task_review_approved"
-    else:
+    elif decision_key == "reject":
         db.execute(
             text("""
                 UPDATE tree_tasks
@@ -7317,6 +7360,26 @@ def review_submitted_task(
             },
         )
         action_name = "task_review_rejected"
+    else:
+        db.execute(
+            text("""
+                UPDATE tree_tasks
+                SET status = 'pending',
+                    review_state = 'metadata_edit',
+                    submitted_at = NULL,
+                    completed_at = NULL,
+                    reviewed_at = NOW(),
+                    reviewed_by = :reviewer_name,
+                    review_notes = :review_notes
+                WHERE id = :task_id
+            """),
+            {
+                "task_id": task_id,
+                "reviewer_name": reviewer_name or None,
+                "review_notes": review_notes or None,
+            },
+        )
+        action_name = "task_review_metadata_edit_requested"
 
     db.execute(
         text("""
@@ -7325,7 +7388,13 @@ def review_submitted_task(
         """),
         {
             "task_id": task_id,
-            "decision": "approved" if decision_key == "approve" else "rejected",
+            "decision": (
+                "approved"
+                if decision_key == "approve"
+                else "rejected"
+                if decision_key == "reject"
+                else "metadata_edit"
+            ),
             "reviewer_name": reviewer_name or None,
             "review_notes": review_notes or None,
         },
@@ -7347,7 +7416,13 @@ def review_submitted_task(
     db.commit()
     return {
         "status": "ok",
-        "decision": "approved" if decision_key == "approve" else "rejected",
+        "decision": (
+            "approved"
+            if decision_key == "approve"
+            else "rejected"
+            if decision_key == "reject"
+            else "metadata_edit"
+        ),
         "auto_generated_task_id": auto_generated_task_id,
     }
 
@@ -7912,6 +7987,7 @@ def live_maintenance_rows(
     project_id: int,
     season_mode: str = Query(default="rainy"),
     assignee_name: str | None = Query(default=None),
+    tree_scope: str = Query(default="new_planting"),
     db: Session = Depends(get_db),
 ):
     payload = _compute_live_maintenance_rows(
@@ -7919,10 +7995,12 @@ def live_maintenance_rows(
         project_id=project_id,
         season_mode=season_mode,
         assignee_name=assignee_name,
+        tree_scope=tree_scope,
     )
     return {
         "project_id": project_id,
         "season_mode": "dry" if _normalize_name(season_mode) == "dry" else "rainy",
+        "tree_scope": _normalize_name(tree_scope or "new_planting"),
         "computed_at": datetime.utcnow().isoformat(),
         "summary": payload["summary"],
         "rows": payload["rows"],
@@ -10336,6 +10414,7 @@ def create_work_order(
     area_enabled: bool = Body(default=False),
     area_label: str | None = Body(default=None),
     area_geojson: dict | str | None = Body(default=None),
+    allow_existing_tree_area_reuse: bool = Body(default=False),
 ):
     if work_type not in {"planting", "maintenance"}:
         raise HTTPException(status_code=400, detail="Invalid work_type")
@@ -10363,6 +10442,9 @@ def create_work_order(
     if not area_enabled:
         area_label_clean = None
         normalized_area_geojson = None
+        allow_existing_tree_area_reuse = False
+    else:
+        allow_existing_tree_area_reuse = bool(allow_existing_tree_area_reuse) and work_type == "planting"
 
     can_accumulate = (
         work_type == "planting"
@@ -10417,12 +10499,12 @@ def create_work_order(
             INSERT INTO green_work_orders (
                 project_id, assignee_name, work_type, target_trees, species_allocations, maintenance_schedule,
                 auto_assign_first_cycle_maintenance, due_date,
-                area_enabled, area_label, area_geojson
+                area_enabled, area_label, area_geojson, allow_existing_tree_area_reuse
             )
             VALUES (
                 :project_id, :assignee_name, :work_type, :target_trees, CAST(:species_allocations AS JSONB), :maintenance_schedule,
                 :auto_assign_first_cycle_maintenance, :due_date,
-                :area_enabled, :area_label, CAST(:area_geojson AS JSONB)
+                :area_enabled, :area_label, CAST(:area_geojson AS JSONB), :allow_existing_tree_area_reuse
             )
             RETURNING id
         """), {
@@ -10437,6 +10519,7 @@ def create_work_order(
             "area_enabled": bool(area_enabled),
             "area_label": area_label_clean,
             "area_geojson": _safe_json(normalized_area_geojson) if normalized_area_geojson else None,
+            "allow_existing_tree_area_reuse": bool(allow_existing_tree_area_reuse),
         }).scalar()
         action_name = "work_order_created"
     _log_audit_event(
@@ -10456,6 +10539,7 @@ def create_work_order(
             "area_enabled": bool(area_enabled),
             "area_label": area_label_clean,
             "area_geojson": normalized_area_geojson,
+            "allow_existing_tree_area_reuse": bool(allow_existing_tree_area_reuse),
         },
     )
     db.commit()
@@ -10485,6 +10569,7 @@ def list_work_orders(
                o.due_date, o.status,
                COALESCE(o.area_enabled, FALSE) AS area_enabled,
                o.area_label, o.area_geojson,
+               COALESCE(o.allow_existing_tree_area_reuse, FALSE) AS allow_existing_tree_area_reuse,
                CASE
                    WHEN o.work_type = 'planting' THEN COALESCE(t.planted, 0)
                    ELSE o.planted_count
@@ -10514,9 +10599,11 @@ def list_work_orders(
         item["species_allocations"] = _normalize_species_allocations(raw_species_allocations)
         item["auto_assign_first_cycle_maintenance"] = bool(item.get("auto_assign_first_cycle_maintenance"))
         item["area_enabled"] = bool(item.get("area_enabled")) and item.get("work_type") == "planting"
+        item["allow_existing_tree_area_reuse"] = bool(item.get("allow_existing_tree_area_reuse")) and item["area_enabled"]
         if not item["area_enabled"]:
             item["area_geojson"] = None
             item["area_label"] = None
+            item["allow_existing_tree_area_reuse"] = False
         payload.append(item)
     return payload
 
@@ -11026,6 +11113,26 @@ def _coerce_tree_age_months(value: object) -> float | None:
     if months < 0:
         return None
     return months
+
+
+def _infer_tree_age_days_for_maintenance(tree_row: dict, as_of_date: date | None = None) -> int | None:
+    today = as_of_date or date.today()
+    planting_ref = _parse_date_value(tree_row.get("planting_date"))
+    if planting_ref is not None:
+        return max(_day_diff(today, planting_ref), 0)
+
+    age_months = _coerce_tree_age_months(tree_row.get("tree_age_months"))
+    if age_months is None:
+        return None
+
+    capture_ref = (
+        _parse_date_value(tree_row.get("created_at"))
+        or _parse_date_value(tree_row.get("submitted_at"))
+        or _parse_date_value(tree_row.get("reviewed_at"))
+    )
+    elapsed_days = max(_day_diff(today, capture_ref), 0) if capture_ref is not None else 0
+    base_days = int(round(age_months * 30.4375))
+    return max(base_days + elapsed_days, 0)
 
 
 def _infer_tree_age_for_carbon(tree_row: dict) -> tuple[float, str]:
