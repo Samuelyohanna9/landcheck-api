@@ -900,6 +900,27 @@ def _get_maintenance_intervals(activity: str, tree_age_days: int, season: str) -
     return {"first_days": 30, "repeat_days": 90}
 
 
+def _should_skip_existing_tree_routine_activity(
+    activity: str,
+    tree_origin: str,
+    tree_age_days: int | None,
+    tree_status: str,
+    has_open_task: bool,
+) -> bool:
+    origin_key = _normalize_tree_origin(tree_origin)
+    activity_key = _normalize_name(activity)
+    status_key = _normalize_tree_status(tree_status)
+    if origin_key != "existing_inventory" or has_open_task:
+        return False
+    if activity_key == "watering":
+        if status_key == "need_watering":
+            return False
+        return tree_age_days is None or tree_age_days >= 365
+    if activity_key == "weeding":
+        return tree_age_days is None or tree_age_days >= 730
+    return False
+
+
 def _point_in_ring(lng: float, lat: float, ring: list[list[float]]) -> bool:
     if not isinstance(ring, list) or len(ring) < 4:
         return False
@@ -1463,7 +1484,7 @@ def _compute_live_maintenance_rows(
         item = dict(row)
         origin_key = _normalize_tree_origin(item.get("tree_origin"))
         in_new_scope = origin_key == "new_planting" and bool(item.get("count_in_planting_kpis", True))
-        in_existing_scope = origin_key != "new_planting"
+        in_existing_scope = origin_key == "existing_inventory"
         if scope_key == "new_planting" and not in_new_scope:
             continue
         if scope_key == "existing_inventory" and not in_existing_scope:
@@ -1501,6 +1522,7 @@ def _compute_live_maintenance_rows(
     for tree in filtered_trees:
         tree_id = int(tree["id"])
         tree_assignee = str(tree.get("created_by") or "-")
+        origin_key = _normalize_tree_origin(tree.get("tree_origin"))
         if assignee_key:
             has_matching_task = any(
                 _normalize_name(str(task.get("assignee_name") or "")) == assignee_key and int(task["tree_id"]) == tree_id
@@ -1574,6 +1596,15 @@ def _compute_live_maintenance_rows(
             )
             latest_done = done_tasks[0] if done_tasks else None
             active_task = open_tasks[0] if open_tasks else None
+
+            if _should_skip_existing_tree_routine_activity(
+                activity,
+                origin_key,
+                tree_age_days,
+                tree_status,
+                bool(active_task),
+            ):
+                continue
 
             status_text = "No open task"
             tone = "ok"
@@ -1693,6 +1724,7 @@ def _compute_live_maintenance_rows(
                 {
                     "key": f"{tree_id}:{activity}",
                     "treeId": tree_id,
+                    "treeOrigin": origin_key,
                     "assignee": tree_assignee,
                     "activity": activity,
                     "activityLabel": activity.replace("_", " ").title(),
@@ -11128,11 +11160,22 @@ def _coerce_tree_age_months(value: object) -> float | None:
 
 def _infer_tree_age_days_for_maintenance(tree_row: dict, as_of_date: date | None = None) -> int | None:
     today = as_of_date or date.today()
+    origin_key = _normalize_tree_origin(tree_row.get("tree_origin"))
+    age_months = _coerce_tree_age_months(tree_row.get("tree_age_months"))
+    if origin_key == "existing_inventory" and age_months is not None:
+        capture_ref = (
+            _parse_date_value(tree_row.get("created_at"))
+            or _parse_date_value(tree_row.get("submitted_at"))
+            or _parse_date_value(tree_row.get("reviewed_at"))
+        )
+        elapsed_days = max(_day_diff(today, capture_ref), 0) if capture_ref is not None else 0
+        base_days = int(round(age_months * 30.4375))
+        return max(base_days + elapsed_days, 0)
+
     planting_ref = _parse_date_value(tree_row.get("planting_date"))
     if planting_ref is not None:
         return max(_day_diff(today, planting_ref), 0)
 
-    age_months = _coerce_tree_age_months(tree_row.get("tree_age_months"))
     if age_months is None:
         return None
 
