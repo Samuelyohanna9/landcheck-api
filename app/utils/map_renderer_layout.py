@@ -7,6 +7,7 @@ matplotlib.use("Agg")
 
 import math
 import textwrap
+import re
 import numpy as np
 import geopandas as gpd
 import matplotlib.pyplot as plt
@@ -45,6 +46,17 @@ DEFAULT_CERTIFICATION_STATEMENT = (
     "I hereby certify that this survey plan is a true representation of the survey "
     "executed by me and conforms with the regulations of surveying profession."
 )
+
+
+def format_station_label(label) -> str:
+    raw = str(label or "").strip()
+    if not raw:
+        return raw
+    # Format codes like SCAD5130 -> SCAD\n5130 for clearer station labeling.
+    match = re.match(r"^([A-Za-z]{1,4})\s*[-_/]?\s*(\d+)$", raw)
+    if match:
+        return f"{match.group(1).upper()}\n{match.group(2)}"
+    return raw
 
 def get_paper_config(paper_size: str):
     """Get paper dimensions and scale factor"""
@@ -758,9 +770,14 @@ def annotate_vertices(
     def collides(box):
         return any(intersects(box, other) for other in placed_boxes)
 
-    def estimate_box(x, y, text_len, scale_w, scale_h):
-        w = span_x * scale_w * max(1.0, text_len / 8.0)
-        h = span_y * scale_h
+    def estimate_box(x, y, text_value, scale_w, scale_h):
+        lines = [line for line in str(text_value).splitlines() if line is not None]
+        if not lines:
+            lines = [str(text_value)]
+        max_len = max(len(line) for line in lines) if lines else 1
+        line_count = max(1, len(lines))
+        w = span_x * scale_w * max(1.0, max_len / 8.0)
+        h = span_y * scale_h * (1.0 + 0.55 * (line_count - 1))
         return (x - w / 2.0, y - h / 2.0, x + w / 2.0, y + h / 2.0)
 
     def place_text(x, y, text, font_size, color, rotation=0, weight="bold", scale_w=0.015, scale_h=0.02, normal=None):
@@ -802,7 +819,7 @@ def annotate_vertices(
             (-span_x * 0.01, -span_y * 0.01),
         ]
         for dx, dy in offsets:
-            bx = estimate_box(x + dx, y + dy, len(text), scale_w, scale_h)
+            bx = estimate_box(x + dx, y + dy, text, scale_w, scale_h)
             if not collides(bx):
                 ax.text(
                     x + dx,
@@ -814,6 +831,8 @@ def annotate_vertices(
                     va="center",
                     rotation=rotation,
                     weight=weight,
+                    multialignment="center",
+                    linespacing=0.95,
                     zorder=25,
                 )
                 placed_boxes.append(bx)
@@ -875,8 +894,10 @@ def annotate_vertices(
 
     for i in range(len(coords) - 1):
         p1, p2 = Point(coords[i]), Point(coords[i + 1])
-        label = labels[i % len(labels)]
-        next_label = labels[(i + 1) % len(labels)]
+        raw_label = labels[i % len(labels)]
+        raw_next_label = labels[(i + 1) % len(labels)]
+        label = format_station_label(raw_label)
+        next_label = format_station_label(raw_next_label)
 
         seg_dx = p2.x - p1.x
         seg_dy = p2.y - p1.y

@@ -5,6 +5,7 @@ matplotlib.use("Agg")
 
 import os
 import math
+import re
 import numpy as np
 import geopandas as gpd
 import matplotlib.pyplot as plt
@@ -45,6 +46,17 @@ SCALE_FACTORS = {
     "A1": 1.8,
     "A0": 2.2,
 }
+
+
+def format_station_label(label) -> str:
+    raw = str(label or "").strip()
+    if not raw:
+        return raw
+    # Format codes like SCAD5130 -> SCAD\n5130 for clearer station labeling.
+    match = re.match(r"^([A-Za-z]{1,4})\s*[-_/]?\s*(\d+)$", raw)
+    if match:
+        return f"{match.group(1).upper()}\n{match.group(2)}"
+    return raw
 
 
 def get_paper_config(paper_size: str):
@@ -340,7 +352,7 @@ def annotate_vertices_orthophoto(ax, poly, station_names=None, font_scale=1.0, s
     for i in range(len(coords) - 1):
         p1 = Point(coords[i])
         p2 = Point(coords[i + 1])
-        label = labels[i % len(labels)]
+        label = format_station_label(labels[i % len(labels)])
 
         seg_dx = p2.x - p1.x
         seg_dy = p2.y - p1.y
@@ -359,6 +371,8 @@ def annotate_vertices_orthophoto(ax, poly, station_names=None, font_scale=1.0, s
             ha="center",
             va="center",
             weight="bold",
+            multialignment="center",
+            linespacing=0.95,
             zorder=25,
             bbox=dict(facecolor="white", edgecolor="black", boxstyle="round,pad=0.15", alpha=0.85)
         )
