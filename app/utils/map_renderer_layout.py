@@ -513,25 +513,28 @@ def add_north_arrow(ax, font_scale=1.0, style: str = "one_side_stem", color: str
     box = ax.get_position()
     x = float(box.x1)
     y = min(0.93, float(box.y1) + 0.060)
-    size = 0.030 * max(0.8, font_scale)
+    size = 0.032 * max(0.8, font_scale)
 
     if style in ("one_side_stem", "one-sided-stem", "oneside_stem", "stacked_4n", "stacked4n", "vertical_4n"):
         # Match reference symbol without text "4":
         # diagonal down-left into stem knee, then horizontal to the right.
-        stem_knee_y = y + size * 0.50
-        stem_bottom = y - size * 1.02
-        n_y = y - size * 0.28
-        head_top_x = x + size * 0.16
+        stem_knee_y = y + size * 0.52
+        stem_bottom = y - size * 1.05
+        n_x = x + size * 0.03
+        n_y = y - size * 0.36
+        head_top_x = x + size * 0.18
         head_top_y = stem_knee_y + size * 0.30
-        head_right_x = x + size * 0.21
+        head_right_x = x + size * 0.24
+        line_lw = max(0.7, 0.85 * font_scale)
         fig.add_artist(
             mlines.Line2D(
                 [x, x],
                 [stem_bottom, stem_knee_y],
                 transform=fig.transFigure,
                 color=col,
-                lw=max(0.8, 0.9 * font_scale),
+                lw=line_lw,
                 zorder=20,
+                solid_capstyle="butt",
             )
         )
         fig.add_artist(
@@ -540,19 +543,19 @@ def add_north_arrow(ax, font_scale=1.0, style: str = "one_side_stem", color: str
                 [head_top_y, stem_knee_y, stem_knee_y],
                 transform=fig.transFigure,
                 color=col,
-                lw=max(0.8, 0.9 * font_scale),
+                lw=line_lw,
                 zorder=20,
                 solid_joinstyle="miter",
-                solid_capstyle="round",
+                solid_capstyle="butt",
             )
         )
         fig.text(
-            x + size * 0.015,
+            n_x,
             n_y,
             "N",
             ha="center",
             va="center",
-            fontsize=int(10.5 * font_scale),
+            fontsize=int(10.0 * font_scale),
             color=col,
             weight="normal",
             fontfamily="DejaVu Sans",
