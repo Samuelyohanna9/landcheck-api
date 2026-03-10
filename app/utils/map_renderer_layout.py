@@ -516,20 +516,20 @@ def add_north_arrow(ax, font_scale=1.0, style: str = "one_side_stem", color: str
     size = 0.030 * max(0.8, font_scale)
 
     if style in ("one_side_stem", "one-sided-stem", "oneside_stem", "stacked_4n", "stacked4n", "vertical_4n"):
-        # One-sided stem with centered "N" and no numeric glyph.
-        stem_top = y + size * 0.84
-        stem_bottom = y - size * 1.00
-        n_y = (stem_top + stem_bottom) / 2.0
-        n_gap = size * 0.30
+        # One-sided stem style (reference): angled head + straight stem + centered N.
+        stem_bottom = y - size * 1.02
+        stem_head_y = y + size * 0.58
+        n_y = y - size * 0.12
+        n_gap = size * 0.62
         upper_bottom = n_y + (n_gap / 2.0)
         lower_top = n_y - (n_gap / 2.0)
-        # One-sided tip rises to the right from the stem head.
-        arrow_tip_x = x + size * 0.20
-        arrow_tip_y = stem_top + size * 0.17
+        # Angled head to the right (do not resemble a numeric "4").
+        arrow_tip_x = x + size * 0.19
+        arrow_tip_y = stem_head_y + size * 0.22
         fig.add_artist(
             mlines.Line2D(
                 [x, arrow_tip_x],
-                [stem_top, arrow_tip_y],
+                [stem_head_y, arrow_tip_y],
                 transform=fig.transFigure,
                 color=col,
                 lw=max(0.8, 0.85 * font_scale),
@@ -539,7 +539,7 @@ def add_north_arrow(ax, font_scale=1.0, style: str = "one_side_stem", color: str
         fig.add_artist(
             mlines.Line2D(
                 [x, x],
-                [upper_bottom, stem_top],
+                [upper_bottom, stem_head_y],
                 transform=fig.transFigure,
                 color=col,
                 lw=max(0.8, 0.85 * font_scale),
@@ -562,7 +562,7 @@ def add_north_arrow(ax, font_scale=1.0, style: str = "one_side_stem", color: str
             "N",
             ha="center",
             va="center",
-            fontsize=int(10.5 * font_scale),
+            fontsize=int(10.0 * font_scale),
             color=col,
             weight="normal",
             fontfamily="DejaVu Sans",
