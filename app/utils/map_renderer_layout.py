@@ -518,14 +518,14 @@ def add_north_arrow(ax, font_scale=1.0, style: str = "one_side_stem", color: str
     if style in ("one_side_stem", "one-sided-stem", "oneside_stem", "stacked_4n", "stacked4n", "vertical_4n"):
         # One-sided stem style (reference): angled head + straight stem + centered N.
         stem_bottom = y - size * 1.02
-        stem_head_y = y + size * 0.58
+        stem_head_y = y + size * 0.72
         n_y = y - size * 0.12
         n_gap = size * 0.62
         upper_bottom = n_y + (n_gap / 2.0)
         lower_top = n_y - (n_gap / 2.0)
-        # Angled head to the right (do not resemble a numeric "4").
+        # True one-sided arrow head at the top tip (not a side hook).
         arrow_tip_x = x + size * 0.19
-        arrow_tip_y = stem_head_y + size * 0.22
+        arrow_tip_y = stem_head_y - size * 0.22
         fig.add_artist(
             mlines.Line2D(
                 [x, arrow_tip_x],
