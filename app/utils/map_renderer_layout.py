@@ -1565,40 +1565,40 @@ def _draw_adamawa_bottom_blocks(
     disclaimer_text: str,
     font_scale=1.0,
 ):
-    footer_title_font = max(5, int(6.0 * font_scale))
-    footer_main_font = max(4, int(5.2 * font_scale))
-    footer_small_font = max(4, int(4.5 * font_scale))
-    footer_tiny_font = max(3, int(3.9 * font_scale))
+    footer_title_font = max(5, int(6.2 * font_scale))
+    footer_main_font = max(5, int(5.8 * font_scale))
+    footer_small_font = max(4, int(5.0 * font_scale))
+    footer_tiny_font = max(4, int(4.4 * font_scale))
 
     cp_name = _safe_text(control_point_name, "CONTROL POINT")
     fig.text(
         0.06,
-        0.166,
+        0.182,
         f"UTM CO-ORDINATE OF {cp_name}",
         fontsize=footer_title_font,
         color="blue",
         weight="bold",
         fontfamily=ADAMAWA_FONT_FAMILY,
     )
-    fig.text(0.06, 0.151, f"N {_safe_text(northing_text, '-')}", fontsize=footer_main_font, fontfamily=ADAMAWA_FONT_FAMILY)
-    fig.text(0.06, 0.136, f"E {_safe_text(easting_text, '-')}", fontsize=footer_main_font, fontfamily=ADAMAWA_FONT_FAMILY)
-    fig.text(0.06, 0.121, f"Z {_safe_text(elevation_text, '-')}", fontsize=footer_main_font, fontfamily=ADAMAWA_FONT_FAMILY)
-    fig.text(0.06, 0.106, _safe_text(origin_text, DEFAULT_ADAMAWA_ORIGIN_TEXT), fontsize=footer_main_font, color="blue", fontfamily=ADAMAWA_FONT_FAMILY)
-    fig.text(0.06, 0.091, _safe_text(topo_sheet_text, DEFAULT_ADAMAWA_TOPO_SHEET_TEXT), fontsize=footer_main_font, fontfamily=ADAMAWA_FONT_FAMILY)
-    fig.text(0.06, 0.074, DEFAULT_ADAMAWA_CHECKED_BY_TEXT, fontsize=footer_small_font, fontfamily=ADAMAWA_FONT_FAMILY)
-    fig.text(0.06, 0.060, DEFAULT_ADAMAWA_PASSED_BY_TEXT, fontsize=footer_small_font, fontfamily=ADAMAWA_FONT_FAMILY)
-    fig.text(0.06, 0.046, DEFAULT_ADAMAWA_COPYRIGHT_TEXT, fontsize=footer_small_font, fontfamily=ADAMAWA_FONT_FAMILY)
+    fig.text(0.06, 0.166, f"N {_safe_text(northing_text, '-')}", fontsize=footer_main_font, fontfamily=ADAMAWA_FONT_FAMILY)
+    fig.text(0.06, 0.151, f"E {_safe_text(easting_text, '-')}", fontsize=footer_main_font, fontfamily=ADAMAWA_FONT_FAMILY)
+    fig.text(0.06, 0.136, f"Z {_safe_text(elevation_text, '-')}", fontsize=footer_main_font, fontfamily=ADAMAWA_FONT_FAMILY)
+    fig.text(0.06, 0.121, _safe_text(origin_text, DEFAULT_ADAMAWA_ORIGIN_TEXT), fontsize=footer_main_font, color="blue", fontfamily=ADAMAWA_FONT_FAMILY)
+    fig.text(0.06, 0.106, _safe_text(topo_sheet_text, DEFAULT_ADAMAWA_TOPO_SHEET_TEXT), fontsize=footer_main_font, fontfamily=ADAMAWA_FONT_FAMILY)
+    fig.text(0.06, 0.090, DEFAULT_ADAMAWA_CHECKED_BY_TEXT, fontsize=footer_small_font, fontfamily=ADAMAWA_FONT_FAMILY)
+    fig.text(0.06, 0.076, DEFAULT_ADAMAWA_PASSED_BY_TEXT, fontsize=footer_small_font, fontfamily=ADAMAWA_FONT_FAMILY)
+    fig.text(0.06, 0.062, DEFAULT_ADAMAWA_COPYRIGHT_TEXT, fontsize=footer_small_font, fontfamily=ADAMAWA_FONT_FAMILY)
 
     # Computation/plan block with the distinctive center brace used in the Adamawa template.
-    comp_label_y = 0.036
-    plan_label_y = 0.027
+    comp_label_y = 0.047
+    plan_label_y = 0.036
     fig.text(0.06, comp_label_y, "COMPUTATION", fontsize=footer_small_font, fontfamily=ADAMAWA_FONT_FAMILY)
     fig.text(0.195, comp_label_y, "NO", fontsize=footer_small_font, fontfamily=ADAMAWA_FONT_FAMILY)
     fig.text(0.06, plan_label_y, "PLAN", fontsize=footer_small_font, fontfamily=ADAMAWA_FONT_FAMILY)
     fig.text(0.195, plan_label_y, "NO", fontsize=footer_small_font, fontfamily=ADAMAWA_FONT_FAMILY)
 
-    top_y = comp_label_y + 0.0015
-    bottom_y = plan_label_y + 0.0015
+    top_y = comp_label_y + 0.002
+    bottom_y = plan_label_y + 0.002
     brace_left = 0.235
     brace_trunk = 0.285
     brace_tip = 0.300
@@ -1614,11 +1614,11 @@ def _draw_adamawa_bottom_blocks(
     comp_display = _safe_text(computation_no, _safe_text(plan_no, "-"))
     comp_mid_y = (top_y + bottom_y) / 2.0
     fig.text(0.305, comp_mid_y, comp_display, fontsize=footer_main_font, fontfamily=ADAMAWA_FONT_FAMILY, va="center")
-    fig.text(0.35, 0.042, f"CADASTRAL SHEET NO. {_safe_text(cadastral_sheet_no, '-')}", fontsize=footer_small_font, fontfamily=ADAMAWA_FONT_FAMILY, va="center")
-    fig.text(0.455, 0.058, f"SCALE {_normalize_scale_label_adamawa(scale_text)}", fontsize=footer_small_font, fontfamily=ADAMAWA_FONT_FAMILY, ha="center", va="center")
-    fig.text(0.50, 0.0225, DEFAULT_ADAMAWA_PREPARED_BY_TEXT, fontsize=footer_tiny_font, fontfamily=ADAMAWA_FONT_FAMILY, ha="center", va="center")
+    fig.text(0.35, 0.055, f"CADASTRAL SHEET NO. {_safe_text(cadastral_sheet_no, '-')}", fontsize=footer_small_font, fontfamily=ADAMAWA_FONT_FAMILY, va="center")
+    fig.text(0.455, 0.070, f"SCALE {_normalize_scale_label_adamawa(scale_text)}", fontsize=footer_small_font, fontfamily=ADAMAWA_FONT_FAMILY, ha="center", va="center")
+    fig.text(0.50, 0.039, DEFAULT_ADAMAWA_PREPARED_BY_TEXT, fontsize=footer_tiny_font, fontfamily=ADAMAWA_FONT_FAMILY, ha="center", va="center")
 
-    table_ax = fig.add_axes([0.58, 0.072, 0.36, 0.102])
+    table_ax = fig.add_axes([0.58, 0.088, 0.36, 0.112])
     table_ax.axis("off")
     header = ["FROM", "BEARING", "LENGTH", "TO"]
     all_rows = [[r["from"], r["bearing"], r["length"], r["to"]] for r in segment_rows]
@@ -1640,7 +1640,7 @@ def _draw_adamawa_bottom_blocks(
         bbox=[0, 0, 1, 1],
     )
     table.auto_set_font_size(False)
-    table_font = max(4, int(5.4 * font_scale))
+    table_font = max(4, int(5.6 * font_scale))
     table.set_fontsize(table_font)
     for (row_idx, col_idx), cell in table.get_celld().items():
         cell.set_linewidth(0.8 if row_idx == 0 else 0.5)
@@ -1658,9 +1658,9 @@ def _draw_adamawa_bottom_blocks(
                 cell.set_height(row_height)
 
     # Draw right-note text inside a clipped mini-axes so it never overlaps center/footer lines.
-    right_note_ax = fig.add_axes([0.58, 0.032, 0.36, 0.032])
+    right_note_ax = fig.add_axes([0.58, 0.040, 0.36, 0.030])
     right_note_ax.axis("off")
-    note_font = max(3, int(3.8 * font_scale))
+    note_font = max(4, int(4.0 * font_scale))
     disclaimer_line = _safe_text(disclaimer_text, DEFAULT_ADAMAWA_DISCLAIMER_TEXT).strip()
     if len(disclaimer_line) > 110:
         disclaimer_line = f"{disclaimer_line[:107].rstrip()}..."
@@ -1828,9 +1828,8 @@ def _render_plot_map_layout_adamawa(
 
     fig = plt.figure(figsize=(fig_width, fig_height), dpi=dpi)
     _ = FigureCanvas(fig)
-    # Match Adamawa template vertical spacing: slightly lower map top line so
-    # header blocks (authority + date) breathe above the frame.
-    map_left, map_bottom, map_width, map_height = 0.08, 0.20, 0.84, 0.58
+    # Reserve extra room for the dense Adamawa footer so footer texts never collide.
+    map_left, map_bottom, map_width, map_height = 0.08, 0.225, 0.84, 0.555
     ax = fig.add_axes([map_left, map_bottom, map_width, map_height])
 
     rof_no = _safe_text(adamawa_rof_no, f"{plot_id}")
