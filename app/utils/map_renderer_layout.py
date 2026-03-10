@@ -1565,10 +1565,10 @@ def _draw_adamawa_bottom_blocks(
     disclaimer_text: str,
     font_scale=1.0,
 ):
-    footer_title_font = max(5, int(6.2 * font_scale))
-    footer_main_font = max(5, int(5.8 * font_scale))
-    footer_small_font = max(4, int(5.0 * font_scale))
-    footer_tiny_font = max(4, int(4.4 * font_scale))
+    footer_title_font = max(5, int(6.6 * font_scale))
+    footer_main_font = max(5, int(6.1 * font_scale))
+    footer_small_font = max(4, int(5.3 * font_scale))
+    footer_tiny_font = max(4, int(4.7 * font_scale))
 
     cp_name = _safe_text(control_point_name, "CONTROL POINT")
     fig.text(
@@ -1614,9 +1614,9 @@ def _draw_adamawa_bottom_blocks(
     comp_display = _safe_text(computation_no, _safe_text(plan_no, "-"))
     comp_mid_y = (top_y + bottom_y) / 2.0
     fig.text(0.305, comp_mid_y, comp_display, fontsize=footer_main_font, fontfamily=ADAMAWA_FONT_FAMILY, va="center")
-    fig.text(0.35, 0.055, f"CADASTRAL SHEET NO. {_safe_text(cadastral_sheet_no, '-')}", fontsize=footer_small_font, fontfamily=ADAMAWA_FONT_FAMILY, va="center")
-    fig.text(0.455, 0.070, f"SCALE {_normalize_scale_label_adamawa(scale_text)}", fontsize=footer_small_font, fontfamily=ADAMAWA_FONT_FAMILY, ha="center", va="center")
-    fig.text(0.50, 0.039, DEFAULT_ADAMAWA_PREPARED_BY_TEXT, fontsize=footer_tiny_font, fontfamily=ADAMAWA_FONT_FAMILY, ha="center", va="center")
+    fig.text(0.37, 0.061, f"CADASTRAL SHEET NO. {_safe_text(cadastral_sheet_no, '-')}", fontsize=footer_small_font, fontfamily=ADAMAWA_FONT_FAMILY, va="center")
+    # Adamawa footer uses header scale; keep footer compact without a duplicate scale line.
+    fig.text(0.50, 0.041, DEFAULT_ADAMAWA_PREPARED_BY_TEXT, fontsize=footer_tiny_font, fontfamily=ADAMAWA_FONT_FAMILY, ha="center", va="center")
 
     table_ax = fig.add_axes([0.58, 0.088, 0.36, 0.112])
     table_ax.axis("off")
@@ -1640,7 +1640,7 @@ def _draw_adamawa_bottom_blocks(
         bbox=[0, 0, 1, 1],
     )
     table.auto_set_font_size(False)
-    table_font = max(4, int(5.6 * font_scale))
+    table_font = max(4, int(5.9 * font_scale))
     table.set_fontsize(table_font)
     for (row_idx, col_idx), cell in table.get_celld().items():
         cell.set_linewidth(0.8 if row_idx == 0 else 0.5)
@@ -1660,7 +1660,7 @@ def _draw_adamawa_bottom_blocks(
     # Draw right-note text inside a clipped mini-axes so it never overlaps center/footer lines.
     right_note_ax = fig.add_axes([0.58, 0.040, 0.36, 0.030])
     right_note_ax.axis("off")
-    note_font = max(4, int(4.0 * font_scale))
+    note_font = max(4, int(4.3 * font_scale))
     disclaimer_line = _safe_text(disclaimer_text, DEFAULT_ADAMAWA_DISCLAIMER_TEXT).strip()
     if len(disclaimer_line) > 110:
         disclaimer_line = f"{disclaimer_line[:107].rstrip()}..."
