@@ -1565,32 +1565,37 @@ def _draw_adamawa_bottom_blocks(
     disclaimer_text: str,
     font_scale=1.0,
 ):
+    footer_title_font = max(5, int(6.2 * font_scale))
+    footer_main_font = max(5, int(5.6 * font_scale))
+    footer_small_font = max(4, int(4.8 * font_scale))
+    footer_tiny_font = max(4, int(4.2 * font_scale))
+
     cp_name = _safe_text(control_point_name, "CONTROL POINT")
     fig.text(
         0.06,
         0.166,
         f"UTM CO-ORDINATE OF {cp_name}",
-        fontsize=max(6, int(7 * font_scale)),
+        fontsize=footer_title_font,
         color="blue",
         weight="bold",
         fontfamily=ADAMAWA_FONT_FAMILY,
     )
-    fig.text(0.06, 0.151, f"N {_safe_text(northing_text, '-')}", fontsize=max(6, int(7 * font_scale)), fontfamily=ADAMAWA_FONT_FAMILY)
-    fig.text(0.06, 0.136, f"E {_safe_text(easting_text, '-')}", fontsize=max(6, int(7 * font_scale)), fontfamily=ADAMAWA_FONT_FAMILY)
-    fig.text(0.06, 0.121, f"Z {_safe_text(elevation_text, '-')}", fontsize=max(6, int(7 * font_scale)), fontfamily=ADAMAWA_FONT_FAMILY)
-    fig.text(0.06, 0.106, _safe_text(origin_text, DEFAULT_ADAMAWA_ORIGIN_TEXT), fontsize=max(6, int(7 * font_scale)), color="blue", fontfamily=ADAMAWA_FONT_FAMILY)
-    fig.text(0.06, 0.091, _safe_text(topo_sheet_text, DEFAULT_ADAMAWA_TOPO_SHEET_TEXT), fontsize=max(6, int(7 * font_scale)), fontfamily=ADAMAWA_FONT_FAMILY)
-    fig.text(0.06, 0.075, DEFAULT_ADAMAWA_CHECKED_BY_TEXT, fontsize=max(5, int(5.8 * font_scale)), fontfamily=ADAMAWA_FONT_FAMILY)
-    fig.text(0.06, 0.061, DEFAULT_ADAMAWA_PASSED_BY_TEXT, fontsize=max(5, int(5.8 * font_scale)), fontfamily=ADAMAWA_FONT_FAMILY)
-    fig.text(0.06, 0.047, DEFAULT_ADAMAWA_COPYRIGHT_TEXT, fontsize=max(5, int(5.8 * font_scale)), fontfamily=ADAMAWA_FONT_FAMILY)
+    fig.text(0.06, 0.151, f"N {_safe_text(northing_text, '-')}", fontsize=footer_main_font, fontfamily=ADAMAWA_FONT_FAMILY)
+    fig.text(0.06, 0.136, f"E {_safe_text(easting_text, '-')}", fontsize=footer_main_font, fontfamily=ADAMAWA_FONT_FAMILY)
+    fig.text(0.06, 0.121, f"Z {_safe_text(elevation_text, '-')}", fontsize=footer_main_font, fontfamily=ADAMAWA_FONT_FAMILY)
+    fig.text(0.06, 0.106, _safe_text(origin_text, DEFAULT_ADAMAWA_ORIGIN_TEXT), fontsize=footer_main_font, color="blue", fontfamily=ADAMAWA_FONT_FAMILY)
+    fig.text(0.06, 0.091, _safe_text(topo_sheet_text, DEFAULT_ADAMAWA_TOPO_SHEET_TEXT), fontsize=footer_main_font, fontfamily=ADAMAWA_FONT_FAMILY)
+    fig.text(0.06, 0.075, DEFAULT_ADAMAWA_CHECKED_BY_TEXT, fontsize=footer_small_font, fontfamily=ADAMAWA_FONT_FAMILY)
+    fig.text(0.06, 0.061, DEFAULT_ADAMAWA_PASSED_BY_TEXT, fontsize=footer_small_font, fontfamily=ADAMAWA_FONT_FAMILY)
+    fig.text(0.06, 0.048, DEFAULT_ADAMAWA_COPYRIGHT_TEXT, fontsize=footer_small_font, fontfamily=ADAMAWA_FONT_FAMILY)
 
     # Computation/plan block with the distinctive center brace used in the Adamawa template.
     comp_label_y = 0.041
     plan_label_y = 0.031
-    fig.text(0.06, comp_label_y, "COMPUTATION", fontsize=max(5, int(6.0 * font_scale)), fontfamily=ADAMAWA_FONT_FAMILY)
-    fig.text(0.195, comp_label_y, "NO", fontsize=max(5, int(6.0 * font_scale)), fontfamily=ADAMAWA_FONT_FAMILY)
-    fig.text(0.06, plan_label_y, "PLAN", fontsize=max(5, int(6.0 * font_scale)), fontfamily=ADAMAWA_FONT_FAMILY)
-    fig.text(0.195, plan_label_y, "NO", fontsize=max(5, int(6.0 * font_scale)), fontfamily=ADAMAWA_FONT_FAMILY)
+    fig.text(0.06, comp_label_y, "COMPUTATION", fontsize=footer_small_font, fontfamily=ADAMAWA_FONT_FAMILY)
+    fig.text(0.195, comp_label_y, "NO", fontsize=footer_small_font, fontfamily=ADAMAWA_FONT_FAMILY)
+    fig.text(0.06, plan_label_y, "PLAN", fontsize=footer_small_font, fontfamily=ADAMAWA_FONT_FAMILY)
+    fig.text(0.195, plan_label_y, "NO", fontsize=footer_small_font, fontfamily=ADAMAWA_FONT_FAMILY)
 
     top_y = comp_label_y + 0.002
     bottom_y = plan_label_y + 0.002
@@ -1608,10 +1613,10 @@ def _draw_adamawa_bottom_blocks(
 
     comp_display = _safe_text(computation_no, _safe_text(plan_no, "-"))
     comp_mid_y = (top_y + bottom_y) / 2.0
-    fig.text(0.305, comp_mid_y, comp_display, fontsize=max(6, int(6.6 * font_scale)), fontfamily=ADAMAWA_FONT_FAMILY, va="center")
-    fig.text(0.365, 0.047, f"CADASTRAL SHEET NO. {_safe_text(cadastral_sheet_no, '-')}", fontsize=max(5, int(5.8 * font_scale)), fontfamily=ADAMAWA_FONT_FAMILY, va="center")
-    fig.text(0.455, 0.061, f"SCALE {_normalize_scale_label_adamawa(scale_text)}", fontsize=max(5, int(6.0 * font_scale)), fontfamily=ADAMAWA_FONT_FAMILY, ha="center", va="center")
-    fig.text(0.50, 0.036, DEFAULT_ADAMAWA_PREPARED_BY_TEXT, fontsize=max(5, int(5.8 * font_scale)), fontfamily=ADAMAWA_FONT_FAMILY, ha="center", va="center")
+    fig.text(0.305, comp_mid_y, comp_display, fontsize=footer_main_font, fontfamily=ADAMAWA_FONT_FAMILY, va="center")
+    fig.text(0.365, 0.046, f"CADASTRAL SHEET NO. {_safe_text(cadastral_sheet_no, '-')}", fontsize=footer_small_font, fontfamily=ADAMAWA_FONT_FAMILY, va="center")
+    fig.text(0.455, 0.060, f"SCALE {_normalize_scale_label_adamawa(scale_text)}", fontsize=footer_small_font, fontfamily=ADAMAWA_FONT_FAMILY, ha="center", va="center")
+    fig.text(0.50, 0.0275, DEFAULT_ADAMAWA_PREPARED_BY_TEXT, fontsize=footer_tiny_font, fontfamily=ADAMAWA_FONT_FAMILY, ha="center", va="center")
 
     table_ax = fig.add_axes([0.58, 0.072, 0.36, 0.102])
     table_ax.axis("off")
@@ -1635,7 +1640,7 @@ def _draw_adamawa_bottom_blocks(
         bbox=[0, 0, 1, 1],
     )
     table.auto_set_font_size(False)
-    table_font = max(5, int(6 * font_scale))
+    table_font = max(4, int(5.4 * font_scale))
     table.set_fontsize(table_font)
     for (row_idx, col_idx), cell in table.get_celld().items():
         cell.set_linewidth(0.8 if row_idx == 0 else 0.5)
@@ -1654,8 +1659,8 @@ def _draw_adamawa_bottom_blocks(
 
     text_x = 0.58
     text_width = 0.35
-    text_font = max(4, int(4.8 * font_scale))
-    line_step = max(0.007, 0.0085 * font_scale)
+    text_font = max(4, int(4.4 * font_scale))
+    line_step = max(0.0065, 0.0078 * font_scale)
     y_cursor = 0.060
 
     disclaimer_lines = _wrap_figure_text(
