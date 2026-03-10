@@ -1693,7 +1693,7 @@ def _draw_adamawa_bottom_blocks(
         fontfamily=ADAMAWA_FONT_FAMILY,
         ha="left",
         va="top",
-        linespacing=0.78,
+        linespacing=1.02,
         clip_on=True,
     )
 
