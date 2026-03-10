@@ -1124,7 +1124,7 @@ def annotate_vertices(
                     label_offset_mult = 1.15
                     # Increase bearing/distance interval on fenced boundaries
                     # so the two red lines of text clear fence teeth.
-                    label_line_spacing = 2.25
+                    label_line_spacing = 2.5
             except Exception:
                 pass
         if fence_edge and avoid_geom is not None:
