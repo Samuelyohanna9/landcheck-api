@@ -1607,7 +1607,7 @@ def _draw_adamawa_bottom_blocks(
     brace_tip = 0.281
     mid_y = (top_y + bottom_y) / 2.0
     notch_half = 0.0035
-    lw = 1.2
+    lw = 0.9
     fig.add_artist(mlines.Line2D(
         [brace_left, brace_trunk, brace_trunk, brace_tip, brace_trunk, brace_trunk, brace_left],
         [top_y, top_y, mid_y + notch_half, mid_y, mid_y - notch_half, bottom_y, bottom_y],
