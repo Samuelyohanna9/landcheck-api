@@ -1617,7 +1617,7 @@ def _draw_adamawa_bottom_blocks(
             return f"{prefix} {raw[len(prefix):].strip()}"
         return f"{prefix} {raw}"
 
-    fig.text(left_x, y, f"UTM CO-ORDINATE OF {cp_name}", fontsize=footer_font, color="blue", fontfamily=ADAMAWA_FONT_FAMILY, weight="bold")
+    fig.text(left_x, y, f"UTM CO-ORDINATE OF {cp_name}", fontsize=footer_font, color="blue", fontfamily=ADAMAWA_FONT_FAMILY, weight="normal")
     y -= line_gap
     fig.text(left_x, y, _with_prefix("N", northing_text), fontsize=footer_font, color="blue", fontfamily=ADAMAWA_FONT_FAMILY)
     y -= line_gap
@@ -1736,7 +1736,7 @@ def _draw_adamawa_bottom_blocks(
         fontfamily=ADAMAWA_FONT_FAMILY,
         ha="left",
         va="top",
-        linespacing=1.0,
+        linespacing=1.18,
         clip_on=True,
     )
 
