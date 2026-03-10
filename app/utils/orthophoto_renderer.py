@@ -149,9 +149,7 @@ def add_north_arrow(ax, font_scale=1.0, style: str = "stacked_4n", color: str = 
     size = 0.030 * max(0.8, font_scale)
 
     if style in ("stacked_4n", "stacked4n", "vertical_4n"):
-        four_y = y + size * 0.82
-        # Bring stem up to the "4" so there is no visible gap.
-        stem_top = four_y - size * 0.04
+        stem_top = y + size * 0.78
         stem_bottom = y - size * 1.02
         n_y = (stem_top + stem_bottom) / 2.0
         gap = size * 0.24
@@ -159,6 +157,20 @@ def add_north_arrow(ax, font_scale=1.0, style: str = "stacked_4n", color: str = 
         stem_upper_bottom = n_y + gap / 2.0
         stem_lower_top = n_y - gap / 2.0
         stem_lower_bottom = stem_bottom
+
+        # One-sided arrow tip on the stem head.
+        arrow_tip_x = x + size * 0.19
+        arrow_tip_y = stem_top - size * 0.17
+        fig.add_artist(
+            mlines.Line2D(
+                [x, arrow_tip_x],
+                [stem_top, arrow_tip_y],
+                transform=fig.transFigure,
+                color=col,
+                lw=max(0.8, 0.85 * font_scale),
+                zorder=20,
+            )
+        )
         fig.add_artist(
             mlines.Line2D(
                 [x, x],
@@ -178,17 +190,6 @@ def add_north_arrow(ax, font_scale=1.0, style: str = "stacked_4n", color: str = 
                 lw=max(0.8, 0.85 * font_scale),
                 zorder=20,
             )
-        )
-        fig.text(
-            x,
-            four_y,
-            "4",
-            ha="center",
-            va="center",
-            fontsize=int(14 * font_scale),
-            color=col,
-            weight="normal",
-            fontfamily="DejaVu Sans",
         )
         fig.text(
             x,
