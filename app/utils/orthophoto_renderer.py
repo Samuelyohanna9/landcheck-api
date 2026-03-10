@@ -141,30 +141,26 @@ def draw_footer(fig, crs, source, surveyor, rank, font_scale=1.0):
     fig.text(0.95, 0.05, source, fontsize=int(7*font_scale), ha="right")
 
 
-def add_north_arrow(ax, font_scale=1.0, style: str = "stacked_4n", color: str = "black"):
+def add_north_arrow(ax, font_scale=1.0, style: str = "one_side_stem", color: str = "black"):
     fig = ax.figure
     col = "blue" if str(color).lower() == "blue" else "black"
-    style = (style or "stacked_4n").lower()
-    x, y = 0.85, 0.86
+    style = (style or "one_side_stem").lower()
+    box = ax.get_position()
+    x = float(box.x1)
+    y = min(0.93, float(box.y1) + 0.060)
     size = 0.030 * max(0.8, font_scale)
 
-    if style in ("stacked_4n", "stacked4n", "vertical_4n"):
-        stem_top = y + size * 0.78
-        stem_bottom = y - size * 1.02
+    if style in ("one_side_stem", "one-sided-stem", "oneside_stem", "stacked_4n", "stacked4n", "vertical_4n"):
+        stem_top = y + size * 0.84
+        stem_bottom = y - size * 1.00
         n_y = (stem_top + stem_bottom) / 2.0
-        gap = size * 0.24
-        stem_upper_top = stem_top
-        stem_upper_bottom = n_y + gap / 2.0
-        stem_lower_top = n_y - gap / 2.0
-        stem_lower_bottom = stem_bottom
-
-        # One-sided arrow tip on the stem head.
-        arrow_tip_x = x + size * 0.19
-        arrow_tip_y = stem_top - size * 0.17
+        tip_base_y = stem_top - size * 0.06
+        arrow_tip_x = x + size * 0.20
+        arrow_tip_y = stem_top + size * 0.17
         fig.add_artist(
             mlines.Line2D(
                 [x, arrow_tip_x],
-                [stem_top, arrow_tip_y],
+                [tip_base_y, arrow_tip_y],
                 transform=fig.transFigure,
                 color=col,
                 lw=max(0.8, 0.85 * font_scale),
@@ -174,17 +170,7 @@ def add_north_arrow(ax, font_scale=1.0, style: str = "stacked_4n", color: str = 
         fig.add_artist(
             mlines.Line2D(
                 [x, x],
-                [stem_upper_bottom, stem_upper_top],
-                transform=fig.transFigure,
-                color=col,
-                lw=max(0.8, 0.85 * font_scale),
-                zorder=20,
-            )
-        )
-        fig.add_artist(
-            mlines.Line2D(
-                [x, x],
-                [stem_lower_bottom, stem_lower_top],
+                [stem_bottom, stem_top],
                 transform=fig.transFigure,
                 color=col,
                 lw=max(0.8, 0.85 * font_scale),
@@ -489,7 +475,7 @@ def render_orthophoto_png(
     coordinate_system="wgs84", epsg_code=4326,
     use_topo_map=False,
     paper_size="A4",
-    north_arrow_style="stacked_4n",
+    north_arrow_style="one_side_stem",
     north_arrow_color="black",
     preview_mode: bool = False,
 ):

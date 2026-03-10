@@ -59,6 +59,7 @@ DEFAULT_ADAMAWA_PASSED_BY_TEXT = "Passed by Carto..............."
 DEFAULT_ADAMAWA_COPYRIGHT_TEXT = "Copy Right Reserved"
 DEFAULT_ADAMAWA_PREPARED_BY_TEXT = "Plan Prepared by Office of the Surveyor General Adamawa State"
 ADAMAWA_FONT_FAMILY = "DejaVu Serif"
+ADAMAWA_BLUE = "#1f2f8a"
 
 
 def format_station_label(label) -> str:
@@ -503,10 +504,10 @@ def draw_key_box(fig, has_buildings: bool, has_roads: bool, has_rivers: bool, ha
 # Map Decorations
 # ======================
 
-def add_north_arrow(ax, font_scale=1.0, style: str = "stacked_4n", color: str = "black"):
+def add_north_arrow(ax, font_scale=1.0, style: str = "one_side_stem", color: str = "black"):
     fig = ax.figure
     col = "blue" if str(color).lower() == "blue" else "black"
-    style = (style or "stacked_4n").lower()
+    style = (style or "one_side_stem").lower()
     # Keep north arrows vertically aligned to the right edge of the map frame
     # in both general and Adamawa templates.
     box = ax.get_position()
@@ -514,24 +515,19 @@ def add_north_arrow(ax, font_scale=1.0, style: str = "stacked_4n", color: str = 
     y = min(0.93, float(box.y1) + 0.060)
     size = 0.030 * max(0.8, font_scale)
 
-    if style in ("stacked_4n", "stacked4n", "vertical_4n"):
-        # One-sided arrow stem with centered "N" (no text glyph "4").
-        stem_top = y + size * 0.78
-        stem_bottom = y - size * 1.02
+    if style in ("one_side_stem", "one-sided-stem", "oneside_stem", "stacked_4n", "stacked4n", "vertical_4n"):
+        # One-sided stem with centered "N" and no numeric glyph.
+        stem_top = y + size * 0.84
+        stem_bottom = y - size * 1.00
         n_y = (stem_top + stem_bottom) / 2.0
-        gap = size * 0.24
-        stem_upper_top = stem_top
-        stem_upper_bottom = n_y + gap / 2.0
-        stem_lower_top = n_y - gap / 2.0
-        stem_lower_bottom = stem_bottom
-
-        # One-sided arrow tip on the stem head.
-        arrow_tip_x = x + size * 0.19
-        arrow_tip_y = stem_top - size * 0.17
+        # One-sided tip rises to the right so it reads as an arrow, not "4".
+        tip_base_y = stem_top - size * 0.06
+        arrow_tip_x = x + size * 0.20
+        arrow_tip_y = stem_top + size * 0.17
         fig.add_artist(
             mlines.Line2D(
                 [x, arrow_tip_x],
-                [stem_top, arrow_tip_y],
+                [tip_base_y, arrow_tip_y],
                 transform=fig.transFigure,
                 color=col,
                 lw=max(0.8, 0.85 * font_scale),
@@ -541,17 +537,7 @@ def add_north_arrow(ax, font_scale=1.0, style: str = "stacked_4n", color: str = 
         fig.add_artist(
             mlines.Line2D(
                 [x, x],
-                [stem_upper_bottom, stem_upper_top],
-                transform=fig.transFigure,
-                color=col,
-                lw=max(0.8, 0.85 * font_scale),
-                zorder=20,
-            )
-        )
-        fig.add_artist(
-            mlines.Line2D(
-                [x, x],
-                [stem_lower_bottom, stem_lower_top],
+                [stem_bottom, stem_top],
                 transform=fig.transFigure,
                 color=col,
                 lw=max(0.8, 0.85 * font_scale),
@@ -1712,19 +1698,19 @@ def _draw_adamawa_coordinate_labels(ax, font_scale=1.0):
     bottom_n = f"{int(round(ymin))}mN"
     fs = max(6, int(6 * font_scale))
 
-    ax.text(0.0, 1.012, left_e, color="blue", fontsize=fs, ha="left", va="bottom", transform=ax.transAxes, fontfamily=ADAMAWA_FONT_FAMILY)
-    ax.text(1.0, 1.012, right_e, color="blue", fontsize=fs, ha="right", va="bottom", transform=ax.transAxes, fontfamily=ADAMAWA_FONT_FAMILY)
-    ax.text(0.0, -0.018, left_e, color="blue", fontsize=fs, ha="left", va="top", transform=ax.transAxes, fontfamily=ADAMAWA_FONT_FAMILY)
-    ax.text(1.0, -0.018, right_e, color="blue", fontsize=fs, ha="right", va="top", transform=ax.transAxes, fontfamily=ADAMAWA_FONT_FAMILY)
+    ax.text(0.0, 1.012, left_e, color=ADAMAWA_BLUE, fontsize=fs, ha="left", va="bottom", transform=ax.transAxes, fontfamily=ADAMAWA_FONT_FAMILY)
+    ax.text(1.0, 1.012, right_e, color=ADAMAWA_BLUE, fontsize=fs, ha="right", va="bottom", transform=ax.transAxes, fontfamily=ADAMAWA_FONT_FAMILY)
+    ax.text(0.0, -0.018, left_e, color=ADAMAWA_BLUE, fontsize=fs, ha="left", va="top", transform=ax.transAxes, fontfamily=ADAMAWA_FONT_FAMILY)
+    ax.text(1.0, -0.018, right_e, color=ADAMAWA_BLUE, fontsize=fs, ha="right", va="top", transform=ax.transAxes, fontfamily=ADAMAWA_FONT_FAMILY)
 
-    ax.text(-0.018, 1.0, top_n, color="blue", fontsize=fs, ha="right", va="top", rotation=90, transform=ax.transAxes, fontfamily=ADAMAWA_FONT_FAMILY)
-    ax.text(1.018, 1.0, top_n, color="blue", fontsize=fs, ha="left", va="top", rotation=90, transform=ax.transAxes, fontfamily=ADAMAWA_FONT_FAMILY)
-    ax.text(-0.018, 0.0, bottom_n, color="blue", fontsize=fs, ha="right", va="bottom", rotation=90, transform=ax.transAxes, fontfamily=ADAMAWA_FONT_FAMILY)
-    ax.text(1.018, 0.0, bottom_n, color="blue", fontsize=fs, ha="left", va="bottom", rotation=90, transform=ax.transAxes, fontfamily=ADAMAWA_FONT_FAMILY)
+    ax.text(-0.018, 1.0, top_n, color=ADAMAWA_BLUE, fontsize=fs, ha="right", va="top", rotation=90, transform=ax.transAxes, fontfamily=ADAMAWA_FONT_FAMILY)
+    ax.text(1.018, 1.0, top_n, color=ADAMAWA_BLUE, fontsize=fs, ha="left", va="top", rotation=90, transform=ax.transAxes, fontfamily=ADAMAWA_FONT_FAMILY)
+    ax.text(-0.018, 0.0, bottom_n, color=ADAMAWA_BLUE, fontsize=fs, ha="right", va="bottom", rotation=90, transform=ax.transAxes, fontfamily=ADAMAWA_FONT_FAMILY)
+    ax.text(1.018, 0.0, bottom_n, color=ADAMAWA_BLUE, fontsize=fs, ha="left", va="bottom", rotation=90, transform=ax.transAxes, fontfamily=ADAMAWA_FONT_FAMILY)
 
 
 def _draw_adamawa_map_frame(ax, font_scale=1.0):
-    frame_color = "blue"
+    frame_color = ADAMAWA_BLUE
     frame_lw = max(0.9, 1.0 * font_scale)
     # Explicit frame lines (not spines) so they still render when axis is off.
     ax.add_line(mlines.Line2D([0, 1], [1, 1], transform=ax.transAxes, color=frame_color, lw=frame_lw, zorder=29, clip_on=False))
@@ -1761,7 +1747,7 @@ def _draw_adamawa_map_frame(ax, font_scale=1.0):
 def _draw_adamawa_north_arrow(
     ax,
     font_scale=1.0,
-    style: str = "stacked_4n",
+    style: str = "one_side_stem",
     color: str = "black",
 ):
     # Reuse the same north-arrow style/color logic used by the general template.
@@ -1786,7 +1772,7 @@ def _draw_adamawa_bottom_blocks(
     font_scale=1.0,
 ):
     # Match Adamawa sample: compact footer with uniform text size.
-    footer_font = min(6, max(4, int(5.0 * font_scale)))
+    footer_font = max(5, int(round(5.2 * font_scale)))
     line_gap = 0.0095
     left_x = 0.06
     y = 0.182
@@ -1812,15 +1798,15 @@ def _draw_adamawa_bottom_blocks(
             return f"{prefix} {raw[len(prefix):].strip()}"
         return f"{prefix} {raw}"
 
-    fig.text(left_x, y, f"UTM CO-ORDINATE OF {cp_name}", fontsize=footer_font, color="blue", fontfamily=ADAMAWA_FONT_FAMILY, weight="normal")
+    fig.text(left_x, y, f"UTM CO-ORDINATE OF {cp_name}", fontsize=footer_font, color=ADAMAWA_BLUE, fontfamily=ADAMAWA_FONT_FAMILY, weight="normal")
     y -= line_gap
-    fig.text(left_x, y, _with_prefix("N", northing_text), fontsize=footer_font, color="blue", fontfamily=ADAMAWA_FONT_FAMILY)
+    fig.text(left_x, y, _with_prefix("N", northing_text), fontsize=footer_font, color=ADAMAWA_BLUE, fontfamily=ADAMAWA_FONT_FAMILY)
     y -= line_gap
-    fig.text(left_x, y, _with_prefix("E", easting_text), fontsize=footer_font, color="blue", fontfamily=ADAMAWA_FONT_FAMILY)
+    fig.text(left_x, y, _with_prefix("E", easting_text), fontsize=footer_font, color=ADAMAWA_BLUE, fontfamily=ADAMAWA_FONT_FAMILY)
     y -= line_gap
-    fig.text(left_x, y, _with_prefix("Z", elevation_text), fontsize=footer_font, color="blue", fontfamily=ADAMAWA_FONT_FAMILY)
+    fig.text(left_x, y, _with_prefix("Z", elevation_text), fontsize=footer_font, color=ADAMAWA_BLUE, fontfamily=ADAMAWA_FONT_FAMILY)
     y -= line_gap
-    fig.text(left_x, y, origin_display, fontsize=footer_font, color="blue", fontfamily=ADAMAWA_FONT_FAMILY)
+    fig.text(left_x, y, origin_display, fontsize=footer_font, color=ADAMAWA_BLUE, fontfamily=ADAMAWA_FONT_FAMILY)
     y -= line_gap
     fig.text(left_x, y, _safe_text(topo_sheet_text, DEFAULT_ADAMAWA_TOPO_SHEET_TEXT).upper(), fontsize=footer_font, fontfamily=ADAMAWA_FONT_FAMILY)
     y -= (line_gap + 0.002)
@@ -1950,7 +1936,7 @@ def _render_plot_map_layout_adamawa(
     station_names=None,
     coordinate_system: str = "wgs84",
     epsg_code: int = 4326,
-    north_arrow_style: str = "stacked_4n",
+    north_arrow_style: str = "one_side_stem",
     north_arrow_color: str = "black",
     beacon_style: str = "cross",
     road_width_m: float | None = None,
@@ -2303,7 +2289,7 @@ def render_plot_map_layout(
     coordinate_system: str = "wgs84",
     epsg_code: int = 4326,
     paper_size: str = "A4",
-    north_arrow_style: str = "stacked_4n",
+    north_arrow_style: str = "one_side_stem",
     north_arrow_color: str = "black",
     beacon_style: str = "cross",
     road_width_m: float | None = None,
