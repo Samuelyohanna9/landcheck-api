@@ -864,7 +864,7 @@ def draw_coordinate_frame(ax, spacing: float, font_scale=1.0, first_point_info=N
             va="top",
             fontsize=int(8*font_scale),
             color="black",
-            weight="bold",
+            weight="normal",
             clip_on=False,
         )
 
@@ -1050,7 +1050,7 @@ def annotate_vertices(
             font_size=int(8 * font_scale),
             color="black",
             rotation=0,
-            weight="bold",
+            weight="normal",
             scale_w=0.010,
             scale_h=0.016,
             normal=None,
