@@ -925,6 +925,7 @@ def annotate_vertices(
         normal=None,
         normal_offset_mult: float = 1.0,
         line_spacing: float = 0.95,
+        allow_center: bool = True,
     ):
         offset_m = max(2.0, (6.0 / 1000.0) * scale_ratio) * max(0.6, normal_offset_mult)
         candidates = [(x, y)]
@@ -939,17 +940,24 @@ def annotate_vertices(
                 (x - nx * offset_m, y - ny * offset_m),
                 (x + nx * offset_m * 1.5, y + ny * offset_m * 1.5),
                 (x - nx * offset_m * 1.5, y - ny * offset_m * 1.5),
-                (x, y),
             ]
+            if allow_center:
+                candidates.append((x, y))
             if avoid_geom is not None:
                 candidates = [c for c in candidates if not avoid_geom.contains(Point(c[0], c[1]))]
                 if not candidates:
                     for k in range(2, 7):
-                        cand = (x + nx * offset_m * k, y + ny * offset_m * k)
-                        if not avoid_geom.contains(Point(cand[0], cand[1])):
-                            candidates.append(cand)
+                        cand_pos = (x + nx * offset_m * k, y + ny * offset_m * k)
+                        cand_neg = (x - nx * offset_m * k, y - ny * offset_m * k)
+                        if not avoid_geom.contains(Point(cand_pos[0], cand_pos[1])):
+                            candidates.append(cand_pos)
+                        if not avoid_geom.contains(Point(cand_neg[0], cand_neg[1])):
+                            candidates.append(cand_neg)
                     if not candidates:
-                        candidates = [(x, y)]
+                        if allow_center:
+                            candidates = [(x, y)]
+                        else:
+                            candidates = [(x - nx * offset_m * 2.0, y - ny * offset_m * 2.0)]
         elif avoid_geom is not None:
             candidates = [c for c in candidates if not avoid_geom.contains(Point(c[0], c[1]))] or candidates
         offsets = [
@@ -1087,6 +1095,7 @@ def annotate_vertices(
         label_nx, label_ny = normal
         label_offset_mult = 1.0
         label_line_spacing = 0.95
+        fence_edge = False
         base_offset = max(2.0, (6.0 / 1000.0) * scale_ratio)
         if boundary_poly is not None:
             test_pt = Point(mx + label_nx * base_offset, my + label_ny * base_offset)
@@ -1110,11 +1119,22 @@ def annotate_vertices(
                 seg = LineString([(p1.x, p1.y), (p2.x, p2.y)])
                 fence_touch_tol = max(0.5, (2.5 / 1000.0) * scale_ratio)
                 if seg.buffer(fence_touch_tol).intersects(avoid_geom):
+                    fence_edge = True
                     # Keep a subtle extra separation only on fenced edges.
-                    label_offset_mult = 1.08
+                    label_offset_mult = 1.15
                     # Increase bearing/distance interval on fenced boundaries
                     # so the two red lines of text clear fence teeth.
-                    label_line_spacing = 1.35
+                    label_line_spacing = 1.45
+            except Exception:
+                pass
+        if fence_edge and avoid_geom is not None:
+            try:
+                plus_pt = Point(mx + label_nx * base_offset * label_offset_mult, my + label_ny * base_offset * label_offset_mult)
+                minus_pt = Point(mx - label_nx * base_offset * label_offset_mult, my - label_ny * base_offset * label_offset_mult)
+                plus_d = avoid_geom.distance(plus_pt)
+                minus_d = avoid_geom.distance(minus_pt)
+                if minus_d > plus_d:
+                    label_nx, label_ny = -label_nx, -label_ny
             except Exception:
                 pass
 
@@ -1131,6 +1151,7 @@ def annotate_vertices(
             normal=(label_nx, label_ny),
             normal_offset_mult=label_offset_mult,
             line_spacing=label_line_spacing,
+            allow_center=not fence_edge,
         )
 
     return skipped, placed_boxes
