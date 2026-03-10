@@ -44,7 +44,7 @@ REPORTS_DIR = os.path.join(BASE_DIR, "reports")
 PREVIEW_CACHE_DIR = os.path.join(REPORTS_DIR, "previews_cache")
 PREVIEW_CACHE_TTL_SECONDS = max(30, int(os.getenv("PLOT_PREVIEW_CACHE_TTL_SECONDS", "180")))
 PREVIEW_CACHE_MAX_FILES_PER_PLOT = max(5, int(os.getenv("PLOT_PREVIEW_CACHE_MAX_FILES_PER_PLOT", "24")))
-PREVIEW_LAYOUT_VERSION = "survey_layout_2026_03_10_adamawa_v49"
+PREVIEW_LAYOUT_VERSION = "survey_layout_2026_03_10_adamawa_v50"
 
 # Coordinate system EPSG codes mapping
 COORDINATE_SYSTEMS = {
