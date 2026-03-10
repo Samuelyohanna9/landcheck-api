@@ -171,6 +171,23 @@ def add_north_arrow(ax, font_scale=1.0, style: str = "one_side_stem", color: str
                 solid_capstyle="butt",
             )
         )
+        # Arrowhead at top of stem
+        arrow_hw = size * 0.22  # half-width of arrowhead
+        arrow_h = size * 0.30   # height of arrowhead
+        arrowhead = patches.Polygon(
+            [
+                (x, stem_top + arrow_h),           # tip
+                (x - arrow_hw, stem_top),           # bottom-left
+                (x + arrow_hw, stem_top),           # bottom-right
+            ],
+            closed=True,
+            facecolor=col,
+            edgecolor=col,
+            lw=0.5,
+            transform=fig.transFigure,
+            zorder=21,
+        )
+        fig.add_artist(arrowhead)
         # Lower stem (below N)
         fig.add_artist(
             mlines.Line2D(
