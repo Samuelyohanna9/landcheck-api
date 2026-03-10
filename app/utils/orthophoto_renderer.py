@@ -169,26 +169,18 @@ def add_north_arrow(ax, font_scale=1.0, style: str = "one_side_stem", color: str
         )
         fig.add_artist(
             mlines.Line2D(
-                [head_top_x, x],
-                [head_top_y, stem_knee_y],
+                [head_top_x, x, head_right_x],
+                [head_top_y, stem_knee_y, stem_knee_y],
                 transform=fig.transFigure,
                 color=col,
                 lw=max(0.8, 0.9 * font_scale),
                 zorder=20,
-            )
-        )
-        fig.add_artist(
-            mlines.Line2D(
-                [x, head_right_x],
-                [stem_knee_y, stem_knee_y],
-                transform=fig.transFigure,
-                color=col,
-                lw=max(0.8, 0.9 * font_scale),
-                zorder=20,
+                solid_joinstyle="miter",
+                solid_capstyle="round",
             )
         )
         fig.text(
-            x,
+            x + size * 0.015,
             n_y,
             "N",
             ha="center",
