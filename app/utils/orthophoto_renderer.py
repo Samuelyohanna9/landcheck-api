@@ -150,7 +150,7 @@ def add_north_arrow(ax, font_scale=1.0, style: str = "one_side_stem", color: str
     y = min(0.93, float(box.y1) + 0.060)
     size = 0.032 * max(0.8, font_scale)
 
-    if style in ("one_side_stem", "one-sided-stem", "oneside_stem", "stacked_4n", "stacked4n", "vertical_4n", "classic", "triangle"):
+    if style in ("one_side_stem", "one-sided-stem", "oneside_stem", "stacked_4n", "stacked4n", "vertical_4n"):
         # "N" centred on a vertical stem line (upper stem + N + lower stem).
         n_y = y + size * 0.20
         n_gap = size * 0.28
@@ -338,10 +338,19 @@ def add_north_arrow(ax, font_scale=1.0, style: str = "one_side_stem", color: str
                  fontsize=int(10 * font_scale), color=col, weight="bold")
         return
 
-    # Unknown/legacy style fallback: render the approved 4-head symbol, never filled triangle.
-    if style != "one_side_stem":
-        return add_north_arrow(ax, font_scale=font_scale, style="one_side_stem", color=color)
-    return
+    # default: classic arrow
+    ax.annotate(
+        "N",
+        xy=(x, y + size * 0.95),
+        xytext=(x, y - size * 0.75),
+        xycoords="figure fraction",
+        arrowprops=dict(facecolor=col, edgecolor=col, width=2*font_scale, headwidth=8*font_scale),
+        ha="center",
+        fontsize=int(12*font_scale),
+        weight="bold",
+        color=col,
+        zorder=20,
+    )
 
 
 
