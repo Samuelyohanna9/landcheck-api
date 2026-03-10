@@ -35,11 +35,13 @@ PAPER_SIZES = {
 
 # Scale factors for fonts and elements relative to A4
 SCALE_FACTORS = {
-    "A4": 1.0,
-    "A3": 1.25,
-    "A2": 1.5,
-    "A1": 1.8,
-    "A0": 2.2,
+    # Slightly larger default typography to improve readability and better
+    # match the reference template output.
+    "A4": 1.15,
+    "A3": 1.44,
+    "A2": 1.72,
+    "A1": 2.06,
+    "A0": 2.53,
 }
 
 DEFAULT_CERTIFICATION_STATEMENT = (
@@ -1201,7 +1203,7 @@ def annotate_vertices(
             mx,
             my,
             f"{format_bearing_dms(bearing)}\n{dist:.2f}m",
-            font_size=int(6.5 * font_scale),
+            font_size=int(7.0 * font_scale),
             color="red",
             rotation=ang,
             weight="normal",
@@ -2026,7 +2028,8 @@ def _draw_adamawa_bottom_blocks(
     all_rows = [[r["from"], r["bearing"], r["length"], r["to"]] for r in segment_rows]
     # Keep the table readable and non-overlapping for polygons with many vertices.
     # For overflow, show a compact summary row instead of shrinking text into collisions.
-    max_visible_rows = max(6, int(round(9 * font_scale)))
+    # Keep footer table stable with larger text sizes.
+    max_visible_rows = 8
     if len(all_rows) > max_visible_rows:
         keep_rows = max(1, max_visible_rows - 1)
         hidden_count = len(all_rows) - keep_rows
