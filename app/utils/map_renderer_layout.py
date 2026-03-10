@@ -503,16 +503,52 @@ def draw_key_box(fig, has_buildings: bool, has_roads: bool, has_rivers: bool, ha
 # Map Decorations
 # ======================
 
-def add_north_arrow(ax, font_scale=1.0, style: str = "classic", color: str = "black"):
+def add_north_arrow(ax, font_scale=1.0, style: str = "stacked_4n", color: str = "black"):
     fig = ax.figure
     col = "blue" if str(color).lower() == "blue" else "black"
-    style = (style or "classic").lower()
+    style = (style or "stacked_4n").lower()
     # Keep north arrows vertically aligned to the right edge of the map frame
     # in both general and Adamawa templates.
     box = ax.get_position()
     x = float(box.x1)
     y = min(0.93, float(box.y1) + 0.060)
     size = 0.030 * max(0.8, font_scale)
+
+    if style in ("stacked_4n", "stacked4n", "vertical_4n"):
+        # Simple north marker: "4" over "N" with a vertical stem.
+        stem_top = y - size * 0.05
+        stem_bottom = y - size * 1.10
+        fig.add_artist(
+            mlines.Line2D(
+                [x, x],
+                [stem_bottom, stem_top],
+                transform=fig.transFigure,
+                color=col,
+                lw=max(0.9, 1.0 * font_scale),
+                zorder=20,
+            )
+        )
+        fig.text(
+            x - size * 0.02,
+            y + size * 0.88,
+            "4",
+            ha="center",
+            va="center",
+            fontsize=int(16 * font_scale),
+            color=col,
+            weight="normal",
+        )
+        fig.text(
+            x,
+            y + size * 0.42,
+            "N",
+            ha="center",
+            va="center",
+            fontsize=int(12 * font_scale),
+            color=col,
+            weight="normal",
+        )
+        return
 
     if style == "triangle":
         tri = patches.Polygon(
@@ -880,7 +916,7 @@ def annotate_vertices(
     avoid_geom=None,
     scale_ratio: int = 1000,
     boundary_poly=None,
-    beacon_style: str = "circle",
+    beacon_style: str = "cross",
 ):
     """
     Annotate vertices with station names and bearing/distance in RED.
@@ -1704,7 +1740,7 @@ def _draw_adamawa_map_frame(ax, font_scale=1.0):
 def _draw_adamawa_north_arrow(
     ax,
     font_scale=1.0,
-    style: str = "classic",
+    style: str = "stacked_4n",
     color: str = "black",
 ):
     # Reuse the same north-arrow style/color logic used by the general template.
@@ -1893,9 +1929,9 @@ def _render_plot_map_layout_adamawa(
     station_names=None,
     coordinate_system: str = "wgs84",
     epsg_code: int = 4326,
-    north_arrow_style: str = "classic",
+    north_arrow_style: str = "stacked_4n",
     north_arrow_color: str = "black",
-    beacon_style: str = "circle",
+    beacon_style: str = "cross",
     road_width_m: float | None = None,
     road_width_override_m: float | None = None,
     adamawa_rof_no: str = "",
@@ -2246,9 +2282,9 @@ def render_plot_map_layout(
     coordinate_system: str = "wgs84",
     epsg_code: int = 4326,
     paper_size: str = "A4",
-    north_arrow_style: str = "classic",
+    north_arrow_style: str = "stacked_4n",
     north_arrow_color: str = "black",
-    beacon_style: str = "circle",
+    beacon_style: str = "cross",
     road_width_m: float | None = None,
     road_width_override_m: float | None = None,
     preview_mode: bool = False,

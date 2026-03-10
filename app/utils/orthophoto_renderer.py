@@ -141,12 +141,47 @@ def draw_footer(fig, crs, source, surveyor, rank, font_scale=1.0):
     fig.text(0.95, 0.05, source, fontsize=int(7*font_scale), ha="right")
 
 
-def add_north_arrow(ax, font_scale=1.0, style: str = "classic", color: str = "black"):
+def add_north_arrow(ax, font_scale=1.0, style: str = "stacked_4n", color: str = "black"):
     fig = ax.figure
     col = "blue" if str(color).lower() == "blue" else "black"
-    style = (style or "classic").lower()
+    style = (style or "stacked_4n").lower()
     x, y = 0.85, 0.86
     size = 0.030 * max(0.8, font_scale)
+
+    if style in ("stacked_4n", "stacked4n", "vertical_4n"):
+        stem_top = y - size * 0.05
+        stem_bottom = y - size * 1.10
+        fig.add_artist(
+            mlines.Line2D(
+                [x, x],
+                [stem_bottom, stem_top],
+                transform=fig.transFigure,
+                color=col,
+                lw=max(0.9, 1.0 * font_scale),
+                zorder=20,
+            )
+        )
+        fig.text(
+            x - size * 0.02,
+            y + size * 0.88,
+            "4",
+            ha="center",
+            va="center",
+            fontsize=int(16 * font_scale),
+            color=col,
+            weight="normal",
+        )
+        fig.text(
+            x,
+            y + size * 0.42,
+            "N",
+            ha="center",
+            va="center",
+            fontsize=int(12 * font_scale),
+            color=col,
+            weight="normal",
+        )
+        return
 
     if style == "triangle":
         tri = patches.Polygon(
@@ -433,7 +468,7 @@ def render_orthophoto_png(
     coordinate_system="wgs84", epsg_code=4326,
     use_topo_map=False,
     paper_size="A4",
-    north_arrow_style="classic",
+    north_arrow_style="stacked_4n",
     north_arrow_color="black",
     preview_mode: bool = False,
 ):
