@@ -17,7 +17,6 @@ from shapely.geometry import LineString, Point, shape
 from shapely.ops import snap
 import matplotlib.patches as patches
 import matplotlib.lines as mlines
-from matplotlib.path import Path
 from matplotlib.font_manager import FontProperties
 from datetime import datetime
 from matplotlib.backends.backend_agg import FigureCanvasAgg as FigureCanvas
@@ -1593,7 +1592,7 @@ def _draw_adamawa_bottom_blocks(
     y -= line_gap
     fig.text(left_x, y, DEFAULT_ADAMAWA_COPYRIGHT_TEXT, fontsize=footer_font, fontfamily=ADAMAWA_FONT_FAMILY)
 
-    # Computation/plan block with a curved Adamawa-style brace and identifiers.
+    # Computation/plan block with angular curly style like the Adamawa sample.
     comp_label_y = 0.079
     plan_label_y = 0.063
     fig.text(0.06, comp_label_y, "COMPUTATION", fontsize=footer_font, fontfamily=ADAMAWA_FONT_FAMILY)
@@ -1604,51 +1603,18 @@ def _draw_adamawa_bottom_blocks(
     top_y = comp_label_y + 0.002
     bottom_y = plan_label_y + 0.002
     brace_left = 0.235
-    brace_trunk = 0.270
-    brace_tip = 0.286
+    brace_trunk = 0.268
+    brace_tip = 0.281
     mid_y = (top_y + bottom_y) / 2.0
+    notch_half = 0.0035
     lw = 1.2
-    brace_path = Path(
-        [
-            (brace_left, top_y),                      # start (top left)
-            (brace_left + 0.010, top_y),             # cp1
-            (brace_trunk - 0.004, top_y),            # cp2
-            (brace_trunk - 0.004, mid_y + 0.006),    # top inner
-            (brace_trunk - 0.004, mid_y + 0.003),    # cp1
-            (brace_tip, mid_y + 0.001),              # cp2
-            (brace_tip, mid_y),                      # center tip
-            (brace_tip, mid_y - 0.001),              # cp1
-            (brace_trunk - 0.004, mid_y - 0.003),    # cp2
-            (brace_trunk - 0.004, bottom_y + 0.006), # lower inner
-            (brace_trunk - 0.004, bottom_y),         # cp1
-            (brace_left + 0.010, bottom_y),          # cp2
-            (brace_left, bottom_y),                  # end (bottom left)
-        ],
-        [
-            Path.MOVETO,
-            Path.CURVE4,
-            Path.CURVE4,
-            Path.CURVE4,
-            Path.CURVE4,
-            Path.CURVE4,
-            Path.CURVE4,
-            Path.CURVE4,
-            Path.CURVE4,
-            Path.CURVE4,
-            Path.CURVE4,
-            Path.CURVE4,
-            Path.CURVE4,
-        ],
-    )
-    fig.add_artist(
-        patches.PathPatch(
-            brace_path,
-            transform=fig.transFigure,
-            fill=False,
-            edgecolor="black",
-            lw=lw,
-        )
-    )
+    fig.add_artist(mlines.Line2D(
+        [brace_left, brace_trunk, brace_trunk, brace_tip, brace_trunk, brace_trunk, brace_left],
+        [top_y, top_y, mid_y + notch_half, mid_y, mid_y - notch_half, bottom_y, bottom_y],
+        transform=fig.transFigure,
+        color="black",
+        lw=lw,
+    ))
 
     comp_display = _safe_text(computation_no, _safe_text(plan_no, "-"))
     comp_mid_y = (top_y + bottom_y) / 2.0
