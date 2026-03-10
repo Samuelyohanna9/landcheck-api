@@ -1594,8 +1594,8 @@ def _draw_adamawa_bottom_blocks(
     fig.text(left_x, y, DEFAULT_ADAMAWA_COPYRIGHT_TEXT, fontsize=footer_font, fontfamily=ADAMAWA_FONT_FAMILY)
 
     # Computation/plan block with the Adamawa brace and identifiers.
-    comp_label_y = 0.055
-    plan_label_y = 0.044
+    comp_label_y = 0.061
+    plan_label_y = 0.047
     fig.text(0.06, comp_label_y, "COMPUTATION", fontsize=footer_font, fontfamily=ADAMAWA_FONT_FAMILY)
     fig.text(0.195, comp_label_y, "NO", fontsize=footer_font, fontfamily=ADAMAWA_FONT_FAMILY)
     fig.text(0.06, plan_label_y, "PLAN", fontsize=footer_font, fontfamily=ADAMAWA_FONT_FAMILY)
@@ -1619,8 +1619,8 @@ def _draw_adamawa_bottom_blocks(
     comp_mid_y = (top_y + bottom_y) / 2.0
     fig.text(0.305, comp_mid_y, comp_display, fontsize=footer_font, fontfamily=ADAMAWA_FONT_FAMILY, va="center")
     fig.text(0.36, comp_mid_y, f"CADASTRAL NO. {_safe_text(cadastral_sheet_no, '-')}", fontsize=footer_font, fontfamily=ADAMAWA_FONT_FAMILY, va="center")
-    fig.text(0.455, 0.038, f"SCALE {_normalize_scale_label_adamawa(scale_text)}", fontsize=footer_font, fontfamily=ADAMAWA_FONT_FAMILY, ha="center", va="center")
-    fig.text(0.50, 0.032, DEFAULT_ADAMAWA_PREPARED_BY_TEXT, fontsize=footer_tiny_font, fontfamily=ADAMAWA_FONT_FAMILY, ha="center", va="center")
+    fig.text(0.455, 0.049, f"SCALE {_normalize_scale_label_adamawa(scale_text)}", fontsize=footer_font, fontfamily=ADAMAWA_FONT_FAMILY, ha="center", va="center")
+    fig.text(0.50, 0.038, DEFAULT_ADAMAWA_PREPARED_BY_TEXT, fontsize=footer_tiny_font, fontfamily=ADAMAWA_FONT_FAMILY, ha="center", va="center")
 
     table_ax = fig.add_axes([0.58, 0.088, 0.36, 0.112])
     table_ax.axis("off")
@@ -1662,7 +1662,7 @@ def _draw_adamawa_bottom_blocks(
                 cell.set_height(row_height)
 
     # Draw right-note text inside a clipped mini-axes so it never overlaps center/footer lines.
-    right_note_ax = fig.add_axes([0.58, 0.040, 0.36, 0.030])
+    right_note_ax = fig.add_axes([0.58, 0.045, 0.36, 0.030])
     right_note_ax.axis("off")
     note_font = min(6, max(4, int(5.0 * font_scale)))
     disclaimer_line = _safe_text(disclaimer_text, DEFAULT_ADAMAWA_DISCLAIMER_TEXT).strip()
