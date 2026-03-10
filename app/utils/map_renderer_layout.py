@@ -1622,7 +1622,7 @@ def _draw_adamawa_bottom_blocks(
     fig.text(0.40, comp_mid_y, f"CADASTRAL SHEET NO. {_safe_text(cadastral_sheet_no, '-')}", fontsize=footer_font, fontfamily=ADAMAWA_FONT_FAMILY, va="center")
     fig.text(0.50, 0.043, DEFAULT_ADAMAWA_PREPARED_BY_TEXT, fontsize=footer_font, fontfamily=ADAMAWA_FONT_FAMILY, ha="center", va="center")
 
-    table_ax = fig.add_axes([0.58, 0.100, 0.36, 0.100])
+    table_ax = fig.add_axes([0.58, 0.110, 0.36, 0.090])
     table_ax.axis("off")
     header = ["FROM", "BEARING", "DISTANCE", "TO"]
     all_rows = [[r["from"], r["bearing"], r["length"], r["to"]] for r in segment_rows]
