@@ -517,11 +517,14 @@ def add_north_arrow(ax, font_scale=1.0, style: str = "stacked_4n", color: str = 
     if style in ("stacked_4n", "stacked4n", "vertical_4n"):
         # Simple north marker: "4" over "N" with a vertical stem.
         four_y = y + size * 0.82
-        n_y = y + size * 0.40
-        stem_upper_top = y + size * 0.60
-        stem_upper_bottom = n_y + size * 0.14
-        stem_lower_top = n_y - size * 0.14
-        stem_lower_bottom = y - size * 1.02
+        stem_top = y + size * 0.60
+        stem_bottom = y - size * 1.02
+        n_y = (stem_top + stem_bottom) / 2.0
+        gap = size * 0.24
+        stem_upper_top = stem_top
+        stem_upper_bottom = n_y + gap / 2.0
+        stem_lower_top = n_y - gap / 2.0
+        stem_lower_bottom = stem_bottom
         fig.add_artist(
             mlines.Line2D(
                 [x, x],
