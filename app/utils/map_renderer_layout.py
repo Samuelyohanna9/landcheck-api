@@ -1740,7 +1740,7 @@ def _draw_adamawa_bottom_blocks(
     for (row_idx, col_idx), cell in table.get_celld().items():
         cell.set_linewidth(0.8 if row_idx == 0 else 0.5)
         if row_idx == 0:
-            cell.set_text_props(weight="bold", fontfamily=ADAMAWA_FONT_FAMILY)
+            cell.set_text_props(weight="normal", fontfamily=ADAMAWA_FONT_FAMILY)
         else:
             cell.set_text_props(fontfamily=ADAMAWA_FONT_FAMILY)
     # Enforce even row height to prevent any accidental text clipping/overlap.
