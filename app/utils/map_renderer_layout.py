@@ -677,39 +677,19 @@ def draw_grid(
 
     # Optional interior grid lines (used by Adamawa template).
     if full_grid:
-        minor_step = max(float(minor or 0), 0.000001)
-        major_step = max(float(major or 0), minor_step)
+        span_x = max(xmax - xmin, 0.000001)
+        span_y = max(ymax - ymin, 0.000001)
+        # Fixed divisions give stable visible interior grid lines across scales.
+        x_divisions = 8
+        y_divisions = 8
 
-        x_minor_vals = np.arange(math.floor(xmin / minor_step) * minor_step, xmax + minor_step, minor_step)
-        y_minor_vals = np.arange(math.floor(ymin / minor_step) * minor_step, ymax + minor_step, minor_step)
-        x_major_vals = np.arange(math.floor(xmin / major_step) * major_step, xmax + major_step, major_step)
-        y_major_vals = np.arange(math.floor(ymin / major_step) * major_step, ymax + major_step, major_step)
+        for i in range(1, x_divisions):
+            x = xmin + (span_x * i / x_divisions)
+            ax.plot([x, x], [ymin, ymax], color="#5f7dff", lw=0.42 * font_scale, alpha=0.33, zorder=2)
 
-        major_tol = max(major_step * 0.02, 0.000001)
-
-        for x in x_minor_vals:
-            if x <= xmin or x >= xmax:
-                continue
-            if any(abs(x - xm) <= major_tol for xm in x_major_vals):
-                continue
-            ax.plot([x, x], [ymin, ymax], color="blue", lw=0.25 * font_scale, alpha=0.14, zorder=1)
-
-        for y in y_minor_vals:
-            if y <= ymin or y >= ymax:
-                continue
-            if any(abs(y - ym) <= major_tol for ym in y_major_vals):
-                continue
-            ax.plot([xmin, xmax], [y, y], color="blue", lw=0.25 * font_scale, alpha=0.14, zorder=1)
-
-        for x in x_major_vals:
-            if x <= xmin or x >= xmax:
-                continue
-            ax.plot([x, x], [ymin, ymax], color="blue", lw=0.45 * font_scale, alpha=0.26, zorder=2)
-
-        for y in y_major_vals:
-            if y <= ymin or y >= ymax:
-                continue
-            ax.plot([xmin, xmax], [y, y], color="blue", lw=0.45 * font_scale, alpha=0.26, zorder=2)
+        for j in range(1, y_divisions):
+            y = ymin + (span_y * j / y_divisions)
+            ax.plot([xmin, xmax], [y, y], color="#5f7dff", lw=0.42 * font_scale, alpha=0.33, zorder=2)
 
     # Tick-only grid to keep plot area clean
     tick_len = (xmax - xmin) * 0.01
@@ -1423,14 +1403,29 @@ def _draw_adamawa_bottom_blocks(
     fig.text(0.06, 0.103, _safe_text(origin_text, DEFAULT_ADAMAWA_ORIGIN_TEXT), fontsize=max(6, int(7 * font_scale)), color="blue", fontfamily=ADAMAWA_FONT_FAMILY)
     fig.text(0.06, 0.088, _safe_text(topo_sheet_text, DEFAULT_ADAMAWA_TOPO_SHEET_TEXT), fontsize=max(6, int(7 * font_scale)), fontfamily=ADAMAWA_FONT_FAMILY)
 
-    fig.text(0.06, 0.070, "COMPUTATION NO", fontsize=max(6, int(6.5 * font_scale)), fontfamily=ADAMAWA_FONT_FAMILY)
-    fig.add_artist(mlines.Line2D([0.16, 0.21], [0.072, 0.072], transform=fig.transFigure, color="black", lw=0.8))
-    fig.text(0.215, 0.070, _safe_text(computation_no, "-"), fontsize=max(6, int(6.5 * font_scale)), fontfamily=ADAMAWA_FONT_FAMILY)
-    fig.text(0.305, 0.070, f"CADASTRAL SHEET NO. {_safe_text(cadastral_sheet_no, '-')}", fontsize=max(6, int(6.5 * font_scale)), fontfamily=ADAMAWA_FONT_FAMILY)
+    # Computation/plan block with the distinctive center brace used in the Adamawa template.
+    fig.text(0.06, 0.070, "COMPUTATION", fontsize=max(6, int(6.5 * font_scale)), fontfamily=ADAMAWA_FONT_FAMILY)
+    fig.text(0.195, 0.070, "NO", fontsize=max(6, int(6.5 * font_scale)), fontfamily=ADAMAWA_FONT_FAMILY)
     fig.text(0.06, 0.053, "PLAN", fontsize=max(6, int(6.5 * font_scale)), fontfamily=ADAMAWA_FONT_FAMILY)
-    fig.text(0.108, 0.053, "NO", fontsize=max(6, int(6.5 * font_scale)), fontfamily=ADAMAWA_FONT_FAMILY)
-    fig.add_artist(mlines.Line2D([0.13, 0.21], [0.055, 0.055], transform=fig.transFigure, color="black", lw=0.8))
-    fig.text(0.215, 0.053, _safe_text(plan_no, "-"), fontsize=max(6, int(6.5 * font_scale)), fontfamily=ADAMAWA_FONT_FAMILY)
+    fig.text(0.195, 0.053, "NO", fontsize=max(6, int(6.5 * font_scale)), fontfamily=ADAMAWA_FONT_FAMILY)
+
+    top_y = 0.072
+    bottom_y = 0.055
+    brace_left = 0.235
+    brace_trunk = 0.285
+    brace_tip = 0.300
+    mid_y = (top_y + bottom_y) / 2.0
+    lw = 1.2
+    fig.add_artist(mlines.Line2D([brace_left, brace_trunk], [top_y, top_y], transform=fig.transFigure, color="black", lw=lw))
+    fig.add_artist(mlines.Line2D([brace_left, brace_trunk], [bottom_y, bottom_y], transform=fig.transFigure, color="black", lw=lw))
+    fig.add_artist(mlines.Line2D([brace_trunk, brace_trunk], [top_y, mid_y + 0.004], transform=fig.transFigure, color="black", lw=lw))
+    fig.add_artist(mlines.Line2D([brace_trunk, brace_tip], [mid_y + 0.004, mid_y], transform=fig.transFigure, color="black", lw=lw))
+    fig.add_artist(mlines.Line2D([brace_tip, brace_trunk], [mid_y, mid_y - 0.004], transform=fig.transFigure, color="black", lw=lw))
+    fig.add_artist(mlines.Line2D([brace_trunk, brace_trunk], [mid_y - 0.004, bottom_y], transform=fig.transFigure, color="black", lw=lw))
+
+    comp_display = _safe_text(plan_no, _safe_text(computation_no, "-"))
+    fig.text(0.305, 0.064, comp_display, fontsize=max(6, int(7.5 * font_scale)), fontfamily=ADAMAWA_FONT_FAMILY, va="center")
+    fig.text(0.41, 0.064, f"CADASTRAL SHEET NO. {_safe_text(cadastral_sheet_no, '-')}", fontsize=max(6, int(6.8 * font_scale)), fontfamily=ADAMAWA_FONT_FAMILY, va="center")
 
     table_ax = fig.add_axes([0.58, 0.072, 0.36, 0.102])
     table_ax.axis("off")

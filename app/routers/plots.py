@@ -44,6 +44,7 @@ REPORTS_DIR = os.path.join(BASE_DIR, "reports")
 PREVIEW_CACHE_DIR = os.path.join(REPORTS_DIR, "previews_cache")
 PREVIEW_CACHE_TTL_SECONDS = max(30, int(os.getenv("PLOT_PREVIEW_CACHE_TTL_SECONDS", "180")))
 PREVIEW_CACHE_MAX_FILES_PER_PLOT = max(5, int(os.getenv("PLOT_PREVIEW_CACHE_MAX_FILES_PER_PLOT", "24")))
+PREVIEW_LAYOUT_VERSION = "survey_layout_2026_03_10_adamawa_v2"
 
 # Coordinate system EPSG codes mapping
 COORDINATE_SYSTEMS = {
@@ -1171,6 +1172,7 @@ def preview_plot_map(plot_id: int, db: Session = Depends(get_db), background_tas
     adamawa_disclaimer_text: str = Body(DEFAULT_ADAMAWA_DISCLAIMER_TEXT)):
 
     payload_for_cache = {
+        "_layout_version": PREVIEW_LAYOUT_VERSION,
         "title_text": title_text,
         "location_text": location_text,
         "lga_text": lga_text,
