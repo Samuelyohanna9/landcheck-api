@@ -151,19 +151,19 @@ def add_north_arrow(ax, font_scale=1.0, style: str = "one_side_stem", color: str
     size = 0.032 * max(0.8, font_scale)
 
     if style in ("one_side_stem", "one-sided-stem", "oneside_stem", "stacked_4n", "stacked4n", "vertical_4n"):
-        # "N" centred on a vertical stem line (upper stem + N + lower stem).
-        n_y = y + size * 0.20
-        n_gap = size * 0.28
-        stem_top = n_y + n_gap / 2.0 + size * 0.60
-        stem_bottom = n_y - n_gap / 2.0 - size * 0.90
-        lower_stem_top = n_y - n_gap / 2.0
-        upper_stem_bottom = n_y + n_gap / 2.0
-        line_lw = max(0.7, 0.90 * font_scale)
-        # Upper stem (above N)
+        # One-sided "4-shape" head per provided reference code.
+        stem_bottom = y - size * 1.00
+        stem_top = y + size * 0.80
+        head_knee_x = x - size * 0.08
+        head_knee_y = y + size * 0.40
+        n_y = y - size * 0.21
+        line_lw = max(0.8, 0.95 * font_scale)
+
+        # Main shaft
         fig.add_artist(
             mlines.Line2D(
                 [x, x],
-                [upper_stem_bottom, stem_top],
+                [stem_bottom, stem_top],
                 transform=fig.transFigure,
                 color=col,
                 lw=line_lw,
@@ -171,32 +171,27 @@ def add_north_arrow(ax, font_scale=1.0, style: str = "one_side_stem", color: str
                 solid_capstyle="butt",
             )
         )
-        # Arrowhead at top of stem
-        arrow_hw = size * 0.22  # half-width of arrowhead
-        arrow_h = size * 0.30   # height of arrowhead
-        arrowhead = patches.Polygon(
-            [
-                (x, stem_top + arrow_h),           # tip
-                (x - arrow_hw, stem_top),           # bottom-left
-                (x + arrow_hw, stem_top),           # bottom-right
-            ],
-            closed=True,
-            facecolor=col,
-            edgecolor=col,
-            lw=0.5,
-            transform=fig.transFigure,
-            zorder=21,
-        )
-        fig.add_artist(arrowhead)
-        # Lower stem (below N)
+        # Diagonal from top of shaft down-left
         fig.add_artist(
             mlines.Line2D(
-                [x, x],
-                [stem_bottom, lower_stem_top],
+                [x, head_knee_x],
+                [stem_top, head_knee_y],
                 transform=fig.transFigure,
                 color=col,
                 lw=line_lw,
-                zorder=20,
+                zorder=21,
+                solid_capstyle="butt",
+            )
+        )
+        # Horizontal back to shaft
+        fig.add_artist(
+            mlines.Line2D(
+                [head_knee_x, x],
+                [head_knee_y, head_knee_y],
+                transform=fig.transFigure,
+                color=col,
+                lw=line_lw,
+                zorder=21,
                 solid_capstyle="butt",
             )
         )
@@ -208,7 +203,7 @@ def add_north_arrow(ax, font_scale=1.0, style: str = "one_side_stem", color: str
             va="center",
             fontsize=int(11.0 * font_scale),
             color=col,
-            weight="bold",
+            weight="normal",
             fontfamily="DejaVu Sans",
             zorder=25,
         )
