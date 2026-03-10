@@ -1430,6 +1430,7 @@ def _render_plot_map_layout_adamawa(
     scale_text: str,
     surveyor_name: str,
     surveyor_rank: str,
+    paper_size: str = "A4",
     station_names=None,
     coordinate_system: str = "wgs84",
     epsg_code: int = 4326,
@@ -1549,7 +1550,7 @@ def _render_plot_map_layout_adamawa(
         poly = poly.buffer(0)
         gdf_plot = gpd.GeoDataFrame(geometry=[poly], crs=f"EPSG:{display_epsg}")
 
-    paper_config = get_paper_config("A4")
+    paper_config = get_paper_config(paper_size)
     fig_width = paper_config["width"]
     fig_height = paper_config["height"]
     font_scale = paper_config["scale"]
@@ -1574,7 +1575,7 @@ def _render_plot_map_layout_adamawa(
         font_scale=font_scale,
     )
 
-    scale_ratio = parse_scale_ratio(scale_text if str(scale_text or "").strip() else "1 : 2500")
+    scale_ratio = parse_scale_ratio(scale_text)
     apply_true_scale(ax, poly, scale_ratio, fig_width * map_width, fig_height * map_height)
     target_xlim = ax.get_xlim()
     target_ylim = ax.get_ylim()
@@ -1756,6 +1757,7 @@ def render_plot_map_layout(
             scale_text=scale_text,
             surveyor_name=surveyor_name,
             surveyor_rank=surveyor_rank,
+            paper_size=paper_size,
             station_names=station_names,
             coordinate_system=coordinate_system,
             epsg_code=epsg_code,
