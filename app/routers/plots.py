@@ -70,6 +70,15 @@ DEFAULT_CERTIFICATION_STATEMENT = (
     "I hereby certify that this survey plan is a true representation of the survey "
     "executed by me and conforms with the regulations of surveying profession."
 )
+DEFAULT_TEMPLATE_NAME = "general"
+DEFAULT_ADAMAWA_AUTHORITY_TITLE = "SURVEYOR GENERAL"
+DEFAULT_ADAMAWA_AUTHORITY_DATE = "November, 2024"
+DEFAULT_ADAMAWA_ORIGIN_TEXT = "ORIGIN:- WGS 84 UTM ZONE 33N"
+DEFAULT_ADAMAWA_TOPO_SHEET_TEXT = "BASED ON GIREI TOPO SHEET 197 NE"
+DEFAULT_ADAMAWA_DISCLAIMER_TEXT = (
+    "Detail shewn not the result of accurate survey. All bearing and distances shewn on this plan "
+    "have been computed from registered Co-ordinates."
+)
 
 _PLOTS_SCHEMA_READY = False
 _PLOTS_SCHEMA_LOCK = Lock()
@@ -147,6 +156,22 @@ def ensure_plot_meta_table(db: Session):
             scale_text VARCHAR(50),
             paper_size VARCHAR(10),
             coordinate_system VARCHAR(20),
+            template_name VARCHAR(40) DEFAULT 'general',
+            adamawa_rof_no TEXT,
+            adamawa_owner_name TEXT,
+            adamawa_authority_title TEXT,
+            adamawa_authority_date_text TEXT,
+            adamawa_control_point_name TEXT,
+            adamawa_northing TEXT,
+            adamawa_easting TEXT,
+            adamawa_elevation TEXT,
+            adamawa_origin_text TEXT,
+            adamawa_topo_sheet_text TEXT,
+            adamawa_computation_no TEXT,
+            adamawa_cadastral_sheet_no TEXT,
+            adamawa_plan_no TEXT,
+            adamawa_surveyed_by_text TEXT,
+            adamawa_disclaimer_text TEXT,
             created_at TIMESTAMP DEFAULT NOW(),
             updated_at TIMESTAMP DEFAULT NOW()
         )
@@ -163,6 +188,22 @@ def ensure_plot_meta_table(db: Session):
         ("scale_text", "VARCHAR(50)"),
         ("paper_size", "VARCHAR(10)"),
         ("coordinate_system", "VARCHAR(20)"),
+        ("template_name", "VARCHAR(40) DEFAULT 'general'"),
+        ("adamawa_rof_no", "TEXT"),
+        ("adamawa_owner_name", "TEXT"),
+        ("adamawa_authority_title", "TEXT"),
+        ("adamawa_authority_date_text", "TEXT"),
+        ("adamawa_control_point_name", "TEXT"),
+        ("adamawa_northing", "TEXT"),
+        ("adamawa_easting", "TEXT"),
+        ("adamawa_elevation", "TEXT"),
+        ("adamawa_origin_text", "TEXT"),
+        ("adamawa_topo_sheet_text", "TEXT"),
+        ("adamawa_computation_no", "TEXT"),
+        ("adamawa_cadastral_sheet_no", "TEXT"),
+        ("adamawa_plan_no", "TEXT"),
+        ("adamawa_surveyed_by_text", "TEXT"),
+        ("adamawa_disclaimer_text", "TEXT"),
         ("created_at", "TIMESTAMP DEFAULT NOW()"),
         ("updated_at", "TIMESTAMP DEFAULT NOW()"),
     ]
@@ -245,17 +286,41 @@ def upsert_plot_meta(
     scale_text: Optional[str] = None,
     paper_size: Optional[str] = None,
     coordinate_system: Optional[str] = None,
+    template_name: Optional[str] = None,
+    adamawa_rof_no: Optional[str] = None,
+    adamawa_owner_name: Optional[str] = None,
+    adamawa_authority_title: Optional[str] = None,
+    adamawa_authority_date_text: Optional[str] = None,
+    adamawa_control_point_name: Optional[str] = None,
+    adamawa_northing: Optional[str] = None,
+    adamawa_easting: Optional[str] = None,
+    adamawa_elevation: Optional[str] = None,
+    adamawa_origin_text: Optional[str] = None,
+    adamawa_topo_sheet_text: Optional[str] = None,
+    adamawa_computation_no: Optional[str] = None,
+    adamawa_cadastral_sheet_no: Optional[str] = None,
+    adamawa_plan_no: Optional[str] = None,
+    adamawa_surveyed_by_text: Optional[str] = None,
+    adamawa_disclaimer_text: Optional[str] = None,
 ):
     ensure_plot_meta_table(db)
 
     db.execute(text("""
         INSERT INTO plot_meta (
             plot_id, title_text, location_text, lga_text, state_text,
-            surveyor_name, surveyor_rank, certification_statement, scale_text, paper_size, coordinate_system
+            surveyor_name, surveyor_rank, certification_statement, scale_text, paper_size, coordinate_system,
+            template_name, adamawa_rof_no, adamawa_owner_name, adamawa_authority_title, adamawa_authority_date_text,
+            adamawa_control_point_name, adamawa_northing, adamawa_easting, adamawa_elevation, adamawa_origin_text,
+            adamawa_topo_sheet_text, adamawa_computation_no, adamawa_cadastral_sheet_no, adamawa_plan_no,
+            adamawa_surveyed_by_text, adamawa_disclaimer_text
         )
         VALUES (
             :plot_id, :title_text, :location_text, :lga_text, :state_text,
-            :surveyor_name, :surveyor_rank, :certification_statement, :scale_text, :paper_size, :coordinate_system
+            :surveyor_name, :surveyor_rank, :certification_statement, :scale_text, :paper_size, :coordinate_system,
+            :template_name, :adamawa_rof_no, :adamawa_owner_name, :adamawa_authority_title, :adamawa_authority_date_text,
+            :adamawa_control_point_name, :adamawa_northing, :adamawa_easting, :adamawa_elevation, :adamawa_origin_text,
+            :adamawa_topo_sheet_text, :adamawa_computation_no, :adamawa_cadastral_sheet_no, :adamawa_plan_no,
+            :adamawa_surveyed_by_text, :adamawa_disclaimer_text
         )
         ON CONFLICT (plot_id) DO UPDATE SET
             title_text = COALESCE(NULLIF(EXCLUDED.title_text, ''), plot_meta.title_text),
@@ -268,6 +333,22 @@ def upsert_plot_meta(
             scale_text = COALESCE(NULLIF(EXCLUDED.scale_text, ''), plot_meta.scale_text),
             paper_size = COALESCE(NULLIF(EXCLUDED.paper_size, ''), plot_meta.paper_size),
             coordinate_system = COALESCE(NULLIF(EXCLUDED.coordinate_system, ''), plot_meta.coordinate_system),
+            template_name = COALESCE(NULLIF(EXCLUDED.template_name, ''), plot_meta.template_name),
+            adamawa_rof_no = COALESCE(NULLIF(EXCLUDED.adamawa_rof_no, ''), plot_meta.adamawa_rof_no),
+            adamawa_owner_name = COALESCE(NULLIF(EXCLUDED.adamawa_owner_name, ''), plot_meta.adamawa_owner_name),
+            adamawa_authority_title = COALESCE(NULLIF(EXCLUDED.adamawa_authority_title, ''), plot_meta.adamawa_authority_title),
+            adamawa_authority_date_text = COALESCE(NULLIF(EXCLUDED.adamawa_authority_date_text, ''), plot_meta.adamawa_authority_date_text),
+            adamawa_control_point_name = COALESCE(NULLIF(EXCLUDED.adamawa_control_point_name, ''), plot_meta.adamawa_control_point_name),
+            adamawa_northing = COALESCE(NULLIF(EXCLUDED.adamawa_northing, ''), plot_meta.adamawa_northing),
+            adamawa_easting = COALESCE(NULLIF(EXCLUDED.adamawa_easting, ''), plot_meta.adamawa_easting),
+            adamawa_elevation = COALESCE(NULLIF(EXCLUDED.adamawa_elevation, ''), plot_meta.adamawa_elevation),
+            adamawa_origin_text = COALESCE(NULLIF(EXCLUDED.adamawa_origin_text, ''), plot_meta.adamawa_origin_text),
+            adamawa_topo_sheet_text = COALESCE(NULLIF(EXCLUDED.adamawa_topo_sheet_text, ''), plot_meta.adamawa_topo_sheet_text),
+            adamawa_computation_no = COALESCE(NULLIF(EXCLUDED.adamawa_computation_no, ''), plot_meta.adamawa_computation_no),
+            adamawa_cadastral_sheet_no = COALESCE(NULLIF(EXCLUDED.adamawa_cadastral_sheet_no, ''), plot_meta.adamawa_cadastral_sheet_no),
+            adamawa_plan_no = COALESCE(NULLIF(EXCLUDED.adamawa_plan_no, ''), plot_meta.adamawa_plan_no),
+            adamawa_surveyed_by_text = COALESCE(NULLIF(EXCLUDED.adamawa_surveyed_by_text, ''), plot_meta.adamawa_surveyed_by_text),
+            adamawa_disclaimer_text = COALESCE(NULLIF(EXCLUDED.adamawa_disclaimer_text, ''), plot_meta.adamawa_disclaimer_text),
             updated_at = NOW()
     """), {
         "plot_id": plot_id,
@@ -281,6 +362,22 @@ def upsert_plot_meta(
         "scale_text": scale_text,
         "paper_size": paper_size,
         "coordinate_system": coordinate_system,
+        "template_name": template_name,
+        "adamawa_rof_no": adamawa_rof_no,
+        "adamawa_owner_name": adamawa_owner_name,
+        "adamawa_authority_title": adamawa_authority_title,
+        "adamawa_authority_date_text": adamawa_authority_date_text,
+        "adamawa_control_point_name": adamawa_control_point_name,
+        "adamawa_northing": adamawa_northing,
+        "adamawa_easting": adamawa_easting,
+        "adamawa_elevation": adamawa_elevation,
+        "adamawa_origin_text": adamawa_origin_text,
+        "adamawa_topo_sheet_text": adamawa_topo_sheet_text,
+        "adamawa_computation_no": adamawa_computation_no,
+        "adamawa_cadastral_sheet_no": adamawa_cadastral_sheet_no,
+        "adamawa_plan_no": adamawa_plan_no,
+        "adamawa_surveyed_by_text": adamawa_surveyed_by_text,
+        "adamawa_disclaimer_text": adamawa_disclaimer_text,
     })
     db.commit()
 
@@ -288,7 +385,11 @@ def upsert_plot_meta(
 def get_plot_meta(db: Session, plot_id: int) -> dict:
     row = db.execute(text("""
         SELECT title_text, location_text, lga_text, state_text,
-               surveyor_name, surveyor_rank, certification_statement, scale_text, paper_size, coordinate_system
+               surveyor_name, surveyor_rank, certification_statement, scale_text, paper_size, coordinate_system,
+               template_name, adamawa_rof_no, adamawa_owner_name, adamawa_authority_title, adamawa_authority_date_text,
+               adamawa_control_point_name, adamawa_northing, adamawa_easting, adamawa_elevation, adamawa_origin_text,
+               adamawa_topo_sheet_text, adamawa_computation_no, adamawa_cadastral_sheet_no, adamawa_plan_no,
+               adamawa_surveyed_by_text, adamawa_disclaimer_text
         FROM plot_meta
         WHERE plot_id = :plot_id
     """), {"plot_id": plot_id}).mappings().first()
@@ -304,6 +405,22 @@ def get_plot_meta(db: Session, plot_id: int) -> dict:
             "scale_text": "1 : 1000",
             "paper_size": "A4",
             "coordinate_system": "wgs84",
+            "template_name": DEFAULT_TEMPLATE_NAME,
+            "adamawa_rof_no": "",
+            "adamawa_owner_name": "",
+            "adamawa_authority_title": DEFAULT_ADAMAWA_AUTHORITY_TITLE,
+            "adamawa_authority_date_text": DEFAULT_ADAMAWA_AUTHORITY_DATE,
+            "adamawa_control_point_name": "",
+            "adamawa_northing": "",
+            "adamawa_easting": "",
+            "adamawa_elevation": "",
+            "adamawa_origin_text": DEFAULT_ADAMAWA_ORIGIN_TEXT,
+            "adamawa_topo_sheet_text": DEFAULT_ADAMAWA_TOPO_SHEET_TEXT,
+            "adamawa_computation_no": "",
+            "adamawa_cadastral_sheet_no": "",
+            "adamawa_plan_no": "",
+            "adamawa_surveyed_by_text": "",
+            "adamawa_disclaimer_text": DEFAULT_ADAMAWA_DISCLAIMER_TEXT,
         }
     return {
         "title_text": row.get("title_text") or "SURVEY PLAN",
@@ -316,6 +433,22 @@ def get_plot_meta(db: Session, plot_id: int) -> dict:
         "scale_text": row.get("scale_text") or "1 : 1000",
         "paper_size": row.get("paper_size") or "A4",
         "coordinate_system": row.get("coordinate_system") or "wgs84",
+        "template_name": row.get("template_name") or DEFAULT_TEMPLATE_NAME,
+        "adamawa_rof_no": row.get("adamawa_rof_no") or "",
+        "adamawa_owner_name": row.get("adamawa_owner_name") or "",
+        "adamawa_authority_title": row.get("adamawa_authority_title") or DEFAULT_ADAMAWA_AUTHORITY_TITLE,
+        "adamawa_authority_date_text": row.get("adamawa_authority_date_text") or DEFAULT_ADAMAWA_AUTHORITY_DATE,
+        "adamawa_control_point_name": row.get("adamawa_control_point_name") or "",
+        "adamawa_northing": row.get("adamawa_northing") or "",
+        "adamawa_easting": row.get("adamawa_easting") or "",
+        "adamawa_elevation": row.get("adamawa_elevation") or "",
+        "adamawa_origin_text": row.get("adamawa_origin_text") or DEFAULT_ADAMAWA_ORIGIN_TEXT,
+        "adamawa_topo_sheet_text": row.get("adamawa_topo_sheet_text") or DEFAULT_ADAMAWA_TOPO_SHEET_TEXT,
+        "adamawa_computation_no": row.get("adamawa_computation_no") or "",
+        "adamawa_cadastral_sheet_no": row.get("adamawa_cadastral_sheet_no") or "",
+        "adamawa_plan_no": row.get("adamawa_plan_no") or "",
+        "adamawa_surveyed_by_text": row.get("adamawa_surveyed_by_text") or "",
+        "adamawa_disclaimer_text": row.get("adamawa_disclaimer_text") or DEFAULT_ADAMAWA_DISCLAIMER_TEXT,
     }
 
 
@@ -845,7 +978,23 @@ def download_plot_report_pdf(plot_id: int, db: Session = Depends(get_db), backgr
     north_arrow_color: str = Body("black"),
     beacon_style: str = Body("circle"),
     road_width_m: float | None = Body(None),
-    road_width_override_m: float | None = Body(None)):
+    road_width_override_m: float | None = Body(None),
+    template_name: str = Body(DEFAULT_TEMPLATE_NAME),
+    adamawa_rof_no: str = Body(""),
+    adamawa_owner_name: str = Body(""),
+    adamawa_authority_title: str = Body(DEFAULT_ADAMAWA_AUTHORITY_TITLE),
+    adamawa_authority_date_text: str = Body(DEFAULT_ADAMAWA_AUTHORITY_DATE),
+    adamawa_control_point_name: str = Body(""),
+    adamawa_northing: str = Body(""),
+    adamawa_easting: str = Body(""),
+    adamawa_elevation: str = Body(""),
+    adamawa_origin_text: str = Body(DEFAULT_ADAMAWA_ORIGIN_TEXT),
+    adamawa_topo_sheet_text: str = Body(DEFAULT_ADAMAWA_TOPO_SHEET_TEXT),
+    adamawa_computation_no: str = Body(""),
+    adamawa_cadastral_sheet_no: str = Body(""),
+    adamawa_plan_no: str = Body(""),
+    adamawa_surveyed_by_text: str = Body(""),
+    adamawa_disclaimer_text: str = Body(DEFAULT_ADAMAWA_DISCLAIMER_TEXT)):
 
     reports_dir = REPORTS_DIR
     maps_dir = os.path.join(REPORTS_DIR, "maps")
@@ -872,6 +1021,22 @@ def download_plot_report_pdf(plot_id: int, db: Session = Depends(get_db), backgr
         scale_text=scale_text,
         paper_size=paper_size,
         coordinate_system=coordinate_system,
+        template_name=template_name,
+        adamawa_rof_no=adamawa_rof_no,
+        adamawa_owner_name=adamawa_owner_name,
+        adamawa_authority_title=adamawa_authority_title,
+        adamawa_authority_date_text=adamawa_authority_date_text,
+        adamawa_control_point_name=adamawa_control_point_name,
+        adamawa_northing=adamawa_northing,
+        adamawa_easting=adamawa_easting,
+        adamawa_elevation=adamawa_elevation,
+        adamawa_origin_text=adamawa_origin_text,
+        adamawa_topo_sheet_text=adamawa_topo_sheet_text,
+        adamawa_computation_no=adamawa_computation_no,
+        adamawa_cadastral_sheet_no=adamawa_cadastral_sheet_no,
+        adamawa_plan_no=adamawa_plan_no,
+        adamawa_surveyed_by_text=adamawa_surveyed_by_text,
+        adamawa_disclaimer_text=adamawa_disclaimer_text,
     )
 
     # Get EPSG code for selected coordinate system
@@ -900,6 +1065,22 @@ def download_plot_report_pdf(plot_id: int, db: Session = Depends(get_db), backgr
         beacon_style=beacon_style,
         road_width_m=road_width_m,
         road_width_override_m=road_width_override_m,
+        template_name=template_name,
+        adamawa_rof_no=adamawa_rof_no,
+        adamawa_owner_name=adamawa_owner_name,
+        adamawa_authority_title=adamawa_authority_title,
+        adamawa_authority_date_text=adamawa_authority_date_text,
+        adamawa_control_point_name=adamawa_control_point_name,
+        adamawa_northing=adamawa_northing,
+        adamawa_easting=adamawa_easting,
+        adamawa_elevation=adamawa_elevation,
+        adamawa_origin_text=adamawa_origin_text,
+        adamawa_topo_sheet_text=adamawa_topo_sheet_text,
+        adamawa_computation_no=adamawa_computation_no,
+        adamawa_cadastral_sheet_no=adamawa_cadastral_sheet_no,
+        adamawa_plan_no=adamawa_plan_no,
+        adamawa_surveyed_by_text=adamawa_surveyed_by_text,
+        adamawa_disclaimer_text=adamawa_disclaimer_text,
     )
 
     report = get_plot_report(plot_id, db)
@@ -971,7 +1152,23 @@ def preview_plot_map(plot_id: int, db: Session = Depends(get_db), background_tas
     north_arrow_color: str = Body("black"),
     beacon_style: str = Body("circle"),
     road_width_m: float | None = Body(None),
-    road_width_override_m: float | None = Body(None)):
+    road_width_override_m: float | None = Body(None),
+    template_name: str = Body(DEFAULT_TEMPLATE_NAME),
+    adamawa_rof_no: str = Body(""),
+    adamawa_owner_name: str = Body(""),
+    adamawa_authority_title: str = Body(DEFAULT_ADAMAWA_AUTHORITY_TITLE),
+    adamawa_authority_date_text: str = Body(DEFAULT_ADAMAWA_AUTHORITY_DATE),
+    adamawa_control_point_name: str = Body(""),
+    adamawa_northing: str = Body(""),
+    adamawa_easting: str = Body(""),
+    adamawa_elevation: str = Body(""),
+    adamawa_origin_text: str = Body(DEFAULT_ADAMAWA_ORIGIN_TEXT),
+    adamawa_topo_sheet_text: str = Body(DEFAULT_ADAMAWA_TOPO_SHEET_TEXT),
+    adamawa_computation_no: str = Body(""),
+    adamawa_cadastral_sheet_no: str = Body(""),
+    adamawa_plan_no: str = Body(""),
+    adamawa_surveyed_by_text: str = Body(""),
+    adamawa_disclaimer_text: str = Body(DEFAULT_ADAMAWA_DISCLAIMER_TEXT)):
 
     payload_for_cache = {
         "title_text": title_text,
@@ -990,6 +1187,22 @@ def preview_plot_map(plot_id: int, db: Session = Depends(get_db), background_tas
         "beacon_style": beacon_style,
         "road_width_m": road_width_m,
         "road_width_override_m": road_width_override_m,
+        "template_name": template_name,
+        "adamawa_rof_no": adamawa_rof_no,
+        "adamawa_owner_name": adamawa_owner_name,
+        "adamawa_authority_title": adamawa_authority_title,
+        "adamawa_authority_date_text": adamawa_authority_date_text,
+        "adamawa_control_point_name": adamawa_control_point_name,
+        "adamawa_northing": adamawa_northing,
+        "adamawa_easting": adamawa_easting,
+        "adamawa_elevation": adamawa_elevation,
+        "adamawa_origin_text": adamawa_origin_text,
+        "adamawa_topo_sheet_text": adamawa_topo_sheet_text,
+        "adamawa_computation_no": adamawa_computation_no,
+        "adamawa_cadastral_sheet_no": adamawa_cadastral_sheet_no,
+        "adamawa_plan_no": adamawa_plan_no,
+        "adamawa_surveyed_by_text": adamawa_surveyed_by_text,
+        "adamawa_disclaimer_text": adamawa_disclaimer_text,
     }
     revision_token = build_preview_revision_token(db, plot_id)
     cache_key = build_preview_cache_key(plot_id, payload_for_cache, revision_token)
@@ -1021,6 +1234,22 @@ def preview_plot_map(plot_id: int, db: Session = Depends(get_db), background_tas
         scale_text=scale_text,
         paper_size=paper_size,
         coordinate_system=coordinate_system,
+        template_name=template_name,
+        adamawa_rof_no=adamawa_rof_no,
+        adamawa_owner_name=adamawa_owner_name,
+        adamawa_authority_title=adamawa_authority_title,
+        adamawa_authority_date_text=adamawa_authority_date_text,
+        adamawa_control_point_name=adamawa_control_point_name,
+        adamawa_northing=adamawa_northing,
+        adamawa_easting=adamawa_easting,
+        adamawa_elevation=adamawa_elevation,
+        adamawa_origin_text=adamawa_origin_text,
+        adamawa_topo_sheet_text=adamawa_topo_sheet_text,
+        adamawa_computation_no=adamawa_computation_no,
+        adamawa_cadastral_sheet_no=adamawa_cadastral_sheet_no,
+        adamawa_plan_no=adamawa_plan_no,
+        adamawa_surveyed_by_text=adamawa_surveyed_by_text,
+        adamawa_disclaimer_text=adamawa_disclaimer_text,
     )
 
     # Get EPSG code for selected coordinate system
@@ -1050,6 +1279,22 @@ def preview_plot_map(plot_id: int, db: Session = Depends(get_db), background_tas
         road_width_m=road_width_m,
         road_width_override_m=road_width_override_m,
         preview_mode=True,
+        template_name=template_name,
+        adamawa_rof_no=adamawa_rof_no,
+        adamawa_owner_name=adamawa_owner_name,
+        adamawa_authority_title=adamawa_authority_title,
+        adamawa_authority_date_text=adamawa_authority_date_text,
+        adamawa_control_point_name=adamawa_control_point_name,
+        adamawa_northing=adamawa_northing,
+        adamawa_easting=adamawa_easting,
+        adamawa_elevation=adamawa_elevation,
+        adamawa_origin_text=adamawa_origin_text,
+        adamawa_topo_sheet_text=adamawa_topo_sheet_text,
+        adamawa_computation_no=adamawa_computation_no,
+        adamawa_cadastral_sheet_no=adamawa_cadastral_sheet_no,
+        adamawa_plan_no=adamawa_plan_no,
+        adamawa_surveyed_by_text=adamawa_surveyed_by_text,
+        adamawa_disclaimer_text=adamawa_disclaimer_text,
     )
 
     cache_path = preview_cache_path(plot_id, cache_key, variant="survey")
@@ -1470,6 +1715,22 @@ def get_saved_survey_plan_pdf(plot_id: int, refresh: bool = False, db: Session =
             beacon_style="circle",
             road_width_m=None,
             road_width_override_m=None,
+            template_name=meta.get("template_name") or DEFAULT_TEMPLATE_NAME,
+            adamawa_rof_no=meta.get("adamawa_rof_no") or "",
+            adamawa_owner_name=meta.get("adamawa_owner_name") or "",
+            adamawa_authority_title=meta.get("adamawa_authority_title") or DEFAULT_ADAMAWA_AUTHORITY_TITLE,
+            adamawa_authority_date_text=meta.get("adamawa_authority_date_text") or DEFAULT_ADAMAWA_AUTHORITY_DATE,
+            adamawa_control_point_name=meta.get("adamawa_control_point_name") or "",
+            adamawa_northing=meta.get("adamawa_northing") or "",
+            adamawa_easting=meta.get("adamawa_easting") or "",
+            adamawa_elevation=meta.get("adamawa_elevation") or "",
+            adamawa_origin_text=meta.get("adamawa_origin_text") or DEFAULT_ADAMAWA_ORIGIN_TEXT,
+            adamawa_topo_sheet_text=meta.get("adamawa_topo_sheet_text") or DEFAULT_ADAMAWA_TOPO_SHEET_TEXT,
+            adamawa_computation_no=meta.get("adamawa_computation_no") or "",
+            adamawa_cadastral_sheet_no=meta.get("adamawa_cadastral_sheet_no") or "",
+            adamawa_plan_no=meta.get("adamawa_plan_no") or "",
+            adamawa_surveyed_by_text=meta.get("adamawa_surveyed_by_text") or "",
+            adamawa_disclaimer_text=meta.get("adamawa_disclaimer_text") or DEFAULT_ADAMAWA_DISCLAIMER_TEXT,
         )
         report = get_plot_report(plot_id, db)
         generate_plot_report_pdf(report, pdf_path, map_path, paper_size=meta["paper_size"])

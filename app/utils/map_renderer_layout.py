@@ -46,6 +46,15 @@ DEFAULT_CERTIFICATION_STATEMENT = (
     "I hereby certify that this survey plan is a true representation of the survey "
     "executed by me and conforms with the regulations of surveying profession."
 )
+DEFAULT_ADAMAWA_AUTHORITY_TITLE = "SURVEYOR GENERAL"
+DEFAULT_ADAMAWA_AUTHORITY_DATE = "November, 2024"
+DEFAULT_ADAMAWA_ORIGIN_TEXT = "ORIGIN:- WGS 84 UTM ZONE 33N"
+DEFAULT_ADAMAWA_TOPO_SHEET_TEXT = "BASED ON GIREI TOPO SHEET 197 NE"
+DEFAULT_ADAMAWA_DISCLAIMER_TEXT = (
+    "Detail shewn not the result of accurate survey. All bearing and distances shewn on this plan "
+    "have been computed from registered Co-ordinates."
+)
+ADAMAWA_FONT_FAMILY = "DejaVu Serif"
 
 
 def format_station_label(label) -> str:
@@ -1168,6 +1177,529 @@ def draw_fences(ax, fence_geoms, display_epsg: int, scale_ratio: int, font_scale
         for line_part in _iter_line_geometries(projected):
             _draw_fence_line(ax, line_part, scale_ratio=scale_ratio, font_scale=font_scale)
 
+
+def _safe_text(value, fallback=""):
+    text_value = str(value).strip() if value is not None else ""
+    return text_value if text_value else fallback
+
+
+def _normalize_scale_label(scale_text: str) -> str:
+    raw = str(scale_text or "").strip().replace(" ", "")
+    if not raw:
+        return "1:2500"
+    if ":" in raw:
+        left, right = raw.split(":", 1)
+        left = left or "1"
+        right = right or "2500"
+        return f"{left}:{right}"
+    return f"1:{raw}"
+
+
+def _build_segment_rows(poly, station_names=None):
+    coords = list(poly.exterior.coords)
+    if len(coords) < 2:
+        return []
+    default_labels = list("ABCDEFGHIJKLMNOPQRSTUVWXYZ")
+    labels = station_names if station_names else default_labels
+    rows = []
+    for idx in range(len(coords) - 1):
+        p1 = Point(coords[idx])
+        p2 = Point(coords[idx + 1])
+        from_label = str(labels[idx % len(labels)] or "").strip() or default_labels[idx % len(default_labels)]
+        to_label = str(labels[(idx + 1) % len(labels)] or "").strip() or default_labels[(idx + 1) % len(default_labels)]
+        bearing = calculate_bearing_deg(p1, p2)
+        rows.append({
+            "from": from_label,
+            "bearing": format_bearing_dms(bearing),
+            "length": f"{p1.distance(p2):.2f}m",
+            "to": to_label,
+        })
+    return rows
+
+
+def _draw_adamawa_header(
+    fig,
+    rof_no: str,
+    owner_name: str,
+    location_text: str,
+    lga_text: str,
+    scale_text: str,
+    authority_title: str,
+    authority_date_text: str,
+    font_scale=1.0,
+):
+    fig.add_artist(patches.Rectangle((0.03, 0.03), 0.94, 0.94, transform=fig.transFigure, fill=False, lw=1.2))
+    y = 0.945
+    fig.text(
+        0.5,
+        y,
+        f"R of O {rof_no}",
+        ha="center",
+        va="center",
+        fontsize=max(8, int(9 * font_scale)),
+        weight="bold",
+        fontfamily=ADAMAWA_FONT_FAMILY,
+    )
+    fig.text(
+        0.5,
+        y - 0.022,
+        f"SURVEY PLAN OF LAND BELONGING TO {_safe_text(owner_name).upper()}",
+        ha="center",
+        va="center",
+        fontsize=max(8, int(8 * font_scale)),
+        fontfamily=ADAMAWA_FONT_FAMILY,
+    )
+    fig.text(
+        0.5,
+        y - 0.043,
+        "AT",
+        ha="center",
+        va="center",
+        fontsize=max(8, int(8 * font_scale)),
+        fontfamily=ADAMAWA_FONT_FAMILY,
+    )
+    fig.text(
+        0.5,
+        y - 0.063,
+        _safe_text(location_text).upper(),
+        ha="center",
+        va="center",
+        fontsize=max(8, int(8 * font_scale)),
+        fontfamily=ADAMAWA_FONT_FAMILY,
+    )
+    fig.text(
+        0.5,
+        y - 0.084,
+        _safe_text(lga_text).upper(),
+        ha="center",
+        va="center",
+        fontsize=max(8, int(8 * font_scale)),
+        fontfamily=ADAMAWA_FONT_FAMILY,
+    )
+    fig.text(
+        0.5,
+        y - 0.105,
+        f"SCALE:- {_normalize_scale_label(scale_text)}",
+        ha="center",
+        va="center",
+        fontsize=max(8, int(8 * font_scale)),
+        fontfamily=ADAMAWA_FONT_FAMILY,
+    )
+    fig.text(
+        0.5,
+        y - 0.155,
+        _safe_text(authority_title, DEFAULT_ADAMAWA_AUTHORITY_TITLE),
+        ha="center",
+        va="center",
+        fontsize=max(8, int(8 * font_scale)),
+        fontfamily=ADAMAWA_FONT_FAMILY,
+    )
+    fig.text(
+        0.5,
+        y - 0.176,
+        _safe_text(authority_date_text, DEFAULT_ADAMAWA_AUTHORITY_DATE),
+        ha="center",
+        va="center",
+        fontsize=max(7, int(7 * font_scale)),
+        fontfamily=ADAMAWA_FONT_FAMILY,
+    )
+
+
+def _draw_adamawa_coordinate_labels(ax, font_scale=1.0):
+    xmin, xmax = ax.get_xlim()
+    ymin, ymax = ax.get_ylim()
+    left_e = f"{int(round(xmin))}mE"
+    right_e = f"{int(round(xmax))}mE"
+    top_n = f"{int(round(ymax))}mN"
+    bottom_n = f"{int(round(ymin))}mN"
+    fs = max(6, int(6 * font_scale))
+
+    ax.text(0.0, 1.012, left_e, color="blue", fontsize=fs, ha="left", va="bottom", transform=ax.transAxes, fontfamily=ADAMAWA_FONT_FAMILY)
+    ax.text(1.0, 1.012, right_e, color="blue", fontsize=fs, ha="right", va="bottom", transform=ax.transAxes, fontfamily=ADAMAWA_FONT_FAMILY)
+    ax.text(0.0, -0.018, left_e, color="blue", fontsize=fs, ha="left", va="top", transform=ax.transAxes, fontfamily=ADAMAWA_FONT_FAMILY)
+    ax.text(1.0, -0.018, right_e, color="blue", fontsize=fs, ha="right", va="top", transform=ax.transAxes, fontfamily=ADAMAWA_FONT_FAMILY)
+
+    ax.text(-0.018, 1.0, top_n, color="blue", fontsize=fs, ha="right", va="top", rotation=90, transform=ax.transAxes, fontfamily=ADAMAWA_FONT_FAMILY)
+    ax.text(1.018, 1.0, top_n, color="blue", fontsize=fs, ha="left", va="top", rotation=90, transform=ax.transAxes, fontfamily=ADAMAWA_FONT_FAMILY)
+    ax.text(-0.018, 0.0, bottom_n, color="blue", fontsize=fs, ha="right", va="bottom", rotation=90, transform=ax.transAxes, fontfamily=ADAMAWA_FONT_FAMILY)
+    ax.text(1.018, 0.0, bottom_n, color="blue", fontsize=fs, ha="left", va="bottom", rotation=90, transform=ax.transAxes, fontfamily=ADAMAWA_FONT_FAMILY)
+
+
+def _draw_adamawa_north_arrow(ax, font_scale=1.0):
+    arrow_color = "blue"
+    ax.annotate(
+        "",
+        xy=(0.973, 1.01),
+        xytext=(0.973, 0.935),
+        xycoords=ax.transAxes,
+        arrowprops=dict(arrowstyle="-|>", color=arrow_color, lw=max(0.8, 1.0 * font_scale)),
+        annotation_clip=False,
+    )
+    ax.text(
+        0.973,
+        1.018,
+        "N",
+        transform=ax.transAxes,
+        color=arrow_color,
+        fontsize=max(8, int(10 * font_scale)),
+        ha="center",
+        va="bottom",
+        fontfamily=ADAMAWA_FONT_FAMILY,
+    )
+
+
+def _draw_adamawa_bottom_blocks(
+    fig,
+    segment_rows,
+    control_point_name: str,
+    northing_text: str,
+    easting_text: str,
+    elevation_text: str,
+    origin_text: str,
+    topo_sheet_text: str,
+    computation_no: str,
+    cadastral_sheet_no: str,
+    plan_no: str,
+    surveyed_by_text: str,
+    disclaimer_text: str,
+    font_scale=1.0,
+):
+    cp_name = _safe_text(control_point_name, "CONTROL POINT")
+    fig.text(
+        0.06,
+        0.163,
+        f"UTM CO-ORDINATE OF {cp_name}",
+        fontsize=max(6, int(7 * font_scale)),
+        color="blue",
+        weight="bold",
+        fontfamily=ADAMAWA_FONT_FAMILY,
+    )
+    fig.text(0.06, 0.148, f"N {_safe_text(northing_text, '-')}", fontsize=max(6, int(7 * font_scale)), fontfamily=ADAMAWA_FONT_FAMILY)
+    fig.text(0.06, 0.133, f"E {_safe_text(easting_text, '-')}", fontsize=max(6, int(7 * font_scale)), fontfamily=ADAMAWA_FONT_FAMILY)
+    fig.text(0.06, 0.118, f"Z {_safe_text(elevation_text, '-')}", fontsize=max(6, int(7 * font_scale)), fontfamily=ADAMAWA_FONT_FAMILY)
+    fig.text(0.06, 0.103, _safe_text(origin_text, DEFAULT_ADAMAWA_ORIGIN_TEXT), fontsize=max(6, int(7 * font_scale)), color="blue", fontfamily=ADAMAWA_FONT_FAMILY)
+    fig.text(0.06, 0.088, _safe_text(topo_sheet_text, DEFAULT_ADAMAWA_TOPO_SHEET_TEXT), fontsize=max(6, int(7 * font_scale)), fontfamily=ADAMAWA_FONT_FAMILY)
+
+    fig.text(0.06, 0.070, "COMPUTATION NO", fontsize=max(6, int(6.5 * font_scale)), fontfamily=ADAMAWA_FONT_FAMILY)
+    fig.add_artist(mlines.Line2D([0.16, 0.21], [0.072, 0.072], transform=fig.transFigure, color="black", lw=0.8))
+    fig.text(0.215, 0.070, _safe_text(computation_no, "-"), fontsize=max(6, int(6.5 * font_scale)), fontfamily=ADAMAWA_FONT_FAMILY)
+    fig.text(0.305, 0.070, f"CADASTRAL SHEET NO. {_safe_text(cadastral_sheet_no, '-')}", fontsize=max(6, int(6.5 * font_scale)), fontfamily=ADAMAWA_FONT_FAMILY)
+    fig.text(0.06, 0.053, "PLAN", fontsize=max(6, int(6.5 * font_scale)), fontfamily=ADAMAWA_FONT_FAMILY)
+    fig.text(0.108, 0.053, "NO", fontsize=max(6, int(6.5 * font_scale)), fontfamily=ADAMAWA_FONT_FAMILY)
+    fig.add_artist(mlines.Line2D([0.13, 0.21], [0.055, 0.055], transform=fig.transFigure, color="black", lw=0.8))
+    fig.text(0.215, 0.053, _safe_text(plan_no, "-"), fontsize=max(6, int(6.5 * font_scale)), fontfamily=ADAMAWA_FONT_FAMILY)
+
+    table_ax = fig.add_axes([0.58, 0.072, 0.36, 0.102])
+    table_ax.axis("off")
+    header = ["FROM", "BEARING", "LENGTH", "TO"]
+    rows = [[r["from"], r["bearing"], r["length"], r["to"]] for r in segment_rows[:14]]
+    table = table_ax.table(
+        cellText=rows,
+        colLabels=header,
+        colWidths=[0.24, 0.27, 0.23, 0.26],
+        cellLoc="center",
+        colLoc="center",
+        bbox=[0, 0, 1, 1],
+    )
+    table.auto_set_font_size(False)
+    table.set_fontsize(max(5, int(6 * font_scale)))
+    for (row_idx, col_idx), cell in table.get_celld().items():
+        cell.set_linewidth(0.8 if row_idx == 0 else 0.5)
+        if row_idx == 0:
+            cell.set_text_props(weight="bold", fontfamily=ADAMAWA_FONT_FAMILY)
+        else:
+            cell.set_text_props(fontfamily=ADAMAWA_FONT_FAMILY)
+
+    fig.text(
+        0.58,
+        0.060,
+        _safe_text(disclaimer_text, DEFAULT_ADAMAWA_DISCLAIMER_TEXT),
+        fontsize=max(5, int(5.6 * font_scale)),
+        fontfamily=ADAMAWA_FONT_FAMILY,
+    )
+    fig.text(0.58, 0.047, _safe_text(surveyed_by_text, ""), fontsize=max(5, int(5.6 * font_scale)), fontfamily=ADAMAWA_FONT_FAMILY)
+
+
+def _render_plot_map_layout_adamawa(
+    db,
+    plot_id: int,
+    output_path: str,
+    title_text: str,
+    location_text: str,
+    lga_text: str,
+    scale_text: str,
+    surveyor_name: str,
+    surveyor_rank: str,
+    station_names=None,
+    coordinate_system: str = "wgs84",
+    epsg_code: int = 4326,
+    north_arrow_style: str = "classic",
+    north_arrow_color: str = "black",
+    beacon_style: str = "circle",
+    road_width_m: float | None = None,
+    road_width_override_m: float | None = None,
+    adamawa_rof_no: str = "",
+    adamawa_owner_name: str = "",
+    adamawa_authority_title: str = DEFAULT_ADAMAWA_AUTHORITY_TITLE,
+    adamawa_authority_date_text: str = DEFAULT_ADAMAWA_AUTHORITY_DATE,
+    adamawa_control_point_name: str = "",
+    adamawa_northing: str = "",
+    adamawa_easting: str = "",
+    adamawa_elevation: str = "",
+    adamawa_origin_text: str = DEFAULT_ADAMAWA_ORIGIN_TEXT,
+    adamawa_topo_sheet_text: str = DEFAULT_ADAMAWA_TOPO_SHEET_TEXT,
+    adamawa_computation_no: str = "",
+    adamawa_cadastral_sheet_no: str = "",
+    adamawa_plan_no: str = "",
+    adamawa_surveyed_by_text: str = "",
+    adamawa_disclaimer_text: str = DEFAULT_ADAMAWA_DISCLAIMER_TEXT,
+    preview_mode: bool = False,
+):
+    plot_wkb = db.execute(text("SELECT geom FROM plots WHERE id=:id"), {"id": plot_id}).scalar()
+    if not plot_wkb:
+        raise ValueError("Plot not found")
+
+    rows = db.execute(
+        text("SELECT geom, feature_type FROM detected_features WHERE plot_id=:id"),
+        {"id": plot_id},
+    ).fetchall()
+    override_rows = db.execute(
+        text("""
+            SELECT feature_type, action, name, width_m, ST_AsGeoJSON(geom) AS geojson
+            FROM plot_feature_overrides
+            WHERE plot_id = :id
+        """),
+        {"id": plot_id},
+    ).fetchall()
+    area_m2 = db.execute(
+        text("SELECT ST_Area(geom::geography) FROM plots WHERE id=:id"),
+        {"id": plot_id}
+    ).scalar() or 0
+
+    plot_geom = wkb.loads(plot_wkb)
+    buildings, rivers, fences, detected_roads = [], [], [], []
+    for r in rows:
+        g = wkb.loads(r.geom)
+        if r.feature_type == "building":
+            buildings.append(g)
+        elif r.feature_type == "river":
+            rivers.append(g)
+        elif r.feature_type == "fence":
+            fences.append(g)
+        elif r.feature_type == "road":
+            detected_roads.append(g)
+
+    overrides = []
+    import json
+    for r in override_rows:
+        geom = None
+        if r.geojson:
+            try:
+                geom = shape(json.loads(r.geojson))
+            except Exception:
+                geom = None
+        overrides.append({
+            "feature_type": r.feature_type,
+            "action": r.action,
+            "name": r.name,
+            "width_m": r.width_m if hasattr(r, "width_m") else None,
+            "geom": geom,
+        })
+
+    def apply_overrides(base_list, feature_type: str):
+        result = list(base_list)
+        added = []
+        delete_geoms = []
+        for ov in overrides:
+            if ov["feature_type"] != feature_type:
+                continue
+            geom = ov["geom"]
+            if geom is None:
+                continue
+            try:
+                if hasattr(geom, "is_valid") and not geom.is_valid:
+                    geom = geom.buffer(0)
+            except Exception:
+                pass
+            if ov["action"] in ("delete", "update"):
+                result = [g for g in result if not g.intersects(geom)]
+                delete_geoms.append(geom)
+            if ov["action"] in ("add", "update"):
+                result.append(geom)
+                added.append(geom)
+        if delete_geoms:
+            added = [g for g in added if not any(g.intersects(dg) for dg in delete_geoms)]
+        return result, added
+
+    buildings, added_buildings = apply_overrides(buildings, "building")
+    rivers, _ = apply_overrides(rivers, "river")
+    fences, _ = apply_overrides(fences, "fence")
+    roads_for_draw, road_added_overrides = apply_overrides(detected_roads, "road")
+
+    display_epsg = epsg_code
+    if coordinate_system == "wgs84" or epsg_code == 4326:
+        centroid = plot_geom.centroid
+        utm_zone = int((centroid.x + 180) / 6) + 1
+        hemisphere = "north" if centroid.y >= 0 else "south"
+        display_epsg = 32600 + utm_zone if hemisphere == "north" else 32700 + utm_zone
+
+    gdf_plot = gpd.GeoDataFrame(geometry=[plot_geom], crs="EPSG:4326").to_crs(epsg=display_epsg)
+    poly = gdf_plot.geometry.iloc[0]
+    if not poly.is_valid:
+        poly = poly.buffer(0)
+        gdf_plot = gpd.GeoDataFrame(geometry=[poly], crs=f"EPSG:{display_epsg}")
+
+    paper_config = get_paper_config("A4")
+    fig_width = paper_config["width"]
+    fig_height = paper_config["height"]
+    font_scale = paper_config["scale"]
+    dpi = 150 if preview_mode else 200
+
+    fig = plt.figure(figsize=(fig_width, fig_height), dpi=dpi)
+    _ = FigureCanvas(fig)
+    map_left, map_bottom, map_width, map_height = 0.08, 0.20, 0.84, 0.60
+    ax = fig.add_axes([map_left, map_bottom, map_width, map_height])
+
+    rof_no = _safe_text(adamawa_rof_no, _safe_text(adamawa_computation_no, f"{plot_id}"))
+    owner_text = _safe_text(adamawa_owner_name, title_text)
+    _draw_adamawa_header(
+        fig,
+        rof_no=rof_no,
+        owner_name=owner_text,
+        location_text=location_text,
+        lga_text=lga_text,
+        scale_text=scale_text,
+        authority_title=_safe_text(adamawa_authority_title, DEFAULT_ADAMAWA_AUTHORITY_TITLE),
+        authority_date_text=_safe_text(adamawa_authority_date_text, DEFAULT_ADAMAWA_AUTHORITY_DATE),
+        font_scale=font_scale,
+    )
+
+    scale_ratio = parse_scale_ratio(scale_text if str(scale_text or "").strip() else "1 : 2500")
+    apply_true_scale(ax, poly, scale_ratio, fig_width * map_width, fig_height * map_height)
+    target_xlim = ax.get_xlim()
+    target_ylim = ax.get_ylim()
+    from shapely.geometry import box
+    extent_poly = box(target_xlim[0], target_ylim[0], target_xlim[1], target_ylim[1])
+
+    if rivers:
+        gpd.GeoDataFrame(geometry=rivers, crs="EPSG:4326").to_crs(epsg=display_epsg).plot(
+            ax=ax, color="#10a3df", lw=1.0 * font_scale, zorder=5
+        )
+
+    road_polys = []
+    for geom in roads_for_draw + road_added_overrides:
+        if geom is None:
+            continue
+        try:
+            gdf_line = gpd.GeoSeries([geom], crs="EPSG:4326").to_crs(epsg=display_epsg)
+            line_proj = gdf_line.iloc[0]
+        except Exception:
+            continue
+        snap_tol = max(1.0, (5.0 / 1000.0) * scale_ratio)
+        expanded_frame = extent_poly.buffer(snap_tol)
+        clipped = line_proj.intersection(expanded_frame)
+        if clipped.is_empty:
+            continue
+        snapped_clipped = snap(clipped, extent_poly.boundary, snap_tol)
+        try:
+            half_w = max(1.0, (road_width_m or 3.0) / 2.0)
+            road_polys.append(snapped_clipped.buffer(half_w, cap_style=2, join_style=2))
+        except Exception:
+            continue
+
+    if road_polys:
+        try:
+            road_union = road_polys[0]
+            for rp in road_polys[1:]:
+                road_union = road_union.union(rp)
+            boundary = road_union.boundary
+            frame = box(target_xlim[0], target_ylim[0], target_xlim[1], target_ylim[1])
+            snap_tol = max(1.0, (5.0 / 1000.0) * scale_ratio)
+            snapped = snap(boundary, frame.boundary, snap_tol)
+            clipped = snapped.intersection(frame)
+            gpd.GeoSeries([clipped], crs=f"EPSG:{display_epsg}").plot(
+                ax=ax, color="black", lw=0.8 * font_scale, zorder=6
+            )
+        except Exception:
+            pass
+
+    all_buildings = []
+    if buildings:
+        all_buildings.extend(buildings)
+    if added_buildings:
+        all_buildings.extend(added_buildings)
+    if all_buildings:
+        draw_building_hatch(ax, all_buildings, display_epsg, scale_ratio=scale_ratio, font_scale=font_scale)
+        gpd.GeoDataFrame(geometry=all_buildings, crs="EPSG:4326").to_crs(epsg=display_epsg).plot(
+            ax=ax, facecolor="none", edgecolor="black", lw=0.9 * font_scale, zorder=8
+        )
+    if fences:
+        draw_fences(ax, fences, display_epsg, scale_ratio=scale_ratio, font_scale=font_scale)
+
+    gdf_plot.plot(ax=ax, facecolor="none", edgecolor="red", lw=1.1 * font_scale, zorder=20)
+    ax.set_xlim(target_xlim)
+    ax.set_ylim(target_ylim)
+
+    major = nice_grid_step(max(ax.get_xlim()[1] - ax.get_xlim()[0], ax.get_ylim()[1] - ax.get_ylim()[0]))
+    draw_grid(ax, poly, major / 5.0, major, font_scale)
+
+    annotate_vertices(
+        ax,
+        poly,
+        plot_id,
+        station_names=station_names,
+        font_scale=font_scale,
+        min_label_length_m=0.0,
+        scale_ratio=scale_ratio,
+        boundary_poly=poly,
+        beacon_style=beacon_style,
+    )
+    rp = poly.representative_point()
+    ax.text(
+        rp.x,
+        rp.y,
+        f"{area_m2 / 10000:.2f}Hectares",
+        color="red",
+        fontsize=max(7, int(7 * font_scale)),
+        ha="center",
+        va="center",
+        zorder=26,
+    )
+
+    _draw_adamawa_coordinate_labels(ax, font_scale=font_scale)
+    _draw_adamawa_north_arrow(ax, font_scale=font_scale)
+
+    segment_rows = _build_segment_rows(poly, station_names=station_names)
+    first_coords = list(poly.exterior.coords)[0]
+    control_point_name = _safe_text(adamawa_control_point_name, str((station_names or ["A"])[0]))
+    northing_value = _safe_text(adamawa_northing, f"{first_coords[1]:.3f}m")
+    easting_value = _safe_text(adamawa_easting, f"{first_coords[0]:.3f}m")
+    _draw_adamawa_bottom_blocks(
+        fig,
+        segment_rows=segment_rows,
+        control_point_name=control_point_name,
+        northing_text=northing_value,
+        easting_text=easting_value,
+        elevation_text=_safe_text(adamawa_elevation, "-"),
+        origin_text=_safe_text(adamawa_origin_text, DEFAULT_ADAMAWA_ORIGIN_TEXT),
+        topo_sheet_text=_safe_text(adamawa_topo_sheet_text, DEFAULT_ADAMAWA_TOPO_SHEET_TEXT),
+        computation_no=_safe_text(adamawa_computation_no, rof_no),
+        cadastral_sheet_no=_safe_text(adamawa_cadastral_sheet_no, "-"),
+        plan_no=_safe_text(adamawa_plan_no, ""),
+        surveyed_by_text=_safe_text(adamawa_surveyed_by_text, f"Surveyed by {surveyor_rank} {surveyor_name}".strip()),
+        disclaimer_text=_safe_text(adamawa_disclaimer_text, DEFAULT_ADAMAWA_DISCLAIMER_TEXT),
+        font_scale=font_scale,
+    )
+
+    for spine in ax.spines.values():
+        spine.set_edgecolor("blue")
+        spine.set_linewidth(0.9)
+    ax.set_aspect("equal")
+    ax.axis("off")
+    fig.canvas.draw()
+    fig.savefig(output_path, dpi=dpi)
+    plt.close(fig)
+
 # ======================
 # Main Renderer Function
 # ======================
@@ -1196,7 +1728,61 @@ def render_plot_map_layout(
     road_width_m: float | None = None,
     road_width_override_m: float | None = None,
     preview_mode: bool = False,
+    template_name: str = "general",
+    adamawa_rof_no: str = "",
+    adamawa_owner_name: str = "",
+    adamawa_authority_title: str = DEFAULT_ADAMAWA_AUTHORITY_TITLE,
+    adamawa_authority_date_text: str = DEFAULT_ADAMAWA_AUTHORITY_DATE,
+    adamawa_control_point_name: str = "",
+    adamawa_northing: str = "",
+    adamawa_easting: str = "",
+    adamawa_elevation: str = "",
+    adamawa_origin_text: str = DEFAULT_ADAMAWA_ORIGIN_TEXT,
+    adamawa_topo_sheet_text: str = DEFAULT_ADAMAWA_TOPO_SHEET_TEXT,
+    adamawa_computation_no: str = "",
+    adamawa_cadastral_sheet_no: str = "",
+    adamawa_plan_no: str = "",
+    adamawa_surveyed_by_text: str = "",
+    adamawa_disclaimer_text: str = DEFAULT_ADAMAWA_DISCLAIMER_TEXT,
 ):
+    if str(template_name or "general").strip().lower() == "adamawa_osg":
+        _render_plot_map_layout_adamawa(
+            db=db,
+            plot_id=plot_id,
+            output_path=output_path,
+            title_text=title_text,
+            location_text=location_text,
+            lga_text=lga_text,
+            scale_text=scale_text,
+            surveyor_name=surveyor_name,
+            surveyor_rank=surveyor_rank,
+            station_names=station_names,
+            coordinate_system=coordinate_system,
+            epsg_code=epsg_code,
+            north_arrow_style=north_arrow_style,
+            north_arrow_color=north_arrow_color,
+            beacon_style=beacon_style,
+            road_width_m=road_width_m,
+            road_width_override_m=road_width_override_m,
+            adamawa_rof_no=adamawa_rof_no,
+            adamawa_owner_name=adamawa_owner_name,
+            adamawa_authority_title=adamawa_authority_title,
+            adamawa_authority_date_text=adamawa_authority_date_text,
+            adamawa_control_point_name=adamawa_control_point_name,
+            adamawa_northing=adamawa_northing,
+            adamawa_easting=adamawa_easting,
+            adamawa_elevation=adamawa_elevation,
+            adamawa_origin_text=adamawa_origin_text,
+            adamawa_topo_sheet_text=adamawa_topo_sheet_text,
+            adamawa_computation_no=adamawa_computation_no,
+            adamawa_cadastral_sheet_no=adamawa_cadastral_sheet_no,
+            adamawa_plan_no=adamawa_plan_no,
+            adamawa_surveyed_by_text=adamawa_surveyed_by_text,
+            adamawa_disclaimer_text=adamawa_disclaimer_text,
+            preview_mode=preview_mode,
+        )
+        return
+
     plot_wkb = db.execute(text("SELECT geom FROM plots WHERE id=:id"), {"id": plot_id}).scalar()
     rows = db.execute(
         text("SELECT geom, feature_type FROM detected_features WHERE plot_id=:id"),
