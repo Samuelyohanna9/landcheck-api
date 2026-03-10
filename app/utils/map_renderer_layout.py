@@ -14,7 +14,7 @@ import matplotlib.pyplot as plt
 from sqlalchemy import text
 from shapely import wkb
 from shapely.geometry import LineString, Point, shape
-from shapely.ops import snap
+from shapely.ops import snap, linemerge, unary_union
 import matplotlib.patches as patches
 import matplotlib.lines as mlines
 from matplotlib.font_manager import FontProperties
@@ -1457,8 +1457,9 @@ def _collect_road_edge_lines(centerline_geom, half_width_m: float):
         try:
             if getattr(line_part, "length", 0.0) <= 0:
                 continue
-            left = line_part.parallel_offset(half_width_m, "left", join_style=2)
-            right = line_part.parallel_offset(half_width_m, "right", join_style=2)
+            # Use round joins so overlaps/intersections look continuous.
+            left = line_part.parallel_offset(half_width_m, "left", join_style=1)
+            right = line_part.parallel_offset(half_width_m, "right", join_style=1)
             for off in (left, right):
                 for seg in _iter_line_geometries(off):
                     if seg is None or getattr(seg, "is_empty", True):
@@ -1466,17 +1467,45 @@ def _collect_road_edge_lines(centerline_geom, half_width_m: float):
                     edges.append(seg)
         except Exception:
             continue
+    # Merge contiguous edge segments so overlaps connect visually.
+    if edges:
+        try:
+            merged = linemerge(unary_union(edges))
+            merged_edges = [seg for seg in _iter_line_geometries(merged) if seg is not None and not getattr(seg, "is_empty", True)]
+            if merged_edges:
+                return merged_edges
+        except Exception:
+            pass
     return edges
 
 
 def _draw_road_edges(ax, edge_lines, font_scale=1.0):
     if not edge_lines:
         return
-    lw = 0.8 * font_scale
-    for seg in edge_lines:
+    lw = 0.85 * font_scale
+    draw_lines = edge_lines
+    try:
+        network = unary_union(edge_lines)
+        snap_tol = max(0.5, 0.6 * max(1.0, float(font_scale)))
+        snapped = [snap(seg, network, snap_tol) for seg in edge_lines]
+        merged = linemerge(unary_union(snapped))
+        merged_lines = [seg for seg in _iter_line_geometries(merged) if seg is not None and not getattr(seg, "is_empty", True)]
+        if merged_lines:
+            draw_lines = merged_lines
+    except Exception:
+        draw_lines = edge_lines
+    for seg in draw_lines:
         try:
             x_vals, y_vals = seg.xy
-            ax.plot(x_vals, y_vals, color="black", lw=lw, zorder=6)
+            ax.plot(
+                x_vals,
+                y_vals,
+                color="black",
+                lw=lw,
+                zorder=6,
+                solid_joinstyle="round",
+                solid_capstyle="round",
+            )
         except Exception:
             continue
 
