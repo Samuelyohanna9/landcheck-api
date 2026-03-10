@@ -1568,7 +1568,7 @@ def _draw_adamawa_bottom_blocks(
     # Match Adamawa sample: compact footer with near-uniform text size and tight vertical spacing.
     footer_font = min(6, max(4, int(5.0 * font_scale)))
     footer_tiny_font = max(4, int(4.4 * font_scale))
-    line_gap = 0.014
+    line_gap = 0.0095
     left_x = 0.06
     y = 0.182
 
