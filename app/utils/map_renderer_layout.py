@@ -671,6 +671,7 @@ def draw_grid(
     major: float,
     font_scale=1.0,
     full_grid: bool = False,
+    edge_ticks: bool = True,
 ):
     xmin, xmax = ax.get_xlim()
     ymin, ymax = ax.get_ylim()
@@ -709,22 +710,23 @@ def draw_grid(
                 )
             )
 
-    # Tick-only grid to keep plot area clean
-    tick_len = (xmax - xmin) * 0.01
-    xs = np.arange(math.floor(xmin / major) * major, xmax + 0.1, major)
-    ys = np.arange(math.floor(ymin / major) * major, ymax + 0.1, major)
+    # Optional edge ticks.
+    if edge_ticks:
+        tick_len = (xmax - xmin) * 0.01
+        xs = np.arange(math.floor(xmin / major) * major, xmax + 0.1, major)
+        ys = np.arange(math.floor(ymin / major) * major, ymax + 0.1, major)
 
-    for x in xs:
-        if x < xmin or x > xmax:
-            continue
-        ax.plot([x, x], [ymax, ymax - tick_len], color="blue", lw=0.6*font_scale, alpha=0.5)
-        ax.plot([x, x], [ymin, ymin + tick_len], color="blue", lw=0.6*font_scale, alpha=0.5)
+        for x in xs:
+            if x < xmin or x > xmax:
+                continue
+            ax.plot([x, x], [ymax, ymax - tick_len], color="blue", lw=0.6*font_scale, alpha=0.5)
+            ax.plot([x, x], [ymin, ymin + tick_len], color="blue", lw=0.6*font_scale, alpha=0.5)
 
-    for y in ys:
-        if y < ymin or y > ymax:
-            continue
-        ax.plot([xmin, xmin + tick_len], [y, y], color="blue", lw=0.6*font_scale, alpha=0.5)
-        ax.plot([xmax, xmax - tick_len], [y, y], color="blue", lw=0.6*font_scale, alpha=0.5)
+        for y in ys:
+            if y < ymin or y > ymax:
+                continue
+            ax.plot([xmin, xmin + tick_len], [y, y], color="blue", lw=0.6*font_scale, alpha=0.5)
+            ax.plot([xmax, xmax - tick_len], [y, y], color="blue", lw=0.6*font_scale, alpha=0.5)
 
 
 def draw_coordinate_frame(ax, spacing: float, font_scale=1.0, first_point_info=None):
@@ -1698,7 +1700,7 @@ def _render_plot_map_layout_adamawa(
     ax.set_ylim(target_ylim)
 
     major = nice_grid_step(max(ax.get_xlim()[1] - ax.get_xlim()[0], ax.get_ylim()[1] - ax.get_ylim()[0]))
-    draw_grid(ax, poly, major / 5.0, major, font_scale, full_grid=False)
+    draw_grid(ax, poly, major / 5.0, major, font_scale, full_grid=False, edge_ticks=False)
 
     annotate_vertices(
         ax,
