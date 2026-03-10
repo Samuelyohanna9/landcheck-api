@@ -406,6 +406,25 @@ def draw_key_box(fig, has_buildings: bool, has_roads: bool, has_rivers: bool, ha
                     lw=1.2,
                 )
             )
+            # Show simple hatch inside the building symbol.
+            fig.add_artist(
+                mlines.Line2D(
+                    [x + 0.042, x + 0.088],
+                    [yy - 0.003, yy - 0.003],
+                    transform=fig.transFigure,
+                    color=col,
+                    lw=0.8,
+                )
+            )
+            fig.add_artist(
+                mlines.Line2D(
+                    [x + 0.042, x + 0.088],
+                    [yy + 0.003, yy + 0.003],
+                    transform=fig.transFigure,
+                    color=col,
+                    lw=0.8,
+                )
+            )
         elif sym == "fence_line":
             draw_fence_symbol(fig, x + 0.03, x + 0.10, yy, color=col, lw=lw * font_scale)
 
@@ -1005,6 +1024,51 @@ def _iter_line_geometries(geom):
             yield from _iter_line_geometries(part)
 
 
+def _iter_polygons(geom):
+    if geom is None or getattr(geom, "is_empty", False):
+        return
+    gtype = getattr(geom, "geom_type", "")
+    if gtype == "Polygon":
+        yield geom
+        return
+    if hasattr(geom, "geoms"):
+        for part in geom.geoms:
+            yield from _iter_polygons(part)
+
+
+def draw_building_hatch(ax, building_geoms, display_epsg: int, scale_ratio: int, font_scale=1.0):
+    """
+    Draw sparse horizontal hatch lines clipped to building polygons,
+    similar to common survey-plan building symbols.
+    """
+    if not building_geoms:
+        return
+    spacing = max(1.0, (10.0 / 1000.0) * max(scale_ratio, 100))
+    for geom in building_geoms:
+        try:
+            projected = gpd.GeoSeries([geom], crs="EPSG:4326").to_crs(epsg=display_epsg).iloc[0]
+        except Exception:
+            continue
+        for poly in _iter_polygons(projected):
+            try:
+                minx, miny, maxx, maxy = poly.bounds
+                if maxy <= miny:
+                    continue
+                y = miny + spacing
+                while y < maxy:
+                    scan = LineString([(minx - spacing, y), (maxx + spacing, y)])
+                    clipped = poly.intersection(scan)
+                    for segment in _iter_line_geometries(clipped):
+                        try:
+                            x_vals, y_vals = segment.xy
+                            ax.plot(x_vals, y_vals, color="black", lw=0.7 * font_scale, zorder=7.5)
+                        except Exception:
+                            continue
+                    y += spacing
+            except Exception:
+                continue
+
+
 def _draw_fence_line(ax, line_geom, scale_ratio: int, font_scale=1.0):
     if line_geom is None or line_geom.is_empty:
         return
@@ -1399,6 +1463,14 @@ def render_plot_map_layout(
             )
         except Exception:
             pass
+
+    all_buildings = []
+    if buildings:
+        all_buildings.extend(buildings)
+    if added_buildings:
+        all_buildings.extend(added_buildings)
+    if all_buildings:
+        draw_building_hatch(ax, all_buildings, display_epsg, scale_ratio=scale_ratio, font_scale=font_scale)
 
     if buildings:
         gpd.GeoDataFrame(geometry=buildings, crs="EPSG:4326").to_crs(epsg=display_epsg).plot(
