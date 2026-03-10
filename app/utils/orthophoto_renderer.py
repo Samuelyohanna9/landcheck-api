@@ -154,13 +154,15 @@ def add_north_arrow(ax, font_scale=1.0, style: str = "one_side_stem", color: str
         stem_top = y + size * 0.84
         stem_bottom = y - size * 1.00
         n_y = (stem_top + stem_bottom) / 2.0
-        tip_base_y = stem_top - size * 0.06
+        n_gap = size * 0.30
+        upper_bottom = n_y + (n_gap / 2.0)
+        lower_top = n_y - (n_gap / 2.0)
         arrow_tip_x = x + size * 0.20
         arrow_tip_y = stem_top + size * 0.17
         fig.add_artist(
             mlines.Line2D(
                 [x, arrow_tip_x],
-                [tip_base_y, arrow_tip_y],
+                [stem_top, arrow_tip_y],
                 transform=fig.transFigure,
                 color=col,
                 lw=max(0.8, 0.85 * font_scale),
@@ -170,7 +172,17 @@ def add_north_arrow(ax, font_scale=1.0, style: str = "one_side_stem", color: str
         fig.add_artist(
             mlines.Line2D(
                 [x, x],
-                [stem_bottom, stem_top],
+                [upper_bottom, stem_top],
+                transform=fig.transFigure,
+                color=col,
+                lw=max(0.8, 0.85 * font_scale),
+                zorder=20,
+            )
+        )
+        fig.add_artist(
+            mlines.Line2D(
+                [x, x],
+                [stem_bottom, lower_top],
                 transform=fig.transFigure,
                 color=col,
                 lw=max(0.8, 0.85 * font_scale),
@@ -183,7 +195,7 @@ def add_north_arrow(ax, font_scale=1.0, style: str = "one_side_stem", color: str
             "N",
             ha="center",
             va="center",
-            fontsize=int(11 * font_scale),
+            fontsize=int(10.5 * font_scale),
             color=col,
             weight="normal",
             fontfamily="DejaVu Sans",
