@@ -1961,6 +1961,13 @@ def _render_plot_map_layout_adamawa(
     rivers, _ = apply_overrides(rivers, "river")
     fences, _ = apply_overrides(fences, "fence")
     roads_for_draw, road_added_overrides = apply_overrides(detected_roads, "road")
+    road_add_named_overrides = [
+        ov for ov in overrides
+        if ov["feature_type"] == "road"
+        and ov["action"] in ("add", "update")
+        and ov["geom"] is not None
+        and str(ov.get("name") or "").strip()
+    ]
 
     display_epsg = epsg_code
     if coordinate_system == "wgs84" or epsg_code == 4326:
@@ -2014,6 +2021,7 @@ def _render_plot_map_layout_adamawa(
         )
 
     road_polys = []
+    road_label_features = []
     for geom in roads_for_draw + road_added_overrides:
         if geom is None:
             continue
@@ -2034,6 +2042,25 @@ def _render_plot_map_layout_adamawa(
         except Exception:
             continue
 
+    # Label manually-added roads in Adamawa template too.
+    for ov in road_add_named_overrides:
+        geom = ov.get("geom")
+        name = str(ov.get("name") or "").strip()
+        if geom is None or not name:
+            continue
+        try:
+            gdf_line = gpd.GeoSeries([geom], crs="EPSG:4326").to_crs(epsg=display_epsg)
+            line_proj = gdf_line.iloc[0]
+        except Exception:
+            continue
+        snap_tol = max(1.0, (5.0 / 1000.0) * scale_ratio)
+        expanded_frame = extent_poly.buffer(snap_tol)
+        clipped = line_proj.intersection(expanded_frame)
+        if clipped.is_empty:
+            continue
+        snapped_clipped = snap(clipped, extent_poly.boundary, snap_tol)
+        road_label_features.append((snapped_clipped, name))
+
     if road_polys:
         try:
             road_union = road_polys[0]
@@ -2049,6 +2076,41 @@ def _render_plot_map_layout_adamawa(
             )
         except Exception:
             pass
+
+    if road_label_features:
+        seen_names = set()
+        for geom, name in road_label_features:
+            label = str(name or "").strip()
+            if not label or label in seen_names:
+                continue
+            seen_names.add(label)
+            try:
+                if geom.length <= max(2.0, (10.0 / 1000.0) * scale_ratio):
+                    continue
+                mid = geom.interpolate(0.5, normalized=True)
+                angle = 0.0
+                try:
+                    p1 = geom.interpolate(0.45, normalized=True)
+                    p2 = geom.interpolate(0.55, normalized=True)
+                    angle = math.degrees(math.atan2(p2.y - p1.y, p2.x - p1.x))
+                    if angle < -90 or angle > 90:
+                        angle += 180
+                except Exception:
+                    pass
+                ax.text(
+                    mid.x,
+                    mid.y,
+                    label,
+                    fontsize=max(5, int(6.0 * font_scale)),
+                    color="black",
+                    ha="center",
+                    va="center",
+                    rotation=angle,
+                    weight="normal",
+                    zorder=10,
+                )
+            except Exception:
+                continue
 
     all_buildings = []
     if buildings:
@@ -2374,6 +2436,10 @@ def render_plot_map_layout(
     extent_poly = box(target_xlim[0], target_ylim[0], target_xlim[1], target_ylim[1])
     road_polys = []
     road_label_features = []
+    road_add_geoms = [
+        ov for ov in overrides
+        if ov["feature_type"] == "road" and ov["action"] in ("add", "update") and ov["geom"] is not None
+    ]
     if preview_mode:
         for geom in roads_for_preview:
             try:
@@ -2392,6 +2458,26 @@ def render_plot_map_layout(
                 road_polys.append(snapped_clipped.buffer(half_w, cap_style=2, join_style=2))
             except Exception:
                 continue
+        # In edit/preview mode, include labels for manually added roads.
+        for ov in road_add_geoms:
+            name = str(ov.get("name") or "").strip()
+            if not name:
+                continue
+            geom = ov.get("geom")
+            if geom is None:
+                continue
+            try:
+                gdf_line = gpd.GeoSeries([geom], crs="EPSG:4326").to_crs(epsg=display_epsg)
+                line_proj = gdf_line.iloc[0]
+            except Exception:
+                continue
+            snap_tol = max(1.0, (5.0 / 1000.0) * scale_ratio)
+            expanded_frame = extent_poly.buffer(snap_tol)
+            clipped = line_proj.intersection(expanded_frame)
+            if clipped.is_empty:
+                continue
+            snapped_clipped = snap(clipped, extent_poly.boundary, snap_tol)
+            road_label_features.append((snapped_clipped, name, "override"))
         has_roads = len(road_polys) > 0
     else:
         # Draw roads with class-based real-world widths
@@ -2415,7 +2501,6 @@ def render_plot_map_layout(
         """), {"plot_id": plot_id}).fetchall()
 
         road_delete_geoms = [ov["geom"] for ov in overrides if ov["feature_type"] == "road" and ov["action"] == "delete" and ov["geom"] is not None]
-        road_add_geoms = [ov for ov in overrides if ov["feature_type"] == "road" and ov["action"] in ("add", "update") and ov["geom"] is not None]
         for row in road_rows:
             geom = wkb.loads(row.geom)
             highway = row.highway
@@ -2561,7 +2646,7 @@ def render_plot_map_layout(
     draw_skipped_table(ax, skipped_entries, font_scale)
 
     # Road names (optional). Keep small and never overlap boundary labels.
-    if not preview_mode and road_label_features:
+    if road_label_features:
         seen_names = set()
         boundary_buffer = poly.buffer((12.0 / 1000.0) * scale_ratio)
         major_classes = {
@@ -2584,6 +2669,7 @@ def render_plot_map_layout(
             return (x - w / 2.0, y - h / 2.0, x + w / 2.0, y + h / 2.0)
 
         for geom, name, highway in road_label_features:
+            name = str(name or "").strip()
             if not name or name in seen_names:
                 continue
             if highway and highway.lower() not in major_classes and highway != "override":
