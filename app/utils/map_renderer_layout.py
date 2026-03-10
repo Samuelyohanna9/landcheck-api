@@ -1777,7 +1777,9 @@ def _render_plot_map_layout_adamawa(
 
     fig = plt.figure(figsize=(fig_width, fig_height), dpi=dpi)
     _ = FigureCanvas(fig)
-    map_left, map_bottom, map_width, map_height = 0.08, 0.20, 0.84, 0.60
+    # Match Adamawa template vertical spacing: slightly lower map top line so
+    # header blocks (authority + date) breathe above the frame.
+    map_left, map_bottom, map_width, map_height = 0.08, 0.20, 0.84, 0.58
     ax = fig.add_axes([map_left, map_bottom, map_width, map_height])
 
     rof_no = _safe_text(adamawa_rof_no, _safe_text(adamawa_computation_no, f"{plot_id}"))
