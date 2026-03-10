@@ -15,6 +15,7 @@ import glob
 import re
 import shutil
 import zipfile
+from threading import Lock
 
 from app.db import SessionLocal
 from app.models.plot import Plot
@@ -64,12 +65,26 @@ DEFAULT_CERTIFICATION_STATEMENT = (
     "executed by me and conforms with the regulations of surveying profession."
 )
 
+_PLOTS_SCHEMA_READY = False
+_PLOTS_SCHEMA_LOCK = Lock()
+
+
+def ensure_plots_schema_once(db: Session):
+    global _PLOTS_SCHEMA_READY
+    if _PLOTS_SCHEMA_READY:
+        return
+    with _PLOTS_SCHEMA_LOCK:
+        if _PLOTS_SCHEMA_READY:
+            return
+        ensure_plot_meta_table(db)
+        ensure_plot_feature_overrides_table(db)
+        _PLOTS_SCHEMA_READY = True
+
 
 def get_db():
     db = SessionLocal()
     try:
-        ensure_plot_meta_table(db)
-        ensure_plot_feature_overrides_table(db)
+        ensure_plots_schema_once(db)
         yield db
     finally:
         db.close()
@@ -867,6 +882,7 @@ def preview_plot_map(plot_id: int, db: Session = Depends(get_db), background_tas
         beacon_style=beacon_style,
         road_width_m=road_width_m,
         road_width_override_m=road_width_override_m,
+        preview_mode=True,
     )
 
     if background_tasks:

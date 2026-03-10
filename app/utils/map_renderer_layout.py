@@ -1104,6 +1104,7 @@ def render_plot_map_layout(
     beacon_style: str = "circle",
     road_width_m: float | None = None,
     road_width_override_m: float | None = None,
+    preview_mode: bool = False,
 ):
     plot_wkb = db.execute(text("SELECT geom FROM plots WHERE id=:id"), {"id": plot_id}).scalar()
     rows = db.execute(
@@ -1129,7 +1130,7 @@ def render_plot_map_layout(
     ).scalar() or 0
 
     plot_geom = wkb.loads(plot_wkb)
-    buildings, rivers, fences = [], [], []
+    buildings, rivers, fences, detected_roads = [], [], [], []
     for r in rows:
         g = wkb.loads(r.geom)
         if r.feature_type == "building":
@@ -1138,6 +1139,8 @@ def render_plot_map_layout(
             rivers.append(g)
         elif r.feature_type == "fence":
             fences.append(g)
+        elif r.feature_type == "road":
+            detected_roads.append(g)
 
     overrides = []
     import json
@@ -1185,6 +1188,7 @@ def render_plot_map_layout(
     buildings, added_buildings = apply_overrides(buildings, "building")
     rivers, added_rivers = apply_overrides(rivers, "river")
     fences, added_fences = apply_overrides(fences, "fence")
+    roads_for_preview, _ = apply_overrides(detected_roads, "road")
 
     # Use user's selected coordinate system for rendering
     # If WGS84 selected, use appropriate UTM zone for projected display
@@ -1210,8 +1214,12 @@ def render_plot_map_layout(
     fig_height = paper_config["height"]
     font_scale = paper_config["scale"]
 
-    # Adjust DPI based on paper size (larger papers need lower DPI for reasonable file sizes)
-    dpi = 200 if paper_size in ["A4", "A3"] else 150 if paper_size == "A2" else 100
+    # Preview renders can use lower DPI to return quickly while preserving export quality.
+    if preview_mode:
+        dpi = 120
+    else:
+        # Adjust DPI based on paper size (larger papers need lower DPI for reasonable file sizes)
+        dpi = 200 if paper_size in ["A4", "A3"] else 150 if paper_size == "A2" else 100
 
     fig = plt.figure(figsize=(fig_width, fig_height), dpi=dpi)
     canvas_obj = FigureCanvas(fig)
@@ -1241,83 +1249,103 @@ def render_plot_map_layout(
             ax=ax, color="blue", lw=1.2*font_scale, zorder=5
         )
 
-    # Draw roads with class-based real-world widths
-    road_rows = db.execute(text("""
-        WITH roads AS (
-            SELECT
-                CASE
-                    WHEN ST_SRID(r.geom) = 4326 THEN r.geom
-                    WHEN ST_SRID(r.geom) = 0 THEN ST_SetSRID(r.geom, 4326)
-                    ELSE ST_Transform(r.geom, 4326)
-                END AS geom,
-                r.highway,
-                r.name
-            FROM lines r
-            WHERE r.highway IS NOT NULL
-        )
-        SELECT roads.geom, roads.highway, roads.name
-        FROM roads
-        JOIN plot_buffers b ON b.plot_id = :plot_id
-        WHERE ST_Intersects(roads.geom, b.geom)
-    """), {"plot_id": plot_id}).fetchall()
-
     from shapely.geometry import box
 
     extent_poly = box(target_xlim[0], target_ylim[0], target_xlim[1], target_ylim[1])
     road_polys = []
     road_label_features = []
-    road_delete_geoms = [ov["geom"] for ov in overrides if ov["feature_type"] == "road" and ov["action"] == "delete" and ov["geom"] is not None]
-    road_add_geoms = [ov for ov in overrides if ov["feature_type"] == "road" and ov["action"] in ("add", "update") and ov["geom"] is not None]
-    for row in road_rows:
-        geom = wkb.loads(row.geom)
-        highway = row.highway
-        name = row.name
-        if road_delete_geoms and any(geom.intersects(dg) for dg in road_delete_geoms):
-            continue
-        try:
-            gdf_line = gpd.GeoSeries([geom], crs="EPSG:4326").to_crs(epsg=display_epsg)
-            line_proj = gdf_line.iloc[0]
-        except Exception:
-            continue
+    if preview_mode:
+        for geom in roads_for_preview:
+            try:
+                gdf_line = gpd.GeoSeries([geom], crs="EPSG:4326").to_crs(epsg=display_epsg)
+                line_proj = gdf_line.iloc[0]
+            except Exception:
+                continue
+            snap_tol = max(1.0, (5.0 / 1000.0) * scale_ratio)
+            expanded_frame = extent_poly.buffer(snap_tol)
+            clipped = line_proj.intersection(expanded_frame)
+            if clipped.is_empty:
+                continue
+            snapped_clipped = snap(clipped, extent_poly.boundary, snap_tol)
+            try:
+                half_w = max(1.0, (road_width_m or 3.0) / 2.0)
+                road_polys.append(snapped_clipped.buffer(half_w, cap_style=2, join_style=2))
+            except Exception:
+                continue
+        has_roads = len(road_polys) > 0
+    else:
+        # Draw roads with class-based real-world widths
+        road_rows = db.execute(text("""
+            WITH roads AS (
+                SELECT
+                    CASE
+                        WHEN ST_SRID(r.geom) = 4326 THEN r.geom
+                        WHEN ST_SRID(r.geom) = 0 THEN ST_SetSRID(r.geom, 4326)
+                        ELSE ST_Transform(r.geom, 4326)
+                    END AS geom,
+                    r.highway,
+                    r.name
+                FROM lines r
+                WHERE r.highway IS NOT NULL
+            )
+            SELECT roads.geom, roads.highway, roads.name
+            FROM roads
+            JOIN plot_buffers b ON b.plot_id = :plot_id
+            WHERE ST_Intersects(roads.geom, b.geom)
+        """), {"plot_id": plot_id}).fetchall()
 
-        snap_tol = max(1.0, (5.0 / 1000.0) * scale_ratio)
-        expanded_frame = extent_poly.buffer(snap_tol)
-        clipped = line_proj.intersection(expanded_frame)
-        if clipped.is_empty:
-            continue
-        # Snap to frame boundary so buffered road edges reach the grid border cleanly.
-        snapped_clipped = snap(clipped, extent_poly.boundary, snap_tol)
-        road_label_features.append((snapped_clipped, name, highway))
-        # Use buffered road polygon to keep intersections connected
-        try:
-            half_w = max(1.0, (road_width_m or 3.0) / 2.0)
-            road_polys.append(snapped_clipped.buffer(half_w, cap_style=2, join_style=2))
-        except Exception:
-            continue
+        road_delete_geoms = [ov["geom"] for ov in overrides if ov["feature_type"] == "road" and ov["action"] == "delete" and ov["geom"] is not None]
+        road_add_geoms = [ov for ov in overrides if ov["feature_type"] == "road" and ov["action"] in ("add", "update") and ov["geom"] is not None]
+        for row in road_rows:
+            geom = wkb.loads(row.geom)
+            highway = row.highway
+            name = row.name
+            if road_delete_geoms and any(geom.intersects(dg) for dg in road_delete_geoms):
+                continue
+            try:
+                gdf_line = gpd.GeoSeries([geom], crs="EPSG:4326").to_crs(epsg=display_epsg)
+                line_proj = gdf_line.iloc[0]
+            except Exception:
+                continue
 
-    # Add user-provided road overrides
-    for ov in road_add_geoms:
-        geom = ov["geom"]
-        name = ov["name"]
-        try:
-            gdf_line = gpd.GeoSeries([geom], crs="EPSG:4326").to_crs(epsg=display_epsg)
-            line_proj = gdf_line.iloc[0]
-        except Exception:
-            continue
-        snap_tol = max(1.0, (5.0 / 1000.0) * scale_ratio)
-        expanded_frame = extent_poly.buffer(snap_tol)
-        clipped = line_proj.intersection(expanded_frame)
-        if clipped.is_empty:
-            continue
-        snapped_clipped = snap(clipped, extent_poly.boundary, snap_tol)
-        road_label_features.append((snapped_clipped, name, "override"))
-        try:
-            half_w = max(1.0, ((ov.get("width_m") or road_width_override_m or road_width_m) or 3.0) / 2.0)
-            road_polys.append(snapped_clipped.buffer(half_w, cap_style=2, join_style=2))
-        except Exception:
-            continue
+            snap_tol = max(1.0, (5.0 / 1000.0) * scale_ratio)
+            expanded_frame = extent_poly.buffer(snap_tol)
+            clipped = line_proj.intersection(expanded_frame)
+            if clipped.is_empty:
+                continue
+            # Snap to frame boundary so buffered road edges reach the grid border cleanly.
+            snapped_clipped = snap(clipped, extent_poly.boundary, snap_tol)
+            road_label_features.append((snapped_clipped, name, highway))
+            # Use buffered road polygon to keep intersections connected
+            try:
+                half_w = max(1.0, (road_width_m or 3.0) / 2.0)
+                road_polys.append(snapped_clipped.buffer(half_w, cap_style=2, join_style=2))
+            except Exception:
+                continue
 
-    has_roads = len(road_rows) > 0 or len(road_add_geoms) > 0
+        # Add user-provided road overrides
+        for ov in road_add_geoms:
+            geom = ov["geom"]
+            name = ov["name"]
+            try:
+                gdf_line = gpd.GeoSeries([geom], crs="EPSG:4326").to_crs(epsg=display_epsg)
+                line_proj = gdf_line.iloc[0]
+            except Exception:
+                continue
+            snap_tol = max(1.0, (5.0 / 1000.0) * scale_ratio)
+            expanded_frame = extent_poly.buffer(snap_tol)
+            clipped = line_proj.intersection(expanded_frame)
+            if clipped.is_empty:
+                continue
+            snapped_clipped = snap(clipped, extent_poly.boundary, snap_tol)
+            road_label_features.append((snapped_clipped, name, "override"))
+            try:
+                half_w = max(1.0, ((ov.get("width_m") or road_width_override_m or road_width_m) or 3.0) / 2.0)
+                road_polys.append(snapped_clipped.buffer(half_w, cap_style=2, join_style=2))
+            except Exception:
+                continue
+
+        has_roads = len(road_rows) > 0 or len(road_add_geoms) > 0
     key_bounds = draw_key_box(
         fig,
         has_buildings=has_buildings,
@@ -1393,7 +1421,7 @@ def render_plot_map_layout(
     draw_skipped_table(ax, skipped_entries, font_scale)
 
     # Road names (optional). Keep small and never overlap boundary labels.
-    if road_label_features:
+    if not preview_mode and road_label_features:
         seen_names = set()
         boundary_buffer = poly.buffer((12.0 / 1000.0) * scale_ratio)
         major_classes = {
