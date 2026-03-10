@@ -1481,10 +1481,11 @@ def _collect_road_edge_lines(centerline_geom, half_width_m: float):
 
 def _collect_connected_road_edge_lines(road_geoms_with_width, snap_tol_m: float = 1.0):
     """
-    Build connected road-edge lines by buffering all road centerlines and dissolving
-    overlaps/intersections into a single surface, then extracting boundaries.
+    Build connected OPEN road-edge lines.
+    - Keeps disconnected road ends open (no closed polygon end-caps)
+    - Snaps/merges centerlines first so overlaps/intersections connect cleanly
     """
-    line_parts = []
+    grouped_centerlines = {}
     for item in road_geoms_with_width or []:
         if not item or len(item) < 2:
             continue
@@ -1492,64 +1493,76 @@ def _collect_connected_road_edge_lines(road_geoms_with_width, snap_tol_m: float 
         if geom is None or getattr(geom, "is_empty", True):
             continue
         try:
-            hw = max(0.5, float(half_width or 1.0))
+            hw = round(max(0.5, float(half_width or 1.0)), 3)
         except Exception:
             hw = 1.0
+        grouped_centerlines.setdefault(hw, [])
         for seg in _iter_line_geometries(geom):
             if seg is None or getattr(seg, "is_empty", True):
                 continue
             if getattr(seg, "length", 0.0) <= 0:
                 continue
-            line_parts.append((seg, hw))
-    if not line_parts:
+            grouped_centerlines[hw].append(seg)
+
+    if not grouped_centerlines:
         return []
 
-    try:
-        network = unary_union([seg for seg, _ in line_parts])
-    except Exception:
-        network = None
-
-    road_polys = []
-    for seg, hw in line_parts:
-        try:
-            snapped_seg = snap(seg, network, snap_tol_m) if network is not None else seg
-        except Exception:
-            snapped_seg = seg
-        try:
-            # Flat cap keeps road ends clean; round join avoids sharp corner gaps.
-            road_poly = snapped_seg.buffer(hw, cap_style=2, join_style=1)
-            if road_poly is not None and not road_poly.is_empty:
-                road_polys.append(road_poly)
-        except Exception:
+    edge_lines = []
+    for hw, centerlines in grouped_centerlines.items():
+        if not centerlines:
             continue
-    if not road_polys:
-        return []
+        try:
+            center_network = unary_union(centerlines)
+        except Exception:
+            center_network = None
 
-    try:
-        merged_surface = unary_union(road_polys)
-    except Exception:
-        merged_surface = road_polys[0]
-        for p in road_polys[1:]:
+        snapped_lines = []
+        for seg in centerlines:
             try:
-                merged_surface = merged_surface.union(p)
+                snapped = snap(seg, center_network, snap_tol_m) if center_network is not None else seg
+            except Exception:
+                snapped = seg
+            snapped_lines.append(snapped)
+
+        try:
+            merged_centerlines = linemerge(unary_union(snapped_lines))
+            merged_parts = [seg for seg in _iter_line_geometries(merged_centerlines) if seg is not None and not getattr(seg, "is_empty", True)]
+            if not merged_parts:
+                merged_parts = snapped_lines
+        except Exception:
+            merged_parts = snapped_lines
+
+        for center in merged_parts:
+            if center is None or getattr(center, "is_empty", True):
+                continue
+            if getattr(center, "length", 0.0) <= 0:
+                continue
+            try:
+                left = center.parallel_offset(hw, "left", join_style=1)
+                right = center.parallel_offset(hw, "right", join_style=1)
             except Exception:
                 continue
+            for off in (left, right):
+                for seg in _iter_line_geometries(off):
+                    if seg is None or getattr(seg, "is_empty", True):
+                        continue
+                    edge_lines.append(seg)
 
-    boundary = getattr(merged_surface, "boundary", None)
-    if boundary is None or getattr(boundary, "is_empty", True):
+    if not edge_lines:
         return []
 
-    edges = [seg for seg in _iter_line_geometries(boundary) if seg is not None and not getattr(seg, "is_empty", True)]
-    if not edges:
-        return []
+    # Final snap/merge pass for cleaner joins, while preserving open ends.
     try:
-        merged_edges = linemerge(unary_union(edges))
+        edge_network = unary_union(edge_lines)
+        fine_tol = max(0.2, snap_tol_m * 0.35)
+        snapped_edges = [snap(seg, edge_network, fine_tol) for seg in edge_lines]
+        merged_edges = linemerge(unary_union(snapped_edges))
         final_edges = [seg for seg in _iter_line_geometries(merged_edges) if seg is not None and not getattr(seg, "is_empty", True)]
         if final_edges:
             return final_edges
     except Exception:
         pass
-    return edges
+    return edge_lines
 
 
 def _draw_road_edges(ax, edge_lines, font_scale=1.0):
