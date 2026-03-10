@@ -1043,7 +1043,10 @@ def draw_building_hatch(ax, building_geoms, display_epsg: int, scale_ratio: int,
     """
     if not building_geoms:
         return
-    spacing = max(1.0, (10.0 / 1000.0) * max(scale_ratio, 100))
+    # Hatch spacing in map units derived from paper mm and scale ratio.
+    # Example: 3.5 mm on paper => 3.5m at 1:1000, 7m at 1:2000.
+    hatch_spacing_mm = 3.5
+    base_spacing = max(0.6, (hatch_spacing_mm / 1000.0) * max(scale_ratio, 100))
     for geom in building_geoms:
         try:
             projected = gpd.GeoSeries([geom], crs="EPSG:4326").to_crs(epsg=display_epsg).iloc[0]
@@ -1054,6 +1057,9 @@ def draw_building_hatch(ax, building_geoms, display_epsg: int, scale_ratio: int,
                 minx, miny, maxx, maxy = poly.bounds
                 if maxy <= miny:
                     continue
+                height = maxy - miny
+                # Keep spacing scale-driven, but shrink for very small buildings so hatch is still visible.
+                spacing = min(base_spacing, max(0.4, height / 4.0))
                 y = miny + spacing
                 while y < maxy:
                     scan = LineString([(minx - spacing, y), (maxx + spacing, y)])
