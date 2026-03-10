@@ -152,12 +152,12 @@ def add_north_arrow(ax, font_scale=1.0, style: str = "one_side_stem", color: str
 
     if style in ("one_side_stem", "one-sided-stem", "oneside_stem", "stacked_4n", "stacked4n", "vertical_4n"):
         # One-sided "4-shape" head per provided reference code.
-        stem_bottom = y - size * 1.00
+        stem_bottom = y - size * 1.20
         stem_top = y + size * 0.80
-        head_knee_x = x - size * 0.08
+        head_knee_x = x - size * 0.20
         head_knee_y = y + size * 0.40
-        n_y = y - size * 0.21
-        line_lw = max(0.8, 0.95 * font_scale)
+        n_y = y - size * 0.25
+        line_lw = max(1.0, 1.2 * font_scale)
 
         # Main shaft
         fig.add_artist(
@@ -201,7 +201,8 @@ def add_north_arrow(ax, font_scale=1.0, style: str = "one_side_stem", color: str
             "N",
             ha="center",
             va="center",
-            fontsize=int(11.0 * font_scale),
+            transform=fig.transFigure,
+            fontsize=int(12.0 * font_scale),
             color=col,
             weight="normal",
             fontfamily="DejaVu Sans",
