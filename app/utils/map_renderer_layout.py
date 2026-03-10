@@ -1572,6 +1572,9 @@ def _draw_adamawa_bottom_blocks(
     y = 0.182
 
     cp_name = _safe_text(control_point_name, "CONTROL POINT").replace("\n", " ").strip().upper()
+    cp_name_match = re.match(r"^([A-Z]{2,})[-_/ ]?(\d+)$", cp_name)
+    if cp_name_match:
+        cp_name = f"{cp_name_match.group(1)}/{cp_name_match.group(2)}"
     origin_display = _safe_text(origin_text, DEFAULT_ADAMAWA_ORIGIN_TEXT).strip().upper()
     if not origin_display.startswith("ORIGIN"):
         origin_display = f"ORIGIN:- {origin_display}"
