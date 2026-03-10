@@ -677,19 +677,37 @@ def draw_grid(
 
     # Optional interior grid lines (used by Adamawa template).
     if full_grid:
-        span_x = max(xmax - xmin, 0.000001)
-        span_y = max(ymax - ymin, 0.000001)
-        # Fixed divisions give stable visible interior grid lines across scales.
+        # Use axes-fraction lines to guarantee visible interior grid regardless of
+        # map extent scaling and export downsampling.
         x_divisions = 8
         y_divisions = 8
-
         for i in range(1, x_divisions):
-            x = xmin + (span_x * i / x_divisions)
-            ax.plot([x, x], [ymin, ymax], color="#5f7dff", lw=0.42 * font_scale, alpha=0.33, zorder=2)
+            xf = i / x_divisions
+            ax.add_line(
+                mlines.Line2D(
+                    [xf, xf],
+                    [0.0, 1.0],
+                    transform=ax.transAxes,
+                    color="#5a78ff",
+                    lw=0.52 * font_scale,
+                    alpha=0.62,
+                    zorder=1,
+                )
+            )
 
         for j in range(1, y_divisions):
-            y = ymin + (span_y * j / y_divisions)
-            ax.plot([xmin, xmax], [y, y], color="#5f7dff", lw=0.42 * font_scale, alpha=0.33, zorder=2)
+            yf = j / y_divisions
+            ax.add_line(
+                mlines.Line2D(
+                    [0.0, 1.0],
+                    [yf, yf],
+                    transform=ax.transAxes,
+                    color="#5a78ff",
+                    lw=0.52 * font_scale,
+                    alpha=0.62,
+                    zorder=1,
+                )
+            )
 
     # Tick-only grid to keep plot area clean
     tick_len = (xmax - xmin) * 0.01
