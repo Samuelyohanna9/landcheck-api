@@ -151,53 +151,30 @@ def add_north_arrow(ax, font_scale=1.0, style: str = "one_side_stem", color: str
     size = 0.030 * max(0.8, font_scale)
 
     if style in ("one_side_stem", "one-sided-stem", "oneside_stem", "stacked_4n", "stacked4n", "vertical_4n"):
+        stem_top = y + size * 0.44
         stem_bottom = y - size * 1.02
-        stem_tip_y = y + size * 0.84
-        n_y = y - size * 0.14
-        n_gap = size * 0.64
-        upper_bottom = n_y + (n_gap / 2.0)
-        lower_top = n_y - (n_gap / 2.0)
-        arrow_tip_x = x + size * 0.19
-        arrow_tip_y = stem_tip_y + size * 0.22
-        fig.add_artist(
-            mlines.Line2D(
-                [x, arrow_tip_x],
-                [stem_tip_y, arrow_tip_y],
-                transform=fig.transFigure,
-                color=col,
-                lw=max(0.8, 0.85 * font_scale),
-                zorder=20,
-            )
-        )
-        fig.add_artist(
-            mlines.Line2D(
-                [x, arrow_tip_x],
-                [stem_tip_y, stem_tip_y],
-                transform=fig.transFigure,
-                color=col,
-                lw=max(0.8, 0.85 * font_scale),
-                zorder=20,
-            )
-        )
+        four_y = y + size * 0.75
+        n_y = y - size * 0.12
         fig.add_artist(
             mlines.Line2D(
                 [x, x],
-                [upper_bottom, stem_tip_y],
+                [stem_bottom, stem_top],
                 transform=fig.transFigure,
                 color=col,
-                lw=max(0.8, 0.85 * font_scale),
+                lw=max(0.8, 0.9 * font_scale),
                 zorder=20,
             )
         )
-        fig.add_artist(
-            mlines.Line2D(
-                [x, x],
-                [stem_bottom, lower_top],
-                transform=fig.transFigure,
-                color=col,
-                lw=max(0.8, 0.85 * font_scale),
-                zorder=20,
-            )
+        fig.text(
+            x,
+            four_y,
+            "4",
+            ha="center",
+            va="center",
+            fontsize=int(11.0 * font_scale),
+            color=col,
+            weight="normal",
+            fontfamily="DejaVu Sans",
         )
         fig.text(
             x,
@@ -205,7 +182,7 @@ def add_north_arrow(ax, font_scale=1.0, style: str = "one_side_stem", color: str
             "N",
             ha="center",
             va="center",
-            fontsize=int(10.0 * font_scale),
+            fontsize=int(11.0 * font_scale),
             color=col,
             weight="normal",
             fontfamily="DejaVu Sans",
