@@ -421,6 +421,7 @@ def render_orthophoto_png(
     paper_size="A4",
     north_arrow_style="classic",
     north_arrow_color="black",
+    preview_mode: bool = False,
 ):
     # Fetch Geometry from DB
     res = db.execute(text("SELECT geom FROM plots WHERE id=:id"), {"id": plot_id}).fetchone()
@@ -444,7 +445,10 @@ def render_orthophoto_png(
     fig_width = paper_config["width"]
     fig_height = paper_config["height"]
     font_scale = paper_config["scale"]
-    dpi = 200 if paper_config["name"] in ["A4", "A3"] else 150 if paper_config["name"] == "A2" else 100
+    if preview_mode:
+        dpi = 120
+    else:
+        dpi = 200 if paper_config["name"] in ["A4", "A3"] else 150 if paper_config["name"] == "A2" else 100
 
     fig = plt.figure(figsize=(fig_width, fig_height), dpi=dpi)
     canvas_agg = FigureCanvas(fig)
@@ -463,97 +467,140 @@ def render_orthophoto_png(
     axis_crs = f"EPSG:{display_epsg}"
 
     if use_topo_map:
-        # Use OpenTopoMap for terrain/elevation visualization
-        topo_sources = [
-            ("OpenTopoMap", "https://tile.opentopomap.org/{z}/{x}/{y}.png"),
-            ("Stamen Terrain", "https://stamen-tiles.a.ssl.fastly.net/terrain/{z}/{x}/{y}.png"),
-        ]
-
-        for name, url in topo_sources:
-            try:
-                ctx.add_basemap(
-                    ax,
-                    source=url,
-                    crs=axis_crs,
-                    attribution=False,
-                    zoom=15,
-                    reset_extent=True,
-                )
-                basemap_loaded = True
-                print(f"Loaded topo basemap from {name}")
-                break
-            except Exception as e:
-                print(f"{name} failed: {e}")
-                continue
-
-        if not basemap_loaded:
-            # Fallback to contextily OpenTopoMap provider
+        topo_zoom = 14 if preview_mode else 15
+        if preview_mode:
+            # Fast path for previews: single provider attempt to avoid stacked network timeouts.
             try:
                 ctx.add_basemap(
                     ax,
                     source=ctx.providers.OpenTopoMap,
                     crs=axis_crs,
                     attribution=False,
-                    zoom=15,
+                    zoom=topo_zoom,
                     reset_extent=True,
                 )
                 basemap_loaded = True
-            except Exception as e:
-                print(f"OpenTopoMap provider failed: {e}")
-    else:
-        # Use satellite/aerial imagery
-        basemap_sources = [
-            ("Esri WorldImagery", "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}"),
-            ("OpenStreetMap", "https://tile.openstreetmap.org/{z}/{x}/{y}.png"),
-            ("CartoDB Light", "https://basemaps.cartocdn.com/light_all/{z}/{x}/{y}.png"),
-        ]
+            except Exception:
+                basemap_loaded = False
+        else:
+        # Use OpenTopoMap for terrain/elevation visualization
+            topo_sources = [
+                ("OpenTopoMap", "https://tile.opentopomap.org/{z}/{x}/{y}.png"),
+                ("Stamen Terrain", "https://stamen-tiles.a.ssl.fastly.net/terrain/{z}/{x}/{y}.png"),
+            ]
 
-        # First try the contextily providers
-        try:
-            ctx.add_basemap(
-                ax,
-                source=ctx.providers.Esri.WorldImagery,
-                crs=axis_crs,
-                attribution=False,
-                zoom=17,
-                reset_extent=True,
-            )
-            basemap_loaded = True
-        except Exception as e:
-            print(f"Esri WorldImagery failed: {e}")
-
-        if not basemap_loaded:
-            try:
-                ctx.add_basemap(
-                    ax,
-                    source=ctx.providers.OpenStreetMap.Mapnik,
-                    crs=axis_crs,
-                    attribution=False,
-                    zoom=17,
-                    reset_extent=True,
-                )
-                basemap_loaded = True
-            except Exception as e:
-                print(f"OpenStreetMap failed: {e}")
-
-        if not basemap_loaded:
-            # Try URL-based approach as last resort
-            for name, url in basemap_sources:
+            for name, url in topo_sources:
                 try:
                     ctx.add_basemap(
                         ax,
                         source=url,
                         crs=axis_crs,
                         attribution=False,
-                        zoom=17,
+                        zoom=topo_zoom,
                         reset_extent=True,
                     )
                     basemap_loaded = True
-                    print(f"Loaded basemap from {name}")
+                    print(f"Loaded topo basemap from {name}")
                     break
                 except Exception as e:
                     print(f"{name} failed: {e}")
                     continue
+
+            if not basemap_loaded:
+                # Fallback to contextily OpenTopoMap provider
+                try:
+                    ctx.add_basemap(
+                        ax,
+                        source=ctx.providers.OpenTopoMap,
+                        crs=axis_crs,
+                        attribution=False,
+                        zoom=topo_zoom,
+                        reset_extent=True,
+                    )
+                    basemap_loaded = True
+                except Exception as e:
+                    print(f"OpenTopoMap provider failed: {e}")
+    else:
+        sat_zoom = 16 if preview_mode else 17
+        if preview_mode:
+            # Fast path for previews: no long fallback chain.
+            try:
+                ctx.add_basemap(
+                    ax,
+                    source=ctx.providers.Esri.WorldImagery,
+                    crs=axis_crs,
+                    attribution=False,
+                    zoom=sat_zoom,
+                    reset_extent=True,
+                )
+                basemap_loaded = True
+            except Exception:
+                try:
+                    ctx.add_basemap(
+                        ax,
+                        source=ctx.providers.OpenStreetMap.Mapnik,
+                        crs=axis_crs,
+                        attribution=False,
+                        zoom=sat_zoom,
+                        reset_extent=True,
+                    )
+                    basemap_loaded = True
+                except Exception:
+                    basemap_loaded = False
+        else:
+        # Use satellite/aerial imagery
+            basemap_sources = [
+                ("Esri WorldImagery", "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}"),
+                ("OpenStreetMap", "https://tile.openstreetmap.org/{z}/{x}/{y}.png"),
+                ("CartoDB Light", "https://basemaps.cartocdn.com/light_all/{z}/{x}/{y}.png"),
+            ]
+
+            # First try the contextily providers
+            try:
+                ctx.add_basemap(
+                    ax,
+                    source=ctx.providers.Esri.WorldImagery,
+                    crs=axis_crs,
+                    attribution=False,
+                    zoom=sat_zoom,
+                    reset_extent=True,
+                )
+                basemap_loaded = True
+            except Exception as e:
+                print(f"Esri WorldImagery failed: {e}")
+
+            if not basemap_loaded:
+                try:
+                    ctx.add_basemap(
+                        ax,
+                        source=ctx.providers.OpenStreetMap.Mapnik,
+                        crs=axis_crs,
+                        attribution=False,
+                        zoom=sat_zoom,
+                        reset_extent=True,
+                    )
+                    basemap_loaded = True
+                except Exception as e:
+                    print(f"OpenStreetMap failed: {e}")
+
+            if not basemap_loaded:
+                # Try URL-based approach as last resort
+                for name, url in basemap_sources:
+                    try:
+                        ctx.add_basemap(
+                            ax,
+                            source=url,
+                            crs=axis_crs,
+                            attribution=False,
+                            zoom=sat_zoom,
+                            reset_extent=True,
+                        )
+                        basemap_loaded = True
+                        print(f"Loaded basemap from {name}")
+                        break
+                    except Exception as e:
+                        print(f"{name} failed: {e}")
+                        continue
 
     if not basemap_loaded:
         # Add a light green background to represent land if no basemap loads

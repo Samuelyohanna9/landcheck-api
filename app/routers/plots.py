@@ -399,13 +399,24 @@ def build_preview_cache_key(plot_id: int, payload: dict, revision_token: dict) -
     return hashlib.sha256(packed.encode("utf-8")).hexdigest()
 
 
-def preview_cache_path(plot_id: int, cache_key: str) -> str:
+def build_plot_geom_revision_token(db: Session, plot_id: int) -> dict:
+    geom_hex = db.execute(
+        text("SELECT encode(ST_AsEWKB(geom), 'hex') FROM plots WHERE id = :plot_id"),
+        {"plot_id": plot_id},
+    ).scalar() if _table_exists(db, "public.plots") else ""
+    return {
+        "plot_geom_hash": hashlib.sha256((geom_hex or "").encode("utf-8")).hexdigest() if geom_hex else "",
+    }
+
+
+def preview_cache_path(plot_id: int, cache_key: str, variant: str = "preview") -> str:
     os.makedirs(PREVIEW_CACHE_DIR, exist_ok=True)
-    return os.path.join(PREVIEW_CACHE_DIR, f"plot_{plot_id}_{cache_key}.png")
+    safe_variant = re.sub(r"[^a-zA-Z0-9_-]", "_", str(variant or "preview"))
+    return os.path.join(PREVIEW_CACHE_DIR, f"plot_{plot_id}_{safe_variant}_{cache_key}.png")
 
 
-def get_cached_preview_path(plot_id: int, cache_key: str) -> str | None:
-    cache_path = preview_cache_path(plot_id, cache_key)
+def get_cached_preview_path(plot_id: int, cache_key: str, variant: str = "preview") -> str | None:
+    cache_path = preview_cache_path(plot_id, cache_key, variant=variant)
     if not os.path.exists(cache_path):
         return None
     try:
@@ -418,9 +429,13 @@ def get_cached_preview_path(plot_id: int, cache_key: str) -> str | None:
         return None
 
 
-def prune_preview_cache(plot_id: int):
+def prune_preview_cache(plot_id: int, variant: str | None = None):
     os.makedirs(PREVIEW_CACHE_DIR, exist_ok=True)
-    pattern = os.path.join(PREVIEW_CACHE_DIR, f"plot_{plot_id}_*.png")
+    if variant:
+        safe_variant = re.sub(r"[^a-zA-Z0-9_-]", "_", str(variant))
+        pattern = os.path.join(PREVIEW_CACHE_DIR, f"plot_{plot_id}_{safe_variant}_*.png")
+    else:
+        pattern = os.path.join(PREVIEW_CACHE_DIR, f"plot_{plot_id}_*.png")
     files = []
     for path in glob.glob(pattern):
         try:
@@ -978,8 +993,8 @@ def preview_plot_map(plot_id: int, db: Session = Depends(get_db), background_tas
     }
     revision_token = build_preview_revision_token(db, plot_id)
     cache_key = build_preview_cache_key(plot_id, payload_for_cache, revision_token)
-    prune_preview_cache(plot_id)
-    cached_path = get_cached_preview_path(plot_id, cache_key)
+    prune_preview_cache(plot_id, variant="survey")
+    cached_path = get_cached_preview_path(plot_id, cache_key, variant="survey")
     if cached_path:
         return FileResponse(
             cached_path,
@@ -1037,7 +1052,7 @@ def preview_plot_map(plot_id: int, db: Session = Depends(get_db), background_tas
         preview_mode=True,
     )
 
-    cache_path = preview_cache_path(plot_id, cache_key)
+    cache_path = preview_cache_path(plot_id, cache_key, variant="survey")
     served_path = map_path
     served_background = background_tasks
     try:
@@ -1120,8 +1135,31 @@ def orthophoto_preview(plot_id: int, db: Session = Depends(get_db), background_t
     coordinate_system: str = Body("wgs84"),
     paper_size: str = Body("A4"),
     use_topo_map: bool = Body(False),
+    topo_source: str = Body("opentopomap"),
     north_arrow_style: str = Body("classic"),
     north_arrow_color: str = Body("black")):
+
+    payload_for_cache = {
+        "scale_text": scale_text,
+        "station_names": station_names or [],
+        "coordinate_system": coordinate_system,
+        "paper_size": paper_size,
+        "use_topo_map": bool(use_topo_map),
+        "topo_source": topo_source or "opentopomap",
+        "north_arrow_style": north_arrow_style,
+        "north_arrow_color": north_arrow_color,
+    }
+    revision_token = build_plot_geom_revision_token(db, plot_id)
+    cache_key = build_preview_cache_key(plot_id, payload_for_cache, revision_token)
+    cache_variant = "topomap" if use_topo_map else "orthophoto"
+    prune_preview_cache(plot_id, variant=cache_variant)
+    cached_path = get_cached_preview_path(plot_id, cache_key, variant=cache_variant)
+    if cached_path:
+        return FileResponse(
+            cached_path,
+            media_type="image/png",
+            headers={"Cache-Control": "no-store"},
+        )
 
     cleanup_preview_files(plot_id)
     tmp_png = tempfile.NamedTemporaryFile(suffix="_orthophoto_preview.png", delete=False)
@@ -1156,16 +1194,30 @@ def orthophoto_preview(plot_id: int, db: Session = Depends(get_db), background_t
         paper_size=paper_size,
         north_arrow_style=north_arrow_style,
         north_arrow_color=north_arrow_color,
+        preview_mode=True,
     )
 
-    if background_tasks:
-        background_tasks.add_task(safe_remove, png_path)
+    cache_path = preview_cache_path(plot_id, cache_key, variant=cache_variant)
+    served_path = png_path
+    served_background = background_tasks
+    try:
+        shutil.copyfile(png_path, cache_path)
+        safe_remove(png_path)
+        served_path = cache_path
+        served_background = None
+    except Exception:
+        pass
+
+    if served_path == png_path:
+        if served_background is None:
+            served_background = BackgroundTasks()
+        served_background.add_task(safe_remove, png_path)
 
     return FileResponse(
-        png_path,
+        served_path,
         media_type="image/png",
         headers={"Cache-Control": "no-store"},
-        background=background_tasks,
+        background=served_background,
     )
 
 
