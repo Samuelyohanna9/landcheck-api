@@ -44,7 +44,7 @@ REPORTS_DIR = os.path.join(BASE_DIR, "reports")
 PREVIEW_CACHE_DIR = os.path.join(REPORTS_DIR, "previews_cache")
 PREVIEW_CACHE_TTL_SECONDS = max(30, int(os.getenv("PLOT_PREVIEW_CACHE_TTL_SECONDS", "180")))
 PREVIEW_CACHE_MAX_FILES_PER_PLOT = max(5, int(os.getenv("PLOT_PREVIEW_CACHE_MAX_FILES_PER_PLOT", "24")))
-PREVIEW_LAYOUT_VERSION = "survey_layout_2026_03_10_adamawa_v56"
+PREVIEW_LAYOUT_VERSION = "survey_layout_2026_03_10_adamawa_v57"
 
 # Coordinate system EPSG codes mapping
 COORDINATE_SYSTEMS = {
@@ -976,7 +976,7 @@ def download_plot_report_pdf(plot_id: int, db: Session = Depends(get_db), backgr
     coordinate_system: str = Body("wgs84"),
     paper_size: str = Body("A4"),
     north_arrow_style: str = Body("stacked_4n"),
-    north_arrow_color: str = Body("black"),
+    north_arrow_color: str = Body("blue"),
     beacon_style: str = Body("cross"),
     road_width_m: float | None = Body(None),
     road_width_override_m: float | None = Body(None),
@@ -1150,7 +1150,7 @@ def preview_plot_map(plot_id: int, db: Session = Depends(get_db), background_tas
     coordinate_system: str = Body("wgs84"),
     paper_size: str = Body("A4"),
     north_arrow_style: str = Body("stacked_4n"),
-    north_arrow_color: str = Body("black"),
+    north_arrow_color: str = Body("blue"),
     beacon_style: str = Body("cross"),
     road_width_m: float | None = Body(None),
     road_width_override_m: float | None = Body(None),
@@ -1384,7 +1384,7 @@ def orthophoto_preview(plot_id: int, db: Session = Depends(get_db), background_t
     use_topo_map: bool = Body(False),
     topo_source: str = Body("opentopomap"),
     north_arrow_style: str = Body("stacked_4n"),
-    north_arrow_color: str = Body("black")):
+    north_arrow_color: str = Body("blue")):
 
     payload_for_cache = {
         "scale_text": scale_text,
@@ -1482,7 +1482,7 @@ def orthophoto_pdf(plot_id: int, db: Session = Depends(get_db), background_tasks
     paper_size: str = Body("A4"),
     use_topo_map: bool = Body(False),
     north_arrow_style: str = Body("stacked_4n"),
-    north_arrow_color: str = Body("black")):
+    north_arrow_color: str = Body("blue")):
 
     out_dir = os.path.join(REPORTS_DIR, "orthophoto")
     os.makedirs(out_dir, exist_ok=True)
@@ -1713,7 +1713,7 @@ def get_saved_survey_plan_pdf(plot_id: int, refresh: bool = False, db: Session =
             crs_footer_text=f"COORDINATE SYSTEM: {crs_name}",
             paper_size=meta["paper_size"],
             north_arrow_style="stacked_4n",
-            north_arrow_color="black",
+            north_arrow_color="blue",
             beacon_style="cross",
             road_width_m=None,
             road_width_override_m=None,
@@ -1778,7 +1778,7 @@ def get_saved_orthophoto_pdf(plot_id: int, map_type: str = "satellite", refresh:
             use_topo_map=(safe_type == "topo"),
             paper_size=meta["paper_size"],
             north_arrow_style="stacked_4n",
-            north_arrow_color="black",
+            north_arrow_color="blue",
         )
         render_orthophoto_pdf_from_png(png_path, pdf_path, paper_size=meta["paper_size"])
         safe_remove(png_path)
