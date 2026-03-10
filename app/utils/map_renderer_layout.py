@@ -1536,6 +1536,31 @@ def _draw_adamawa_map_frame(ax, font_scale=1.0):
     ax.add_line(mlines.Line2D([0, 1], [0, 0], transform=ax.transAxes, color=frame_color, lw=frame_lw, zorder=29, clip_on=False))
     ax.add_line(mlines.Line2D([0, 0], [0, 1], transform=ax.transAxes, color=frame_color, lw=frame_lw, zorder=29, clip_on=False))
     ax.add_line(mlines.Line2D([1, 1], [0, 1], transform=ax.transAxes, color=frame_color, lw=frame_lw, zorder=29, clip_on=False))
+    # Adamawa corner cross markers (same style seen in the reference template).
+    corner_tick = 0.018
+    for cx, cy in ((0, 0), (1, 0), (0, 1), (1, 1)):
+        ax.add_line(
+            mlines.Line2D(
+                [cx - corner_tick, cx + corner_tick],
+                [cy, cy],
+                transform=ax.transAxes,
+                color=frame_color,
+                lw=frame_lw,
+                zorder=30,
+                clip_on=False,
+            )
+        )
+        ax.add_line(
+            mlines.Line2D(
+                [cx, cx],
+                [cy - corner_tick, cy + corner_tick],
+                transform=ax.transAxes,
+                color=frame_color,
+                lw=frame_lw,
+                zorder=30,
+                clip_on=False,
+            )
+        )
 
 
 def _draw_adamawa_north_arrow(
