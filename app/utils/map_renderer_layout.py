@@ -664,9 +664,52 @@ def add_scalebar(ax, length_m: float, segments: int = 4, font_scale=1.0):
 # Grid & Annotations
 # ======================
 
-def draw_grid(ax, plot_poly, minor: float, major: float, font_scale=1.0):
+def draw_grid(
+    ax,
+    plot_poly,
+    minor: float,
+    major: float,
+    font_scale=1.0,
+    full_grid: bool = False,
+):
     xmin, xmax = ax.get_xlim()
     ymin, ymax = ax.get_ylim()
+
+    # Optional interior grid lines (used by Adamawa template).
+    if full_grid:
+        minor_step = max(float(minor or 0), 0.000001)
+        major_step = max(float(major or 0), minor_step)
+
+        x_minor_vals = np.arange(math.floor(xmin / minor_step) * minor_step, xmax + minor_step, minor_step)
+        y_minor_vals = np.arange(math.floor(ymin / minor_step) * minor_step, ymax + minor_step, minor_step)
+        x_major_vals = np.arange(math.floor(xmin / major_step) * major_step, xmax + major_step, major_step)
+        y_major_vals = np.arange(math.floor(ymin / major_step) * major_step, ymax + major_step, major_step)
+
+        major_tol = max(major_step * 0.02, 0.000001)
+
+        for x in x_minor_vals:
+            if x <= xmin or x >= xmax:
+                continue
+            if any(abs(x - xm) <= major_tol for xm in x_major_vals):
+                continue
+            ax.plot([x, x], [ymin, ymax], color="blue", lw=0.25 * font_scale, alpha=0.14, zorder=1)
+
+        for y in y_minor_vals:
+            if y <= ymin or y >= ymax:
+                continue
+            if any(abs(y - ym) <= major_tol for ym in y_major_vals):
+                continue
+            ax.plot([xmin, xmax], [y, y], color="blue", lw=0.25 * font_scale, alpha=0.14, zorder=1)
+
+        for x in x_major_vals:
+            if x <= xmin or x >= xmax:
+                continue
+            ax.plot([x, x], [ymin, ymax], color="blue", lw=0.45 * font_scale, alpha=0.26, zorder=2)
+
+        for y in y_major_vals:
+            if y <= ymin or y >= ymax:
+                continue
+            ax.plot([xmin, xmax], [y, y], color="blue", lw=0.45 * font_scale, alpha=0.26, zorder=2)
 
     # Tick-only grid to keep plot area clean
     tick_len = (xmax - xmin) * 0.01
@@ -1642,7 +1685,7 @@ def _render_plot_map_layout_adamawa(
     ax.set_ylim(target_ylim)
 
     major = nice_grid_step(max(ax.get_xlim()[1] - ax.get_xlim()[0], ax.get_ylim()[1] - ax.get_ylim()[0]))
-    draw_grid(ax, poly, major / 5.0, major, font_scale)
+    draw_grid(ax, poly, major / 5.0, major, font_scale, full_grid=True)
 
     annotate_vertices(
         ax,
