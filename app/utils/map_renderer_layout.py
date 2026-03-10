@@ -1616,8 +1616,7 @@ def _draw_adamawa_bottom_blocks(
     comp_mid_y = (top_y + bottom_y) / 2.0
     fig.text(0.292, comp_mid_y, comp_display, fontsize=footer_font, fontfamily=ADAMAWA_FONT_FAMILY, va="center")
     fig.text(0.40, comp_mid_y, f"CADASTRAL SHEET NO. {_safe_text(cadastral_sheet_no, '-')}", fontsize=footer_font, fontfamily=ADAMAWA_FONT_FAMILY, va="center")
-    fig.text(0.455, 0.049, f"SCALE {_normalize_scale_label_adamawa(scale_text)}", fontsize=footer_font, fontfamily=ADAMAWA_FONT_FAMILY, ha="center", va="center")
-    fig.text(0.50, 0.038, DEFAULT_ADAMAWA_PREPARED_BY_TEXT, fontsize=footer_font, fontfamily=ADAMAWA_FONT_FAMILY, ha="center", va="center")
+    fig.text(0.50, 0.043, DEFAULT_ADAMAWA_PREPARED_BY_TEXT, fontsize=footer_font, fontfamily=ADAMAWA_FONT_FAMILY, ha="center", va="center")
 
     table_ax = fig.add_axes([0.58, 0.088, 0.36, 0.112])
     table_ax.axis("off")
@@ -1659,36 +1658,27 @@ def _draw_adamawa_bottom_blocks(
                 cell.set_height(row_height)
 
     # Draw right-note text inside a clipped mini-axes so it never overlaps center/footer lines.
-    right_note_ax = fig.add_axes([0.58, 0.045, 0.36, 0.030])
+    right_note_ax = fig.add_axes([0.58, 0.044, 0.36, 0.038])
     right_note_ax.axis("off")
-    note_font = footer_font
+    note_font = min(7, max(5, footer_font + 1))
     disclaimer_line = _safe_text(disclaimer_text, DEFAULT_ADAMAWA_DISCLAIMER_TEXT).strip()
-    if len(disclaimer_line) > 86:
-        disclaimer_line = f"{disclaimer_line[:83].rstrip()}..."
+    if len(disclaimer_line) > 78:
+        disclaimer_line = f"{disclaimer_line[:75].rstrip()}..."
     surveyed_line = _safe_text(surveyed_by_text, "").strip()
-    if len(surveyed_line) > 70:
-        surveyed_line = f"{surveyed_line[:67].rstrip()}..."
+    if len(surveyed_line) > 62:
+        surveyed_line = f"{surveyed_line[:59].rstrip()}..."
+    note_text = disclaimer_line if not surveyed_line else f"{disclaimer_line}\n{surveyed_line}"
     right_note_ax.text(
         0.0,
-        0.82,
-        disclaimer_line,
+        1.0,
+        note_text,
         fontsize=note_font,
         fontfamily=ADAMAWA_FONT_FAMILY,
         ha="left",
         va="top",
+        linespacing=0.9,
         clip_on=True,
     )
-    if surveyed_line:
-        right_note_ax.text(
-            0.0,
-            0.12,
-            surveyed_line,
-            fontsize=note_font,
-            fontfamily=ADAMAWA_FONT_FAMILY,
-            ha="left",
-            va="bottom",
-            clip_on=True,
-        )
 
 
 def _render_plot_map_layout_adamawa(
