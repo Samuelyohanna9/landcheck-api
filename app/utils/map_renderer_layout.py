@@ -1698,7 +1698,7 @@ def _render_plot_map_layout_adamawa(
     ax.set_ylim(target_ylim)
 
     major = nice_grid_step(max(ax.get_xlim()[1] - ax.get_xlim()[0], ax.get_ylim()[1] - ax.get_ylim()[0]))
-    draw_grid(ax, poly, major / 5.0, major, font_scale, full_grid=True)
+    draw_grid(ax, poly, major / 5.0, major, font_scale, full_grid=False)
 
     annotate_vertices(
         ax,
