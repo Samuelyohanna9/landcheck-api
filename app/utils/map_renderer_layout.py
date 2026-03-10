@@ -2383,10 +2383,23 @@ def _render_plot_map_layout_adamawa(
         boundary_poly=poly,
         beacon_style=beacon_style,
     )
-    rp = poly.representative_point()
+    area_label_point = None
+    try:
+        # Prefer an interior visual center for label placement.
+        from shapely.ops import polylabel as _polylabel
+        area_label_point = _polylabel(poly, tolerance=1.0)
+    except Exception:
+        area_label_point = None
+    if area_label_point is None or area_label_point.is_empty:
+        try:
+            area_label_point = poly.centroid
+        except Exception:
+            area_label_point = None
+    if area_label_point is None or area_label_point.is_empty:
+        area_label_point = poly.representative_point()
     ax.text(
-        rp.x,
-        rp.y,
+        area_label_point.x,
+        area_label_point.y,
         f"{area_m2 / 10000:.2f}Hectares",
         color="red",
         fontsize=max(7, int(7 * font_scale)),
