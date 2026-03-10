@@ -1594,8 +1594,8 @@ def _draw_adamawa_bottom_blocks(
     fig.text(left_x, y, DEFAULT_ADAMAWA_COPYRIGHT_TEXT, fontsize=footer_font, fontfamily=ADAMAWA_FONT_FAMILY)
 
     # Computation/plan block with the Adamawa brace and identifiers.
-    comp_label_y = 0.047
-    plan_label_y = 0.036
+    comp_label_y = 0.055
+    plan_label_y = 0.044
     fig.text(0.06, comp_label_y, "COMPUTATION", fontsize=footer_font, fontfamily=ADAMAWA_FONT_FAMILY)
     fig.text(0.195, comp_label_y, "NO", fontsize=footer_font, fontfamily=ADAMAWA_FONT_FAMILY)
     fig.text(0.06, plan_label_y, "PLAN", fontsize=footer_font, fontfamily=ADAMAWA_FONT_FAMILY)
@@ -1618,7 +1618,7 @@ def _draw_adamawa_bottom_blocks(
     comp_display = _safe_text(computation_no, _safe_text(plan_no, "-"))
     comp_mid_y = (top_y + bottom_y) / 2.0
     fig.text(0.305, comp_mid_y, comp_display, fontsize=footer_font, fontfamily=ADAMAWA_FONT_FAMILY, va="center")
-    fig.text(0.36, 0.048, f"CADASTRAL NO. {_safe_text(cadastral_sheet_no, '-')}", fontsize=footer_font, fontfamily=ADAMAWA_FONT_FAMILY, va="center")
+    fig.text(0.36, comp_mid_y, f"CADASTRAL NO. {_safe_text(cadastral_sheet_no, '-')}", fontsize=footer_font, fontfamily=ADAMAWA_FONT_FAMILY, va="center")
     fig.text(0.455, 0.038, f"SCALE {_normalize_scale_label_adamawa(scale_text)}", fontsize=footer_font, fontfamily=ADAMAWA_FONT_FAMILY, ha="center", va="center")
     fig.text(0.50, 0.032, DEFAULT_ADAMAWA_PREPARED_BY_TEXT, fontsize=footer_tiny_font, fontfamily=ADAMAWA_FONT_FAMILY, ha="center", va="center")
 
