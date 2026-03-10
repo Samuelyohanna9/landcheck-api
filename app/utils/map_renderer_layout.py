@@ -1303,6 +1303,31 @@ def _normalize_scale_label_adamawa(scale_text: str) -> str:
     return f"1: {int(ratio)}"
 
 
+def _resolve_adamawa_origin_text(coordinate_system: str, display_epsg: int) -> str:
+    cs = str(coordinate_system or "").strip().lower()
+    if cs.startswith("utm_"):
+        try:
+            zone = int(cs.split("_")[1][0:2] if len(cs.split("_")) > 1 else cs.replace("utm_", ""))
+        except Exception:
+            zone = None
+        if zone:
+            return f"ORIGIN:- WGS 84 UTM ZONE {zone}N"
+    if cs.startswith("minna_"):
+        try:
+            zone = int(cs.split("_")[1])
+        except Exception:
+            zone = None
+        if zone:
+            return f"ORIGIN:- MINNA DATUM UTM ZONE {zone}N"
+    if cs == "wgs84":
+        if 32600 < int(display_epsg or 0) < 32700:
+            return f"ORIGIN:- WGS 84 UTM ZONE {int(display_epsg) - 32600}N"
+        if 32700 < int(display_epsg or 0) < 32800:
+            return f"ORIGIN:- WGS 84 UTM ZONE {int(display_epsg) - 32700}S"
+        return "ORIGIN:- WGS84 (Lat/Lon)"
+    return DEFAULT_ADAMAWA_ORIGIN_TEXT
+
+
 def _draw_center_text_with_bold_suffix(
     fig,
     y: float,
@@ -1913,6 +1938,8 @@ def _render_plot_map_layout_adamawa(
             elevation_value = "-"
     else:
         elevation_value = "-"
+    origin_line = _resolve_adamawa_origin_text(coordinate_system, display_epsg)
+    surveyed_line = f"Surveyed by {_safe_text(surveyor_name, '-')}"
     _draw_adamawa_bottom_blocks(
         fig,
         segment_rows=segment_rows,
@@ -1920,12 +1947,12 @@ def _render_plot_map_layout_adamawa(
         northing_text=northing_value,
         easting_text=easting_value,
         elevation_text=elevation_value,
-        origin_text=_safe_text(adamawa_origin_text, DEFAULT_ADAMAWA_ORIGIN_TEXT),
+        origin_text=origin_line,
         topo_sheet_text=_safe_text(adamawa_topo_sheet_text, DEFAULT_ADAMAWA_TOPO_SHEET_TEXT),
         computation_no=rof_no,
         cadastral_sheet_no=_safe_text(adamawa_cadastral_sheet_no, "-"),
-        plan_no=_safe_text(adamawa_plan_no, ""),
-        surveyed_by_text=_safe_text(adamawa_surveyed_by_text, f"Surveyed by {surveyor_rank} {surveyor_name}".strip()),
+        plan_no=rof_no,
+        surveyed_by_text=surveyed_line,
         disclaimer_text=_safe_text(adamawa_disclaimer_text, DEFAULT_ADAMAWA_DISCLAIMER_TEXT),
         font_scale=font_scale,
     )
