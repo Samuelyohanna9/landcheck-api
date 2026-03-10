@@ -54,6 +54,10 @@ DEFAULT_ADAMAWA_DISCLAIMER_TEXT = (
     "Detail shewn not the result of accurate survey. All bearing and distances shewn on this plan "
     "have been computed from registered Co-ordinates."
 )
+DEFAULT_ADAMAWA_CHECKED_BY_TEXT = "Checked by OCX................"
+DEFAULT_ADAMAWA_PASSED_BY_TEXT = "Passed by Carto..............."
+DEFAULT_ADAMAWA_COPYRIGHT_TEXT = "Copy Right Reserved"
+DEFAULT_ADAMAWA_PREPARED_BY_TEXT = "Plan Prepared by Office of the Surveyor General Adamawa State"
 ADAMAWA_FONT_FAMILY = "DejaVu Serif"
 
 
@@ -1556,6 +1560,7 @@ def _draw_adamawa_bottom_blocks(
     computation_no: str,
     cadastral_sheet_no: str,
     plan_no: str,
+    scale_text: str,
     surveyed_by_text: str,
     disclaimer_text: str,
     font_scale=1.0,
@@ -1575,15 +1580,20 @@ def _draw_adamawa_bottom_blocks(
     fig.text(0.06, 0.118, f"Z {_safe_text(elevation_text, '-')}", fontsize=max(6, int(7 * font_scale)), fontfamily=ADAMAWA_FONT_FAMILY)
     fig.text(0.06, 0.103, _safe_text(origin_text, DEFAULT_ADAMAWA_ORIGIN_TEXT), fontsize=max(6, int(7 * font_scale)), color="blue", fontfamily=ADAMAWA_FONT_FAMILY)
     fig.text(0.06, 0.088, _safe_text(topo_sheet_text, DEFAULT_ADAMAWA_TOPO_SHEET_TEXT), fontsize=max(6, int(7 * font_scale)), fontfamily=ADAMAWA_FONT_FAMILY)
+    fig.text(0.06, 0.076, DEFAULT_ADAMAWA_CHECKED_BY_TEXT, fontsize=max(5, int(6.2 * font_scale)), fontfamily=ADAMAWA_FONT_FAMILY)
+    fig.text(0.06, 0.064, DEFAULT_ADAMAWA_PASSED_BY_TEXT, fontsize=max(5, int(6.2 * font_scale)), fontfamily=ADAMAWA_FONT_FAMILY)
+    fig.text(0.06, 0.052, DEFAULT_ADAMAWA_COPYRIGHT_TEXT, fontsize=max(5, int(6.2 * font_scale)), fontfamily=ADAMAWA_FONT_FAMILY)
 
     # Computation/plan block with the distinctive center brace used in the Adamawa template.
-    fig.text(0.06, 0.070, "COMPUTATION", fontsize=max(6, int(6.5 * font_scale)), fontfamily=ADAMAWA_FONT_FAMILY)
-    fig.text(0.195, 0.070, "NO", fontsize=max(6, int(6.5 * font_scale)), fontfamily=ADAMAWA_FONT_FAMILY)
-    fig.text(0.06, 0.053, "PLAN", fontsize=max(6, int(6.5 * font_scale)), fontfamily=ADAMAWA_FONT_FAMILY)
-    fig.text(0.195, 0.053, "NO", fontsize=max(6, int(6.5 * font_scale)), fontfamily=ADAMAWA_FONT_FAMILY)
+    comp_label_y = 0.046
+    plan_label_y = 0.036
+    fig.text(0.06, comp_label_y, "COMPUTATION", fontsize=max(5, int(6.2 * font_scale)), fontfamily=ADAMAWA_FONT_FAMILY)
+    fig.text(0.195, comp_label_y, "NO", fontsize=max(5, int(6.2 * font_scale)), fontfamily=ADAMAWA_FONT_FAMILY)
+    fig.text(0.06, plan_label_y, "PLAN", fontsize=max(5, int(6.2 * font_scale)), fontfamily=ADAMAWA_FONT_FAMILY)
+    fig.text(0.195, plan_label_y, "NO", fontsize=max(5, int(6.2 * font_scale)), fontfamily=ADAMAWA_FONT_FAMILY)
 
-    top_y = 0.072
-    bottom_y = 0.055
+    top_y = comp_label_y + 0.002
+    bottom_y = plan_label_y + 0.002
     brace_left = 0.235
     brace_trunk = 0.285
     brace_tip = 0.300
@@ -1597,8 +1607,11 @@ def _draw_adamawa_bottom_blocks(
     fig.add_artist(mlines.Line2D([brace_trunk, brace_trunk], [mid_y - 0.004, bottom_y], transform=fig.transFigure, color="black", lw=lw))
 
     comp_display = _safe_text(computation_no, _safe_text(plan_no, "-"))
-    fig.text(0.305, 0.064, comp_display, fontsize=max(6, int(7.5 * font_scale)), fontfamily=ADAMAWA_FONT_FAMILY, va="center")
-    fig.text(0.41, 0.064, f"CADASTRAL SHEET NO. {_safe_text(cadastral_sheet_no, '-')}", fontsize=max(6, int(6.8 * font_scale)), fontfamily=ADAMAWA_FONT_FAMILY, va="center")
+    comp_mid_y = (top_y + bottom_y) / 2.0
+    fig.text(0.305, comp_mid_y, comp_display, fontsize=max(6, int(7.0 * font_scale)), fontfamily=ADAMAWA_FONT_FAMILY, va="center")
+    fig.text(0.41, comp_mid_y, f"CADASTRAL SHEET NO. {_safe_text(cadastral_sheet_no, '-')}", fontsize=max(5, int(6.4 * font_scale)), fontfamily=ADAMAWA_FONT_FAMILY, va="center")
+    fig.text(0.50, 0.047, f"SCALE {_normalize_scale_label_adamawa(scale_text)}", fontsize=max(6, int(7 * font_scale)), fontfamily=ADAMAWA_FONT_FAMILY, ha="center")
+    fig.text(0.50, 0.0325, DEFAULT_ADAMAWA_PREPARED_BY_TEXT, fontsize=max(5, int(6.4 * font_scale)), fontfamily=ADAMAWA_FONT_FAMILY, ha="center")
 
     table_ax = fig.add_axes([0.58, 0.072, 0.36, 0.102])
     table_ax.axis("off")
@@ -1952,6 +1965,7 @@ def _render_plot_map_layout_adamawa(
         computation_no=rof_no,
         cadastral_sheet_no=_safe_text(adamawa_cadastral_sheet_no, "-"),
         plan_no=rof_no,
+        scale_text=scale_text,
         surveyed_by_text=surveyed_line,
         disclaimer_text=_safe_text(adamawa_disclaimer_text, DEFAULT_ADAMAWA_DISCLAIMER_TEXT),
         font_scale=font_scale,
