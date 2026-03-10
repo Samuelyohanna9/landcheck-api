@@ -912,8 +912,20 @@ def annotate_vertices(
         h = span_y * scale_h * (1.0 + 0.55 * (line_count - 1))
         return (x - w / 2.0, y - h / 2.0, x + w / 2.0, y + h / 2.0)
 
-    def place_text(x, y, text, font_size, color, rotation=0, weight="bold", scale_w=0.015, scale_h=0.02, normal=None):
-        offset_m = max(2.0, (6.0 / 1000.0) * scale_ratio)
+    def place_text(
+        x,
+        y,
+        text,
+        font_size,
+        color,
+        rotation=0,
+        weight="bold",
+        scale_w=0.015,
+        scale_h=0.02,
+        normal=None,
+        normal_offset_mult: float = 1.0,
+    ):
+        offset_m = max(2.0, (6.0 / 1000.0) * scale_ratio) * max(0.6, normal_offset_mult)
         candidates = [(x, y)]
         if normal is not None:
             nx, ny = normal
@@ -1071,10 +1083,11 @@ def annotate_vertices(
         if ang < -90 or ang > 90:
             ang += 180
 
-        label_offset = max(2.0, (6.0 / 1000.0) * scale_ratio)
         label_nx, label_ny = normal
+        label_offset_mult = 1.0
+        base_offset = max(2.0, (6.0 / 1000.0) * scale_ratio)
         if boundary_poly is not None:
-            test_pt = Point(mx + label_nx * label_offset, my + label_ny * label_offset)
+            test_pt = Point(mx + label_nx * base_offset, my + label_ny * base_offset)
             if boundary_poly.contains(test_pt):
                 label_nx, label_ny = -label_nx, -label_ny
         # If this edge is fenced, push the bearing/distance text farther away
@@ -1084,13 +1097,14 @@ def annotate_vertices(
                 seg = LineString([(p1.x, p1.y), (p2.x, p2.y)])
                 fence_touch_tol = max(0.5, (2.5 / 1000.0) * scale_ratio)
                 if seg.buffer(fence_touch_tol).intersects(avoid_geom):
-                    label_offset = max(label_offset, (10.0 / 1000.0) * scale_ratio)
+                    # Keep a subtle extra separation only on fenced edges.
+                    label_offset_mult = 1.35
             except Exception:
                 pass
 
         place_text(
-            mx + label_nx * label_offset,
-            my + label_ny * label_offset,
+            mx,
+            my,
             f"{format_bearing_dms(bearing)}\n{dist:.2f}m",
             font_size=int(6.5 * font_scale),
             color="red",
@@ -1098,7 +1112,8 @@ def annotate_vertices(
             weight="normal",
             scale_w=0.02,
             scale_h=0.025,
-            normal=None,
+            normal=(label_nx, label_ny),
+            normal_offset_mult=label_offset_mult,
         )
 
     return skipped, placed_boxes
