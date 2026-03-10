@@ -503,7 +503,11 @@ def add_north_arrow(ax, font_scale=1.0, style: str = "classic", color: str = "bl
     fig = ax.figure
     col = "blue" if str(color).lower() == "blue" else "black"
     style = (style or "classic").lower()
-    x, y = 0.85, 0.86
+    # Keep north arrows vertically aligned to the right edge of the map frame
+    # in both general and Adamawa templates.
+    box = ax.get_position()
+    x = float(box.x1)
+    y = min(0.93, float(box.y1) + 0.060)
     size = 0.030 * max(0.8, font_scale)
 
     if style == "triangle":
@@ -633,8 +637,8 @@ def add_north_arrow(ax, font_scale=1.0, style: str = "classic", color: str = "bl
     # default: classic arrow
     ax.annotate(
         "N",
-        xy=(0.85, 0.90),
-        xytext=(0.85, 0.83),
+        xy=(x, y + size * 0.95),
+        xytext=(x, y - size * 0.75),
         xycoords="figure fraction",
         arrowprops=dict(facecolor=col, edgecolor=col, width=2*font_scale, headwidth=8*font_scale),
         ha="center",
