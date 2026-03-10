@@ -1368,6 +1368,16 @@ def _draw_adamawa_coordinate_labels(ax, font_scale=1.0):
     ax.text(1.018, 0.0, bottom_n, color="blue", fontsize=fs, ha="left", va="bottom", rotation=90, transform=ax.transAxes, fontfamily=ADAMAWA_FONT_FAMILY)
 
 
+def _draw_adamawa_map_frame(ax, font_scale=1.0):
+    frame_color = "blue"
+    frame_lw = max(0.9, 1.0 * font_scale)
+    # Explicit frame lines (not spines) so they still render when axis is off.
+    ax.add_line(mlines.Line2D([0, 1], [1, 1], transform=ax.transAxes, color=frame_color, lw=frame_lw, zorder=29, clip_on=False))
+    ax.add_line(mlines.Line2D([0, 1], [0, 0], transform=ax.transAxes, color=frame_color, lw=frame_lw, zorder=29, clip_on=False))
+    ax.add_line(mlines.Line2D([0, 0], [0, 1], transform=ax.transAxes, color=frame_color, lw=frame_lw, zorder=29, clip_on=False))
+    ax.add_line(mlines.Line2D([1, 1], [0, 1], transform=ax.transAxes, color=frame_color, lw=frame_lw, zorder=29, clip_on=False))
+
+
 def _draw_adamawa_north_arrow(ax, font_scale=1.0):
     arrow_color = "blue"
     ax.annotate(
@@ -1725,6 +1735,7 @@ def _render_plot_map_layout_adamawa(
         zorder=26,
     )
 
+    _draw_adamawa_map_frame(ax, font_scale=font_scale)
     _draw_adamawa_coordinate_labels(ax, font_scale=font_scale)
     _draw_adamawa_north_arrow(ax, font_scale=font_scale)
 
@@ -1750,9 +1761,6 @@ def _render_plot_map_layout_adamawa(
         font_scale=font_scale,
     )
 
-    for spine in ax.spines.values():
-        spine.set_edgecolor("blue")
-        spine.set_linewidth(0.9)
     ax.set_aspect("equal")
     ax.axis("off")
     fig.canvas.draw()
