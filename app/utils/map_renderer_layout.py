@@ -1565,9 +1565,8 @@ def _draw_adamawa_bottom_blocks(
     disclaimer_text: str,
     font_scale=1.0,
 ):
-    # Match Adamawa sample: compact footer with near-uniform text size and tight vertical spacing.
+    # Match Adamawa sample: compact footer with uniform text size.
     footer_font = min(6, max(4, int(5.0 * font_scale)))
-    footer_tiny_font = max(4, int(4.4 * font_scale))
     line_gap = 0.0095
     left_x = 0.06
     y = 0.182
@@ -1593,7 +1592,7 @@ def _draw_adamawa_bottom_blocks(
     y -= line_gap
     fig.text(left_x, y, DEFAULT_ADAMAWA_COPYRIGHT_TEXT, fontsize=footer_font, fontfamily=ADAMAWA_FONT_FAMILY)
 
-    # Computation/plan block with the Adamawa brace and identifiers.
+    # Computation/plan block with the Adamawa bracket and identifiers.
     comp_label_y = 0.061
     plan_label_y = 0.047
     fig.text(0.06, comp_label_y, "COMPUTATION", fontsize=footer_font, fontfamily=ADAMAWA_FONT_FAMILY)
@@ -1604,23 +1603,21 @@ def _draw_adamawa_bottom_blocks(
     top_y = comp_label_y + 0.002
     bottom_y = plan_label_y + 0.002
     brace_left = 0.235
-    brace_trunk = 0.285
-    brace_tip = 0.300
+    brace_trunk = 0.270
+    brace_tip = 0.286
     mid_y = (top_y + bottom_y) / 2.0
     lw = 1.2
     fig.add_artist(mlines.Line2D([brace_left, brace_trunk], [top_y, top_y], transform=fig.transFigure, color="black", lw=lw))
     fig.add_artist(mlines.Line2D([brace_left, brace_trunk], [bottom_y, bottom_y], transform=fig.transFigure, color="black", lw=lw))
-    fig.add_artist(mlines.Line2D([brace_trunk, brace_trunk], [top_y, mid_y + 0.004], transform=fig.transFigure, color="black", lw=lw))
-    fig.add_artist(mlines.Line2D([brace_trunk, brace_tip], [mid_y + 0.004, mid_y], transform=fig.transFigure, color="black", lw=lw))
-    fig.add_artist(mlines.Line2D([brace_tip, brace_trunk], [mid_y, mid_y - 0.004], transform=fig.transFigure, color="black", lw=lw))
-    fig.add_artist(mlines.Line2D([brace_trunk, brace_trunk], [mid_y - 0.004, bottom_y], transform=fig.transFigure, color="black", lw=lw))
+    fig.add_artist(mlines.Line2D([brace_trunk, brace_trunk], [bottom_y, top_y], transform=fig.transFigure, color="black", lw=lw))
+    fig.add_artist(mlines.Line2D([brace_trunk, brace_tip], [mid_y, mid_y], transform=fig.transFigure, color="black", lw=lw))
 
     comp_display = _safe_text(computation_no, _safe_text(plan_no, "-"))
     comp_mid_y = (top_y + bottom_y) / 2.0
-    fig.text(0.305, comp_mid_y, comp_display, fontsize=footer_font, fontfamily=ADAMAWA_FONT_FAMILY, va="center")
-    fig.text(0.36, comp_mid_y, f"CADASTRAL NO. {_safe_text(cadastral_sheet_no, '-')}", fontsize=footer_font, fontfamily=ADAMAWA_FONT_FAMILY, va="center")
+    fig.text(0.292, comp_mid_y, comp_display, fontsize=footer_font, fontfamily=ADAMAWA_FONT_FAMILY, va="center")
+    fig.text(0.40, comp_mid_y, f"CADASTRAL SHEET NO. {_safe_text(cadastral_sheet_no, '-')}", fontsize=footer_font, fontfamily=ADAMAWA_FONT_FAMILY, va="center")
     fig.text(0.455, 0.049, f"SCALE {_normalize_scale_label_adamawa(scale_text)}", fontsize=footer_font, fontfamily=ADAMAWA_FONT_FAMILY, ha="center", va="center")
-    fig.text(0.50, 0.038, DEFAULT_ADAMAWA_PREPARED_BY_TEXT, fontsize=footer_tiny_font, fontfamily=ADAMAWA_FONT_FAMILY, ha="center", va="center")
+    fig.text(0.50, 0.038, DEFAULT_ADAMAWA_PREPARED_BY_TEXT, fontsize=footer_font, fontfamily=ADAMAWA_FONT_FAMILY, ha="center", va="center")
 
     table_ax = fig.add_axes([0.58, 0.088, 0.36, 0.112])
     table_ax.axis("off")
@@ -1644,7 +1641,7 @@ def _draw_adamawa_bottom_blocks(
         bbox=[0, 0, 1, 1],
     )
     table.auto_set_font_size(False)
-    table_font = min(6, max(4, int(5.0 * font_scale)))
+    table_font = footer_font
     table.set_fontsize(table_font)
     for (row_idx, col_idx), cell in table.get_celld().items():
         cell.set_linewidth(0.8 if row_idx == 0 else 0.5)
@@ -1664,7 +1661,7 @@ def _draw_adamawa_bottom_blocks(
     # Draw right-note text inside a clipped mini-axes so it never overlaps center/footer lines.
     right_note_ax = fig.add_axes([0.58, 0.045, 0.36, 0.030])
     right_note_ax.axis("off")
-    note_font = min(6, max(4, int(5.0 * font_scale)))
+    note_font = footer_font
     disclaimer_line = _safe_text(disclaimer_text, DEFAULT_ADAMAWA_DISCLAIMER_TEXT).strip()
     if len(disclaimer_line) > 86:
         disclaimer_line = f"{disclaimer_line[:83].rstrip()}..."
