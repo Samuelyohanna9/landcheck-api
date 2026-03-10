@@ -224,6 +224,59 @@ def _draw_figure_text_justified(fig, x, y, text, width_fig, fontsize, fontweight
             cursor_x += gap_px / fig_w_px
 
 
+def _wrap_figure_text(fig, text: str, width_fig: float, fontsize: float, fontweight: str = "normal", fontfamily: str | None = None):
+    raw = str(text or "").strip()
+    if not raw:
+        return []
+
+    words = raw.split()
+    if not words:
+        return []
+
+    try:
+        renderer = fig.canvas.get_renderer()
+    except Exception:
+        fig.canvas.draw()
+        renderer = fig.canvas.get_renderer()
+
+    if fontfamily:
+        fp = FontProperties(size=fontsize, weight=fontweight, family=fontfamily)
+    else:
+        fp = FontProperties(size=fontsize, weight=fontweight)
+
+    def px_width(s: str) -> float:
+        try:
+            w, _, _ = renderer.get_text_width_height_descent(s, fp, ismath=False)
+            return float(w)
+        except Exception:
+            return float(len(s) * fontsize * 0.6)
+
+    fig_w_px = max(float(fig.bbox.width), 1.0)
+    max_px = max(width_fig * fig_w_px, 1.0)
+    space_px = px_width(" ")
+
+    lines = []
+    current = []
+    current_px = 0.0
+    for word in words:
+        w_px = px_width(word)
+        needed = w_px if not current else (space_px + w_px)
+        if current and (current_px + needed) > max_px:
+            lines.append(" ".join(current))
+            current = [word]
+            current_px = w_px
+        else:
+            if current:
+                current_px += needed
+            else:
+                current_px = w_px
+            current.append(word)
+    if current:
+        lines.append(" ".join(current))
+
+    return lines
+
+
 def draw_certification_box(fig, certification_statement: str, surveyor_name: str, key_bounds=None, font_scale=1.0):
     """
     Draw certification text block beside the key (no surrounding box).
@@ -1465,14 +1518,51 @@ def _draw_adamawa_bottom_blocks(
         else:
             cell.set_text_props(fontfamily=ADAMAWA_FONT_FAMILY)
 
-    fig.text(
-        0.58,
-        0.060,
+    text_x = 0.58
+    text_width = 0.37
+    text_font = max(5, int(5.6 * font_scale))
+    line_step = max(0.009, 0.011 * font_scale)
+    y_cursor = 0.060
+
+    disclaimer_lines = _wrap_figure_text(
+        fig,
         _safe_text(disclaimer_text, DEFAULT_ADAMAWA_DISCLAIMER_TEXT),
-        fontsize=max(5, int(5.6 * font_scale)),
+        width_fig=text_width,
+        fontsize=text_font,
         fontfamily=ADAMAWA_FONT_FAMILY,
     )
-    fig.text(0.58, 0.047, _safe_text(surveyed_by_text, ""), fontsize=max(5, int(5.6 * font_scale)), fontfamily=ADAMAWA_FONT_FAMILY)
+    for line in disclaimer_lines[:3]:
+        fig.text(
+            text_x,
+            y_cursor,
+            line,
+            fontsize=text_font,
+            fontfamily=ADAMAWA_FONT_FAMILY,
+            va="top",
+            ha="left",
+        )
+        y_cursor -= line_step
+
+    surveyed_lines = _wrap_figure_text(
+        fig,
+        _safe_text(surveyed_by_text, ""),
+        width_fig=text_width,
+        fontsize=text_font,
+        fontfamily=ADAMAWA_FONT_FAMILY,
+    )
+    for line in surveyed_lines[:2]:
+        if y_cursor < 0.033:
+            break
+        fig.text(
+            text_x,
+            y_cursor,
+            line,
+            fontsize=text_font,
+            fontfamily=ADAMAWA_FONT_FAMILY,
+            va="top",
+            ha="left",
+        )
+        y_cursor -= line_step
 
 
 def _render_plot_map_layout_adamawa(
