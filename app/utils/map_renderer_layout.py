@@ -1481,11 +1481,11 @@ def _collect_road_edge_lines(centerline_geom, half_width_m: float):
 
 def _collect_connected_road_edge_lines(road_geoms_with_width, snap_tol_m: float = 1.0):
     """
-    Build connected OPEN road-edge lines.
-    - Keeps disconnected road ends open (no closed polygon end-caps)
-    - Snaps/merges centerlines first so overlaps/intersections connect cleanly
+    Build connected road-edge lines where only non-overlap (dangling) ends are open:
+    - overlapping/intersection zones stay connected
+    - only true dangling ends are opened by trimming cap segments
     """
-    grouped_centerlines = {}
+    line_parts = []
     for item in road_geoms_with_width or []:
         if not item or len(item) < 2:
             continue
@@ -1493,65 +1493,106 @@ def _collect_connected_road_edge_lines(road_geoms_with_width, snap_tol_m: float 
         if geom is None or getattr(geom, "is_empty", True):
             continue
         try:
-            hw = round(max(0.5, float(half_width or 1.0)), 3)
+            hw = max(0.5, float(half_width or 1.0))
         except Exception:
             hw = 1.0
-        grouped_centerlines.setdefault(hw, [])
         for seg in _iter_line_geometries(geom):
             if seg is None or getattr(seg, "is_empty", True):
                 continue
             if getattr(seg, "length", 0.0) <= 0:
                 continue
-            grouped_centerlines[hw].append(seg)
+            line_parts.append((seg, hw))
 
-    if not grouped_centerlines:
+    if not line_parts:
         return []
 
     edge_lines = []
-    for hw, centerlines in grouped_centerlines.items():
-        if not centerlines:
+    try:
+        center_network = unary_union([seg for seg, _ in line_parts])
+    except Exception:
+        center_network = None
+
+    snapped_parts = []
+    for seg, hw in line_parts:
+        try:
+            snapped = snap(seg, center_network, snap_tol_m) if center_network is not None else seg
+        except Exception:
+            snapped = seg
+        snapped_parts.append((snapped, hw))
+
+    # Build merged road surface with flat caps; this keeps overlap joins connected.
+    road_polys = []
+    for seg, hw in snapped_parts:
+        try:
+            poly = seg.buffer(hw, cap_style=2, join_style=1)
+            if poly is not None and not poly.is_empty:
+                road_polys.append(poly)
+        except Exception:
             continue
-        try:
-            center_network = unary_union(centerlines)
-        except Exception:
-            center_network = None
+    if not road_polys:
+        return []
 
-        snapped_lines = []
-        for seg in centerlines:
+    try:
+        merged_surface = unary_union(road_polys)
+    except Exception:
+        merged_surface = road_polys[0]
+        for p in road_polys[1:]:
             try:
-                snapped = snap(seg, center_network, snap_tol_m) if center_network is not None else seg
-            except Exception:
-                snapped = seg
-            snapped_lines.append(snapped)
-
-        try:
-            merged_centerlines = linemerge(unary_union(snapped_lines))
-            merged_parts = [seg for seg in _iter_line_geometries(merged_centerlines) if seg is not None and not getattr(seg, "is_empty", True)]
-            if not merged_parts:
-                merged_parts = snapped_lines
-        except Exception:
-            merged_parts = snapped_lines
-
-        for center in merged_parts:
-            if center is None or getattr(center, "is_empty", True):
-                continue
-            if getattr(center, "length", 0.0) <= 0:
-                continue
-            try:
-                left = center.parallel_offset(hw, "left", join_style=1)
-                right = center.parallel_offset(hw, "right", join_style=1)
+                merged_surface = merged_surface.union(p)
             except Exception:
                 continue
-            for off in (left, right):
-                for seg in _iter_line_geometries(off):
-                    if seg is None or getattr(seg, "is_empty", True):
-                        continue
-                    edge_lines.append(seg)
 
+    boundary = getattr(merged_surface, "boundary", None)
+    if boundary is None or getattr(boundary, "is_empty", True):
+        return []
+    edge_lines = [seg for seg in _iter_line_geometries(boundary) if seg is not None and not getattr(seg, "is_empty", True)]
     if not edge_lines:
         return []
 
-    # Final snap/merge pass for cleaner joins, while preserving open ends.
+    # Detect dangling centerline nodes (degree==1) and open only those ends.
+    endpoint_tol = max(0.2, snap_tol_m * 0.25)
+    endpoint_counts = {}
+    endpoint_coords = {}
+    try:
+        merged_center = linemerge(unary_union([seg for seg, _ in snapped_parts]))
+    except Exception:
+        merged_center = unary_union([seg for seg, _ in snapped_parts])
+    for seg in _iter_line_geometries(merged_center):
+        if seg is None or getattr(seg, "is_empty", True):
+            continue
+        coords = list(seg.coords)
+        if len(coords) < 2:
+            continue
+        for pt in (coords[0], coords[-1]):
+            key = (int(round(pt[0] / endpoint_tol)), int(round(pt[1] / endpoint_tol)))
+            endpoint_counts[key] = endpoint_counts.get(key, 0) + 1
+            endpoint_coords[key] = (pt[0], pt[1])
+
+    dangling_points = [Point(xy) for k, xy in endpoint_coords.items() if endpoint_counts.get(k, 0) == 1]
+    if dangling_points:
+        half_widths = [hw for _, hw in snapped_parts if hw is not None]
+        mean_hw = (sum(half_widths) / len(half_widths)) if half_widths else 1.0
+        cut_radius = max(0.45, min(2.5, mean_hw * 0.9))
+        try:
+            cut_geom = unary_union([pt.buffer(cut_radius) for pt in dangling_points])
+            opened_edges = []
+            for seg in edge_lines:
+                try:
+                    diff = seg.difference(cut_geom)
+                except Exception:
+                    diff = seg
+                for part in _iter_line_geometries(diff):
+                    if part is None or getattr(part, "is_empty", True):
+                        continue
+                    if getattr(part, "length", 0.0) < max(0.8, cut_radius * 0.6):
+                        continue
+                    opened_edges.append(part)
+            if opened_edges:
+                edge_lines = opened_edges
+        except Exception:
+            pass
+
+    # Final snap/merge pass for cleaner joins.
     try:
         edge_network = unary_union(edge_lines)
         fine_tol = max(0.2, snap_tol_m * 0.35)
