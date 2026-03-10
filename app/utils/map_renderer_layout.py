@@ -1616,7 +1616,16 @@ def _draw_adamawa_bottom_blocks(
     table_ax = fig.add_axes([0.58, 0.072, 0.36, 0.102])
     table_ax.axis("off")
     header = ["FROM", "BEARING", "LENGTH", "TO"]
-    rows = [[r["from"], r["bearing"], r["length"], r["to"]] for r in segment_rows[:14]]
+    all_rows = [[r["from"], r["bearing"], r["length"], r["to"]] for r in segment_rows]
+    # Keep the table readable and non-overlapping for polygons with many vertices.
+    # For overflow, show a compact summary row instead of shrinking text into collisions.
+    max_visible_rows = max(6, int(round(9 * font_scale)))
+    if len(all_rows) > max_visible_rows:
+        keep_rows = max(1, max_visible_rows - 1)
+        hidden_count = len(all_rows) - keep_rows
+        rows = all_rows[:keep_rows] + [["...", "", "", f"+{hidden_count} more"]]
+    else:
+        rows = all_rows
     table = table_ax.table(
         cellText=rows,
         colLabels=header,
@@ -1626,13 +1635,22 @@ def _draw_adamawa_bottom_blocks(
         bbox=[0, 0, 1, 1],
     )
     table.auto_set_font_size(False)
-    table.set_fontsize(max(5, int(6 * font_scale)))
+    table_font = max(5, int(6 * font_scale))
+    table.set_fontsize(table_font)
     for (row_idx, col_idx), cell in table.get_celld().items():
         cell.set_linewidth(0.8 if row_idx == 0 else 0.5)
         if row_idx == 0:
             cell.set_text_props(weight="bold", fontfamily=ADAMAWA_FONT_FAMILY)
         else:
             cell.set_text_props(fontfamily=ADAMAWA_FONT_FAMILY)
+    # Enforce even row height to prevent any accidental text clipping/overlap.
+    total_rows = len(rows) + 1  # include header
+    row_height = 1.0 / max(1, total_rows)
+    for ridx in range(total_rows):
+        for cidx in range(len(header)):
+            cell = table.get_celld().get((ridx, cidx))
+            if cell is not None:
+                cell.set_height(row_height)
 
     text_x = 0.58
     text_width = 0.37
