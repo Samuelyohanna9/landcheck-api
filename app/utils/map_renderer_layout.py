@@ -1386,6 +1386,42 @@ def build_fence_avoid_geom(fence_geoms, display_epsg: int, scale_ratio: int):
     return merged
 
 
+def _collect_road_edge_lines(centerline_geom, half_width_m: float):
+    """
+    Build open road edges (left/right offsets) from a centerline geometry.
+    This avoids closed rectangular end-caps from polygon-boundary rendering.
+    """
+    edges = []
+    if centerline_geom is None or getattr(centerline_geom, "is_empty", True):
+        return edges
+    for line_part in _iter_line_geometries(centerline_geom):
+        try:
+            if getattr(line_part, "length", 0.0) <= 0:
+                continue
+            left = line_part.parallel_offset(half_width_m, "left", join_style=2)
+            right = line_part.parallel_offset(half_width_m, "right", join_style=2)
+            for off in (left, right):
+                for seg in _iter_line_geometries(off):
+                    if seg is None or getattr(seg, "is_empty", True):
+                        continue
+                    edges.append(seg)
+        except Exception:
+            continue
+    return edges
+
+
+def _draw_road_edges(ax, edge_lines, font_scale=1.0):
+    if not edge_lines:
+        return
+    lw = 0.8 * font_scale
+    for seg in edge_lines:
+        try:
+            x_vals, y_vals = seg.xy
+            ax.plot(x_vals, y_vals, color="black", lw=lw, zorder=6)
+        except Exception:
+            continue
+
+
 def _safe_text(value, fallback=""):
     text_value = str(value).strip() if value is not None else ""
     return text_value if text_value else fallback
@@ -2020,7 +2056,7 @@ def _render_plot_map_layout_adamawa(
             ax=ax, color="#10a3df", lw=1.0 * font_scale, zorder=5
         )
 
-    road_polys = []
+    road_edge_lines = []
     road_label_features = []
     for geom in roads_for_draw + road_added_overrides:
         if geom is None:
@@ -2038,7 +2074,7 @@ def _render_plot_map_layout_adamawa(
         snapped_clipped = snap(clipped, extent_poly.boundary, snap_tol)
         try:
             half_w = max(1.0, (road_width_m or 3.0) / 2.0)
-            road_polys.append(snapped_clipped.buffer(half_w, cap_style=2, join_style=2))
+            road_edge_lines.extend(_collect_road_edge_lines(snapped_clipped, half_w))
         except Exception:
             continue
 
@@ -2061,21 +2097,7 @@ def _render_plot_map_layout_adamawa(
         snapped_clipped = snap(clipped, extent_poly.boundary, snap_tol)
         road_label_features.append((snapped_clipped, name))
 
-    if road_polys:
-        try:
-            road_union = road_polys[0]
-            for rp in road_polys[1:]:
-                road_union = road_union.union(rp)
-            boundary = road_union.boundary
-            frame = box(target_xlim[0], target_ylim[0], target_xlim[1], target_ylim[1])
-            snap_tol = max(1.0, (5.0 / 1000.0) * scale_ratio)
-            snapped = snap(boundary, frame.boundary, snap_tol)
-            clipped = snapped.intersection(frame)
-            gpd.GeoSeries([clipped], crs=f"EPSG:{display_epsg}").plot(
-                ax=ax, color="black", lw=0.8 * font_scale, zorder=6
-            )
-        except Exception:
-            pass
+    _draw_road_edges(ax, road_edge_lines, font_scale=font_scale)
 
     if road_label_features:
         seen_names = set()
@@ -2434,7 +2456,7 @@ def render_plot_map_layout(
     from shapely.geometry import box
 
     extent_poly = box(target_xlim[0], target_ylim[0], target_xlim[1], target_ylim[1])
-    road_polys = []
+    road_edge_lines = []
     road_label_features = []
     road_add_geoms = [
         ov for ov in overrides
@@ -2455,7 +2477,7 @@ def render_plot_map_layout(
             snapped_clipped = snap(clipped, extent_poly.boundary, snap_tol)
             try:
                 half_w = max(1.0, (road_width_m or 3.0) / 2.0)
-                road_polys.append(snapped_clipped.buffer(half_w, cap_style=2, join_style=2))
+                road_edge_lines.extend(_collect_road_edge_lines(snapped_clipped, half_w))
             except Exception:
                 continue
         # In edit/preview mode, include labels for manually added roads.
@@ -2478,7 +2500,7 @@ def render_plot_map_layout(
                 continue
             snapped_clipped = snap(clipped, extent_poly.boundary, snap_tol)
             road_label_features.append((snapped_clipped, name, "override"))
-        has_roads = len(road_polys) > 0
+        has_roads = len(road_edge_lines) > 0
     else:
         # Draw roads with class-based real-world widths
         road_rows = db.execute(text("""
@@ -2524,7 +2546,7 @@ def render_plot_map_layout(
             # Use buffered road polygon to keep intersections connected
             try:
                 half_w = max(1.0, (road_width_m or 3.0) / 2.0)
-                road_polys.append(snapped_clipped.buffer(half_w, cap_style=2, join_style=2))
+                road_edge_lines.extend(_collect_road_edge_lines(snapped_clipped, half_w))
             except Exception:
                 continue
 
@@ -2546,7 +2568,7 @@ def render_plot_map_layout(
             road_label_features.append((snapped_clipped, name, "override"))
             try:
                 half_w = max(1.0, ((ov.get("width_m") or road_width_override_m or road_width_m) or 3.0) / 2.0)
-                road_polys.append(snapped_clipped.buffer(half_w, cap_style=2, join_style=2))
+                road_edge_lines.extend(_collect_road_edge_lines(snapped_clipped, half_w))
             except Exception:
                 continue
 
@@ -2567,22 +2589,7 @@ def render_plot_map_layout(
         font_scale=font_scale,
     )
 
-    if road_polys:
-        try:
-            road_union = road_polys[0]
-            for rp in road_polys[1:]:
-                road_union = road_union.union(rp)
-            boundary = road_union.boundary
-            # Clip roads to map frame for even endings at the border
-            frame = box(target_xlim[0], target_ylim[0], target_xlim[1], target_ylim[1])
-            snap_tol = max(1.0, (5.0 / 1000.0) * scale_ratio)
-            snapped = snap(boundary, frame.boundary, snap_tol)
-            clipped = snapped.intersection(frame)
-            gpd.GeoSeries([clipped], crs=f"EPSG:{display_epsg}").plot(
-                ax=ax, color="black", lw=0.8 * font_scale, zorder=6
-            )
-        except Exception:
-            pass
+    _draw_road_edges(ax, road_edge_lines, font_scale=font_scale)
 
     all_buildings = []
     if buildings:
