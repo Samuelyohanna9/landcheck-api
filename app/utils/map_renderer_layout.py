@@ -1094,7 +1094,8 @@ def annotate_vertices(
 
         label_nx, label_ny = normal
         label_offset_mult = 1.0
-        label_line_spacing = 1.0
+        # Keep bearing/distance vertical spacing consistent on every boundary edge.
+        label_line_spacing = 2.2
         fence_edge = False
         base_offset = max(2.0, (6.0 / 1000.0) * scale_ratio)
         if boundary_poly is not None:
@@ -1122,9 +1123,6 @@ def annotate_vertices(
                     fence_edge = True
                     # Keep a subtle extra separation only on fenced edges.
                     label_offset_mult = 1.15
-                    # Increase bearing/distance interval on fenced boundaries
-                    # so the two red lines of text clear fence teeth.
-                    label_line_spacing = 3.0
             except Exception:
                 pass
         if fence_edge and avoid_geom is not None:
@@ -1268,15 +1266,15 @@ def _draw_fence_line(ax, line_geom, scale_ratio: int, font_scale=1.0):
 
     length = getattr(line_geom, "length", 0.0) or 0.0
     if length <= 0:
-        ax.plot(x_vals, y_vals, color="black", lw=0.8 * font_scale, zorder=7)
+        ax.plot(x_vals, y_vals, color="black", lw=0.65 * font_scale, zorder=7)
         return
 
-    # Slightly smaller fence symbol to reduce visual dominance in both templates.
-    step_span = max(2.2, (7.5 / 1000.0) * max(scale_ratio, 100))
-    tooth_amp = max(1.0, (2.4 / 1000.0) * max(scale_ratio, 100))
+    # Compact fence symbol so it fits cleanly between bearing and distance text.
+    step_span = max(1.8, (6.2 / 1000.0) * max(scale_ratio, 100))
+    tooth_amp = max(0.7, (1.6 / 1000.0) * max(scale_ratio, 100))
     probe = max(0.4, step_span * 0.2)
     if length < step_span * 1.2:
-        ax.plot(x_vals, y_vals, color="black", lw=0.8 * font_scale, zorder=7)
+        ax.plot(x_vals, y_vals, color="black", lw=0.65 * font_scale, zorder=7)
         return
 
     points_x = []
@@ -1338,7 +1336,7 @@ def _draw_fence_line(ax, line_geom, scale_ratio: int, font_scale=1.0):
     except Exception:
         pass
 
-    ax.plot(points_x, points_y, color="black", lw=0.75 * font_scale, zorder=7)
+    ax.plot(points_x, points_y, color="black", lw=0.65 * font_scale, zorder=7)
 
 
 def draw_fences(ax, fence_geoms, display_epsg: int, scale_ratio: int, font_scale=1.0):
