@@ -1618,7 +1618,7 @@ def _draw_adamawa_bottom_blocks(
     fig.text(0.40, comp_mid_y, f"CADASTRAL SHEET NO. {_safe_text(cadastral_sheet_no, '-')}", fontsize=footer_font, fontfamily=ADAMAWA_FONT_FAMILY, va="center")
     fig.text(0.50, 0.043, DEFAULT_ADAMAWA_PREPARED_BY_TEXT, fontsize=footer_font, fontfamily=ADAMAWA_FONT_FAMILY, ha="center", va="center")
 
-    table_ax = fig.add_axes([0.58, 0.088, 0.36, 0.112])
+    table_ax = fig.add_axes([0.58, 0.100, 0.36, 0.100])
     table_ax.axis("off")
     header = ["FROM", "BEARING", "DISTANCE", "TO"]
     all_rows = [[r["from"], r["bearing"], r["length"], r["to"]] for r in segment_rows]
@@ -1657,28 +1657,44 @@ def _draw_adamawa_bottom_blocks(
             if cell is not None:
                 cell.set_height(row_height)
 
-    # Draw right-note text inside a clipped mini-axes so it never overlaps center/footer lines.
-    right_note_ax = fig.add_axes([0.58, 0.044, 0.36, 0.038])
+    # Draw right-note text in a dedicated note block below the table.
+    right_note_ax = fig.add_axes([0.58, 0.034, 0.36, 0.062])
     right_note_ax.axis("off")
-    note_font = min(7, max(5, footer_font + 1))
+    note_font = max(4, footer_font)
     disclaimer_line = _safe_text(disclaimer_text, DEFAULT_ADAMAWA_DISCLAIMER_TEXT).strip()
-    if len(disclaimer_line) > 78:
-        disclaimer_line = f"{disclaimer_line[:75].rstrip()}..."
     surveyed_line = _safe_text(surveyed_by_text, "").strip()
-    if len(surveyed_line) > 62:
-        surveyed_line = f"{surveyed_line[:59].rstrip()}..."
-    note_text = disclaimer_line if not surveyed_line else f"{disclaimer_line}\n{surveyed_line}"
-    right_note_ax.text(
-        0.0,
-        1.0,
-        note_text,
+
+    # Wrap full disclaimer/surveyed lines to the available note width without truncation.
+    disclaimer_lines = _wrap_figure_text(
+        fig,
+        disclaimer_line,
+        width_fig=0.36,
         fontsize=note_font,
         fontfamily=ADAMAWA_FONT_FAMILY,
-        ha="left",
-        va="top",
-        linespacing=0.9,
-        clip_on=True,
     )
+    surveyed_lines = _wrap_figure_text(
+        fig,
+        surveyed_line,
+        width_fig=0.36,
+        fontsize=note_font,
+        fontfamily=ADAMAWA_FONT_FAMILY,
+    ) if surveyed_line else []
+    note_lines = disclaimer_lines + surveyed_lines
+    line_count = max(1, len(note_lines))
+    step = 1.0 / (line_count + 0.2)
+    y_cursor = 1.0
+    for line in note_lines:
+        right_note_ax.text(
+            0.0,
+            y_cursor,
+            line,
+            fontsize=note_font,
+            fontfamily=ADAMAWA_FONT_FAMILY,
+            ha="left",
+            va="top",
+            clip_on=True,
+        )
+        y_cursor -= step
 
 
 def _render_plot_map_layout_adamawa(
