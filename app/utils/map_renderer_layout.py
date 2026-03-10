@@ -1291,6 +1291,80 @@ def _normalize_scale_label(scale_text: str) -> str:
     return f"1:{raw}"
 
 
+def _normalize_scale_label_adamawa(scale_text: str) -> str:
+    try:
+        ratio = parse_scale_ratio(scale_text)
+    except Exception:
+        ratio = 2500
+    return f"1: {int(ratio)}"
+
+
+def _draw_center_text_with_bold_suffix(
+    fig,
+    y: float,
+    prefix: str,
+    suffix: str,
+    fontsize: float,
+    fontfamily: str = ADAMAWA_FONT_FAMILY,
+):
+    prefix = str(prefix or "")
+    suffix = str(suffix or "")
+    if not suffix:
+        fig.text(
+            0.5,
+            y,
+            prefix,
+            ha="center",
+            va="center",
+            fontsize=fontsize,
+            fontfamily=fontfamily,
+        )
+        return
+
+    try:
+        renderer = fig.canvas.get_renderer()
+    except Exception:
+        fig.canvas.draw()
+        renderer = fig.canvas.get_renderer()
+
+    fp_norm = FontProperties(size=fontsize, weight="normal", family=fontfamily)
+    fp_bold = FontProperties(size=fontsize, weight="bold", family=fontfamily)
+    try:
+        w_prefix, _, _ = renderer.get_text_width_height_descent(prefix, fp_norm, ismath=False)
+    except Exception:
+        w_prefix = len(prefix) * fontsize * 0.58
+    try:
+        w_suffix, _, _ = renderer.get_text_width_height_descent(suffix, fp_bold, ismath=False)
+    except Exception:
+        w_suffix = len(suffix) * fontsize * 0.62
+
+    fig_w = max(float(fig.bbox.width), 1.0)
+    total_w_frac = (float(w_prefix) + float(w_suffix)) / fig_w
+    x_start = 0.5 - (total_w_frac / 2.0)
+    x_suffix = x_start + (float(w_prefix) / fig_w)
+
+    fig.text(
+        x_start,
+        y,
+        prefix,
+        ha="left",
+        va="center",
+        fontsize=fontsize,
+        fontfamily=fontfamily,
+        weight="normal",
+    )
+    fig.text(
+        x_suffix,
+        y,
+        suffix,
+        ha="left",
+        va="center",
+        fontsize=fontsize,
+        fontfamily=fontfamily,
+        weight="bold",
+    )
+
+
 def _build_segment_rows(poly, station_names=None):
     coords = list(poly.exterior.coords)
     if len(coords) < 2:
@@ -1329,22 +1403,19 @@ def _draw_adamawa_header(
     scale_y = y - 0.098
     authority_y = y - 0.123
     authority_date_y = y - 0.140
-    fig.text(
-        0.5,
-        y,
-        f"R of O {rof_no}",
-        ha="center",
-        va="center",
+    _draw_center_text_with_bold_suffix(
+        fig,
+        y=y,
+        prefix="R of O ",
+        suffix=_safe_text(rof_no, "-"),
         fontsize=max(8, int(9 * font_scale)),
-        weight="bold",
         fontfamily=ADAMAWA_FONT_FAMILY,
     )
-    fig.text(
-        0.5,
-        y - 0.022,
-        f"SURVEY PLAN OF LAND BELONGING TO {_safe_text(owner_name).upper()}",
-        ha="center",
-        va="center",
+    _draw_center_text_with_bold_suffix(
+        fig,
+        y=y - 0.022,
+        prefix="SURVEY PLAN OF LAND BELONGING TO ",
+        suffix=_safe_text(owner_name).upper(),
         fontsize=max(8, int(8 * font_scale)),
         fontfamily=ADAMAWA_FONT_FAMILY,
     )
@@ -1378,7 +1449,7 @@ def _draw_adamawa_header(
     fig.text(
         0.5,
         scale_y,
-        f"SCALE:- {_normalize_scale_label(scale_text)}",
+        f"SCALE:- {_normalize_scale_label_adamawa(scale_text)}",
         ha="center",
         va="center",
         fontsize=max(8, int(8 * font_scale)),
