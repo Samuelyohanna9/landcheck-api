@@ -1479,6 +1479,79 @@ def _collect_road_edge_lines(centerline_geom, half_width_m: float):
     return edges
 
 
+def _collect_connected_road_edge_lines(road_geoms_with_width, snap_tol_m: float = 1.0):
+    """
+    Build connected road-edge lines by buffering all road centerlines and dissolving
+    overlaps/intersections into a single surface, then extracting boundaries.
+    """
+    line_parts = []
+    for item in road_geoms_with_width or []:
+        if not item or len(item) < 2:
+            continue
+        geom, half_width = item[0], item[1]
+        if geom is None or getattr(geom, "is_empty", True):
+            continue
+        try:
+            hw = max(0.5, float(half_width or 1.0))
+        except Exception:
+            hw = 1.0
+        for seg in _iter_line_geometries(geom):
+            if seg is None or getattr(seg, "is_empty", True):
+                continue
+            if getattr(seg, "length", 0.0) <= 0:
+                continue
+            line_parts.append((seg, hw))
+    if not line_parts:
+        return []
+
+    try:
+        network = unary_union([seg for seg, _ in line_parts])
+    except Exception:
+        network = None
+
+    road_polys = []
+    for seg, hw in line_parts:
+        try:
+            snapped_seg = snap(seg, network, snap_tol_m) if network is not None else seg
+        except Exception:
+            snapped_seg = seg
+        try:
+            # Flat cap keeps road ends clean; round join avoids sharp corner gaps.
+            road_poly = snapped_seg.buffer(hw, cap_style=2, join_style=1)
+            if road_poly is not None and not road_poly.is_empty:
+                road_polys.append(road_poly)
+        except Exception:
+            continue
+    if not road_polys:
+        return []
+
+    try:
+        merged_surface = unary_union(road_polys)
+    except Exception:
+        merged_surface = road_polys[0]
+        for p in road_polys[1:]:
+            try:
+                merged_surface = merged_surface.union(p)
+            except Exception:
+                continue
+
+    boundary = getattr(merged_surface, "boundary", None)
+    if boundary is None or getattr(boundary, "is_empty", True):
+        return []
+
+    edges = [seg for seg in _iter_line_geometries(boundary) if seg is not None and not getattr(seg, "is_empty", True)]
+    if not edges:
+        return []
+    try:
+        merged_edges = linemerge(unary_union(edges))
+        final_edges = [seg for seg in _iter_line_geometries(merged_edges) if seg is not None and not getattr(seg, "is_empty", True)]
+        if final_edges:
+            return final_edges
+    except Exception:
+        pass
+    return edges
+
+
 def _draw_road_edges(ax, edge_lines, font_scale=1.0):
     if not edge_lines:
         return
@@ -2084,7 +2157,7 @@ def _render_plot_map_layout_adamawa(
     buildings, added_buildings = apply_overrides(buildings, "building")
     rivers, _ = apply_overrides(rivers, "river")
     fences, _ = apply_overrides(fences, "fence")
-    roads_for_draw, road_added_overrides = apply_overrides(detected_roads, "road")
+    roads_for_draw, _road_added_overrides = apply_overrides(detected_roads, "road")
     road_add_named_overrides = [
         ov for ov in overrides
         if ov["feature_type"] == "road"
@@ -2145,8 +2218,10 @@ def _render_plot_map_layout_adamawa(
         )
 
     road_edge_lines = []
+    road_geom_width = []
     road_label_features = []
-    for geom in roads_for_draw + road_added_overrides:
+    road_snap_tol = max(1.0, (5.0 / 1000.0) * scale_ratio)
+    for geom in roads_for_draw:
         if geom is None:
             continue
         try:
@@ -2154,15 +2229,14 @@ def _render_plot_map_layout_adamawa(
             line_proj = gdf_line.iloc[0]
         except Exception:
             continue
-        snap_tol = max(1.0, (5.0 / 1000.0) * scale_ratio)
-        expanded_frame = extent_poly.buffer(snap_tol)
+        expanded_frame = extent_poly.buffer(road_snap_tol)
         clipped = line_proj.intersection(expanded_frame)
         if clipped.is_empty:
             continue
-        snapped_clipped = snap(clipped, extent_poly.boundary, snap_tol)
+        snapped_clipped = snap(clipped, extent_poly.boundary, road_snap_tol)
         try:
             half_w = max(1.0, (road_width_m or 3.0) / 2.0)
-            road_edge_lines.extend(_collect_road_edge_lines(snapped_clipped, half_w))
+            road_geom_width.append((snapped_clipped, half_w))
         except Exception:
             continue
 
@@ -2177,14 +2251,14 @@ def _render_plot_map_layout_adamawa(
             line_proj = gdf_line.iloc[0]
         except Exception:
             continue
-        snap_tol = max(1.0, (5.0 / 1000.0) * scale_ratio)
-        expanded_frame = extent_poly.buffer(snap_tol)
+        expanded_frame = extent_poly.buffer(road_snap_tol)
         clipped = line_proj.intersection(expanded_frame)
         if clipped.is_empty:
             continue
-        snapped_clipped = snap(clipped, extent_poly.boundary, snap_tol)
+        snapped_clipped = snap(clipped, extent_poly.boundary, road_snap_tol)
         road_label_features.append((snapped_clipped, name))
 
+    road_edge_lines = _collect_connected_road_edge_lines(road_geom_width, snap_tol_m=road_snap_tol)
     _draw_road_edges(ax, road_edge_lines, font_scale=font_scale)
 
     if road_label_features:
@@ -2545,7 +2619,9 @@ def render_plot_map_layout(
 
     extent_poly = box(target_xlim[0], target_ylim[0], target_xlim[1], target_ylim[1])
     road_edge_lines = []
+    road_geom_width = []
     road_label_features = []
+    road_snap_tol = max(1.0, (5.0 / 1000.0) * scale_ratio)
     road_add_geoms = [
         ov for ov in overrides
         if ov["feature_type"] == "road" and ov["action"] in ("add", "update") and ov["geom"] is not None
@@ -2557,15 +2633,14 @@ def render_plot_map_layout(
                 line_proj = gdf_line.iloc[0]
             except Exception:
                 continue
-            snap_tol = max(1.0, (5.0 / 1000.0) * scale_ratio)
-            expanded_frame = extent_poly.buffer(snap_tol)
+            expanded_frame = extent_poly.buffer(road_snap_tol)
             clipped = line_proj.intersection(expanded_frame)
             if clipped.is_empty:
                 continue
-            snapped_clipped = snap(clipped, extent_poly.boundary, snap_tol)
+            snapped_clipped = snap(clipped, extent_poly.boundary, road_snap_tol)
             try:
                 half_w = max(1.0, (road_width_m or 3.0) / 2.0)
-                road_edge_lines.extend(_collect_road_edge_lines(snapped_clipped, half_w))
+                road_geom_width.append((snapped_clipped, half_w))
             except Exception:
                 continue
         # In edit/preview mode, include labels for manually added roads.
@@ -2581,13 +2656,13 @@ def render_plot_map_layout(
                 line_proj = gdf_line.iloc[0]
             except Exception:
                 continue
-            snap_tol = max(1.0, (5.0 / 1000.0) * scale_ratio)
-            expanded_frame = extent_poly.buffer(snap_tol)
+            expanded_frame = extent_poly.buffer(road_snap_tol)
             clipped = line_proj.intersection(expanded_frame)
             if clipped.is_empty:
                 continue
-            snapped_clipped = snap(clipped, extent_poly.boundary, snap_tol)
+            snapped_clipped = snap(clipped, extent_poly.boundary, road_snap_tol)
             road_label_features.append((snapped_clipped, name, "override"))
+        road_edge_lines = _collect_connected_road_edge_lines(road_geom_width, snap_tol_m=road_snap_tol)
         has_roads = len(road_edge_lines) > 0
     else:
         # Draw roads with class-based real-world widths
@@ -2623,18 +2698,17 @@ def render_plot_map_layout(
             except Exception:
                 continue
 
-            snap_tol = max(1.0, (5.0 / 1000.0) * scale_ratio)
-            expanded_frame = extent_poly.buffer(snap_tol)
+            expanded_frame = extent_poly.buffer(road_snap_tol)
             clipped = line_proj.intersection(expanded_frame)
             if clipped.is_empty:
                 continue
             # Snap to frame boundary so buffered road edges reach the grid border cleanly.
-            snapped_clipped = snap(clipped, extent_poly.boundary, snap_tol)
+            snapped_clipped = snap(clipped, extent_poly.boundary, road_snap_tol)
             road_label_features.append((snapped_clipped, name, highway))
             # Use buffered road polygon to keep intersections connected
             try:
                 half_w = max(1.0, (road_width_m or 3.0) / 2.0)
-                road_edge_lines.extend(_collect_road_edge_lines(snapped_clipped, half_w))
+                road_geom_width.append((snapped_clipped, half_w))
             except Exception:
                 continue
 
@@ -2647,19 +2721,19 @@ def render_plot_map_layout(
                 line_proj = gdf_line.iloc[0]
             except Exception:
                 continue
-            snap_tol = max(1.0, (5.0 / 1000.0) * scale_ratio)
-            expanded_frame = extent_poly.buffer(snap_tol)
+            expanded_frame = extent_poly.buffer(road_snap_tol)
             clipped = line_proj.intersection(expanded_frame)
             if clipped.is_empty:
                 continue
-            snapped_clipped = snap(clipped, extent_poly.boundary, snap_tol)
+            snapped_clipped = snap(clipped, extent_poly.boundary, road_snap_tol)
             road_label_features.append((snapped_clipped, name, "override"))
             try:
                 half_w = max(1.0, ((ov.get("width_m") or road_width_override_m or road_width_m) or 3.0) / 2.0)
-                road_edge_lines.extend(_collect_road_edge_lines(snapped_clipped, half_w))
+                road_geom_width.append((snapped_clipped, half_w))
             except Exception:
                 continue
 
+        road_edge_lines = _collect_connected_road_edge_lines(road_geom_width, snap_tol_m=road_snap_tol)
         has_roads = len(road_rows) > 0 or len(road_add_geoms) > 0
     key_bounds = draw_key_box(
         fig,
