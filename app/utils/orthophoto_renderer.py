@@ -150,7 +150,8 @@ def add_north_arrow(ax, font_scale=1.0, style: str = "stacked_4n", color: str = 
 
     if style in ("stacked_4n", "stacked4n", "vertical_4n"):
         four_y = y + size * 0.82
-        stem_top = y + size * 0.60
+        # Bring stem up to the "4" so there is no visible gap.
+        stem_top = four_y - size * 0.04
         stem_bottom = y - size * 1.02
         n_y = (stem_top + stem_bottom) / 2.0
         gap = size * 0.24
