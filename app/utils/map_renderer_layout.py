@@ -1696,9 +1696,9 @@ def _draw_adamawa_bottom_blocks(
                 cell.set_height(row_height)
 
     # Draw right-note text in a dedicated note block below the table.
-    right_note_ax = fig.add_axes([0.58, 0.034, 0.36, 0.062])
+    right_note_ax = fig.add_axes([0.58, 0.032, 0.36, 0.066])
     right_note_ax.axis("off")
-    note_font = max(4, footer_font)
+    note_font = min(7, max(5, footer_font + 1))
     disclaimer_line = _safe_text(disclaimer_text, DEFAULT_ADAMAWA_DISCLAIMER_TEXT).strip()
     surveyed_line = _safe_text(surveyed_by_text, "").strip()
 
@@ -1718,21 +1718,18 @@ def _draw_adamawa_bottom_blocks(
         fontfamily=ADAMAWA_FONT_FAMILY,
     ) if surveyed_line else []
     note_lines = disclaimer_lines + surveyed_lines
-    line_count = max(1, len(note_lines))
-    step = 1.0 / (line_count + 0.2)
-    y_cursor = 1.0
-    for line in note_lines:
-        right_note_ax.text(
-            0.0,
-            y_cursor,
-            line,
-            fontsize=note_font,
-            fontfamily=ADAMAWA_FONT_FAMILY,
-            ha="left",
-            va="top",
-            clip_on=True,
-        )
-        y_cursor -= step
+    note_text = "\n".join(note_lines) if note_lines else ""
+    right_note_ax.text(
+        0.0,
+        1.0,
+        note_text,
+        fontsize=note_font,
+        fontfamily=ADAMAWA_FONT_FAMILY,
+        ha="left",
+        va="top",
+        linespacing=0.78,
+        clip_on=True,
+    )
 
 
 def _render_plot_map_layout_adamawa(
