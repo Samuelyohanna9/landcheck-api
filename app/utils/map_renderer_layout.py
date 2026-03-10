@@ -1587,7 +1587,7 @@ def _draw_adamawa_bottom_blocks(
     fig.text(left_x, y, _safe_text(topo_sheet_text, DEFAULT_ADAMAWA_TOPO_SHEET_TEXT), fontsize=footer_font, fontfamily=ADAMAWA_FONT_FAMILY)
     y -= (line_gap + 0.002)
     fig.text(left_x, y, DEFAULT_ADAMAWA_CHECKED_BY_TEXT, fontsize=footer_font, fontfamily=ADAMAWA_FONT_FAMILY)
-    y -= line_gap
+    y -= (line_gap + 0.004)
     fig.text(left_x, y, DEFAULT_ADAMAWA_PASSED_BY_TEXT, fontsize=footer_font, fontfamily=ADAMAWA_FONT_FAMILY)
     y -= line_gap
     fig.text(left_x, y, DEFAULT_ADAMAWA_COPYRIGHT_TEXT, fontsize=footer_font, fontfamily=ADAMAWA_FONT_FAMILY)
