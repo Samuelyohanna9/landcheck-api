@@ -1580,13 +1580,13 @@ def _draw_adamawa_bottom_blocks(
     fig.text(0.06, 0.118, f"Z {_safe_text(elevation_text, '-')}", fontsize=max(6, int(7 * font_scale)), fontfamily=ADAMAWA_FONT_FAMILY)
     fig.text(0.06, 0.103, _safe_text(origin_text, DEFAULT_ADAMAWA_ORIGIN_TEXT), fontsize=max(6, int(7 * font_scale)), color="blue", fontfamily=ADAMAWA_FONT_FAMILY)
     fig.text(0.06, 0.088, _safe_text(topo_sheet_text, DEFAULT_ADAMAWA_TOPO_SHEET_TEXT), fontsize=max(6, int(7 * font_scale)), fontfamily=ADAMAWA_FONT_FAMILY)
-    fig.text(0.06, 0.076, DEFAULT_ADAMAWA_CHECKED_BY_TEXT, fontsize=max(5, int(6.2 * font_scale)), fontfamily=ADAMAWA_FONT_FAMILY)
-    fig.text(0.06, 0.064, DEFAULT_ADAMAWA_PASSED_BY_TEXT, fontsize=max(5, int(6.2 * font_scale)), fontfamily=ADAMAWA_FONT_FAMILY)
-    fig.text(0.06, 0.052, DEFAULT_ADAMAWA_COPYRIGHT_TEXT, fontsize=max(5, int(6.2 * font_scale)), fontfamily=ADAMAWA_FONT_FAMILY)
+    fig.text(0.06, 0.076, DEFAULT_ADAMAWA_CHECKED_BY_TEXT, fontsize=max(5, int(6.0 * font_scale)), fontfamily=ADAMAWA_FONT_FAMILY)
+    fig.text(0.06, 0.063, DEFAULT_ADAMAWA_PASSED_BY_TEXT, fontsize=max(5, int(6.0 * font_scale)), fontfamily=ADAMAWA_FONT_FAMILY)
+    fig.text(0.06, 0.050, DEFAULT_ADAMAWA_COPYRIGHT_TEXT, fontsize=max(5, int(6.0 * font_scale)), fontfamily=ADAMAWA_FONT_FAMILY)
 
     # Computation/plan block with the distinctive center brace used in the Adamawa template.
-    comp_label_y = 0.046
-    plan_label_y = 0.036
+    comp_label_y = 0.043
+    plan_label_y = 0.034
     fig.text(0.06, comp_label_y, "COMPUTATION", fontsize=max(5, int(6.2 * font_scale)), fontfamily=ADAMAWA_FONT_FAMILY)
     fig.text(0.195, comp_label_y, "NO", fontsize=max(5, int(6.2 * font_scale)), fontfamily=ADAMAWA_FONT_FAMILY)
     fig.text(0.06, plan_label_y, "PLAN", fontsize=max(5, int(6.2 * font_scale)), fontfamily=ADAMAWA_FONT_FAMILY)
@@ -1608,10 +1608,10 @@ def _draw_adamawa_bottom_blocks(
 
     comp_display = _safe_text(computation_no, _safe_text(plan_no, "-"))
     comp_mid_y = (top_y + bottom_y) / 2.0
-    fig.text(0.305, comp_mid_y, comp_display, fontsize=max(6, int(7.0 * font_scale)), fontfamily=ADAMAWA_FONT_FAMILY, va="center")
-    fig.text(0.41, comp_mid_y, f"CADASTRAL SHEET NO. {_safe_text(cadastral_sheet_no, '-')}", fontsize=max(5, int(6.4 * font_scale)), fontfamily=ADAMAWA_FONT_FAMILY, va="center")
-    fig.text(0.50, 0.047, f"SCALE {_normalize_scale_label_adamawa(scale_text)}", fontsize=max(6, int(7 * font_scale)), fontfamily=ADAMAWA_FONT_FAMILY, ha="center")
-    fig.text(0.50, 0.0325, DEFAULT_ADAMAWA_PREPARED_BY_TEXT, fontsize=max(5, int(6.4 * font_scale)), fontfamily=ADAMAWA_FONT_FAMILY, ha="center")
+    fig.text(0.305, comp_mid_y, comp_display, fontsize=max(6, int(6.8 * font_scale)), fontfamily=ADAMAWA_FONT_FAMILY, va="center")
+    fig.text(0.41, comp_mid_y, f"CADASTRAL SHEET NO. {_safe_text(cadastral_sheet_no, '-')}", fontsize=max(5, int(6.0 * font_scale)), fontfamily=ADAMAWA_FONT_FAMILY, va="center")
+    fig.text(0.50, 0.052, f"SCALE {_normalize_scale_label_adamawa(scale_text)}", fontsize=max(6, int(6.8 * font_scale)), fontfamily=ADAMAWA_FONT_FAMILY, ha="center", va="bottom")
+    fig.text(0.50, 0.0315, DEFAULT_ADAMAWA_PREPARED_BY_TEXT, fontsize=max(5, int(6.0 * font_scale)), fontfamily=ADAMAWA_FONT_FAMILY, ha="center", va="bottom")
 
     table_ax = fig.add_axes([0.58, 0.072, 0.36, 0.102])
     table_ax.axis("off")
@@ -1636,9 +1636,9 @@ def _draw_adamawa_bottom_blocks(
 
     text_x = 0.58
     text_width = 0.37
-    text_font = max(5, int(5.6 * font_scale))
-    line_step = max(0.009, 0.011 * font_scale)
-    y_cursor = 0.060
+    text_font = max(5, int(5.2 * font_scale))
+    line_step = max(0.008, 0.0095 * font_scale)
+    y_cursor = 0.058
 
     disclaimer_lines = _wrap_figure_text(
         fig,
@@ -1647,7 +1647,7 @@ def _draw_adamawa_bottom_blocks(
         fontsize=text_font,
         fontfamily=ADAMAWA_FONT_FAMILY,
     )
-    for line in disclaimer_lines[:3]:
+    for line in disclaimer_lines[:2]:
         fig.text(
             text_x,
             y_cursor,
@@ -1666,8 +1666,8 @@ def _draw_adamawa_bottom_blocks(
         fontsize=text_font,
         fontfamily=ADAMAWA_FONT_FAMILY,
     )
-    for line in surveyed_lines[:2]:
-        if y_cursor < 0.033:
+    for line in surveyed_lines[:1]:
+        if y_cursor < 0.037:
             break
         fig.text(
             text_x,
