@@ -152,17 +152,17 @@ def add_north_arrow(ax, font_scale=1.0, style: str = "one_side_stem", color: str
 
     if style in ("one_side_stem", "one-sided-stem", "oneside_stem", "stacked_4n", "stacked4n", "vertical_4n"):
         stem_bottom = y - size * 1.02
-        stem_head_y = y + size * 0.72
-        n_y = y - size * 0.12
-        n_gap = size * 0.62
+        stem_tip_y = y + size * 0.84
+        n_y = y - size * 0.14
+        n_gap = size * 0.64
         upper_bottom = n_y + (n_gap / 2.0)
         lower_top = n_y - (n_gap / 2.0)
         arrow_tip_x = x + size * 0.19
-        arrow_tip_y = stem_head_y - size * 0.22
+        arrow_tip_y = stem_tip_y - size * 0.22
         fig.add_artist(
             mlines.Line2D(
                 [x, arrow_tip_x],
-                [stem_head_y, arrow_tip_y],
+                [stem_tip_y, arrow_tip_y],
                 transform=fig.transFigure,
                 color=col,
                 lw=max(0.8, 0.85 * font_scale),
@@ -172,7 +172,7 @@ def add_north_arrow(ax, font_scale=1.0, style: str = "one_side_stem", color: str
         fig.add_artist(
             mlines.Line2D(
                 [x, x],
-                [upper_bottom, stem_head_y],
+                [upper_bottom, stem_tip_y],
                 transform=fig.transFigure,
                 color=col,
                 lw=max(0.8, 0.85 * font_scale),
