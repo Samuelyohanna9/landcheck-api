@@ -15,6 +15,9 @@ import glob
 import re
 import shutil
 import zipfile
+import time
+import json
+import hashlib
 from threading import Lock
 
 from app.db import SessionLocal
@@ -38,6 +41,9 @@ router = APIRouter(prefix="/plots", tags=["plots"])
 
 BASE_DIR = os.path.dirname(os.path.dirname(__file__))
 REPORTS_DIR = os.path.join(BASE_DIR, "reports")
+PREVIEW_CACHE_DIR = os.path.join(REPORTS_DIR, "previews_cache")
+PREVIEW_CACHE_TTL_SECONDS = max(30, int(os.getenv("PLOT_PREVIEW_CACHE_TTL_SECONDS", "180")))
+PREVIEW_CACHE_MAX_FILES_PER_PLOT = max(5, int(os.getenv("PLOT_PREVIEW_CACHE_MAX_FILES_PER_PLOT", "24")))
 
 # Coordinate system EPSG codes mapping
 COORDINATE_SYSTEMS = {
@@ -78,6 +84,7 @@ def ensure_plots_schema_once(db: Session):
             return
         ensure_plot_meta_table(db)
         ensure_plot_feature_overrides_table(db)
+        ensure_plot_query_indexes(db)
         _PLOTS_SCHEMA_READY = True
 
 
@@ -88,6 +95,42 @@ def get_db():
         yield db
     finally:
         db.close()
+
+
+def _table_exists(db: Session, table_name: str) -> bool:
+    try:
+        return db.execute(text("SELECT to_regclass(:table_name)"), {"table_name": table_name}).scalar() is not None
+    except Exception:
+        return False
+
+
+def _safe_run_ddl(db: Session, ddl_sql: str):
+    try:
+        db.execute(text(ddl_sql))
+        db.commit()
+    except Exception:
+        db.rollback()
+
+
+def ensure_plot_query_indexes(db: Session):
+    index_plan = [
+        ("public.plots", "CREATE INDEX IF NOT EXISTS idx_plots_geom ON plots USING GIST (geom)"),
+        ("public.plot_buffers", "CREATE INDEX IF NOT EXISTS idx_plot_buffers_plot_id ON plot_buffers(plot_id)"),
+        ("public.plot_buffers", "CREATE INDEX IF NOT EXISTS idx_plot_buffers_geom ON plot_buffers USING GIST (geom)"),
+        ("public.detected_features", "CREATE INDEX IF NOT EXISTS idx_detected_features_plot_id ON detected_features(plot_id)"),
+        ("public.detected_features", "CREATE INDEX IF NOT EXISTS idx_detected_features_plot_type ON detected_features(plot_id, feature_type)"),
+        ("public.detected_features", "CREATE INDEX IF NOT EXISTS idx_detected_features_geom ON detected_features USING GIST (geom)"),
+        ("public.lines", "CREATE INDEX IF NOT EXISTS idx_lines_geom ON lines USING GIST (geom)"),
+        ("public.lines", "CREATE INDEX IF NOT EXISTS idx_lines_highway_not_null ON lines(highway) WHERE highway IS NOT NULL"),
+        ("public.lines", "CREATE INDEX IF NOT EXISTS idx_lines_waterway_not_null ON lines(waterway) WHERE waterway IS NOT NULL"),
+        ("public.multipolygons", "CREATE INDEX IF NOT EXISTS idx_multipolygons_geom ON multipolygons USING GIST (geom)"),
+        ("public.multipolygons", "CREATE INDEX IF NOT EXISTS idx_multipolygons_building_not_null ON multipolygons(building) WHERE building IS NOT NULL"),
+        ("public.multilinestrings", "CREATE INDEX IF NOT EXISTS idx_multilinestrings_geom ON multilinestrings USING GIST (geom)"),
+        ("public.multilinestrings", "CREATE INDEX IF NOT EXISTS idx_multilinestrings_type ON multilinestrings(type)"),
+    ]
+    for table_name, ddl_sql in index_plan:
+        if _table_exists(db, table_name):
+            _safe_run_ddl(db, ddl_sql)
 
 
 def ensure_plot_meta_table(db: Session):
@@ -310,6 +353,86 @@ def cleanup_preview_files(plot_id: int):
     ]
     for pattern in patterns:
         for path in glob.glob(pattern):
+            safe_remove(path)
+
+
+def build_preview_revision_token(db: Session, plot_id: int) -> dict:
+    feature_row = db.execute(text("""
+        SELECT COALESCE(MAX(id), 0) AS max_id, COUNT(*) AS count
+        FROM detected_features
+        WHERE plot_id = :plot_id
+    """), {"plot_id": plot_id}).mappings().first() if _table_exists(db, "public.detected_features") else {"max_id": 0, "count": 0}
+
+    override_row = db.execute(text("""
+        SELECT
+            COALESCE(MAX(EXTRACT(EPOCH FROM updated_at)), 0)::BIGINT AS updated_epoch,
+            COUNT(*) AS count
+        FROM plot_feature_overrides
+        WHERE plot_id = :plot_id
+    """), {"plot_id": plot_id}).mappings().first() if _table_exists(db, "public.plot_feature_overrides") else {"updated_epoch": 0, "count": 0}
+
+    geom_hex = db.execute(
+        text("SELECT encode(ST_AsEWKB(geom), 'hex') FROM plots WHERE id = :plot_id"),
+        {"plot_id": plot_id},
+    ).scalar() if _table_exists(db, "public.plots") else ""
+
+    return {
+        "features_max_id": int((feature_row or {}).get("max_id") or 0),
+        "features_count": int((feature_row or {}).get("count") or 0),
+        "overrides_updated_epoch": int((override_row or {}).get("updated_epoch") or 0),
+        "overrides_count": int((override_row or {}).get("count") or 0),
+        "plot_geom_hash": hashlib.sha256((geom_hex or "").encode("utf-8")).hexdigest() if geom_hex else "",
+    }
+
+
+def build_preview_cache_key(plot_id: int, payload: dict, revision_token: dict) -> str:
+    packed = json.dumps(
+        {
+            "plot_id": plot_id,
+            "payload": payload,
+            "revision": revision_token,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+    return hashlib.sha256(packed.encode("utf-8")).hexdigest()
+
+
+def preview_cache_path(plot_id: int, cache_key: str) -> str:
+    os.makedirs(PREVIEW_CACHE_DIR, exist_ok=True)
+    return os.path.join(PREVIEW_CACHE_DIR, f"plot_{plot_id}_{cache_key}.png")
+
+
+def get_cached_preview_path(plot_id: int, cache_key: str) -> str | None:
+    cache_path = preview_cache_path(plot_id, cache_key)
+    if not os.path.exists(cache_path):
+        return None
+    try:
+        age_s = max(0.0, time.time() - os.path.getmtime(cache_path))
+        if age_s > PREVIEW_CACHE_TTL_SECONDS:
+            safe_remove(cache_path)
+            return None
+        return cache_path
+    except Exception:
+        return None
+
+
+def prune_preview_cache(plot_id: int):
+    os.makedirs(PREVIEW_CACHE_DIR, exist_ok=True)
+    pattern = os.path.join(PREVIEW_CACHE_DIR, f"plot_{plot_id}_*.png")
+    files = []
+    for path in glob.glob(pattern):
+        try:
+            files.append((path, os.path.getmtime(path)))
+        except Exception:
+            safe_remove(path)
+    files.sort(key=lambda item: item[1], reverse=True)
+    now = time.time()
+    for idx, (path, modified_at) in enumerate(files):
+        too_old = (now - modified_at) > (PREVIEW_CACHE_TTL_SECONDS * 6)
+        overflow = idx >= PREVIEW_CACHE_MAX_FILES_PER_PLOT
+        if too_old or overflow:
             safe_remove(path)
 
 
@@ -835,6 +958,35 @@ def preview_plot_map(plot_id: int, db: Session = Depends(get_db), background_tas
     road_width_m: float | None = Body(None),
     road_width_override_m: float | None = Body(None)):
 
+    payload_for_cache = {
+        "title_text": title_text,
+        "location_text": location_text,
+        "lga_text": lga_text,
+        "state_text": state_text,
+        "scale_text": scale_text,
+        "surveyor_name": surveyor_name,
+        "surveyor_rank": surveyor_rank,
+        "certification_statement": certification_statement,
+        "station_names": station_names or [],
+        "coordinate_system": coordinate_system,
+        "paper_size": paper_size,
+        "north_arrow_style": north_arrow_style,
+        "north_arrow_color": north_arrow_color,
+        "beacon_style": beacon_style,
+        "road_width_m": road_width_m,
+        "road_width_override_m": road_width_override_m,
+    }
+    revision_token = build_preview_revision_token(db, plot_id)
+    cache_key = build_preview_cache_key(plot_id, payload_for_cache, revision_token)
+    prune_preview_cache(plot_id)
+    cached_path = get_cached_preview_path(plot_id, cache_key)
+    if cached_path:
+        return FileResponse(
+            cached_path,
+            media_type="image/png",
+            headers={"Cache-Control": "no-store"},
+        )
+
     cleanup_preview_files(plot_id)
     tmp_map = tempfile.NamedTemporaryFile(suffix="_preview.png", delete=False)
     map_path = tmp_map.name
@@ -885,14 +1037,27 @@ def preview_plot_map(plot_id: int, db: Session = Depends(get_db), background_tas
         preview_mode=True,
     )
 
-    if background_tasks:
-        background_tasks.add_task(safe_remove, map_path)
+    cache_path = preview_cache_path(plot_id, cache_key)
+    served_path = map_path
+    served_background = background_tasks
+    try:
+        shutil.copyfile(map_path, cache_path)
+        safe_remove(map_path)
+        served_path = cache_path
+        served_background = None
+    except Exception:
+        pass
+
+    if served_path == map_path:
+        if served_background is None:
+            served_background = BackgroundTasks()
+        served_background.add_task(safe_remove, map_path)
 
     return FileResponse(
-        map_path,
+        served_path,
         media_type="image/png",
         headers={"Cache-Control": "no-store"},
-        background=background_tasks,
+        background=served_background,
     )
 
 
