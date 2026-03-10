@@ -151,11 +151,11 @@ def add_north_arrow(ax, font_scale=1.0, style: str = "one_side_stem", color: str
     size = 0.030 * max(0.8, font_scale)
 
     if style in ("one_side_stem", "one-sided-stem", "oneside_stem", "stacked_4n", "stacked4n", "vertical_4n"):
-        stem_knee_y = y + size * 0.44
+        stem_knee_y = y + size * 0.50
         stem_bottom = y - size * 1.02
-        n_y = y - size * 0.12
-        head_top_x = x + size * 0.17
-        head_top_y = stem_knee_y + size * 0.28
+        n_y = y - size * 0.28
+        head_top_x = x + size * 0.16
+        head_top_y = stem_knee_y + size * 0.30
         head_right_x = x + size * 0.21
         fig.add_artist(
             mlines.Line2D(
@@ -193,10 +193,11 @@ def add_north_arrow(ax, font_scale=1.0, style: str = "one_side_stem", color: str
             "N",
             ha="center",
             va="center",
-            fontsize=int(11.0 * font_scale),
+            fontsize=int(10.5 * font_scale),
             color=col,
             weight="normal",
             fontfamily="DejaVu Sans",
+            zorder=25,
         )
         return
 
