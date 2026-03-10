@@ -1071,9 +1071,26 @@ def annotate_vertices(
         if ang < -90 or ang > 90:
             ang += 180
 
+        label_offset = max(2.0, (6.0 / 1000.0) * scale_ratio)
+        label_nx, label_ny = normal
+        if boundary_poly is not None:
+            test_pt = Point(mx + label_nx * label_offset, my + label_ny * label_offset)
+            if boundary_poly.contains(test_pt):
+                label_nx, label_ny = -label_nx, -label_ny
+        # If this edge is fenced, push the bearing/distance text farther away
+        # so the red annotation clears the fence teeth.
+        if avoid_geom is not None:
+            try:
+                seg = LineString([(p1.x, p1.y), (p2.x, p2.y)])
+                fence_touch_tol = max(0.5, (2.5 / 1000.0) * scale_ratio)
+                if seg.buffer(fence_touch_tol).intersects(avoid_geom):
+                    label_offset = max(label_offset, (10.0 / 1000.0) * scale_ratio)
+            except Exception:
+                pass
+
         place_text(
-            mx,
-            my,
+            mx + label_nx * label_offset,
+            my + label_ny * label_offset,
             f"{format_bearing_dms(bearing)}\n{dist:.2f}m",
             font_size=int(6.5 * font_scale),
             color="red",
@@ -1081,7 +1098,7 @@ def annotate_vertices(
             weight="normal",
             scale_w=0.02,
             scale_h=0.025,
-            normal=normal,
+            normal=None,
         )
 
     return skipped, placed_boxes
@@ -1201,8 +1218,9 @@ def _draw_fence_line(ax, line_geom, scale_ratio: int, font_scale=1.0):
         ax.plot(x_vals, y_vals, color="black", lw=0.8 * font_scale, zorder=7)
         return
 
-    step_span = max(2.5, (9.0 / 1000.0) * max(scale_ratio, 100))
-    tooth_amp = max(1.2, (3.0 / 1000.0) * max(scale_ratio, 100))
+    # Slightly smaller fence symbol to reduce visual dominance in both templates.
+    step_span = max(2.2, (7.5 / 1000.0) * max(scale_ratio, 100))
+    tooth_amp = max(1.0, (2.4 / 1000.0) * max(scale_ratio, 100))
     probe = max(0.4, step_span * 0.2)
     if length < step_span * 1.2:
         ax.plot(x_vals, y_vals, color="black", lw=0.8 * font_scale, zorder=7)
@@ -1267,7 +1285,7 @@ def _draw_fence_line(ax, line_geom, scale_ratio: int, font_scale=1.0):
     except Exception:
         pass
 
-    ax.plot(points_x, points_y, color="black", lw=0.8 * font_scale, zorder=7)
+    ax.plot(points_x, points_y, color="black", lw=0.75 * font_scale, zorder=7)
 
 
 def draw_fences(ax, fence_geoms, display_epsg: int, scale_ratio: int, font_scale=1.0):
@@ -1280,6 +1298,36 @@ def draw_fences(ax, fence_geoms, display_epsg: int, scale_ratio: int, font_scale
             continue
         for line_part in _iter_line_geometries(projected):
             _draw_fence_line(ax, line_part, scale_ratio=scale_ratio, font_scale=font_scale)
+
+
+def build_fence_avoid_geom(fence_geoms, display_epsg: int, scale_ratio: int):
+    """
+    Build a buffered projected fence geometry used to offset bearing/distance labels
+    when they sit on fenced boundary edges.
+    """
+    if not fence_geoms:
+        return None
+    buffer_m = max(0.8, (1.8 / 1000.0) * max(scale_ratio, 100))
+    buffered_parts = []
+    for geom in fence_geoms:
+        try:
+            projected = gpd.GeoSeries([geom], crs="EPSG:4326").to_crs(epsg=display_epsg).iloc[0]
+        except Exception:
+            continue
+        for line_part in _iter_line_geometries(projected):
+            try:
+                buffered_parts.append(line_part.buffer(buffer_m, cap_style=2, join_style=2))
+            except Exception:
+                continue
+    if not buffered_parts:
+        return None
+    merged = buffered_parts[0]
+    for part in buffered_parts[1:]:
+        try:
+            merged = merged.union(part)
+        except Exception:
+            continue
+    return merged
 
 
 def _safe_text(value, fallback=""):
@@ -1958,6 +2006,7 @@ def _render_plot_map_layout_adamawa(
         )
     if fences:
         draw_fences(ax, fences, display_epsg, scale_ratio=scale_ratio, font_scale=font_scale)
+    fence_avoid_geom = build_fence_avoid_geom(fences, display_epsg=display_epsg, scale_ratio=scale_ratio)
 
     gdf_plot.plot(ax=ax, facecolor="none", edgecolor="red", lw=1.1 * font_scale, zorder=20)
     ax.set_xlim(target_xlim)
@@ -1973,6 +2022,7 @@ def _render_plot_map_layout_adamawa(
         station_names=station_names,
         font_scale=font_scale,
         min_label_length_m=0.0,
+        avoid_geom=fence_avoid_geom,
         scale_ratio=scale_ratio,
         boundary_poly=poly,
         beacon_style=beacon_style,
@@ -2410,7 +2460,18 @@ def render_plot_map_layout(
             ax=ax, facecolor="none", edgecolor="black", lw=1*font_scale, zorder=9
         )
     if fences or added_fences:
-        draw_fences(ax, fences, display_epsg, scale_ratio=scale_ratio, font_scale=font_scale)
+        draw_fences(
+            ax,
+            list(fences or []) + list(added_fences or []),
+            display_epsg,
+            scale_ratio=scale_ratio,
+            font_scale=font_scale,
+        )
+    fence_avoid_geom = build_fence_avoid_geom(
+        list(fences or []) + list(added_fences or []),
+        display_epsg=display_epsg,
+        scale_ratio=scale_ratio,
+    )
 
     # Boundary thickness in mm based on common drafting line weights
     paper_name = paper_config["name"]
@@ -2436,6 +2497,7 @@ def render_plot_map_layout(
         station_names,
         font_scale,
         min_label_length_m=min_label_length_m,
+        avoid_geom=fence_avoid_geom,
         scale_ratio=scale_ratio,
         boundary_poly=poly,
         beacon_style=beacon_style,
