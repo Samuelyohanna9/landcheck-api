@@ -1571,26 +1571,35 @@ def _draw_adamawa_bottom_blocks(
     left_x = 0.06
     y = 0.182
 
-    cp_name = _safe_text(control_point_name, "CONTROL POINT")
-    origin_display = re.sub(r"\s+", " ", _safe_text(origin_text, DEFAULT_ADAMAWA_ORIGIN_TEXT).replace(":-", " ").replace(":", " ")).strip()
+    cp_name = _safe_text(control_point_name, "CONTROL POINT").replace("\n", " ").strip().upper()
+    origin_display = _safe_text(origin_text, DEFAULT_ADAMAWA_ORIGIN_TEXT).strip().upper()
+    if not origin_display.startswith("ORIGIN"):
+        origin_display = f"ORIGIN:- {origin_display}"
+    else:
+        origin_display = re.sub(r"^ORIGIN\s*[:\-]*\s*", "ORIGIN:- ", origin_display)
 
-    fig.text(left_x, y, f"UTM Coordinate of {cp_name}", fontsize=footer_font, color="blue", fontfamily=ADAMAWA_FONT_FAMILY)
+    def _with_prefix(prefix: str, value: str) -> str:
+        raw = _safe_text(value, "-").strip()
+        if not raw or raw == "-":
+            return f"{prefix} -"
+        upper = raw.upper()
+        if upper.startswith(f"{prefix} "):
+            return raw
+        if upper.startswith(prefix):
+            return f"{prefix} {raw[len(prefix):].strip()}"
+        return f"{prefix} {raw}"
+
+    fig.text(left_x, y, f"UTM CO-ORDINATE OF {cp_name}", fontsize=footer_font, color="blue", fontfamily=ADAMAWA_FONT_FAMILY, weight="bold")
     y -= line_gap
-    fig.text(left_x, y, _safe_text(easting_text, "-"), fontsize=footer_font, fontfamily=ADAMAWA_FONT_FAMILY)
+    fig.text(left_x, y, _with_prefix("N", northing_text), fontsize=footer_font, color="blue", fontfamily=ADAMAWA_FONT_FAMILY)
     y -= line_gap
-    fig.text(left_x, y, _safe_text(northing_text, "-"), fontsize=footer_font, fontfamily=ADAMAWA_FONT_FAMILY)
+    fig.text(left_x, y, _with_prefix("E", easting_text), fontsize=footer_font, color="blue", fontfamily=ADAMAWA_FONT_FAMILY)
     y -= line_gap
-    fig.text(left_x, y, _safe_text(elevation_text, "-"), fontsize=footer_font, fontfamily=ADAMAWA_FONT_FAMILY)
+    fig.text(left_x, y, _with_prefix("Z", elevation_text), fontsize=footer_font, color="blue", fontfamily=ADAMAWA_FONT_FAMILY)
     y -= line_gap
     fig.text(left_x, y, origin_display, fontsize=footer_font, color="blue", fontfamily=ADAMAWA_FONT_FAMILY)
     y -= line_gap
-    fig.text(left_x, y, _safe_text(topo_sheet_text, DEFAULT_ADAMAWA_TOPO_SHEET_TEXT), fontsize=footer_font, fontfamily=ADAMAWA_FONT_FAMILY)
-    y -= (line_gap + 0.002)
-    fig.text(left_x, y, DEFAULT_ADAMAWA_CHECKED_BY_TEXT, fontsize=footer_font, fontfamily=ADAMAWA_FONT_FAMILY)
-    y -= (line_gap + 0.004)
-    fig.text(left_x, y, DEFAULT_ADAMAWA_PASSED_BY_TEXT, fontsize=footer_font, fontfamily=ADAMAWA_FONT_FAMILY)
-    y -= line_gap
-    fig.text(left_x, y, DEFAULT_ADAMAWA_COPYRIGHT_TEXT, fontsize=footer_font, fontfamily=ADAMAWA_FONT_FAMILY)
+    fig.text(left_x, y, _safe_text(topo_sheet_text, DEFAULT_ADAMAWA_TOPO_SHEET_TEXT).upper(), fontsize=footer_font, fontfamily=ADAMAWA_FONT_FAMILY)
 
     # Computation/plan block with angular curly style like the Adamawa sample.
     comp_label_y = 0.079
@@ -1620,11 +1629,11 @@ def _draw_adamawa_bottom_blocks(
     comp_mid_y = (top_y + bottom_y) / 2.0
     fig.text(0.292, comp_mid_y, comp_display, fontsize=footer_font, fontfamily=ADAMAWA_FONT_FAMILY, va="center")
     fig.text(0.40, comp_mid_y, f"CADASTRAL SHEET NO. {_safe_text(cadastral_sheet_no, '-')}", fontsize=footer_font, fontfamily=ADAMAWA_FONT_FAMILY, va="center")
-    fig.text(0.50, 0.043, DEFAULT_ADAMAWA_PREPARED_BY_TEXT, fontsize=footer_font, fontfamily=ADAMAWA_FONT_FAMILY, ha="center", va="center")
+    # Sample Adamawa footer keeps this section uncluttered; omit extra bottom line here.
 
     table_ax = fig.add_axes([0.58, 0.110, 0.36, 0.090])
     table_ax.axis("off")
-    header = ["FROM", "BEARING", "DISTANCE", "TO"]
+    header = ["FROM", "BEARING", "LENGTH", "TO"]
     all_rows = [[r["from"], r["bearing"], r["length"], r["to"]] for r in segment_rows]
     # Keep the table readable and non-overlapping for polygons with many vertices.
     # For overflow, show a compact summary row instead of shrinking text into collisions.
@@ -1664,7 +1673,7 @@ def _draw_adamawa_bottom_blocks(
     # Draw right-note text in a dedicated note block below the table.
     right_note_ax = fig.add_axes([0.58, 0.032, 0.36, 0.066])
     right_note_ax.axis("off")
-    note_font = min(7, max(5, footer_font + 1))
+    note_font = footer_font
     disclaimer_line = _safe_text(disclaimer_text, DEFAULT_ADAMAWA_DISCLAIMER_TEXT).strip()
     surveyed_line = _safe_text(surveyed_by_text, "").strip()
 
@@ -1693,7 +1702,7 @@ def _draw_adamawa_bottom_blocks(
         fontfamily=ADAMAWA_FONT_FAMILY,
         ha="left",
         va="top",
-        linespacing=1.02,
+        linespacing=1.0,
         clip_on=True,
     )
 
