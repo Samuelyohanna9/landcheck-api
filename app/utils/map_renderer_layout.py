@@ -924,6 +924,7 @@ def annotate_vertices(
         scale_h=0.02,
         normal=None,
         normal_offset_mult: float = 1.0,
+        line_spacing: float = 0.95,
     ):
         offset_m = max(2.0, (6.0 / 1000.0) * scale_ratio) * max(0.6, normal_offset_mult)
         candidates = [(x, y)]
@@ -976,7 +977,7 @@ def annotate_vertices(
                     rotation=rotation,
                     weight=weight,
                     multialignment="center",
-                    linespacing=0.95,
+                    linespacing=line_spacing,
                     zorder=25,
                 )
                 placed_boxes.append(bx)
@@ -1085,6 +1086,7 @@ def annotate_vertices(
 
         label_nx, label_ny = normal
         label_offset_mult = 1.0
+        label_line_spacing = 0.95
         base_offset = max(2.0, (6.0 / 1000.0) * scale_ratio)
         if boundary_poly is not None:
             test_pt = Point(mx + label_nx * base_offset, my + label_ny * base_offset)
@@ -1098,7 +1100,10 @@ def annotate_vertices(
                 fence_touch_tol = max(0.5, (2.5 / 1000.0) * scale_ratio)
                 if seg.buffer(fence_touch_tol).intersects(avoid_geom):
                     # Keep a subtle extra separation only on fenced edges.
-                    label_offset_mult = 1.35
+                    label_offset_mult = 1.10
+                    # Increase bearing/distance interval on fenced boundaries
+                    # so the two red lines of text clear fence teeth.
+                    label_line_spacing = 1.35
             except Exception:
                 pass
 
@@ -1114,6 +1119,7 @@ def annotate_vertices(
             scale_h=0.025,
             normal=(label_nx, label_ny),
             normal_offset_mult=label_offset_mult,
+            line_spacing=label_line_spacing,
         )
 
     return skipped, placed_boxes
