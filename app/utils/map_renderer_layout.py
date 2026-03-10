@@ -520,8 +520,11 @@ def add_north_arrow(ax, font_scale=1.0, style: str = "one_side_stem", color: str
         # diagonal down-left into stem knee, then horizontal to the right.
         stem_knee_y = y + size * 0.52
         stem_bottom = y - size * 1.05
-        n_x = x + size * 0.03
-        n_y = y - size * 0.36
+        n_x = x
+        n_y = y - size * 0.34
+        n_gap = size * 0.42
+        upper_stem_bottom = n_y + (n_gap / 2.0)
+        lower_stem_top = n_y - (n_gap / 2.0)
         head_top_x = x + size * 0.18
         head_top_y = stem_knee_y + size * 0.30
         head_right_x = x + size * 0.24
@@ -529,7 +532,18 @@ def add_north_arrow(ax, font_scale=1.0, style: str = "one_side_stem", color: str
         fig.add_artist(
             mlines.Line2D(
                 [x, x],
-                [stem_bottom, stem_knee_y],
+                [upper_stem_bottom, stem_knee_y],
+                transform=fig.transFigure,
+                color=col,
+                lw=line_lw,
+                zorder=20,
+                solid_capstyle="butt",
+            )
+        )
+        fig.add_artist(
+            mlines.Line2D(
+                [x, x],
+                [stem_bottom, lower_stem_top],
                 transform=fig.transFigure,
                 color=col,
                 lw=line_lw,
