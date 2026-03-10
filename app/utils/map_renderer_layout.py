@@ -1378,27 +1378,14 @@ def _draw_adamawa_map_frame(ax, font_scale=1.0):
     ax.add_line(mlines.Line2D([1, 1], [0, 1], transform=ax.transAxes, color=frame_color, lw=frame_lw, zorder=29, clip_on=False))
 
 
-def _draw_adamawa_north_arrow(ax, font_scale=1.0):
-    arrow_color = "blue"
-    ax.annotate(
-        "",
-        xy=(0.973, 1.01),
-        xytext=(0.973, 0.935),
-        xycoords=ax.transAxes,
-        arrowprops=dict(arrowstyle="-|>", color=arrow_color, lw=max(0.8, 1.0 * font_scale)),
-        annotation_clip=False,
-    )
-    ax.text(
-        0.973,
-        1.018,
-        "N",
-        transform=ax.transAxes,
-        color=arrow_color,
-        fontsize=max(8, int(10 * font_scale)),
-        ha="center",
-        va="bottom",
-        fontfamily=ADAMAWA_FONT_FAMILY,
-    )
+def _draw_adamawa_north_arrow(
+    ax,
+    font_scale=1.0,
+    style: str = "classic",
+    color: str = "black",
+):
+    # Reuse the same north-arrow style/color logic used by the general template.
+    add_north_arrow(ax, font_scale=font_scale, style=style, color=color)
 
 
 def _draw_adamawa_bottom_blocks(
@@ -1737,7 +1724,12 @@ def _render_plot_map_layout_adamawa(
 
     _draw_adamawa_map_frame(ax, font_scale=font_scale)
     _draw_adamawa_coordinate_labels(ax, font_scale=font_scale)
-    _draw_adamawa_north_arrow(ax, font_scale=font_scale)
+    _draw_adamawa_north_arrow(
+        ax,
+        font_scale=font_scale,
+        style=north_arrow_style,
+        color=north_arrow_color,
+    )
 
     segment_rows = _build_segment_rows(poly, station_names=station_names)
     first_coords = list(poly.exterior.coords)[0]
