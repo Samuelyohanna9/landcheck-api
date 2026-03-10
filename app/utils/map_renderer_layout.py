@@ -1092,6 +1092,17 @@ def annotate_vertices(
             test_pt = Point(mx + label_nx * base_offset, my + label_ny * base_offset)
             if boundary_poly.contains(test_pt):
                 label_nx, label_ny = -label_nx, -label_ny
+        if avoid_geom is not None:
+            try:
+                check_buf = avoid_geom.buffer(max(0.2, base_offset * 0.15))
+                plus_pt = Point(mx + label_nx * base_offset, my + label_ny * base_offset)
+                minus_pt = Point(mx - label_nx * base_offset, my - label_ny * base_offset)
+                plus_blocked = check_buf.contains(plus_pt)
+                minus_blocked = check_buf.contains(minus_pt)
+                if plus_blocked and not minus_blocked:
+                    label_nx, label_ny = -label_nx, -label_ny
+            except Exception:
+                pass
         # If this edge is fenced, push the bearing/distance text farther away
         # so the red annotation clears the fence teeth.
         if avoid_geom is not None:
@@ -1100,7 +1111,7 @@ def annotate_vertices(
                 fence_touch_tol = max(0.5, (2.5 / 1000.0) * scale_ratio)
                 if seg.buffer(fence_touch_tol).intersects(avoid_geom):
                     # Keep a subtle extra separation only on fenced edges.
-                    label_offset_mult = 1.10
+                    label_offset_mult = 1.08
                     # Increase bearing/distance interval on fenced boundaries
                     # so the two red lines of text clear fence teeth.
                     label_line_spacing = 1.35
@@ -1328,7 +1339,8 @@ def build_fence_avoid_geom(fence_geoms, display_epsg: int, scale_ratio: int):
     """
     if not fence_geoms:
         return None
-    buffer_m = max(0.8, (1.8 / 1000.0) * max(scale_ratio, 100))
+    # One-sided buffer: match fence teeth side used in _draw_fence_line (side=+1).
+    buffer_m = max(1.0, (2.2 / 1000.0) * max(scale_ratio, 100))
     buffered_parts = []
     for geom in fence_geoms:
         try:
@@ -1337,7 +1349,9 @@ def build_fence_avoid_geom(fence_geoms, display_epsg: int, scale_ratio: int):
             continue
         for line_part in _iter_line_geometries(projected):
             try:
-                buffered_parts.append(line_part.buffer(buffer_m, cap_style=2, join_style=2))
+                tooth_side = line_part.buffer(buffer_m, cap_style=2, join_style=2, single_sided=True)
+                if tooth_side is not None and not tooth_side.is_empty:
+                    buffered_parts.append(tooth_side)
             except Exception:
                 continue
     if not buffered_parts:
