@@ -1326,6 +1326,9 @@ def _draw_adamawa_header(
 ):
     fig.add_artist(patches.Rectangle((0.03, 0.03), 0.94, 0.94, transform=fig.transFigure, fill=False, lw=1.2))
     y = 0.945
+    scale_y = y - 0.098
+    authority_y = y - 0.123
+    authority_date_y = y - 0.140
     fig.text(
         0.5,
         y,
@@ -1374,7 +1377,7 @@ def _draw_adamawa_header(
     )
     fig.text(
         0.5,
-        y - 0.105,
+        scale_y,
         f"SCALE:- {_normalize_scale_label(scale_text)}",
         ha="center",
         va="center",
@@ -1383,7 +1386,7 @@ def _draw_adamawa_header(
     )
     fig.text(
         0.5,
-        y - 0.155,
+        authority_y,
         _safe_text(authority_title, DEFAULT_ADAMAWA_AUTHORITY_TITLE),
         ha="center",
         va="center",
@@ -1392,7 +1395,7 @@ def _draw_adamawa_header(
     )
     fig.text(
         0.5,
-        y - 0.176,
+        authority_date_y,
         _safe_text(authority_date_text, DEFAULT_ADAMAWA_AUTHORITY_DATE),
         ha="center",
         va="center",
