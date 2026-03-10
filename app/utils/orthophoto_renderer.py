@@ -149,31 +149,33 @@ def add_north_arrow(ax, font_scale=1.0, style: str = "stacked_4n", color: str = 
     size = 0.030 * max(0.8, font_scale)
 
     if style in ("stacked_4n", "stacked4n", "vertical_4n"):
-        stem_top = y - size * 0.05
-        stem_bottom = y - size * 1.10
+        four_y = y + size * 0.90
+        n_y = y + size * 0.44
+        stem_top = y + size * 0.06
+        stem_bottom = y - size * 1.00
         fig.add_artist(
             mlines.Line2D(
                 [x, x],
                 [stem_bottom, stem_top],
                 transform=fig.transFigure,
                 color=col,
-                lw=max(0.9, 1.0 * font_scale),
+                lw=max(0.8, 0.9 * font_scale),
                 zorder=20,
             )
         )
         fig.text(
-            x - size * 0.02,
-            y + size * 0.88,
+            x,
+            four_y,
             "4",
             ha="center",
             va="center",
-            fontsize=int(16 * font_scale),
+            fontsize=int(15 * font_scale),
             color=col,
             weight="normal",
         )
         fig.text(
             x,
-            y + size * 0.42,
+            n_y,
             "N",
             ha="center",
             va="center",
