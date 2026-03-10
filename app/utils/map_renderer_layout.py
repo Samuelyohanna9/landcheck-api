@@ -516,31 +516,43 @@ def add_north_arrow(ax, font_scale=1.0, style: str = "one_side_stem", color: str
     size = 0.030 * max(0.8, font_scale)
 
     if style in ("one_side_stem", "one-sided-stem", "oneside_stem", "stacked_4n", "stacked4n", "vertical_4n"):
-        # Match reference symbol: "4" above "N" with a straight vertical stem.
-        stem_top = y + size * 0.44
+        # Match reference symbol without text "4":
+        # diagonal down-left into stem knee, then horizontal to the right.
+        stem_knee_y = y + size * 0.44
         stem_bottom = y - size * 1.02
-        four_y = y + size * 0.75
         n_y = y - size * 0.12
+        head_top_x = x + size * 0.17
+        head_top_y = stem_knee_y + size * 0.28
+        head_right_x = x + size * 0.21
         fig.add_artist(
             mlines.Line2D(
                 [x, x],
-                [stem_bottom, stem_top],
+                [stem_bottom, stem_knee_y],
                 transform=fig.transFigure,
                 color=col,
                 lw=max(0.8, 0.9 * font_scale),
                 zorder=20,
             )
         )
-        fig.text(
-            x,
-            four_y,
-            "4",
-            ha="center",
-            va="center",
-            fontsize=int(11.0 * font_scale),
-            color=col,
-            weight="normal",
-            fontfamily="DejaVu Sans",
+        fig.add_artist(
+            mlines.Line2D(
+                [head_top_x, x],
+                [head_top_y, stem_knee_y],
+                transform=fig.transFigure,
+                color=col,
+                lw=max(0.8, 0.9 * font_scale),
+                zorder=20,
+            )
+        )
+        fig.add_artist(
+            mlines.Line2D(
+                [x, head_right_x],
+                [stem_knee_y, stem_knee_y],
+                transform=fig.transFigure,
+                color=col,
+                lw=max(0.8, 0.9 * font_scale),
+                zorder=20,
+            )
         )
         fig.text(
             x,
