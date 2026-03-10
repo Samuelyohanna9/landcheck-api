@@ -1571,7 +1571,7 @@ def _draw_adamawa_bottom_blocks(
     fig.add_artist(mlines.Line2D([brace_tip, brace_trunk], [mid_y, mid_y - 0.004], transform=fig.transFigure, color="black", lw=lw))
     fig.add_artist(mlines.Line2D([brace_trunk, brace_trunk], [mid_y - 0.004, bottom_y], transform=fig.transFigure, color="black", lw=lw))
 
-    comp_display = _safe_text(plan_no, _safe_text(computation_no, "-"))
+    comp_display = _safe_text(computation_no, _safe_text(plan_no, "-"))
     fig.text(0.305, 0.064, comp_display, fontsize=max(6, int(7.5 * font_scale)), fontfamily=ADAMAWA_FONT_FAMILY, va="center")
     fig.text(0.41, 0.064, f"CADASTRAL SHEET NO. {_safe_text(cadastral_sheet_no, '-')}", fontsize=max(6, int(6.8 * font_scale)), fontfamily=ADAMAWA_FONT_FAMILY, va="center")
 
@@ -1786,7 +1786,7 @@ def _render_plot_map_layout_adamawa(
     map_left, map_bottom, map_width, map_height = 0.08, 0.20, 0.84, 0.58
     ax = fig.add_axes([map_left, map_bottom, map_width, map_height])
 
-    rof_no = _safe_text(adamawa_rof_no, _safe_text(adamawa_computation_no, f"{plot_id}"))
+    rof_no = _safe_text(adamawa_rof_no, f"{plot_id}")
     owner_text = _safe_text(adamawa_owner_name, title_text)
     _draw_adamawa_header(
         fig,
@@ -1903,19 +1903,26 @@ def _render_plot_map_layout_adamawa(
 
     segment_rows = _build_segment_rows(poly, station_names=station_names)
     first_coords = list(poly.exterior.coords)[0]
-    control_point_name = _safe_text(adamawa_control_point_name, str((station_names or ["A"])[0]))
-    northing_value = _safe_text(adamawa_northing, f"{first_coords[1]:.3f}m")
-    easting_value = _safe_text(adamawa_easting, f"{first_coords[0]:.3f}m")
+    control_point_name = str((station_names or ["A"])[0])
+    northing_value = f"{first_coords[1]:.3f}m"
+    easting_value = f"{first_coords[0]:.3f}m"
+    if len(first_coords) >= 3 and first_coords[2] is not None:
+        try:
+            elevation_value = f"{float(first_coords[2]):.3f}m"
+        except Exception:
+            elevation_value = "-"
+    else:
+        elevation_value = "-"
     _draw_adamawa_bottom_blocks(
         fig,
         segment_rows=segment_rows,
         control_point_name=control_point_name,
         northing_text=northing_value,
         easting_text=easting_value,
-        elevation_text=_safe_text(adamawa_elevation, "-"),
+        elevation_text=elevation_value,
         origin_text=_safe_text(adamawa_origin_text, DEFAULT_ADAMAWA_ORIGIN_TEXT),
         topo_sheet_text=_safe_text(adamawa_topo_sheet_text, DEFAULT_ADAMAWA_TOPO_SHEET_TEXT),
-        computation_no=_safe_text(adamawa_computation_no, rof_no),
+        computation_no=rof_no,
         cadastral_sheet_no=_safe_text(adamawa_cadastral_sheet_no, "-"),
         plan_no=_safe_text(adamawa_plan_no, ""),
         surveyed_by_text=_safe_text(adamawa_surveyed_by_text, f"Surveyed by {surveyor_rank} {surveyor_name}".strip()),
