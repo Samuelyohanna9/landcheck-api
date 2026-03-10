@@ -151,26 +151,15 @@ def add_north_arrow(ax, font_scale=1.0, style: str = "one_side_stem", color: str
     size = 0.032 * max(0.8, font_scale)
 
     if style in ("one_side_stem", "one-sided-stem", "oneside_stem", "stacked_4n", "stacked4n", "vertical_4n"):
-        stem_top = y + size * 0.50
-        stem_bottom = y - size * 1.05
-        four_y = y + size * 0.80
-        n_y = y - size * 0.12
-        n_x = x + size * 0.05
-        n_gap = size * 0.26
-        lower_stem_top = n_y - (n_gap / 2.0)
-        upper_stem_bottom = n_y + (n_gap / 2.0)
+        # "N" centred on a vertical stem line (upper stem + N + lower stem).
+        n_y = y + size * 0.20
+        n_gap = size * 0.28
+        stem_top = n_y + n_gap / 2.0 + size * 0.60
+        stem_bottom = n_y - n_gap / 2.0 - size * 0.90
+        lower_stem_top = n_y - n_gap / 2.0
+        upper_stem_bottom = n_y + n_gap / 2.0
         line_lw = max(0.7, 0.90 * font_scale)
-        fig.add_artist(
-            mlines.Line2D(
-                [x, x],
-                [stem_bottom, lower_stem_top],
-                transform=fig.transFigure,
-                color=col,
-                lw=line_lw,
-                zorder=20,
-                solid_capstyle="butt",
-            )
-        )
+        # Upper stem (above N)
         fig.add_artist(
             mlines.Line2D(
                 [x, x],
@@ -182,27 +171,27 @@ def add_north_arrow(ax, font_scale=1.0, style: str = "one_side_stem", color: str
                 solid_capstyle="butt",
             )
         )
-        fig.text(
-            x,
-            four_y,
-            "4",
-            ha="center",
-            va="center",
-            fontsize=int(11.0 * font_scale),
-            color=col,
-            weight="normal",
-            fontfamily="DejaVu Sans",
-            zorder=25,
+        # Lower stem (below N)
+        fig.add_artist(
+            mlines.Line2D(
+                [x, x],
+                [stem_bottom, lower_stem_top],
+                transform=fig.transFigure,
+                color=col,
+                lw=line_lw,
+                zorder=20,
+                solid_capstyle="butt",
+            )
         )
         fig.text(
-            n_x,
+            x,
             n_y,
             "N",
             ha="center",
             va="center",
-            fontsize=int(10.0 * font_scale),
+            fontsize=int(11.0 * font_scale),
             color=col,
-            weight="normal",
+            weight="bold",
             fontfamily="DejaVu Sans",
             zorder=25,
         )
