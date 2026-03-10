@@ -155,11 +155,26 @@ def add_north_arrow(ax, font_scale=1.0, style: str = "one_side_stem", color: str
         stem_bottom = y - size * 1.05
         four_y = y + size * 0.80
         n_y = y - size * 0.12
+        n_x = x + size * 0.05
+        n_gap = size * 0.26
+        lower_stem_top = n_y - (n_gap / 2.0)
+        upper_stem_bottom = n_y + (n_gap / 2.0)
         line_lw = max(0.7, 0.90 * font_scale)
         fig.add_artist(
             mlines.Line2D(
                 [x, x],
-                [stem_bottom, stem_top],
+                [stem_bottom, lower_stem_top],
+                transform=fig.transFigure,
+                color=col,
+                lw=line_lw,
+                zorder=20,
+                solid_capstyle="butt",
+            )
+        )
+        fig.add_artist(
+            mlines.Line2D(
+                [x, x],
+                [upper_stem_bottom, stem_top],
                 transform=fig.transFigure,
                 color=col,
                 lw=line_lw,
@@ -180,7 +195,7 @@ def add_north_arrow(ax, font_scale=1.0, style: str = "one_side_stem", color: str
             zorder=25,
         )
         fig.text(
-            x,
+            n_x,
             n_y,
             "N",
             ha="center",
