@@ -144,7 +144,7 @@ def draw_footer(fig, crs, source, surveyor, rank, font_scale=1.0):
 def add_north_arrow(ax, font_scale=1.0, style: str = "one_side_stem", color: str = "black"):
     fig = ax.figure
     col = "blue" if str(color).lower() == "blue" else "black"
-    style = (style or "one_side_stem").lower()
+    style = str(style or "one_side_stem").strip().lower()
     box = ax.get_position()
     x = float(box.x1)
     y = min(0.93, float(box.y1) + 0.060)
@@ -338,19 +338,10 @@ def add_north_arrow(ax, font_scale=1.0, style: str = "one_side_stem", color: str
                  fontsize=int(10 * font_scale), color=col, weight="bold")
         return
 
-    # default: classic arrow
-    ax.annotate(
-        "N",
-        xy=(0.85, 0.90),
-        xytext=(0.85, 0.83),
-        xycoords="figure fraction",
-        arrowprops=dict(facecolor=col, edgecolor=col, width=2*font_scale, headwidth=8*font_scale),
-        ha="center",
-        fontsize=int(12*font_scale),
-        weight="bold",
-        color=col,
-        zorder=20,
-    )
+    # Unknown/legacy style fallback: render the approved 4-head symbol, never filled triangle.
+    if style != "one_side_stem":
+        return add_north_arrow(ax, font_scale=font_scale, style="one_side_stem", color=color)
+    return
 
 
 

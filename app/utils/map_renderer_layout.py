@@ -507,7 +507,7 @@ def draw_key_box(fig, has_buildings: bool, has_roads: bool, has_rivers: bool, ha
 def add_north_arrow(ax, font_scale=1.0, style: str = "one_side_stem", color: str = "black"):
     fig = ax.figure
     col = "blue" if str(color).lower() == "blue" else "black"
-    style = (style or "one_side_stem").lower()
+    style = str(style or "one_side_stem").strip().lower()
     # Keep north arrows vertically aligned to the right edge of the map frame
     # in both general and Adamawa templates.
     box = ax.get_position()
@@ -703,19 +703,10 @@ def add_north_arrow(ax, font_scale=1.0, style: str = "one_side_stem", color: str
                  fontsize=int(10 * font_scale), color=col, weight="bold")
         return
 
-    # default: classic arrow
-    ax.annotate(
-        "N",
-        xy=(x, y + size * 0.95),
-        xytext=(x, y - size * 0.75),
-        xycoords="figure fraction",
-        arrowprops=dict(facecolor=col, edgecolor=col, width=2*font_scale, headwidth=8*font_scale),
-        ha="center",
-        fontsize=int(12*font_scale),
-        weight="bold",
-        color=col,
-        zorder=20,
-    )
+    # Unknown/legacy style fallback: render the approved 4-head symbol, never filled triangle.
+    if style != "one_side_stem":
+        return add_north_arrow(ax, font_scale=font_scale, style="one_side_stem", color=color)
+    return
 
 
 def add_scalebar(ax, length_m: float, segments: int = 4, font_scale=1.0):
