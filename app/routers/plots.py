@@ -1,13 +1,14 @@
 # app/routers/plots.py
 
-from fastapi import APIRouter, Depends, Body, HTTPException, BackgroundTasks
+from fastapi import APIRouter, Depends, Body, HTTPException, BackgroundTasks, Query
 from sqlalchemy.orm import Session
 from geoalchemy2.shape import from_shape
-from shapely.geometry import Polygon, shape, Point
+from shapely.geometry import Polygon, shape, Point, box
+from shapely.affinity import rotate
 from sqlalchemy import text
 from fastapi.responses import FileResponse
 from app.schemas.plot_create import PlotCreateRequest
-from typing import Optional, Union, List
+from typing import Optional, Union, List, Any
 
 import os
 import tempfile
@@ -18,6 +19,7 @@ import zipfile
 import time
 import json
 import hashlib
+import math
 from threading import Lock
 
 from app.db import SessionLocal
@@ -95,6 +97,7 @@ def ensure_plots_schema_once(db: Session):
             return
         ensure_plot_meta_table(db)
         ensure_plot_feature_overrides_table(db)
+        ensure_plot_subdivision_tables(db)
         ensure_plot_query_indexes(db)
         _PLOTS_SCHEMA_READY = True
 
@@ -275,6 +278,67 @@ def ensure_plot_feature_overrides_table(db: Session):
         db.rollback()
 
 
+def ensure_plot_subdivision_tables(db: Session):
+    db.execute(
+        text(
+            """
+            CREATE TABLE IF NOT EXISTS plot_subdivision_batches (
+                id SERIAL PRIMARY KEY,
+                parent_plot_id INTEGER NOT NULL REFERENCES plots(id) ON DELETE CASCADE,
+                estate_name TEXT,
+                method TEXT NOT NULL,
+                requested_count INTEGER,
+                target_area_m2 DOUBLE PRECISION,
+                orientation_deg DOUBLE PRECISION DEFAULT 0,
+                generated_count INTEGER DEFAULT 0,
+                total_area_m2 DOUBLE PRECISION DEFAULT 0,
+                status TEXT NOT NULL DEFAULT 'completed',
+                created_at TIMESTAMP DEFAULT NOW(),
+                updated_at TIMESTAMP DEFAULT NOW()
+            )
+            """
+        )
+    )
+    db.execute(
+        text(
+            """
+            CREATE TABLE IF NOT EXISTS plot_subdivision_items (
+                id SERIAL PRIMARY KEY,
+                batch_id INTEGER NOT NULL REFERENCES plot_subdivision_batches(id) ON DELETE CASCADE,
+                child_plot_id INTEGER NOT NULL REFERENCES plots(id) ON DELETE CASCADE,
+                lot_no TEXT,
+                area_m2 DOUBLE PRECISION,
+                created_at TIMESTAMP DEFAULT NOW()
+            )
+            """
+        )
+    )
+    for col_name, col_type in [
+        ("parent_plot_id", "INTEGER"),
+        ("subdivision_batch_id", "INTEGER"),
+        ("subdivision_lot_no", "TEXT"),
+        ("estate_name", "TEXT"),
+    ]:
+        try:
+            db.execute(text(f"ALTER TABLE plot_meta ADD COLUMN IF NOT EXISTS {col_name} {col_type}"))
+        except Exception:
+            pass
+
+    index_sql = [
+        "CREATE INDEX IF NOT EXISTS idx_plot_sub_batches_parent ON plot_subdivision_batches(parent_plot_id, created_at DESC)",
+        "CREATE INDEX IF NOT EXISTS idx_plot_sub_items_batch ON plot_subdivision_items(batch_id)",
+        "CREATE INDEX IF NOT EXISTS idx_plot_sub_items_child ON plot_subdivision_items(child_plot_id)",
+        "CREATE INDEX IF NOT EXISTS idx_plot_meta_parent_plot_id ON plot_meta(parent_plot_id)",
+        "CREATE INDEX IF NOT EXISTS idx_plot_meta_subdivision_batch ON plot_meta(subdivision_batch_id)",
+    ]
+    for ddl in index_sql:
+        try:
+            db.execute(text(ddl))
+        except Exception:
+            pass
+    db.commit()
+
+
 def upsert_plot_meta(
     db: Session,
     plot_id: int,
@@ -304,6 +368,7 @@ def upsert_plot_meta(
     adamawa_plan_no: Optional[str] = None,
     adamawa_surveyed_by_text: Optional[str] = None,
     adamawa_disclaimer_text: Optional[str] = None,
+    commit: bool = True,
 ):
     ensure_plot_meta_table(db)
 
@@ -381,7 +446,8 @@ def upsert_plot_meta(
         "adamawa_surveyed_by_text": adamawa_surveyed_by_text,
         "adamawa_disclaimer_text": adamawa_disclaimer_text,
     })
-    db.commit()
+    if commit:
+        db.commit()
 
 
 def get_plot_meta(db: Session, plot_id: int) -> dict:
@@ -391,7 +457,8 @@ def get_plot_meta(db: Session, plot_id: int) -> dict:
                template_name, adamawa_rof_no, adamawa_owner_name, adamawa_authority_title, adamawa_authority_date_text,
                adamawa_control_point_name, adamawa_northing, adamawa_easting, adamawa_elevation, adamawa_origin_text,
                adamawa_topo_sheet_text, adamawa_computation_no, adamawa_cadastral_sheet_no, adamawa_plan_no,
-               adamawa_surveyed_by_text, adamawa_disclaimer_text
+               adamawa_surveyed_by_text, adamawa_disclaimer_text,
+               parent_plot_id, subdivision_batch_id, subdivision_lot_no, estate_name
         FROM plot_meta
         WHERE plot_id = :plot_id
     """), {"plot_id": plot_id}).mappings().first()
@@ -423,6 +490,10 @@ def get_plot_meta(db: Session, plot_id: int) -> dict:
             "adamawa_plan_no": "",
             "adamawa_surveyed_by_text": "",
             "adamawa_disclaimer_text": DEFAULT_ADAMAWA_DISCLAIMER_TEXT,
+            "parent_plot_id": None,
+            "subdivision_batch_id": None,
+            "subdivision_lot_no": "",
+            "estate_name": "",
         }
     return {
         "title_text": row.get("title_text") or "SURVEY PLAN",
@@ -451,6 +522,10 @@ def get_plot_meta(db: Session, plot_id: int) -> dict:
         "adamawa_plan_no": row.get("adamawa_plan_no") or "",
         "adamawa_surveyed_by_text": row.get("adamawa_surveyed_by_text") or "",
         "adamawa_disclaimer_text": row.get("adamawa_disclaimer_text") or DEFAULT_ADAMAWA_DISCLAIMER_TEXT,
+        "parent_plot_id": row.get("parent_plot_id"),
+        "subdivision_batch_id": row.get("subdivision_batch_id"),
+        "subdivision_lot_no": row.get("subdivision_lot_no") or "",
+        "estate_name": row.get("estate_name") or "",
     }
 
 
@@ -609,6 +684,859 @@ def prune_preview_cache(plot_id: int, variant: str | None = None):
         overflow = idx >= PREVIEW_CACHE_MAX_FILES_PER_PLOT
         if too_old or overflow:
             safe_remove(path)
+
+
+def _coerce_positive_int(value: Any) -> int | None:
+    try:
+        if value is None or value == "":
+            return None
+        parsed = int(value)
+        if parsed <= 0:
+            return None
+        return parsed
+    except Exception:
+        return None
+
+
+def _coerce_float(value: Any, default: float = 0.0) -> float:
+    try:
+        if value is None or value == "":
+            return float(default)
+        parsed = float(value)
+        if math.isnan(parsed) or math.isinf(parsed):
+            return float(default)
+        return float(parsed)
+    except Exception:
+        return float(default)
+
+
+def _station_name(index: int) -> str:
+    name = ""
+    num = int(index)
+    while True:
+        name = chr(65 + (num % 26)) + name
+        num = (num // 26) - 1
+        if num < 0:
+            break
+    return name
+
+
+def _polygon_parts(geom: Any) -> list[Polygon]:
+    if geom is None:
+        return []
+    if isinstance(geom, Polygon):
+        return [geom]
+    if geom.geom_type == "MultiPolygon":
+        return [g for g in geom.geoms if isinstance(g, Polygon)]
+    if geom.geom_type == "GeometryCollection":
+        out: list[Polygon] = []
+        for g in geom.geoms:
+            if isinstance(g, Polygon):
+                out.append(g)
+            elif g.geom_type == "MultiPolygon":
+                out.extend([p for p in g.geoms if isinstance(p, Polygon)])
+        return out
+    return []
+
+
+def _largest_polygon(geom: Any) -> Polygon | None:
+    parts = [p for p in _polygon_parts(geom) if p.area > 1e-9]
+    if not parts:
+        return None
+    return max(parts, key=lambda p: p.area)
+
+
+def _clean_single_polygon(geom: Any) -> Polygon | None:
+    if geom is None:
+        return None
+    cleaned = geom.buffer(0)
+    return _largest_polygon(cleaned)
+
+
+def _metric_epsg_for_wgs84_polygon(poly_wgs84: Polygon) -> int:
+    centroid = poly_wgs84.centroid
+    zone = int((centroid.x + 180) / 6) + 1
+    zone = max(1, min(zone, 60))
+    return (32600 + zone) if centroid.y >= 0 else (32700 + zone)
+
+
+def _split_polygon_once_by_area(poly_metric: Polygon, target_area: float) -> tuple[Polygon, Polygon]:
+    poly = _clean_single_polygon(poly_metric)
+    if poly is None:
+        raise HTTPException(status_code=400, detail="Subdivision failed: invalid mother parcel geometry.")
+
+    minx, miny, maxx, maxy = poly.bounds
+    if maxx - minx <= 1e-8:
+        raise HTTPException(status_code=400, detail="Subdivision failed: mother parcel width too small for automatic split.")
+
+    pad_x = max(1.0, (maxx - minx) * 0.2)
+    pad_y = max(1.0, (maxy - miny) * 0.2)
+    lo = minx + 1e-9
+    hi = maxx - 1e-9
+    best_x = (lo + hi) / 2.0
+    best_diff = float("inf")
+    best_left: Polygon | None = None
+
+    for _ in range(56):
+        mid = (lo + hi) / 2.0
+        left_mask = box(minx - pad_x, miny - pad_y, mid, maxy + pad_y)
+        left_geom = _clean_single_polygon(poly.intersection(left_mask))
+        left_area = float(left_geom.area if left_geom is not None else 0.0)
+        diff = abs(left_area - target_area)
+        if diff < best_diff and left_geom is not None:
+            best_diff = diff
+            best_x = mid
+            best_left = left_geom
+        if left_area < target_area:
+            lo = mid
+        else:
+            hi = mid
+
+    if best_left is None or best_left.area <= 1e-6:
+        raise HTTPException(status_code=400, detail="Subdivision failed: unable to compute left split parcel.")
+
+    right_mask = box(best_x, miny - pad_y, maxx + pad_x, maxy + pad_y)
+    right_geom = _clean_single_polygon(poly.intersection(right_mask))
+    if right_geom is None or right_geom.area <= 1e-6:
+        # fallback using difference if masking loses a tiny seam
+        right_geom = _clean_single_polygon(poly.difference(best_left))
+    if right_geom is None or right_geom.area <= 1e-6:
+        raise HTTPException(status_code=400, detail="Subdivision failed: unable to compute right split parcel.")
+
+    return best_left, right_geom
+
+
+def _subdivide_polygon_equal_count(poly_metric: Polygon, split_count: int, orientation_deg: float) -> list[Polygon]:
+    if split_count < 2:
+        raise HTTPException(status_code=400, detail="Subdivision requires at least 2 derived plots.")
+    base_poly = _clean_single_polygon(poly_metric)
+    if base_poly is None:
+        raise HTTPException(status_code=400, detail="Mother parcel geometry is invalid.")
+
+    rotated = _clean_single_polygon(rotate(base_poly, -orientation_deg, origin="centroid", use_radians=False))
+    if rotated is None:
+        raise HTTPException(status_code=400, detail="Subdivision failed: unable to rotate mother parcel.")
+
+    pieces: list[Polygon] = []
+    remaining = rotated
+    for idx in range(split_count - 1):
+        pending_slots = split_count - idx
+        target_area = float(remaining.area / pending_slots)
+        left_piece, right_piece = _split_polygon_once_by_area(remaining, target_area)
+        pieces.append(left_piece)
+        remaining = right_piece
+    pieces.append(remaining)
+
+    out: list[Polygon] = []
+    for piece in pieces:
+        restored = _clean_single_polygon(rotate(piece, orientation_deg, origin=base_poly.centroid, use_radians=False))
+        if restored is None or restored.area <= 1e-8:
+            raise HTTPException(status_code=400, detail="Subdivision failed: generated a degenerate parcel.")
+        out.append(restored)
+    return out
+
+
+def _compute_subdivision_payload(
+    parent_plot_id: int,
+    parent_geom_wgs84: Polygon,
+    *,
+    method: str,
+    split_count: int | None,
+    target_area_m2: float | None,
+    orientation_deg: float,
+    lot_prefix: str,
+) -> dict:
+    method_key = (method or "by_count").strip().lower()
+    if method_key not in {"by_count", "by_area"}:
+        raise HTTPException(status_code=400, detail="Invalid subdivision method. Use 'by_count' or 'by_area'.")
+
+    metric_epsg = _metric_epsg_for_wgs84_polygon(parent_geom_wgs84)
+    gdf_metric = gpd.GeoDataFrame(geometry=[parent_geom_wgs84], crs="EPSG:4326").to_crs(epsg=metric_epsg)
+    parent_metric = _clean_single_polygon(gdf_metric.geometry.iloc[0])
+    if parent_metric is None or parent_metric.area <= 1e-6:
+        raise HTTPException(status_code=400, detail="Mother parcel area is too small for subdivision.")
+
+    total_area_m2 = float(parent_metric.area)
+    resolved_count = _coerce_positive_int(split_count)
+    target_area = _coerce_float(target_area_m2, 0.0)
+    if method_key == "by_count":
+        if resolved_count is None or resolved_count < 2:
+            raise HTTPException(status_code=400, detail="For 'by_count', set derived plot count to 2 or more.")
+    else:
+        if target_area <= 0:
+            raise HTTPException(status_code=400, detail="For 'by_area', provide a positive target plot size (sqm).")
+        approx_count = int(round(total_area_m2 / target_area))
+        resolved_count = max(2, approx_count)
+
+    resolved_count = min(int(resolved_count or 2), 500)
+    pieces_wgs84 = _subdivide_polygon_equal_count(parent_metric, resolved_count, orientation_deg)
+    gdf_out = gpd.GeoDataFrame(geometry=pieces_wgs84, crs=f"EPSG:{metric_epsg}").to_crs(epsg=4326)
+
+    safe_prefix = re.sub(r"[^A-Za-z0-9]+", "", str(lot_prefix or "LOT").upper()) or "LOT"
+    plots: list[dict] = []
+    derived_total = 0.0
+    for idx, (poly_wgs, poly_metric) in enumerate(zip(gdf_out.geometry.tolist(), pieces_wgs84), start=1):
+        area_m2 = float(max(poly_metric.area, 0.0))
+        derived_total += area_m2
+        ring = [[float(x), float(y)] for x, y in list(poly_wgs.exterior.coords)]
+        plot_no = f"{safe_prefix}-{idx:03d}"
+        plots.append(
+            {
+                "index": idx,
+                "lot_no": plot_no,
+                "area_m2": round(area_m2, 2),
+                "area_hectares": round(area_m2 / 10000.0, 4),
+                "geometry": {"type": "Polygon", "coordinates": [ring]},
+                "station_names": [_station_name(i) for i in range(max(0, len(ring) - 1))],
+            }
+        )
+
+    feature_collection = {
+        "type": "FeatureCollection",
+        "features": [
+            {
+                "type": "Feature",
+                "properties": {
+                    "lot_no": p["lot_no"],
+                    "index": p["index"],
+                    "area_m2": p["area_m2"],
+                    "area_hectares": p["area_hectares"],
+                },
+                "geometry": p["geometry"],
+            }
+            for p in plots
+        ],
+    }
+
+    return {
+        "parent_plot_id": int(parent_plot_id),
+        "method": method_key,
+        "metric_epsg": int(metric_epsg),
+        "orientation_deg": round(float(orientation_deg), 3),
+        "requested_count": int(split_count or 0) if split_count is not None else None,
+        "target_area_m2": round(float(target_area), 2) if target_area > 0 else None,
+        "resolved_count": len(plots),
+        "total_area_m2": round(total_area_m2, 2),
+        "derived_total_area_m2": round(derived_total, 2),
+        "area_imbalance_m2": round(total_area_m2 - derived_total, 4),
+        "plots": plots,
+        "preview_geojson": feature_collection,
+    }
+
+
+def _ensure_plot_meta_row(db: Session, plot_id: int):
+    db.execute(
+        text(
+            """
+            INSERT INTO plot_meta (plot_id)
+            VALUES (:plot_id)
+            ON CONFLICT (plot_id) DO NOTHING
+            """
+        ),
+        {"plot_id": int(plot_id)},
+    )
+
+
+def _set_plot_subdivision_meta(
+    db: Session,
+    *,
+    child_plot_id: int,
+    parent_plot_id: int,
+    batch_id: int,
+    lot_no: str,
+    estate_name: str | None,
+):
+    _ensure_plot_meta_row(db, child_plot_id)
+    db.execute(
+        text(
+            """
+            UPDATE plot_meta
+            SET parent_plot_id = :parent_plot_id,
+                subdivision_batch_id = :batch_id,
+                subdivision_lot_no = :lot_no,
+                estate_name = :estate_name,
+                updated_at = NOW()
+            WHERE plot_id = :plot_id
+            """
+        ),
+        {
+            "plot_id": int(child_plot_id),
+            "parent_plot_id": int(parent_plot_id),
+            "batch_id": int(batch_id),
+            "lot_no": str(lot_no or ""),
+            "estate_name": str(estate_name or ""),
+        },
+    )
+
+
+def _run_plot_feature_detection(db: Session, plot_id: int):
+    db.execute(
+        text(
+            """
+            INSERT INTO plot_buffers (plot_id, geom)
+            SELECT :plot_id,
+                   ST_Buffer(geom::geography, 50)::geometry
+            FROM plots
+            WHERE id = :plot_id
+            ON CONFLICT DO NOTHING
+            """
+        ),
+        {"plot_id": int(plot_id)},
+    )
+
+    db.execute(
+        text(
+            """
+            DELETE FROM detected_features
+            WHERE plot_id = :plot_id
+            """
+        ),
+        {"plot_id": int(plot_id)},
+    )
+
+    # Buildings
+    db.execute(
+        text(
+            """
+            INSERT INTO detected_features (plot_id, feature_type, location, geom)
+            SELECT :plot_id, 'building', 'inside', m.geom
+            FROM multipolygons m
+            JOIN plots p ON p.id = :plot_id
+            WHERE m.building IS NOT NULL
+              AND ST_Intersects(m.geom, p.geom)
+            """
+        ),
+        {"plot_id": int(plot_id)},
+    )
+    db.execute(
+        text(
+            """
+            INSERT INTO detected_features (plot_id, feature_type, location, geom)
+            SELECT :plot_id, 'building', 'buffer', m.geom
+            FROM multipolygons m
+            JOIN plot_buffers b ON b.plot_id = :plot_id
+            JOIN plots p ON p.id = :plot_id
+            WHERE m.building IS NOT NULL
+              AND ST_Intersects(m.geom, b.geom)
+              AND NOT ST_Intersects(m.geom, p.geom)
+            """
+        ),
+        {"plot_id": int(plot_id)},
+    )
+
+    # Roads
+    db.execute(
+        text(
+            """
+            INSERT INTO detected_features (plot_id, feature_type, location, geom)
+            SELECT :plot_id, 'road', 'inside', r.geom
+            FROM (
+                SELECT geom FROM lines WHERE highway IS NOT NULL
+                UNION ALL
+                SELECT geom FROM multilinestrings
+                WHERE type = 'highway' OR other_tags LIKE '%highway%'
+            ) r
+            JOIN plots p ON p.id = :plot_id
+            WHERE ST_Intersects(r.geom, p.geom)
+            """
+        ),
+        {"plot_id": int(plot_id)},
+    )
+    db.execute(
+        text(
+            """
+            INSERT INTO detected_features (plot_id, feature_type, location, geom)
+            SELECT :plot_id, 'road', 'buffer', r.geom
+            FROM (
+                SELECT geom FROM lines WHERE highway IS NOT NULL
+                UNION ALL
+                SELECT geom FROM multilinestrings
+                WHERE type = 'highway' OR other_tags LIKE '%highway%'
+            ) r
+            JOIN plot_buffers b ON b.plot_id = :plot_id
+            JOIN plots p ON p.id = :plot_id
+            WHERE ST_Intersects(r.geom, b.geom)
+              AND NOT ST_Intersects(r.geom, p.geom)
+            """
+        ),
+        {"plot_id": int(plot_id)},
+    )
+
+    # Rivers
+    db.execute(
+        text(
+            """
+            INSERT INTO detected_features (plot_id, feature_type, location, geom)
+            SELECT :plot_id, 'river', 'inside', r.geom
+            FROM (
+                SELECT geom FROM lines WHERE waterway IS NOT NULL
+                UNION ALL
+                SELECT geom FROM multilinestrings
+                WHERE type = 'waterway' OR other_tags LIKE '%waterway%'
+            ) r
+            JOIN plots p ON p.id = :plot_id
+            WHERE ST_Intersects(r.geom, p.geom)
+            """
+        ),
+        {"plot_id": int(plot_id)},
+    )
+    db.execute(
+        text(
+            """
+            INSERT INTO detected_features (plot_id, feature_type, location, geom)
+            SELECT :plot_id, 'river', 'buffer', r.geom
+            FROM (
+                SELECT geom FROM lines WHERE waterway IS NOT NULL
+                UNION ALL
+                SELECT geom FROM multilinestrings
+                WHERE type = 'waterway' OR other_tags LIKE '%waterway%'
+            ) r
+            JOIN plot_buffers b ON b.plot_id = :plot_id
+            JOIN plots p ON p.id = :plot_id
+            WHERE ST_Intersects(r.geom, b.geom)
+              AND NOT ST_Intersects(r.geom, p.geom)
+            """
+        ),
+        {"plot_id": int(plot_id)},
+    )
+
+
+def _load_plot_polygon_wgs84(db: Session, plot_id: int) -> Polygon:
+    plot_wkb = db.execute(text("SELECT geom FROM plots WHERE id = :id"), {"id": int(plot_id)}).scalar()
+    if plot_wkb is None:
+        raise HTTPException(status_code=404, detail="Mother parcel not found.")
+    try:
+        geom = wkb.loads(plot_wkb)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Mother parcel geometry is invalid.")
+    poly = _clean_single_polygon(geom)
+    if poly is None:
+        raise HTTPException(status_code=400, detail="Mother parcel geometry is invalid.")
+    return poly
+
+
+def _safe_filename_fragment(value: str, fallback: str) -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", str(value or "")).strip("._-")
+    return cleaned or fallback
+
+
+def _compose_child_title(parent_meta: dict, lot_no: str, estate_name: str | None) -> str:
+    estate = str(estate_name or parent_meta.get("estate_name") or "").strip()
+    base_title = str(parent_meta.get("title_text") or "SURVEY PLAN").strip()
+    if estate:
+        return f"{estate} - {lot_no}".strip()
+    if base_title:
+        return f"{base_title} - {lot_no}".strip()
+    return f"SURVEY PLAN - {lot_no}".strip()
+
+
+def _render_survey_plan_pdf_for_plot(db: Session, plot_id: int, output_pdf_path: str):
+    meta = get_plot_meta(db, plot_id)
+    epsg_code = COORDINATE_SYSTEMS.get(meta["coordinate_system"], 4326)
+    crs_name = COORDINATE_SYSTEM_NAMES.get(meta["coordinate_system"], "WGS84")
+
+    tmp_map = tempfile.NamedTemporaryFile(suffix="_map.png", delete=False)
+    map_path = tmp_map.name
+    tmp_map.close()
+
+    render_plot_map_layout(
+        db=db,
+        plot_id=plot_id,
+        output_path=map_path,
+        title_text=meta["title_text"],
+        location_text=meta["location_text"],
+        lga_text=meta["lga_text"],
+        state_text=meta["state_text"],
+        scale_text=meta["scale_text"],
+        surveyor_name=meta["surveyor_name"],
+        surveyor_rank=meta["surveyor_rank"],
+        certification_statement=meta.get("certification_statement"),
+        station_names=None,
+        coordinate_system=meta["coordinate_system"],
+        epsg_code=epsg_code,
+        crs_footer_text=f"COORDINATE SYSTEM: {crs_name}",
+        paper_size=meta["paper_size"],
+        north_arrow_style="one_side_stem",
+        north_arrow_color="blue",
+        beacon_style="cross",
+        road_width_m=None,
+        road_width_override_m=None,
+        template_name=meta.get("template_name") or DEFAULT_TEMPLATE_NAME,
+        adamawa_rof_no=meta.get("adamawa_rof_no") or "",
+        adamawa_owner_name=meta.get("adamawa_owner_name") or "",
+        adamawa_authority_title=meta.get("adamawa_authority_title") or DEFAULT_ADAMAWA_AUTHORITY_TITLE,
+        adamawa_authority_date_text=meta.get("adamawa_authority_date_text") or DEFAULT_ADAMAWA_AUTHORITY_DATE,
+        adamawa_control_point_name=meta.get("adamawa_control_point_name") or "",
+        adamawa_northing=meta.get("adamawa_northing") or "",
+        adamawa_easting=meta.get("adamawa_easting") or "",
+        adamawa_elevation=meta.get("adamawa_elevation") or "",
+        adamawa_origin_text=meta.get("adamawa_origin_text") or DEFAULT_ADAMAWA_ORIGIN_TEXT,
+        adamawa_topo_sheet_text=meta.get("adamawa_topo_sheet_text") or DEFAULT_ADAMAWA_TOPO_SHEET_TEXT,
+        adamawa_computation_no=meta.get("adamawa_computation_no") or "",
+        adamawa_cadastral_sheet_no=meta.get("adamawa_cadastral_sheet_no") or "",
+        adamawa_plan_no=meta.get("adamawa_plan_no") or "",
+        adamawa_surveyed_by_text=meta.get("adamawa_surveyed_by_text") or "",
+        adamawa_disclaimer_text=meta.get("adamawa_disclaimer_text") or DEFAULT_ADAMAWA_DISCLAIMER_TEXT,
+    )
+    report = get_plot_report(plot_id, db)
+    generate_plot_report_pdf(report, output_pdf_path, map_path, paper_size=meta["paper_size"])
+    safe_remove(map_path)
+
+
+@router.post("/{plot_id}/subdivision/preview")
+def preview_plot_subdivision(
+    plot_id: int,
+    db: Session = Depends(get_db),
+    method: str = Body("by_count"),
+    split_count: int | None = Body(None),
+    target_area_m2: float | None = Body(None),
+    orientation_deg: float = Body(0.0),
+    lot_prefix: str = Body("LOT"),
+    estate_name: str = Body(""),
+):
+    parent_geom_wgs84 = _load_plot_polygon_wgs84(db, plot_id)
+    payload = _compute_subdivision_payload(
+        plot_id,
+        parent_geom_wgs84,
+        method=method,
+        split_count=split_count,
+        target_area_m2=target_area_m2,
+        orientation_deg=_coerce_float(orientation_deg, 0.0),
+        lot_prefix=lot_prefix,
+    )
+    payload["estate_name"] = str(estate_name or "").strip()
+    return payload
+
+
+@router.post("/{plot_id}/subdivision/apply")
+def apply_plot_subdivision(
+    plot_id: int,
+    db: Session = Depends(get_db),
+    method: str = Body("by_count"),
+    split_count: int | None = Body(None),
+    target_area_m2: float | None = Body(None),
+    orientation_deg: float = Body(0.0),
+    lot_prefix: str = Body("LOT"),
+    estate_name: str = Body(""),
+    include_feature_detection: bool = Body(True),
+):
+    parent_geom_wgs84 = _load_plot_polygon_wgs84(db, plot_id)
+    safe_estate_name = str(estate_name or "").strip()
+    payload = _compute_subdivision_payload(
+        plot_id,
+        parent_geom_wgs84,
+        method=method,
+        split_count=split_count,
+        target_area_m2=target_area_m2,
+        orientation_deg=_coerce_float(orientation_deg, 0.0),
+        lot_prefix=lot_prefix,
+    )
+    parent_meta = get_plot_meta(db, plot_id)
+
+    batch_id = db.execute(
+        text(
+            """
+            INSERT INTO plot_subdivision_batches (
+                parent_plot_id, estate_name, method, requested_count, target_area_m2,
+                orientation_deg, generated_count, total_area_m2, status
+            )
+            VALUES (
+                :parent_plot_id, :estate_name, :method, :requested_count, :target_area_m2,
+                :orientation_deg, 0, 0, 'processing'
+            )
+            RETURNING id
+            """
+        ),
+        {
+            "parent_plot_id": int(plot_id),
+            "estate_name": safe_estate_name or None,
+            "method": payload["method"],
+            "requested_count": payload.get("requested_count"),
+            "target_area_m2": payload.get("target_area_m2"),
+            "orientation_deg": payload.get("orientation_deg") or 0.0,
+        },
+    ).scalar()
+    if batch_id is None:
+        db.rollback()
+        raise HTTPException(status_code=500, detail="Failed to create subdivision batch.")
+
+    created_items: list[dict] = []
+    try:
+        for row in payload["plots"]:
+            geom_obj = _clean_single_polygon(shape(row["geometry"]))
+            if geom_obj is None:
+                raise HTTPException(status_code=400, detail=f"Invalid generated geometry for lot {row['lot_no']}.")
+
+            child_plot = Plot(geom=from_shape(geom_obj, srid=4326))
+            db.add(child_plot)
+            db.flush()
+            child_plot_id = int(child_plot.id)
+            lot_no = str(row.get("lot_no") or f"LOT-{child_plot_id}")
+
+            upsert_plot_meta(
+                db=db,
+                plot_id=child_plot_id,
+                title_text=_compose_child_title(parent_meta, lot_no, safe_estate_name),
+                location_text=parent_meta.get("location_text") or None,
+                lga_text=parent_meta.get("lga_text") or None,
+                state_text=parent_meta.get("state_text") or None,
+                surveyor_name=parent_meta.get("surveyor_name") or None,
+                surveyor_rank=parent_meta.get("surveyor_rank") or None,
+                certification_statement=parent_meta.get("certification_statement") or DEFAULT_CERTIFICATION_STATEMENT,
+                scale_text=parent_meta.get("scale_text") or "1 : 1000",
+                paper_size=parent_meta.get("paper_size") or "A4",
+                coordinate_system=parent_meta.get("coordinate_system") or "wgs84",
+                template_name=parent_meta.get("template_name") or DEFAULT_TEMPLATE_NAME,
+                adamawa_rof_no=parent_meta.get("adamawa_rof_no") or "",
+                adamawa_owner_name=parent_meta.get("adamawa_owner_name") or "",
+                adamawa_authority_title=parent_meta.get("adamawa_authority_title") or DEFAULT_ADAMAWA_AUTHORITY_TITLE,
+                adamawa_authority_date_text=parent_meta.get("adamawa_authority_date_text") or DEFAULT_ADAMAWA_AUTHORITY_DATE,
+                adamawa_control_point_name="",
+                adamawa_northing="",
+                adamawa_easting="",
+                adamawa_elevation="",
+                adamawa_origin_text=parent_meta.get("adamawa_origin_text") or DEFAULT_ADAMAWA_ORIGIN_TEXT,
+                adamawa_topo_sheet_text=parent_meta.get("adamawa_topo_sheet_text") or DEFAULT_ADAMAWA_TOPO_SHEET_TEXT,
+                adamawa_computation_no=parent_meta.get("adamawa_computation_no") or "",
+                adamawa_cadastral_sheet_no=parent_meta.get("adamawa_cadastral_sheet_no") or "",
+                adamawa_plan_no=parent_meta.get("adamawa_plan_no") or "",
+                adamawa_surveyed_by_text=parent_meta.get("adamawa_surveyed_by_text") or "",
+                adamawa_disclaimer_text=parent_meta.get("adamawa_disclaimer_text") or DEFAULT_ADAMAWA_DISCLAIMER_TEXT,
+                commit=False,
+            )
+            _set_plot_subdivision_meta(
+                db,
+                child_plot_id=child_plot_id,
+                parent_plot_id=int(plot_id),
+                batch_id=int(batch_id),
+                lot_no=lot_no,
+                estate_name=safe_estate_name,
+            )
+            db.execute(
+                text(
+                    """
+                    INSERT INTO plot_subdivision_items (batch_id, child_plot_id, lot_no, area_m2)
+                    VALUES (:batch_id, :child_plot_id, :lot_no, :area_m2)
+                    """
+                ),
+                {
+                    "batch_id": int(batch_id),
+                    "child_plot_id": child_plot_id,
+                    "lot_no": lot_no,
+                    "area_m2": float(row.get("area_m2") or 0.0),
+                },
+            )
+
+            if include_feature_detection:
+                _run_plot_feature_detection(db, child_plot_id)
+
+            created_items.append(
+                {
+                    "child_plot_id": child_plot_id,
+                    "lot_no": lot_no,
+                    "area_m2": float(row.get("area_m2") or 0.0),
+                    "area_hectares": float(row.get("area_hectares") or 0.0),
+                }
+            )
+
+        db.execute(
+            text(
+                """
+                UPDATE plot_subdivision_batches
+                SET generated_count = :generated_count,
+                    total_area_m2 = :total_area_m2,
+                    status = 'completed',
+                    updated_at = NOW()
+                WHERE id = :batch_id
+                """
+            ),
+            {
+                "batch_id": int(batch_id),
+                "generated_count": len(created_items),
+                "total_area_m2": float(payload.get("derived_total_area_m2") or 0.0),
+            },
+        )
+        db.commit()
+    except HTTPException:
+        db.rollback()
+        raise
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Subdivision apply failed: {exc}")
+
+    return {
+        "batch_id": int(batch_id),
+        "parent_plot_id": int(plot_id),
+        "estate_name": safe_estate_name,
+        "method": payload["method"],
+        "generated_count": len(created_items),
+        "total_area_m2": payload.get("derived_total_area_m2"),
+        "plots": created_items,
+    }
+
+
+@router.get("/{plot_id}/subdivision/batches")
+def list_plot_subdivision_batches(plot_id: int, db: Session = Depends(get_db)):
+    rows = db.execute(
+        text(
+            """
+            SELECT b.id,
+                   b.parent_plot_id,
+                   b.estate_name,
+                   b.method,
+                   b.requested_count,
+                   b.target_area_m2,
+                   b.orientation_deg,
+                   b.generated_count,
+                   b.total_area_m2,
+                   b.status,
+                   b.created_at,
+                   b.updated_at,
+                   COALESCE(COUNT(i.id), 0) AS item_count
+            FROM plot_subdivision_batches b
+            LEFT JOIN plot_subdivision_items i ON i.batch_id = b.id
+            WHERE b.parent_plot_id = :plot_id
+            GROUP BY b.id
+            ORDER BY b.created_at DESC, b.id DESC
+            """
+        ),
+        {"plot_id": int(plot_id)},
+    ).mappings().all()
+    return [dict(r) for r in rows]
+
+
+@router.get("/subdivision/batches/{batch_id}")
+def get_plot_subdivision_batch(batch_id: int, include_geojson: bool = Query(False), db: Session = Depends(get_db)):
+    batch_row = db.execute(
+        text(
+            """
+            SELECT id, parent_plot_id, estate_name, method, requested_count, target_area_m2,
+                   orientation_deg, generated_count, total_area_m2, status, created_at, updated_at
+            FROM plot_subdivision_batches
+            WHERE id = :batch_id
+            """
+        ),
+        {"batch_id": int(batch_id)},
+    ).mappings().first()
+    if not batch_row:
+        raise HTTPException(status_code=404, detail="Subdivision batch not found.")
+
+    if include_geojson:
+        item_rows = db.execute(
+            text(
+                """
+                SELECT i.id,
+                       i.batch_id,
+                       i.child_plot_id,
+                       i.lot_no,
+                       i.area_m2,
+                       i.created_at,
+                       ST_AsGeoJSON(p.geom) AS geojson
+                FROM plot_subdivision_items i
+                JOIN plots p ON p.id = i.child_plot_id
+                WHERE i.batch_id = :batch_id
+                ORDER BY i.id ASC
+                """
+            ),
+            {"batch_id": int(batch_id)},
+        ).mappings().all()
+    else:
+        item_rows = db.execute(
+            text(
+                """
+                SELECT id, batch_id, child_plot_id, lot_no, area_m2, created_at
+                FROM plot_subdivision_items
+                WHERE batch_id = :batch_id
+                ORDER BY id ASC
+                """
+            ),
+            {"batch_id": int(batch_id)},
+        ).mappings().all()
+
+    return {
+        "batch": dict(batch_row),
+        "items": [dict(r) for r in item_rows],
+    }
+
+
+@router.get("/subdivision/batches/{batch_id}/export/survey-plans.zip")
+def export_subdivision_batch_survey_plans(
+    batch_id: int,
+    db: Session = Depends(get_db),
+    background_tasks: BackgroundTasks = None,
+):
+    batch_row = db.execute(
+        text(
+            """
+            SELECT id, parent_plot_id, estate_name, method, created_at
+            FROM plot_subdivision_batches
+            WHERE id = :batch_id
+            """
+        ),
+        {"batch_id": int(batch_id)},
+    ).mappings().first()
+    if not batch_row:
+        raise HTTPException(status_code=404, detail="Subdivision batch not found.")
+
+    items = db.execute(
+        text(
+            """
+            SELECT child_plot_id, lot_no, area_m2
+            FROM plot_subdivision_items
+            WHERE batch_id = :batch_id
+            ORDER BY id ASC
+            """
+        ),
+        {"batch_id": int(batch_id)},
+    ).mappings().all()
+    if not items:
+        raise HTTPException(status_code=404, detail="Subdivision batch has no generated plots.")
+
+    tmp_dir = tempfile.mkdtemp(prefix=f"subdivision_batch_{batch_id}_")
+    export_rows: list[str] = ["lot_no,child_plot_id,area_m2"]
+    pdf_files: list[str] = []
+
+    try:
+        for item in items:
+            child_plot_id = int(item["child_plot_id"])
+            lot_no = str(item.get("lot_no") or f"LOT-{child_plot_id}")
+            safe_lot = _safe_filename_fragment(lot_no, f"LOT_{child_plot_id}")
+            pdf_name = f"{safe_lot}_survey_plan.pdf"
+            pdf_path = os.path.join(tmp_dir, pdf_name)
+            _render_survey_plan_pdf_for_plot(db, child_plot_id, pdf_path)
+            pdf_files.append(pdf_path)
+            export_rows.append(f"{lot_no},{child_plot_id},{float(item.get('area_m2') or 0.0):.2f}")
+
+        manifest_path = os.path.join(tmp_dir, "batch_manifest.csv")
+        with open(manifest_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(export_rows))
+
+        estate_tag = _safe_filename_fragment(str(batch_row.get("estate_name") or ""), f"batch_{batch_id}")
+        zip_name = f"{estate_tag}_survey_plans_batch_{batch_id}.zip"
+        zip_path = os.path.join(tmp_dir, zip_name)
+
+        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+            zf.write(manifest_path, arcname="batch_manifest.csv")
+            for fp in pdf_files:
+                if os.path.isfile(fp):
+                    zf.write(fp, arcname=os.path.basename(fp))
+
+        if background_tasks is None:
+            background_tasks = BackgroundTasks()
+        background_tasks.add_task(safe_rmtree, tmp_dir)
+
+        return FileResponse(
+            zip_path,
+            media_type="application/zip",
+            filename=zip_name,
+            background=background_tasks,
+        )
+    except HTTPException:
+        safe_rmtree(tmp_dir)
+        raise
+    except Exception as exc:
+        safe_rmtree(tmp_dir)
+        raise HTTPException(status_code=500, detail=f"Failed to export subdivision batch: {exc}")
 
 
 # ---------------- CREATE PLOT ----------------
