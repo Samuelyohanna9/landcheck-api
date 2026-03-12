@@ -31,6 +31,7 @@ from app.utils.green_pdf import (
     render_green_existing_trees_report_pdf,
     render_green_org_credentials_pdf,
 )
+from app.utils.r2_exports import upload_export_file_best_effort
 from app.utils.carbon import (
     compute_project_carbon,
     generate_co2_projection_table,
@@ -218,6 +219,33 @@ def _slugify_text(value: str | None, fallback: str = "organization") -> str:
     raw = (value or "").strip().lower()
     raw = re.sub(r"[^a-z0-9]+", "-", raw).strip("-")
     return raw or fallback
+
+
+def _pdf_response_with_r2(
+    local_pdf_path: str,
+    filename: str,
+    *,
+    category: str,
+    project_id: int | None = None,
+    organization_id: int | None = None,
+):
+    upload_meta = upload_export_file_best_effort(
+        local_pdf_path,
+        filename,
+        category=category,
+        project_id=project_id,
+        organization_id=organization_id,
+        content_type="application/pdf",
+    )
+    response = FileResponse(local_pdf_path, media_type="application/pdf", filename=filename)
+    if upload_meta:
+        object_key = upload_meta.get("object_key")
+        public_url = upload_meta.get("public_url")
+        if object_key:
+            response.headers["X-LandCheck-R2-Key"] = str(object_key)
+        if public_url:
+            response.headers["X-LandCheck-R2-Url"] = str(public_url)
+    return response
 
 
 def _ensure_unique_org_slug(db: Session, slug_base: str, exclude_org_id: int | None = None) -> str:
@@ -3793,7 +3821,12 @@ def export_admin_org_credentials_pdf(
     with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
         tmp.write(content)
         pdf_path = tmp.name
-    return FileResponse(pdf_path, media_type="application/pdf", filename=filename)
+    return _pdf_response_with_r2(
+        pdf_path,
+        filename,
+        category="green-admin-credentials",
+        organization_id=organization_id,
+    )
 
 
 @router.get("/projects")
@@ -10815,7 +10848,12 @@ def export_work_stats_pdf(project_id: int, db: Session = Depends(get_db)):
     tmp_pdf.close()
     render_green_work_report_pdf(pdf_path, project, stats)
     filename = f"project_{project_id}_work_report.pdf"
-    return FileResponse(pdf_path, media_type="application/pdf", filename=filename)
+    return _pdf_response_with_r2(
+        pdf_path,
+        filename,
+        category="green-work-stats",
+        project_id=project_id,
+    )
 
 
 @router.get("/projects/{project_id}/custodians/export/pdf")
@@ -11062,7 +11100,12 @@ def export_custodian_report_pdf(
         supervision_photo_rows=supervision_photo_rows,
     )
     filename = f"project_{project_id}_custodian_report.pdf"
-    return FileResponse(pdf_path, media_type="application/pdf", filename=filename)
+    return _pdf_response_with_r2(
+        pdf_path,
+        filename,
+        category="green-custodian-report",
+        project_id=project_id,
+    )
 
 
 @router.get("/projects/{project_id}/tasks/export/csv")
@@ -11113,7 +11156,12 @@ def export_tasks_pdf(project_id: int, db: Session = Depends(get_db)):
     tmp_pdf.close()
     render_green_work_report_pdf(pdf_path, project, {"orders": [], **stats})
     filename = f"project_{project_id}_tasks_report.pdf"
-    return FileResponse(pdf_path, media_type="application/pdf", filename=filename)
+    return _pdf_response_with_r2(
+        pdf_path,
+        filename,
+        category="green-tasks-report",
+        project_id=project_id,
+    )
 
 
 def _estimate_tree_co2_height_aware_kg(
@@ -11695,7 +11743,12 @@ def export_existing_trees_pdf(
         photo_rows=photo_rows,
     )
     filename = f"project_{project_id}_existing_trees_detailed.pdf"
-    return FileResponse(pdf_path, media_type="application/pdf", filename=filename)
+    return _pdf_response_with_r2(
+        pdf_path,
+        filename,
+        category="green-existing-trees-report",
+        project_id=project_id,
+    )
 
 
 @router.get("/projects/{project_id}/export/csv")
@@ -11984,7 +12037,12 @@ def export_project_pdf(
             species_daily_survival=species_daily_survival,
         )
     filename = f"project_{project_id}_report.pdf"
-    return FileResponse(pdf_path, media_type="application/pdf", filename=filename)
+    return _pdf_response_with_r2(
+        pdf_path,
+        filename,
+        category="green-project-report",
+        project_id=project_id,
+    )
 
 
 def _fetch_kpi_trend(project_id: int, db: Session, days: int = 90) -> list[dict]:
@@ -12269,4 +12327,9 @@ def export_work_report_pdf(
         if assignee_name
         else f"project_{project_id}_work_report_all.pdf"
     )
-    return FileResponse(pdf_path, media_type="application/pdf", filename=filename)
+    return _pdf_response_with_r2(
+        pdf_path,
+        filename,
+        category="green-work-report",
+        project_id=project_id,
+    )

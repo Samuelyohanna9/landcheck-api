@@ -6,6 +6,7 @@ import logging
 
 from app.utils.hazard_flood import compute_flood_risk, overlay_to_data_url
 from app.utils.hazard_pdf import render_flood_report_pdf
+from app.utils.r2_exports import upload_export_file_best_effort
 
 
 router = APIRouter(prefix="/hazards", tags=["hazards"])
@@ -13,6 +14,24 @@ logger = logging.getLogger("hazards")
 
 BASE_DIR = os.path.dirname(os.path.dirname(__file__))
 REPORTS_DIR = os.path.join(BASE_DIR, "reports")
+
+
+def _pdf_response_with_r2(local_pdf_path: str, filename: str):
+    upload_meta = upload_export_file_best_effort(
+        local_pdf_path,
+        filename,
+        category="hazard-flood",
+        content_type="application/pdf",
+    )
+    response = FileResponse(local_pdf_path, media_type="application/pdf", filename=filename)
+    if upload_meta:
+        object_key = upload_meta.get("object_key")
+        public_url = upload_meta.get("public_url")
+        if object_key:
+            response.headers["X-LandCheck-R2-Key"] = str(object_key)
+        if public_url:
+            response.headers["X-LandCheck-R2-Url"] = str(public_url)
+    return response
 
 
 def _extract_boundary(payload: dict) -> dict:
@@ -148,4 +167,4 @@ def flood_pdf(payload: dict = Body(...)):
         "show_raster": str(show_raster),
     }
     render_flood_report_pdf(pdf_path, overlay_png, summary)
-    return FileResponse(pdf_path, media_type="application/pdf", filename="flood_risk_report.pdf")
+    return _pdf_response_with_r2(pdf_path, "flood_risk_report.pdf")

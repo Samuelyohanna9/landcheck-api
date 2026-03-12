@@ -30,6 +30,7 @@ from app.utils.back_computation_pdf import render_back_computation_pdf
 from shapely import wkb
 import geopandas as gpd
 from app.utils.dwg_exporter import export_survey_plan_to_dxf
+from app.utils.r2_exports import upload_export_file_best_effort
 
 
 from app.utils.orthophoto_renderer import (
@@ -460,6 +461,31 @@ def safe_remove(path: str):
         pass
     except Exception:
         pass
+
+
+def _pdf_response_with_r2(
+    local_pdf_path: str,
+    filename: str,
+    *,
+    category: str,
+    project_id: int | None = None,
+):
+    upload_meta = upload_export_file_best_effort(
+        local_pdf_path,
+        filename,
+        category=category,
+        project_id=project_id,
+        content_type="application/pdf",
+    )
+    response = FileResponse(local_pdf_path, media_type="application/pdf", filename=filename)
+    if upload_meta:
+        object_key = upload_meta.get("object_key")
+        public_url = upload_meta.get("public_url")
+        if object_key:
+            response.headers["X-LandCheck-R2-Key"] = str(object_key)
+        if public_url:
+            response.headers["X-LandCheck-R2-Url"] = str(public_url)
+    return response
 
 
 def safe_rmtree(path: str):
@@ -1089,7 +1115,13 @@ def download_plot_report_pdf(plot_id: int, db: Session = Depends(get_db), backgr
 
     safe_remove(map_path)
 
-    return FileResponse(pdf_path, filename=f"plot_{plot_id}_report.pdf")
+    filename = f"plot_{plot_id}_report.pdf"
+    return _pdf_response_with_r2(
+        pdf_path,
+        filename,
+        category="survey-plan",
+        project_id=plot_id,
+    )
 
 
 # ---------------- SIMPLE PDF DOWNLOAD (GET) ----------------
@@ -1131,7 +1163,13 @@ def simple_download_pdf(plot_id: int, db: Session = Depends(get_db), background_
 
     safe_remove(map_path)
 
-    return FileResponse(pdf_path, filename=f"plot_{plot_id}_report.pdf")
+    filename = f"plot_{plot_id}_report.pdf"
+    return _pdf_response_with_r2(
+        pdf_path,
+        filename,
+        category="survey-plan",
+        project_id=plot_id,
+    )
 
 
 # ---------------- SURVEY PLAN PREVIEW ----------------
@@ -1370,7 +1408,13 @@ def download_back_computation_pdf(plot_id: int, db: Session = Depends(get_db), b
 
     render_back_computation_pdf(rows, sum_de, sum_dn, area_m2, plot_id, pdf_path, crs_name)
 
-    return FileResponse(pdf_path, filename=f"plot_{plot_id}_back_computation.pdf")
+    filename = f"plot_{plot_id}_back_computation.pdf"
+    return _pdf_response_with_r2(
+        pdf_path,
+        filename,
+        category="back-computation",
+        project_id=plot_id,
+    )
 
 
 # ---------------- ORTHOPHOTO ----------------
@@ -1540,7 +1584,12 @@ def orthophoto_pdf(plot_id: int, db: Session = Depends(get_db), background_tasks
     filename = f"plot_{plot_id}_{'topomap' if use_topo_map else 'orthophoto'}.pdf"
     safe_remove(png_path)
 
-    return FileResponse(pdf_path, media_type="application/pdf", filename=filename)
+    return _pdf_response_with_r2(
+        pdf_path,
+        filename,
+        category="orthophoto" if not use_topo_map else "topo-map",
+        project_id=plot_id,
+    )
 @router.get("/{plot_id}/survey-plan/dwg")
 def download_survey_plan_dwg(plot_id: int, db: Session = Depends(get_db)):
 
@@ -1739,7 +1788,13 @@ def get_saved_survey_plan_pdf(plot_id: int, refresh: bool = False, db: Session =
         safe_remove(map_path)
     if not pdf_path or not os.path.exists(pdf_path):
         raise HTTPException(status_code=404, detail="Survey plan PDF not found")
-    return FileResponse(pdf_path, media_type="application/pdf", filename=f"plot_{plot_id}_survey_plan.pdf")
+    filename = f"plot_{plot_id}_survey_plan.pdf"
+    return _pdf_response_with_r2(
+        pdf_path,
+        filename,
+        category="survey-plan",
+        project_id=plot_id,
+    )
 
 
 @router.get("/{plot_id}/reports/orthophoto")
@@ -1785,7 +1840,12 @@ def get_saved_orthophoto_pdf(plot_id: int, map_type: str = "satellite", refresh:
     if not pdf_path or not os.path.exists(pdf_path):
         raise HTTPException(status_code=404, detail="Orthophoto PDF not found")
     filename = f"plot_{plot_id}_{'topomap' if safe_type == 'topo' else 'orthophoto'}.pdf"
-    return FileResponse(pdf_path, media_type="application/pdf", filename=filename)
+    return _pdf_response_with_r2(
+        pdf_path,
+        filename,
+        category="orthophoto" if safe_type != "topo" else "topo-map",
+        project_id=plot_id,
+    )
 
 
 @router.get("/{plot_id}/reports/back-computation")
@@ -1820,4 +1880,10 @@ def get_saved_back_computation_pdf(plot_id: int, refresh: bool = False, db: Sess
         render_back_computation_pdf(rows, sum_de, sum_dn, area_m2, plot_id, pdf_path, crs_name)
     if not pdf_path or not os.path.exists(pdf_path):
         raise HTTPException(status_code=404, detail="Back computation PDF not found")
-    return FileResponse(pdf_path, media_type="application/pdf", filename=f"plot_{plot_id}_back_computation.pdf")
+    filename = f"plot_{plot_id}_back_computation.pdf"
+    return _pdf_response_with_r2(
+        pdf_path,
+        filename,
+        category="back-computation",
+        project_id=plot_id,
+    )
