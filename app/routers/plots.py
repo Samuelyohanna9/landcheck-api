@@ -969,6 +969,80 @@ def _set_plot_subdivision_meta(
     )
 
 
+def _apply_child_plot_meta(
+    db: Session,
+    *,
+    plot_id: int,
+    title_text: str,
+    parent_meta: dict,
+):
+    _ensure_plot_meta_row(db, plot_id)
+    db.execute(
+        text(
+            """
+            UPDATE plot_meta
+            SET title_text = :title_text,
+                location_text = :location_text,
+                lga_text = :lga_text,
+                state_text = :state_text,
+                surveyor_name = :surveyor_name,
+                surveyor_rank = :surveyor_rank,
+                certification_statement = :certification_statement,
+                scale_text = :scale_text,
+                paper_size = :paper_size,
+                coordinate_system = :coordinate_system,
+                template_name = :template_name,
+                adamawa_rof_no = :adamawa_rof_no,
+                adamawa_owner_name = :adamawa_owner_name,
+                adamawa_authority_title = :adamawa_authority_title,
+                adamawa_authority_date_text = :adamawa_authority_date_text,
+                adamawa_control_point_name = :adamawa_control_point_name,
+                adamawa_northing = :adamawa_northing,
+                adamawa_easting = :adamawa_easting,
+                adamawa_elevation = :adamawa_elevation,
+                adamawa_origin_text = :adamawa_origin_text,
+                adamawa_topo_sheet_text = :adamawa_topo_sheet_text,
+                adamawa_computation_no = :adamawa_computation_no,
+                adamawa_cadastral_sheet_no = :adamawa_cadastral_sheet_no,
+                adamawa_plan_no = :adamawa_plan_no,
+                adamawa_surveyed_by_text = :adamawa_surveyed_by_text,
+                adamawa_disclaimer_text = :adamawa_disclaimer_text,
+                updated_at = NOW()
+            WHERE plot_id = :plot_id
+            """
+        ),
+        {
+            "plot_id": int(plot_id),
+            "title_text": title_text,
+            "location_text": parent_meta.get("location_text") or None,
+            "lga_text": parent_meta.get("lga_text") or None,
+            "state_text": parent_meta.get("state_text") or None,
+            "surveyor_name": parent_meta.get("surveyor_name") or None,
+            "surveyor_rank": parent_meta.get("surveyor_rank") or None,
+            "certification_statement": parent_meta.get("certification_statement") or DEFAULT_CERTIFICATION_STATEMENT,
+            "scale_text": parent_meta.get("scale_text") or "1 : 1000",
+            "paper_size": parent_meta.get("paper_size") or "A4",
+            "coordinate_system": parent_meta.get("coordinate_system") or "wgs84",
+            "template_name": parent_meta.get("template_name") or DEFAULT_TEMPLATE_NAME,
+            "adamawa_rof_no": parent_meta.get("adamawa_rof_no") or "",
+            "adamawa_owner_name": parent_meta.get("adamawa_owner_name") or "",
+            "adamawa_authority_title": parent_meta.get("adamawa_authority_title") or DEFAULT_ADAMAWA_AUTHORITY_TITLE,
+            "adamawa_authority_date_text": parent_meta.get("adamawa_authority_date_text") or DEFAULT_ADAMAWA_AUTHORITY_DATE,
+            "adamawa_control_point_name": "",
+            "adamawa_northing": "",
+            "adamawa_easting": "",
+            "adamawa_elevation": "",
+            "adamawa_origin_text": parent_meta.get("adamawa_origin_text") or DEFAULT_ADAMAWA_ORIGIN_TEXT,
+            "adamawa_topo_sheet_text": parent_meta.get("adamawa_topo_sheet_text") or DEFAULT_ADAMAWA_TOPO_SHEET_TEXT,
+            "adamawa_computation_no": parent_meta.get("adamawa_computation_no") or "",
+            "adamawa_cadastral_sheet_no": parent_meta.get("adamawa_cadastral_sheet_no") or "",
+            "adamawa_plan_no": parent_meta.get("adamawa_plan_no") or "",
+            "adamawa_surveyed_by_text": parent_meta.get("adamawa_surveyed_by_text") or "",
+            "adamawa_disclaimer_text": parent_meta.get("adamawa_disclaimer_text") or DEFAULT_ADAMAWA_DISCLAIMER_TEXT,
+        },
+    )
+
+
 def _run_plot_feature_detection(db: Session, plot_id: int):
     db.execute(
         text(
