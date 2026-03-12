@@ -16,6 +16,7 @@ import glob
 import re
 import shutil
 import zipfile
+import csv
 import time
 import json
 import hashlib
@@ -836,6 +837,107 @@ def _subdivide_polygon_equal_count(poly_metric: Polygon, split_count: int, orien
     return out
 
 
+def _normalize_fraction_weights(values: Any) -> list[float]:
+    if not isinstance(values, (list, tuple)):
+        return []
+    out: list[float] = []
+    for raw in values:
+        parsed = _coerce_float(raw, 0.0)
+        if parsed > 0:
+            out.append(float(parsed))
+    return out
+
+
+def _normalize_fraction_breaks(values: Any) -> list[float]:
+    if not isinstance(values, (list, tuple)):
+        return []
+    raw_breaks: list[float] = []
+    for raw in values:
+        parsed = _coerce_float(raw, float("nan"))
+        if not math.isfinite(parsed):
+            continue
+        # Allow percentages (0-100) and normalized ratios (0-1).
+        if parsed > 1.0 and parsed <= 100.0:
+            parsed = parsed / 100.0
+        if 0.0 < parsed < 1.0:
+            raw_breaks.append(float(parsed))
+    if not raw_breaks:
+        return []
+    raw_breaks.sort()
+    deduped: list[float] = []
+    for value in raw_breaks:
+        if not deduped or abs(value - deduped[-1]) > 1e-6:
+            deduped.append(value)
+    return deduped
+
+
+def _breaks_to_weights(breaks: list[float]) -> list[float]:
+    if not breaks:
+        return []
+    weights: list[float] = []
+    prev = 0.0
+    for value in breaks:
+        weights.append(max(value - prev, 0.0))
+        prev = value
+    weights.append(max(1.0 - prev, 0.0))
+    return [w for w in weights if w > 0]
+
+
+def _weights_to_breaks(weights: list[float]) -> list[float]:
+    if not weights or len(weights) < 2:
+        return []
+    total = sum(weights)
+    if total <= 0:
+        return []
+    acc = 0.0
+    out: list[float] = []
+    for weight in weights[:-1]:
+        acc += float(weight) / total
+        out.append(max(0.0, min(1.0, acc)))
+    return out
+
+
+def _subdivide_polygon_weighted(poly_metric: Polygon, weights: list[float], orientation_deg: float) -> list[Polygon]:
+    normalized_weights = [float(w) for w in weights if float(w) > 0]
+    if len(normalized_weights) < 2:
+        raise HTTPException(status_code=400, detail="Fraction subdivision requires at least 2 positive fraction values.")
+
+    base_poly = _clean_single_polygon(poly_metric)
+    if base_poly is None:
+        raise HTTPException(status_code=400, detail="Mother parcel geometry is invalid.")
+
+    rotated = _clean_single_polygon(rotate(base_poly, -orientation_deg, origin="centroid", use_radians=False))
+    if rotated is None:
+        raise HTTPException(status_code=400, detail="Subdivision failed: unable to rotate mother parcel.")
+
+    pieces: list[Polygon] = []
+    remaining = rotated
+    remaining_weight = float(sum(normalized_weights))
+    if remaining_weight <= 0:
+        raise HTTPException(status_code=400, detail="Fraction subdivision weights are invalid.")
+
+    for weight in normalized_weights[:-1]:
+        weight = float(weight)
+        if remaining_weight <= 1e-9:
+            break
+        share = max(0.0, min(1.0, weight / remaining_weight))
+        target_area = max(1e-9, float(remaining.area) * share)
+        left_piece, right_piece = _split_polygon_once_by_area(remaining, target_area)
+        pieces.append(left_piece)
+        remaining = right_piece
+        remaining_weight -= weight
+
+    pieces.append(remaining)
+
+    out: list[Polygon] = []
+    for piece in pieces:
+        restored = _clean_single_polygon(rotate(piece, orientation_deg, origin=base_poly.centroid, use_radians=False))
+        if restored is None or restored.area <= 1e-8:
+            raise HTTPException(status_code=400, detail="Subdivision failed: generated a degenerate parcel.")
+        out.append(restored)
+    return out
+
+
 def _compute_subdivision_payload(
     parent_plot_id: int,
     parent_geom_wgs84: Polygon,
@@ -845,10 +947,13 @@ def _compute_subdivision_payload(
     target_area_m2: float | None,
     orientation_deg: float,
     lot_prefix: str,
+    fraction_weights: list[float] | None = None,
+    fraction_breaks: list[float] | None = None,
+    lot_names: list[str] | None = None,
 ) -> dict:
     method_key = (method or "by_count").strip().lower()
-    if method_key not in {"by_count", "by_area"}:
-        raise HTTPException(status_code=400, detail="Invalid subdivision method. Use 'by_count' or 'by_area'.")
+    if method_key not in {"by_count", "by_area", "by_fraction"}:
+        raise HTTPException(status_code=400, detail="Invalid subdivision method. Use 'by_count', 'by_area', or 'by_fraction'.")
 
     metric_epsg = _metric_epsg_for_wgs84_polygon(parent_geom_wgs84)
     gdf_metric = gpd.GeoDataFrame(geometry=[parent_geom_wgs84], crs="EPSG:4326").to_crs(epsg=metric_epsg)
@@ -859,27 +964,54 @@ def _compute_subdivision_payload(
     total_area_m2 = float(parent_metric.area)
     resolved_count = _coerce_positive_int(split_count)
     target_area = _coerce_float(target_area_m2, 0.0)
+    effective_fraction_weights: list[float] = []
+    effective_fraction_breaks: list[float] = []
     if method_key == "by_count":
         if resolved_count is None or resolved_count < 2:
             raise HTTPException(status_code=400, detail="For 'by_count', set derived plot count to 2 or more.")
+        pieces_wgs84 = _subdivide_polygon_equal_count(parent_metric, int(resolved_count), orientation_deg)
     else:
-        if target_area <= 0:
-            raise HTTPException(status_code=400, detail="For 'by_area', provide a positive target plot size (sqm).")
-        approx_count = int(round(total_area_m2 / target_area))
-        resolved_count = max(2, approx_count)
+        if method_key == "by_area":
+            if target_area <= 0:
+                raise HTTPException(status_code=400, detail="For 'by_area', provide a positive target plot size (sqm).")
+            approx_count = int(round(total_area_m2 / target_area))
+            resolved_count = max(2, approx_count)
+            resolved_count = min(int(resolved_count or 2), 500)
+            pieces_wgs84 = _subdivide_polygon_equal_count(parent_metric, resolved_count, orientation_deg)
+        else:
+            normalized_breaks = _normalize_fraction_breaks(fraction_breaks)
+            normalized_weights = _normalize_fraction_weights(fraction_weights)
+            if normalized_breaks:
+                effective_fraction_breaks = normalized_breaks
+                effective_fraction_weights = _breaks_to_weights(normalized_breaks)
+            elif len(normalized_weights) >= 2:
+                effective_fraction_weights = normalized_weights
+                effective_fraction_breaks = _weights_to_breaks(normalized_weights)
+            else:
+                raise HTTPException(
+                    status_code=400,
+                    detail="For 'by_fraction', provide fraction values (for example: [2,3,5]) or break positions (for example: [0.3,0.65]).",
+                )
+            if len(effective_fraction_weights) < 2:
+                raise HTTPException(status_code=400, detail="Fraction subdivision requires at least two resulting plots.")
+            resolved_count = min(len(effective_fraction_weights), 500)
+            effective_fraction_weights = effective_fraction_weights[:resolved_count]
+            effective_fraction_breaks = _weights_to_breaks(effective_fraction_weights)
+            pieces_wgs84 = _subdivide_polygon_weighted(parent_metric, effective_fraction_weights, orientation_deg)
 
     resolved_count = min(int(resolved_count or 2), 500)
-    pieces_wgs84 = _subdivide_polygon_equal_count(parent_metric, resolved_count, orientation_deg)
     gdf_out = gpd.GeoDataFrame(geometry=pieces_wgs84, crs=f"EPSG:{metric_epsg}").to_crs(epsg=4326)
 
     safe_prefix = re.sub(r"[^A-Za-z0-9]+", "", str(lot_prefix or "LOT").upper()) or "LOT"
+    custom_lot_names = list(lot_names or [])
     plots: list[dict] = []
     derived_total = 0.0
     for idx, (poly_wgs, poly_metric) in enumerate(zip(gdf_out.geometry.tolist(), pieces_wgs84), start=1):
         area_m2 = float(max(poly_metric.area, 0.0))
         derived_total += area_m2
         ring = [[float(x), float(y)] for x, y in list(poly_wgs.exterior.coords)]
-        plot_no = f"{safe_prefix}-{idx:03d}"
+        custom_name = str(custom_lot_names[idx - 1] or "").strip() if idx - 1 < len(custom_lot_names) else ""
+        plot_no = custom_name or f"{safe_prefix}-{idx:03d}"
         plots.append(
             {
                 "index": idx,
@@ -915,6 +1047,8 @@ def _compute_subdivision_payload(
         "orientation_deg": round(float(orientation_deg), 3),
         "requested_count": int(split_count or 0) if split_count is not None else None,
         "target_area_m2": round(float(target_area), 2) if target_area > 0 else None,
+        "fraction_weights": [round(float(w), 6) for w in effective_fraction_weights] if effective_fraction_weights else None,
+        "fraction_breaks": [round(float(v), 6) for v in effective_fraction_breaks] if effective_fraction_breaks else None,
         "resolved_count": len(plots),
         "total_area_m2": round(total_area_m2, 2),
         "derived_total_area_m2": round(derived_total, 2),
@@ -1267,6 +1401,9 @@ def preview_plot_subdivision(
     orientation_deg: float = Body(0.0),
     lot_prefix: str = Body("LOT"),
     estate_name: str = Body(""),
+    fraction_weights: list[float] | None = Body(None),
+    fraction_breaks: list[float] | None = Body(None),
+    lot_names: list[str] | None = Body(None),
 ):
     parent_geom_wgs84 = _load_plot_polygon_wgs84(db, plot_id)
     payload = _compute_subdivision_payload(
@@ -1277,6 +1414,9 @@ def preview_plot_subdivision(
         target_area_m2=target_area_m2,
         orientation_deg=_coerce_float(orientation_deg, 0.0),
         lot_prefix=lot_prefix,
+        fraction_weights=fraction_weights,
+        fraction_breaks=fraction_breaks,
+        lot_names=lot_names,
     )
     payload["estate_name"] = str(estate_name or "").strip()
     return payload
@@ -1292,6 +1432,9 @@ def apply_plot_subdivision(
     orientation_deg: float = Body(0.0),
     lot_prefix: str = Body("LOT"),
     estate_name: str = Body(""),
+    fraction_weights: list[float] | None = Body(None),
+    fraction_breaks: list[float] | None = Body(None),
+    lot_names: list[str] | None = Body(None),
     include_feature_detection: bool = Body(True),
 ):
     parent_geom_wgs84 = _load_plot_polygon_wgs84(db, plot_id)
@@ -1304,6 +1447,9 @@ def apply_plot_subdivision(
         target_area_m2=target_area_m2,
         orientation_deg=_coerce_float(orientation_deg, 0.0),
         lot_prefix=lot_prefix,
+        fraction_weights=fraction_weights,
+        fraction_breaks=fraction_breaks,
+        lot_names=lot_names,
     )
     parent_meta = get_plot_meta(db, plot_id)
 
@@ -1542,7 +1688,7 @@ def export_subdivision_batch_survey_plans(
         raise HTTPException(status_code=404, detail="Subdivision batch has no generated plots.")
 
     tmp_dir = tempfile.mkdtemp(prefix=f"subdivision_batch_{batch_id}_")
-    export_rows: list[str] = ["lot_no,child_plot_id,area_m2"]
+    export_rows: list[list[str]] = [["lot_no", "child_plot_id", "area_m2"]]
     pdf_files: list[str] = []
 
     try:
@@ -1554,11 +1700,12 @@ def export_subdivision_batch_survey_plans(
             pdf_path = os.path.join(tmp_dir, pdf_name)
             _render_survey_plan_pdf_for_plot(db, child_plot_id, pdf_path)
             pdf_files.append(pdf_path)
-            export_rows.append(f"{lot_no},{child_plot_id},{float(item.get('area_m2') or 0.0):.2f}")
+            export_rows.append([lot_no, str(child_plot_id), f"{float(item.get('area_m2') or 0.0):.2f}"])
 
         manifest_path = os.path.join(tmp_dir, "batch_manifest.csv")
-        with open(manifest_path, "w", encoding="utf-8") as f:
-            f.write("\n".join(export_rows))
+        with open(manifest_path, "w", encoding="utf-8", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerows(export_rows)
 
         estate_tag = _safe_filename_fragment(str(batch_row.get("estate_name") or ""), f"batch_{batch_id}")
         zip_name = f"{estate_tag}_survey_plans_batch_{batch_id}.zip"
