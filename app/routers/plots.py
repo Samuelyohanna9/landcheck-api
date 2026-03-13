@@ -1150,6 +1150,7 @@ def _apply_child_plot_meta(
     plot_id: int,
     title_text: str,
     parent_meta: dict,
+    adamawa_owner_name: str | None = None,
 ):
     _ensure_plot_meta_row(db, plot_id)
     db.execute(
@@ -1200,7 +1201,11 @@ def _apply_child_plot_meta(
             "coordinate_system": parent_meta.get("coordinate_system") or "wgs84",
             "template_name": parent_meta.get("template_name") or DEFAULT_TEMPLATE_NAME,
             "adamawa_rof_no": parent_meta.get("adamawa_rof_no") or "",
-            "adamawa_owner_name": parent_meta.get("adamawa_owner_name") or "",
+            "adamawa_owner_name": (
+                str(adamawa_owner_name or "").strip()
+                or parent_meta.get("adamawa_owner_name")
+                or ""
+            ),
             "adamawa_authority_title": parent_meta.get("adamawa_authority_title") or DEFAULT_ADAMAWA_AUTHORITY_TITLE,
             "adamawa_authority_date_text": parent_meta.get("adamawa_authority_date_text") or DEFAULT_ADAMAWA_AUTHORITY_DATE,
             "adamawa_control_point_name": "",
@@ -1479,7 +1484,7 @@ def apply_plot_subdivision(
     fraction_breaks: list[float] | None = Body(None),
     custom_areas_m2: list[float] | None = Body(None),
     lot_names: list[str] | None = Body(None),
-    include_feature_detection: bool = Body(True),
+    include_feature_detection: bool = Body(False),
 ):
     parent_geom_wgs84 = _load_plot_polygon_wgs84(db, plot_id)
     safe_estate_name = str(estate_name or "").strip()
@@ -1543,6 +1548,7 @@ def apply_plot_subdivision(
                 plot_id=child_plot_id,
                 title_text=_compose_child_title(parent_meta, lot_no, safe_estate_name),
                 parent_meta=parent_meta,
+                adamawa_owner_name=lot_no,
             )
             _set_plot_subdivision_meta(
                 db,
@@ -1754,6 +1760,16 @@ def export_subdivision_batch_survey_plans(
             safe_lot = _safe_filename_fragment(lot_no, f"LOT_{child_plot_id}")
             pdf_name = f"{safe_lot}_survey_plan.pdf"
             pdf_path = os.path.join(tmp_dir, pdf_name)
+            try:
+                existing_feature_count = db.execute(
+                    text("SELECT COUNT(*) FROM detected_features WHERE plot_id = :plot_id"),
+                    {"plot_id": child_plot_id},
+                ).scalar()
+                if int(existing_feature_count or 0) <= 0:
+                    _run_plot_feature_detection(db, child_plot_id)
+            except Exception:
+                # Continue export even if feature detection check fails.
+                pass
             _render_survey_plan_pdf_for_plot(db, child_plot_id, pdf_path)
             pdf_files.append(pdf_path)
             export_rows.append([lot_no, str(child_plot_id), f"{float(item.get('area_m2') or 0.0):.2f}"])
@@ -1791,13 +1807,25 @@ def export_subdivision_batch_survey_plans(
                 pass
 
         manifest_path = os.path.join(tmp_dir, "batch_manifest.csv")
-        with open(manifest_path, "w", encoding="utf-8", newline="") as f:
-            writer = csv.writer(f)
+        with open(manifest_path, "w", encoding="utf-8-sig", newline="") as f:
+            writer = csv.writer(
+                f,
+                delimiter=",",
+                quotechar='"',
+                quoting=csv.QUOTE_MINIMAL,
+                lineterminator="\n",
+            )
             writer.writerows(export_rows)
 
         setting_out_path = os.path.join(tmp_dir, "setting_out_points_dgps.csv")
-        with open(setting_out_path, "w", encoding="utf-8", newline="") as f:
-            writer = csv.writer(f)
+        with open(setting_out_path, "w", encoding="utf-8-sig", newline="") as f:
+            writer = csv.writer(
+                f,
+                delimiter=",",
+                quotechar='"',
+                quoting=csv.QUOTE_MINIMAL,
+                lineterminator="\n",
+            )
             writer.writerows(setting_out_rows)
 
         estate_tag = _safe_filename_fragment(str(batch_row.get("estate_name") or ""), f"batch_{batch_id}")
@@ -2205,6 +2233,70 @@ def get_plot_report(plot_id: int, db: Session = Depends(get_db)):
 
 
 # ---------------- SURVEY PLAN PDF ----------------
+
+@router.post("/{plot_id}/meta")
+def save_plot_metadata(
+    plot_id: int,
+    db: Session = Depends(get_db),
+    title_text: str = Body("SURVEY PLAN"),
+    location_text: str = Body(""),
+    lga_text: str = Body(""),
+    state_text: str = Body(""),
+    scale_text: str = Body("1 : 1000"),
+    surveyor_name: str = Body(""),
+    surveyor_rank: str = Body(""),
+    certification_statement: str = Body(DEFAULT_CERTIFICATION_STATEMENT),
+    coordinate_system: str = Body("wgs84"),
+    paper_size: str = Body("A4"),
+    template_name: str = Body(DEFAULT_TEMPLATE_NAME),
+    adamawa_rof_no: str = Body(""),
+    adamawa_owner_name: str = Body(""),
+    adamawa_authority_title: str = Body(DEFAULT_ADAMAWA_AUTHORITY_TITLE),
+    adamawa_authority_date_text: str = Body(DEFAULT_ADAMAWA_AUTHORITY_DATE),
+    adamawa_control_point_name: str = Body(""),
+    adamawa_northing: str = Body(""),
+    adamawa_easting: str = Body(""),
+    adamawa_elevation: str = Body(""),
+    adamawa_origin_text: str = Body(DEFAULT_ADAMAWA_ORIGIN_TEXT),
+    adamawa_topo_sheet_text: str = Body(DEFAULT_ADAMAWA_TOPO_SHEET_TEXT),
+    adamawa_computation_no: str = Body(""),
+    adamawa_cadastral_sheet_no: str = Body(""),
+    adamawa_plan_no: str = Body(""),
+    adamawa_surveyed_by_text: str = Body(""),
+    adamawa_disclaimer_text: str = Body(DEFAULT_ADAMAWA_DISCLAIMER_TEXT),
+):
+    upsert_plot_meta(
+        db=db,
+        plot_id=plot_id,
+        title_text=title_text,
+        location_text=location_text,
+        lga_text=lga_text,
+        state_text=state_text,
+        surveyor_name=surveyor_name,
+        surveyor_rank=surveyor_rank,
+        certification_statement=certification_statement,
+        scale_text=scale_text,
+        paper_size=paper_size,
+        coordinate_system=coordinate_system,
+        template_name=template_name,
+        adamawa_rof_no=adamawa_rof_no,
+        adamawa_owner_name=adamawa_owner_name,
+        adamawa_authority_title=adamawa_authority_title,
+        adamawa_authority_date_text=adamawa_authority_date_text,
+        adamawa_control_point_name=adamawa_control_point_name,
+        adamawa_northing=adamawa_northing,
+        adamawa_easting=adamawa_easting,
+        adamawa_elevation=adamawa_elevation,
+        adamawa_origin_text=adamawa_origin_text,
+        adamawa_topo_sheet_text=adamawa_topo_sheet_text,
+        adamawa_computation_no=adamawa_computation_no,
+        adamawa_cadastral_sheet_no=adamawa_cadastral_sheet_no,
+        adamawa_plan_no=adamawa_plan_no,
+        adamawa_surveyed_by_text=adamawa_surveyed_by_text,
+        adamawa_disclaimer_text=adamawa_disclaimer_text,
+    )
+    return {"ok": True, "plot_id": int(plot_id)}
+
 
 @router.post("/{plot_id}/report/pdf")
 def download_plot_report_pdf(plot_id: int, db: Session = Depends(get_db), background_tasks: BackgroundTasks = None,
