@@ -1374,6 +1374,15 @@ def _safe_filename_fragment(value: str, fallback: str) -> str:
     return cleaned or fallback
 
 
+def _format_nigerian_number(value: float, decimals: int) -> str:
+    try:
+        numeric = float(value)
+    except Exception:
+        numeric = 0.0
+    # Prefix apostrophe keeps exact display in Excel while preserving dot-decimal style.
+    return f"'{numeric:,.{decimals}f}"
+
+
 def _compose_child_title(parent_meta: dict, lot_no: str, estate_name: str | None) -> str:
     estate = str(estate_name or parent_meta.get("estate_name") or "").strip()
     base_title = str(parent_meta.get("title_text") or "SURVEY PLAN").strip()
@@ -1763,6 +1772,17 @@ def export_subdivision_batch_survey_plans(
         "northing",
         "utm_epsg",
     ]]
+    setting_out_rows_raw: list[list[str]] = [[
+        "lot_no",
+        "child_plot_id",
+        "point_index",
+        "station",
+        "longitude",
+        "latitude",
+        "easting",
+        "northing",
+        "utm_epsg",
+    ]]
     pdf_files: list[str] = []
 
     try:
@@ -1793,15 +1813,30 @@ def export_subdivision_batch_survey_plans(
                         if len(coords_metric) >= 2 and coords_metric[0] == coords_metric[-1]:
                             coords_metric = coords_metric[:-1]
                         for idx, (wgs_pt, metric_pt) in enumerate(zip(coords_wgs, coords_metric), start=1):
+                            lng_val = float(wgs_pt[0])
+                            lat_val = float(wgs_pt[1])
+                            easting_val = float(metric_pt[0])
+                            northing_val = float(metric_pt[1])
                             setting_out_rows.append([
                                 lot_no,
                                 str(child_plot_id),
                                 str(idx),
                                 _station_name(idx - 1),
-                                f"{float(wgs_pt[0]):.8f}",
-                                f"{float(wgs_pt[1]):.8f}",
-                                f"{float(metric_pt[0]):.3f}",
-                                f"{float(metric_pt[1]):.3f}",
+                                _format_nigerian_number(lng_val, 8),
+                                _format_nigerian_number(lat_val, 8),
+                                _format_nigerian_number(easting_val, 3),
+                                _format_nigerian_number(northing_val, 3),
+                                str(int(utm_epsg)),
+                            ])
+                            setting_out_rows_raw.append([
+                                lot_no,
+                                str(child_plot_id),
+                                str(idx),
+                                _station_name(idx - 1),
+                                f"{lng_val:.8f}",
+                                f"{lat_val:.8f}",
+                                f"{easting_val:.3f}",
+                                f"{northing_val:.3f}",
                                 str(int(utm_epsg)),
                             ])
             except Exception:
@@ -1829,12 +1864,23 @@ def export_subdivision_batch_survey_plans(
                 lineterminator="\n",
             )
             writer.writerows(setting_out_rows)
+        setting_out_raw_path = os.path.join(tmp_dir, "setting_out_points_dgps_raw.csv")
+        with open(setting_out_raw_path, "w", encoding="utf-8", newline="") as f:
+            writer = csv.writer(
+                f,
+                delimiter=",",
+                quotechar='"',
+                quoting=csv.QUOTE_MINIMAL,
+                lineterminator="\n",
+            )
+            writer.writerows(setting_out_rows_raw)
 
         zip_path = os.path.join(tmp_dir, zip_name)
 
         with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
             zf.write(manifest_path, arcname="batch_manifest.csv")
             zf.write(setting_out_path, arcname="setting_out_points_dgps.csv")
+            zf.write(setting_out_raw_path, arcname="setting_out_points_dgps_raw.csv")
             for fp in pdf_files:
                 if os.path.isfile(fp):
                     zf.write(fp, arcname=os.path.basename(fp))

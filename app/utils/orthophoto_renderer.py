@@ -10,6 +10,7 @@ import numpy as np
 import geopandas as gpd
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
+import matplotlib.lines as mlines
 from sqlalchemy import text
 from shapely import wkb
 from datetime import datetime
