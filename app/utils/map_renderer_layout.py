@@ -318,7 +318,6 @@ def draw_certification_box(fig, certification_statement: str, surveyor_name: str
 
     line_step = 0.019
     start_y = top_y - 0.024
-    text_width_fig = max(0.16, min(0.29, 0.95 - x - 0.012))
 
     # Prevent overlap with footer/source text when the key is short (fewer legend items).
     # This issue can look "device-specific" because different plots may have different key heights.
@@ -331,20 +330,16 @@ def draw_certification_box(fig, certification_statement: str, surveyor_name: str
 
     for idx, line in enumerate(lines):
         yy = start_y - idx * line_step
-        is_last_line = idx == len(lines) - 1
         fs = max(5, int(6 * font_scale))
-        if is_last_line:
-            fig.text(
-                x,
-                yy,
-                line,
-                transform=fig.transFigure,
-                fontsize=fs,
-                va="top",
-                ha="left",
-            )
-        else:
-            _draw_figure_text_justified(fig, x, yy, line, text_width_fig, fs)
+        fig.text(
+            x,
+            yy,
+            line,
+            transform=fig.transFigure,
+            fontsize=fs,
+            va="top",
+            ha="left",
+        )
 
     cert_name = (surveyor_name or "").strip() or "________________"
     fig.text(

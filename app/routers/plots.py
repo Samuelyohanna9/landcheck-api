@@ -1738,9 +1738,21 @@ def export_subdivision_batch_survey_plans(
     if not items:
         raise HTTPException(status_code=404, detail="Subdivision batch has no generated plots.")
 
+    estate_tag = _safe_filename_fragment(str(batch_row.get("estate_name") or ""), f"batch_{batch_id}")
+    zip_name = f"{estate_tag}_survey_plans_batch_{batch_id}.zip"
+    cache_dir = os.path.join(REPORTS_DIR, "subdivision_batches")
+    os.makedirs(cache_dir, exist_ok=True)
+    cached_zip_path = os.path.join(cache_dir, zip_name)
+    if os.path.isfile(cached_zip_path):
+        return FileResponse(
+            cached_zip_path,
+            media_type="application/zip",
+            filename=zip_name,
+        )
+
     tmp_dir = tempfile.mkdtemp(prefix=f"subdivision_batch_{batch_id}_")
-    export_rows: list[list[str]] = [["lot_no", "child_plot_id", "area_m2"]]
-    setting_out_rows: list[list[str]] = [[
+    export_rows: list[list[str]] = [["sep=,"], ["lot_no", "child_plot_id", "area_m2"]]
+    setting_out_rows: list[list[str]] = [["sep=,"], [
         "lot_no",
         "child_plot_id",
         "point_index",
@@ -1760,16 +1772,6 @@ def export_subdivision_batch_survey_plans(
             safe_lot = _safe_filename_fragment(lot_no, f"LOT_{child_plot_id}")
             pdf_name = f"{safe_lot}_survey_plan.pdf"
             pdf_path = os.path.join(tmp_dir, pdf_name)
-            try:
-                existing_feature_count = db.execute(
-                    text("SELECT COUNT(*) FROM detected_features WHERE plot_id = :plot_id"),
-                    {"plot_id": child_plot_id},
-                ).scalar()
-                if int(existing_feature_count or 0) <= 0:
-                    _run_plot_feature_detection(db, child_plot_id)
-            except Exception:
-                # Continue export even if feature detection check fails.
-                pass
             _render_survey_plan_pdf_for_plot(db, child_plot_id, pdf_path)
             pdf_files.append(pdf_path)
             export_rows.append([lot_no, str(child_plot_id), f"{float(item.get('area_m2') or 0.0):.2f}"])
@@ -1828,8 +1830,6 @@ def export_subdivision_batch_survey_plans(
             )
             writer.writerows(setting_out_rows)
 
-        estate_tag = _safe_filename_fragment(str(batch_row.get("estate_name") or ""), f"batch_{batch_id}")
-        zip_name = f"{estate_tag}_survey_plans_batch_{batch_id}.zip"
         zip_path = os.path.join(tmp_dir, zip_name)
 
         with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
@@ -1838,6 +1838,10 @@ def export_subdivision_batch_survey_plans(
             for fp in pdf_files:
                 if os.path.isfile(fp):
                     zf.write(fp, arcname=os.path.basename(fp))
+        try:
+            shutil.copyfile(zip_path, cached_zip_path)
+        except Exception:
+            pass
 
         if background_tasks is None:
             background_tasks = BackgroundTasks()
