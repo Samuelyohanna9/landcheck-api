@@ -1,5 +1,5 @@
 from fastapi import APIRouter, Body, Depends, HTTPException, Query, UploadFile, File, Form, Request
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, Response, StreamingResponse
 from sqlalchemy.orm import Session
 from sqlalchemy import text
 from datetime import datetime, date, timedelta, timezone
@@ -22,6 +22,7 @@ from email.message import EmailMessage
 
 import boto3
 from botocore.exceptions import ClientError
+from PIL import Image, ImageOps, UnidentifiedImageError
 
 from app.db import SessionLocal
 from app.utils.green_pdf import (
@@ -2833,7 +2834,13 @@ def _normalize_object_key(raw_key: str, bucket: str) -> str:
 
 
 @router.get("/uploads/object/{object_key:path}")
-def get_uploaded_photo(object_key: str):
+def get_uploaded_photo(
+    object_key: str,
+    w: int | None = Query(default=None, ge=64, le=4096),
+    h: int | None = Query(default=None, ge=64, le=4096),
+    q: int = Query(default=72, ge=35, le=95),
+    fm: str | None = Query(default=None, pattern="^(?i:webp|jpeg|jpg|png)$"),
+):
     settings = _build_r2_settings()
     resolved_key = _normalize_object_key(object_key, settings["bucket"])
     if not resolved_key:
@@ -2851,11 +2858,83 @@ def get_uploaded_photo(object_key: str):
 
     content_type = obj.get("ContentType") or "application/octet-stream"
     cache_control = obj.get("CacheControl") or "public, max-age=86400"
-    return StreamingResponse(
-        obj["Body"].iter_chunks(),
-        media_type=content_type,
-        headers={"Cache-Control": cache_control},
-    )
+    want_resize = bool(w or h or fm)
+
+    if not want_resize:
+        return StreamingResponse(
+            obj["Body"].iter_chunks(),
+            media_type=content_type,
+            headers={"Cache-Control": cache_control},
+        )
+
+    source_bytes = b""
+    try:
+        source_bytes = obj["Body"].read()
+        with Image.open(io.BytesIO(source_bytes)) as image:
+            image = ImageOps.exif_transpose(image)
+            src_w, src_h = image.size
+            target_w = int(w or 0)
+            target_h = int(h or 0)
+
+            if target_w and target_h:
+                image.thumbnail((target_w, target_h), Image.Resampling.LANCZOS)
+            elif target_w and src_w > 0 and src_h > 0:
+                scaled_h = max(1, int(round(src_h * (target_w / src_w))))
+                image = image.resize((target_w, scaled_h), Image.Resampling.LANCZOS)
+            elif target_h and src_w > 0 and src_h > 0:
+                scaled_w = max(1, int(round(src_w * (target_h / src_h))))
+                image = image.resize((scaled_w, target_h), Image.Resampling.LANCZOS)
+
+            output_format_raw = (fm or "").strip().lower()
+            if output_format_raw == "jpg":
+                output_format_raw = "jpeg"
+            if output_format_raw not in {"webp", "jpeg", "png"}:
+                if content_type.startswith("image/"):
+                    output_format_raw = content_type.split("/", 1)[1].lower()
+                if output_format_raw not in {"webp", "jpeg", "jpg", "png"}:
+                    output_format_raw = "webp"
+                if output_format_raw == "jpg":
+                    output_format_raw = "jpeg"
+
+            if output_format_raw == "jpeg":
+                if image.mode not in {"RGB", "L"}:
+                    image = image.convert("RGB")
+            elif output_format_raw == "png":
+                if image.mode not in {"RGB", "RGBA", "L", "LA", "P"}:
+                    image = image.convert("RGBA")
+            else:
+                if image.mode not in {"RGB", "RGBA", "L", "LA", "P"}:
+                    image = image.convert("RGB")
+
+            output = io.BytesIO()
+            save_kwargs: dict[str, object] = {}
+            if output_format_raw in {"webp", "jpeg"}:
+                save_kwargs["quality"] = int(q)
+                save_kwargs["optimize"] = True
+            if output_format_raw == "jpeg":
+                save_kwargs["progressive"] = True
+            if output_format_raw == "png":
+                save_kwargs["optimize"] = True
+
+            image.save(output, format=output_format_raw.upper(), **save_kwargs)
+            payload = output.getvalue()
+
+        transformed_cache_control = "public, max-age=31536000, immutable"
+        media_type = f"image/{'jpeg' if output_format_raw == 'jpeg' else output_format_raw}"
+        return Response(
+            content=payload,
+            media_type=media_type,
+            headers={"Cache-Control": transformed_cache_control},
+        )
+    except UnidentifiedImageError:
+        # Fallback for non-image payloads or malformed files.
+        if source_bytes:
+            return Response(content=source_bytes, media_type=content_type, headers={"Cache-Control": cache_control})
+        return StreamingResponse(obj["Body"].iter_chunks(), media_type=content_type, headers={"Cache-Control": cache_control})
+    except Exception:
+        if source_bytes:
+            return Response(content=source_bytes, media_type=content_type, headers={"Cache-Control": cache_control})
+        return StreamingResponse(obj["Body"].iter_chunks(), media_type=content_type, headers={"Cache-Control": cache_control})
 
 
 @router.post("/uploads/photo")
