@@ -2371,7 +2371,7 @@ def export_subdivision_batch_clean_copy_pdf(
     clean_title = str(title_text or "").strip()
     if not clean_title:
         estate_name = str(batch_row.get("estate_name") or "").strip()
-        clean_title = f"{estate_name} CLEAN COPY PLAN" if estate_name else "SUBDIVISION CLEAN COPY PLAN"
+        clean_title = f"{estate_name} CLEAN COPY PLAN" if estate_name else "SURVEY PLAN"
 
     area_override_map = _extract_clean_copy_area_overrides(area_labels)
     cache_key_payload = {
