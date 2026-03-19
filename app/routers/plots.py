@@ -64,6 +64,7 @@ PREVIEW_CACHE_DIR = os.path.join(REPORTS_DIR, "previews_cache")
 PREVIEW_CACHE_TTL_SECONDS = max(30, int(os.getenv("PLOT_PREVIEW_CACHE_TTL_SECONDS", "180")))
 PREVIEW_CACHE_MAX_FILES_PER_PLOT = max(5, int(os.getenv("PLOT_PREVIEW_CACHE_MAX_FILES_PER_PLOT", "24")))
 PREVIEW_LAYOUT_VERSION = "survey_layout_2026_03_10_adamawa_v83"
+CLEAN_COPY_RENDER_VERSION = "clean_copy_2026_03_19_border_v2"
 
 # Coordinate system EPSG codes mapping
 COORDINATE_SYSTEMS = {
@@ -1638,16 +1639,55 @@ def _render_subdivision_clean_copy_pdf(
     paper_config = get_paper_config(paper_name)
     font_scale = float(paper_config.get("scale", 1.0))
     dpi = 220 if paper_name in {"A4", "A3"} else (170 if paper_name == "A2" else 130)
+    old_font_family = matplotlib.rcParams.get("font.family")
+    matplotlib.rcParams["font.family"] = "DejaVu Serif"
     fig = plt.figure(figsize=(paper_config["width"], paper_config["height"]), dpi=dpi)
     fig.patch.set_facecolor("white")
+    # Clean-copy double border style (same sheet feel as reference template).
+    fig.add_artist(
+        patches.Rectangle(
+            (0.012, 0.012),
+            0.976,
+            0.976,
+            transform=fig.transFigure,
+            fill=False,
+            lw=1.5,
+            edgecolor="black",
+            zorder=200,
+            clip_on=False,
+        )
+    )
+    fig.add_artist(
+        patches.Rectangle(
+            (0.02, 0.02),
+            0.96,
+            0.96,
+            transform=fig.transFigure,
+            fill=False,
+            lw=0.9,
+            edgecolor="black",
+            zorder=201,
+            clip_on=False,
+        )
+    )
 
     title = str(title_text or "").strip()
     if title:
-        fig.text(0.5, 0.975, title, ha="center", va="top", fontsize=int(11 * font_scale), weight="bold", color="#111827")
+        fig.text(
+            0.5,
+            0.975,
+            title,
+            ha="center",
+            va="top",
+            fontsize=int(11 * font_scale),
+            weight="normal",
+            color="black",
+        )
         map_left, map_bottom, map_width, map_height = 0.04, 0.04, 0.92, 0.90
     else:
-        map_left, map_bottom, map_width, map_height = 0.03, 0.03, 0.94, 0.94
+        map_left, map_bottom, map_width, map_height = 0.035, 0.035, 0.93, 0.93
     ax = fig.add_axes([map_left, map_bottom, map_width, map_height])
+
     ax.set_aspect("equal", adjustable="box")
     ax.set_facecolor("white")
 
@@ -1762,14 +1802,9 @@ def _render_subdivision_clean_copy_pdf(
             ha="center",
             va="center",
             fontsize=max(7, int(6.8 * font_scale)),
-            color="#111827",
+            color="black",
             zorder=22,
-            bbox=dict(
-                boxstyle="round,pad=0.18",
-                facecolor=(1, 1, 1, 0.72),
-                edgecolor=(0, 0, 0, 0.12),
-                linewidth=0.4,
-            ),
+            fontfamily="DejaVu Serif",
         )
 
     add_north_arrow(
@@ -1780,9 +1815,24 @@ def _render_subdivision_clean_copy_pdf(
     )
 
     ax.set_aspect("equal")
+    # Visible map/frame border inside the page border.
+    ax.add_patch(
+        patches.Rectangle(
+            (0, 0),
+            1,
+            1,
+            transform=ax.transAxes,
+            fill=False,
+            lw=max(0.8, 0.85 * font_scale),
+            edgecolor="black",
+            zorder=180,
+            clip_on=False,
+        )
+    )
     ax.axis("off")
     fig.savefig(output_pdf_path, format="pdf", dpi=dpi, facecolor=fig.get_facecolor())
     plt.close(fig)
+    matplotlib.rcParams["font.family"] = old_font_family
 
 
 def _compose_child_title(parent_meta: dict, lot_no: str, estate_name: str | None) -> str:
@@ -2375,6 +2425,7 @@ def export_subdivision_batch_clean_copy_pdf(
 
     area_override_map = _extract_clean_copy_area_overrides(area_labels)
     cache_key_payload = {
+        "render_version": CLEAN_COPY_RENDER_VERSION,
         "batch_id": int(batch_id),
         "title_text": clean_title,
         "paper_size": effective_paper_size,
