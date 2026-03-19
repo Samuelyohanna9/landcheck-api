@@ -32,7 +32,17 @@ from app.db import SessionLocal
 from app.models.plot import Plot
 from app.models.plot_buffer import PlotBuffer
 from app.utils.pdf import generate_plot_report_pdf
-from app.utils.map_renderer_layout import render_plot_map_layout, get_paper_config
+from app.utils.map_renderer_layout import (
+    render_plot_map_layout,
+    get_paper_config,
+    parse_scale_ratio,
+    apply_true_scale,
+    annotate_vertices,
+    draw_building_hatch,
+    draw_fences,
+    build_fence_avoid_geom,
+    add_north_arrow,
+)
 from app.utils.back_computation import compute_back_computation
 from app.utils.back_computation_pdf import render_back_computation_pdf
 from shapely import wkb
@@ -1441,24 +1451,59 @@ def _resolve_clean_copy_area_label(
     return f"{(float(area_m2) / 10000.0):.4f} Hectares"
 
 
+def _iter_line_geometries_for_clean_copy(geom: Any):
+    if geom is None or getattr(geom, "is_empty", False):
+        return
+    gtype = getattr(geom, "geom_type", "")
+    if gtype in ("LineString", "LinearRing"):
+        try:
+            yield geom
+        except Exception:
+            return
+        return
+    if gtype == "Polygon":
+        try:
+            yield geom.exterior
+            for ring in geom.interiors:
+                yield ring
+        except Exception:
+            pass
+        return
+    if hasattr(geom, "geoms"):
+        for part in geom.geoms:
+            yield from _iter_line_geometries_for_clean_copy(part)
+
+
 def _render_subdivision_clean_copy_pdf(
+    db: Session,
+    parent_plot_id: int,
     parent_poly_wgs84: Polygon,
     child_rows: list[dict],
     output_pdf_path: str,
     *,
-    batch_id: int,
     title_text: str,
     paper_size: str,
+    scale_text: str,
+    coordinate_system: str,
+    epsg_code: int,
+    station_names: list[str] | None,
+    north_arrow_style: str,
+    north_arrow_color: str,
+    beacon_style: str,
+    road_width_m: float | None,
     area_overrides: dict[str, str] | None = None,
 ):
     paper_name = str(paper_size or "A4").upper()
     if paper_name not in {"A4", "A3", "A2", "A1", "A0"}:
         paper_name = "A4"
 
-    child_metric_rows: list[dict] = []
-    metric_epsg = _metric_epsg_for_wgs84_polygon(parent_poly_wgs84)
-    parent_metric = gpd.GeoDataFrame(geometry=[parent_poly_wgs84], crs="EPSG:4326").to_crs(epsg=metric_epsg).geometry.iloc[0]
+    display_epsg = int(epsg_code or 4326)
+    if str(coordinate_system or "").strip().lower() == "wgs84" or display_epsg == 4326:
+        display_epsg = _metric_epsg_for_wgs84_polygon(parent_poly_wgs84)
 
+    parent_metric = gpd.GeoDataFrame(geometry=[parent_poly_wgs84], crs="EPSG:4326").to_crs(epsg=display_epsg).geometry.iloc[0]
+
+    child_metric_rows: list[dict] = []
     for row in child_rows:
         geom_geojson_raw = row.get("geom_geojson")
         if not geom_geojson_raw:
@@ -1469,7 +1514,7 @@ def _render_subdivision_clean_copy_pdf(
             geom_wgs = None
         if geom_wgs is None or geom_wgs.is_empty:
             continue
-        geom_metric = gpd.GeoDataFrame(geometry=[geom_wgs], crs="EPSG:4326").to_crs(epsg=metric_epsg).geometry.iloc[0]
+        geom_metric = gpd.GeoDataFrame(geometry=[geom_wgs], crs="EPSG:4326").to_crs(epsg=display_epsg).geometry.iloc[0]
         child_metric_rows.append(
             {
                 "child_plot_id": int(row.get("child_plot_id") or 0),
@@ -1482,88 +1527,260 @@ def _render_subdivision_clean_copy_pdf(
     if not child_metric_rows:
         raise HTTPException(status_code=404, detail="Subdivision batch has no valid lot geometries.")
 
+    detected_rows = db.execute(
+        text("SELECT geom, feature_type FROM detected_features WHERE plot_id=:id"),
+        {"id": int(parent_plot_id)},
+    ).fetchall()
+    override_rows = db.execute(
+        text(
+            """
+            SELECT feature_type, action, name, width_m, ST_AsGeoJSON(geom) AS geojson
+            FROM plot_feature_overrides
+            WHERE plot_id = :id
+            """
+        ),
+        {"id": int(parent_plot_id)},
+    ).fetchall()
+    roads_auto_rows = db.execute(
+        text(
+            """
+            WITH roads AS (
+                SELECT
+                    CASE
+                        WHEN ST_SRID(r.geom) = 4326 THEN r.geom
+                        WHEN ST_SRID(r.geom) = 0 THEN ST_SetSRID(r.geom, 4326)
+                        ELSE ST_Transform(r.geom, 4326)
+                    END AS geom
+                FROM lines r
+                WHERE r.highway IS NOT NULL
+            )
+            SELECT roads.geom
+            FROM roads
+            JOIN plot_buffers b ON b.plot_id = :plot_id
+            WHERE ST_Intersects(roads.geom, b.geom)
+            """
+        ),
+        {"plot_id": int(parent_plot_id)},
+    ).fetchall()
+
+    buildings_wgs: list[Any] = []
+    rivers_wgs: list[Any] = []
+    fences_wgs: list[Any] = []
+    for row in detected_rows:
+        try:
+            geom = wkb.loads(row.geom)
+        except Exception:
+            continue
+        feature_type = str(row.feature_type or "").strip().lower()
+        if feature_type == "building":
+            buildings_wgs.append(geom)
+        elif feature_type == "river":
+            rivers_wgs.append(geom)
+        elif feature_type == "fence":
+            fences_wgs.append(geom)
+
+    overrides: list[dict[str, Any]] = []
+    for row in override_rows:
+        geom = None
+        if row.geojson:
+            try:
+                geom = shape(json.loads(row.geojson))
+            except Exception:
+                geom = None
+        overrides.append(
+            {
+                "feature_type": str(row.feature_type or "").strip().lower(),
+                "action": str(row.action or "").strip().lower(),
+                "name": row.name,
+                "width_m": row.width_m,
+                "geom": geom,
+            }
+        )
+
+    def apply_overrides(base_list: list[Any], feature_type: str):
+        result = list(base_list)
+        added: list[Any] = []
+        delete_geoms: list[Any] = []
+        for ov in overrides:
+            if ov.get("feature_type") != feature_type:
+                continue
+            geom = ov.get("geom")
+            if geom is None:
+                continue
+            try:
+                if hasattr(geom, "is_valid") and not geom.is_valid:
+                    geom = geom.buffer(0)
+            except Exception:
+                pass
+            if ov.get("action") in ("delete", "update"):
+                result = [g for g in result if not g.intersects(geom)]
+                delete_geoms.append(geom)
+            if ov.get("action") in ("add", "update"):
+                result.append(geom)
+                added.append(geom)
+        if delete_geoms:
+            added = [g for g in added if not any(g.intersects(dg) for dg in delete_geoms)]
+        return result, added, delete_geoms
+
+    buildings_wgs, added_buildings_wgs, _ = apply_overrides(buildings_wgs, "building")
+    rivers_wgs, _, _ = apply_overrides(rivers_wgs, "river")
+    fences_wgs, added_fences_wgs, _ = apply_overrides(fences_wgs, "fence")
+
+    roads_wgs: list[Any] = []
+    for row in roads_auto_rows:
+        try:
+            roads_wgs.append(wkb.loads(row.geom))
+        except Exception:
+            continue
+    _, added_roads_wgs, road_delete_geoms = apply_overrides([], "road")
+    roads_wgs = [g for g in roads_wgs if not any(g.intersects(dg) for dg in road_delete_geoms)] + list(added_roads_wgs)
+
     paper_config = get_paper_config(paper_name)
     font_scale = float(paper_config.get("scale", 1.0))
     dpi = 220 if paper_name in {"A4", "A3"} else (170 if paper_name == "A2" else 130)
     fig = plt.figure(figsize=(paper_config["width"], paper_config["height"]), dpi=dpi)
     fig.patch.set_facecolor("white")
 
-    fig.add_artist(
-        patches.Rectangle((0.02, 0.02), 0.96, 0.96, transform=fig.transFigure, fill=False, lw=1.5, edgecolor="#111827")
-    )
-    fig.add_artist(
-        patches.Rectangle((0.03, 0.03), 0.94, 0.94, transform=fig.transFigure, fill=False, lw=0.8, edgecolor="#111827")
-    )
-
-    resolved_title = str(title_text or "").strip() or "SUBDIVISION CLEAN COPY PLAN"
-    fig.text(0.5, 0.965, resolved_title, ha="center", va="top", fontsize=int(12 * font_scale), weight="bold", color="#111827")
-    fig.text(0.94, 0.965, f"Batch #{int(batch_id)}", ha="right", va="top", fontsize=int(8 * font_scale), color="#374151")
-
-    ax = fig.add_axes([0.07, 0.16, 0.86, 0.74])
+    title = str(title_text or "").strip()
+    if title:
+        fig.text(0.5, 0.975, title, ha="center", va="top", fontsize=int(11 * font_scale), weight="bold", color="#111827")
+        map_left, map_bottom, map_width, map_height = 0.04, 0.04, 0.92, 0.90
+    else:
+        map_left, map_bottom, map_width, map_height = 0.03, 0.03, 0.94, 0.94
+    ax = fig.add_axes([map_left, map_bottom, map_width, map_height])
     ax.set_aspect("equal", adjustable="box")
     ax.set_facecolor("white")
 
-    minx, miny, maxx, maxy = parent_metric.bounds
-    span_x = max(maxx - minx, 1.0)
-    span_y = max(maxy - miny, 1.0)
-    pad_x = max(6.0, span_x * 0.08)
-    pad_y = max(6.0, span_y * 0.08)
-    ax.set_xlim(minx - pad_x, maxx + pad_x)
-    ax.set_ylim(miny - pad_y, maxy + pad_y)
+    scale_ratio = parse_scale_ratio(scale_text)
+    apply_true_scale(ax, parent_metric, scale_ratio, paper_config["width"] * map_width, paper_config["height"] * map_height)
+    target_xlim = ax.get_xlim()
+    target_ylim = ax.get_ylim()
+    extent_poly = box(target_xlim[0], target_ylim[0], target_xlim[1], target_ylim[1])
+    clip_buffer = max(1.0, (5.0 / 1000.0) * scale_ratio)
 
-    parent_x, parent_y = parent_metric.exterior.xy
-    ax.plot(parent_x, parent_y, color="#111827", linewidth=max(1.2, 1.25 * font_scale), zorder=2)
+    if rivers_wgs:
+        gpd.GeoDataFrame(geometry=rivers_wgs, crs="EPSG:4326").to_crs(epsg=display_epsg).plot(
+            ax=ax, color="#1d4ed8", lw=max(0.8, 1.0 * font_scale), zorder=5
+        )
 
-    total_area_m2 = 0.0
+    road_lw = max(0.8, ((float(road_width_m) if road_width_m else 10.0) / 12.0) * font_scale)
+    for road_geom in roads_wgs:
+        try:
+            projected = gpd.GeoSeries([road_geom], crs="EPSG:4326").to_crs(epsg=display_epsg).iloc[0]
+        except Exception:
+            continue
+        clipped = projected.intersection(extent_poly.buffer(clip_buffer))
+        if clipped.is_empty:
+            continue
+        for line_part in _iter_line_geometries_for_clean_copy(clipped):
+            try:
+                x_vals, y_vals = line_part.xy
+                ax.plot(
+                    x_vals,
+                    y_vals,
+                    color="black",
+                    lw=road_lw,
+                    linestyle=(0, (7, 4)),
+                    zorder=6,
+                )
+            except Exception:
+                continue
+
+    all_buildings = list(buildings_wgs) + list(added_buildings_wgs or [])
+    if all_buildings:
+        draw_building_hatch(
+            ax,
+            all_buildings,
+            display_epsg,
+            scale_ratio=scale_ratio,
+            font_scale=font_scale,
+        )
+        try:
+            gpd.GeoDataFrame(geometry=all_buildings, crs="EPSG:4326").to_crs(epsg=display_epsg).plot(
+                ax=ax, facecolor="none", edgecolor="black", lw=max(0.8, 0.9 * font_scale), zorder=8
+            )
+        except Exception:
+            pass
+
+    all_fences = list(fences_wgs or []) + list(added_fences_wgs or [])
+    if all_fences:
+        draw_fences(
+            ax,
+            all_fences,
+            display_epsg=display_epsg,
+            scale_ratio=scale_ratio,
+            font_scale=font_scale,
+        )
+    fence_avoid_geom = build_fence_avoid_geom(all_fences, display_epsg=display_epsg, scale_ratio=scale_ratio)
+
     for row in child_metric_rows:
         geom_metric = _clean_single_polygon(row["geometry"])
         if geom_metric is None or geom_metric.is_empty:
             continue
+        try:
+            x_vals, y_vals = geom_metric.exterior.xy
+            ax.plot(x_vals, y_vals, color="#dc2626", linewidth=max(0.9, 1.0 * font_scale), zorder=17)
+        except Exception:
+            continue
 
+    boundary_mm = 0.7 if paper_name in ["A0"] else 0.5 if paper_name in ["A1"] else 0.35
+    boundary_lw_pts = boundary_mm * 72.0 / 25.4
+    gpd.GeoDataFrame(geometry=[parent_metric], crs=f"EPSG:{display_epsg}").plot(
+        ax=ax, facecolor="none", edgecolor="red", lw=boundary_lw_pts, zorder=20
+    )
+    ax.set_xlim(target_xlim)
+    ax.set_ylim(target_ylim)
+
+    min_label_mm = 12
+    min_label_length_m = (min_label_mm / 1000.0) * scale_ratio
+    annotate_vertices(
+        ax,
+        parent_metric,
+        int(parent_plot_id),
+        station_names=station_names if station_names else None,
+        font_scale=font_scale,
+        min_label_length_m=min_label_length_m,
+        avoid_geom=fence_avoid_geom,
+        scale_ratio=scale_ratio,
+        boundary_poly=parent_metric,
+        beacon_style=beacon_style,
+    )
+
+    for row in child_metric_rows:
+        geom_metric = _clean_single_polygon(row["geometry"])
+        if geom_metric is None or geom_metric.is_empty:
+            continue
         lot_no = str(row.get("lot_no") or "").strip() or "LOT"
         child_plot_id = int(row.get("child_plot_id") or 0)
         area_m2 = float(row.get("area_m2") or 0.0)
-        total_area_m2 += max(area_m2, 0.0)
-
-        x_coords, y_coords = geom_metric.exterior.xy
-        ax.plot(x_coords, y_coords, color="#dc2626", linewidth=max(1.0, 1.1 * font_scale), zorder=3)
-
-        label_pt = geom_metric.representative_point()
         area_label = _resolve_clean_copy_area_label(lot_no, child_plot_id, area_m2, area_overrides)
+        label_pt = geom_metric.representative_point()
         ax.text(
             label_pt.x,
             label_pt.y,
             f"{lot_no}\n{area_label}",
             ha="center",
             va="center",
-            fontsize=max(7, int(7.3 * font_scale)),
+            fontsize=max(7, int(6.8 * font_scale)),
             color="#111827",
-            zorder=4,
-            bbox=dict(boxstyle="round,pad=0.18", facecolor=(1, 1, 1, 0.75), edgecolor=(0, 0, 0, 0.12), linewidth=0.5),
+            zorder=22,
+            bbox=dict(
+                boxstyle="round,pad=0.18",
+                facecolor=(1, 1, 1, 0.72),
+                edgecolor=(0, 0, 0, 0.12),
+                linewidth=0.4,
+            ),
         )
 
-    ax.set_xticks([])
-    ax.set_yticks([])
-    for spine in ax.spines.values():
-        spine.set_linewidth(0.8)
-        spine.set_edgecolor("#111827")
-
-    fig.text(
-        0.06,
-        0.088,
-        f"Total subdivided area: {total_area_m2:,.2f} sqm ({(total_area_m2 / 10000.0):.4f} ha)",
-        fontsize=int(8 * font_scale),
-        color="#111827",
+    add_north_arrow(
+        ax,
+        font_scale=font_scale,
+        style=str(north_arrow_style or "one_side_stem"),
+        color=str(north_arrow_color or "blue"),
     )
-    fig.text(
-        0.06,
-        0.065,
-        "Clean copy output: lots + displayed area labels (editable).",
-        fontsize=int(7.4 * font_scale),
-        color="#4b5563",
-    )
-    fig.text(0.94, 0.06, "SOURCE: LandCheck", ha="right", fontsize=int(8 * font_scale), color="#111827")
 
+    ax.set_aspect("equal")
+    ax.axis("off")
     fig.savefig(output_pdf_path, format="pdf", dpi=dpi, facecolor=fig.get_facecolor())
     plt.close(fig)
 
@@ -2099,6 +2316,13 @@ def export_subdivision_batch_clean_copy_pdf(
     title_text: str = Body(""),
     area_labels: list[dict] | None = Body(None),
     paper_size: str | None = Body(None),
+    scale_text: str | None = Body(None),
+    coordinate_system: str | None = Body(None),
+    station_names: list[str] | None = Body(None),
+    north_arrow_style: str = Body("one_side_stem"),
+    north_arrow_color: str = Body("blue"),
+    beacon_style: str = Body("cross"),
+    road_width_m: float | None = Body(None),
 ):
     batch_row = db.execute(
         text(
@@ -2140,6 +2364,9 @@ def export_subdivision_batch_clean_copy_pdf(
     effective_paper_size = str(paper_size or parent_meta.get("paper_size") or "A4").upper()
     if effective_paper_size not in {"A4", "A3", "A2", "A1", "A0"}:
         effective_paper_size = "A4"
+    effective_scale_text = str(scale_text or parent_meta.get("scale_text") or "1 : 1000")
+    effective_coordinate_system = str(coordinate_system or parent_meta.get("coordinate_system") or "wgs84")
+    effective_epsg = COORDINATE_SYSTEMS.get(effective_coordinate_system, 4326)
 
     clean_title = str(title_text or "").strip()
     if not clean_title:
@@ -2151,6 +2378,13 @@ def export_subdivision_batch_clean_copy_pdf(
         "batch_id": int(batch_id),
         "title_text": clean_title,
         "paper_size": effective_paper_size,
+        "scale_text": effective_scale_text,
+        "coordinate_system": effective_coordinate_system,
+        "station_names": list(station_names or []),
+        "north_arrow_style": str(north_arrow_style or "one_side_stem"),
+        "north_arrow_color": str(north_arrow_color or "blue"),
+        "beacon_style": str(beacon_style or "cross"),
+        "road_width_m": float(road_width_m or 0.0),
         "area_overrides": sorted(area_override_map.items()),
     }
     cache_hash = hashlib.sha1(json.dumps(cache_key_payload, sort_keys=True).encode("utf-8")).hexdigest()[:12]
@@ -2164,12 +2398,21 @@ def export_subdivision_batch_clean_copy_pdf(
         parent_poly_wgs84 = _load_plot_polygon_wgs84(db, parent_plot_id)
         try:
             _render_subdivision_clean_copy_pdf(
-                parent_poly_wgs84,
-                [dict(r) for r in child_rows],
-                cached_pdf_path,
-                batch_id=int(batch_id),
+                db=db,
+                parent_plot_id=int(parent_plot_id),
+                parent_poly_wgs84=parent_poly_wgs84,
+                child_rows=[dict(r) for r in child_rows],
+                output_pdf_path=cached_pdf_path,
                 title_text=clean_title,
                 paper_size=effective_paper_size,
+                scale_text=effective_scale_text,
+                coordinate_system=effective_coordinate_system,
+                epsg_code=int(effective_epsg),
+                station_names=list(station_names or []),
+                north_arrow_style=str(north_arrow_style or "one_side_stem"),
+                north_arrow_color=str(north_arrow_color or "blue"),
+                beacon_style=str(beacon_style or "cross"),
+                road_width_m=road_width_m,
                 area_overrides=area_override_map,
             )
         except HTTPException:
