@@ -22,6 +22,7 @@ import time
 import json
 import hashlib
 import math
+import textwrap
 from threading import Lock
 import matplotlib
 matplotlib.use("Agg")
@@ -64,7 +65,7 @@ PREVIEW_CACHE_DIR = os.path.join(REPORTS_DIR, "previews_cache")
 PREVIEW_CACHE_TTL_SECONDS = max(30, int(os.getenv("PLOT_PREVIEW_CACHE_TTL_SECONDS", "180")))
 PREVIEW_CACHE_MAX_FILES_PER_PLOT = max(5, int(os.getenv("PLOT_PREVIEW_CACHE_MAX_FILES_PER_PLOT", "24")))
 PREVIEW_LAYOUT_VERSION = "survey_layout_2026_03_10_adamawa_v83"
-CLEAN_COPY_RENDER_VERSION = "clean_copy_2026_03_19_border_v2"
+CLEAN_COPY_RENDER_VERSION = "clean_copy_2026_03_20_layout_v4"
 
 # Coordinate system EPSG codes mapping
 COORDINATE_SYSTEMS = {
@@ -1639,200 +1640,245 @@ def _render_subdivision_clean_copy_pdf(
     paper_config = get_paper_config(paper_name)
     font_scale = float(paper_config.get("scale", 1.0))
     dpi = 220 if paper_name in {"A4", "A3"} else (170 if paper_name == "A2" else 130)
-    old_font_family = matplotlib.rcParams.get("font.family")
-    matplotlib.rcParams["font.family"] = "DejaVu Serif"
-    fig = plt.figure(figsize=(paper_config["width"], paper_config["height"]), dpi=dpi)
-    fig.patch.set_facecolor("white")
-    # Clean-copy double border style (same sheet feel as reference template).
-    fig.add_artist(
-        patches.Rectangle(
-            (0.012, 0.012),
-            0.976,
-            0.976,
-            transform=fig.transFigure,
-            fill=False,
-            lw=1.5,
-            edgecolor="black",
-            zorder=200,
-            clip_on=False,
-        )
-    )
-    fig.add_artist(
-        patches.Rectangle(
-            (0.02, 0.02),
-            0.96,
-            0.96,
-            transform=fig.transFigure,
-            fill=False,
-            lw=0.9,
-            edgecolor="black",
-            zorder=201,
-            clip_on=False,
-        )
-    )
-
-    title = str(title_text or "").strip()
-    if title:
-        fig.text(
-            0.5,
-            0.975,
-            title,
-            ha="center",
-            va="top",
-            fontsize=int(11 * font_scale),
-            weight="normal",
-            color="black",
-        )
-        map_left, map_bottom, map_width, map_height = 0.04, 0.04, 0.92, 0.90
-    else:
-        map_left, map_bottom, map_width, map_height = 0.035, 0.035, 0.93, 0.93
-    ax = fig.add_axes([map_left, map_bottom, map_width, map_height])
-
-    ax.set_aspect("equal", adjustable="box")
-    ax.set_facecolor("white")
-
     scale_ratio = parse_scale_ratio(scale_text)
-    apply_true_scale(ax, parent_metric, scale_ratio, paper_config["width"] * map_width, paper_config["height"] * map_height)
-    target_xlim = ax.get_xlim()
-    target_ylim = ax.get_ylim()
-    extent_poly = box(target_xlim[0], target_ylim[0], target_xlim[1], target_ylim[1])
-    clip_buffer = max(1.0, (5.0 / 1000.0) * scale_ratio)
+    parent_area_m2 = float(parent_metric.area or 0.0)
+    old_font_family = matplotlib.rcParams.get("font.family")
+    fig = None
+    try:
+        matplotlib.rcParams["font.family"] = "DejaVu Serif"
+        fig = plt.figure(figsize=(paper_config["width"], paper_config["height"]), dpi=dpi)
+        fig.patch.set_facecolor("white")
 
-    if rivers_wgs:
-        gpd.GeoDataFrame(geometry=rivers_wgs, crs="EPSG:4326").to_crs(epsg=display_epsg).plot(
-            ax=ax, color="#1d4ed8", lw=max(0.8, 1.0 * font_scale), zorder=5
+        # Clean-copy page frame (outer + inner) to match the template feel.
+        fig.add_artist(
+            patches.Rectangle(
+                (0.02, 0.02),
+                0.96,
+                0.96,
+                transform=fig.transFigure,
+                fill=False,
+                lw=1.0,
+                edgecolor="black",
+                zorder=300,
+                clip_on=False,
+            )
+        )
+        fig.add_artist(
+            patches.Rectangle(
+                (0.03, 0.03),
+                0.94,
+                0.94,
+                transform=fig.transFigure,
+                fill=False,
+                lw=0.85,
+                edgecolor="black",
+                zorder=300,
+                clip_on=False,
+            )
         )
 
-    road_lw = max(0.8, ((float(road_width_m) if road_width_m else 10.0) / 12.0) * font_scale)
-    for road_geom in roads_wgs:
-        try:
-            projected = gpd.GeoSeries([road_geom], crs="EPSG:4326").to_crs(epsg=display_epsg).iloc[0]
-        except Exception:
-            continue
-        clipped = projected.intersection(extent_poly.buffer(clip_buffer))
-        if clipped.is_empty:
-            continue
-        for line_part in _iter_line_geometries_for_clean_copy(clipped):
+        raw_title = str(title_text or "").strip()
+        wrap_width = 54 if paper_name in {"A0", "A1", "A2"} else 48
+        title_lines: list[str] = []
+        if raw_title:
+            for segment in [s.strip() for s in str(raw_title).upper().splitlines() if s.strip()]:
+                seg_clean = re.sub(r"\s+", " ", segment)
+                title_lines.extend(textwrap.wrap(seg_clean, width=wrap_width, break_long_words=False))
+        if not title_lines:
+            title_lines = ["SURVEY PLAN CLEAN COPY PLAN"]
+        title_lines = title_lines[:5]
+
+        y_title = 0.955
+        line_gap = 0.03 if paper_name in {"A0", "A1", "A2"} else 0.028
+        title_size = max(9, int(10.6 * font_scale))
+        for idx, line in enumerate(title_lines):
+            fig.text(
+                0.5,
+                y_title - idx * line_gap,
+                line,
+                ha="center",
+                va="top",
+                fontsize=title_size,
+                weight="bold",
+                color="black",
+                fontfamily="DejaVu Serif",
+            )
+
+        if parent_area_m2 > 0:
+            area_y = y_title - len(title_lines) * line_gap - 0.006
+            fig.text(
+                0.5,
+                area_y,
+                f"AREA={parent_area_m2 / 10000.0:.2f}Ha",
+                ha="center",
+                va="top",
+                fontsize=max(8, int(9.4 * font_scale)),
+                weight="bold",
+                color="black",
+                fontfamily="DejaVu Serif",
+            )
+
+        map_left, map_bottom, map_right = 0.055, 0.075, 0.945
+        header_clearance = 0.085 + (len(title_lines) * line_gap)
+        map_top = max(0.66, 0.96 - header_clearance)
+        map_width = map_right - map_left
+        map_height = map_top - map_bottom
+        fig.add_artist(
+            patches.Rectangle(
+                (map_left, map_bottom),
+                map_width,
+                map_height,
+                transform=fig.transFigure,
+                fill=False,
+                lw=0.9,
+                edgecolor="black",
+                zorder=250,
+                clip_on=False,
+            )
+        )
+        ax = fig.add_axes([map_left + 0.004, map_bottom + 0.004, map_width - 0.008, map_height - 0.008])
+        ax.set_aspect("equal", adjustable="box")
+        ax.set_anchor("C")
+        ax.set_facecolor("white")
+
+        # Fit map to parent parcel bounds; lock limits so later plots cannot stretch it.
+        minx, miny, maxx, maxy = parent_metric.bounds
+        span_x = max(maxx - minx, 1.0)
+        span_y = max(maxy - miny, 1.0)
+        pad_x = max(1.0, span_x * 0.1)
+        pad_y = max(1.0, span_y * 0.1)
+        target_xlim = (minx - pad_x, maxx + pad_x)
+        target_ylim = (miny - pad_y, maxy + pad_y)
+        ax.set_xlim(*target_xlim)
+        ax.set_ylim(*target_ylim)
+        ax.set_autoscale_on(False)
+        extent_poly = box(target_xlim[0], target_ylim[0], target_xlim[1], target_ylim[1])
+        clip_buffer = max(1.0, min(span_x, span_y) * 0.05)
+
+        if rivers_wgs:
+            gpd.GeoDataFrame(geometry=rivers_wgs, crs="EPSG:4326").to_crs(epsg=display_epsg).plot(
+                ax=ax, color="#1d4ed8", lw=max(0.8, 1.0 * font_scale), zorder=5
+            )
+
+        road_lw = max(0.8, ((float(road_width_m) if road_width_m else 10.0) / 12.0) * font_scale)
+        for road_geom in roads_wgs:
             try:
-                x_vals, y_vals = line_part.xy
-                ax.plot(
-                    x_vals,
-                    y_vals,
-                    color="black",
-                    lw=road_lw,
-                    linestyle=(0, (7, 4)),
-                    zorder=6,
+                projected = gpd.GeoSeries([road_geom], crs="EPSG:4326").to_crs(epsg=display_epsg).iloc[0]
+            except Exception:
+                continue
+            clipped = projected.intersection(extent_poly.buffer(clip_buffer))
+            if clipped.is_empty:
+                continue
+            for line_part in _iter_line_geometries_for_clean_copy(clipped):
+                try:
+                    x_vals, y_vals = line_part.xy
+                    ax.plot(
+                        x_vals,
+                        y_vals,
+                        color="black",
+                        lw=road_lw,
+                        linestyle=(0, (7, 4)),
+                        zorder=6,
+                    )
+                except Exception:
+                    continue
+
+        all_buildings = list(buildings_wgs) + list(added_buildings_wgs or [])
+        if all_buildings:
+            draw_building_hatch(
+                ax,
+                all_buildings,
+                display_epsg,
+                scale_ratio=scale_ratio,
+                font_scale=font_scale,
+            )
+            try:
+                gpd.GeoDataFrame(geometry=all_buildings, crs="EPSG:4326").to_crs(epsg=display_epsg).plot(
+                    ax=ax, facecolor="none", edgecolor="black", lw=max(0.8, 0.9 * font_scale), zorder=8
                 )
+            except Exception:
+                pass
+
+        all_fences = list(fences_wgs or []) + list(added_fences_wgs or [])
+        if all_fences:
+            draw_fences(
+                ax,
+                all_fences,
+                display_epsg=display_epsg,
+                scale_ratio=scale_ratio,
+                font_scale=font_scale,
+            )
+        fence_avoid_geom = build_fence_avoid_geom(all_fences, display_epsg=display_epsg, scale_ratio=scale_ratio)
+
+        for row in child_metric_rows:
+            geom_metric = _clean_single_polygon(row["geometry"])
+            if geom_metric is None or geom_metric.is_empty:
+                continue
+            try:
+                x_vals, y_vals = geom_metric.exterior.xy
+                ax.plot(x_vals, y_vals, color="black", linewidth=max(0.85, 0.95 * font_scale), zorder=17)
             except Exception:
                 continue
 
-    all_buildings = list(buildings_wgs) + list(added_buildings_wgs or [])
-    if all_buildings:
-        draw_building_hatch(
-            ax,
-            all_buildings,
-            display_epsg,
-            scale_ratio=scale_ratio,
-            font_scale=font_scale,
+        boundary_mm = 0.7 if paper_name in ["A0"] else 0.5 if paper_name in ["A1"] else 0.35
+        boundary_lw_pts = boundary_mm * 72.0 / 25.4
+        gpd.GeoDataFrame(geometry=[parent_metric], crs=f"EPSG:{display_epsg}").plot(
+            ax=ax, facecolor="none", edgecolor="black", lw=boundary_lw_pts, zorder=20
         )
-        try:
-            gpd.GeoDataFrame(geometry=all_buildings, crs="EPSG:4326").to_crs(epsg=display_epsg).plot(
-                ax=ax, facecolor="none", edgecolor="black", lw=max(0.8, 0.9 * font_scale), zorder=8
+        ax.set_xlim(target_xlim)
+        ax.set_ylim(target_ylim)
+
+        min_label_mm = 12
+        min_label_length_m = (min_label_mm / 1000.0) * scale_ratio
+        annotate_vertices(
+            ax,
+            parent_metric,
+            int(parent_plot_id),
+            station_names=station_names if station_names else None,
+            font_scale=font_scale,
+            min_label_length_m=min_label_length_m,
+            avoid_geom=fence_avoid_geom,
+            scale_ratio=scale_ratio,
+            boundary_poly=parent_metric,
+            beacon_style=beacon_style,
+        )
+
+        for row in child_metric_rows:
+            geom_metric = _clean_single_polygon(row["geometry"])
+            if geom_metric is None or geom_metric.is_empty:
+                continue
+            lot_no = str(row.get("lot_no") or "").strip() or "LOT"
+            child_plot_id = int(row.get("child_plot_id") or 0)
+            area_m2 = float(row.get("area_m2") or 0.0)
+            area_label = _resolve_clean_copy_area_label(lot_no, child_plot_id, area_m2, area_overrides)
+            label_pt = geom_metric.representative_point()
+            ax.text(
+                label_pt.x,
+                label_pt.y,
+                f"{lot_no}\n{area_label}",
+                ha="center",
+                va="center",
+                fontsize=max(7, int(6.8 * font_scale)),
+                color="black",
+                zorder=22,
+                fontfamily="DejaVu Serif",
+                weight="bold",
             )
-        except Exception:
-            pass
 
-    all_fences = list(fences_wgs or []) + list(added_fences_wgs or [])
-    if all_fences:
-        draw_fences(
+        add_north_arrow(
             ax,
-            all_fences,
-            display_epsg=display_epsg,
-            scale_ratio=scale_ratio,
             font_scale=font_scale,
-        )
-    fence_avoid_geom = build_fence_avoid_geom(all_fences, display_epsg=display_epsg, scale_ratio=scale_ratio)
-
-    for row in child_metric_rows:
-        geom_metric = _clean_single_polygon(row["geometry"])
-        if geom_metric is None or geom_metric.is_empty:
-            continue
-        try:
-            x_vals, y_vals = geom_metric.exterior.xy
-            ax.plot(x_vals, y_vals, color="#dc2626", linewidth=max(0.9, 1.0 * font_scale), zorder=17)
-        except Exception:
-            continue
-
-    boundary_mm = 0.7 if paper_name in ["A0"] else 0.5 if paper_name in ["A1"] else 0.35
-    boundary_lw_pts = boundary_mm * 72.0 / 25.4
-    gpd.GeoDataFrame(geometry=[parent_metric], crs=f"EPSG:{display_epsg}").plot(
-        ax=ax, facecolor="none", edgecolor="red", lw=boundary_lw_pts, zorder=20
-    )
-    ax.set_xlim(target_xlim)
-    ax.set_ylim(target_ylim)
-
-    min_label_mm = 12
-    min_label_length_m = (min_label_mm / 1000.0) * scale_ratio
-    annotate_vertices(
-        ax,
-        parent_metric,
-        int(parent_plot_id),
-        station_names=station_names if station_names else None,
-        font_scale=font_scale,
-        min_label_length_m=min_label_length_m,
-        avoid_geom=fence_avoid_geom,
-        scale_ratio=scale_ratio,
-        boundary_poly=parent_metric,
-        beacon_style=beacon_style,
-    )
-
-    for row in child_metric_rows:
-        geom_metric = _clean_single_polygon(row["geometry"])
-        if geom_metric is None or geom_metric.is_empty:
-            continue
-        lot_no = str(row.get("lot_no") or "").strip() or "LOT"
-        child_plot_id = int(row.get("child_plot_id") or 0)
-        area_m2 = float(row.get("area_m2") or 0.0)
-        area_label = _resolve_clean_copy_area_label(lot_no, child_plot_id, area_m2, area_overrides)
-        label_pt = geom_metric.representative_point()
-        ax.text(
-            label_pt.x,
-            label_pt.y,
-            f"{lot_no}\n{area_label}",
-            ha="center",
-            va="center",
-            fontsize=max(7, int(6.8 * font_scale)),
-            color="black",
-            zorder=22,
-            fontfamily="DejaVu Serif",
+            style=str(north_arrow_style or "one_side_stem"),
+            color=str(north_arrow_color or "blue"),
         )
 
-    add_north_arrow(
-        ax,
-        font_scale=font_scale,
-        style=str(north_arrow_style or "one_side_stem"),
-        color=str(north_arrow_color or "blue"),
-    )
-
-    ax.set_aspect("equal")
-    # Visible map/frame border inside the page border.
-    ax.add_patch(
-        patches.Rectangle(
-            (0, 0),
-            1,
-            1,
-            transform=ax.transAxes,
-            fill=False,
-            lw=max(0.8, 0.85 * font_scale),
-            edgecolor="black",
-            zorder=180,
-            clip_on=False,
-        )
-    )
-    ax.axis("off")
-    fig.savefig(output_pdf_path, format="pdf", dpi=dpi, facecolor=fig.get_facecolor())
-    plt.close(fig)
-    matplotlib.rcParams["font.family"] = old_font_family
+        ax.set_aspect("equal")
+        ax.axis("off")
+        fig.savefig(output_pdf_path, format="pdf", dpi=dpi, facecolor=fig.get_facecolor())
+    finally:
+        if fig is not None:
+            plt.close(fig)
+        matplotlib.rcParams["font.family"] = old_font_family
 
 
 def _compose_child_title(parent_meta: dict, lot_no: str, estate_name: str | None) -> str:
