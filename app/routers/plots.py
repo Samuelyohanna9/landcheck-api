@@ -65,7 +65,7 @@ PREVIEW_CACHE_DIR = os.path.join(REPORTS_DIR, "previews_cache")
 PREVIEW_CACHE_TTL_SECONDS = max(30, int(os.getenv("PLOT_PREVIEW_CACHE_TTL_SECONDS", "180")))
 PREVIEW_CACHE_MAX_FILES_PER_PLOT = max(5, int(os.getenv("PLOT_PREVIEW_CACHE_MAX_FILES_PER_PLOT", "24")))
 PREVIEW_LAYOUT_VERSION = "survey_layout_2026_03_10_adamawa_v83"
-CLEAN_COPY_RENDER_VERSION = "clean_copy_2026_03_20_layout_v4"
+CLEAN_COPY_RENDER_VERSION = "clean_copy_2026_03_20_layout_v5"
 
 # Coordinate system EPSG codes mapping
 COORDINATE_SYSTEMS = {
@@ -1865,11 +1865,17 @@ def _render_subdivision_clean_copy_pdf(
                 weight="bold",
             )
 
+        # Match the clean-copy north-arrow position to the standard survey-plan layout.
+        survey_layout_anchor_y = 0.81  # 0.30 + 0.45 + 0.06 from general survey plan map layout
+        clean_box = ax.get_position()
+        clean_anchor_y = min(float(clean_box.y1) + 0.060, survey_layout_anchor_y)
         add_north_arrow(
             ax,
             font_scale=font_scale,
             style=str(north_arrow_style or "one_side_stem"),
             color=str(north_arrow_color or "blue"),
+            anchor_x=float(clean_box.x1),
+            anchor_y=clean_anchor_y,
         )
 
         ax.set_aspect("equal")

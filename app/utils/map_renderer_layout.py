@@ -501,15 +501,22 @@ def draw_key_box(fig, has_buildings: bool, has_roads: bool, has_rivers: bool, ha
 # Map Decorations
 # ======================
 
-def add_north_arrow(ax, font_scale=1.0, style: str = "one_side_stem", color: str = "black"):
+def add_north_arrow(
+    ax,
+    font_scale=1.0,
+    style: str = "one_side_stem",
+    color: str = "black",
+    anchor_x=None,
+    anchor_y=None,
+):
     fig = ax.figure
     col = "blue" if str(color).lower() == "blue" else "black"
     style = str(style or "one_side_stem").strip().lower()
     # Keep north arrows vertically aligned to the right edge of the map frame
     # in both general and Adamawa templates.
     box = ax.get_position()
-    x = float(box.x1)
-    y = min(0.93, float(box.y1) + 0.060)
+    x = float(box.x1) if anchor_x is None else float(anchor_x)
+    y = min(0.93, float(box.y1) + 0.060) if anchor_y is None else float(anchor_y)
     size = 0.032 * max(0.8, font_scale)
 
     if style in ("one_side_stem", "one-sided-stem", "oneside_stem", "stacked_4n", "stacked4n", "vertical_4n"):
