@@ -1,4 +1,5 @@
 import math
+import os
 from sqlalchemy import text
 from shapely import wkb
 from shapely.geometry import Point
@@ -51,6 +52,17 @@ def add_text(msp, txt, x, y, h, layer="TEXT", rot=0):
             "rotation": float(rot),
         },
     ).set_placement((float(x), float(y)), align=ezdxf.enums.TextEntityAlignment.CENTER)
+
+
+def resolve_dxf_version() -> str:
+    """Return a DXF release string supported by ezdxf.
+
+    We default to R2000 (AC1015) for broad compatibility with older AutoCAD versions.
+    Override with env var PLOT_DXF_VERSION (e.g., R2007, R2010, R2013, R2018).
+    """
+    requested = str(os.getenv("PLOT_DXF_VERSION", "R2000") or "R2000").strip().upper()
+    allowed = {"R12", "R2000", "R2004", "R2007", "R2010", "R2013", "R2018"}
+    return requested if requested in allowed else "R2000"
 
 
 # ==========================
@@ -126,7 +138,7 @@ def export_survey_plan_to_dxf(db, plot_id: int, output_path: str):
     # Create DXF
     # =====================
 
-    doc = ezdxf.new("R2018")
+    doc = ezdxf.new(resolve_dxf_version())
     doc.units = ezdxf.units.M
 
     add_layers(doc)
@@ -161,7 +173,7 @@ def export_survey_plan_to_dxf(db, plot_id: int, output_path: str):
         if ang < -90 or ang > 90:
             ang += 180
 
-        txt = f"{bearing:.1f}°  {dist:.1f}m"
+        txt = f"{bearing:.1f}%%d  {dist:.1f}m"
 
         add_text(msp, txt, mx, my, 3.0, rot=ang)
 
