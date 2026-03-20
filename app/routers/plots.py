@@ -5,7 +5,7 @@ from sqlalchemy.orm import Session
 from geoalchemy2.shape import from_shape
 from shapely.geometry import Polygon, shape, Point, box
 from shapely.affinity import rotate
-from shapely.ops import unary_union
+from shapely.ops import unary_union, snap
 from sqlalchemy import text
 from fastapi.responses import FileResponse
 from app.schemas.plot_create import PlotCreateRequest
@@ -43,6 +43,7 @@ from app.utils.map_renderer_layout import (
     draw_fences,
     build_fence_avoid_geom,
     add_north_arrow,
+    _collect_connected_road_edge_lines,
 )
 from app.utils.back_computation import compute_back_computation
 from app.utils.back_computation_pdf import render_back_computation_pdf
@@ -65,7 +66,7 @@ PREVIEW_CACHE_DIR = os.path.join(REPORTS_DIR, "previews_cache")
 PREVIEW_CACHE_TTL_SECONDS = max(30, int(os.getenv("PLOT_PREVIEW_CACHE_TTL_SECONDS", "180")))
 PREVIEW_CACHE_MAX_FILES_PER_PLOT = max(5, int(os.getenv("PLOT_PREVIEW_CACHE_MAX_FILES_PER_PLOT", "24")))
 PREVIEW_LAYOUT_VERSION = "survey_layout_2026_03_10_adamawa_v83"
-CLEAN_COPY_RENDER_VERSION = "clean_copy_2026_03_20_layout_v9"
+CLEAN_COPY_RENDER_VERSION = "clean_copy_2026_03_20_layout_v10"
 
 # Coordinate system EPSG codes mapping
 COORDINATE_SYSTEMS = {
@@ -1569,6 +1570,7 @@ def _render_subdivision_clean_copy_pdf(
     buildings_wgs: list[Any] = []
     rivers_wgs: list[Any] = []
     fences_wgs: list[Any] = []
+    detected_roads_wgs: list[Any] = []
     for row in detected_rows:
         try:
             geom = wkb.loads(row.geom)
@@ -1581,6 +1583,8 @@ def _render_subdivision_clean_copy_pdf(
             rivers_wgs.append(geom)
         elif feature_type == "fence":
             fences_wgs.append(geom)
+        elif feature_type == "road":
+            detected_roads_wgs.append(geom)
 
     overrides: list[dict[str, Any]] = []
     for row in override_rows:
@@ -1641,6 +1645,14 @@ def _render_subdivision_clean_copy_pdf(
             )
         except Exception:
             continue
+    for geom in detected_roads_wgs:
+        roads_wgs.append(
+            {
+                "geom": geom,
+                "name": "",
+                "width_m": None,
+            }
+        )
     road_delete_geoms: list[Any] = []
     added_roads_wgs: list[dict[str, Any]] = []
     for ov in overrides:
@@ -1803,6 +1815,10 @@ def _render_subdivision_clean_copy_pdf(
 
         road_edge_lw = max(0.75, 0.9 * font_scale)
         road_label_size = max(7, int(7.2 * font_scale))
+        road_snap_tol = max(1.0, (5.0 / 1000.0) * scale_ratio)
+        road_geom_width: list[tuple[Any, float]] = []
+        road_label_features: list[tuple[Any, str]] = []
+
         for road_item in roads_wgs:
             road_geom = road_item.get("geom")
             if road_geom is None:
@@ -1821,78 +1837,66 @@ def _render_subdivision_clean_copy_pdf(
                     width_value = global_width if global_width > 0 else 10.0
                 except Exception:
                     width_value = 10.0
-            half_width = max(0.7, width_value / 2.0)
+            half_width = max(1.0, width_value / 2.0)
+
             try:
                 projected = gpd.GeoSeries([road_geom], crs="EPSG:4326").to_crs(epsg=display_epsg).iloc[0]
             except Exception:
                 continue
-            clipped = projected.intersection(extent_poly.buffer(clip_buffer))
+            clipped = projected.intersection(extent_poly.buffer(road_snap_tol))
             if clipped.is_empty:
                 continue
+            snapped_clipped = snap(clipped, extent_poly.boundary, road_snap_tol)
+            road_geom_width.append((snapped_clipped, half_width))
+            if road_name:
+                road_label_features.append((snapped_clipped, road_name))
 
-            line_parts = [lp for lp in _iter_line_geometries_for_clean_copy(clipped) if lp is not None and not lp.is_empty]
-            if not line_parts:
+        road_edge_lines = _collect_connected_road_edge_lines(road_geom_width, snap_tol_m=road_snap_tol)
+        for seg in road_edge_lines:
+            try:
+                x_vals, y_vals = seg.xy
+                ax.plot(
+                    x_vals,
+                    y_vals,
+                    color="black",
+                    lw=road_edge_lw,
+                    linestyle=(0, (7, 4)),
+                    zorder=6,
+                )
+            except Exception:
                 continue
 
-            drawn_any_edge = False
-            for line_part in line_parts:
-                try:
-                    for side in ("left", "right"):
-                        edge_geom = line_part.parallel_offset(half_width, side, join_style=2)
-                        for edge_part in _iter_line_geometries_for_clean_copy(edge_geom):
-                            if edge_part is None or edge_part.is_empty:
-                                continue
-                            x_vals, y_vals = edge_part.xy
-                            ax.plot(
-                                x_vals,
-                                y_vals,
-                                color="black",
-                                lw=road_edge_lw,
-                                linestyle=(0, (7, 4)),
-                                zorder=6,
-                            )
-                            drawn_any_edge = True
-                except Exception:
+        for geom, road_name in road_label_features:
+            try:
+                if geom is None or geom.is_empty:
                     continue
-            if not drawn_any_edge:
-                # Fallback: at least draw a center dashed line if offsets fail.
-                for line_part in line_parts:
-                    try:
-                        x_vals, y_vals = line_part.xy
-                        ax.plot(
-                            x_vals,
-                            y_vals,
-                            color="black",
-                            lw=road_edge_lw,
-                            linestyle=(0, (7, 4)),
-                            zorder=6,
-                        )
-                    except Exception:
-                        continue
-
-            if road_name:
-                try:
-                    label_line = max(line_parts, key=lambda ln: float(getattr(ln, "length", 0.0)))
-                    mid = label_line.interpolate(0.5, normalized=True)
-                    p1 = label_line.interpolate(0.45, normalized=True)
-                    p2 = label_line.interpolate(0.55, normalized=True)
-                    angle = math.degrees(math.atan2(p2.y - p1.y, p2.x - p1.x))
-                    if angle < -90 or angle > 90:
-                        angle += 180
-                    ax.text(
-                        mid.x,
-                        mid.y,
-                        road_name.upper(),
-                        fontsize=road_label_size,
-                        color="black",
-                        ha="center",
-                        va="center",
-                        rotation=angle,
-                        weight="normal",
-                        zorder=10,
-                    )
-                except Exception:
-                    pass
+                label_line = max(
+                    [lp for lp in _iter_line_geometries_for_clean_copy(geom) if lp is not None and not lp.is_empty],
+                    key=lambda ln: float(getattr(ln, "length", 0.0)),
+                    default=None,
+                )
+                if label_line is None:
+                    continue
+                mid = label_line.interpolate(0.5, normalized=True)
+                p1 = label_line.interpolate(0.45, normalized=True)
+                p2 = label_line.interpolate(0.55, normalized=True)
+                angle = math.degrees(math.atan2(p2.y - p1.y, p2.x - p1.x))
+                if angle < -90 or angle > 90:
+                    angle += 180
+                ax.text(
+                    mid.x,
+                    mid.y,
+                    road_name.upper(),
+                    fontsize=road_label_size,
+                    color="black",
+                    ha="center",
+                    va="center",
+                    rotation=angle,
+                    weight="normal",
+                    zorder=10,
+                )
+            except Exception:
+                continue
 
         all_buildings = list(buildings_wgs) + list(added_buildings_wgs or [])
         if all_buildings:
