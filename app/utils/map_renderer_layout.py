@@ -946,6 +946,8 @@ def annotate_vertices(
     scale_ratio: int = 1000,
     boundary_poly=None,
     beacon_style: str = "cross",
+    show_station_names: bool = True,
+    show_beacons: bool = True,
 ):
     """
     Annotate vertices with station names and bearing/distance in RED.
@@ -1122,25 +1124,27 @@ def annotate_vertices(
         seg_len = math.hypot(seg_dx, seg_dy) or 1.0
         normal = (-seg_dy / seg_len, seg_dx / seg_len)
 
-        draw_beacon(p1.x, p1.y)
-        station_offset = max(2.0, (5.0 / 1000.0) * scale_ratio)
-        nx, ny = normal
-        if boundary_poly is not None:
-            test_pt = Point(p1.x + nx * station_offset, p1.y + ny * station_offset)
-            if boundary_poly.contains(test_pt):
-                nx, ny = -nx, -ny
-        place_text(
-            p1.x + nx * station_offset,
-            p1.y + ny * station_offset,
-            label,
-            font_size=int(8 * font_scale),
-            color="black",
-            rotation=0,
-            weight="normal",
-            scale_w=0.010,
-            scale_h=0.016,
-            normal=None,
-        )
+        if show_beacons:
+            draw_beacon(p1.x, p1.y)
+        if show_station_names:
+            station_offset = max(2.0, (5.0 / 1000.0) * scale_ratio)
+            nx, ny = normal
+            if boundary_poly is not None:
+                test_pt = Point(p1.x + nx * station_offset, p1.y + ny * station_offset)
+                if boundary_poly.contains(test_pt):
+                    nx, ny = -nx, -ny
+            place_text(
+                p1.x + nx * station_offset,
+                p1.y + ny * station_offset,
+                label,
+                font_size=int(8 * font_scale),
+                color="black",
+                rotation=0,
+                weight="normal",
+                scale_w=0.010,
+                scale_h=0.016,
+                normal=None,
+            )
 
         bearing, dist = calculate_bearing_deg(p1, p2), p1.distance(p2)
         if min_label_length_m and dist < min_label_length_m:

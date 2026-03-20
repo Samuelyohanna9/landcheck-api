@@ -65,7 +65,7 @@ PREVIEW_CACHE_DIR = os.path.join(REPORTS_DIR, "previews_cache")
 PREVIEW_CACHE_TTL_SECONDS = max(30, int(os.getenv("PLOT_PREVIEW_CACHE_TTL_SECONDS", "180")))
 PREVIEW_CACHE_MAX_FILES_PER_PLOT = max(5, int(os.getenv("PLOT_PREVIEW_CACHE_MAX_FILES_PER_PLOT", "24")))
 PREVIEW_LAYOUT_VERSION = "survey_layout_2026_03_10_adamawa_v83"
-CLEAN_COPY_RENDER_VERSION = "clean_copy_2026_03_20_layout_v8"
+CLEAN_COPY_RENDER_VERSION = "clean_copy_2026_03_20_layout_v9"
 
 # Coordinate system EPSG codes mapping
 COORDINATE_SYSTEMS = {
@@ -1952,6 +1952,8 @@ def _render_subdivision_clean_copy_pdf(
             scale_ratio=scale_ratio,
             boundary_poly=parent_metric,
             beacon_style=beacon_style,
+            show_station_names=False,
+            show_beacons=False,
         )
 
         for row in child_metric_rows:
