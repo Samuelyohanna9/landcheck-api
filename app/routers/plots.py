@@ -65,7 +65,7 @@ PREVIEW_CACHE_DIR = os.path.join(REPORTS_DIR, "previews_cache")
 PREVIEW_CACHE_TTL_SECONDS = max(30, int(os.getenv("PLOT_PREVIEW_CACHE_TTL_SECONDS", "180")))
 PREVIEW_CACHE_MAX_FILES_PER_PLOT = max(5, int(os.getenv("PLOT_PREVIEW_CACHE_MAX_FILES_PER_PLOT", "24")))
 PREVIEW_LAYOUT_VERSION = "survey_layout_2026_03_10_adamawa_v83"
-CLEAN_COPY_RENDER_VERSION = "clean_copy_2026_03_20_layout_v6"
+CLEAN_COPY_RENDER_VERSION = "clean_copy_2026_03_20_layout_v7"
 
 # Coordinate system EPSG codes mapping
 COORDINATE_SYSTEMS = {
@@ -1552,11 +1552,12 @@ def _render_subdivision_clean_copy_pdf(
                         WHEN ST_SRID(r.geom) = 4326 THEN r.geom
                         WHEN ST_SRID(r.geom) = 0 THEN ST_SetSRID(r.geom, 4326)
                         ELSE ST_Transform(r.geom, 4326)
-                    END AS geom
+                    END AS geom,
+                    r.name AS name
                 FROM lines r
                 WHERE r.highway IS NOT NULL
             )
-            SELECT roads.geom
+            SELECT roads.geom, roads.name
             FROM roads
             JOIN plot_buffers b ON b.plot_id = :plot_id
             WHERE ST_Intersects(roads.geom, b.geom)
@@ -1628,14 +1629,54 @@ def _render_subdivision_clean_copy_pdf(
     rivers_wgs, _, _ = apply_overrides(rivers_wgs, "river")
     fences_wgs, added_fences_wgs, _ = apply_overrides(fences_wgs, "fence")
 
-    roads_wgs: list[Any] = []
+    roads_wgs: list[dict[str, Any]] = []
     for row in roads_auto_rows:
         try:
-            roads_wgs.append(wkb.loads(row.geom))
+            roads_wgs.append(
+                {
+                    "geom": wkb.loads(row.geom),
+                    "name": str(getattr(row, "name", "") or "").strip(),
+                    "width_m": None,
+                }
+            )
         except Exception:
             continue
-    _, added_roads_wgs, road_delete_geoms = apply_overrides([], "road")
-    roads_wgs = [g for g in roads_wgs if not any(g.intersects(dg) for dg in road_delete_geoms)] + list(added_roads_wgs)
+    road_delete_geoms: list[Any] = []
+    added_roads_wgs: list[dict[str, Any]] = []
+    for ov in overrides:
+        if ov.get("feature_type") != "road":
+            continue
+        geom = ov.get("geom")
+        if geom is None:
+            continue
+        try:
+            if hasattr(geom, "is_valid") and not geom.is_valid:
+                geom = geom.buffer(0)
+        except Exception:
+            pass
+        if ov.get("action") in ("delete", "update"):
+            road_delete_geoms.append(geom)
+        if ov.get("action") in ("add", "update"):
+            width_value = None
+            try:
+                width_parsed = float(ov.get("width_m") or 0.0)
+                if width_parsed > 0:
+                    width_value = width_parsed
+            except Exception:
+                width_value = None
+            added_roads_wgs.append(
+                {
+                    "geom": geom,
+                    "name": str(ov.get("name") or "").strip(),
+                    "width_m": width_value,
+                }
+            )
+
+    roads_wgs = [
+        r for r in roads_wgs
+        if not any(getattr(r.get("geom"), "intersects", lambda *_: False)(dg) for dg in road_delete_geoms)
+    ]
+    roads_wgs.extend(added_roads_wgs)
 
     paper_config = get_paper_config(paper_name)
     font_scale = float(paper_config.get("scale", 1.0))
@@ -1760,8 +1801,27 @@ def _render_subdivision_clean_copy_pdf(
                 ax=ax, color="#1d4ed8", lw=max(0.8, 1.0 * font_scale), zorder=5
             )
 
-        road_lw = max(0.8, ((float(road_width_m) if road_width_m else 10.0) / 12.0) * font_scale)
-        for road_geom in roads_wgs:
+        road_edge_lw = max(0.75, 0.9 * font_scale)
+        road_label_size = max(7, int(7.2 * font_scale))
+        for road_item in roads_wgs:
+            road_geom = road_item.get("geom")
+            if road_geom is None:
+                continue
+            road_name = str(road_item.get("name") or "").strip()
+            width_value = None
+            try:
+                parsed_width = float(road_item.get("width_m") or 0.0)
+                if parsed_width > 0:
+                    width_value = parsed_width
+            except Exception:
+                width_value = None
+            if width_value is None:
+                try:
+                    global_width = float(road_width_m or 0.0)
+                    width_value = global_width if global_width > 0 else 10.0
+                except Exception:
+                    width_value = 10.0
+            half_width = max(0.7, width_value / 2.0)
             try:
                 projected = gpd.GeoSeries([road_geom], crs="EPSG:4326").to_crs(epsg=display_epsg).iloc[0]
             except Exception:
@@ -1769,19 +1829,70 @@ def _render_subdivision_clean_copy_pdf(
             clipped = projected.intersection(extent_poly.buffer(clip_buffer))
             if clipped.is_empty:
                 continue
-            for line_part in _iter_line_geometries_for_clean_copy(clipped):
+
+            line_parts = [lp for lp in _iter_line_geometries_for_clean_copy(clipped) if lp is not None and not lp.is_empty]
+            if not line_parts:
+                continue
+
+            drawn_any_edge = False
+            for line_part in line_parts:
                 try:
-                    x_vals, y_vals = line_part.xy
-                    ax.plot(
-                        x_vals,
-                        y_vals,
-                        color="black",
-                        lw=road_lw,
-                        linestyle=(0, (7, 4)),
-                        zorder=6,
-                    )
+                    for side in ("left", "right"):
+                        edge_geom = line_part.parallel_offset(half_width, side, join_style=2)
+                        for edge_part in _iter_line_geometries_for_clean_copy(edge_geom):
+                            if edge_part is None or edge_part.is_empty:
+                                continue
+                            x_vals, y_vals = edge_part.xy
+                            ax.plot(
+                                x_vals,
+                                y_vals,
+                                color="black",
+                                lw=road_edge_lw,
+                                linestyle=(0, (7, 4)),
+                                zorder=6,
+                            )
+                            drawn_any_edge = True
                 except Exception:
                     continue
+            if not drawn_any_edge:
+                # Fallback: at least draw a center dashed line if offsets fail.
+                for line_part in line_parts:
+                    try:
+                        x_vals, y_vals = line_part.xy
+                        ax.plot(
+                            x_vals,
+                            y_vals,
+                            color="black",
+                            lw=road_edge_lw,
+                            linestyle=(0, (7, 4)),
+                            zorder=6,
+                        )
+                    except Exception:
+                        continue
+
+            if road_name:
+                try:
+                    label_line = max(line_parts, key=lambda ln: float(getattr(ln, "length", 0.0)))
+                    mid = label_line.interpolate(0.5, normalized=True)
+                    p1 = label_line.interpolate(0.45, normalized=True)
+                    p2 = label_line.interpolate(0.55, normalized=True)
+                    angle = math.degrees(math.atan2(p2.y - p1.y, p2.x - p1.x))
+                    if angle < -90 or angle > 90:
+                        angle += 180
+                    ax.text(
+                        mid.x,
+                        mid.y,
+                        road_name.upper(),
+                        fontsize=road_label_size,
+                        color="black",
+                        ha="center",
+                        va="center",
+                        rotation=angle,
+                        weight="normal",
+                        zorder=10,
+                    )
+                except Exception:
+                    pass
 
         all_buildings = list(buildings_wgs) + list(added_buildings_wgs or [])
         if all_buildings:
