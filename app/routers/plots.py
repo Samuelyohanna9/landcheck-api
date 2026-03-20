@@ -66,7 +66,7 @@ PREVIEW_CACHE_DIR = os.path.join(REPORTS_DIR, "previews_cache")
 PREVIEW_CACHE_TTL_SECONDS = max(30, int(os.getenv("PLOT_PREVIEW_CACHE_TTL_SECONDS", "180")))
 PREVIEW_CACHE_MAX_FILES_PER_PLOT = max(5, int(os.getenv("PLOT_PREVIEW_CACHE_MAX_FILES_PER_PLOT", "24")))
 PREVIEW_LAYOUT_VERSION = "survey_layout_2026_03_10_adamawa_v83"
-CLEAN_COPY_RENDER_VERSION = "clean_copy_2026_03_20_layout_v10"
+CLEAN_COPY_RENDER_VERSION = "clean_copy_2026_03_20_layout_v11"
 
 # Coordinate system EPSG codes mapping
 COORDINATE_SYSTEMS = {
@@ -1814,6 +1814,7 @@ def _render_subdivision_clean_copy_pdf(
             )
 
         road_edge_lw = max(0.75, 0.9 * font_scale)
+        road_edge_color = "#f97316"
         road_label_size = max(7, int(7.2 * font_scale))
         road_snap_tol = max(1.0, (5.0 / 1000.0) * scale_ratio)
         road_geom_width: list[tuple[Any, float]] = []
@@ -1858,7 +1859,7 @@ def _render_subdivision_clean_copy_pdf(
                 ax.plot(
                     x_vals,
                     y_vals,
-                    color="black",
+                    color=road_edge_color,
                     lw=road_edge_lw,
                     linestyle=(0, (7, 4)),
                     zorder=6,
