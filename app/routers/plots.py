@@ -66,7 +66,7 @@ PREVIEW_CACHE_DIR = os.path.join(REPORTS_DIR, "previews_cache")
 PREVIEW_CACHE_TTL_SECONDS = max(30, int(os.getenv("PLOT_PREVIEW_CACHE_TTL_SECONDS", "180")))
 PREVIEW_CACHE_MAX_FILES_PER_PLOT = max(5, int(os.getenv("PLOT_PREVIEW_CACHE_MAX_FILES_PER_PLOT", "24")))
 PREVIEW_LAYOUT_VERSION = "survey_layout_2026_03_10_adamawa_v83"
-CLEAN_COPY_RENDER_VERSION = "clean_copy_2026_03_20_layout_v12"
+CLEAN_COPY_RENDER_VERSION = "clean_copy_2026_03_20_layout_v13"
 
 # Coordinate system EPSG codes mapping
 COORDINATE_SYSTEMS = {
@@ -1819,6 +1819,17 @@ def _render_subdivision_clean_copy_pdf(
         road_snap_tol = max(1.0, (5.0 / 1000.0) * scale_ratio)
         road_label_features: list[tuple[Any, str]] = []
 
+        def _line_length_total(geom_obj: Any) -> float:
+            total = 0.0
+            for part in _iter_line_geometries_for_clean_copy(geom_obj):
+                if part is None or part.is_empty:
+                    continue
+                try:
+                    total += float(getattr(part, "length", 0.0))
+                except Exception:
+                    continue
+            return total
+
         for road_item in roads_wgs:
             road_geom = road_item.get("geom")
             if road_geom is None:
@@ -1848,6 +1859,8 @@ def _render_subdivision_clean_copy_pdf(
                 continue
             snapped_clipped = snap(clipped, extent_poly.boundary, road_snap_tol)
             edge_lines = _collect_connected_road_edge_lines([(snapped_clipped, half_width)], snap_tol_m=road_snap_tol)
+            source_len = _line_length_total(snapped_clipped)
+            drawn_edge_len = 0.0
             if not edge_lines:
                 # Fallback: draw per-part offset lines so road still appears for edge cases.
                 for part in _iter_line_geometries_for_clean_copy(snapped_clipped):
@@ -1868,6 +1881,10 @@ def _render_subdivision_clean_copy_pdf(
                                     linestyle=(0, (7, 4)),
                                     zorder=6,
                                 )
+                                try:
+                                    drawn_edge_len += float(getattr(edge_part, "length", 0.0))
+                                except Exception:
+                                    pass
                     except Exception:
                         continue
             else:
@@ -1879,6 +1896,24 @@ def _render_subdivision_clean_copy_pdf(
                             y_vals,
                             color=road_edge_color,
                             lw=road_edge_lw,
+                            linestyle=(0, (7, 4)),
+                            zorder=6,
+                        )
+                        drawn_edge_len += float(getattr(seg, "length", 0.0))
+                    except Exception:
+                        continue
+            # If edge geometry is too weak (or effectively invisible), force a centerline fallback.
+            if source_len > 0 and drawn_edge_len < (0.35 * source_len):
+                for part in _iter_line_geometries_for_clean_copy(snapped_clipped):
+                    if part is None or part.is_empty:
+                        continue
+                    try:
+                        x_vals, y_vals = part.xy
+                        ax.plot(
+                            x_vals,
+                            y_vals,
+                            color=road_edge_color,
+                            lw=max(0.7, 0.85 * road_edge_lw),
                             linestyle=(0, (7, 4)),
                             zorder=6,
                         )
@@ -1908,7 +1943,7 @@ def _render_subdivision_clean_copy_pdf(
                 label_len_m = max(1.0, float(getattr(label_line, "length", 1.0)))
                 char_count = max(1, len(road_name))
                 # Approx text-on-ground length model: chars * 0.62 * pt * 0.3528mm * scale_ratio
-                max_pt_fit = (0.82 * label_len_m * 1000.0) / (char_count * 0.62 * 0.3528 * max(1, scale_ratio))
+                max_pt_fit = (0.74 * label_len_m * 1000.0) / (char_count * 0.62 * 0.3528 * max(1, scale_ratio))
                 fitted_size = max(5.0, min(float(road_label_size), float(max_pt_fit)))
                 ax.text(
                     mid.x,
