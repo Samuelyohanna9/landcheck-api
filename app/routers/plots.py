@@ -66,7 +66,7 @@ PREVIEW_CACHE_DIR = os.path.join(REPORTS_DIR, "previews_cache")
 PREVIEW_CACHE_TTL_SECONDS = max(30, int(os.getenv("PLOT_PREVIEW_CACHE_TTL_SECONDS", "180")))
 PREVIEW_CACHE_MAX_FILES_PER_PLOT = max(5, int(os.getenv("PLOT_PREVIEW_CACHE_MAX_FILES_PER_PLOT", "24")))
 PREVIEW_LAYOUT_VERSION = "survey_layout_2026_03_10_adamawa_v83"
-CLEAN_COPY_RENDER_VERSION = "clean_copy_2026_03_20_layout_v11"
+CLEAN_COPY_RENDER_VERSION = "clean_copy_2026_03_20_layout_v12"
 
 # Coordinate system EPSG codes mapping
 COORDINATE_SYSTEMS = {
@@ -1817,7 +1817,6 @@ def _render_subdivision_clean_copy_pdf(
         road_edge_color = "#f97316"
         road_label_size = max(7, int(7.2 * font_scale))
         road_snap_tol = max(1.0, (5.0 / 1000.0) * scale_ratio)
-        road_geom_width: list[tuple[Any, float]] = []
         road_label_features: list[tuple[Any, str]] = []
 
         for road_item in roads_wgs:
@@ -1848,24 +1847,45 @@ def _render_subdivision_clean_copy_pdf(
             if clipped.is_empty:
                 continue
             snapped_clipped = snap(clipped, extent_poly.boundary, road_snap_tol)
-            road_geom_width.append((snapped_clipped, half_width))
+            edge_lines = _collect_connected_road_edge_lines([(snapped_clipped, half_width)], snap_tol_m=road_snap_tol)
+            if not edge_lines:
+                # Fallback: draw per-part offset lines so road still appears for edge cases.
+                for part in _iter_line_geometries_for_clean_copy(snapped_clipped):
+                    if part is None or part.is_empty:
+                        continue
+                    try:
+                        for side in ("left", "right"):
+                            edge_geom = part.parallel_offset(half_width, side, join_style=2)
+                            for edge_part in _iter_line_geometries_for_clean_copy(edge_geom):
+                                if edge_part is None or edge_part.is_empty:
+                                    continue
+                                x_vals, y_vals = edge_part.xy
+                                ax.plot(
+                                    x_vals,
+                                    y_vals,
+                                    color=road_edge_color,
+                                    lw=road_edge_lw,
+                                    linestyle=(0, (7, 4)),
+                                    zorder=6,
+                                )
+                    except Exception:
+                        continue
+            else:
+                for seg in edge_lines:
+                    try:
+                        x_vals, y_vals = seg.xy
+                        ax.plot(
+                            x_vals,
+                            y_vals,
+                            color=road_edge_color,
+                            lw=road_edge_lw,
+                            linestyle=(0, (7, 4)),
+                            zorder=6,
+                        )
+                    except Exception:
+                        continue
             if road_name:
                 road_label_features.append((snapped_clipped, road_name))
-
-        road_edge_lines = _collect_connected_road_edge_lines(road_geom_width, snap_tol_m=road_snap_tol)
-        for seg in road_edge_lines:
-            try:
-                x_vals, y_vals = seg.xy
-                ax.plot(
-                    x_vals,
-                    y_vals,
-                    color=road_edge_color,
-                    lw=road_edge_lw,
-                    linestyle=(0, (7, 4)),
-                    zorder=6,
-                )
-            except Exception:
-                continue
 
         for geom, road_name in road_label_features:
             try:
@@ -1884,11 +1904,17 @@ def _render_subdivision_clean_copy_pdf(
                 angle = math.degrees(math.atan2(p2.y - p1.y, p2.x - p1.x))
                 if angle < -90 or angle > 90:
                     angle += 180
+                # Shrink road-name text to available road length so labels fit.
+                label_len_m = max(1.0, float(getattr(label_line, "length", 1.0)))
+                char_count = max(1, len(road_name))
+                # Approx text-on-ground length model: chars * 0.62 * pt * 0.3528mm * scale_ratio
+                max_pt_fit = (0.82 * label_len_m * 1000.0) / (char_count * 0.62 * 0.3528 * max(1, scale_ratio))
+                fitted_size = max(5.0, min(float(road_label_size), float(max_pt_fit)))
                 ax.text(
                     mid.x,
                     mid.y,
                     road_name.upper(),
-                    fontsize=road_label_size,
+                    fontsize=fitted_size,
                     color="black",
                     ha="center",
                     va="center",
