@@ -17,6 +17,25 @@ def bearing_deg(p1, p2):
     return (math.degrees(math.atan2(dx, dy)) + 360.0) % 360.0
 
 
+def _clockwise_ring_coords(poly):
+    coords = list(poly.exterior.coords)
+    if len(coords) < 2:
+        return coords
+
+    vertex_count = max(0, len(coords) - 1)
+    try:
+        is_ccw = bool(poly.exterior.is_ccw)
+    except Exception:
+        is_ccw = False
+
+    if not is_ccw or vertex_count <= 2:
+        return coords
+
+    body = coords[:-1]
+    reordered_body = [body[0], *reversed(body[1:])]
+    return reordered_body + [reordered_body[0]]
+
+
 def nice_grid_step(span):
     if span <= 0:
         return 100.0
@@ -148,7 +167,7 @@ def export_survey_plan_to_dxf(db, plot_id: int, output_path: str):
     # Plot boundary
     # =====================
 
-    coords = list(poly.exterior.coords)
+    coords = _clockwise_ring_coords(poly)
 
     for i in range(len(coords) - 1):
         p1 = coords[i]

@@ -95,6 +95,38 @@ def calculate_bearing_deg(p1: Point, p2: Point) -> float:
     return (math.degrees(math.atan2(dx, dy)) + 360.0) % 360.0
 
 
+def _clockwise_ring_coords_and_labels(poly, station_names=None):
+    coords = list(poly.exterior.coords)
+    if len(coords) < 2:
+        return coords, []
+
+    vertex_count = max(0, len(coords) - 1)
+    default_labels = list("ABCDEFGHIJKLMNOPQRSTUVWXYZ")
+    labels = []
+    for idx in range(vertex_count):
+        if station_names and idx < len(station_names):
+            raw = station_names[idx]
+        else:
+            raw = default_labels[idx % len(default_labels)]
+        label = str(raw or "").strip() or default_labels[idx % len(default_labels)]
+        labels.append(label)
+
+    try:
+        is_ccw = bool(poly.exterior.is_ccw)
+    except Exception:
+        is_ccw = False
+
+    if not is_ccw or vertex_count <= 2:
+        return coords, labels
+
+    # Normalize to clockwise while preserving the first entered point as the start.
+    body = coords[:-1]
+    reordered_body = [body[0], *reversed(body[1:])]
+    reordered_coords = reordered_body + [reordered_body[0]]
+    reordered_labels = [labels[0], *reversed(labels[1:])] if labels else labels
+    return reordered_coords, reordered_labels
+
+
 def format_bearing_dms(bearing_deg: float) -> str:
     deg = int(bearing_deg)
     minutes_full = (bearing_deg - deg) * 60.0
@@ -953,9 +985,7 @@ def annotate_vertices(
     Annotate vertices with station names and bearing/distance in RED.
     Applies simple collision-aware placement for tight turns.
     """
-    coords = list(poly.exterior.coords)
-    default_labels = list("ABCDEFGHIJKLMNOPQRSTUVWXYZ")
-    labels = station_names if station_names else default_labels
+    coords, labels = _clockwise_ring_coords_and_labels(poly, station_names=station_names)
 
     placed_boxes = []
     x0, x1 = ax.get_xlim()
@@ -1762,17 +1792,15 @@ def _draw_center_text_with_bold_suffix(
 
 
 def _build_segment_rows(poly, station_names=None):
-    coords = list(poly.exterior.coords)
+    coords, labels = _clockwise_ring_coords_and_labels(poly, station_names=station_names)
     if len(coords) < 2:
         return []
-    default_labels = list("ABCDEFGHIJKLMNOPQRSTUVWXYZ")
-    labels = station_names if station_names else default_labels
     rows = []
     for idx in range(len(coords) - 1):
         p1 = Point(coords[idx])
         p2 = Point(coords[idx + 1])
-        from_label = str(labels[idx % len(labels)] or "").strip() or default_labels[idx % len(default_labels)]
-        to_label = str(labels[(idx + 1) % len(labels)] or "").strip() or default_labels[(idx + 1) % len(default_labels)]
+        from_label = str(labels[idx % len(labels)] or "").strip() if labels else ""
+        to_label = str(labels[(idx + 1) % len(labels)] or "").strip() if labels else ""
         bearing = calculate_bearing_deg(p1, p2)
         rows.append({
             "from": from_label,

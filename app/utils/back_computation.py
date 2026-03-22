@@ -2,6 +2,7 @@
 import math
 from shapely.geometry import Polygon, Point
 
+
 # -------------------------------
 # Bearing helpers
 # -------------------------------
@@ -21,14 +22,43 @@ def deg_to_dms(angle_deg: float) -> str:
     return f"{deg:03d}°{minute:02d}'{sec:05.2f}\""
 
 
+def _clockwise_ring_coords_and_labels(poly: Polygon, station_names=None):
+    coords = list(poly.exterior.coords)
+    if len(coords) < 2:
+        return coords, []
+
+    vertex_count = max(0, len(coords) - 1)
+    default_stations = list("ABCDEFGHIJKLMNOPQRSTUVWXYZ")
+    labels = []
+    for idx in range(vertex_count):
+        if station_names and idx < len(station_names):
+            raw = station_names[idx]
+        else:
+            raw = default_stations[idx % len(default_stations)]
+        label = str(raw or "").strip() or default_stations[idx % len(default_stations)]
+        labels.append(label)
+
+    try:
+        is_ccw = bool(poly.exterior.is_ccw)
+    except Exception:
+        is_ccw = False
+
+    if not is_ccw or vertex_count <= 2:
+        return coords, labels
+
+    body = coords[:-1]
+    reordered_body = [body[0], *reversed(body[1:])]
+    reordered_coords = reordered_body + [reordered_body[0]]
+    reordered_labels = [labels[0], *reversed(labels[1:])] if labels else labels
+    return reordered_coords, reordered_labels
+
+
 # -------------------------------
 # Back computation
 # -------------------------------
 
 def compute_back_computation(poly: Polygon, station_names=None):
-    coords = list(poly.exterior.coords)
-    default_stations = list("ABCDEFGHIJKLMNOPQRSTUVWXYZ")
-    stations = station_names if station_names else default_stations
+    coords, stations = _clockwise_ring_coords_and_labels(poly, station_names=station_names)
 
     rows = []
     sum_de = 0.0

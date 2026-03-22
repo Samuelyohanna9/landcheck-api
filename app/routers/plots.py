@@ -65,8 +65,9 @@ REPORTS_DIR = os.path.join(BASE_DIR, "reports")
 PREVIEW_CACHE_DIR = os.path.join(REPORTS_DIR, "previews_cache")
 PREVIEW_CACHE_TTL_SECONDS = max(30, int(os.getenv("PLOT_PREVIEW_CACHE_TTL_SECONDS", "180")))
 PREVIEW_CACHE_MAX_FILES_PER_PLOT = max(5, int(os.getenv("PLOT_PREVIEW_CACHE_MAX_FILES_PER_PLOT", "24")))
-PREVIEW_LAYOUT_VERSION = "survey_layout_2026_03_10_adamawa_v83"
-CLEAN_COPY_RENDER_VERSION = "clean_copy_2026_03_20_layout_v13"
+PREVIEW_LAYOUT_VERSION = "survey_layout_2026_03_23_clockwise_v84"
+SURVEY_REPORT_RENDER_VERSION = "survey_report_2026_03_23_clockwise_v1"
+CLEAN_COPY_RENDER_VERSION = "clean_copy_2026_03_20_layout_v14"
 
 # Coordinate system EPSG codes mapping
 COORDINATE_SYSTEMS = {
@@ -1818,6 +1819,8 @@ def _render_subdivision_clean_copy_pdf(
         road_label_size = max(7, int(7.2 * font_scale))
         road_snap_tol = max(1.0, (5.0 / 1000.0) * scale_ratio)
         road_label_features: list[tuple[Any, str]] = []
+        road_line_zorder = 21
+        road_label_zorder = 23
 
         def _line_length_total(geom_obj: Any) -> float:
             total = 0.0
@@ -1879,7 +1882,7 @@ def _render_subdivision_clean_copy_pdf(
                                     color=road_edge_color,
                                     lw=road_edge_lw,
                                     linestyle=(0, (7, 4)),
-                                    zorder=6,
+                                    zorder=road_line_zorder,
                                 )
                                 try:
                                     drawn_edge_len += float(getattr(edge_part, "length", 0.0))
@@ -1897,7 +1900,7 @@ def _render_subdivision_clean_copy_pdf(
                             color=road_edge_color,
                             lw=road_edge_lw,
                             linestyle=(0, (7, 4)),
-                            zorder=6,
+                            zorder=road_line_zorder,
                         )
                         drawn_edge_len += float(getattr(seg, "length", 0.0))
                     except Exception:
@@ -1915,7 +1918,7 @@ def _render_subdivision_clean_copy_pdf(
                             color=road_edge_color,
                             lw=max(0.7, 0.85 * road_edge_lw),
                             linestyle=(0, (7, 4)),
-                            zorder=6,
+                            zorder=road_line_zorder,
                         )
                     except Exception:
                         continue
@@ -1955,7 +1958,7 @@ def _render_subdivision_clean_copy_pdf(
                     va="center",
                     rotation=angle,
                     weight="normal",
-                    zorder=10,
+                    zorder=road_label_zorder,
                 )
             except Exception:
                 continue
@@ -3893,15 +3896,15 @@ def download_survey_plan_shapefile(
 @router.get("/{plot_id}/reports/survey-plan")
 def get_saved_survey_plan_pdf(plot_id: int, refresh: bool = False, db: Session = Depends(get_db)):
     pdf_path = resolve_existing_path([
-        os.path.join(REPORTS_DIR, f"plot_{plot_id}_report.pdf"),
-        f"app/reports/plot_{plot_id}_report.pdf",
+        os.path.join(REPORTS_DIR, f"plot_{plot_id}_report_{SURVEY_REPORT_RENDER_VERSION}.pdf"),
+        f"app/reports/plot_{plot_id}_report_{SURVEY_REPORT_RENDER_VERSION}.pdf",
     ])
     if refresh or not pdf_path:
         meta = get_plot_meta(db, plot_id)
         maps_dir = os.path.join(REPORTS_DIR, "maps")
         os.makedirs(REPORTS_DIR, exist_ok=True)
         os.makedirs(maps_dir, exist_ok=True)
-        pdf_path = os.path.join(REPORTS_DIR, f"plot_{plot_id}_report.pdf")
+        pdf_path = os.path.join(REPORTS_DIR, f"plot_{plot_id}_report_{SURVEY_REPORT_RENDER_VERSION}.pdf")
         tmp_map = tempfile.NamedTemporaryFile(suffix="_map.png", delete=False)
         map_path = tmp_map.name
         tmp_map.close()
