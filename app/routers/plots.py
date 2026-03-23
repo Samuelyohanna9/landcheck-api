@@ -3758,13 +3758,19 @@ def orthophoto_pdf(plot_id: int, db: Session = Depends(get_db), background_tasks
     )
 @router.get("/{plot_id}/survey-plan/dwg")
 def download_survey_plan_dwg(plot_id: int, db: Session = Depends(get_db)):
+    meta = get_plot_meta(db, plot_id)
 
     out_dir = os.path.join(REPORTS_DIR, "dwg")
     os.makedirs(out_dir, exist_ok=True)
 
     dxf_path = f"{out_dir}/plot_{plot_id}_survey_plan.dxf"
 
-    export_survey_plan_to_dxf(db, plot_id, dxf_path)
+    export_survey_plan_to_dxf(
+        db,
+        plot_id,
+        dxf_path,
+        coordinate_system=meta.get("coordinate_system") or "wgs84",
+    )
 
     return FileResponse(
         dxf_path,

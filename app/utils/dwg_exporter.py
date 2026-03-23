@@ -2,9 +2,10 @@ import math
 import os
 from sqlalchemy import text
 from shapely import wkb
-from shapely.geometry import Point
+from shapely.geometry import Point, Polygon
 import geopandas as gpd
 import ezdxf
+from app.utils.coordinate_converter import COORDINATE_SYSTEMS
 
 
 # ==========================
@@ -34,6 +35,22 @@ def _clockwise_ring_coords(poly):
     body = coords[:-1]
     reordered_body = [body[0], *reversed(body[1:])]
     return reordered_body + [reordered_body[0]]
+
+
+def _metric_epsg_for_wgs84_polygon(poly_wgs84: Polygon) -> int:
+    centroid = poly_wgs84.centroid
+    zone = int((centroid.x + 180) / 6) + 1
+    zone = max(1, min(zone, 60))
+    return (32600 + zone) if centroid.y >= 0 else (32700 + zone)
+
+
+def _resolve_export_epsg(plot_geom_wgs84, coordinate_system: str | None) -> int:
+    cs_key = str(coordinate_system or "").strip().lower()
+    if cs_key and cs_key != "wgs84":
+        epsg = COORDINATE_SYSTEMS.get(cs_key, {}).get("epsg")
+        if epsg:
+            return int(epsg)
+    return _metric_epsg_for_wgs84_polygon(plot_geom_wgs84)
 
 
 def nice_grid_step(span):
@@ -116,7 +133,7 @@ def draw_grid_and_coords(msp, bounds, spacing):
 # Main Exporter
 # ==========================
 
-def export_survey_plan_to_dxf(db, plot_id: int, output_path: str):
+def export_survey_plan_to_dxf(db, plot_id: int, output_path: str, coordinate_system: str | None = None):
 
     plot_wkb = db.execute(
         text("SELECT geom FROM plots WHERE id=:id"),
@@ -146,12 +163,14 @@ def export_survey_plan_to_dxf(db, plot_id: int, output_path: str):
         elif r.feature_type == "river":
             rivers.append(g)
 
-    gdf_plot = gpd.GeoDataFrame(geometry=[plot_geom], crs="EPSG:4326").to_crs(3857)
+    export_epsg = _resolve_export_epsg(plot_geom, coordinate_system)
+
+    gdf_plot = gpd.GeoDataFrame(geometry=[plot_geom], crs="EPSG:4326").to_crs(epsg=export_epsg)
     poly = gdf_plot.geometry.iloc[0]
 
-    gdf_buildings = gpd.GeoDataFrame(geometry=buildings, crs="EPSG:4326").to_crs(3857) if buildings else None
-    gdf_roads = gpd.GeoDataFrame(geometry=roads, crs="EPSG:4326").to_crs(3857) if roads else None
-    gdf_rivers = gpd.GeoDataFrame(geometry=rivers, crs="EPSG:4326").to_crs(3857) if rivers else None
+    gdf_buildings = gpd.GeoDataFrame(geometry=buildings, crs="EPSG:4326").to_crs(epsg=export_epsg) if buildings else None
+    gdf_roads = gpd.GeoDataFrame(geometry=roads, crs="EPSG:4326").to_crs(epsg=export_epsg) if roads else None
+    gdf_rivers = gpd.GeoDataFrame(geometry=rivers, crs="EPSG:4326").to_crs(epsg=export_epsg) if rivers else None
 
     # =====================
     # Create DXF
