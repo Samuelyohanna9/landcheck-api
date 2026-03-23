@@ -37,7 +37,6 @@ app.add_middleware(
     allow_headers=["*"],
     expose_headers=["*"],
 )
-
 # Routers
 app.include_router(health.router)
 app.include_router(plots.router)

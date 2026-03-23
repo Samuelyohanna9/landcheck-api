@@ -23,6 +23,7 @@ from email.message import EmailMessage
 import boto3
 from botocore.exceptions import ClientError
 from PIL import Image, ImageOps, UnidentifiedImageError
+from pydantic import BaseModel
 
 from app.db import SessionLocal
 from app.utils.green_pdf import (
@@ -104,6 +105,15 @@ TREE_ORIGIN_VALUES = {"new_planting", "existing_inventory", "natural_regeneratio
 TREE_ATTRIBUTION_SCOPE_VALUES = {"full", "monitor_only"}
 CUSTODIAN_TYPE_VALUES = {"household", "school", "community_group"}
 TREE_PROJECT_LINK_TYPE_VALUES = {"owner", "reference"}
+PRIVACY_CONSENT_SCOPE_VALUES = {
+    "public_site_notice",
+    "feedback_contact_submission",
+    "green_field_data_capture",
+    "work_operational_data_processing",
+}
+PRIVACY_CONSENT_VERSION = "2026-03-23-v1"
+PRIVACY_SOURCE_APP_VALUES = {"public", "feedback", "green", "work"}
+PRIVACY_ACTOR_TYPE_VALUES = {"anonymous", "partner_user", "system_admin", "staff", "custodian", "public_visitor"}
 TREE_STATUS_VALUES = {
     "alive",
     "healthy",
@@ -165,6 +175,50 @@ TREE_STATUS_COLOR_HEX = {
     "need_watering": "0ea5e9",
     "need_protection": "a855f7",
 }
+
+
+class PrivacyConsentPayload(BaseModel):
+    scope_key: str
+    consent_version: str | None = None
+    source_app: str | None = None
+    source_path: str | None = None
+    actor_type: str | None = None
+    actor_id: int | None = None
+    actor_name: str | None = None
+    organization_id: int | None = None
+    organization_name: str | None = None
+    accepted: bool = True
+    legal_basis: str | None = None
+    consent_text: str | None = None
+    metadata: dict | None = None
+
+
+def _normalize_privacy_scope(value: str | None) -> str:
+    scope = str(value or "").strip().lower()
+    if scope not in PRIVACY_CONSENT_SCOPE_VALUES:
+        raise HTTPException(status_code=400, detail="Invalid privacy consent scope")
+    return scope
+
+
+def _normalize_privacy_source_app(value: str | None) -> str:
+    source_app = str(value or "").strip().lower() or "public"
+    return source_app if source_app in PRIVACY_SOURCE_APP_VALUES else "public"
+
+
+def _normalize_privacy_actor_type(value: str | None) -> str:
+    actor_type = str(value or "").strip().lower() or "anonymous"
+    return actor_type if actor_type in PRIVACY_ACTOR_TYPE_VALUES else "anonymous"
+
+
+def _request_ip_address(request: Request) -> str | None:
+    forwarded = str(request.headers.get("x-forwarded-for") or "").strip()
+    if forwarded:
+        return forwarded.split(",")[0].strip() or None
+    real_ip = str(request.headers.get("x-real-ip") or "").strip()
+    if real_ip:
+        return real_ip
+    client_host = getattr(request.client, "host", None)
+    return str(client_host).strip() or None
 
 
 def get_db():
@@ -2319,6 +2373,27 @@ def ensure_green_tables(db: Session):
         )
     """))
     db.execute(text("""
+        CREATE TABLE IF NOT EXISTS green_privacy_consents (
+            id SERIAL PRIMARY KEY,
+            scope_key TEXT NOT NULL,
+            consent_version TEXT NOT NULL DEFAULT '2026-03-23-v1',
+            source_app TEXT NOT NULL DEFAULT 'public',
+            source_path TEXT,
+            actor_type TEXT NOT NULL DEFAULT 'anonymous',
+            actor_id INTEGER,
+            actor_name TEXT,
+            organization_id INTEGER REFERENCES green_organizations(id) ON DELETE SET NULL,
+            organization_name TEXT,
+            accepted BOOLEAN NOT NULL DEFAULT TRUE,
+            legal_basis TEXT,
+            consent_text TEXT,
+            metadata JSONB,
+            ip_address TEXT,
+            user_agent TEXT,
+            created_at TIMESTAMP DEFAULT NOW()
+        )
+    """))
+    db.execute(text("""
         CREATE TABLE IF NOT EXISTS green_maintenance_cycles (
             id SERIAL PRIMARY KEY,
             project_id INTEGER NOT NULL REFERENCES tree_projects(id) ON DELETE CASCADE,
@@ -2460,6 +2535,9 @@ def ensure_green_tables(db: Session):
     db.execute(text("CREATE INDEX IF NOT EXISTS idx_species_maturity_project_id ON green_species_maturity(project_id)"))
     db.execute(text("CREATE INDEX IF NOT EXISTS idx_task_reviews_task_id ON green_task_reviews(task_id)"))
     db.execute(text("CREATE INDEX IF NOT EXISTS idx_audit_project_created ON green_audit_events(project_id, created_at DESC)"))
+    db.execute(text("CREATE INDEX IF NOT EXISTS idx_privacy_consents_scope_time ON green_privacy_consents(scope_key, created_at DESC)"))
+    db.execute(text("CREATE INDEX IF NOT EXISTS idx_privacy_consents_actor ON green_privacy_consents(actor_type, actor_id, created_at DESC)"))
+    db.execute(text("CREATE INDEX IF NOT EXISTS idx_privacy_consents_org ON green_privacy_consents(organization_id, created_at DESC)"))
     db.execute(text("CREATE INDEX IF NOT EXISTS idx_cycles_project_due ON green_maintenance_cycles(project_id, due_date)"))
     db.execute(text("CREATE INDEX IF NOT EXISTS idx_alerts_project_status ON green_alerts(project_id, status, created_at DESC)"))
     db.execute(text("CREATE INDEX IF NOT EXISTS idx_sched_reports_project ON green_scheduled_reports(project_id, is_enabled)"))
@@ -2654,6 +2732,107 @@ def _load_env_token() -> str | None:
     except Exception:
         return None
     return None
+
+
+@router.get("/privacy/policy")
+def get_privacy_policy_meta():
+    return {
+        "consent_version": PRIVACY_CONSENT_VERSION,
+        "scopes": {
+            "public_site_notice": {
+                "title": "Public website notice",
+                "summary": "Acknowledges device storage, map loading, and contact interactions on LandCheck public pages.",
+            },
+            "feedback_contact_submission": {
+                "title": "Feedback contact submission",
+                "summary": "Covers optional email address and feedback content submitted through the public feedback form.",
+            },
+            "green_field_data_capture": {
+                "title": "Green field data capture",
+                "summary": "Covers GPS location, photos, notes, tree records, task evidence, and audit trail data captured in LandCheck Green.",
+            },
+            "work_operational_data_processing": {
+                "title": "Work operational data processing",
+                "summary": "Covers staff, custodian, organization, distribution, photo, and review records processed in LandCheck Work.",
+            },
+        },
+    }
+
+
+@router.post("/privacy/consents")
+def record_privacy_consent(
+    payload: PrivacyConsentPayload,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    scope_key = _normalize_privacy_scope(payload.scope_key)
+    consent_version = str(payload.consent_version or PRIVACY_CONSENT_VERSION).strip() or PRIVACY_CONSENT_VERSION
+    source_app = _normalize_privacy_source_app(payload.source_app)
+    actor_type = _normalize_privacy_actor_type(payload.actor_type)
+    metadata_value = payload.metadata if isinstance(payload.metadata, dict) else {}
+    row = db.execute(
+        text(
+            """
+            INSERT INTO green_privacy_consents (
+                scope_key,
+                consent_version,
+                source_app,
+                source_path,
+                actor_type,
+                actor_id,
+                actor_name,
+                organization_id,
+                organization_name,
+                accepted,
+                legal_basis,
+                consent_text,
+                metadata,
+                ip_address,
+                user_agent
+            )
+            VALUES (
+                :scope_key,
+                :consent_version,
+                :source_app,
+                :source_path,
+                :actor_type,
+                :actor_id,
+                :actor_name,
+                :organization_id,
+                :organization_name,
+                :accepted,
+                :legal_basis,
+                :consent_text,
+                CAST(:metadata AS JSONB),
+                :ip_address,
+                :user_agent
+            )
+            RETURNING id, scope_key, consent_version, source_app, actor_type, accepted, created_at
+            """
+        ),
+        {
+            "scope_key": scope_key,
+            "consent_version": consent_version,
+            "source_app": source_app,
+            "source_path": str(payload.source_path or "").strip() or None,
+            "actor_type": actor_type,
+            "actor_id": int(payload.actor_id) if payload.actor_id is not None else None,
+            "actor_name": str(payload.actor_name or "").strip() or None,
+            "organization_id": int(payload.organization_id) if payload.organization_id is not None else None,
+            "organization_name": str(payload.organization_name or "").strip() or None,
+            "accepted": bool(payload.accepted),
+            "legal_basis": str(payload.legal_basis or "").strip() or None,
+            "consent_text": str(payload.consent_text or "").strip() or None,
+            "metadata": json.dumps(metadata_value),
+            "ip_address": _request_ip_address(request),
+            "user_agent": str(request.headers.get("user-agent") or "").strip() or None,
+        },
+    ).mappings().first()
+    db.commit()
+    return {
+        "ok": True,
+        "record": dict(row or {}),
+    }
 
 
 def _http_get_binary(url: str, timeout: int = 15) -> bytes | None:
