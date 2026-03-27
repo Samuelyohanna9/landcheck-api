@@ -4120,6 +4120,7 @@ def export_admin_org_credentials_pdf(
 def list_projects(
     db: Session = Depends(get_db),
     organization_id: int | None = Query(default=None),
+    assignee_name: str | None = Query(default=None),
 ):
     rows = db.execute(text("""
         SELECT
@@ -4130,15 +4131,43 @@ def list_projects(
         FROM tree_projects p
         LEFT JOIN green_organizations o ON o.id = p.organization_id
         WHERE (:organization_id IS NULL OR p.organization_id = :organization_id)
+          AND (
+                :assignee_name IS NULL
+                OR EXISTS (
+                    SELECT 1
+                    FROM tree_tasks tt
+                    JOIN trees tr ON tr.id = tt.tree_id
+                    WHERE tr.project_id = p.id
+                      AND LOWER(TRIM(COALESCE(tt.assignee_name, ''))) = LOWER(TRIM(:assignee_name))
+                )
+                OR EXISTS (
+                    SELECT 1
+                    FROM green_work_orders wo
+                    WHERE wo.project_id = p.id
+                      AND LOWER(TRIM(COALESCE(wo.assignee_name, ''))) = LOWER(TRIM(:assignee_name))
+                )
+                OR EXISTS (
+                    SELECT 1
+                    FROM trees tr
+                    WHERE tr.project_id = p.id
+                      AND LOWER(TRIM(COALESCE(tr.created_by, ''))) = LOWER(TRIM(:assignee_name))
+                )
+          )
         ORDER BY p.created_at DESC
     """), {
         "organization_id": int(organization_id) if organization_id is not None else None,
+        "assignee_name": (assignee_name or "").strip() or None,
     }).mappings().all()
     return [dict(r) for r in rows]
 
 
 @router.get("/projects/{project_id}")
-def get_project(project_id: int, db: Session = Depends(get_db)):
+def get_project(
+    project_id: int,
+    db: Session = Depends(get_db),
+    assignee_name: str | None = Query(default=None),
+):
+    assignee_clean = (assignee_name or "").strip() or None
     project = db.execute(text("""
         SELECT
             p.id, p.organization_id, p.name, p.location_text, p.sponsor,
@@ -4152,14 +4181,47 @@ def get_project(project_id: int, db: Session = Depends(get_db)):
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
 
+    if assignee_clean:
+        has_access = db.execute(
+            text(
+                """
+                SELECT (
+                    EXISTS (
+                        SELECT 1
+                        FROM tree_tasks tt
+                        JOIN trees tr ON tr.id = tt.tree_id
+                        WHERE tr.project_id = :project_id
+                          AND LOWER(TRIM(COALESCE(tt.assignee_name, ''))) = LOWER(TRIM(:assignee_name))
+                    )
+                    OR EXISTS (
+                        SELECT 1
+                        FROM green_work_orders wo
+                        WHERE wo.project_id = :project_id
+                          AND LOWER(TRIM(COALESCE(wo.assignee_name, ''))) = LOWER(TRIM(:assignee_name))
+                    )
+                    OR EXISTS (
+                        SELECT 1
+                        FROM trees tr
+                        WHERE tr.project_id = :project_id
+                          AND LOWER(TRIM(COALESCE(tr.created_by, ''))) = LOWER(TRIM(:assignee_name))
+                    )
+                ) AS allowed
+                """
+            ),
+            {"project_id": project_id, "assignee_name": assignee_clean},
+        ).scalar()
+        if not bool(has_access):
+            raise HTTPException(status_code=404, detail="Project not found")
+
     stats_rows = db.execute(
         text("""
             SELECT status, COALESCE(count_in_planting_kpis, TRUE) AS in_scope, COUNT(*) AS count
             FROM trees
             WHERE project_id = :project_id
+              AND (:assignee_name IS NULL OR LOWER(TRIM(COALESCE(created_by, ''))) = LOWER(TRIM(:assignee_name)))
             GROUP BY status, COALESCE(count_in_planting_kpis, TRUE)
         """),
-        {"project_id": project_id},
+        {"project_id": project_id, "assignee_name": assignee_clean},
     ).mappings().all()
     status_counts: dict[str, int] = {}
     status_counts_all: dict[str, int] = {}
@@ -4183,7 +4245,8 @@ def get_project(project_id: int, db: Session = Depends(get_db)):
         FROM trees
         WHERE project_id = :project_id
           AND COALESCE(count_in_carbon_scope, TRUE) = TRUE
-    """), {"project_id": project_id}).mappings().all()
+          AND (:assignee_name IS NULL OR LOWER(TRIM(COALESCE(created_by, ''))) = LOWER(TRIM(:assignee_name)))
+    """), {"project_id": project_id, "assignee_name": assignee_clean}).mappings().all()
     carbon = compute_project_carbon([dict(r) for r in tree_rows_for_carbon])
 
     custodian_summary = db.execute(
@@ -4265,7 +4328,14 @@ def get_project(project_id: int, db: Session = Depends(get_db)):
 
 
 @router.get("/projects/{project_id}/trees")
-def list_trees(project_id: int, db: Session = Depends(get_db)):
+def list_trees(
+    project_id: int,
+    db: Session = Depends(get_db),
+    assignee_name: str | None = Query(default=None),
+):
+    assignee_clean = (assignee_name or "").strip() or None
+    if assignee_clean:
+        get_project(project_id=project_id, db=db, assignee_name=assignee_clean)
     rows = db.execute(text("""
         SELECT
                t.id,
@@ -4296,8 +4366,9 @@ def list_trees(project_id: int, db: Session = Depends(get_db)):
         FROM trees t
         LEFT JOIN green_custodians c ON c.id = t.custodian_id
         WHERE t.project_id = :project_id
+          AND (:assignee_name IS NULL OR LOWER(TRIM(COALESCE(t.created_by, ''))) = LOWER(TRIM(:assignee_name)))
         ORDER BY t.created_at DESC
-    """), {"project_id": project_id}).mappings().all()
+    """), {"project_id": project_id, "assignee_name": assignee_clean}).mappings().all()
     return [dict(r) for r in rows]
 
 
@@ -5422,20 +5493,23 @@ def upsert_species_maturity(
 
 
 @router.get("/projects/{project_id}/carbon-summary")
-def carbon_summary(project_id: int, projection_years: int = Query(default=40), db: Session = Depends(get_db)):
+def carbon_summary(
+    project_id: int,
+    projection_years: int = Query(default=40),
+    assignee_name: str | None = Query(default=None),
+    db: Session = Depends(get_db),
+):
     """Get CO2 sequestration summary for a project."""
-    project = db.execute(
-        text("SELECT id FROM tree_projects WHERE id = :pid"), {"pid": project_id},
-    ).scalar()
-    if not project:
-        raise HTTPException(status_code=404, detail="Project not found")
+    assignee_clean = (assignee_name or "").strip() or None
+    get_project(project_id=project_id, db=db, assignee_name=assignee_clean)
 
     tree_rows = db.execute(text("""
         SELECT id, species, planting_date, status, created_at, tree_age_months, COALESCE(inventory_tree_count, 1) AS inventory_tree_count
         FROM trees
         WHERE project_id = :project_id
           AND COALESCE(count_in_carbon_scope, TRUE) = TRUE
-    """), {"project_id": project_id}).mappings().all()
+          AND (:assignee_name IS NULL OR LOWER(TRIM(COALESCE(created_by, ''))) = LOWER(TRIM(:assignee_name)))
+    """), {"project_id": project_id, "assignee_name": assignee_clean}).mappings().all()
     trees = [dict(r) for r in tree_rows]
     summary = compute_project_carbon(trees, projection_years)
     summary["project_id"] = project_id
@@ -5443,20 +5517,23 @@ def carbon_summary(project_id: int, projection_years: int = Query(default=40), d
 
 
 @router.get("/projects/{project_id}/carbon-projection")
-def carbon_projection(project_id: int, years: int = Query(default=30), db: Session = Depends(get_db)):
+def carbon_projection(
+    project_id: int,
+    years: int = Query(default=30),
+    assignee_name: str | None = Query(default=None),
+    db: Session = Depends(get_db),
+):
     """Get year-by-year CO2 projection for a project."""
-    project = db.execute(
-        text("SELECT id FROM tree_projects WHERE id = :pid"), {"pid": project_id},
-    ).scalar()
-    if not project:
-        raise HTTPException(status_code=404, detail="Project not found")
+    assignee_clean = (assignee_name or "").strip() or None
+    get_project(project_id=project_id, db=db, assignee_name=assignee_clean)
 
     tree_rows = db.execute(text("""
         SELECT id, species, planting_date, status, created_at, tree_age_months, COALESCE(inventory_tree_count, 1) AS inventory_tree_count
         FROM trees
         WHERE project_id = :project_id
           AND COALESCE(count_in_carbon_scope, TRUE) = TRUE
-    """), {"project_id": project_id}).mappings().all()
+          AND (:assignee_name IS NULL OR LOWER(TRIM(COALESCE(created_by, ''))) = LOWER(TRIM(:assignee_name)))
+    """), {"project_id": project_id, "assignee_name": assignee_clean}).mappings().all()
     trees = [dict(r) for r in tree_rows]
     projection = generate_co2_projection_table(trees, years)
     return {"project_id": project_id, "projection": projection}
@@ -8372,7 +8449,7 @@ def live_maintenance_rows(
     }
 
 
-def _build_donor_report_rows(project_id: int, db: Session) -> list[dict]:
+def _build_donor_report_rows(project_id: int, db: Session, assignee_name: str | None = None) -> list[dict]:
     rows = db.execute(
         text("""
             SELECT
@@ -8396,9 +8473,10 @@ def _build_donor_report_rows(project_id: int, db: Session) -> list[dict]:
             JOIN trees tr ON tr.id = t.tree_id
             LEFT JOIN green_custodians c ON c.id = tr.custodian_id
             WHERE tr.project_id = :project_id
+              AND (:assignee_name IS NULL OR LOWER(TRIM(COALESCE(tr.created_by, ''))) = LOWER(TRIM(:assignee_name)))
             ORDER BY COALESCE(t.reviewed_at, t.submitted_at, t.created_at) DESC, t.id DESC
         """),
-        {"project_id": project_id},
+        {"project_id": project_id, "assignee_name": (assignee_name or "").strip() or None},
     ).mappings().all()
     report_rows: list[dict] = []
     today = date.today()
@@ -8462,10 +8540,12 @@ def _review_summary_by_tree(project_id: int, db: Session, assignee_name: str | N
 def _compute_age_based_survival(
     project_id: int,
     db: Session,
+    assignee_name: str | None = None,
     checkpoints_days: tuple[int, ...] = AGE_SURVIVAL_CHECKPOINTS_DAYS,
     as_of_date: date | None = None,
 ) -> dict:
     as_of = as_of_date or date.today()
+    assignee_clean = (assignee_name or "").strip() or None
 
     tree_rows = db.execute(
         text(
@@ -8474,21 +8554,24 @@ def _compute_age_based_survival(
             FROM trees
             WHERE project_id = :project_id
               AND COALESCE(count_in_planting_kpis, TRUE) = TRUE
+              AND (:assignee_name IS NULL OR LOWER(TRIM(COALESCE(created_by, ''))) = LOWER(TRIM(:assignee_name)))
             """
         ),
-        {"project_id": project_id},
+        {"project_id": project_id, "assignee_name": assignee_clean},
     ).mappings().all()
 
     history_rows = db.execute(
         text(
             """
-            SELECT tree_id, status, status_date, created_at, id
-            FROM green_tree_status_history
-            WHERE project_id = :project_id
+            SELECT h.tree_id, h.status, h.status_date, h.created_at, h.id
+            FROM green_tree_status_history h
+            JOIN trees tr ON tr.id = h.tree_id
+            WHERE h.project_id = :project_id
+              AND (:assignee_name IS NULL OR LOWER(TRIM(COALESCE(tr.created_by, ''))) = LOWER(TRIM(:assignee_name)))
             ORDER BY tree_id ASC, status_date ASC, created_at ASC, id ASC
             """
         ),
-        {"project_id": project_id},
+        {"project_id": project_id, "assignee_name": assignee_clean},
     ).mappings().all()
 
     history_by_tree: dict[int, list[tuple[date, str]]] = {}
@@ -8632,7 +8715,8 @@ def _compute_age_based_survival(
     return result
 
 
-def _compute_kpi_snapshot(project_id: int, db: Session) -> dict:
+def _compute_kpi_snapshot(project_id: int, db: Session, assignee_name: str | None = None) -> dict:
+    assignee_clean = (assignee_name or "").strip() or None
     tree_rows = db.execute(
         text(
             """
@@ -8643,9 +8727,10 @@ def _compute_kpi_snapshot(project_id: int, db: Session) -> dict:
                 COALESCE(count_in_carbon_scope, TRUE) AS in_carbon_scope
             FROM trees
             WHERE project_id = :project_id
+              AND (:assignee_name IS NULL OR LOWER(TRIM(COALESCE(created_by, ''))) = LOWER(TRIM(:assignee_name)))
             """
         ),
-        {"project_id": project_id},
+        {"project_id": project_id, "assignee_name": assignee_clean},
     ).mappings().all()
     task_rows = db.execute(
         text("""
@@ -8653,8 +8738,9 @@ def _compute_kpi_snapshot(project_id: int, db: Session) -> dict:
             FROM tree_tasks t
             JOIN trees tr ON tr.id = t.tree_id
             WHERE tr.project_id = :project_id
+              AND (:assignee_name IS NULL OR LOWER(TRIM(COALESCE(tr.created_by, ''))) = LOWER(TRIM(:assignee_name)))
         """),
-        {"project_id": project_id},
+        {"project_id": project_id, "assignee_name": assignee_clean},
     ).mappings().all()
 
     total_trees_all = len(tree_rows)
@@ -8710,9 +8796,10 @@ def _compute_kpi_snapshot(project_id: int, db: Session) -> dict:
         FROM trees
         WHERE project_id = :project_id
           AND COALESCE(count_in_carbon_scope, TRUE) = TRUE
-    """), {"project_id": project_id}).mappings().all()
+          AND (:assignee_name IS NULL OR LOWER(TRIM(COALESCE(created_by, ''))) = LOWER(TRIM(:assignee_name)))
+    """), {"project_id": project_id, "assignee_name": assignee_clean}).mappings().all()
     carbon = compute_project_carbon([dict(r) for r in carbon_tree_rows])
-    age_survival = _compute_age_based_survival(project_id, db)
+    age_survival = _compute_age_based_survival(project_id, db, assignee_name=assignee_clean)
 
     return {
         "project_id": project_id,
@@ -8764,13 +8851,14 @@ def _survival_phase_label(age_days: int) -> str:
     return "0-29 days"
 
 
-def _build_species_daily_survival_series(project_id: int, db: Session) -> dict:
+def _build_species_daily_survival_series(project_id: int, db: Session, assignee_name: str | None = None) -> dict:
     """
     Build per-species daily survival lines from planting date to today.
     Survival uses status history timeline (maintenance/task-review/manual updates)
     with current tree status as fallback baseline.
     """
     today = date.today()
+    assignee_clean = (assignee_name or "").strip() or None
 
     tree_rows = db.execute(
         text(
@@ -8779,21 +8867,24 @@ def _build_species_daily_survival_series(project_id: int, db: Session) -> dict:
             FROM trees
             WHERE project_id = :project_id
               AND COALESCE(count_in_planting_kpis, TRUE) = TRUE
+              AND (:assignee_name IS NULL OR LOWER(TRIM(COALESCE(created_by, ''))) = LOWER(TRIM(:assignee_name)))
             """
         ),
-        {"project_id": project_id},
+        {"project_id": project_id, "assignee_name": assignee_clean},
     ).mappings().all()
 
     history_rows = db.execute(
         text(
             """
-            SELECT tree_id, status, status_date, created_at, id
-            FROM green_tree_status_history
-            WHERE project_id = :project_id
+            SELECT h.tree_id, h.status, h.status_date, h.created_at, h.id
+            FROM green_tree_status_history h
+            JOIN trees tr ON tr.id = h.tree_id
+            WHERE h.project_id = :project_id
+              AND (:assignee_name IS NULL OR LOWER(TRIM(COALESCE(tr.created_by, ''))) = LOWER(TRIM(:assignee_name)))
             ORDER BY tree_id ASC, status_date ASC, created_at ASC, id ASC
             """
         ),
-        {"project_id": project_id},
+        {"project_id": project_id, "assignee_name": assignee_clean},
     ).mappings().all()
 
     history_by_tree: dict[int, list[tuple[date, str]]] = {}
@@ -8960,7 +9051,7 @@ def _build_species_daily_survival_series(project_id: int, db: Session) -> dict:
     }
 
 
-def _build_kpi_trend_series(project_id: int, db: Session, days: int = 180) -> list[dict]:
+def _build_kpi_trend_series(project_id: int, db: Session, days: int = 180, assignee_name: str | None = None) -> list[dict]:
     """
     Build meaningful KPI trend points by month:
     - Survival: cumulative healthy share across planting cohorts over time.
@@ -8969,6 +9060,7 @@ def _build_kpi_trend_series(project_id: int, db: Session, days: int = 180) -> li
     window_days = max(int(days), 1)
     today = date.today()
     window_start = today - timedelta(days=window_days - 1)
+    assignee_clean = (assignee_name or "").strip() or None
 
     earliest_planting = db.execute(
         text(
@@ -8978,9 +9070,10 @@ def _build_kpi_trend_series(project_id: int, db: Session, days: int = 180) -> li
             WHERE project_id = :project_id
               AND COALESCE(count_in_planting_kpis, TRUE) = TRUE
               AND planting_date IS NOT NULL
+              AND (:assignee_name IS NULL OR LOWER(TRIM(COALESCE(created_by, ''))) = LOWER(TRIM(:assignee_name)))
             """
         ),
-        {"project_id": project_id},
+        {"project_id": project_id, "assignee_name": assignee_clean},
     ).scalar()
     earliest_planting_date = _parse_date_value(earliest_planting)
     trend_start_date = earliest_planting_date or window_start
@@ -9003,9 +9096,10 @@ def _build_kpi_trend_series(project_id: int, db: Session, days: int = 180) -> li
             FROM trees
             WHERE project_id = :project_id
               AND COALESCE(count_in_planting_kpis, TRUE) = TRUE
+              AND (:assignee_name IS NULL OR LOWER(TRIM(COALESCE(created_by, ''))) = LOWER(TRIM(:assignee_name)))
             """
         ),
-        {"project_id": project_id},
+        {"project_id": project_id, "assignee_name": assignee_clean},
     ).mappings().all()
 
     tree_month_totals: dict[date, int] = {}
@@ -9039,9 +9133,10 @@ def _build_kpi_trend_series(project_id: int, db: Session, days: int = 180) -> li
             FROM tree_tasks t
             JOIN trees tr ON tr.id = t.tree_id
             WHERE tr.project_id = :project_id
+              AND (:assignee_name IS NULL OR LOWER(TRIM(COALESCE(tr.created_by, ''))) = LOWER(TRIM(:assignee_name)))
             """
         ),
-        {"project_id": project_id},
+        {"project_id": project_id, "assignee_name": assignee_clean},
     ).mappings().all()
 
     task_month_required: dict[date, int] = {}
@@ -12332,9 +12427,9 @@ def export_project_pdf(
     )
 
 
-def _fetch_kpi_trend(project_id: int, db: Session, days: int = 90) -> list[dict]:
+def _fetch_kpi_trend(project_id: int, db: Session, days: int = 90, assignee_name: str | None = None) -> list[dict]:
     """Fetch KPI trend series for charts using cohort/activity monthly basis."""
-    return _build_kpi_trend_series(project_id, db, days=days)
+    return _build_kpi_trend_series(project_id, db, days=days, assignee_name=assignee_name)
 
 
 def _build_tree_stats(rows: list[dict]) -> dict:
@@ -12384,7 +12479,8 @@ def export_work_report_pdf(
     bearing_value = _coerce_optional_float(bearing)
     pitch_value = _coerce_optional_float(pitch)
 
-    project = get_project(project_id, db)
+    assignee_clean = (assignee_name or "").strip() or None
+    project = get_project(project_id=project_id, db=db, assignee_name=assignee_clean)
     if assignee_name:
         rows = db.execute(text("""
             SELECT
@@ -12553,8 +12649,8 @@ def export_work_report_pdf(
     map_view = None
     if lng_value is not None and lat_value is not None and zoom_value is not None:
         map_view = {"lng": lng_value, "lat": lat_value, "zoom": zoom_value}
-    donor_rows = _build_donor_report_rows(project_id, db)
-    kpi_snapshot = _compute_kpi_snapshot(project_id, db)
+    donor_rows = _build_donor_report_rows(project_id, db, assignee_name=assignee_clean)
+    kpi_snapshot = _compute_kpi_snapshot(project_id, db, assignee_name=assignee_clean)
     try:
         _store_kpi_snapshot(project_id, kpi_snapshot, db)
         db.commit()
@@ -12567,13 +12663,14 @@ def export_work_report_pdf(
         FROM trees
         WHERE project_id = :pid
           AND COALESCE(count_in_carbon_scope, TRUE) = TRUE
-    """), {"pid": project_id}).mappings().all()
+          AND (:assignee_name IS NULL OR LOWER(TRIM(COALESCE(created_by, ''))) = LOWER(TRIM(:assignee_name)))
+    """), {"pid": project_id, "assignee_name": assignee_clean}).mappings().all()
     carbon_data = compute_project_carbon([dict(r) for r in carbon_trees])
     carbon_data["projection"] = generate_co2_projection_table([dict(r) for r in carbon_trees], 30)
 
     # KPI trend for survival chart
-    kpi_trend = _fetch_kpi_trend(project_id, db, days=90)
-    species_daily_survival = _build_species_daily_survival_series(project_id, db)
+    kpi_trend = _fetch_kpi_trend(project_id, db, days=90, assignee_name=assignee_clean)
+    species_daily_survival = _build_species_daily_survival_series(project_id, db, assignee_name=assignee_clean)
 
     try:
         render_green_report_pdf(
