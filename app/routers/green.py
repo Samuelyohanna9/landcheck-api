@@ -2896,6 +2896,27 @@ def _build_report_map_png(
     b = bearing_value if bearing_value is not None else 0
     p = pitch_value if pitch_value is not None else 0
 
+    has_explicit_view = lng_value is not None and lat_value is not None and zoom_value is not None
+
+    def _estimate_zoom_to_fit() -> int:
+        import math
+
+        min_lng = min(lngs)
+        max_lng = max(lngs)
+        min_lat = min(lats)
+        max_lat = max(lats)
+        lng_span = max(max_lng - min_lng, 0.0008)
+        lat_span = max(max_lat - min_lat, 0.0008)
+        usable_width = 800 * 0.74
+        usable_height = 500 * 0.74
+        zoom_x = math.log2((360.0 * usable_width) / (512.0 * lng_span))
+        zoom_y = math.log2((170.1022 * usable_height) / (512.0 * lat_span))
+        zoom_fit = math.floor(min(zoom_x, zoom_y))
+        return max(2, min(17, int(zoom_fit)))
+
+    if not has_explicit_view:
+        z = _estimate_zoom_to_fit()
+
     token = _load_env_token()
     if token:
         markers = []
@@ -2907,6 +2928,14 @@ def _build_report_map_png(
         overlay = ",".join(markers) if markers else ""
         overlay_part = f"{quote(overlay, safe='(),:+')}/" if overlay else ""
         for style in ("mapbox/satellite-streets-v12", "mapbox/satellite-v9"):
+            if overlay and not has_explicit_view:
+                url = (
+                    f"https://api.mapbox.com/styles/v1/{style}/static/"
+                    f"{overlay_part}auto/800x500@2x?padding=64,64,64,64&access_token={token}"
+                )
+                map_png = _http_get_binary(url)
+                if map_png:
+                    return map_png
             if overlay:
                 url = (
                     f"https://api.mapbox.com/styles/v1/{style}/static/"
