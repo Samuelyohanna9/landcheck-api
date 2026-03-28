@@ -3734,6 +3734,39 @@ def list_admin_organizations(db: Session = Depends(get_db)):
     return [dict(r) for r in rows]
 
 
+@router.get("/organizations/{organization_id}/branding")
+def get_organization_branding(
+    organization_id: int,
+    db: Session = Depends(get_db),
+):
+    row = db.execute(
+        text(
+            """
+            SELECT
+                id,
+                name,
+                slug,
+                status,
+                logo_url,
+                COALESCE(is_active, TRUE) AS is_active
+            FROM green_organizations
+            WHERE id = :organization_id
+            """
+        ),
+        {"organization_id": organization_id},
+    ).mappings().first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Organization not found")
+    return {
+        "id": int(row.get("id") or 0),
+        "name": row.get("name"),
+        "slug": row.get("slug"),
+        "status": row.get("status"),
+        "is_active": bool(row.get("is_active", True)),
+        "logo_url": row.get("logo_url"),
+    }
+
+
 @router.post("/admin/organizations")
 def create_admin_organization(
     db: Session = Depends(get_db),
