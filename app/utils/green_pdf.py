@@ -3,11 +3,13 @@ from reportlab.pdfgen import canvas
 from reportlab.lib.colors import HexColor
 from reportlab.lib.utils import ImageReader
 from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import io
 import os
 import ssl
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
+from PIL import Image, ImageOps
 
 
 def render_green_org_credentials_pdf(organization: dict, users: list[dict]) -> bytes:
@@ -469,6 +471,26 @@ def _format_delay_label(delay_days, delay_context=None):
     return "0d"
 
 
+def _optimize_photo_bytes(data: bytes) -> bytes:
+    try:
+        with Image.open(io.BytesIO(data)) as img:
+            img = ImageOps.exif_transpose(img)
+            max_edge = max(1, int(os.getenv("GREEN_REPORT_PHOTO_MAX_EDGE", "1400") or 1400))
+            if img.mode not in {"RGB", "L"}:
+                img = img.convert("RGB")
+            img.thumbnail((max_edge, max_edge), Image.Resampling.LANCZOS)
+            out = io.BytesIO()
+            img.save(
+                out,
+                format="JPEG",
+                quality=max(50, min(95, int(os.getenv("GREEN_REPORT_PHOTO_JPEG_QUALITY", "78") or 78))),
+                optimize=True,
+            )
+            return out.getvalue()
+    except Exception:
+        return data
+
+
 def _load_photo_reader(photo_url, image_cache):
     raw = str(photo_url or "").strip()
     if not raw:
@@ -485,12 +507,12 @@ def _load_photo_reader(photo_url, image_cache):
         if parsed.scheme in {"http", "https"}:
             req = Request(raw, headers={"User-Agent": "LandCheck-Green-Report/1.0"})
             try:
-                with urlopen(req, timeout=8) as response:
+                with urlopen(req, timeout=6) as response:
                     data = response.read()
             except Exception:
                 if parsed.scheme == "https":
                     context = ssl._create_unverified_context()
-                    with urlopen(req, timeout=8, context=context) as response:
+                    with urlopen(req, timeout=6, context=context) as response:
                         data = response.read()
         else:
             if raw.startswith("/"):
@@ -499,7 +521,7 @@ def _load_photo_reader(photo_url, image_cache):
                     remote_url = f"{base_url}{raw}"
                     req = Request(remote_url, headers={"User-Agent": "LandCheck-Green-Report/1.0"})
                     try:
-                        with urlopen(req, timeout=8) as response:
+                        with urlopen(req, timeout=6) as response:
                             data = response.read()
                     except Exception:
                         pass
@@ -517,12 +539,35 @@ def _load_photo_reader(photo_url, image_cache):
                         data = f.read()
                     break
         if data:
+            data = _optimize_photo_bytes(data)
             reader = ImageReader(io.BytesIO(data))
     except Exception:
         reader = None
 
     image_cache[raw] = reader
     return reader
+
+
+def _prefetch_photo_readers(photo_rows, image_cache):
+    unique_urls = []
+    seen = set()
+    for row in photo_rows or []:
+        raw = str((row or {}).get("photo_url") or "").strip()
+        if raw.startswith("//"):
+            raw = f"https:{raw}"
+        if raw and raw not in seen:
+            seen.add(raw)
+            unique_urls.append(raw)
+    if not unique_urls:
+        return
+    max_workers = max(2, min(8, int(os.getenv("GREEN_REPORT_PHOTO_FETCH_WORKERS", "6") or 6)))
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = [pool.submit(_load_photo_reader, raw, image_cache) for raw in unique_urls]
+        for future in as_completed(futures):
+            try:
+                future.result()
+            except Exception:
+                pass
 
 
 def _draw_photo_card(c, x, y, w, h, row, image_cache):
@@ -584,6 +629,11 @@ def _draw_photo_card(c, x, y, w, h, row, image_cache):
 
 
 def _render_photo_appendix_pages(c, width, height, project, photo_rows, assignee_name=None):
+    max_photos = max(1, int(os.getenv("GREEN_REPORT_APPENDIX_MAX_PHOTOS", "120") or 120))
+    source_rows = [dict(row) for row in (photo_rows or []) if str((row or {}).get("photo_url") or "").strip()]
+    truncated_count = max(0, len(source_rows) - max_photos)
+    photo_rows = source_rows[:max_photos]
+
     if not photo_rows:
         c.showPage()
         c.setFont("Helvetica-Bold", 15)
@@ -594,6 +644,7 @@ def _render_photo_appendix_pages(c, width, height, project, photo_rows, assignee
         return
 
     image_cache = {}
+    _prefetch_photo_readers(photo_rows, image_cache)
     per_page = 6
     card_cols = 2
     card_rows = 3
@@ -617,6 +668,13 @@ def _render_photo_appendix_pages(c, width, height, project, photo_rows, assignee
         if assignee_name:
             scope_text += f" | Assignee: {assignee_name}"
         c.drawString(40, height - 66, scope_text[:100])
+        if truncated_count > 0:
+            c.setFillColor(HexColor("#8a5a00"))
+            c.drawString(
+                40,
+                height - 78,
+                f"Photo appendix trimmed to first {len(photo_rows)} photos for reliable download. {truncated_count} more not embedded.",
+            )
         c.drawRightString(width - 40, height - 66, f"Page {page_index}/{total_pages}")
 
         page_rows = photo_rows[start : start + per_page]

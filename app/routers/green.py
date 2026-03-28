@@ -286,34 +286,33 @@ def _pdf_response_with_r2(
     project_id: int | None = None,
     organization_id: int | None = None,
 ):
-    upload_meta = upload_export_file_best_effort(
-        local_pdf_path,
-        filename,
-        category=category,
-        project_id=project_id,
-        organization_id=organization_id,
-        content_type="application/pdf",
-    )
-    def _delete_temp_file(path: str):
+    def _finalize_pdf(path: str):
         try:
             if os.path.exists(path):
-                os.remove(path)
+                upload_export_file_best_effort(
+                    path,
+                    filename,
+                    category=category,
+                    project_id=project_id,
+                    organization_id=organization_id,
+                    content_type="application/pdf",
+                )
         except Exception:
             pass
+        finally:
+            try:
+                if os.path.exists(path):
+                    os.remove(path)
+            except Exception:
+                pass
 
     response = FileResponse(
         local_pdf_path,
         media_type="application/pdf",
         filename=filename,
-        background=BackgroundTask(_delete_temp_file, local_pdf_path),
+        background=BackgroundTask(_finalize_pdf, local_pdf_path),
     )
-    if upload_meta:
-        object_key = upload_meta.get("object_key")
-        public_url = upload_meta.get("public_url")
-        if object_key:
-            response.headers["X-LandCheck-R2-Key"] = str(object_key)
-        if public_url:
-            response.headers["X-LandCheck-R2-Url"] = str(public_url)
+    response.headers["X-LandCheck-R2-Upload"] = "deferred"
     return response
 
 
