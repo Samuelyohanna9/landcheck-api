@@ -8,6 +8,7 @@ import os
 import tempfile
 import csv
 import io
+import mimetypes
 import uuid
 import zipfile
 import re
@@ -2858,6 +2859,23 @@ def _http_get_binary(url: str, timeout: int = 15) -> bytes | None:
     return None
 
 
+def _guess_image_media_type(payload: bytes, source_url: str | None = None, fallback: str = "image/png") -> str:
+    if payload:
+        try:
+            with Image.open(io.BytesIO(payload)) as image:
+                fmt = str(image.format or "").strip().lower()
+                if fmt == "jpg":
+                    fmt = "jpeg"
+                if fmt in {"jpeg", "png", "webp", "gif", "bmp", "tiff"}:
+                    return f"image/{fmt}"
+        except Exception:
+            pass
+    guessed = mimetypes.guess_type(str(source_url or "").strip())[0] or ""
+    if guessed.startswith("image/"):
+        return guessed
+    return fallback
+
+
 def _build_report_map_png(
     map_rows: list[dict],
     lng: float | None = None,
@@ -3143,6 +3161,45 @@ def get_uploaded_photo(
         if source_bytes:
             return Response(content=source_bytes, media_type=content_type, headers={"Cache-Control": cache_control})
         return StreamingResponse(obj["Body"].iter_chunks(), media_type=content_type, headers={"Cache-Control": cache_control})
+
+
+@router.get("/organizations/logo-proxy")
+def proxy_organization_logo(
+    url: str = Query(..., min_length=1),
+):
+    raw = str(url or "").strip()
+    if not raw:
+        raise HTTPException(status_code=400, detail="Logo URL is required.")
+    parsed = urlparse(raw)
+    if parsed.scheme.lower() not in {"http", "https"}:
+        raise HTTPException(status_code=400, detail="Only http/https logo URLs are supported.")
+
+    try:
+        import requests
+
+        response = requests.get(
+            raw,
+            timeout=20,
+            headers={"User-Agent": "LandCheck/1.0"},
+            stream=True,
+            allow_redirects=True,
+        )
+        if response.status_code != 200:
+            raise HTTPException(status_code=404, detail="Organization logo not found.")
+        payload = response.content
+        if not payload:
+            raise HTTPException(status_code=404, detail="Organization logo not found.")
+        content_type = str(response.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
+        media_type = content_type if content_type.startswith("image/") else _guess_image_media_type(payload, raw)
+        return Response(
+            content=payload,
+            media_type=media_type,
+            headers={"Cache-Control": "public, max-age=86400"},
+        )
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(status_code=502, detail="Failed to load organization logo.")
 
 
 @router.post("/uploads/photo")
