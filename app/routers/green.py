@@ -20,6 +20,7 @@ from pathlib import Path
 from threading import Lock
 from urllib.parse import quote, unquote, urlparse
 from email.message import EmailMessage
+from starlette.background import BackgroundTask
 
 import boto3
 from botocore.exceptions import ClientError
@@ -293,7 +294,19 @@ def _pdf_response_with_r2(
         organization_id=organization_id,
         content_type="application/pdf",
     )
-    response = FileResponse(local_pdf_path, media_type="application/pdf", filename=filename)
+    def _delete_temp_file(path: str):
+        try:
+            if os.path.exists(path):
+                os.remove(path)
+        except Exception:
+            pass
+
+    response = FileResponse(
+        local_pdf_path,
+        media_type="application/pdf",
+        filename=filename,
+        background=BackgroundTask(_delete_temp_file, local_pdf_path),
+    )
     if upload_meta:
         object_key = upload_meta.get("object_key")
         public_url = upload_meta.get("public_url")
@@ -3059,6 +3072,76 @@ def _normalize_object_key(raw_key: str, bucket: str) -> str:
     return key
 
 
+def _sanitize_storage_segment(value: object, fallback: str) -> str:
+    cleaned = re.sub(r"[^a-zA-Z0-9._-]+", "-", str(value or "").strip()).strip("-.")
+    return cleaned or fallback
+
+
+def _build_scoped_upload_folder(
+    db: Session,
+    *,
+    folder: str,
+    tree_id: int | None = None,
+    task_id: int | None = None,
+) -> str:
+    folder_parts = [part for part in str(folder or "trees").split("/") if part and part not in {".", ".."}]
+    safe_folder = "/".join(_sanitize_storage_segment(part, "file") for part in folder_parts) or "trees"
+
+    if task_id is not None:
+        task_scope = db.execute(
+            text(
+                """
+                SELECT
+                    tt.id AS task_id,
+                    tr.id AS tree_id,
+                    tr.project_id,
+                    p.organization_id
+                FROM tree_tasks tt
+                JOIN trees tr ON tr.id = tt.tree_id
+                LEFT JOIN tree_projects p ON p.id = tr.project_id
+                WHERE tt.id = :task_id
+                """
+            ),
+            {"task_id": int(task_id)},
+        ).mappings().first()
+        if task_scope:
+            segments: list[str] = []
+            if task_scope.get("organization_id") is not None:
+                segments.extend(["organizations", _sanitize_storage_segment(f"org_{int(task_scope['organization_id'])}", "organization")])
+            if task_scope.get("project_id") is not None:
+                segments.extend(["projects", _sanitize_storage_segment(f"project_{int(task_scope['project_id'])}", "project")])
+            if task_scope.get("tree_id") is not None:
+                segments.extend(["trees", _sanitize_storage_segment(f"tree_{int(task_scope['tree_id'])}", "tree")])
+            segments.extend(["tasks", _sanitize_storage_segment(f"task_{int(task_scope['task_id'])}", "task"), "photos"])
+            return "/".join(segments)
+
+    if tree_id is not None:
+        tree_scope = db.execute(
+            text(
+                """
+                SELECT
+                    t.id AS tree_id,
+                    t.project_id,
+                    p.organization_id
+                FROM trees t
+                LEFT JOIN tree_projects p ON p.id = t.project_id
+                WHERE t.id = :tree_id
+                """
+            ),
+            {"tree_id": int(tree_id)},
+        ).mappings().first()
+        if tree_scope:
+            segments = []
+            if tree_scope.get("organization_id") is not None:
+                segments.extend(["organizations", _sanitize_storage_segment(f"org_{int(tree_scope['organization_id'])}", "organization")])
+            if tree_scope.get("project_id") is not None:
+                segments.extend(["projects", _sanitize_storage_segment(f"project_{int(tree_scope['project_id'])}", "project")])
+            segments.extend(["trees", _sanitize_storage_segment(f"tree_{int(tree_scope['tree_id'])}", "tree"), "photos"])
+            return "/".join(segments)
+
+    return safe_folder
+
+
 @router.get("/uploads/object/{object_key:path}")
 def get_uploaded_photo(
     object_key: str,
@@ -3243,8 +3326,12 @@ async def upload_photo_to_r2(
         }
         ext = content_ext.get(content_type, ".jpg")
 
-    folder_parts = [part for part in (folder or "trees").split("/") if part and part not in {".", ".."}]
-    safe_folder = "/".join(folder_parts) or "trees"
+    safe_folder = _build_scoped_upload_folder(
+        db,
+        folder=folder or "trees",
+        tree_id=tree_id,
+        task_id=task_id,
+    )
     date_path = datetime.utcnow().strftime("%Y/%m")
     object_key = f"{safe_folder}/{date_path}/{uuid.uuid4().hex}{ext}"
 
@@ -11326,6 +11413,7 @@ def export_work_stats_pdf(project_id: int, db: Session = Depends(get_db)):
         filename,
         category="green-work-stats",
         project_id=project_id,
+        organization_id=int(project.get("organization_id") or 0) or None,
     )
 
 
@@ -11578,6 +11666,7 @@ def export_custodian_report_pdf(
         filename,
         category="green-custodian-report",
         project_id=project_id,
+        organization_id=int(project.get("organization_id") or 0) or None,
     )
 
 
@@ -11634,6 +11723,7 @@ def export_tasks_pdf(project_id: int, db: Session = Depends(get_db)):
         filename,
         category="green-tasks-report",
         project_id=project_id,
+        organization_id=int(project.get("organization_id") or 0) or None,
     )
 
 
@@ -12221,6 +12311,7 @@ def export_existing_trees_pdf(
         filename,
         category="green-existing-trees-report",
         project_id=project_id,
+        organization_id=int(project.get("organization_id") or 0) or None,
     )
 
 
@@ -12515,6 +12606,7 @@ def export_project_pdf(
         filename,
         category="green-project-report",
         project_id=project_id,
+        organization_id=int(project.get("organization_id") or 0) or None,
     )
 
 
@@ -12807,4 +12899,5 @@ def export_work_report_pdf(
         filename,
         category="green-work-report",
         project_id=project_id,
+        organization_id=int(project_copy.get("organization_id") or 0) or None,
     )
