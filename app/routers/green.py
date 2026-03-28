@@ -3229,7 +3229,7 @@ async def upload_photo_to_r2(
     settings = _build_r2_settings()
 
     ext = Path(file.filename or "").suffix.lower()
-    allowed_ext = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".heic", ".heif"}
+    allowed_ext = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".heic", ".heif", ".svg"}
     if ext not in allowed_ext:
         content_ext = {
             "image/jpeg": ".jpg",
@@ -3239,6 +3239,7 @@ async def upload_photo_to_r2(
             "image/bmp": ".bmp",
             "image/heic": ".heic",
             "image/heif": ".heif",
+            "image/svg+xml": ".svg",
         }
         ext = content_ext.get(content_type, ".jpg")
 
