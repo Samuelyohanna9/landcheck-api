@@ -18,6 +18,7 @@ import secrets
 import smtplib
 from pathlib import Path
 from threading import Lock
+import threading
 from urllib.parse import quote, unquote, urlparse
 from email.message import EmailMessage
 from starlette.background import BackgroundTask
@@ -195,6 +196,18 @@ class PrivacyConsentPayload(BaseModel):
     metadata: dict | None = None
 
 
+class WorkReportExportJobPayload(BaseModel):
+    project_id: int
+    assignee_name: str | None = None
+    include_photos: bool = True
+    lng: float | None = None
+    lat: float | None = None
+    zoom: float | None = None
+    bearing: float | None = 0.0
+    pitch: float | None = 0.0
+    requested_by: str | None = None
+
+
 def _normalize_privacy_scope(value: str | None) -> str:
     scope = str(value or "").strip().lower()
     if scope not in PRIVACY_CONSENT_SCOPE_VALUES:
@@ -314,6 +327,88 @@ def _pdf_response_with_r2(
     )
     response.headers["X-LandCheck-R2-Upload"] = "deferred"
     return response
+
+
+def _serialize_green_export_job(row: dict | None) -> dict | None:
+    if not row:
+        return None
+    data = dict(row)
+    public_url = str(data.get("public_url") or "").strip()
+    return {
+        "id": str(data.get("id") or ""),
+        "export_type": str(data.get("export_type") or ""),
+        "project_id": int(data.get("project_id") or 0) or None,
+        "organization_id": int(data.get("organization_id") or 0) or None,
+        "assignee_name": str(data.get("assignee_name") or "").strip() or None,
+        "include_photos": bool(data.get("include_photos")),
+        "status": str(data.get("status") or "queued"),
+        "file_name": str(data.get("file_name") or "").strip() or None,
+        "object_key": str(data.get("object_key") or "").strip() or None,
+        "public_url": public_url or None,
+        "download_url": public_url or None,
+        "error_text": str(data.get("error_text") or "").strip() or None,
+        "requested_by": str(data.get("requested_by") or "").strip() or None,
+        "created_at": data.get("created_at"),
+        "started_at": data.get("started_at"),
+        "completed_at": data.get("completed_at"),
+        "updated_at": data.get("updated_at"),
+    }
+
+
+def _get_green_export_job(db: Session, job_id: str) -> dict | None:
+    row = db.execute(
+        text(
+            """
+            SELECT *
+            FROM green_export_jobs
+            WHERE id = :job_id
+            LIMIT 1
+            """
+        ),
+        {"job_id": str(job_id or "").strip()},
+    ).mappings().first()
+    return dict(row) if row else None
+
+
+def _set_green_export_job_status(
+    db: Session,
+    job_id: str,
+    *,
+    status: str,
+    error_text: str | None = None,
+    object_key: str | None = None,
+    public_url: str | None = None,
+    file_name: str | None = None,
+    started: bool = False,
+    completed: bool = False,
+):
+    db.execute(
+        text(
+            """
+            UPDATE green_export_jobs
+            SET status = :status,
+                error_text = :error_text,
+                object_key = COALESCE(:object_key, object_key),
+                public_url = COALESCE(:public_url, public_url),
+                file_name = COALESCE(:file_name, file_name),
+                started_at = CASE WHEN :started THEN COALESCE(started_at, NOW()) ELSE started_at END,
+                completed_at = CASE WHEN :completed THEN NOW() ELSE completed_at END,
+                updated_at = NOW()
+            WHERE id = :job_id
+            """
+        ),
+        {
+            "job_id": str(job_id or "").strip(),
+            "status": status,
+            "error_text": (error_text or "").strip() or None,
+            "object_key": (object_key or "").strip() or None,
+            "public_url": (public_url or "").strip() or None,
+            "file_name": (file_name or "").strip() or None,
+            "started": bool(started),
+            "completed": bool(completed),
+        },
+    )
+    db.commit()
 
 
 def _ensure_unique_org_slug(db: Session, slug_base: str, exclude_org_id: int | None = None) -> str:
@@ -2524,6 +2619,36 @@ def ensure_green_tables(db: Session):
             created_at TIMESTAMP DEFAULT NOW()
         )
     """))
+    db.execute(text("""
+        CREATE TABLE IF NOT EXISTS green_export_jobs (
+            id TEXT PRIMARY KEY,
+            export_type TEXT NOT NULL,
+            project_id INTEGER REFERENCES tree_projects(id) ON DELETE CASCADE,
+            organization_id INTEGER REFERENCES green_organizations(id) ON DELETE SET NULL,
+            assignee_name TEXT,
+            include_photos BOOLEAN NOT NULL DEFAULT FALSE,
+            lng DOUBLE PRECISION,
+            lat DOUBLE PRECISION,
+            zoom DOUBLE PRECISION,
+            bearing DOUBLE PRECISION,
+            pitch DOUBLE PRECISION,
+            status TEXT NOT NULL DEFAULT 'queued',
+            file_name TEXT,
+            object_key TEXT,
+            public_url TEXT,
+            error_text TEXT,
+            requested_by TEXT,
+            started_at TIMESTAMP,
+            completed_at TIMESTAMP,
+            created_at TIMESTAMP DEFAULT NOW(),
+            updated_at TIMESTAMP DEFAULT NOW()
+        )
+    """))
+    db.execute(text("ALTER TABLE green_export_jobs ADD COLUMN IF NOT EXISTS lng DOUBLE PRECISION"))
+    db.execute(text("ALTER TABLE green_export_jobs ADD COLUMN IF NOT EXISTS lat DOUBLE PRECISION"))
+    db.execute(text("ALTER TABLE green_export_jobs ADD COLUMN IF NOT EXISTS zoom DOUBLE PRECISION"))
+    db.execute(text("ALTER TABLE green_export_jobs ADD COLUMN IF NOT EXISTS bearing DOUBLE PRECISION"))
+    db.execute(text("ALTER TABLE green_export_jobs ADD COLUMN IF NOT EXISTS pitch DOUBLE PRECISION"))
     db.execute(text("CREATE INDEX IF NOT EXISTS idx_trees_project_id ON trees(project_id)"))
     db.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS idx_trees_project_tree_no ON trees(project_id, project_tree_no)"))
     db.execute(text("CREATE INDEX IF NOT EXISTS idx_trees_geom ON trees USING GIST (geom)"))
@@ -2559,6 +2684,8 @@ def ensure_green_tables(db: Session):
     db.execute(text("CREATE INDEX IF NOT EXISTS idx_alert_events_project_time ON green_alert_events(project_id, triggered_at DESC)"))
     db.execute(text("CREATE INDEX IF NOT EXISTS idx_webhook_event ON green_webhook_deliveries(event_id, created_at DESC)"))
     db.execute(text("CREATE INDEX IF NOT EXISTS idx_verra_exports_project_time ON green_verra_exports(project_id, created_at DESC)"))
+    db.execute(text("CREATE INDEX IF NOT EXISTS idx_green_export_jobs_status_created ON green_export_jobs(status, created_at DESC)"))
+    db.execute(text("CREATE INDEX IF NOT EXISTS idx_green_export_jobs_project_created ON green_export_jobs(project_id, created_at DESC)"))
     db.execute(text("CREATE INDEX IF NOT EXISTS idx_tree_projects_model ON tree_projects(planting_model)"))
     db.execute(text("CREATE INDEX IF NOT EXISTS idx_tree_projects_org ON tree_projects(organization_id)"))
     db.execute(text("CREATE INDEX IF NOT EXISTS idx_trees_origin ON trees(tree_origin)"))
@@ -12633,18 +12760,19 @@ def _build_tree_stats(rows: list[dict]) -> dict:
     }
 
 
-@router.get("/work-report/pdf")
-def export_work_report_pdf(
+def _render_work_report_to_pdf(
+    db: Session,
+    *,
     project_id: int,
-    assignee_name: str | None = None,
-    include_photos: bool = Query(default=False),
-    lng: float | None = Query(default=None),
-    lat: float | None = Query(default=None),
-    zoom: float | None = Query(default=None),
-    bearing: float | None = Query(default=0.0),
-    pitch: float | None = Query(default=0.0),
-    db: Session = Depends(get_db),
-):
+    assignee_name: str | None,
+    include_photos: bool,
+    lng: float | None,
+    lat: float | None,
+    zoom: float | None,
+    bearing: float | None,
+    pitch: float | None,
+    pdf_path: str,
+) -> tuple[str, int | None]:
     def _coerce_optional_float(value: object) -> float | None:
         if value is None:
             return None
@@ -12814,11 +12942,6 @@ def export_work_report_pdf(
     project_copy["stats"] = _build_tree_stats(map_rows)
     project_copy["report_assignee"] = assignee_name
 
-    os.makedirs(REPORTS_DIR, exist_ok=True)
-    tmp_pdf = tempfile.NamedTemporaryFile(suffix="_work_map_report.pdf", delete=False)
-    pdf_path = tmp_pdf.name
-    tmp_pdf.close()
-
     map_png = _build_report_map_png(
         map_rows=map_rows,
         lng=lng_value,
@@ -12839,7 +12962,6 @@ def export_work_report_pdf(
     except Exception:
         db.rollback()
 
-    # Carbon data for executive summary
     carbon_trees = db.execute(text("""
         SELECT id, species, planting_date, status, created_at, tree_age_months, COALESCE(inventory_tree_count, 1) AS inventory_tree_count
         FROM trees
@@ -12850,7 +12972,6 @@ def export_work_report_pdf(
     carbon_data = compute_project_carbon([dict(r) for r in carbon_trees])
     carbon_data["projection"] = generate_co2_projection_table([dict(r) for r in carbon_trees], 30)
 
-    # KPI trend for survival chart
     kpi_trend = _fetch_kpi_trend(project_id, db, days=90, assignee_name=assignee_clean)
     species_daily_survival = _build_species_daily_survival_series(project_id, db, assignee_name=assignee_clean)
 
@@ -12893,10 +13014,207 @@ def export_work_report_pdf(
         if assignee_name
         else f"project_{project_id}_work_report_all.pdf"
     )
+    return filename, int(project_copy.get("organization_id") or 0) or None
+
+
+@router.get("/work-report/pdf")
+def export_work_report_pdf(
+    project_id: int,
+    assignee_name: str | None = None,
+    include_photos: bool = Query(default=False),
+    lng: float | None = Query(default=None),
+    lat: float | None = Query(default=None),
+    zoom: float | None = Query(default=None),
+    bearing: float | None = Query(default=0.0),
+    pitch: float | None = Query(default=0.0),
+    db: Session = Depends(get_db),
+):
+    os.makedirs(REPORTS_DIR, exist_ok=True)
+    tmp_pdf = tempfile.NamedTemporaryFile(suffix="_work_map_report.pdf", delete=False)
+    pdf_path = tmp_pdf.name
+    tmp_pdf.close()
+    filename, organization_id = _render_work_report_to_pdf(
+        db,
+        project_id=project_id,
+        assignee_name=assignee_name,
+        include_photos=include_photos,
+        lng=lng,
+        lat=lat,
+        zoom=zoom,
+        bearing=bearing,
+        pitch=pitch,
+        pdf_path=pdf_path,
+    )
     return _pdf_response_with_r2(
         pdf_path,
         filename,
         category="green-work-report",
         project_id=project_id,
-        organization_id=int(project_copy.get("organization_id") or 0) or None,
+        organization_id=organization_id,
     )
+
+
+def _run_work_report_export_job(job_id: str):
+    db = SessionLocal()
+    pdf_path = ""
+    try:
+        job = _get_green_export_job(db, job_id)
+        if not job:
+            return
+        _set_green_export_job_status(db, job_id, status="running", started=True)
+        os.makedirs(REPORTS_DIR, exist_ok=True)
+        tmp_pdf = tempfile.NamedTemporaryFile(suffix="_work_map_report.pdf", delete=False)
+        pdf_path = tmp_pdf.name
+        tmp_pdf.close()
+        filename, organization_id = _render_work_report_to_pdf(
+            db,
+            project_id=int(job.get("project_id") or 0),
+            assignee_name=str(job.get("assignee_name") or "").strip() or None,
+            include_photos=bool(job.get("include_photos")),
+            lng=job.get("lng"),
+            lat=job.get("lat"),
+            zoom=job.get("zoom"),
+            bearing=job.get("bearing"),
+            pitch=job.get("pitch"),
+            pdf_path=pdf_path,
+        )
+        upload_meta = upload_export_file_best_effort(
+            pdf_path,
+            filename,
+            category="green-work-report",
+            project_id=int(job.get("project_id") or 0) or None,
+            organization_id=organization_id,
+            content_type="application/pdf",
+        )
+        if not upload_meta or not str(upload_meta.get("public_url") or "").strip():
+            raise RuntimeError("Report generated but upload to cloud storage failed.")
+        _set_green_export_job_status(
+            db,
+            job_id,
+            status="completed",
+            object_key=str(upload_meta.get("object_key") or ""),
+            public_url=str(upload_meta.get("public_url") or ""),
+            file_name=filename,
+            completed=True,
+        )
+    except Exception as exc:
+        try:
+            _set_green_export_job_status(db, job_id, status="failed", error_text=str(exc), completed=True)
+        except Exception:
+            pass
+    finally:
+        try:
+            if pdf_path and os.path.exists(pdf_path):
+                os.remove(pdf_path)
+        except Exception:
+            pass
+        db.close()
+
+
+@router.post("/work-report/export-jobs")
+def create_work_report_export_job(payload: WorkReportExportJobPayload, db: Session = Depends(get_db)):
+    project = get_project(
+        project_id=int(payload.project_id),
+        db=db,
+        assignee_name=(payload.assignee_name or "").strip() or None,
+    )
+    job_id = uuid.uuid4().hex
+    file_name = (
+        f"project_{int(payload.project_id)}_work_report_{payload.assignee_name}.pdf"
+        if (payload.assignee_name or "").strip()
+        else f"project_{int(payload.project_id)}_work_report_all.pdf"
+    )
+    db.execute(
+        text(
+            """
+            INSERT INTO green_export_jobs (
+                id,
+                export_type,
+                project_id,
+                organization_id,
+                assignee_name,
+                include_photos,
+                status,
+                file_name,
+                requested_by,
+                started_at,
+                completed_at,
+                created_at,
+                updated_at
+            )
+            VALUES (
+                :id,
+                'green-work-report',
+                :project_id,
+                :organization_id,
+                :assignee_name,
+                :include_photos,
+                'queued',
+                :file_name,
+                :requested_by,
+                NULL,
+                NULL,
+                NOW(),
+                NOW()
+            )
+            """
+        ),
+        {
+            "id": job_id,
+            "project_id": int(payload.project_id),
+            "organization_id": int(project.get("organization_id") or 0) or None,
+            "assignee_name": (payload.assignee_name or "").strip() or None,
+            "include_photos": bool(payload.include_photos),
+            "file_name": file_name,
+            "requested_by": (payload.requested_by or "").strip() or None,
+        },
+    )
+    db.commit()
+    db.execute(
+        text(
+            """
+            UPDATE green_export_jobs
+            SET object_key = NULL,
+                public_url = NULL,
+                error_text = NULL,
+                updated_at = NOW()
+            WHERE id = :job_id
+            """
+        ),
+        {"job_id": job_id},
+    )
+    db.commit()
+    db.execute(
+        text(
+            """
+            UPDATE green_export_jobs
+            SET lng = :lng,
+                lat = :lat,
+                zoom = :zoom,
+                bearing = :bearing,
+                pitch = :pitch,
+                updated_at = NOW()
+            WHERE id = :job_id
+            """
+        ),
+        {
+            "job_id": job_id,
+            "lng": payload.lng,
+            "lat": payload.lat,
+            "zoom": payload.zoom,
+            "bearing": payload.bearing,
+            "pitch": payload.pitch,
+        },
+    )
+    db.commit()
+    threading.Thread(target=_run_work_report_export_job, args=(job_id,), daemon=True).start()
+    job = _get_green_export_job(db, job_id)
+    return _serialize_green_export_job(job)
+
+
+@router.get("/export-jobs/{job_id}")
+def get_green_export_job_status(job_id: str, db: Session = Depends(get_db)):
+    job = _get_green_export_job(db, job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Export job not found")
+    return _serialize_green_export_job(job)
