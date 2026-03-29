@@ -11522,7 +11522,7 @@ def list_remote_monitoring_areas(
     project_id: int,
     db: Session = Depends(get_db),
 ):
-    get_project(project_id=project_id, db=db)
+    _get_project_settings(db, int(project_id))
     rows = _run_remote_monitoring_query(
         db,
         """
@@ -11543,7 +11543,7 @@ def create_remote_monitoring_area(
     db: Session = Depends(get_db),
 ):
     project_id = int(payload.project_id)
-    get_project(project_id=project_id, db=db)
+    _get_project_settings(db, project_id)
     name = str(payload.name or "").strip()
     if not name:
         raise HTTPException(status_code=400, detail="Area name is required")
@@ -11608,7 +11608,7 @@ def delete_remote_monitoring_area(
     project_id: int,
     db: Session = Depends(get_db),
 ):
-    get_project(project_id=project_id, db=db)
+    _get_project_settings(db, int(project_id))
     existing = _get_remote_monitoring_area_row(db, area_id=area_id, project_id=project_id)
     if not existing:
         raise HTTPException(status_code=404, detail="Monitoring area not found")
@@ -11635,7 +11635,7 @@ def remote_monitoring_area_analysis(
     project_id = int(area_row.get("project_id") or 0)
     if project_id <= 0:
         raise HTTPException(status_code=400, detail="Monitoring area is missing a project link")
-    get_project(project_id=project_id, db=db)
+    _get_project_settings(db, project_id)
 
     area_payload = _serialize_remote_monitoring_area(area_row)
     area_geojson = area_payload.get("area_geojson")
