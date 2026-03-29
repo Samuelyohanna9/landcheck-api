@@ -218,6 +218,11 @@ class RemoteMonitoringAreaPayload(BaseModel):
     created_by: str | None = None
 
 
+class VegetationAnalysisPayload(BaseModel):
+    project_id: int
+    area_geojson: dict | str
+
+
 def _normalize_privacy_scope(value: str | None) -> str:
     scope = str(value or "").strip().lower()
     if scope not in PRIVACY_CONSENT_SCOPE_VALUES:
@@ -1270,6 +1275,60 @@ def _count_trees_in_geojson(db: Session, *, project_id: int, area_geojson: dict)
         "existing_inventory_tree_count": int(row.get("existing_inventory_tree_count") or 0) if row else 0,
         "other_tree_count": int(row.get("other_tree_count") or 0) if row else 0,
     }
+
+
+def _list_trees_in_geojson(db: Session, *, project_id: int, area_geojson: dict) -> list[dict]:
+    rows = db.execute(
+        text(
+            """
+            SELECT
+                id,
+                project_id,
+                project_tree_no,
+                species,
+                planting_date,
+                status,
+                tree_origin,
+                created_by,
+                created_at,
+                COALESCE(inventory_tree_count, 1) AS inventory_tree_count,
+                ST_X(geom) AS lng,
+                ST_Y(geom) AS lat
+            FROM trees
+            WHERE project_id = :project_id
+              AND geom IS NOT NULL
+              AND ST_Contains(
+                    ST_SetSRID(ST_GeomFromGeoJSON(:geojson), 4326),
+                    geom
+              )
+            ORDER BY COALESCE(project_tree_no, 99999999) ASC, id ASC
+            """
+        ),
+        {"project_id": int(project_id), "geojson": _safe_json(area_geojson)},
+    ).mappings().all()
+    return [dict(row) for row in rows]
+
+
+def _compute_geojson_area_sqm(db: Session, *, area_geojson: dict) -> float:
+    try:
+        return float(
+            db.execute(
+                text(
+                    """
+                    SELECT ST_Area(
+                        ST_Transform(
+                            ST_SetSRID(ST_GeomFromGeoJSON(:geojson), 4326),
+                            3857
+                        )
+                    )
+                    """
+                ),
+                {"geojson": _safe_json(area_geojson)},
+            ).scalar()
+            or 0.0
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="Invalid monitoring polygon") from exc
 
 
 def _find_matching_auto_first_cycle_work_order(
@@ -11536,6 +11595,48 @@ def list_remote_monitoring_areas(
     return [_serialize_remote_monitoring_area(row) for row in rows]
 
 
+@router.post("/remote-monitoring/analysis")
+@router.post("/vegetation-analysis")
+def analyze_remote_monitoring_area(
+    payload: VegetationAnalysisPayload,
+    series_months: int = Query(default=6, ge=1, le=12),
+    summary_window_days: int = Query(default=90, ge=30, le=180),
+    db: Session = Depends(get_db),
+):
+    project_id = int(payload.project_id)
+    _get_project_settings(db, project_id)
+    normalized_area_geojson = _normalize_work_area_geojson(payload.area_geojson)
+    if normalized_area_geojson is None:
+        raise HTTPException(status_code=400, detail="Draw a valid polygon area")
+
+    area_sqm = _compute_geojson_area_sqm(db, area_geojson=normalized_area_geojson)
+    tree_counts = _count_trees_in_geojson(db, project_id=project_id, area_geojson=normalized_area_geojson)
+    tree_rows = _list_trees_in_geojson(db, project_id=project_id, area_geojson=normalized_area_geojson)
+    try:
+        report = compute_remote_monitoring_report(
+            boundary_geojson=normalized_area_geojson,
+            tree_count=tree_counts["tree_count"],
+            tree_items=tree_rows,
+            polygon_area_sqm=area_sqm,
+            series_months=series_months,
+            summary_window_days=summary_window_days,
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Remote monitoring failed: {exc}") from exc
+
+    return {
+        "area": {
+            "project_id": project_id,
+            "area_geojson": normalized_area_geojson,
+            "area_sqm": round(area_sqm, 2),
+            **tree_counts,
+        },
+        **report,
+    }
+
+
 @router.post("/remote-monitoring/areas")
 @router.post("/vegetation-areas")
 def create_remote_monitoring_area(
@@ -11554,25 +11655,7 @@ def create_remote_monitoring_area(
     baseline_date = _parse_date_value(payload.baseline_date)
     created_by = str(payload.created_by or "").strip() or None
     notes = str(payload.notes or "").strip() or None
-    try:
-        area_sqm = float(
-            db.execute(
-                text(
-                    """
-                    SELECT ST_Area(
-                        ST_Transform(
-                            ST_SetSRID(ST_GeomFromGeoJSON(:geojson), 4326),
-                            3857
-                        )
-                    )
-                    """
-                ),
-                {"geojson": _safe_json(normalized_area_geojson)},
-            ).scalar()
-            or 0.0
-        )
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid monitoring polygon")
+    area_sqm = _compute_geojson_area_sqm(db, area_geojson=normalized_area_geojson)
 
     row = _run_remote_monitoring_query(
         db,
@@ -11643,10 +11726,12 @@ def remote_monitoring_area_analysis(
         raise HTTPException(status_code=400, detail="Monitoring polygon is invalid")
 
     tree_counts = _count_trees_in_geojson(db, project_id=project_id, area_geojson=area_geojson)
+    tree_rows = _list_trees_in_geojson(db, project_id=project_id, area_geojson=area_geojson)
     try:
         report = compute_remote_monitoring_report(
             boundary_geojson=area_geojson,
             tree_count=tree_counts["tree_count"],
+            tree_items=tree_rows,
             polygon_area_sqm=area_payload.get("area_sqm"),
             baseline_date=area_payload.get("baseline_date"),
             series_months=series_months,

@@ -11,6 +11,44 @@ from app.utils.gee_client import init_gee
 
 VEGETATION_NDVI_THRESHOLD = 0.35
 DEFAULT_SUMMARY_WINDOW_DAYS = 90
+TREE_PROXY_BUFFER_METERS = 10
+TREE_VEGETATION_HEALTH_BANDS = (
+    {
+        "key": "critical",
+        "label": "Critical",
+        "min_ndvi": None,
+        "max_ndvi": 0.2,
+        "description": "Very low vegetation signal in the tree buffer.",
+    },
+    {
+        "key": "stressed",
+        "label": "Stressed",
+        "min_ndvi": 0.2,
+        "max_ndvi": 0.35,
+        "description": "Sparse vegetation signal around the tree point.",
+    },
+    {
+        "key": "fair",
+        "label": "Fair",
+        "min_ndvi": 0.35,
+        "max_ndvi": 0.5,
+        "description": "Moderate vegetation signal. Monitor this tree block closely.",
+    },
+    {
+        "key": "healthy",
+        "label": "Healthy",
+        "min_ndvi": 0.5,
+        "max_ndvi": 0.6,
+        "description": "Good vegetation signal around the tree point.",
+    },
+    {
+        "key": "vigorous",
+        "label": "Vigorous",
+        "min_ndvi": 0.6,
+        "max_ndvi": None,
+        "description": "Dense vegetation signal around the tree point.",
+    },
+)
 
 
 @dataclass
@@ -61,6 +99,15 @@ def _safe_float(value: Any) -> float | None:
     except Exception:
         return None
     return numeric if numeric == numeric else None
+
+
+def _safe_int(value: Any) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except Exception:
+        return None
 
 
 def _build_period_stats(
@@ -227,15 +274,188 @@ def classify_remote_monitoring_signal(
     return "stable", "Vegetation signal is stable for this block."
 
 
+def classify_tree_satellite_health(mean_ndvi: float | None) -> tuple[str, str, str]:
+    if mean_ndvi is None:
+        return "no_data", "No data", "No cloud-free satellite vegetation signal is available for this tree buffer."
+
+    for band in TREE_VEGETATION_HEALTH_BANDS:
+        min_ndvi = band.get("min_ndvi")
+        max_ndvi = band.get("max_ndvi")
+        if min_ndvi is not None and mean_ndvi < float(min_ndvi):
+            continue
+        if max_ndvi is not None and mean_ndvi >= float(max_ndvi):
+            continue
+        return str(band["key"]), str(band["label"]), str(band["description"])
+
+    fallback = TREE_VEGETATION_HEALTH_BANDS[-1]
+    return str(fallback["key"]), str(fallback["label"]), str(fallback["description"])
+
+
+def _sample_tree_vegetation(
+    *,
+    boundary_geojson: dict[str, Any],
+    tree_items: list[dict[str, Any]],
+    start_date: date,
+    end_date: date,
+    vegetation_threshold: float,
+    tree_buffer_meters: int,
+) -> list[dict[str, Any]]:
+    if not tree_items:
+        return []
+
+    geom = ee.Geometry(boundary_geojson)
+    collection = (
+        ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
+        .filterBounds(geom)
+        .filterDate(start_date.isoformat(), end_date.isoformat())
+        .filter(ee.Filter.lt("CLOUDY_PIXEL_PERCENTAGE", 80))
+        .map(_mask_sentinel_clouds)
+    )
+    image_count = int(collection.size().getInfo() or 0)
+    if image_count <= 0:
+        rows: list[dict[str, Any]] = []
+        for item in tree_items:
+            health_key, health_label, health_note = classify_tree_satellite_health(None)
+            rows.append(
+                {
+                    "tree_id": _safe_int(item.get("id")) or 0,
+                    "project_tree_no": _safe_int(item.get("project_tree_no")),
+                    "tree_label": f"#{_safe_int(item.get('project_tree_no'))}" if _safe_int(item.get("project_tree_no")) else f"Tree {_safe_int(item.get('id')) or '?'}",
+                    "species": str(item.get("species") or "").strip() or None,
+                    "planting_date": str(item.get("planting_date") or "").strip() or None,
+                    "status": str(item.get("status") or "").strip() or None,
+                    "tree_origin": str(item.get("tree_origin") or "").strip() or None,
+                    "inventory_tree_count": max(_safe_int(item.get("inventory_tree_count")) or 1, 1),
+                    "lng": _safe_float(item.get("lng")),
+                    "lat": _safe_float(item.get("lat")),
+                    "local_mean_ndvi": None,
+                    "local_vegetated_area_sqm": None,
+                    "local_clear_area_sqm": None,
+                    "local_vegetation_cover_pct": None,
+                    "satellite_health": health_key,
+                    "satellite_health_label": health_label,
+                    "satellite_health_note": health_note,
+                    "tree_buffer_meters": int(tree_buffer_meters),
+                }
+            )
+        return rows
+
+    composite = collection.median()
+    ndvi = composite.normalizedDifference(["B8", "B4"]).rename("ndvi")
+    pixel_area = ee.Image.pixelArea().rename("pixel_area")
+    clear_area_image = pixel_area.updateMask(ndvi.mask())
+    vegetation_area_image = pixel_area.updateMask(ndvi.gte(vegetation_threshold))
+
+    features = []
+    for item in tree_items:
+        lng = _safe_float(item.get("lng"))
+        lat = _safe_float(item.get("lat"))
+        tree_id = _safe_int(item.get("id"))
+        if lng is None or lat is None or tree_id is None or tree_id <= 0:
+            continue
+        feature = ee.Feature(
+            ee.Geometry.Point([lng, lat]).buffer(tree_buffer_meters),
+            {
+                "tree_id": tree_id,
+                "project_tree_no": _safe_int(item.get("project_tree_no")),
+                "species": str(item.get("species") or "").strip() or None,
+                "planting_date": str(item.get("planting_date") or "").strip() or None,
+                "status": str(item.get("status") or "").strip() or None,
+                "tree_origin": str(item.get("tree_origin") or "").strip() or None,
+                "inventory_tree_count": max(_safe_int(item.get("inventory_tree_count")) or 1, 1),
+                "lng": lng,
+                "lat": lat,
+            },
+        )
+        features.append(feature)
+
+    if not features:
+        return []
+
+    def _attach_stats(feature: ee.Feature) -> ee.Feature:
+        feature = ee.Feature(feature)
+        feature_geom = feature.geometry()
+        ndvi_mean = ndvi.reduceRegion(
+            reducer=ee.Reducer.mean(),
+            geometry=feature_geom,
+            scale=10,
+            maxPixels=1e9,
+        ).get("ndvi")
+        clear_area = clear_area_image.reduceRegion(
+            reducer=ee.Reducer.sum(),
+            geometry=feature_geom,
+            scale=10,
+            maxPixels=1e9,
+        ).get("pixel_area")
+        vegetation_area = vegetation_area_image.reduceRegion(
+            reducer=ee.Reducer.sum(),
+            geometry=feature_geom,
+            scale=10,
+            maxPixels=1e9,
+        ).get("pixel_area")
+        return feature.set(
+            {
+                "local_mean_ndvi": ndvi_mean,
+                "local_clear_area_sqm": clear_area,
+                "local_vegetated_area_sqm": vegetation_area,
+            }
+        )
+
+    enriched_fc = ee.FeatureCollection(features).map(_attach_stats)
+    enriched_info = enriched_fc.getInfo() or {}
+
+    rows: list[dict[str, Any]] = []
+    for feature in enriched_info.get("features", []) or []:
+        props = feature.get("properties") or {}
+        ndvi_value = _safe_float(props.get("local_mean_ndvi"))
+        clear_area_value = _safe_float(props.get("local_clear_area_sqm"))
+        vegetation_area_value = _safe_float(props.get("local_vegetated_area_sqm"))
+        cover_pct = (
+            (vegetation_area_value / clear_area_value) * 100
+            if vegetation_area_value is not None and clear_area_value and clear_area_value > 0
+            else None
+        )
+        health_key, health_label, health_note = classify_tree_satellite_health(ndvi_value)
+        project_tree_no = _safe_int(props.get("project_tree_no"))
+        tree_id = _safe_int(props.get("tree_id")) or 0
+        rows.append(
+            {
+                "tree_id": tree_id,
+                "project_tree_no": project_tree_no,
+                "tree_label": f"#{project_tree_no}" if project_tree_no else f"Tree {tree_id}",
+                "species": str(props.get("species") or "").strip() or None,
+                "planting_date": str(props.get("planting_date") or "").strip() or None,
+                "status": str(props.get("status") or "").strip() or None,
+                "tree_origin": str(props.get("tree_origin") or "").strip() or None,
+                "inventory_tree_count": max(_safe_int(props.get("inventory_tree_count")) or 1, 1),
+                "lng": _safe_float(props.get("lng")),
+                "lat": _safe_float(props.get("lat")),
+                "local_mean_ndvi": round(ndvi_value, 4) if ndvi_value is not None else None,
+                "local_vegetated_area_sqm": round(vegetation_area_value, 2) if vegetation_area_value is not None else None,
+                "local_clear_area_sqm": round(clear_area_value, 2) if clear_area_value is not None else None,
+                "local_vegetation_cover_pct": round(cover_pct, 2) if cover_pct is not None else None,
+                "satellite_health": health_key,
+                "satellite_health_label": health_label,
+                "satellite_health_note": health_note,
+                "tree_buffer_meters": int(tree_buffer_meters),
+            }
+        )
+
+    rows.sort(key=lambda item: ((item.get("project_tree_no") or 10**9), item.get("tree_id") or 0))
+    return rows
+
+
 def compute_remote_monitoring_report(
     *,
     boundary_geojson: dict[str, Any],
     tree_count: int,
+    tree_items: list[dict[str, Any]] | None = None,
     polygon_area_sqm: float | None = None,
     baseline_date: date | datetime | str | None = None,
     series_months: int = 6,
     summary_window_days: int = DEFAULT_SUMMARY_WINDOW_DAYS,
     vegetation_threshold: float = VEGETATION_NDVI_THRESHOLD,
+    tree_buffer_meters: int = TREE_PROXY_BUFFER_METERS,
 ) -> dict[str, Any]:
     init_gee()
     geom = ee.Geometry(boundary_geojson)
@@ -283,6 +503,14 @@ def compute_remote_monitoring_report(
         summary_ndvi=summary.get("mean_ndvi"),
         history_per_tree=history_per_tree,
     )
+    tree_proxy_rows = _sample_tree_vegetation(
+        boundary_geojson=boundary_geojson,
+        tree_items=tree_items or [],
+        start_date=summary_start,
+        end_date=summary_end,
+        vegetation_threshold=vegetation_threshold,
+        tree_buffer_meters=tree_buffer_meters,
+    )
 
     return {
         "summary": {
@@ -294,4 +522,14 @@ def compute_remote_monitoring_report(
             "vegetation_threshold_ndvi": vegetation_threshold,
         },
         "series": series,
+        "trees": tree_proxy_rows,
+        "health_scale": {
+            "metric": "tree_buffer_ndvi_proxy",
+            "buffer_meters": int(tree_buffer_meters),
+            "note": (
+                "Tree health labels in this view are a satellite vegetation proxy based on NDVI in a small "
+                "buffer around each stored tree point. They do not replace field inspection."
+            ),
+            "bands": list(TREE_VEGETATION_HEALTH_BANDS),
+        },
     }
