@@ -11517,6 +11517,7 @@ def _get_remote_monitoring_area_row(db: Session, *, area_id: int, project_id: in
 
 
 @router.get("/remote-monitoring/areas")
+@router.get("/vegetation-areas")
 def list_remote_monitoring_areas(
     project_id: int,
     db: Session = Depends(get_db),
@@ -11536,6 +11537,7 @@ def list_remote_monitoring_areas(
 
 
 @router.post("/remote-monitoring/areas")
+@router.post("/vegetation-areas")
 def create_remote_monitoring_area(
     payload: RemoteMonitoringAreaPayload,
     db: Session = Depends(get_db),
@@ -11600,6 +11602,7 @@ def create_remote_monitoring_area(
 
 
 @router.delete("/remote-monitoring/areas/{area_id}")
+@router.delete("/vegetation-areas/{area_id}")
 def delete_remote_monitoring_area(
     area_id: int,
     project_id: int,
@@ -11619,6 +11622,7 @@ def delete_remote_monitoring_area(
 
 
 @router.get("/remote-monitoring/areas/{area_id}/analysis")
+@router.get("/vegetation-areas/{area_id}/analysis")
 def remote_monitoring_area_analysis(
     area_id: int,
     series_months: int = Query(default=6, ge=1, le=12),
