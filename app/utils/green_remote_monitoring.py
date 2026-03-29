@@ -10,6 +10,7 @@ from app.utils.gee_client import init_gee
 
 
 VEGETATION_NDVI_THRESHOLD = 0.35
+TREE_VEGETATION_COVER_NDVI_THRESHOLD = 0.12
 DEFAULT_SUMMARY_WINDOW_DAYS = 90
 TREE_PROXY_BUFFER_METERS = 10
 TREE_VEGETATION_HEALTH_BANDS = (
@@ -298,6 +299,7 @@ def _sample_tree_vegetation(
     start_date: date,
     end_date: date,
     vegetation_threshold: float,
+    tree_cover_threshold: float,
     tree_buffer_meters: int,
 ) -> list[dict[str, Any]]:
     if not tree_items:
@@ -335,6 +337,7 @@ def _sample_tree_vegetation(
                     "satellite_health": health_key,
                     "satellite_health_label": health_label,
                     "satellite_health_note": health_note,
+                    "tree_cover_threshold_ndvi": round(tree_cover_threshold, 3),
                     "tree_buffer_meters": int(tree_buffer_meters),
                 }
             )
@@ -344,7 +347,7 @@ def _sample_tree_vegetation(
     ndvi = composite.normalizedDifference(["B8", "B4"]).rename("ndvi")
     pixel_area = ee.Image.pixelArea().rename("pixel_area")
     clear_area_image = pixel_area.updateMask(ndvi.mask())
-    vegetation_area_image = pixel_area.updateMask(ndvi.gte(vegetation_threshold))
+    vegetation_area_image = pixel_area.updateMask(ndvi.gte(tree_cover_threshold))
 
     features = []
     for item in tree_items:
@@ -437,6 +440,7 @@ def _sample_tree_vegetation(
                 "satellite_health": health_key,
                 "satellite_health_label": health_label,
                 "satellite_health_note": health_note,
+                "tree_cover_threshold_ndvi": round(tree_cover_threshold, 3),
                 "tree_buffer_meters": int(tree_buffer_meters),
             }
         )
@@ -455,6 +459,7 @@ def compute_remote_monitoring_report(
     series_months: int = 6,
     summary_window_days: int = DEFAULT_SUMMARY_WINDOW_DAYS,
     vegetation_threshold: float = VEGETATION_NDVI_THRESHOLD,
+    tree_cover_threshold: float = TREE_VEGETATION_COVER_NDVI_THRESHOLD,
     tree_buffer_meters: int = TREE_PROXY_BUFFER_METERS,
 ) -> dict[str, Any]:
     init_gee()
@@ -509,6 +514,7 @@ def compute_remote_monitoring_report(
         start_date=summary_start,
         end_date=summary_end,
         vegetation_threshold=vegetation_threshold,
+        tree_cover_threshold=tree_cover_threshold,
         tree_buffer_meters=tree_buffer_meters,
     )
 
@@ -526,9 +532,11 @@ def compute_remote_monitoring_report(
         "health_scale": {
             "metric": "tree_buffer_ndvi_proxy",
             "buffer_meters": int(tree_buffer_meters),
+            "cover_threshold_ndvi": round(tree_cover_threshold, 3),
             "note": (
                 "Tree health labels in this view are a satellite vegetation proxy based on NDVI in a small "
-                "buffer around each stored tree point. They do not replace field inspection."
+                f"buffer around each stored tree point. Cover and area use NDVI >= {tree_cover_threshold:.2f}. "
+                "They do not replace field inspection."
             ),
             "bands": list(TREE_VEGETATION_HEALTH_BANDS),
         },
