@@ -1187,6 +1187,34 @@ def _serialize_remote_monitoring_area(row: dict | None) -> dict | None:
     return item
 
 
+def _is_remote_monitoring_schema_error(exc: Exception) -> bool:
+    message = str(exc or "").strip().lower()
+    if not message:
+        return False
+    return (
+        "green_remote_monitoring_areas" in message
+        and (
+            "does not exist" in message
+            or "undefinedtable" in message
+            or "undefined column" in message
+            or "undefinedcolumn" in message
+        )
+    )
+
+
+def _run_remote_monitoring_query(db: Session, statement: str, params: dict | None = None):
+    query_params = params or {}
+    try:
+        return db.execute(text(statement), query_params)
+    except Exception as exc:
+        if not _is_remote_monitoring_schema_error(exc):
+            raise
+        db.rollback()
+        ensure_green_tables(db)
+        db.commit()
+        return db.execute(text(statement), query_params)
+
+
 def _count_trees_in_geojson(db: Session, *, project_id: int, area_geojson: dict) -> dict[str, int]:
     row = db.execute(
         text(
@@ -11485,7 +11513,7 @@ def _get_remote_monitoring_area_row(db: Session, *, area_id: int, project_id: in
         WHERE {' AND '.join(conditions)}
         LIMIT 1
     """
-    return db.execute(text(query), params).mappings().first()
+    return _run_remote_monitoring_query(db, query, params).mappings().first()
 
 
 @router.get("/remote-monitoring/areas")
@@ -11494,15 +11522,14 @@ def list_remote_monitoring_areas(
     db: Session = Depends(get_db),
 ):
     get_project(project_id=project_id, db=db)
-    rows = db.execute(
-        text(
-            """
-            SELECT id, project_id, name, area_geojson, area_sqm, baseline_date, notes, created_by, created_at, updated_at
-            FROM green_remote_monitoring_areas
-            WHERE project_id = :project_id
-            ORDER BY created_at DESC, id DESC
-            """
-        ),
+    rows = _run_remote_monitoring_query(
+        db,
+        """
+        SELECT id, project_id, name, area_geojson, area_sqm, baseline_date, notes, created_by, created_at, updated_at
+        FROM green_remote_monitoring_areas
+        WHERE project_id = :project_id
+        ORDER BY created_at DESC, id DESC
+        """,
         {"project_id": int(project_id)},
     ).mappings().all()
     return [_serialize_remote_monitoring_area(row) for row in rows]
@@ -11545,18 +11572,17 @@ def create_remote_monitoring_area(
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid monitoring polygon")
 
-    row = db.execute(
-        text(
-            """
-            INSERT INTO green_remote_monitoring_areas (
-                project_id, name, area_geojson, area_sqm, baseline_date, notes, created_by
-            )
-            VALUES (
-                :project_id, :name, CAST(:area_geojson AS JSONB), :area_sqm, :baseline_date, :notes, :created_by
-            )
-            RETURNING id
-            """
-        ),
+    row = _run_remote_monitoring_query(
+        db,
+        """
+        INSERT INTO green_remote_monitoring_areas (
+            project_id, name, area_geojson, area_sqm, baseline_date, notes, created_by
+        )
+        VALUES (
+            :project_id, :name, CAST(:area_geojson AS JSONB), :area_sqm, :baseline_date, :notes, :created_by
+        )
+        RETURNING id
+        """,
         {
             "project_id": project_id,
             "name": name,
@@ -11583,8 +11609,9 @@ def delete_remote_monitoring_area(
     existing = _get_remote_monitoring_area_row(db, area_id=area_id, project_id=project_id)
     if not existing:
         raise HTTPException(status_code=404, detail="Monitoring area not found")
-    db.execute(
-        text("DELETE FROM green_remote_monitoring_areas WHERE id = :area_id"),
+    _run_remote_monitoring_query(
+        db,
+        "DELETE FROM green_remote_monitoring_areas WHERE id = :area_id",
         {"area_id": int(area_id)},
     )
     db.commit()
