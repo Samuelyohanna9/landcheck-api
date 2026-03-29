@@ -36,6 +36,7 @@ from app.utils.green_pdf import (
     render_green_existing_trees_report_pdf,
     render_green_org_credentials_pdf,
 )
+from app.utils.green_remote_monitoring import compute_remote_monitoring_report
 from app.utils.r2_exports import upload_export_file_best_effort
 from app.utils.carbon import (
     compute_project_carbon,
@@ -206,6 +207,15 @@ class WorkReportExportJobPayload(BaseModel):
     bearing: float | None = 0.0
     pitch: float | None = 0.0
     requested_by: str | None = None
+
+
+class RemoteMonitoringAreaPayload(BaseModel):
+    project_id: int
+    name: str
+    area_geojson: dict | str
+    baseline_date: str | None = None
+    notes: str | None = None
+    created_by: str | None = None
 
 
 def _normalize_privacy_scope(value: str | None) -> str:
@@ -1155,6 +1165,83 @@ def _point_in_polygon_geojson(lng: float, lat: float, geometry: dict | None) -> 
             continue
         return True
     return False
+
+
+def _serialize_remote_monitoring_area(row: dict | None) -> dict | None:
+    if not row:
+        return None
+    item = dict(row)
+    raw_geojson = item.get("area_geojson")
+    if isinstance(raw_geojson, str):
+        try:
+            raw_geojson = json.loads(raw_geojson)
+        except Exception:
+            raw_geojson = None
+    item["area_geojson"] = _normalize_work_area_geojson(raw_geojson)
+    item["area_sqm"] = float(item.get("area_sqm") or 0.0) if item.get("area_sqm") is not None else None
+    item["tree_count"] = int(item.get("tree_count") or 0)
+    item["tree_record_count"] = int(item.get("tree_record_count") or 0)
+    item["new_planting_tree_count"] = int(item.get("new_planting_tree_count") or 0)
+    item["existing_inventory_tree_count"] = int(item.get("existing_inventory_tree_count") or 0)
+    item["other_tree_count"] = int(item.get("other_tree_count") or 0)
+    return item
+
+
+def _count_trees_in_geojson(db: Session, *, project_id: int, area_geojson: dict) -> dict[str, int]:
+    row = db.execute(
+        text(
+            """
+            SELECT
+                COUNT(*) AS tree_record_count,
+                COALESCE(SUM(GREATEST(COALESCE(inventory_tree_count, 1), 1)), 0) AS tree_count,
+                COALESCE(
+                    SUM(
+                        CASE
+                            WHEN LOWER(COALESCE(tree_origin, 'new_planting')) = 'new_planting'
+                            THEN GREATEST(COALESCE(inventory_tree_count, 1), 1)
+                            ELSE 0
+                        END
+                    ),
+                    0
+                ) AS new_planting_tree_count,
+                COALESCE(
+                    SUM(
+                        CASE
+                            WHEN LOWER(COALESCE(tree_origin, 'new_planting')) = 'existing_inventory'
+                            THEN GREATEST(COALESCE(inventory_tree_count, 1), 1)
+                            ELSE 0
+                        END
+                    ),
+                    0
+                ) AS existing_inventory_tree_count,
+                COALESCE(
+                    SUM(
+                        CASE
+                            WHEN LOWER(COALESCE(tree_origin, 'new_planting')) NOT IN ('new_planting', 'existing_inventory')
+                            THEN GREATEST(COALESCE(inventory_tree_count, 1), 1)
+                            ELSE 0
+                        END
+                    ),
+                    0
+                ) AS other_tree_count
+            FROM trees
+            WHERE project_id = :project_id
+              AND geom IS NOT NULL
+              AND ST_Contains(
+                    ST_SetSRID(ST_GeomFromGeoJSON(:geojson), 4326),
+                    geom
+              )
+            """
+        ),
+        {"project_id": int(project_id), "geojson": _safe_json(area_geojson)},
+    ).mappings().first()
+    return {
+        "tree_record_count": int(row.get("tree_record_count") or 0) if row else 0,
+        "tree_count": int(row.get("tree_count") or 0) if row else 0,
+        "new_planting_tree_count": int(row.get("new_planting_tree_count") or 0) if row else 0,
+        "existing_inventory_tree_count": int(row.get("existing_inventory_tree_count") or 0) if row else 0,
+        "other_tree_count": int(row.get("other_tree_count") or 0) if row else 0,
+    }
 
 
 def _find_matching_auto_first_cycle_work_order(
@@ -2644,6 +2731,20 @@ def ensure_green_tables(db: Session):
             updated_at TIMESTAMP DEFAULT NOW()
         )
     """))
+    db.execute(text("""
+        CREATE TABLE IF NOT EXISTS green_remote_monitoring_areas (
+            id SERIAL PRIMARY KEY,
+            project_id INTEGER NOT NULL REFERENCES tree_projects(id) ON DELETE CASCADE,
+            name TEXT NOT NULL,
+            area_geojson JSONB NOT NULL,
+            area_sqm DOUBLE PRECISION,
+            baseline_date DATE,
+            notes TEXT,
+            created_by TEXT,
+            created_at TIMESTAMP DEFAULT NOW(),
+            updated_at TIMESTAMP DEFAULT NOW()
+        )
+    """))
     db.execute(text("ALTER TABLE green_export_jobs ADD COLUMN IF NOT EXISTS lng DOUBLE PRECISION"))
     db.execute(text("ALTER TABLE green_export_jobs ADD COLUMN IF NOT EXISTS lat DOUBLE PRECISION"))
     db.execute(text("ALTER TABLE green_export_jobs ADD COLUMN IF NOT EXISTS zoom DOUBLE PRECISION"))
@@ -2686,6 +2787,7 @@ def ensure_green_tables(db: Session):
     db.execute(text("CREATE INDEX IF NOT EXISTS idx_verra_exports_project_time ON green_verra_exports(project_id, created_at DESC)"))
     db.execute(text("CREATE INDEX IF NOT EXISTS idx_green_export_jobs_status_created ON green_export_jobs(status, created_at DESC)"))
     db.execute(text("CREATE INDEX IF NOT EXISTS idx_green_export_jobs_project_created ON green_export_jobs(project_id, created_at DESC)"))
+    db.execute(text("CREATE INDEX IF NOT EXISTS idx_green_remote_monitoring_project_created ON green_remote_monitoring_areas(project_id, created_at DESC)"))
     db.execute(text("CREATE INDEX IF NOT EXISTS idx_tree_projects_model ON tree_projects(planting_model)"))
     db.execute(text("CREATE INDEX IF NOT EXISTS idx_tree_projects_org ON tree_projects(organization_id)"))
     db.execute(text("CREATE INDEX IF NOT EXISTS idx_trees_origin ON trees(tree_origin)"))
@@ -11369,6 +11471,168 @@ def list_work_orders(
             item["allow_existing_tree_area_reuse"] = False
         payload.append(item)
     return payload
+
+
+def _get_remote_monitoring_area_row(db: Session, *, area_id: int, project_id: int | None = None) -> dict | None:
+    conditions = ["id = :area_id"]
+    params: dict[str, object] = {"area_id": int(area_id)}
+    if project_id is not None:
+        conditions.append("project_id = :project_id")
+        params["project_id"] = int(project_id)
+    query = f"""
+        SELECT id, project_id, name, area_geojson, area_sqm, baseline_date, notes, created_by, created_at, updated_at
+        FROM green_remote_monitoring_areas
+        WHERE {' AND '.join(conditions)}
+        LIMIT 1
+    """
+    return db.execute(text(query), params).mappings().first()
+
+
+@router.get("/remote-monitoring/areas")
+def list_remote_monitoring_areas(
+    project_id: int,
+    db: Session = Depends(get_db),
+):
+    get_project(project_id=project_id, db=db)
+    rows = db.execute(
+        text(
+            """
+            SELECT id, project_id, name, area_geojson, area_sqm, baseline_date, notes, created_by, created_at, updated_at
+            FROM green_remote_monitoring_areas
+            WHERE project_id = :project_id
+            ORDER BY created_at DESC, id DESC
+            """
+        ),
+        {"project_id": int(project_id)},
+    ).mappings().all()
+    return [_serialize_remote_monitoring_area(row) for row in rows]
+
+
+@router.post("/remote-monitoring/areas")
+def create_remote_monitoring_area(
+    payload: RemoteMonitoringAreaPayload,
+    db: Session = Depends(get_db),
+):
+    project_id = int(payload.project_id)
+    get_project(project_id=project_id, db=db)
+    name = str(payload.name or "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="Area name is required")
+    normalized_area_geojson = _normalize_work_area_geojson(payload.area_geojson)
+    if normalized_area_geojson is None:
+        raise HTTPException(status_code=400, detail="Draw a valid polygon area")
+
+    baseline_date = _parse_date_value(payload.baseline_date)
+    created_by = str(payload.created_by or "").strip() or None
+    notes = str(payload.notes or "").strip() or None
+    try:
+        area_sqm = float(
+            db.execute(
+                text(
+                    """
+                    SELECT ST_Area(
+                        ST_Transform(
+                            ST_SetSRID(ST_GeomFromGeoJSON(:geojson), 4326),
+                            3857
+                        )
+                    )
+                    """
+                ),
+                {"geojson": _safe_json(normalized_area_geojson)},
+            ).scalar()
+            or 0.0
+        )
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid monitoring polygon")
+
+    row = db.execute(
+        text(
+            """
+            INSERT INTO green_remote_monitoring_areas (
+                project_id, name, area_geojson, area_sqm, baseline_date, notes, created_by
+            )
+            VALUES (
+                :project_id, :name, CAST(:area_geojson AS JSONB), :area_sqm, :baseline_date, :notes, :created_by
+            )
+            RETURNING id
+            """
+        ),
+        {
+            "project_id": project_id,
+            "name": name,
+            "area_geojson": _safe_json(normalized_area_geojson),
+            "area_sqm": area_sqm,
+            "baseline_date": baseline_date,
+            "notes": notes,
+            "created_by": created_by,
+        },
+    ).scalar()
+    db.commit()
+    return _serialize_remote_monitoring_area(
+        _get_remote_monitoring_area_row(db, area_id=int(row), project_id=project_id)
+    )
+
+
+@router.delete("/remote-monitoring/areas/{area_id}")
+def delete_remote_monitoring_area(
+    area_id: int,
+    project_id: int,
+    db: Session = Depends(get_db),
+):
+    get_project(project_id=project_id, db=db)
+    existing = _get_remote_monitoring_area_row(db, area_id=area_id, project_id=project_id)
+    if not existing:
+        raise HTTPException(status_code=404, detail="Monitoring area not found")
+    db.execute(
+        text("DELETE FROM green_remote_monitoring_areas WHERE id = :area_id"),
+        {"area_id": int(area_id)},
+    )
+    db.commit()
+    return {"status": "deleted", "id": int(area_id)}
+
+
+@router.get("/remote-monitoring/areas/{area_id}/analysis")
+def remote_monitoring_area_analysis(
+    area_id: int,
+    series_months: int = Query(default=6, ge=1, le=12),
+    summary_window_days: int = Query(default=90, ge=30, le=180),
+    db: Session = Depends(get_db),
+):
+    area_row = _get_remote_monitoring_area_row(db, area_id=area_id)
+    if not area_row:
+        raise HTTPException(status_code=404, detail="Monitoring area not found")
+    project_id = int(area_row.get("project_id") or 0)
+    if project_id <= 0:
+        raise HTTPException(status_code=400, detail="Monitoring area is missing a project link")
+    get_project(project_id=project_id, db=db)
+
+    area_payload = _serialize_remote_monitoring_area(area_row)
+    area_geojson = area_payload.get("area_geojson")
+    if not area_geojson:
+        raise HTTPException(status_code=400, detail="Monitoring polygon is invalid")
+
+    tree_counts = _count_trees_in_geojson(db, project_id=project_id, area_geojson=area_geojson)
+    try:
+        report = compute_remote_monitoring_report(
+            boundary_geojson=area_geojson,
+            tree_count=tree_counts["tree_count"],
+            polygon_area_sqm=area_payload.get("area_sqm"),
+            baseline_date=area_payload.get("baseline_date"),
+            series_months=series_months,
+            summary_window_days=summary_window_days,
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Remote monitoring failed: {exc}") from exc
+
+    return {
+        "area": {
+            **area_payload,
+            **tree_counts,
+        },
+        **report,
+    }
 
 
 @router.patch("/work-orders/{work_id}")
