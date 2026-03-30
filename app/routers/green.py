@@ -8,6 +8,7 @@ import os
 import tempfile
 import csv
 import io
+import html
 import mimetypes
 import uuid
 import zipfile
@@ -613,6 +614,11 @@ def _send_new_user_credentials_email(
     use_tls = _env_bool("SMTP_USE_TLS", not use_ssl)
     green_url = str(os.getenv("LANDCHECK_GREEN_URL") or "").strip() or "https://landcheck.online/green/login"
     work_url = str(os.getenv("LANDCHECK_WORK_URL") or "").strip() or "https://landcheck.online/green-work/login"
+    android_apk_url = (
+        str(os.getenv("LANDCHECK_ANDROID_APK_URL") or "").strip()
+        or "https://drive.google.com/file/d/1y1zrNtlff3WVFMj0JwrWEuIPPqVuqkDZ/view?usp=drive_link"
+    )
+    ios_pwa_url = str(os.getenv("LANDCHECK_IOS_PWA_URL") or "").strip() or green_url
 
     access_lines = []
     if allow_green:
@@ -621,6 +627,17 @@ def _send_new_user_credentials_email(
         access_lines.append(f"- LandCheck Work: {work_url}")
     if not access_lines:
         access_lines.append("- No app access enabled")
+
+    device_lines = []
+    if allow_green:
+        device_lines.extend(
+            [
+                "Device access:",
+                f"- Android phones/tablets: download the APK here: {android_apk_url}",
+                f"- iPhone/iPad: open the PWA in Safari here: {ios_pwa_url}",
+                "- On iPhone/iPad, after the page opens in Safari, use Share > Add to Home Screen.",
+            ]
+        )
 
     recipient_name = (full_name or "").strip() or "User"
     org_line = f"Organization: {organization_name}\n" if organization_name else ""
@@ -633,16 +650,75 @@ def _send_new_user_credentials_email(
         f"Temporary Password: {password}\n\n"
         "Access:\n"
         f"{chr(10).join(access_lines)}\n\n"
+        f"{f'{chr(10).join(device_lines)}{chr(10)}{chr(10)}' if device_lines else ''}"
         "Please log in and change/reset your password through your administrator after first access.\n\n"
         "Regards,\n"
         "LandCheck"
     )
+    access_html = "".join(
+        f"<li style=\"margin:0 0 6px;\">{html.escape(line.lstrip('- ').strip()) if not line.startswith('- ') else html.escape(line[2:])}</li>"
+        for line in access_lines
+    )
+    device_html = ""
+    if allow_green:
+        device_html = (
+            "<div style=\"margin:18px 0 0;\">"
+            "<div style=\"font-size:14px;font-weight:700;color:#0f3d1f;margin:0 0 8px;\">Device access</div>"
+            "<ul style=\"padding-left:18px;margin:0;color:#244c30;font-size:14px;line-height:1.55;\">"
+            f"<li style=\"margin:0 0 8px;\">Android phones/tablets: "
+            f"<a href=\"{html.escape(android_apk_url)}\" style=\"color:#1b7f3d;font-weight:700;\">download the APK</a></li>"
+            f"<li style=\"margin:0 0 8px;\">iPhone/iPad: "
+            f"<a href=\"{html.escape(ios_pwa_url)}\" style=\"color:#1b7f3d;font-weight:700;\">open the PWA in Safari</a></li>"
+            "<li style=\"margin:0;\">On iPhone/iPad, after the page opens in Safari, use Share &gt; Add to Home Screen.</li>"
+            "</ul>"
+            "</div>"
+        )
+    html_body = f"""
+    <html>
+      <body style="margin:0;padding:24px;background:#eef7f0;font-family:Arial,sans-serif;color:#163d22;">
+        <div style="max-width:680px;margin:0 auto;background:#ffffff;border:1px solid #d6eadb;border-radius:16px;overflow:hidden;box-shadow:0 12px 28px rgba(15,61,31,0.08);">
+          <div style="background:linear-gradient(180deg,#2cb056 0%,#1b7f3d 100%);padding:22px 24px;">
+            <div style="font-size:24px;font-weight:800;color:#ffffff;line-height:1.15;">LandCheck Login Credentials</div>
+            <div style="margin-top:6px;font-size:14px;color:#e8f8ee;">Your account is ready for first access.</div>
+          </div>
+          <div style="padding:24px;">
+            <p style="margin:0 0 14px;font-size:15px;line-height:1.6;">Hello {html.escape(recipient_name)},</p>
+            <p style="margin:0 0 16px;font-size:15px;line-height:1.6;">Your LandCheck account has been created.</p>
+            {f'<p style="margin:0 0 16px;font-size:14px;line-height:1.6;"><strong>Organization:</strong> {html.escape(organization_name or "")}</p>' if organization_name else ''}
+            <div style="border:1px solid #dbece0;border-radius:14px;background:#f8fcf9;padding:18px 18px 16px;margin:0 0 16px;">
+              <div style="font-size:14px;font-weight:800;color:#0f3d1f;margin:0 0 12px;">Login details</div>
+              <table role="presentation" cellspacing="0" cellpadding="0" style="width:100%;border-collapse:collapse;">
+                <tr>
+                  <td style="padding:0 0 8px;font-size:13px;color:#4f6f58;width:150px;">Username</td>
+                  <td style="padding:0 0 8px;font-size:15px;font-weight:700;color:#163d22;">{html.escape(username)}</td>
+                </tr>
+                <tr>
+                  <td style="padding:0;font-size:13px;color:#4f6f58;">Temporary Password</td>
+                  <td style="padding:0;font-size:15px;font-weight:700;color:#163d22;">{html.escape(password)}</td>
+                </tr>
+              </table>
+            </div>
+            <div style="border:1px solid #dbece0;border-radius:14px;background:#ffffff;padding:18px;margin:0 0 16px;">
+              <div style="font-size:14px;font-weight:800;color:#0f3d1f;margin:0 0 8px;">Access</div>
+              <ul style="padding-left:18px;margin:0;color:#244c30;font-size:14px;line-height:1.55;">{access_html}</ul>
+              {device_html}
+            </div>
+            <p style="margin:0 0 16px;font-size:14px;line-height:1.6;color:#35563f;">
+              Please log in and change/reset your password through your administrator after first access.
+            </p>
+            <p style="margin:0;font-size:14px;line-height:1.6;color:#35563f;">Regards,<br/>LandCheck</p>
+          </div>
+        </div>
+      </body>
+    </html>
+    """
 
     msg = EmailMessage()
     msg["Subject"] = "Your LandCheck Login Credentials"
     msg["From"] = f"{smtp_from_name} <{smtp_from_email}>" if smtp_from_name else smtp_from_email
     msg["To"] = to_email
     msg.set_content(body)
+    msg.add_alternative(html_body, subtype="html")
 
     if use_ssl:
         with smtplib.SMTP_SSL(smtp_host, smtp_port, timeout=20) as server:
