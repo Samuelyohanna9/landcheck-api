@@ -3463,6 +3463,36 @@ def _normalize_object_key(raw_key: str, bucket: str) -> str:
     return key
 
 
+def _normalize_logo_asset_path(raw_value: str | None) -> str | None:
+    raw = str(raw_value or "").strip()
+    if not raw:
+        return None
+    if "/green/uploads/object/" in raw:
+        idx = raw.find("/green/uploads/object/")
+        return raw[idx:]
+    if raw.startswith("green/uploads/object/") or raw.startswith("/green/uploads/object/"):
+        return f"/{raw.lstrip('/')}"
+    try:
+        settings = _build_r2_settings()
+    except Exception:
+        settings = None
+
+    if not raw.lower().startswith(("http://", "https://")):
+        bucket = str((settings or {}).get("bucket") or "")
+        key = _normalize_object_key(raw, bucket)
+        return f"/green/uploads/object/{quote(key, safe='/')}" if key else raw
+
+    if not settings:
+        return raw
+
+    public_base = str(settings.get("public_base") or "").rstrip("/")
+    if public_base and raw.startswith(f"{public_base}/"):
+        key = raw[len(public_base) + 1 :]
+        normalized = _normalize_object_key(key, str(settings.get("bucket") or ""))
+        return f"/green/uploads/object/{quote(normalized, safe='/')}" if normalized else raw
+    return raw
+
+
 def _sanitize_storage_segment(value: object, fallback: str) -> str:
     cleaned = re.sub(r"[^a-zA-Z0-9._-]+", "-", str(value or "").strip()).strip("-.")
     return cleaned or fallback
@@ -3925,7 +3955,7 @@ def create_project(
             project["organization_name"] = org_meta.get("name")
             project["organization_slug"] = org_meta.get("slug")
             project["organization_status"] = org_meta.get("status")
-            project["organization_logo_url"] = org_meta.get("logo_url")
+            project["organization_logo_url"] = _normalize_logo_asset_path(org_meta.get("logo_url"))
     db.commit()
     return project
 
@@ -4242,7 +4272,7 @@ def get_organization_branding(
         "slug": row.get("slug"),
         "status": row.get("status"),
         "is_active": bool(row.get("is_active", True)),
-        "logo_url": row.get("logo_url"),
+        "logo_url": _normalize_logo_asset_path(row.get("logo_url")),
     }
 
 
@@ -4731,7 +4761,10 @@ def list_projects(
         "organization_id": int(organization_id) if organization_id is not None else None,
         "assignee_name": (assignee_name or "").strip() or None,
     }).mappings().all()
-    return [dict(r) for r in rows]
+    items = [dict(r) for r in rows]
+    for item in items:
+        item["organization_logo_url"] = _normalize_logo_asset_path(item.get("organization_logo_url"))
+    return items
 
 
 @router.get("/projects/{project_id}")
@@ -4753,6 +4786,8 @@ def get_project(
     """), {"project_id": project_id}).mappings().first()
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
+    project = dict(project)
+    project["organization_logo_url"] = _normalize_logo_asset_path(project.get("organization_logo_url"))
 
     if assignee_clean:
         has_access = db.execute(
@@ -7804,7 +7839,7 @@ def work_auth_login(
             "organization_slug": user_row.get("organization_slug"),
             "organization_status": user_row.get("organization_status"),
             "organization_is_active": bool(user_row.get("organization_is_active", True)),
-            "organization_logo_url": user_row.get("organization_logo_url"),
+            "organization_logo_url": _normalize_logo_asset_path(user_row.get("organization_logo_url")),
         },
     }
 
@@ -7907,7 +7942,7 @@ def green_auth_login(
             "organization_slug": user_row.get("organization_slug"),
             "organization_status": user_row.get("organization_status"),
             "organization_is_active": bool(user_row.get("organization_is_active", True)),
-            "organization_logo_url": user_row.get("organization_logo_url"),
+            "organization_logo_url": _normalize_logo_asset_path(user_row.get("organization_logo_url")),
         },
     }
 
