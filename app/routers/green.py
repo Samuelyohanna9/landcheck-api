@@ -4424,7 +4424,11 @@ def update_admin_organization(
         },
     )
     db.commit()
-    return dict(row)
+    payload = dict(row)
+    payload["welcome_email_attempted"] = False
+    payload["welcome_email_sent"] = False
+    payload["welcome_email_error"] = None
+    return payload
 
 
 @router.get("/admin/roles")
