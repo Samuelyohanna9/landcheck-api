@@ -38,7 +38,7 @@ from app.utils.green_pdf import (
     render_green_org_credentials_pdf,
 )
 from app.utils.green_remote_monitoring import compute_remote_monitoring_report
-from app.utils.r2_exports import upload_export_file_best_effort
+from app.utils.r2_exports import upload_export_file_best_effort, _build_export_r2_settings
 from app.utils.carbon import (
     compute_project_carbon,
     generate_co2_projection_table,
@@ -345,11 +345,52 @@ def _pdf_response_with_r2(
     return response
 
 
-def _serialize_green_export_job(row: dict | None) -> dict | None:
+def _normalize_export_object_key(raw_key: str) -> str:
+    settings = _build_export_r2_settings() or {}
+    bucket = str(settings.get("bucket") or "").strip()
+    key = (raw_key or "").strip().lstrip("/")
+    if not key:
+        return ""
+    for _ in range(3):
+        decoded = unquote(key)
+        if decoded == key:
+            break
+        key = decoded
+    bucket_prefix = f"{bucket}/"
+    if bucket and key.startswith(bucket_prefix):
+        key = key[len(bucket_prefix):]
+    return key
+
+
+def _build_export_proxy_url(object_key: str | None, request: Request | None = None) -> str | None:
+    raw_key = str(object_key or "").strip()
+    if not raw_key:
+        return None
+    try:
+        settings = _build_export_r2_settings()
+    except Exception:
+        settings = None
+    if not settings:
+        return None
+    normalized = _normalize_export_object_key(raw_key)
+    if not normalized:
+        return None
+    path = f"/green/exports/object/{quote(normalized, safe='/')}"
+    base = ""
+    if request is not None:
+        base = str(request.base_url).rstrip("/")
+    if not base:
+        base = (os.getenv("BACKEND_URL") or "").strip().rstrip("/")
+    return f"{base}{path}" if base else path
+
+
+def _serialize_green_export_job(row: dict | None, request: Request | None = None) -> dict | None:
     if not row:
         return None
     data = dict(row)
+    object_key = str(data.get("object_key") or "").strip()
     public_url = str(data.get("public_url") or "").strip()
+    proxy_url = _build_export_proxy_url(object_key, request=request)
     return {
         "id": str(data.get("id") or ""),
         "export_type": str(data.get("export_type") or ""),
@@ -359,9 +400,9 @@ def _serialize_green_export_job(row: dict | None) -> dict | None:
         "include_photos": bool(data.get("include_photos")),
         "status": str(data.get("status") or "queued"),
         "file_name": str(data.get("file_name") or "").strip() or None,
-        "object_key": str(data.get("object_key") or "").strip() or None,
+        "object_key": object_key or None,
         "public_url": public_url or None,
-        "download_url": public_url or None,
+        "download_url": proxy_url or public_url or None,
         "error_text": str(data.get("error_text") or "").strip() or None,
         "requested_by": str(data.get("requested_by") or "").strip() or None,
         "created_at": data.get("created_at"),
@@ -425,6 +466,44 @@ def _set_green_export_job_status(
         },
     )
     db.commit()
+
+
+@router.get("/exports/object/{object_key:path}")
+def get_exported_object(object_key: str):
+    settings = _build_export_r2_settings()
+    if not settings:
+        raise HTTPException(status_code=404, detail="Export storage is not configured.")
+    resolved_key = _normalize_export_object_key(object_key)
+    if not resolved_key:
+        raise HTTPException(status_code=400, detail="Invalid export key.")
+    try:
+        client = boto3.client(
+            "s3",
+            endpoint_url=settings["endpoint_url"],
+            aws_access_key_id=settings["access_key"],
+            aws_secret_access_key=settings["secret_key"],
+            region_name=settings["region"],
+        )
+        obj = client.get_object(Bucket=settings["bucket"], Key=resolved_key)
+    except ClientError as exc:
+        code = (exc.response.get("Error") or {}).get("Code", "")
+        if code in {"NoSuchKey", "404", "NotFound"}:
+            raise HTTPException(status_code=404, detail="Export not found.")
+        raise HTTPException(status_code=502, detail="Failed to read export from storage.")
+    except Exception:
+        raise HTTPException(status_code=502, detail="Failed to read export from storage.")
+
+    content_type = obj.get("ContentType") or "application/pdf"
+    cache_control = obj.get("CacheControl") or "private, max-age=0, no-store"
+    file_name = Path(resolved_key).name or "export.pdf"
+    return StreamingResponse(
+        obj["Body"].iter_chunks(),
+        media_type=content_type,
+        headers={
+            "Cache-Control": cache_control,
+            "Content-Disposition": f'inline; filename="{file_name}"',
+        },
+    )
 
 
 def _ensure_unique_org_slug(db: Session, slug_base: str, exclude_org_id: int | None = None) -> str:
@@ -13607,7 +13686,11 @@ def _run_work_report_export_job(job_id: str):
 
 
 @router.post("/work-report/export-jobs")
-def create_work_report_export_job(payload: WorkReportExportJobPayload, db: Session = Depends(get_db)):
+def create_work_report_export_job(
+    payload: WorkReportExportJobPayload,
+    request: Request,
+    db: Session = Depends(get_db),
+):
     project = get_project(
         project_id=int(payload.project_id),
         db=db,
@@ -13704,12 +13787,12 @@ def create_work_report_export_job(payload: WorkReportExportJobPayload, db: Sessi
     db.commit()
     threading.Thread(target=_run_work_report_export_job, args=(job_id,), daemon=True).start()
     job = _get_green_export_job(db, job_id)
-    return _serialize_green_export_job(job)
+    return _serialize_green_export_job(job, request=request)
 
 
 @router.get("/export-jobs/{job_id}")
-def get_green_export_job_status(job_id: str, db: Session = Depends(get_db)):
+def get_green_export_job_status(job_id: str, request: Request, db: Session = Depends(get_db)):
     job = _get_green_export_job(db, job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Export job not found")
-    return _serialize_green_export_job(job)
+    return _serialize_green_export_job(job, request=request)
