@@ -816,7 +816,11 @@ def _list_green_push_tokens_for_assignee(db: Session, *, project_id: int, assign
             WHERE COALESCE(pt.is_active, TRUE) = TRUE
               AND COALESCE(u.is_active, TRUE) = TRUE
               AND u.organization_id = :organization_id
-              AND LOWER(TRIM(COALESCE(u.full_name, ''))) = LOWER(TRIM(:assignee_name))
+              AND (
+                    LOWER(TRIM(COALESCE(u.full_name, ''))) = LOWER(TRIM(:assignee_name))
+                 OR LOWER(TRIM(COALESCE(u.work_username, ''))) = LOWER(TRIM(:assignee_name))
+                 OR LOWER(TRIM(COALESCE(u.user_uid, ''))) = LOWER(TRIM(:assignee_name))
+              )
             """
         ),
         {"organization_id": int(org_id), "assignee_name": assignee_clean},
@@ -8183,6 +8187,7 @@ def work_auth_login(
             "role_name": user_row.get("role_name") or user_row.get("role"),
             "allow_work": bool(user_row.get("allow_work")),
             "allow_green": bool(user_row.get("allow_green")),
+            "work_username": user_row.get("work_username"),
             "organization_id": user_row.get("organization_id"),
             "organization_name": user_row.get("organization_name"),
             "organization_slug": user_row.get("organization_slug"),
