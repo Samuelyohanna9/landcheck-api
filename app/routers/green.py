@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Body, Depends, HTTPException, Query, UploadFile, File, Form, Request
 from fastapi.responses import FileResponse, Response, StreamingResponse
 from sqlalchemy.orm import Session
-from sqlalchemy import text
+from sqlalchemy import bindparam, text
 from datetime import datetime, date, timedelta, timezone
 import json
 import os
@@ -23,6 +23,7 @@ import threading
 from urllib.parse import quote, unquote, urlparse
 from email.message import EmailMessage
 from starlette.background import BackgroundTask
+import requests
 
 import boto3
 from botocore.exceptions import ClientError
@@ -62,6 +63,7 @@ _GREEN_SCHEMA_ADVISORY_LOCK_ID = 903670421
 
 BASE_DIR = os.path.dirname(os.path.dirname(__file__))
 REPORTS_DIR = os.path.join(BASE_DIR, "reports", "green")
+EXPO_PUSH_SEND_URL = "https://exp.host/--/api/v2/push/send"
 LIVE_SOURCE_REFERENCES = [
     {
         "label": "FAO - Forest restoration monitoring and maintenance sequence",
@@ -222,6 +224,23 @@ class RemoteMonitoringAreaPayload(BaseModel):
 class VegetationAnalysisPayload(BaseModel):
     project_id: int
     area_geojson: dict | str
+
+
+class MobilePushTokenPayload(BaseModel):
+    user_id: int
+    organization_id: int | None = None
+    user_uid: str | None = None
+    full_name: str | None = None
+    token: str
+    platform: str | None = None
+    app_version: str | None = None
+    project_id: str | None = None
+    device_label: str | None = None
+
+
+class MobilePushTokenDeactivatePayload(BaseModel):
+    token: str
+    user_id: int | None = None
 
 
 def _normalize_privacy_scope(value: str | None) -> str:
@@ -667,6 +686,213 @@ def _env_bool(name: str, default: bool = False) -> bool:
     if not raw:
         return bool(default)
     return raw in {"1", "true", "yes", "on"}
+
+
+def _normalize_expo_push_token(value: str | None) -> str:
+    token = str(value or "").strip()
+    if not token:
+        raise HTTPException(status_code=400, detail="Push token required")
+    if not (token.startswith("ExponentPushToken[") or token.startswith("ExpoPushToken[")):
+        raise HTTPException(status_code=400, detail="Invalid Expo push token")
+    return token
+
+
+def _safe_push_date_label(value: str | date | datetime | None) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        base = value.date()
+    elif isinstance(value, date):
+        base = value
+    else:
+        try:
+            base = date.fromisoformat(str(value).strip()[:10])
+        except Exception:
+            return str(value).strip() or None
+    try:
+        return base.strftime("%d %b %Y")
+    except Exception:
+        return str(base)
+
+
+def _project_organization_id(db: Session, project_id: int) -> int | None:
+    value = db.execute(
+        text("SELECT organization_id FROM tree_projects WHERE id = :project_id"),
+        {"project_id": int(project_id)},
+    ).scalar()
+    return int(value) if value is not None else None
+
+
+def _upsert_green_push_token(
+    db: Session,
+    *,
+    user_id: int,
+    organization_id: int | None,
+    token: str,
+    platform: str | None = None,
+    app_version: str | None = None,
+    project_id: str | None = None,
+    device_label: str | None = None,
+):
+    normalized_token = _normalize_expo_push_token(token)
+    db.execute(
+        text(
+            """
+            INSERT INTO green_push_tokens (
+                user_id, organization_id, expo_push_token, platform, app_version, expo_project_id, device_label,
+                is_active, last_seen_at, created_at, updated_at
+            )
+            VALUES (
+                :user_id, :organization_id, :expo_push_token, :platform, :app_version, :expo_project_id, :device_label,
+                TRUE, NOW(), NOW(), NOW()
+            )
+            ON CONFLICT (expo_push_token) DO UPDATE
+            SET user_id = EXCLUDED.user_id,
+                organization_id = EXCLUDED.organization_id,
+                platform = EXCLUDED.platform,
+                app_version = EXCLUDED.app_version,
+                expo_project_id = EXCLUDED.expo_project_id,
+                device_label = EXCLUDED.device_label,
+                is_active = TRUE,
+                last_seen_at = NOW(),
+                updated_at = NOW()
+            """
+        ),
+        {
+            "user_id": int(user_id),
+            "organization_id": int(organization_id) if organization_id is not None else None,
+            "expo_push_token": normalized_token,
+            "platform": (platform or "").strip().lower() or None,
+            "app_version": (app_version or "").strip() or None,
+            "expo_project_id": (project_id or "").strip() or None,
+            "device_label": (device_label or "").strip() or None,
+        },
+    )
+    return normalized_token
+
+
+def _deactivate_green_push_tokens(db: Session, tokens: list[str], *, user_id: int | None = None):
+    normalized_tokens = list({str(item or "").strip() for item in tokens if str(item or "").strip()})
+    if not normalized_tokens:
+        return
+    statement = text(
+        """
+        UPDATE green_push_tokens
+        SET is_active = FALSE, updated_at = NOW()
+        WHERE expo_push_token IN :tokens
+        """
+    ).bindparams(bindparam("tokens", expanding=True))
+    params: dict[str, object] = {"tokens": normalized_tokens}
+    if user_id is None:
+        db.execute(statement, params)
+    else:
+        params["user_id"] = int(user_id)
+        db.execute(
+            text(
+                """
+                UPDATE green_push_tokens
+                SET is_active = FALSE, updated_at = NOW()
+                WHERE expo_push_token IN :tokens
+                  AND user_id = :user_id
+                """
+            ).bindparams(bindparam("tokens", expanding=True)),
+            params,
+        )
+
+
+def _list_green_push_tokens_for_assignee(db: Session, *, project_id: int, assignee_name: str | None) -> list[str]:
+    assignee_clean = (assignee_name or "").strip()
+    if not assignee_clean:
+        return []
+    org_id = _project_organization_id(db, int(project_id))
+    if org_id is None:
+        return []
+    rows = db.execute(
+        text(
+            """
+            SELECT DISTINCT pt.expo_push_token
+            FROM green_push_tokens pt
+            JOIN green_users u ON u.id = pt.user_id
+            WHERE COALESCE(pt.is_active, TRUE) = TRUE
+              AND COALESCE(u.is_active, TRUE) = TRUE
+              AND u.organization_id = :organization_id
+              AND LOWER(TRIM(COALESCE(u.full_name, ''))) = LOWER(TRIM(:assignee_name))
+            """
+        ),
+        {"organization_id": int(org_id), "assignee_name": assignee_clean},
+    ).mappings().all()
+    return [str(row.get("expo_push_token") or "").strip() for row in rows if str(row.get("expo_push_token") or "").strip()]
+
+
+def _send_expo_push_messages(messages: list[dict]):
+    if not messages:
+        return
+    headers = {
+        "Accept": "application/json",
+        "Accept-Encoding": "gzip, deflate",
+        "Content-Type": "application/json",
+    }
+    access_token = str(os.getenv("EXPO_ACCESS_TOKEN") or "").strip()
+    if access_token:
+        headers["Authorization"] = f"Bearer {access_token}"
+    invalid_tokens: list[str] = []
+    for start in range(0, len(messages), 100):
+        chunk = messages[start : start + 100]
+        try:
+            response = requests.post(EXPO_PUSH_SEND_URL, headers=headers, json=chunk, timeout=12)
+            response.raise_for_status()
+            payload = response.json() if response.content else {}
+        except Exception:
+            continue
+        data_rows = payload.get("data") if isinstance(payload, dict) else None
+        if not isinstance(data_rows, list):
+            continue
+        for idx, row in enumerate(data_rows):
+            if not isinstance(row, dict):
+                continue
+            if str(row.get("status") or "").lower() != "error":
+                continue
+            details = row.get("details") if isinstance(row.get("details"), dict) else {}
+            if str(details.get("error") or "").strip() == "DeviceNotRegistered" and idx < len(chunk):
+                token = str(chunk[idx].get("to") or "").strip()
+                if token:
+                    invalid_tokens.append(token)
+    if invalid_tokens:
+        cleanup_db = SessionLocal()
+        try:
+            _deactivate_green_push_tokens(cleanup_db, invalid_tokens)
+            cleanup_db.commit()
+        except Exception:
+            cleanup_db.rollback()
+        finally:
+            cleanup_db.close()
+
+
+def _queue_green_push_to_assignee(
+    db: Session,
+    *,
+    project_id: int,
+    assignee_name: str | None,
+    title: str,
+    body: str,
+    data: dict | None = None,
+):
+    tokens = _list_green_push_tokens_for_assignee(db, project_id=project_id, assignee_name=assignee_name)
+    if not tokens:
+        return
+    messages = [
+        {
+            "to": token,
+            "title": title,
+            "body": body,
+            "sound": "default",
+            "priority": "high",
+            "channelId": "green-alerts",
+            "data": data or {},
+        }
+        for token in tokens
+    ]
+    _send_expo_push_messages(messages)
 
 
 def _send_new_user_credentials_email(
@@ -2525,6 +2751,22 @@ def ensure_green_tables(db: Session):
         )
     """))
     db.execute(text("""
+        CREATE TABLE IF NOT EXISTS green_push_tokens (
+            id SERIAL PRIMARY KEY,
+            user_id INTEGER NOT NULL REFERENCES green_users(id) ON DELETE CASCADE,
+            organization_id INTEGER REFERENCES green_organizations(id) ON DELETE SET NULL,
+            expo_push_token TEXT NOT NULL UNIQUE,
+            platform TEXT,
+            app_version TEXT,
+            expo_project_id TEXT,
+            device_label TEXT,
+            is_active BOOLEAN NOT NULL DEFAULT TRUE,
+            last_seen_at TIMESTAMP DEFAULT NOW(),
+            created_at TIMESTAMP DEFAULT NOW(),
+            updated_at TIMESTAMP DEFAULT NOW()
+        )
+    """))
+    db.execute(text("""
         CREATE TABLE IF NOT EXISTS green_roles (
             id SERIAL PRIMARY KEY,
             role_uid TEXT NOT NULL,
@@ -2551,6 +2793,14 @@ def ensure_green_tables(db: Session):
         db.execute(text("ALTER TABLE green_users ADD COLUMN IF NOT EXISTS notes TEXT"))
         db.execute(text("ALTER TABLE green_users ADD COLUMN IF NOT EXISTS is_active BOOLEAN NOT NULL DEFAULT TRUE"))
         db.execute(text("ALTER TABLE green_users ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW()"))
+        db.execute(text("ALTER TABLE green_push_tokens ADD COLUMN IF NOT EXISTS organization_id INTEGER"))
+        db.execute(text("ALTER TABLE green_push_tokens ADD COLUMN IF NOT EXISTS platform TEXT"))
+        db.execute(text("ALTER TABLE green_push_tokens ADD COLUMN IF NOT EXISTS app_version TEXT"))
+        db.execute(text("ALTER TABLE green_push_tokens ADD COLUMN IF NOT EXISTS expo_project_id TEXT"))
+        db.execute(text("ALTER TABLE green_push_tokens ADD COLUMN IF NOT EXISTS device_label TEXT"))
+        db.execute(text("ALTER TABLE green_push_tokens ADD COLUMN IF NOT EXISTS is_active BOOLEAN NOT NULL DEFAULT TRUE"))
+        db.execute(text("ALTER TABLE green_push_tokens ADD COLUMN IF NOT EXISTS last_seen_at TIMESTAMP DEFAULT NOW()"))
+        db.execute(text("ALTER TABLE green_push_tokens ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW()"))
         db.execute(text("ALTER TABLE green_organizations ADD COLUMN IF NOT EXISTS logo_url TEXT"))
         db.execute(text("ALTER TABLE green_roles ADD COLUMN IF NOT EXISTS role_uid TEXT"))
         db.execute(text("ALTER TABLE green_roles ADD COLUMN IF NOT EXISTS role_key TEXT"))
@@ -3007,6 +3257,9 @@ def ensure_green_tables(db: Session):
     db.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS idx_green_users_work_username ON green_users(LOWER(work_username))"))
     db.execute(text("CREATE INDEX IF NOT EXISTS idx_green_users_org ON green_users(organization_id)"))
     db.execute(text("CREATE INDEX IF NOT EXISTS idx_green_users_role_id ON green_users(role_id)"))
+    db.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS idx_green_push_tokens_token ON green_push_tokens(expo_push_token)"))
+    db.execute(text("CREATE INDEX IF NOT EXISTS idx_green_push_tokens_user ON green_push_tokens(user_id, is_active)"))
+    db.execute(text("CREATE INDEX IF NOT EXISTS idx_green_push_tokens_org ON green_push_tokens(organization_id, is_active)"))
     db.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS idx_green_roles_uid ON green_roles(UPPER(role_uid))"))
     db.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS idx_green_roles_key ON green_roles(LOWER(role_key))"))
     db.execute(text("CREATE INDEX IF NOT EXISTS idx_green_roles_active ON green_roles(is_active)"))
@@ -7136,6 +7389,23 @@ def add_task(
             task_id=int(row),
         )
     db.commit()
+    if review_state != "submitted":
+        due_label = _safe_push_date_label(due_date)
+        task_label = activity.replace("_", " ").strip() or "field"
+        _queue_green_push_to_assignee(
+            db,
+            project_id=int(tree_row["project_id"]),
+            assignee_name=assignee_name,
+            title="New task assigned",
+            body=f"A new {task_label} task has been assigned to you." + (f" Due {due_label}." if due_label else ""),
+            data={
+                "type": "task_assigned",
+                "project_id": int(tree_row["project_id"]),
+                "task_id": int(row),
+                "task_type": activity,
+                "tree_id": int(tree_id),
+            },
+        )
     return {"id": row}
 
 
@@ -8026,6 +8296,68 @@ def green_auth_login(
     }
 
 
+@router.post("/mobile/push-tokens/register")
+def register_mobile_push_token(
+    payload: MobilePushTokenPayload,
+    db: Session = Depends(get_db),
+):
+    user_id = int(payload.user_id or 0)
+    if user_id <= 0:
+        raise HTTPException(status_code=400, detail="Valid user_id required")
+    user_row = db.execute(
+        text(
+            """
+            SELECT id, full_name, user_uid, organization_id,
+                   COALESCE(is_active, TRUE) AS is_active,
+                   COALESCE(allow_green, TRUE) AS allow_green
+            FROM green_users
+            WHERE id = :user_id
+            LIMIT 1
+            """
+        ),
+        {"user_id": user_id},
+    ).mappings().first()
+    if not user_row:
+        raise HTTPException(status_code=404, detail="User not found")
+    if not bool(user_row.get("is_active", True)) or not bool(user_row.get("allow_green", True)):
+        raise HTTPException(status_code=403, detail="User is not enabled for LandCheck Green")
+    org_id = int(user_row.get("organization_id") or 0) or None
+    if payload.organization_id is not None and org_id != int(payload.organization_id or 0):
+        raise HTTPException(status_code=403, detail="Organization mismatch")
+    if payload.user_uid and str(user_row.get("user_uid") or "").strip() and str(user_row.get("user_uid") or "").strip().upper() != str(payload.user_uid).strip().upper():
+        raise HTTPException(status_code=403, detail="User UID mismatch")
+    if payload.full_name and _normalize_name(user_row.get("full_name")) != _normalize_name(payload.full_name):
+        raise HTTPException(status_code=403, detail="User name mismatch")
+
+    token = _upsert_green_push_token(
+        db,
+        user_id=user_id,
+        organization_id=org_id,
+        token=payload.token,
+        platform=payload.platform,
+        app_version=payload.app_version,
+        project_id=payload.project_id,
+        device_label=payload.device_label,
+    )
+    db.commit()
+    return {"ok": True, "token": token}
+
+
+@router.post("/mobile/push-tokens/deactivate")
+def deactivate_mobile_push_token(
+    payload: MobilePushTokenDeactivatePayload,
+    db: Session = Depends(get_db),
+):
+    token = _normalize_expo_push_token(payload.token)
+    _deactivate_green_push_tokens(
+        db,
+        [token],
+        user_id=int(payload.user_id) if payload.user_id is not None else None,
+    )
+    db.commit()
+    return {"ok": True}
+
+
 @router.patch("/tasks/{task_id}")
 def update_task(
     task_id: int,
@@ -8542,6 +8874,36 @@ def review_submitted_task(
     )
     _refresh_project_alerts(db, project_id)
     db.commit()
+    if decision_key == "approve":
+        _queue_green_push_to_assignee(
+            db,
+            project_id=project_id,
+            assignee_name=task.get("assignee_name"),
+            title="Task approved",
+            body="Your submitted task has been approved by the supervisor.",
+            data={
+                "type": "task_review_approved",
+                "project_id": int(project_id),
+                "task_id": int(task_id),
+                "tree_id": int(task["tree_id"]),
+            },
+        )
+    elif decision_key in {"reject", "metadata_edit"}:
+        _queue_green_push_to_assignee(
+            db,
+            project_id=project_id,
+            assignee_name=task.get("assignee_name"),
+            title="Task returned",
+            body="Your submitted task needs changes before approval."
+            + (f" Note: {review_notes.strip()}" if str(review_notes or "").strip() else ""),
+            data={
+                "type": "task_review_returned",
+                "project_id": int(project_id),
+                "task_id": int(task_id),
+                "tree_id": int(task["tree_id"]),
+                "decision": decision_key,
+            },
+        )
     return {
         "status": "ok",
         "decision": (
@@ -11689,6 +12051,58 @@ def create_work_order(
         },
     )
     db.commit()
+    due_label = _safe_push_date_label(due_date)
+    if work_type == "planting":
+        if action_name == "work_order_accumulated":
+            _queue_green_push_to_assignee(
+                db,
+                project_id=project_id,
+                assignee_name=assignee_clean,
+                title="Planting target increased",
+                body=(
+                    f"Your planting target increased by {int(target_trees or 0)} tree{'s' if int(target_trees or 0) != 1 else ''}."
+                    + (f" Due {due_label}." if due_label else "")
+                ),
+                data={
+                    "type": "work_order_target_increase",
+                    "project_id": int(project_id),
+                    "work_order_id": int(row),
+                    "work_type": work_type,
+                    "target_trees_delta": int(target_trees or 0),
+                },
+            )
+        else:
+            _queue_green_push_to_assignee(
+                db,
+                project_id=project_id,
+                assignee_name=assignee_clean,
+                title="New planting order assigned",
+                body=(
+                    f"You have been assigned {int(target_trees or 0)} tree{'s' if int(target_trees or 0) != 1 else ''} for planting."
+                    + (f" Due {due_label}." if due_label else "")
+                ),
+                data={
+                    "type": "work_order_assigned",
+                    "project_id": int(project_id),
+                    "work_order_id": int(row),
+                    "work_type": work_type,
+                    "target_trees": int(target_trees or 0),
+                },
+            )
+    else:
+        _queue_green_push_to_assignee(
+            db,
+            project_id=project_id,
+            assignee_name=assignee_clean,
+            title="New maintenance order assigned",
+            body="A new maintenance order has been assigned to you." + (f" Due {due_label}." if due_label else ""),
+            data={
+                "type": "work_order_assigned",
+                "project_id": int(project_id),
+                "work_order_id": int(row),
+                "work_type": work_type,
+            },
+        )
     return {"id": row}
 
 
