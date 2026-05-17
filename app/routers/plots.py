@@ -1,6 +1,7 @@
 # app/routers/plots.py
 
 from fastapi import APIRouter, Depends, Body, HTTPException, BackgroundTasks, Query
+from pydantic import BaseModel
 from sqlalchemy.orm import Session
 from geoalchemy2.shape import from_shape
 from shapely.geometry import Polygon, shape, Point, box
@@ -68,6 +69,10 @@ PREVIEW_CACHE_MAX_FILES_PER_PLOT = max(5, int(os.getenv("PLOT_PREVIEW_CACHE_MAX_
 PREVIEW_LAYOUT_VERSION = "survey_layout_2026_03_23_clockwise_v84"
 SURVEY_REPORT_RENDER_VERSION = "survey_report_2026_03_23_clockwise_v1"
 CLEAN_COPY_RENDER_VERSION = "clean_copy_2026_03_20_layout_v14"
+
+
+class PlotGeometryUpdateRequest(BaseModel):
+    coordinates: List[List[float]]
 
 # Coordinate system EPSG codes mapping
 COORDINATE_SYSTEMS = {
@@ -2960,6 +2965,28 @@ def get_plot_features_geojson(plot_id: int, db: Session = Depends(get_db)):
         "rivers": {"type": "FeatureCollection", "features": rivers},
         "fences": {"type": "FeatureCollection", "features": fences},
     }
+
+
+@router.post("/{plot_id}/geometry")
+def update_plot_geometry(
+    plot_id: int,
+    payload: PlotGeometryUpdateRequest,
+    db: Session = Depends(get_db),
+):
+    coords = payload.coordinates or []
+    if len(coords) < 3:
+        raise HTTPException(status_code=400, detail="Polygon requires at least 3 points")
+
+    plot = db.query(Plot).filter(Plot.id == plot_id).first()
+    if not plot:
+        raise HTTPException(status_code=404, detail="Plot not found")
+
+    polygon = Polygon(coords)
+    plot.geom = from_shape(polygon, srid=4326)
+    db.add(plot)
+    db.commit()
+
+    return {"ok": True, "plot_id": plot_id}
 
 
 # ---------------- FEATURE OVERRIDES ----------------
