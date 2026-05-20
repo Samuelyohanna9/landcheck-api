@@ -8554,6 +8554,7 @@ def task_review_queue(
                    t.reported_tree_status, t.review_notes, t.activity_lng, t.activity_lat, t.activity_recorded_at,
                    t.custodian_id, t.distribution_allocation_id, t.supervision_visit_no, t.supervision_total_visits,
                    tr.project_id, tr.status AS tree_status, tr.species AS tree_species,
+                   tr.planting_date AS tree_planting_date, tr.tree_origin, tr.tree_height_m, tr.tree_age_months,
                    ST_X(tr.geom) AS tree_lng, ST_Y(tr.geom) AS tree_lat,
                    c.name AS custodian_name, c.custodian_type, c.community_name AS custodian_community_name,
                    c.contact_person AS custodian_contact_person, c.phone AS custodian_phone, c.email AS custodian_email
