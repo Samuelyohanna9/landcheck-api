@@ -4,6 +4,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy import bindparam, text
 from datetime import datetime, date, timedelta, timezone
 import json
+import base64
 import os
 import tempfile
 import csv
@@ -3858,14 +3859,14 @@ def _extract_object_key_from_asset_value(raw_value: str | None) -> str | None:
     return _normalize_object_key(raw, str((settings or {}).get("bucket") or ""))
 
 
-def _stream_uploaded_photo_object(
+def _load_uploaded_photo_payload(
     resolved_key: str,
     *,
     w: int | None = None,
     h: int | None = None,
     q: int = 72,
     fm: str | None = None,
-):
+) -> tuple[bytes, str, str]:
     settings = _build_r2_settings()
     resolved_key = _normalize_object_key(resolved_key, settings["bucket"])
     if not resolved_key:
@@ -3886,11 +3887,8 @@ def _stream_uploaded_photo_object(
     want_resize = bool(w or h or fm)
 
     if not want_resize:
-        return StreamingResponse(
-            obj["Body"].iter_chunks(),
-            media_type=content_type,
-            headers={"Cache-Control": cache_control},
-        )
+        source_bytes = obj["Body"].read()
+        return source_bytes, content_type, cache_control
 
     source_bytes = b""
     try:
@@ -3939,21 +3937,29 @@ def _stream_uploaded_photo_object(
                 "webp": "image/webp",
                 "png": "image/png",
             }.get(output_format_raw, content_type)
-            return StreamingResponse(
-                iter([out.getvalue()]),
-                media_type=rendered_type,
-                headers={"Cache-Control": cache_control},
-            )
+            return out.getvalue(), rendered_type, cache_control
     except HTTPException:
         raise
     except Exception:
         if source_bytes:
-            return StreamingResponse(
-                iter([source_bytes]),
-                media_type=content_type,
-                headers={"Cache-Control": cache_control},
-            )
+            return source_bytes, content_type, cache_control
         raise HTTPException(status_code=502, detail="Failed to transform photo.")
+
+
+def _stream_uploaded_photo_object(
+    resolved_key: str,
+    *,
+    w: int | None = None,
+    h: int | None = None,
+    q: int = 72,
+    fm: str | None = None,
+):
+    payload, media_type, cache_control = _load_uploaded_photo_payload(resolved_key, w=w, h=h, q=q, fm=fm)
+    return Response(
+        content=payload,
+        media_type=media_type,
+        headers={"Cache-Control": cache_control},
+    )
 
 
 def _sanitize_storage_segment(value: object, fallback: str) -> str:
@@ -4098,6 +4104,69 @@ def get_tree_best_photo(
             continue
         try:
             return _stream_uploaded_photo_object(object_key, w=w, h=h, q=q, fm=fm)
+        except HTTPException as exc:
+            if exc.status_code == 404:
+                last_not_found = exc
+                continue
+            raise
+
+    raise last_not_found or HTTPException(status_code=404, detail="Tree photo not found.")
+
+
+@router.get("/trees/{tree_id}/photo-inline")
+def get_tree_best_photo_inline(
+    tree_id: int,
+    w: int | None = Query(default=1280, ge=64, le=4096),
+    h: int | None = Query(default=None, ge=64, le=4096),
+    q: int = Query(default=76, ge=35, le=95),
+    fm: str | None = Query(default="jpeg", pattern="^(?i:webp|jpeg|jpg|png)$"),
+    db: Session = Depends(get_db),
+):
+    tree = db.execute(
+        text(
+            """
+            SELECT id, photo_url, photo_urls
+            FROM trees
+            WHERE id = :tree_id
+            """
+        ),
+        {"tree_id": tree_id},
+    ).mappings().first()
+    if not tree:
+        raise HTTPException(status_code=404, detail="Tree not found.")
+
+    candidates: list[str] = []
+    _append_photo_candidates(candidates, tree.get("photo_url"), tree.get("photo_urls"))
+
+    task_rows = list_tree_tasks(tree_id, db)
+    for task in task_rows:
+        _append_photo_candidates(candidates, task.get("photo_url"), task.get("photo_urls"))
+
+    visit_rows = db.execute(
+        text(
+            """
+            SELECT photo_url
+            FROM tree_visits
+            WHERE tree_id = :tree_id
+            ORDER BY visit_date DESC, created_at DESC, id DESC
+            """
+        ),
+        {"tree_id": tree_id},
+    ).mappings().all()
+    for visit in visit_rows:
+        _append_photo_candidates(candidates, visit.get("photo_url"), None)
+
+    last_not_found: HTTPException | None = None
+    for candidate in candidates:
+        object_key = _extract_object_key_from_asset_value(candidate)
+        if not object_key:
+            continue
+        try:
+            payload, media_type, _cache_control = _load_uploaded_photo_payload(object_key, w=w, h=h, q=q, fm=fm)
+            return {
+                "data_uri": f"data:{media_type};base64,{base64.b64encode(payload).decode('ascii')}",
+                "content_type": media_type,
+            }
         except HTTPException as exc:
             if exc.status_code == 404:
                 last_not_found = exc
