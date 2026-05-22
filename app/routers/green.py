@@ -3829,6 +3829,133 @@ def _normalize_logo_asset_path(raw_value: str | None) -> str | None:
     return raw
 
 
+def _extract_object_key_from_asset_value(raw_value: str | None) -> str | None:
+    normalized = _normalize_logo_asset_path(raw_value)
+    raw = str(normalized or "").strip()
+    if not raw:
+        return None
+    marker = "/green/uploads/object/"
+    if marker in raw:
+        idx = raw.find(marker)
+        raw = raw[idx + len(marker) :]
+    elif raw.startswith("green/uploads/object/"):
+        raw = raw[len("green/uploads/object/") :]
+    elif raw.startswith("/green/uploads/object/"):
+        raw = raw[len("/green/uploads/object/") :]
+    else:
+        try:
+            settings = _build_r2_settings()
+        except Exception:
+            settings = None
+        bucket = str((settings or {}).get("bucket") or "")
+        raw = _normalize_object_key(raw, bucket)
+    if not raw:
+        return None
+    try:
+        settings = _build_r2_settings()
+    except Exception:
+        settings = None
+    return _normalize_object_key(raw, str((settings or {}).get("bucket") or ""))
+
+
+def _stream_uploaded_photo_object(
+    resolved_key: str,
+    *,
+    w: int | None = None,
+    h: int | None = None,
+    q: int = 72,
+    fm: str | None = None,
+):
+    settings = _build_r2_settings()
+    resolved_key = _normalize_object_key(resolved_key, settings["bucket"])
+    if not resolved_key:
+        raise HTTPException(status_code=400, detail="Invalid photo key.")
+    try:
+        client = _make_r2_client(settings)
+        obj = client.get_object(Bucket=settings["bucket"], Key=resolved_key)
+    except ClientError as exc:
+        code = (exc.response.get("Error") or {}).get("Code", "")
+        if code in {"NoSuchKey", "404", "NotFound"}:
+            raise HTTPException(status_code=404, detail="Photo not found.")
+        raise HTTPException(status_code=502, detail="Failed to read photo from storage.")
+    except Exception:
+        raise HTTPException(status_code=502, detail="Failed to read photo from storage.")
+
+    content_type = obj.get("ContentType") or "application/octet-stream"
+    cache_control = obj.get("CacheControl") or "public, max-age=86400"
+    want_resize = bool(w or h or fm)
+
+    if not want_resize:
+        return StreamingResponse(
+            obj["Body"].iter_chunks(),
+            media_type=content_type,
+            headers={"Cache-Control": cache_control},
+        )
+
+    source_bytes = b""
+    try:
+        source_bytes = obj["Body"].read()
+        with Image.open(io.BytesIO(source_bytes)) as image:
+            image = ImageOps.exif_transpose(image)
+            src_w, src_h = image.size
+            target_w = int(w or 0)
+            target_h = int(h or 0)
+
+            if target_w and target_h:
+                image.thumbnail((target_w, target_h), Image.Resampling.LANCZOS)
+            elif target_w and src_w > 0 and src_h > 0:
+                scaled_h = max(1, int(round(src_h * (target_w / src_w))))
+                image = image.resize((target_w, scaled_h), Image.Resampling.LANCZOS)
+            elif target_h and src_w > 0 and src_h > 0:
+                scaled_w = max(1, int(round(src_w * (target_h / src_h))))
+                image = image.resize((scaled_w, target_h), Image.Resampling.LANCZOS)
+
+            output_format_raw = (fm or "").strip().lower()
+            if output_format_raw == "jpg":
+                output_format_raw = "jpeg"
+            if output_format_raw not in {"webp", "jpeg", "png"}:
+                if content_type.startswith("image/"):
+                    output_format_raw = content_type.split("/", 1)[1].lower()
+                if output_format_raw not in {"webp", "jpeg", "jpg", "png"}:
+                    output_format_raw = "jpeg"
+            if output_format_raw == "jpg":
+                output_format_raw = "jpeg"
+
+            if output_format_raw in {"jpeg", "jpg"} and image.mode not in {"RGB", "L"}:
+                image = image.convert("RGB")
+            elif output_format_raw == "png" and image.mode not in {"RGB", "RGBA", "L", "LA"}:
+                image = image.convert("RGBA")
+
+            out = io.BytesIO()
+            save_kwargs: dict[str, object] = {}
+            if output_format_raw in {"jpeg", "webp"}:
+                save_kwargs["quality"] = int(q or 72)
+            if output_format_raw == "jpeg":
+                save_kwargs["optimize"] = True
+            image.save(out, format=output_format_raw.upper(), **save_kwargs)
+            out.seek(0)
+            rendered_type = {
+                "jpeg": "image/jpeg",
+                "webp": "image/webp",
+                "png": "image/png",
+            }.get(output_format_raw, content_type)
+            return StreamingResponse(
+                iter([out.getvalue()]),
+                media_type=rendered_type,
+                headers={"Cache-Control": cache_control},
+            )
+    except HTTPException:
+        raise
+    except Exception:
+        if source_bytes:
+            return StreamingResponse(
+                iter([source_bytes]),
+                media_type=content_type,
+                headers={"Cache-Control": cache_control},
+            )
+        raise HTTPException(status_code=502, detail="Failed to transform photo.")
+
+
 def _sanitize_storage_segment(value: object, fallback: str) -> str:
     cleaned = re.sub(r"[^a-zA-Z0-9._-]+", "-", str(value or "").strip()).strip("-.")
     return cleaned or fallback
@@ -3907,100 +4034,77 @@ def get_uploaded_photo(
     q: int = Query(default=72, ge=35, le=95),
     fm: str | None = Query(default=None, pattern="^(?i:webp|jpeg|jpg|png)$"),
 ):
-    settings = _build_r2_settings()
-    resolved_key = _normalize_object_key(object_key, settings["bucket"])
-    if not resolved_key:
-        raise HTTPException(status_code=400, detail="Invalid photo key.")
-    try:
-        client = _make_r2_client(settings)
-        obj = client.get_object(Bucket=settings["bucket"], Key=resolved_key)
-    except ClientError as exc:
-        code = (exc.response.get("Error") or {}).get("Code", "")
-        if code in {"NoSuchKey", "404", "NotFound"}:
-            raise HTTPException(status_code=404, detail="Photo not found.")
-        raise HTTPException(status_code=502, detail="Failed to read photo from storage.")
-    except Exception:
-        raise HTTPException(status_code=502, detail="Failed to read photo from storage.")
+    return _stream_uploaded_photo_object(object_key, w=w, h=h, q=q, fm=fm)
 
-    content_type = obj.get("ContentType") or "application/octet-stream"
-    cache_control = obj.get("CacheControl") or "public, max-age=86400"
-    want_resize = bool(w or h or fm)
 
-    if not want_resize:
-        return StreamingResponse(
-            obj["Body"].iter_chunks(),
-            media_type=content_type,
-            headers={"Cache-Control": cache_control},
-        )
+def _append_photo_candidates(bucket: list[str], photo_url: str | None, photo_urls: object) -> None:
+    merged = _normalize_photo_urls(photo_urls)
+    primary = str(photo_url or "").trim()
+    if primary and primary not in merged:
+        merged.append(primary)
+    for raw in merged:
+        candidate = str(raw or "").strip()
+        if candidate and candidate not in bucket:
+            bucket.append(candidate)
 
-    source_bytes = b""
-    try:
-        source_bytes = obj["Body"].read()
-        with Image.open(io.BytesIO(source_bytes)) as image:
-            image = ImageOps.exif_transpose(image)
-            src_w, src_h = image.size
-            target_w = int(w or 0)
-            target_h = int(h or 0)
 
-            if target_w and target_h:
-                image.thumbnail((target_w, target_h), Image.Resampling.LANCZOS)
-            elif target_w and src_w > 0 and src_h > 0:
-                scaled_h = max(1, int(round(src_h * (target_w / src_w))))
-                image = image.resize((target_w, scaled_h), Image.Resampling.LANCZOS)
-            elif target_h and src_w > 0 and src_h > 0:
-                scaled_w = max(1, int(round(src_w * (target_h / src_h))))
-                image = image.resize((scaled_w, target_h), Image.Resampling.LANCZOS)
+@router.get("/trees/{tree_id}/photo")
+def get_tree_best_photo(
+    tree_id: int,
+    w: int | None = Query(default=None, ge=64, le=4096),
+    h: int | None = Query(default=None, ge=64, le=4096),
+    q: int = Query(default=72, ge=35, le=95),
+    fm: str | None = Query(default=None, pattern="^(?i:webp|jpeg|jpg|png)$"),
+    db: Session = Depends(get_db),
+):
+    tree = db.execute(
+        text(
+            """
+            SELECT id, photo_url, photo_urls
+            FROM trees
+            WHERE id = :tree_id
+            """
+        ),
+        {"tree_id": tree_id},
+    ).mappings().first()
+    if not tree:
+        raise HTTPException(status_code=404, detail="Tree not found.")
 
-            output_format_raw = (fm or "").strip().lower()
-            if output_format_raw == "jpg":
-                output_format_raw = "jpeg"
-            if output_format_raw not in {"webp", "jpeg", "png"}:
-                if content_type.startswith("image/"):
-                    output_format_raw = content_type.split("/", 1)[1].lower()
-                if output_format_raw not in {"webp", "jpeg", "jpg", "png"}:
-                    output_format_raw = "webp"
-                if output_format_raw == "jpg":
-                    output_format_raw = "jpeg"
+    candidates: list[str] = []
+    _append_photo_candidates(candidates, tree.get("photo_url"), tree.get("photo_urls"))
 
-            if output_format_raw == "jpeg":
-                if image.mode not in {"RGB", "L"}:
-                    image = image.convert("RGB")
-            elif output_format_raw == "png":
-                if image.mode not in {"RGB", "RGBA", "L", "LA", "P"}:
-                    image = image.convert("RGBA")
-            else:
-                if image.mode not in {"RGB", "RGBA", "L", "LA", "P"}:
-                    image = image.convert("RGB")
+    task_rows = list_tree_tasks(tree_id, db)
+    for task in task_rows:
+        _append_photo_candidates(candidates, task.get("photo_url"), task.get("photo_urls"))
 
-            output = io.BytesIO()
-            save_kwargs: dict[str, object] = {}
-            if output_format_raw in {"webp", "jpeg"}:
-                save_kwargs["quality"] = int(q)
-                save_kwargs["optimize"] = True
-            if output_format_raw == "jpeg":
-                save_kwargs["progressive"] = True
-            if output_format_raw == "png":
-                save_kwargs["optimize"] = True
+    visit_rows = db.execute(
+        text(
+            """
+            SELECT photo_url
+            FROM tree_visits
+            WHERE tree_id = :tree_id
+            ORDER BY visit_date DESC, created_at DESC, id DESC
+            """
+        ),
+        {"tree_id": tree_id},
+    ).mappings().all()
+    for visit in visit_rows:
+        _append_photo_candidates(candidates, visit.get("photo_url"), None)
 
-            image.save(output, format=output_format_raw.upper(), **save_kwargs)
-            payload = output.getvalue()
+    last_not_found: HTTPException | None = None
+    for candidate in candidates:
+        object_key = _extract_object_key_from_asset_value(candidate)
+        if not object_key:
+            continue
+        try:
+            return _stream_uploaded_photo_object(object_key, w=w, h=h, q=q, fm=fm)
+        except HTTPException as exc:
+            if exc.status_code == 404:
+                last_not_found = exc
+                continue
+            raise
 
-        transformed_cache_control = "public, max-age=31536000, immutable"
-        media_type = f"image/{'jpeg' if output_format_raw == 'jpeg' else output_format_raw}"
-        return Response(
-            content=payload,
-            media_type=media_type,
-            headers={"Cache-Control": transformed_cache_control},
-        )
-    except UnidentifiedImageError:
-        # Fallback for non-image payloads or malformed files.
-        if source_bytes:
-            return Response(content=source_bytes, media_type=content_type, headers={"Cache-Control": cache_control})
-        return StreamingResponse(obj["Body"].iter_chunks(), media_type=content_type, headers={"Cache-Control": cache_control})
-    except Exception:
-        if source_bytes:
-            return Response(content=source_bytes, media_type=content_type, headers={"Cache-Control": cache_control})
-        return StreamingResponse(obj["Body"].iter_chunks(), media_type=content_type, headers={"Cache-Control": cache_control})
+    raise last_not_found or HTTPException(status_code=404, detail="Tree photo not found.")
 
 
 @router.get("/organizations/logo-proxy")
