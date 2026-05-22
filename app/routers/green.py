@@ -11848,6 +11848,7 @@ def tree_timeline(tree_id: int, db: Session = Depends(get_db)):
             t.status,
             t.notes,
             t.photo_url,
+            t.photo_urls,
             t.created_by,
             t.created_at,
             t.tree_origin,
@@ -11867,15 +11868,34 @@ def tree_timeline(tree_id: int, db: Session = Depends(get_db)):
         LEFT JOIN green_custodians c ON c.id = t.custodian_id
         WHERE t.id = :tree_id
     """), {"tree_id": tree_id}).mappings().first()
-    tasks = list_tree_tasks(tree_id, db)
+    task_rows = list_tree_tasks(tree_id, db)
     visits = db.execute(text("""
         SELECT visit_date, status, notes, photo_url, created_by, created_at
         FROM tree_visits
         WHERE tree_id = :tree_id
         ORDER BY visit_date DESC
     """), {"tree_id": tree_id}).mappings().all()
+
+    tree_item = dict(tree) if tree else None
+    if tree_item:
+        tree_photo_urls = _normalize_photo_urls(tree_item.get("photo_urls"))
+        tree_photo_url = str(tree_item.get("photo_url") or "").strip()
+        if tree_photo_url and tree_photo_url not in tree_photo_urls:
+            tree_photo_urls.append(tree_photo_url)
+        tree_item["photo_urls"] = tree_photo_urls
+
+    tasks: list[dict] = []
+    for item in task_rows:
+        row = dict(item)
+        photo_urls = _normalize_photo_urls(row.get("photo_urls"))
+        photo_url = str(row.get("photo_url") or "").strip()
+        if photo_url and photo_url not in photo_urls:
+            photo_urls.append(photo_url)
+        row["photo_urls"] = photo_urls
+        tasks.append(row)
+
     return {
-        "tree": dict(tree) if tree else None,
+        "tree": tree_item,
         "tasks": tasks,
         "visits": [dict(v) for v in visits],
     }
