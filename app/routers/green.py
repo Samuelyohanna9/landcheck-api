@@ -4045,7 +4045,7 @@ def get_uploaded_photo(
 
 def _append_photo_candidates(bucket: list[str], photo_url: str | None, photo_urls: object) -> None:
     merged = _normalize_photo_urls(photo_urls)
-    primary = str(photo_url or "").trim()
+    primary = str(photo_url or "").strip()
     if primary and primary not in merged:
         merged.append(primary)
     for raw in merged:
