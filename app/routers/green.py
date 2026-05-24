@@ -801,7 +801,7 @@ def _deactivate_green_push_tokens(db: Session, tokens: list[str], *, user_id: in
         )
 
 
-def _list_green_push_tokens_for_assignee(db: Session, *, project_id: int, assignee_name: str | None) -> list[str]:
+def _list_green_push_targets_for_assignee(db: Session, *, project_id: int, assignee_name: str | None) -> list[dict]:
     assignee_clean = (assignee_name or "").strip()
     if not assignee_clean:
         return []
@@ -811,7 +811,7 @@ def _list_green_push_tokens_for_assignee(db: Session, *, project_id: int, assign
     rows = db.execute(
         text(
             """
-            SELECT DISTINCT pt.expo_push_token
+            SELECT DISTINCT pt.expo_push_token, LOWER(TRIM(COALESCE(pt.platform, ''))) AS platform
             FROM green_push_tokens pt
             JOIN green_users u ON u.id = pt.user_id
             WHERE COALESCE(pt.is_active, TRUE) = TRUE
@@ -826,7 +826,44 @@ def _list_green_push_tokens_for_assignee(db: Session, *, project_id: int, assign
         ),
         {"organization_id": int(org_id), "assignee_name": assignee_clean},
     ).mappings().all()
-    return [str(row.get("expo_push_token") or "").strip() for row in rows if str(row.get("expo_push_token") or "").strip()]
+    return [
+        {
+            "expo_push_token": str(row.get("expo_push_token") or "").strip(),
+            "platform": str(row.get("platform") or "").strip().lower() or None,
+        }
+        for row in rows
+        if str(row.get("expo_push_token") or "").strip()
+    ]
+
+
+def _list_green_push_tokens_for_assignee(db: Session, *, project_id: int, assignee_name: str | None) -> list[str]:
+    return [
+        str(row.get("expo_push_token") or "").strip()
+        for row in _list_green_push_targets_for_assignee(db, project_id=project_id, assignee_name=assignee_name)
+        if str(row.get("expo_push_token") or "").strip()
+    ]
+
+
+def _build_green_background_sync_messages(targets: list[dict], data: dict | None = None) -> list[dict]:
+    payload = dict(data or {})
+    payload["background_sync"] = True
+    payload["sync_scope"] = payload.get("sync_scope") or "assigned_projects"
+    messages: list[dict] = []
+    for target in targets:
+        token = str(target.get("expo_push_token") or "").strip()
+        platform = str(target.get("platform") or "").strip().lower()
+        if not token or platform != "android":
+            continue
+        messages.append(
+            {
+                "to": token,
+                "priority": "high",
+                "ttl": 600,
+                "_contentAvailable": True,
+                "data": payload,
+            }
+        )
+    return messages
 
 
 def _send_expo_push_messages(messages: list[dict]):
@@ -882,8 +919,8 @@ def _queue_green_push_to_assignee(
     body: str,
     data: dict | None = None,
 ):
-    tokens = _list_green_push_tokens_for_assignee(db, project_id=project_id, assignee_name=assignee_name)
-    if not tokens:
+    targets = _list_green_push_targets_for_assignee(db, project_id=project_id, assignee_name=assignee_name)
+    if not targets:
         return
     messages = [
         {
@@ -895,9 +932,12 @@ def _queue_green_push_to_assignee(
             "channelId": "green-alerts",
             "data": data or {},
         }
-        for token in tokens
+        for token in [str(row.get("expo_push_token") or "").strip() for row in targets if str(row.get("expo_push_token") or "").strip()]
     ]
     _send_expo_push_messages(messages)
+    background_messages = _build_green_background_sync_messages(targets, data=data)
+    if background_messages:
+        _send_expo_push_messages(background_messages)
 
 
 def _send_new_user_credentials_email(
