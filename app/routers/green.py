@@ -109,6 +109,30 @@ PLANTING_MODEL_VALUES = {"direct", "community_distributed", "mixed"}
 DEFAULT_PLANTING_MODEL = "direct"
 EXISTING_TREE_SCOPE_VALUES = {"exclude_from_planting_kpi", "include_in_planting_kpi"}
 DEFAULT_EXISTING_TREE_SCOPE = "exclude_from_planting_kpi"
+WORKFLOW_PROFILE_VALUES = {"green", "agric"}
+DEFAULT_WORKFLOW_PROFILE = "green"
+AGRIC_PROGRAM_TYPE_VALUES = {
+    "extension_support",
+    "input_support",
+    "traceability",
+    "finance_insurance",
+    "mixed",
+}
+AGRIC_GENDER_VALUES = {"male", "female"}
+AGRIC_LAND_TENURE_VALUES = {"owned", "family_owned", "leased", "shared", "communal", "other"}
+AGRIC_ACCESS_LEVEL_VALUES = {"yes", "no", "seasonal", "unknown"}
+AGRIC_IRRIGATION_TYPE_VALUES = {"rainfed", "manual", "pump", "drip", "sprinkler", "flood", "other"}
+AGRIC_PRODUCTION_STAGE_VALUES = {
+    "land_preparation",
+    "nursery",
+    "planting",
+    "vegetative",
+    "flowering",
+    "fruiting",
+    "harvest",
+    "post_harvest",
+}
+AGRIC_BOUNDARY_CAPTURE_METHOD_VALUES = {"point", "polygon_map", "polygon_gps_walk"}
 TREE_ORIGIN_VALUES = {"new_planting", "existing_inventory", "natural_regeneration"}
 TREE_ATTRIBUTION_SCOPE_VALUES = {"full", "monitor_only"}
 CUSTODIAN_TYPE_VALUES = {"household", "school", "community_group"}
@@ -1388,6 +1412,161 @@ def _safe_json(value: dict | list | None) -> str:
         return "{}"
 
 
+def _normalize_json_object(value: object) -> dict | None:
+    raw = value
+    if isinstance(raw, str):
+        text_value = raw.strip()
+        if not text_value:
+            return None
+        try:
+            raw = json.loads(text_value)
+        except Exception:
+            return None
+    return raw if isinstance(raw, dict) else None
+
+
+def _clean_text(value: object, max_length: int = 200) -> str | None:
+    text_value = str(value or "").strip()
+    if not text_value:
+        return None
+    return text_value[:max_length]
+
+
+def _clean_choice(value: object, allowed_values: set[str]) -> str | None:
+    normalized = _normalize_name(value).replace("-", "_").replace(" ", "_")
+    return normalized if normalized in allowed_values else None
+
+
+def _clean_int(value: object, *, minimum: int | None = None, maximum: int | None = None) -> int | None:
+    try:
+        next_value = int(value)
+    except Exception:
+        return None
+    if minimum is not None and next_value < minimum:
+        return None
+    if maximum is not None and next_value > maximum:
+        return None
+    return next_value
+
+
+def _clean_float(value: object, *, minimum: float | None = None, maximum: float | None = None) -> float | None:
+    try:
+        next_value = float(value)
+    except Exception:
+        return None
+    if minimum is not None and next_value < minimum:
+        return None
+    if maximum is not None and next_value > maximum:
+        return None
+    return round(next_value, 4)
+
+
+def _clean_bool(value: object) -> bool | None:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)) and value in {0, 1}:
+        return bool(value)
+    normalized = _normalize_name(value)
+    if normalized in {"true", "yes", "1"}:
+        return True
+    if normalized in {"false", "no", "0"}:
+        return False
+    return None
+
+
+def _normalize_workflow_profile(value: str | None) -> str:
+    normalized = _normalize_name(value)
+    if normalized in WORKFLOW_PROFILE_VALUES:
+        return normalized
+    return DEFAULT_WORKFLOW_PROFILE
+
+
+def _normalize_agric_config(value: object) -> dict | None:
+    raw = _normalize_json_object(value) or {}
+    if not raw:
+        return None
+    normalized: dict[str, object] = {}
+    program_type = _clean_choice(raw.get("program_type"), AGRIC_PROGRAM_TYPE_VALUES)
+    if program_type:
+        normalized["program_type"] = program_type
+    focus_commodities = _clean_text(raw.get("focus_commodities"), 240)
+    if focus_commodities:
+        normalized["focus_commodities"] = focus_commodities
+    support_packages = _clean_text(raw.get("support_packages"), 240)
+    if support_packages:
+        normalized["support_packages"] = support_packages
+    season_label = _clean_text(raw.get("season_label"), 120)
+    if season_label:
+        normalized["season_label"] = season_label
+    return normalized or None
+
+
+def _normalize_custodian_profile_data(value: object) -> dict | None:
+    raw = _normalize_json_object(value) or {}
+    if not raw:
+        return None
+    normalized: dict[str, object] = {}
+    for key in ("farmer_code", "national_id", "state_name", "ward_name", "farmer_group", "primary_crop", "secondary_crops", "input_support_needs"):
+        text_value = _clean_text(raw.get(key), 160 if key != "input_support_needs" else 240)
+        if text_value:
+            normalized[key] = text_value
+    gender = _clean_choice(raw.get("gender"), AGRIC_GENDER_VALUES)
+    if gender:
+        normalized["gender"] = gender
+    date_of_birth = _to_date_input(_parse_date_value(raw.get("date_of_birth")))
+    if date_of_birth:
+        normalized["date_of_birth"] = date_of_birth
+    household_size = _clean_int(raw.get("household_size"), minimum=1, maximum=200)
+    if household_size is not None:
+        normalized["household_size"] = household_size
+    land_tenure = _clean_choice(raw.get("land_tenure"), AGRIC_LAND_TENURE_VALUES)
+    if land_tenure:
+        normalized["land_tenure"] = land_tenure
+    irrigation_access = _clean_choice(raw.get("irrigation_access"), AGRIC_ACCESS_LEVEL_VALUES)
+    if irrigation_access:
+        normalized["irrigation_access"] = irrigation_access
+    finance_access = _clean_bool(raw.get("finance_access"))
+    if finance_access is not None:
+        normalized["finance_access"] = finance_access
+    insurance_access = _clean_bool(raw.get("insurance_access"))
+    if insurance_access is not None:
+        normalized["insurance_access"] = insurance_access
+    return normalized or None
+
+
+def _normalize_tree_record_profile_data(value: object, *, existing_area_sqm: float | None = None) -> dict | None:
+    raw = _normalize_json_object(value) or {}
+    if not raw and existing_area_sqm is None:
+        return None
+    normalized: dict[str, object] = {}
+    for key in ("plot_code", "plot_name", "commodity", "variety", "season_name", "land_use"):
+        text_value = _clean_text(raw.get(key), 160)
+        if text_value:
+            normalized[key] = text_value
+    season_year = _clean_int(raw.get("season_year"), minimum=2000, maximum=2100)
+    if season_year is not None:
+        normalized["season_year"] = season_year
+    irrigation_type = _clean_choice(raw.get("irrigation_type"), AGRIC_IRRIGATION_TYPE_VALUES)
+    if irrigation_type:
+        normalized["irrigation_type"] = irrigation_type
+    production_stage = _clean_choice(raw.get("production_stage"), AGRIC_PRODUCTION_STAGE_VALUES)
+    if production_stage:
+        normalized["production_stage"] = production_stage
+    boundary_capture_method = _clean_choice(raw.get("boundary_capture_method"), AGRIC_BOUNDARY_CAPTURE_METHOD_VALUES)
+    if boundary_capture_method:
+        normalized["boundary_capture_method"] = boundary_capture_method
+    estimated_yield_kg = _clean_float(raw.get("estimated_yield_kg"), minimum=0, maximum=100000000)
+    if estimated_yield_kg is not None:
+        normalized["estimated_yield_kg"] = estimated_yield_kg
+    if existing_area_sqm is not None and existing_area_sqm > 0:
+        normalized["area_hectares"] = round(float(existing_area_sqm) / 10000.0, 4)
+    else:
+        area_hectares = _clean_float(raw.get("area_hectares"), minimum=0, maximum=1000000)
+        if area_hectares is not None:
+            normalized["area_hectares"] = area_hectares
+    return normalized or None
+
+
 def _normalize_photo_urls(value: object) -> list[str]:
     raw: object = value
     if isinstance(raw, str):
@@ -1732,7 +1911,10 @@ def _list_trees_in_geojson(db: Session, *, project_id: int, area_geojson: dict) 
         ),
         {"project_id": int(project_id), "geojson": _safe_json(area_geojson)},
     ).mappings().all()
-    return [dict(row) for row in rows]
+    items = [dict(row) for row in rows]
+    for item in items:
+        item["profile_data"] = _normalize_custodian_profile_data(item.get("profile_data"))
+    return items
 
 
 def _compute_geojson_area_sqm(db: Session, *, area_geojson: dict) -> float:
@@ -1915,7 +2097,7 @@ def _get_project_settings(db: Session, project_id: int) -> dict:
     row = db.execute(
         text(
             """
-            SELECT id, planting_model, allow_existing_tree_link, default_existing_tree_scope
+            SELECT id, workflow_profile, agric_config, planting_model, allow_existing_tree_link, default_existing_tree_scope
             FROM tree_projects
             WHERE id = :project_id
             """
@@ -1926,6 +2108,8 @@ def _get_project_settings(db: Session, project_id: int) -> dict:
         raise HTTPException(status_code=404, detail="Project not found")
     return {
         "id": int(row.get("id")),
+        "workflow_profile": _normalize_workflow_profile(row.get("workflow_profile")),
+        "agric_config": _normalize_agric_config(row.get("agric_config")),
         "planting_model": _normalize_planting_model(row.get("planting_model")),
         "allow_existing_tree_link": bool(row.get("allow_existing_tree_link")),
         "default_existing_tree_scope": _normalize_existing_tree_scope(row.get("default_existing_tree_scope")),
@@ -2727,6 +2911,8 @@ def ensure_green_tables(db: Session):
             name TEXT NOT NULL,
             location_text TEXT,
             sponsor TEXT,
+            workflow_profile TEXT NOT NULL DEFAULT 'green',
+            agric_config JSONB,
             planting_model TEXT NOT NULL DEFAULT 'direct',
             allow_existing_tree_link BOOLEAN NOT NULL DEFAULT FALSE,
             default_existing_tree_scope TEXT NOT NULL DEFAULT 'exclude_from_planting_kpi',
@@ -2758,6 +2944,7 @@ def ensure_green_tables(db: Session):
             inventory_tree_count INTEGER NOT NULL DEFAULT 1,
             existing_area_geojson JSONB,
             existing_area_sqm NUMERIC,
+            record_profile_data JSONB,
             created_at TIMESTAMP DEFAULT NOW()
         )
     """))
@@ -2856,6 +3043,8 @@ def ensure_green_tables(db: Session):
         db.execute(text("ALTER TABLE green_roles ADD COLUMN IF NOT EXISTS is_active BOOLEAN NOT NULL DEFAULT TRUE"))
         db.execute(text("ALTER TABLE green_roles ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW()"))
         db.execute(text("ALTER TABLE tree_projects ADD COLUMN IF NOT EXISTS organization_id INTEGER"))
+        db.execute(text("ALTER TABLE tree_projects ADD COLUMN IF NOT EXISTS workflow_profile TEXT NOT NULL DEFAULT 'green'"))
+        db.execute(text("ALTER TABLE tree_projects ADD COLUMN IF NOT EXISTS agric_config JSONB"))
         db.execute(text("ALTER TABLE tree_projects ADD COLUMN IF NOT EXISTS planting_model TEXT NOT NULL DEFAULT 'direct'"))
         db.execute(text("ALTER TABLE tree_projects ADD COLUMN IF NOT EXISTS allow_existing_tree_link BOOLEAN NOT NULL DEFAULT FALSE"))
         db.execute(
@@ -2877,6 +3066,7 @@ def ensure_green_tables(db: Session):
         db.execute(text("ALTER TABLE trees ADD COLUMN IF NOT EXISTS inventory_tree_count INTEGER NOT NULL DEFAULT 1"))
         db.execute(text("ALTER TABLE trees ADD COLUMN IF NOT EXISTS existing_area_geojson JSONB"))
         db.execute(text("ALTER TABLE trees ADD COLUMN IF NOT EXISTS existing_area_sqm NUMERIC"))
+        db.execute(text("ALTER TABLE trees ADD COLUMN IF NOT EXISTS record_profile_data JSONB"))
     except Exception:
         db.rollback()
     try:
@@ -2919,6 +3109,7 @@ def ensure_green_tables(db: Session):
                 community_name TEXT,
                 verification_status TEXT NOT NULL DEFAULT 'pending',
                 notes TEXT,
+                profile_data JSONB,
                 created_by TEXT,
                 created_at TIMESTAMP DEFAULT NOW(),
                 updated_at TIMESTAMP DEFAULT NOW()
@@ -2932,6 +3123,7 @@ def ensure_green_tables(db: Session):
         db.execute(text("ALTER TABLE green_custodians ADD COLUMN IF NOT EXISTS email TEXT"))
         db.execute(text("ALTER TABLE green_custodians ADD COLUMN IF NOT EXISTS local_government TEXT"))
         db.execute(text("ALTER TABLE green_custodians ADD COLUMN IF NOT EXISTS notes TEXT"))
+        db.execute(text("ALTER TABLE green_custodians ADD COLUMN IF NOT EXISTS profile_data JSONB"))
     except Exception:
         db.rollback()
     db.execute(
@@ -3329,6 +3521,7 @@ def ensure_green_tables(db: Session):
     db.execute(text("CREATE INDEX IF NOT EXISTS idx_green_export_jobs_project_created ON green_export_jobs(project_id, created_at DESC)"))
     db.execute(text("CREATE INDEX IF NOT EXISTS idx_green_remote_monitoring_project_created ON green_remote_monitoring_areas(project_id, created_at DESC)"))
     db.execute(text("CREATE INDEX IF NOT EXISTS idx_tree_projects_model ON tree_projects(planting_model)"))
+    db.execute(text("CREATE INDEX IF NOT EXISTS idx_tree_projects_workflow_profile ON tree_projects(workflow_profile)"))
     db.execute(text("CREATE INDEX IF NOT EXISTS idx_tree_projects_org ON tree_projects(organization_id)"))
     db.execute(text("CREATE INDEX IF NOT EXISTS idx_trees_origin ON trees(tree_origin)"))
     db.execute(text("CREATE INDEX IF NOT EXISTS idx_trees_scope_flags ON trees(project_id, count_in_planting_kpis, count_in_carbon_scope)"))
@@ -4443,10 +4636,14 @@ def create_project(
     location_text: str = Body(default=""),
     sponsor: str = Body(default=""),
     organization_id: int | None = Body(default=None),
+    workflow_profile: str = Body(default=DEFAULT_WORKFLOW_PROFILE),
+    agric_config: dict | None = Body(default=None),
     planting_model: str = Body(default=DEFAULT_PLANTING_MODEL),
     allow_existing_tree_link: bool = Body(default=False),
     default_existing_tree_scope: str = Body(default=DEFAULT_EXISTING_TREE_SCOPE),
 ):
+    normalized_workflow_profile = _normalize_workflow_profile(workflow_profile)
+    normalized_agric_config = _normalize_agric_config(agric_config)
     normalized_model = _normalize_planting_model(planting_model)
     normalized_existing_scope = _normalize_existing_tree_scope(default_existing_tree_scope)
     org_id_value = int(organization_id) if organization_id is not None else None
@@ -4462,24 +4659,31 @@ def create_project(
     row = db.execute(
         text("""
             INSERT INTO tree_projects (
-                organization_id, name, location_text, sponsor, planting_model, allow_existing_tree_link, default_existing_tree_scope
+                organization_id, name, location_text, sponsor, workflow_profile, agric_config,
+                planting_model, allow_existing_tree_link, default_existing_tree_scope
             )
             VALUES (
-                :organization_id, :name, :location_text, :sponsor, :planting_model, :allow_existing_tree_link, :default_existing_tree_scope
+                :organization_id, :name, :location_text, :sponsor, :workflow_profile, CAST(:agric_config AS JSONB),
+                :planting_model, :allow_existing_tree_link, :default_existing_tree_scope
             )
-            RETURNING id, organization_id, name, location_text, sponsor, planting_model, allow_existing_tree_link, default_existing_tree_scope, created_at
+            RETURNING id, organization_id, name, location_text, sponsor, workflow_profile, agric_config,
+                      planting_model, allow_existing_tree_link, default_existing_tree_scope, created_at
         """),
         {
             "organization_id": org_id_value,
             "name": name,
             "location_text": location_text,
             "sponsor": sponsor,
+            "workflow_profile": normalized_workflow_profile,
+            "agric_config": _safe_json(normalized_agric_config),
             "planting_model": normalized_model,
             "allow_existing_tree_link": bool(allow_existing_tree_link),
             "default_existing_tree_scope": normalized_existing_scope,
         },
     ).mappings().first()
     project = dict(row)
+    project["workflow_profile"] = _normalize_workflow_profile(project.get("workflow_profile"))
+    project["agric_config"] = _normalize_agric_config(project.get("agric_config"))
     _log_audit_event(
         db,
         project_id=project["id"],
@@ -4490,6 +4694,8 @@ def create_project(
             "name": project.get("name"),
             "location_text": project.get("location_text"),
             "organization_id": project.get("organization_id"),
+            "workflow_profile": project.get("workflow_profile"),
+            "agric_config": project.get("agric_config"),
             "planting_model": project.get("planting_model"),
             "allow_existing_tree_link": bool(project.get("allow_existing_tree_link")),
             "default_existing_tree_scope": project.get("default_existing_tree_scope"),
@@ -4616,6 +4822,8 @@ def delete_project(
 def update_project_settings(
     project_id: int,
     db: Session = Depends(get_db),
+    workflow_profile: str | None = Body(default=None),
+    agric_config: dict | None = Body(default=None),
     planting_model: str | None = Body(default=None),
     allow_existing_tree_link: bool | None = Body(default=None),
     default_existing_tree_scope: str | None = Body(default=None),
@@ -4623,7 +4831,7 @@ def update_project_settings(
     existing = db.execute(
         text(
             """
-            SELECT id, planting_model, allow_existing_tree_link, default_existing_tree_scope
+            SELECT id, workflow_profile, agric_config, planting_model, allow_existing_tree_link, default_existing_tree_scope
             FROM tree_projects
             WHERE id = :project_id
             """
@@ -4633,6 +4841,16 @@ def update_project_settings(
     if not existing:
         raise HTTPException(status_code=404, detail="Project not found")
 
+    next_workflow_profile = (
+        _normalize_workflow_profile(workflow_profile)
+        if workflow_profile is not None
+        else _normalize_workflow_profile(existing.get("workflow_profile"))
+    )
+    next_agric_config = (
+        _normalize_agric_config(agric_config)
+        if agric_config is not None
+        else _normalize_agric_config(existing.get("agric_config"))
+    )
     next_model = _normalize_planting_model(planting_model) if planting_model is not None else _normalize_planting_model(existing.get("planting_model"))
     next_allow_existing = (
         bool(allow_existing_tree_link)
@@ -4649,20 +4867,28 @@ def update_project_settings(
         text(
             """
             UPDATE tree_projects
-            SET planting_model = :planting_model,
+            SET workflow_profile = :workflow_profile,
+                agric_config = CAST(:agric_config AS JSONB),
+                planting_model = :planting_model,
                 allow_existing_tree_link = :allow_existing_tree_link,
                 default_existing_tree_scope = :default_existing_tree_scope
             WHERE id = :project_id
-            RETURNING id, name, location_text, sponsor, planting_model, allow_existing_tree_link, default_existing_tree_scope, created_at
+            RETURNING id, name, location_text, sponsor, workflow_profile, agric_config,
+                      planting_model, allow_existing_tree_link, default_existing_tree_scope, created_at
             """
         ),
         {
             "project_id": project_id,
+            "workflow_profile": next_workflow_profile,
+            "agric_config": _safe_json(next_agric_config),
             "planting_model": next_model,
             "allow_existing_tree_link": next_allow_existing,
             "default_existing_tree_scope": next_scope,
         },
     ).mappings().first()
+    payload = dict(row)
+    payload["workflow_profile"] = _normalize_workflow_profile(payload.get("workflow_profile"))
+    payload["agric_config"] = _normalize_agric_config(payload.get("agric_config"))
     _log_audit_event(
         db,
         project_id=project_id,
@@ -4672,6 +4898,8 @@ def update_project_settings(
         details={
             "before": dict(existing),
             "after": {
+                "workflow_profile": next_workflow_profile,
+                "agric_config": next_agric_config,
                 "planting_model": next_model,
                 "allow_existing_tree_link": next_allow_existing,
                 "default_existing_tree_scope": next_scope,
@@ -4679,7 +4907,7 @@ def update_project_settings(
         },
     )
     db.commit()
-    return dict(row)
+    return payload
 
 
 @router.patch("/projects/{project_id}/organization")
@@ -5277,6 +5505,7 @@ def list_projects(
     rows = db.execute(text("""
         SELECT
             p.id, p.organization_id, p.name, p.location_text, p.sponsor,
+            p.workflow_profile, p.agric_config,
             p.planting_model, p.allow_existing_tree_link, p.default_existing_tree_scope, p.created_at,
             o.name AS organization_name, o.slug AS organization_slug, o.status AS organization_status,
             o.logo_url AS organization_logo_url
@@ -5312,6 +5541,8 @@ def list_projects(
     }).mappings().all()
     items = [dict(r) for r in rows]
     for item in items:
+        item["workflow_profile"] = _normalize_workflow_profile(item.get("workflow_profile"))
+        item["agric_config"] = _normalize_agric_config(item.get("agric_config"))
         item["organization_logo_url"] = _normalize_logo_asset_path(item.get("organization_logo_url"))
     return items
 
@@ -5326,6 +5557,7 @@ def get_project(
     project = db.execute(text("""
         SELECT
             p.id, p.organization_id, p.name, p.location_text, p.sponsor,
+            p.workflow_profile, p.agric_config,
             p.planting_model, p.allow_existing_tree_link, p.default_existing_tree_scope, p.created_at,
             o.name AS organization_name, o.slug AS organization_slug, o.status AS organization_status,
             o.logo_url AS organization_logo_url
@@ -5336,6 +5568,8 @@ def get_project(
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
     project = dict(project)
+    project["workflow_profile"] = _normalize_workflow_profile(project.get("workflow_profile"))
+    project["agric_config"] = _normalize_agric_config(project.get("agric_config"))
     project["organization_logo_url"] = _normalize_logo_asset_path(project.get("organization_logo_url"))
 
     if assignee_clean:
@@ -5456,6 +5690,8 @@ def get_project(
             "survival_rate": survival_rate,
         },
         "settings": {
+            "workflow_profile": _normalize_workflow_profile(project.get("workflow_profile")),
+            "agric_config": _normalize_agric_config(project.get("agric_config")),
             "planting_model": _normalize_planting_model(project.get("planting_model")),
             "allow_existing_tree_link": bool(project.get("allow_existing_tree_link")),
             "default_existing_tree_scope": _normalize_existing_tree_scope(project.get("default_existing_tree_scope")),
@@ -5519,6 +5755,7 @@ def list_trees(
                COALESCE(t.inventory_tree_count, 1) AS inventory_tree_count,
                t.existing_area_geojson,
                t.existing_area_sqm,
+               t.record_profile_data,
                ST_X(geom) AS lng, ST_Y(geom) AS lat
         FROM trees t
         LEFT JOIN green_custodians c ON c.id = t.custodian_id
@@ -5526,7 +5763,13 @@ def list_trees(
           AND (:assignee_name IS NULL OR LOWER(TRIM(COALESCE(t.created_by, ''))) = LOWER(TRIM(:assignee_name)))
         ORDER BY t.created_at DESC
     """), {"project_id": project_id, "assignee_name": assignee_clean}).mappings().all()
-    return [dict(r) for r in rows]
+    items = [dict(r) for r in rows]
+    for item in items:
+        item["record_profile_data"] = _normalize_tree_record_profile_data(
+            item.get("record_profile_data"),
+            existing_area_sqm=float(item.get("existing_area_sqm") or 0) if item.get("existing_area_sqm") is not None else None,
+        )
+    return items
 
 
 @router.get("/projects/{project_id}/custodians")
@@ -5549,6 +5792,7 @@ def list_custodians(project_id: int, db: Session = Depends(get_db)):
                 community_name,
                 verification_status,
                 notes,
+                profile_data,
                 created_by,
                 created_at,
                 updated_at
@@ -5577,23 +5821,25 @@ def create_custodian(
     community_name: str | None = Body(default=None),
     verification_status: str = Body(default="pending"),
     notes: str | None = Body(default=None),
+    profile_data: dict | None = Body(default=None),
     created_by: str | None = Body(default=None),
 ):
     _get_project_settings(db, project_id)
     clean_name = (name or "").strip()
     if not clean_name:
         raise HTTPException(status_code=400, detail="Custodian name is required")
+    normalized_profile_data = _normalize_custodian_profile_data(profile_data)
 
     row = db.execute(
         text(
             """
             INSERT INTO green_custodians (
                 project_id, custodian_type, name, contact_person, phone, alt_phone, email, address_text,
-                local_government, community_name, verification_status, notes, created_by
+                local_government, community_name, verification_status, notes, profile_data, created_by
             )
             VALUES (
                 :project_id, :custodian_type, :name, :contact_person, :phone, :alt_phone, :email, :address_text,
-                :local_government, :community_name, :verification_status, :notes, :created_by
+                :local_government, :community_name, :verification_status, :notes, CAST(:profile_data AS JSONB), :created_by
             )
             RETURNING
                 id,
@@ -5609,6 +5855,7 @@ def create_custodian(
                 community_name,
                 verification_status,
                 notes,
+                profile_data,
                 created_by,
                 created_at,
                 updated_at
@@ -5627,9 +5874,12 @@ def create_custodian(
             "community_name": (community_name or "").strip() or None,
             "verification_status": (_normalize_name(verification_status) or "pending"),
             "notes": (notes or "").strip() or None,
+            "profile_data": _safe_json(normalized_profile_data),
             "created_by": (created_by or "").strip() or None,
         },
     ).mappings().first()
+    payload = dict(row)
+    payload["profile_data"] = _normalize_custodian_profile_data(payload.get("profile_data"))
     _log_audit_event(
         db,
         project_id=project_id,
@@ -5643,10 +5893,11 @@ def create_custodian(
             "contact_person": row.get("contact_person"),
             "email": row.get("email"),
             "community_name": row.get("community_name"),
+            "profile_data": payload.get("profile_data"),
         },
     )
     db.commit()
-    return dict(row)
+    return payload
 
 
 @router.patch("/custodians/{custodian_id}")
@@ -5664,13 +5915,14 @@ def update_custodian(
     community_name: str | None = Body(default=None),
     verification_status: str | None = Body(default=None),
     notes: str | None = Body(default=None),
+    profile_data: dict | None = Body(default=None),
 ):
     existing = db.execute(
         text(
             """
             SELECT
                 id, project_id, custodian_type, name, contact_person, phone, alt_phone, email,
-                address_text, local_government, community_name, verification_status, notes
+                address_text, local_government, community_name, verification_status, notes, profile_data
             FROM green_custodians
             WHERE id = :custodian_id
             """
@@ -5683,6 +5935,11 @@ def update_custodian(
     next_name = (name or "").strip() if name is not None else str(existing.get("name") or "").strip()
     if not next_name:
         raise HTTPException(status_code=400, detail="Custodian name is required")
+    next_profile_data = (
+        _normalize_custodian_profile_data(profile_data)
+        if profile_data is not None
+        else _normalize_custodian_profile_data(existing.get("profile_data"))
+    )
 
     row = db.execute(
         text(
@@ -5700,6 +5957,7 @@ def update_custodian(
                 community_name = COALESCE(:community_name, community_name),
                 verification_status = COALESCE(:verification_status, verification_status),
                 notes = COALESCE(:notes, notes),
+                profile_data = CAST(:profile_data AS JSONB),
                 updated_at = NOW()
             WHERE id = :custodian_id
             RETURNING
@@ -5716,6 +5974,7 @@ def update_custodian(
                 community_name,
                 verification_status,
                 notes,
+                profile_data,
                 created_by,
                 created_at,
                 updated_at
@@ -5734,18 +5993,24 @@ def update_custodian(
             "community_name": ((community_name or "").strip() or None) if community_name is not None else None,
             "verification_status": (_normalize_name(verification_status) or "pending") if verification_status is not None else None,
             "notes": ((notes or "").strip() or None) if notes is not None else None,
+            "profile_data": _safe_json(next_profile_data),
         },
     ).mappings().first()
+    payload = dict(row)
+    payload["profile_data"] = _normalize_custodian_profile_data(payload.get("profile_data"))
     _log_audit_event(
         db,
         project_id=int(existing.get("project_id")),
         entity_type="custodian",
         entity_id=custodian_id,
         action="custodian_updated",
-        details={"before": dict(existing), "after": dict(row)},
+        details={
+            "before": {**dict(existing), "profile_data": _normalize_custodian_profile_data(existing.get("profile_data"))},
+            "after": payload,
+        },
     )
     db.commit()
-    return dict(row)
+    return payload
 
 
 @router.get("/projects/{project_id}/distribution-events")
@@ -6761,6 +7026,7 @@ def add_tree(
     tree_age_months: float | None = Body(default=None),
     inventory_tree_count: int | None = Body(default=None),
     existing_area_geojson: dict | str | None = Body(default=None),
+    record_profile_data: dict | None = Body(default=None),
 ):
     project_settings = _get_project_settings(db, int(project_id))
     origin = _normalize_tree_origin(tree_origin)
@@ -6827,6 +7093,10 @@ def add_tree(
             )
         except Exception:
             raise HTTPException(status_code=400, detail="Invalid existing_area_geojson")
+    normalized_record_profile_data = _normalize_tree_record_profile_data(
+        record_profile_data,
+        existing_area_sqm=existing_area_sqm_value,
+    )
 
     resolved_scope, planting_scope_flag, carbon_scope_flag = _resolve_tree_scope_defaults(
         tree_origin=origin,
@@ -6876,7 +7146,7 @@ def add_tree(
             project_id, project_tree_no, geom, species, planting_date, status, notes, photo_url, photo_urls, created_by,
             tree_origin, custodian_id, custody_started_at, attribution_scope,
             count_in_planting_kpis, count_in_carbon_scope, source_project_id, tree_height_m, tree_age_months,
-            inventory_tree_count, existing_area_geojson, existing_area_sqm
+            inventory_tree_count, existing_area_geojson, existing_area_sqm, record_profile_data
         )
         VALUES (
             :project_id,
@@ -6900,7 +7170,8 @@ def add_tree(
             :tree_age_months,
             :inventory_tree_count,
             CAST(:existing_area_geojson AS JSONB),
-            :existing_area_sqm
+            :existing_area_sqm,
+            CAST(:record_profile_data AS JSONB)
         )
         RETURNING id
     """), {
@@ -6927,6 +7198,7 @@ def add_tree(
         "inventory_tree_count": inventory_tree_count_value,
         "existing_area_geojson": _safe_json(normalized_existing_area_geojson),
         "existing_area_sqm": existing_area_sqm_value,
+        "record_profile_data": _safe_json(normalized_record_profile_data),
     }).scalar()
 
     _record_tree_status_history(
@@ -7082,6 +7354,7 @@ def update_tree(
     tree_age_months: float | None = Body(default=None),
     inventory_tree_count: int | None = Body(default=None),
     existing_area_geojson: dict | str | None = Body(default=None),
+    record_profile_data: dict | None = Body(default=None),
 ):
     if (lng is None) != (lat is None):
         raise HTTPException(status_code=400, detail="Both lng and lat are required together")
@@ -7166,7 +7439,8 @@ def update_tree(
                 tree_age_months,
                 COALESCE(inventory_tree_count, 1) AS inventory_tree_count,
                 existing_area_geojson,
-                existing_area_sqm
+                existing_area_sqm,
+                record_profile_data
             FROM trees
             WHERE id = :tree_id
             """
@@ -7253,6 +7527,25 @@ def update_tree(
             )
         except Exception:
             raise HTTPException(status_code=400, detail="Invalid existing_area_geojson")
+    next_record_profile_data = (
+        _normalize_tree_record_profile_data(
+            record_profile_data,
+            existing_area_sqm=existing_area_sqm_value
+            if existing_area_geojson is not None
+            else (
+                float(existing.get("existing_area_sqm") or 0)
+                if existing.get("existing_area_sqm") is not None
+                else None
+            ),
+        )
+        if record_profile_data is not None
+        else _normalize_tree_record_profile_data(
+            existing.get("record_profile_data"),
+            existing_area_sqm=float(existing.get("existing_area_sqm") or 0)
+            if existing.get("existing_area_sqm") is not None
+            else None,
+        )
+    )
 
     effective_photo_url = None
     effective_photo_urls_json = None
@@ -7286,7 +7579,8 @@ def update_tree(
             tree_age_months = COALESCE(:tree_age_months, tree_age_months),
             inventory_tree_count = COALESCE(:inventory_tree_count, inventory_tree_count),
             existing_area_geojson = COALESCE(CAST(:existing_area_geojson AS JSONB), existing_area_geojson),
-            existing_area_sqm = COALESCE(:existing_area_sqm, existing_area_sqm)
+            existing_area_sqm = COALESCE(:existing_area_sqm, existing_area_sqm),
+            record_profile_data = CAST(:record_profile_data AS JSONB)
         WHERE id = :tree_id
     """), {
         "lng": lng,
@@ -7309,6 +7603,7 @@ def update_tree(
         "inventory_tree_count": inventory_tree_count_value,
         "existing_area_geojson": _safe_json(normalized_existing_area_geojson) if existing_area_geojson is not None else None,
         "existing_area_sqm": existing_area_sqm_value,
+        "record_profile_data": _safe_json(next_record_profile_data),
         "tree_id": tree_id,
     })
     previous_status = _normalize_tree_status(existing.get("status"))
@@ -7375,6 +7670,7 @@ def update_tree(
                 "existing_area_sqm": (
                     existing_area_sqm_value if existing_area_geojson is not None else existing.get("existing_area_sqm")
                 ),
+                "record_profile_data": next_record_profile_data,
             },
         },
     )
@@ -13285,6 +13581,8 @@ def _fetch_existing_tree_export_rows(project_id: int, db: Session) -> list[dict]
                 COALESCE(t.inventory_tree_count, 1) AS inventory_tree_count,
                 t.existing_area_geojson,
                 t.existing_area_sqm,
+                t.record_profile_data,
+                c.profile_data AS custodian_profile_data,
                 ST_X(t.geom) AS lng,
                 ST_Y(t.geom) AS lat
             FROM trees t
@@ -13327,6 +13625,11 @@ def _fetch_existing_tree_export_rows(project_id: int, db: Session) -> list[dict]
             if item.get("existing_area_sqm") is not None
             else None
         )
+        item["record_profile_data"] = _normalize_tree_record_profile_data(
+            item.get("record_profile_data"),
+            existing_area_sqm=item.get("existing_area_sqm"),
+        )
+        item["custodian_profile_data"] = _normalize_custodian_profile_data(item.get("custodian_profile_data"))
         item.update(review_summary.get(int(item.get("id") or 0), {}))
         item.update(_build_tree_carbon_metrics(item, projection_years=40, enforce_carbon_scope=True))
         enriched.append(item)
@@ -13487,6 +13790,13 @@ def export_existing_trees_csv(project_id: int, db: Session = Depends(get_db)):
     project = get_project(project_id, db)
     rows = _fetch_existing_tree_export_rows(project_id, db)
     summary = _summarize_existing_tree_export_rows(rows)
+    workflow_profile = _normalize_workflow_profile(project.get("workflow_profile"))
+    agric_config = _normalize_agric_config(project.get("agric_config")) or {}
+    export_title = (
+        "LandCheck Agric Plot Records Detailed Export"
+        if workflow_profile == "agric"
+        else "LandCheck Existing Trees Detailed Export"
+    )
 
     os.makedirs(REPORTS_DIR, exist_ok=True)
     tmp_csv = tempfile.NamedTemporaryFile(suffix="_existing_trees_detailed.csv", delete=False)
@@ -13495,9 +13805,18 @@ def export_existing_trees_csv(project_id: int, db: Session = Depends(get_db)):
 
     with open(csv_path, "w", newline="", encoding="utf-8-sig") as f:
         writer = _excel_csv_writer(f)
-        writer.writerow(["LandCheck Existing Trees Detailed Export"])
+        writer.writerow([export_title])
         writer.writerow(["Project", project.get("name", "")])
         writer.writerow(["Location", project.get("location_text", "")])
+        writer.writerow(["Workflow Profile", workflow_profile])
+        if workflow_profile == "agric":
+            writer.writerow([
+                "Agric Program",
+                agric_config.get("program_type") or "",
+                agric_config.get("focus_commodities") or "",
+                agric_config.get("support_packages") or "",
+                agric_config.get("season_label") or "",
+            ])
         writer.writerow(["Generated At (UTC)", datetime.utcnow().isoformat()])
         writer.writerow([])
         writer.writerow([
@@ -13563,8 +13882,37 @@ def export_existing_trees_csv(project_id: int, db: Session = Depends(get_db)):
             "last_review_note",
             "last_submitted_at",
             "last_reviewed_at",
+            "plot_code",
+            "plot_name",
+            "commodity",
+            "variety",
+            "season_name",
+            "season_year",
+            "land_use",
+            "irrigation_type",
+            "production_stage",
+            "estimated_yield_kg",
+            "boundary_capture_method",
+            "plot_area_hectares",
+            "farmer_code",
+            "farmer_primary_crop",
+            "farmer_group",
+            "farmer_state",
+            "farmer_ward",
+            "farmer_household_size",
+            "farmer_land_tenure",
+            "farmer_irrigation_access",
+            "farmer_finance_access",
+            "farmer_insurance_access",
+            "record_profile_data_json",
+            "custodian_profile_data_json",
         ])
         for row in rows:
+            record_profile_data = _normalize_tree_record_profile_data(
+                row.get("record_profile_data"),
+                existing_area_sqm=row.get("existing_area_sqm"),
+            ) or {}
+            custodian_profile_data = _normalize_custodian_profile_data(row.get("custodian_profile_data")) or {}
             writer.writerow([
                 row.get("id"),
                 row.get("project_tree_no"),
@@ -13615,6 +13963,30 @@ def export_existing_trees_csv(project_id: int, db: Session = Depends(get_db)):
                 row.get("last_review_note", ""),
                 _to_iso_text(row.get("last_submitted_at")),
                 _to_iso_text(row.get("last_reviewed_at")),
+                record_profile_data.get("plot_code"),
+                record_profile_data.get("plot_name"),
+                record_profile_data.get("commodity"),
+                record_profile_data.get("variety"),
+                record_profile_data.get("season_name"),
+                record_profile_data.get("season_year"),
+                record_profile_data.get("land_use"),
+                record_profile_data.get("irrigation_type"),
+                record_profile_data.get("production_stage"),
+                record_profile_data.get("estimated_yield_kg"),
+                record_profile_data.get("boundary_capture_method"),
+                record_profile_data.get("area_hectares"),
+                custodian_profile_data.get("farmer_code"),
+                custodian_profile_data.get("primary_crop"),
+                custodian_profile_data.get("farmer_group"),
+                custodian_profile_data.get("state_name"),
+                custodian_profile_data.get("ward_name"),
+                custodian_profile_data.get("household_size"),
+                custodian_profile_data.get("land_tenure"),
+                custodian_profile_data.get("irrigation_access"),
+                custodian_profile_data.get("finance_access"),
+                custodian_profile_data.get("insurance_access"),
+                _safe_json(record_profile_data) if record_profile_data else "",
+                _safe_json(custodian_profile_data) if custodian_profile_data else "",
             ])
 
     filename = f"project_{project_id}_existing_trees_detailed.csv"
