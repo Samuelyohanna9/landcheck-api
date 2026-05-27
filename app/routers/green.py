@@ -1564,7 +1564,135 @@ def _normalize_tree_record_profile_data(value: object, *, existing_area_sqm: flo
         area_hectares = _clean_float(raw.get("area_hectares"), minimum=0, maximum=1000000)
         if area_hectares is not None:
             normalized["area_hectares"] = area_hectares
+    support_placeholder = _clean_bool(raw.get("support_placeholder"))
+    if support_placeholder is not None:
+        normalized["support_placeholder"] = support_placeholder
+    hidden_from_records = _clean_bool(raw.get("hidden_from_records"))
+    if hidden_from_records is not None:
+        normalized["hidden_from_records"] = hidden_from_records
+    placeholder_reason = _clean_text(raw.get("placeholder_reason"), 120)
+    if placeholder_reason:
+        normalized["placeholder_reason"] = placeholder_reason
     return normalized or None
+
+
+def _is_hidden_tree_record(value: object) -> bool:
+    raw = _normalize_json_object(value) or {}
+    if _clean_bool(raw.get("hidden_from_records")) is True:
+        return True
+    if _clean_bool(raw.get("support_placeholder")) is True:
+        return True
+    return _clean_text(raw.get("placeholder_reason"), 120) == "support_visit_before_plot_capture"
+
+
+def _get_or_create_support_placeholder_tree(
+    db: Session,
+    *,
+    project_id: int,
+    custodian_id: int,
+    event_species: str | None = None,
+    actor_name: str | None = None,
+) -> dict:
+    existing = db.execute(
+        text(
+            """
+            SELECT id, species, status, planting_date, ST_X(geom) AS lng, ST_Y(geom) AS lat
+            FROM trees
+            WHERE project_id = :project_id
+              AND custodian_id = :custodian_id
+              AND LOWER(COALESCE(record_profile_data->>'placeholder_reason', '')) = 'support_visit_before_plot_capture'
+            ORDER BY created_at ASC, id ASC
+            LIMIT 1
+            """
+        ),
+        {
+            "project_id": int(project_id),
+            "custodian_id": int(custodian_id),
+        },
+    ).mappings().first()
+    if existing:
+        return dict(existing)
+
+    project_tree_no = _next_project_tree_no(db, int(project_id))
+    placeholder_species = _clean_text(event_species, 160) or "Plot pending capture"
+    placeholder_record_profile = _normalize_tree_record_profile_data(
+        {
+            "plot_name": "Plot pending capture",
+            "commodity": placeholder_species if placeholder_species != "Plot pending capture" else None,
+            "support_placeholder": True,
+            "hidden_from_records": True,
+            "placeholder_reason": "support_visit_before_plot_capture",
+        }
+    )
+    row = db.execute(
+        text(
+            """
+            INSERT INTO trees (
+                project_id, project_tree_no, geom, species, planting_date, status, notes, photo_url, photo_urls, created_by,
+                tree_origin, custodian_id, custody_started_at, attribution_scope,
+                count_in_planting_kpis, count_in_carbon_scope, source_project_id, tree_height_m, tree_age_months,
+                inventory_tree_count, existing_area_geojson, existing_area_sqm, record_profile_data
+            )
+            VALUES (
+                :project_id,
+                :project_tree_no,
+                NULL,
+                :species,
+                NULL,
+                'healthy',
+                :notes,
+                NULL,
+                CAST(:photo_urls AS JSONB),
+                :created_by,
+                'existing_inventory',
+                :custodian_id,
+                NULL,
+                'monitor_only',
+                FALSE,
+                FALSE,
+                NULL,
+                NULL,
+                NULL,
+                1,
+                NULL,
+                NULL,
+                CAST(:record_profile_data AS JSONB)
+            )
+            RETURNING id, species, status, planting_date
+            """
+        ),
+        {
+            "project_id": int(project_id),
+            "project_tree_no": int(project_tree_no),
+            "species": placeholder_species,
+            "notes": "Hidden placeholder plot created automatically before the first support visit capture.",
+            "photo_urls": _safe_json([]),
+            "created_by": (actor_name or "").strip() or "system",
+            "custodian_id": int(custodian_id),
+            "record_profile_data": _safe_json(placeholder_record_profile),
+        },
+    ).mappings().first()
+    tree_row = {
+        "id": int(row.get("id") or 0),
+        "species": row.get("species"),
+        "status": row.get("status"),
+        "planting_date": row.get("planting_date"),
+        "lng": None,
+        "lat": None,
+    }
+    _log_audit_event(
+        db,
+        project_id=int(project_id),
+        entity_type="tree",
+        entity_id=int(tree_row["id"]),
+        action="support_placeholder_created",
+        actor=(actor_name or "").strip() or "system",
+        details={
+            "custodian_id": int(custodian_id),
+            "reason": "support_visit_before_plot_capture",
+        },
+    )
+    return tree_row
 
 
 def _normalize_photo_urls(value: object) -> list[str]:
@@ -6336,10 +6464,16 @@ def assign_distribution_supervision(
     if supervision_target <= 0:
         raise HTTPException(status_code=400, detail="Set supervision target in allocation before assigning visits")
 
-    tree_rows = db.execute(
+    project_settings = _get_project_settings(db, int(allocation.get("project_id") or 0))
+    workflow_profile = _normalize_workflow_profile(project_settings.get("workflow_profile"))
+    owner_label = "farmer" if workflow_profile == "agric" else "custodian"
+    entity_label = "plot" if workflow_profile == "agric" else "tree"
+    visit_label = "Farmer support visit" if workflow_profile == "agric" else "Custodian supervision visit"
+
+    tree_rows_all = db.execute(
         text(
             """
-            SELECT id, species, status, planting_date, ST_X(geom) AS lng, ST_Y(geom) AS lat
+            SELECT id, species, status, planting_date, ST_X(geom) AS lng, ST_Y(geom) AS lat, record_profile_data
             FROM trees
             WHERE project_id = :project_id
               AND custodian_id = :custodian_id
@@ -6351,8 +6485,22 @@ def assign_distribution_supervision(
             "custodian_id": int(allocation.get("custodian_id") or 0),
         },
     ).mappings().all()
+    tree_rows = [dict(row) for row in tree_rows_all if not _is_hidden_tree_record(row.get("record_profile_data"))]
+    if not tree_rows and workflow_profile == "agric":
+        tree_rows = [
+            _get_or_create_support_placeholder_tree(
+                db,
+                project_id=int(allocation.get("project_id") or 0),
+                custodian_id=int(allocation.get("custodian_id") or 0),
+                event_species=_clean_text(allocation.get("event_species"), 160),
+                actor_name=actor_name,
+            )
+        ]
     if not tree_rows:
-        raise HTTPException(status_code=400, detail="No trees linked to this custodian yet. Capture at least one tree first.")
+        raise HTTPException(
+            status_code=400,
+            detail=f"No {entity_label}s linked to this {owner_label} yet. Capture at least one {entity_label} first.",
+        )
 
     task_counts = db.execute(
         text(
@@ -6400,10 +6548,14 @@ def assign_distribution_supervision(
         target_tree = tree_rows[(assigned_count + index) % len(tree_rows)]
         task_due_date = due_date_value or (baseline_due + timedelta(days=max(cycle_days * visit_no, 1)))
         task_notes = (
-            f"Custodian supervision visit {visit_no}/{supervision_target}. "
-            f"Custodian: {custodian_name or '-'} ({str(allocation.get('custodian_type') or '-').replace('_', ' ')}). "
+            f"{visit_label} {visit_no}/{supervision_target}. "
+            f"{owner_label.title()}: {custodian_name or '-'} ({str(allocation.get('custodian_type') or '-').replace('_', ' ')}). "
             f"Community: {community_text}. Contact: {contact_text}. "
-            f"Check tree condition, capture GPS, upload visit photos, and document support actions."
+            + (
+                "Check plot condition, capture GPS, upload visit photos, and document support actions."
+                if workflow_profile == "agric"
+                else "Check tree condition, capture GPS, upload visit photos, and document support actions."
+            )
         )
         row = db.execute(
             text(
