@@ -100,7 +100,9 @@ VERRA_VCS_REFERENCES = [
 
 MAINTENANCE_ACTIVITY_ORDER = ("watering", "weeding", "protection", "inspection", "replacement")
 SUPERVISION_TASK_TYPE = "supervision"
-ASSIGNABLE_TASK_TYPES = set(MAINTENANCE_ACTIVITY_ORDER) | {SUPERVISION_TASK_TYPE}
+FIELD_CAPTURE_TASK_TYPE = "field_capture"
+SUPPORT_ALLOCATION_TASK_TYPES = (SUPERVISION_TASK_TYPE, FIELD_CAPTURE_TASK_TYPE)
+ASSIGNABLE_TASK_TYPES = set(MAINTENANCE_ACTIVITY_ORDER) | set(SUPPORT_ALLOCATION_TASK_TYPES)
 AGE_SURVIVAL_CHECKPOINTS_DAYS = (30, 90, 180)
 SEASON_VALUES = {"rainy", "dry"}
 TASK_STATUS_VALUES = {"pending", "done", "overdue"}
@@ -1693,6 +1695,67 @@ def _get_or_create_support_placeholder_tree(
         },
     )
     return tree_row
+
+
+def _close_pending_field_capture_tasks_for_custodian(
+    db: Session,
+    *,
+    project_id: int,
+    custodian_id: int,
+    created_tree_id: int,
+) -> list[int]:
+    rows = db.execute(
+        text(
+            """
+            SELECT t.id
+            FROM tree_tasks t
+            JOIN trees tr ON tr.id = t.tree_id
+            WHERE tr.project_id = :project_id
+              AND t.custodian_id = :custodian_id
+              AND LOWER(COALESCE(t.task_type, '')) = :task_type
+              AND NOT (
+                  LOWER(COALESCE(t.review_state, 'none')) = 'approved'
+                  OR (
+                      LOWER(COALESCE(t.status, '')) IN ('done', 'completed', 'closed')
+                      AND LOWER(COALESCE(t.review_state, 'none')) IN ('none', 'approved')
+                  )
+              )
+            """
+        ),
+        {
+            "project_id": int(project_id),
+            "custodian_id": int(custodian_id),
+            "task_type": FIELD_CAPTURE_TASK_TYPE,
+        },
+    ).mappings().all()
+    task_ids = [int(row.get("id") or 0) for row in rows if int(row.get("id") or 0) > 0]
+    if not task_ids:
+        return []
+    db.execute(
+        text(
+            """
+            UPDATE tree_tasks
+            SET
+                status = 'done',
+                review_state = 'approved',
+                completed_at = COALESCE(completed_at, NOW()),
+                submitted_at = COALESCE(submitted_at, NOW()),
+                notes = CONCAT(
+                    COALESCE(NULLIF(notes, ''), ''),
+                    CASE WHEN COALESCE(NULLIF(notes, ''), '') = '' THEN '' ELSE E'\n' END,
+                    'Field capture completed automatically after plot #',
+                    :created_tree_id,
+                    ' was saved.'
+                )
+            WHERE id IN :task_ids
+            """
+        ).bindparams(bindparam("task_ids", expanding=True)),
+        {
+            "created_tree_id": int(created_tree_id),
+            "task_ids": task_ids,
+        },
+    )
+    return task_ids
 
 
 def _normalize_photo_urls(value: object) -> list[str]:
@@ -6291,15 +6354,15 @@ def list_distribution_allocations(project_id: int, db: Session = Depends(get_db)
                         END
                     ) AS supervision_live
                 FROM tree_tasks t
-                WHERE LOWER(COALESCE(t.task_type, '')) = :supervision_type
+                WHERE LOWER(COALESCE(t.task_type, '')) IN :support_task_types
                   AND t.distribution_allocation_id IS NOT NULL
                 GROUP BY t.distribution_allocation_id
             ) s ON s.distribution_allocation_id = a.id
             WHERE a.project_id = :project_id
             ORDER BY e.event_date DESC, a.created_at DESC, a.id DESC
             """
-        ),
-        {"project_id": project_id, "supervision_type": SUPERVISION_TASK_TYPE},
+        ).bindparams(bindparam("support_task_types", expanding=True)),
+        {"project_id": project_id, "support_task_types": tuple(SUPPORT_ALLOCATION_TASK_TYPES)},
     ).mappings().all()
     return [dict(row) for row in rows]
 
@@ -6486,6 +6549,7 @@ def assign_distribution_supervision(
         },
     ).mappings().all()
     tree_rows = [dict(row) for row in tree_rows_all if not _is_hidden_tree_record(row.get("record_profile_data"))]
+    has_real_plot_records = bool(tree_rows)
     if not tree_rows and workflow_profile == "agric":
         tree_rows = [
             _get_or_create_support_placeholder_tree(
@@ -6501,6 +6565,8 @@ def assign_distribution_supervision(
             status_code=400,
             detail=f"No {entity_label}s linked to this {owner_label} yet. Capture at least one {entity_label} first.",
         )
+    assignment_mode = "field_capture" if workflow_profile == "agric" and not has_real_plot_records else "support_visit"
+    task_type_to_create = FIELD_CAPTURE_TASK_TYPE if assignment_mode == "field_capture" else SUPERVISION_TASK_TYPE
 
     task_counts = db.execute(
         text(
@@ -6519,10 +6585,10 @@ def assign_distribution_supervision(
                 ) AS done_count
             FROM tree_tasks
             WHERE distribution_allocation_id = :allocation_id
-              AND LOWER(COALESCE(task_type, '')) = :task_type
+              AND LOWER(COALESCE(task_type, '')) IN :task_types
             """
-        ),
-        {"allocation_id": allocation_id, "task_type": SUPERVISION_TASK_TYPE},
+        ).bindparams(bindparam("task_types", expanding=True)),
+        {"allocation_id": allocation_id, "task_types": tuple(SUPPORT_ALLOCATION_TASK_TYPES)},
     ).mappings().first()
     assigned_count = int((task_counts or {}).get("assigned_count") or 0)
     done_count = int((task_counts or {}).get("done_count") or 0)
@@ -6530,7 +6596,7 @@ def assign_distribution_supervision(
     if remaining_assignable <= 0:
         raise HTTPException(status_code=409, detail="All supervision visits for this allocation are already assigned")
 
-    create_count = min(requested_visits, remaining_assignable)
+    create_count = min(1 if assignment_mode == "field_capture" else requested_visits, remaining_assignable)
     due_date_value = _parse_date_value(due_date)
     cycle_days = int(allocation.get("followup_cycle_days") or 14)
     baseline_due = (
@@ -6548,7 +6614,12 @@ def assign_distribution_supervision(
         target_tree = tree_rows[(assigned_count + index) % len(tree_rows)]
         task_due_date = due_date_value or (baseline_due + timedelta(days=max(cycle_days * visit_no, 1)))
         task_notes = (
-            f"{visit_label} {visit_no}/{supervision_target}. "
+            f"First field capture {visit_no}/{supervision_target}. "
+            f"{owner_label.title()}: {custodian_name or '-'} ({str(allocation.get('custodian_type') or '-').replace('_', ' ')}). "
+            f"Community: {community_text}. Contact: {contact_text}. "
+            "Open Map & Add Plot in the mobile app, capture the first farm boundary polygon, attach photos, and save the plot."
+            if assignment_mode == "field_capture"
+            else f"{visit_label} {visit_no}/{supervision_target}. "
             f"{owner_label.title()}: {custodian_name or '-'} ({str(allocation.get('custodian_type') or '-').replace('_', ' ')}). "
             f"Community: {community_text}. Contact: {contact_text}. "
             + (
@@ -6575,7 +6646,7 @@ def assign_distribution_supervision(
             ),
             {
                 "tree_id": int(target_tree.get("id") or 0),
-                "task_type": SUPERVISION_TASK_TYPE,
+                "task_type": task_type_to_create,
                 "assignee_name": assignee_clean,
                 "due_date": task_due_date,
                 "priority": priority or "normal",
@@ -6591,6 +6662,7 @@ def assign_distribution_supervision(
             {
                 "task_id": int(row.get("id") or 0),
                 "tree_id": int(row.get("tree_id") or 0),
+                "task_type": task_type_to_create,
                 "tree_species": target_tree.get("species"),
                 "tree_status": target_tree.get("status"),
                 "tree_lng": target_tree.get("lng"),
@@ -6617,6 +6689,8 @@ def assign_distribution_supervision(
             "supervision_target": supervision_target,
             "previous_assigned": assigned_count,
             "supervision_done": done_count,
+            "assignment_mode": assignment_mode,
+            "task_type": task_type_to_create,
         },
     )
     db.commit()
@@ -6630,6 +6704,7 @@ def assign_distribution_supervision(
         "supervision_done": done_count,
         "supervision_live": max((assigned_count + len(created_tasks)) - done_count, 0),
         "supervision_remaining": max(supervision_target - (assigned_count + len(created_tasks)), 0),
+        "assignment_mode": assignment_mode,
         "created_count": len(created_tasks),
         "tasks": created_tasks,
     }
@@ -7366,6 +7441,7 @@ def add_tree(
 
     review_task_id = None
     auto_first_cycle_task_ids: list[int] = []
+    auto_closed_field_capture_task_ids: list[int] = []
     initial_review_task_type: str | None = None
     if created_by_clean and origin in {"new_planting", "existing_inventory"}:
         initial_review_task_type = "planting" if origin == "new_planting" else "existing_inventory_intake"
@@ -7439,6 +7515,18 @@ def add_tree(
                     order_row=matching_auto_order,
                 )
 
+    if (
+        _normalize_workflow_profile(project_settings.get("workflow_profile")) == "agric"
+        and custodian_id_value is not None
+        and not _is_hidden_tree_record(normalized_record_profile_data)
+    ):
+        auto_closed_field_capture_task_ids = _close_pending_field_capture_tasks_for_custodian(
+            db,
+            project_id=int(project_id),
+            custodian_id=int(custodian_id_value),
+            created_tree_id=int(row),
+        )
+
     _log_audit_event(
         db,
         project_id=project_id,
@@ -7469,6 +7557,7 @@ def add_tree(
             "project_tree_no": project_tree_no,
             "review_task_id": int(review_task_id) if review_task_id else None,
             "auto_first_cycle_task_ids": auto_first_cycle_task_ids,
+            "auto_closed_field_capture_task_ids": auto_closed_field_capture_task_ids,
         },
     )
     _refresh_project_alerts(db, project_id)
@@ -13241,7 +13330,7 @@ def export_custodian_report_pdf(
                     FROM tree_tasks t
                     JOIN green_distribution_allocations a ON a.id = t.distribution_allocation_id
                     WHERE a.project_id = :project_id
-                      AND LOWER(COALESCE(t.task_type, '')) = :supervision_type
+                      AND LOWER(COALESCE(t.task_type, '')) IN :support_task_types
                 ) AS supervision_assigned,
                 (
                     SELECT COALESCE(SUM(
@@ -13257,14 +13346,14 @@ def export_custodian_report_pdf(
                     FROM tree_tasks t
                     JOIN green_distribution_allocations a ON a.id = t.distribution_allocation_id
                     WHERE a.project_id = :project_id
-                      AND LOWER(COALESCE(t.task_type, '')) = :supervision_type
+                      AND LOWER(COALESCE(t.task_type, '')) IN :support_task_types
                 ) AS supervision_done,
                 (SELECT COUNT(*) FROM trees
                     WHERE project_id = :project_id
                       AND LOWER(COALESCE(tree_origin, 'new_planting')) <> 'new_planting') AS existing_trees
             """
-        ),
-        {"project_id": project_id, "supervision_type": SUPERVISION_TASK_TYPE},
+        ).bindparams(bindparam("support_task_types", expanding=True)),
+        {"project_id": project_id, "support_task_types": tuple(SUPPORT_ALLOCATION_TASK_TYPES)},
     ).mappings().first()
 
     custodians = db.execute(
@@ -13314,7 +13403,7 @@ def export_custodian_report_pdf(
                 FROM tree_tasks t
                 JOIN trees tr ON tr.id = t.tree_id
                 WHERE tr.project_id = :project_id
-                  AND LOWER(COALESCE(t.task_type, '')) = :supervision_type
+                  AND LOWER(COALESCE(t.task_type, '')) IN :support_task_types
                   AND t.custodian_id IS NOT NULL
                 GROUP BY t.custodian_id
             ) s ON s.custodian_id = c.id
@@ -13336,8 +13425,8 @@ def export_custodian_report_pdf(
                 c.created_at
             ORDER BY c.created_at DESC, c.id DESC
             """
-        ),
-        {"project_id": project_id, "supervision_type": SUPERVISION_TASK_TYPE},
+        ).bindparams(bindparam("support_task_types", expanding=True)),
+        {"project_id": project_id, "support_task_types": tuple(SUPPORT_ALLOCATION_TASK_TYPES)},
     ).mappings().all()
 
     distribution_events = db.execute(
@@ -13409,7 +13498,7 @@ def export_custodian_report_pdf(
                 JOIN trees tr ON tr.id = t.tree_id
                 LEFT JOIN green_custodians c ON c.id = COALESCE(t.custodian_id, tr.custodian_id)
                 WHERE tr.project_id = :project_id
-                  AND LOWER(COALESCE(t.task_type, '')) = :supervision_type
+                  AND LOWER(COALESCE(t.task_type, '')) IN :support_task_types
                   AND (
                         COALESCE(TRIM(t.photo_url), '') <> ''
                         OR COALESCE(
@@ -13423,8 +13512,8 @@ def export_custodian_report_pdf(
                 ORDER BY COALESCE(t.reviewed_at, t.submitted_at, t.created_at) DESC, t.id DESC
                 LIMIT 1200
                 """
-            ),
-            {"project_id": project_id, "supervision_type": SUPERVISION_TASK_TYPE},
+            ).bindparams(bindparam("support_task_types", expanding=True)),
+            {"project_id": project_id, "support_task_types": tuple(SUPPORT_ALLOCATION_TASK_TYPES)},
         ).mappings().all()
         for row in supervision_photo_task_rows:
             photo_urls = _normalize_photo_urls(row.get("photo_urls"))
