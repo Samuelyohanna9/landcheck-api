@@ -5,6 +5,7 @@ from reportlab.lib.utils import ImageReader
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import io
+import math
 import os
 import ssl
 from urllib.parse import urlparse
@@ -2121,5 +2122,668 @@ def render_green_existing_trees_report_pdf(
             [dict(row) for row in (photo_rows or []) if str(row.get("photo_url") or "").strip()],
             assignee_name=None,
         )
+
+    c.save()
+
+
+def _wrap_pdf_text_lines(c, text: str, font_name: str, font_size: float, max_width: float) -> list[str]:
+    words = str(text or "").split()
+    if not words:
+        return [""]
+    lines: list[str] = []
+    current = words[0]
+    for word in words[1:]:
+        candidate = f"{current} {word}"
+        if c.stringWidth(candidate, font_name, font_size) <= max_width:
+            current = candidate
+        else:
+            lines.append(current)
+            current = word
+    lines.append(current)
+    return lines
+
+
+def _safe_float_value(value, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except Exception:
+        return float(default)
+
+
+def _safe_int_value(value, default: int = 0) -> int:
+    try:
+        return int(round(float(value)))
+    except Exception:
+        return int(default)
+
+
+def _format_agric_label(value) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return "-"
+    return text.replace("_", " ").replace("-", " ").title()
+
+
+def _format_yes_no_label(value) -> str:
+    return "Yes" if bool(value) else "No"
+
+
+def _first_available_plot_photo_url(row: dict) -> str:
+    primary = str(row.get("primary_photo_url") or "").strip()
+    if primary:
+        return primary
+    photo_urls = row.get("photo_urls") if isinstance(row.get("photo_urls"), list) else []
+    for item in photo_urls:
+        candidate = str(item or "").strip()
+        if candidate:
+            return candidate
+    return str(row.get("photo_url") or "").strip()
+
+
+def _extract_agric_polygon_rings(geometry) -> list[list[tuple[float, float]]]:
+    if not isinstance(geometry, dict):
+        return []
+    source = geometry.get("geometry") if str(geometry.get("type") or "").strip() == "Feature" else geometry
+    if not isinstance(source, dict):
+        return []
+    geom_type = str(source.get("type") or "").strip()
+    coords = source.get("coordinates") or []
+    rings: list[list[tuple[float, float]]] = []
+
+    def _append_ring(raw_ring):
+        if not isinstance(raw_ring, list):
+            return
+        ring: list[tuple[float, float]] = []
+        for point in raw_ring:
+            if not isinstance(point, list) or len(point) < 2:
+                continue
+            try:
+                ring.append((float(point[0]), float(point[1])))
+            except Exception:
+                continue
+        if len(ring) >= 3:
+            rings.append(ring)
+
+    if geom_type == "Polygon":
+        for raw_ring in coords if isinstance(coords, list) else []:
+            _append_ring(raw_ring)
+    elif geom_type == "MultiPolygon":
+        for polygon in coords if isinstance(coords, list) else []:
+            if not isinstance(polygon, list):
+                continue
+            for raw_ring in polygon:
+                _append_ring(raw_ring)
+    return rings
+
+
+def _collect_agric_geometry_points(row: dict) -> list[tuple[float, float]]:
+    rings = _extract_agric_polygon_rings(row.get("existing_area_geojson"))
+    if rings:
+        return [point for ring in rings for point in ring]
+    try:
+        lng = float(row.get("lng"))
+        lat = float(row.get("lat"))
+        return [(lng, lat)]
+    except Exception:
+        return []
+
+
+def _draw_image_bytes_fit(c, image_bytes: bytes | None, x: float, y: float, w: float, h: float):
+    actual = {"x": x, "y": y, "w": w, "h": h, "src_w": w, "src_h": h}
+    if not image_bytes:
+        c.setFillColor(HexColor("#f6faf7"))
+        c.rect(x, y, w, h, stroke=0, fill=1)
+        c.setStrokeColor(HexColor("#d8e6dd"))
+        c.rect(x, y, w, h, stroke=1, fill=0)
+        return actual
+    try:
+        reader = ImageReader(io.BytesIO(image_bytes))
+        src_w, src_h = reader.getSize()
+        if not src_w or not src_h:
+            raise ValueError("Invalid image size")
+        scale = min(w / src_w, h / src_h)
+        draw_w = src_w * scale
+        draw_h = src_h * scale
+        draw_x = x + (w - draw_w) / 2
+        draw_y = y + (h - draw_h) / 2
+        c.drawImage(reader, draw_x, draw_y, draw_w, draw_h, preserveAspectRatio=True, anchor="c", mask="auto")
+        c.setStrokeColor(HexColor("#d8e6dd"))
+        c.rect(draw_x, draw_y, draw_w, draw_h, stroke=1, fill=0)
+        actual = {"x": draw_x, "y": draw_y, "w": draw_w, "h": draw_h, "src_w": src_w, "src_h": src_h}
+    except Exception:
+        c.setFillColor(HexColor("#f6faf7"))
+        c.rect(x, y, w, h, stroke=0, fill=1)
+        c.setStrokeColor(HexColor("#d8e6dd"))
+        c.rect(x, y, w, h, stroke=1, fill=0)
+    return actual
+
+
+def _mercator_pixel(lng: float, lat: float, world_size: float) -> tuple[float, float]:
+    x_val = (lng + 180.0) / 360.0 * world_size
+    siny = math.sin(math.radians(lat))
+    siny = min(max(siny, -0.9999), 0.9999)
+    y_val = (0.5 - math.log((1 + siny) / (1 - siny)) / (4 * math.pi)) * world_size
+    return x_val, y_val
+
+
+def _draw_agric_map_panel(
+    c,
+    *,
+    x: float,
+    y: float,
+    w: float,
+    h: float,
+    map_png: bytes | None,
+    map_view: dict | None,
+    plot_rows: list[dict],
+    highlight_plot_id: int | None = None,
+):
+    _draw_rounded_box(c, x, y, w, h, 6, fill_color=HexColor("#f8fbf8"), stroke_color=HexColor("#d9e7dc"))
+    pad = 8
+    box = _draw_image_bytes_fit(c, map_png, x + pad, y + pad, w - (pad * 2), h - (pad * 2))
+    if not plot_rows:
+        c.setFont("Helvetica", 8)
+        c.setFillColorRGB(0.42, 0.42, 0.42)
+        c.drawCentredString(x + (w / 2), y + (h / 2), "No mapped plots")
+        return
+
+    if not map_view:
+        map_view = {}
+    center_lng = _safe_float_value(map_view.get("lng"))
+    center_lat = _safe_float_value(map_view.get("lat"))
+    zoom = max(_safe_float_value(map_view.get("zoom"), 13.0), 1.0)
+    world_size = 512 * (2 ** zoom)
+    center_px, center_py = _mercator_pixel(center_lng, center_lat, world_size)
+    scale_x = box["w"] / max(float(box["src_w"] or 1), 1.0)
+    scale_y = box["h"] / max(float(box["src_h"] or 1), 1.0)
+
+    def _to_canvas(point_lng: float, point_lat: float) -> tuple[float, float]:
+        px, py = _mercator_pixel(point_lng, point_lat, world_size)
+        img_px = (float(box["src_w"]) / 2.0) + (px - center_px)
+        img_py = (float(box["src_h"]) / 2.0) + (py - center_py)
+        return (
+            float(box["x"]) + (img_px * scale_x),
+            float(box["y"]) + float(box["h"]) - (img_py * scale_y),
+        )
+
+    light_red = HexColor("#cf6b5f")
+    strong_red = HexColor("#b42318")
+    dot_fill = HexColor("#c7352f")
+    for row in plot_rows:
+        row_id = _safe_int_value(row.get("id"))
+        rings = _extract_agric_polygon_rings(row.get("existing_area_geojson"))
+        is_highlight = highlight_plot_id is not None and row_id == int(highlight_plot_id)
+        stroke = strong_red if is_highlight else light_red
+        width_val = 2.2 if is_highlight else 1.0
+        c.setStrokeColor(stroke)
+        c.setFillColor(stroke)
+        c.setLineWidth(width_val)
+        if rings:
+            for ring in rings:
+                if len(ring) < 2:
+                    continue
+                path = c.beginPath()
+                first_x, first_y = _to_canvas(ring[0][0], ring[0][1])
+                path.moveTo(first_x, first_y)
+                for point_lng, point_lat in ring[1:]:
+                    point_x, point_y = _to_canvas(point_lng, point_lat)
+                    path.lineTo(point_x, point_y)
+                path.close()
+                c.drawPath(path, stroke=1, fill=0)
+        else:
+            points = _collect_agric_geometry_points(row)
+            if not points:
+                continue
+            anchor_x, anchor_y = _to_canvas(points[0][0], points[0][1])
+            radius = 3.6 if is_highlight else 2.1
+            c.circle(anchor_x, anchor_y, radius, stroke=1, fill=1)
+        if is_highlight:
+            label = str((row.get("record_profile_data") or {}).get("plot_code") or row.get("custodian_name") or f"Plot #{row_id}")[:22]
+            label_x, label_y = _to_canvas(*(rings[0][0] if rings and rings[0] else _collect_agric_geometry_points(row)[0]))
+            label_w = min(max(c.stringWidth(label, "Helvetica-Bold", 7.2) + 12, 56), w - 26)
+            label_h = 14
+            label_x = min(max(label_x + 6, x + 10), x + w - label_w - 10)
+            label_y = min(max(label_y + 4, y + 12), y + h - label_h - 12)
+            c.setFillColorRGB(1, 1, 1)
+            c.roundRect(label_x, label_y, label_w, label_h, 4, stroke=0, fill=1)
+            c.setFillColor(strong_red)
+            c.setFont("Helvetica-Bold", 7.2)
+            c.drawString(label_x + 6, label_y + 4, label)
+
+
+def _draw_plot_geometry_zoom_panel(c, *, x: float, y: float, w: float, h: float, row: dict):
+    _draw_rounded_box(c, x, y, w, h, 6, fill_color=HexColor("#faf7f5"), stroke_color=HexColor("#e6d9d4"))
+    pad = 12
+    plot_x = x + pad
+    plot_y = y + 22
+    plot_w = w - (pad * 2)
+    plot_h = h - 42
+    c.setFillColor(HexColor("#fffdfc"))
+    c.rect(plot_x, plot_y, plot_w, plot_h, stroke=0, fill=1)
+    c.setStrokeColor(HexColor("#e8ddd9"))
+    c.rect(plot_x, plot_y, plot_w, plot_h, stroke=1, fill=0)
+
+    rings = _extract_agric_polygon_rings(row.get("existing_area_geojson"))
+    points = [point for ring in rings for point in ring] if rings else _collect_agric_geometry_points(row)
+    c.setFont("Helvetica-Bold", 9)
+    c.setFillColorRGB(0.14, 0.14, 0.14)
+    c.drawString(x + 12, y + h - 16, "Zoomed Plot Boundary")
+    if not points:
+        c.setFont("Helvetica", 8)
+        c.setFillColorRGB(0.42, 0.42, 0.42)
+        c.drawCentredString(x + (w / 2), y + (h / 2), "Boundary geometry unavailable")
+        return
+
+    lngs = [point[0] for point in points]
+    lats = [point[1] for point in points]
+    min_lng, max_lng = min(lngs), max(lngs)
+    min_lat, max_lat = min(lats), max(lats)
+    span_lng = max(max_lng - min_lng, 0.0002)
+    span_lat = max(max_lat - min_lat, 0.0002)
+    pad_lng = span_lng * 0.18
+    pad_lat = span_lat * 0.18
+    min_lng -= pad_lng
+    max_lng += pad_lng
+    min_lat -= pad_lat
+    max_lat += pad_lat
+    draw_span_lng = max(max_lng - min_lng, 0.0002)
+    draw_span_lat = max(max_lat - min_lat, 0.0002)
+
+    def _to_canvas(point_lng: float, point_lat: float) -> tuple[float, float]:
+        px = plot_x + ((point_lng - min_lng) / draw_span_lng) * plot_w
+        py = plot_y + ((point_lat - min_lat) / draw_span_lat) * plot_h
+        return px, py
+
+    c.setStrokeColor(HexColor("#b42318"))
+    c.setLineWidth(2.0)
+    if rings:
+        for ring in rings:
+            if len(ring) < 2:
+                continue
+            path = c.beginPath()
+            first_x, first_y = _to_canvas(ring[0][0], ring[0][1])
+            path.moveTo(first_x, first_y)
+            for point_lng, point_lat in ring[1:]:
+                point_x, point_y = _to_canvas(point_lng, point_lat)
+                path.lineTo(point_x, point_y)
+            path.close()
+            c.drawPath(path, stroke=1, fill=0)
+    else:
+        anchor_x, anchor_y = _to_canvas(points[0][0], points[0][1])
+        c.setFillColor(HexColor("#b42318"))
+        c.circle(anchor_x, anchor_y, 4, stroke=1, fill=1)
+    try:
+        anchor_lng = _safe_float_value(row.get("lng"))
+        anchor_lat = _safe_float_value(row.get("lat"))
+        anchor_x, anchor_y = _to_canvas(anchor_lng, anchor_lat)
+        c.setFillColor(HexColor("#b42318"))
+        c.circle(anchor_x, anchor_y, 3.1, stroke=1, fill=1)
+    except Exception:
+        pass
+    c.setFont("Helvetica", 7)
+    c.setFillColorRGB(0.46, 0.46, 0.46)
+    c.drawString(x + 12, y + 8, "Red boundary = mapped plot | point = capture anchor")
+
+
+def _draw_plot_photo_panel(c, *, x: float, y: float, w: float, h: float, row: dict, image_cache: dict):
+    _draw_rounded_box(c, x, y, w, h, 6, fill_color=HexColor("#f8faf9"), stroke_color=HexColor("#d7e5db"))
+    photo_url = _first_available_plot_photo_url(row)
+    caption = str((row.get("record_profile_data") or {}).get("plot_name") or row.get("custodian_name") or f"Plot #{row.get('id', '-')}")
+    c.setFont("Helvetica-Bold", 9)
+    c.setFillColorRGB(0.12, 0.12, 0.12)
+    c.drawString(x + 10, y + h - 16, "Plot Photo Evidence")
+    c.setFont("Helvetica", 7.5)
+    c.setFillColorRGB(0.42, 0.42, 0.42)
+    c.drawString(x + 10, y + h - 27, caption[:72])
+    img_x = x + 10
+    img_y = y + 10
+    img_w = w - 20
+    img_h = h - 44
+    reader = _load_photo_reader(photo_url, image_cache) if photo_url else None
+    if reader is not None:
+        try:
+            src_w, src_h = reader.getSize()
+            scale = min(img_w / max(src_w, 1), img_h / max(src_h, 1))
+            draw_w = max(src_w * scale, 2)
+            draw_h = max(src_h * scale, 2)
+            draw_x = img_x + (img_w - draw_w) / 2
+            draw_y = img_y + (img_h - draw_h) / 2
+            c.drawImage(reader, draw_x, draw_y, draw_w, draw_h, preserveAspectRatio=True, anchor="c", mask="auto")
+        except Exception:
+            reader = None
+    if reader is None:
+        c.setStrokeColorRGB(0.8, 0.8, 0.8)
+        c.rect(img_x, img_y, img_w, img_h, stroke=1, fill=0)
+        c.setFont("Helvetica-Oblique", 8)
+        c.setFillColorRGB(0.46, 0.46, 0.46)
+        c.drawCentredString(img_x + (img_w / 2), img_y + (img_h / 2), "No photo embedded for this plot")
+
+
+def render_green_agric_programme_pdf(
+    output_path: str,
+    project: dict,
+    summary: dict,
+    farmer_rows: list[dict],
+    plot_rows: list[dict],
+    overview_map_png: bytes | None = None,
+    overview_map_view: dict | None = None,
+    include_photos: bool = False,
+):
+    c = canvas.Canvas(output_path, pagesize=A4)
+    width, height = A4
+    agric_config = project.get("agric_config") if isinstance(project.get("agric_config"), dict) else {}
+
+    def draw_fact_box(title: str, x: float, y: float, w: float, h: float, lines: list[str]):
+        _draw_rounded_box(c, x, y, w, h, 6, fill_color=HexColor("#f8faf9"), stroke_color=HexColor("#d7e5db"))
+        c.setFont("Helvetica-Bold", 9)
+        c.setFillColorRGB(0.12, 0.12, 0.12)
+        c.drawString(x + 10, y + h - 16, title)
+        current_y = y + h - 30
+        c.setFont("Helvetica", 7.6)
+        c.setFillColorRGB(0.35, 0.35, 0.35)
+        for line in lines:
+            wrapped = _wrap_pdf_text_lines(c, line, "Helvetica", 7.6, w - 20)
+            for part in wrapped[:3]:
+                if current_y < y + 10:
+                    return
+                c.drawString(x + 10, current_y, part)
+                current_y -= 9
+
+    def draw_section_header(title: str, subtitle: str | None = None, *, report_label: str, bar_height: float = 68):
+        _draw_project_brand_header_bar(
+            c,
+            width,
+            height,
+            project,
+            report_label=report_label,
+            subtitle=subtitle,
+            bar_height=bar_height,
+            bar_color="#113b24",
+        )
+        c.setFont("Helvetica-Bold", 14)
+        c.setFillColorRGB(0.1, 0.1, 0.1)
+        c.drawString(34, height - bar_height - 18, title)
+
+    image_cache: dict = {}
+    if include_photos:
+        photo_seed_rows = []
+        for row in plot_rows:
+            photo_url = _first_available_plot_photo_url(row)
+            if photo_url:
+                item = dict(row)
+                item["photo_url"] = photo_url
+                photo_seed_rows.append(item)
+        _prefetch_photo_readers(photo_seed_rows, image_cache)
+
+    draw_section_header(
+        str(project.get("name") or "Agric Programme Report"),
+        "Farmer registry, mapped plots, support delivery, and compliance-ready field evidence.",
+        report_label="Agric Programme Report",
+        bar_height=76,
+    )
+
+    c.setFont("Helvetica", 8.6)
+    c.setFillColorRGB(0.34, 0.34, 0.34)
+    meta_parts = []
+    if project.get("location_text"):
+        meta_parts.append(f"Location: {project.get('location_text')}")
+    if agric_config.get("program_type"):
+        meta_parts.append(f"Programme: {_format_agric_label(agric_config.get('program_type'))}")
+    if agric_config.get("focus_commodities"):
+        meta_parts.append(f"Commodities: {str(agric_config.get('focus_commodities'))[:42]}")
+    if agric_config.get("season_label"):
+        meta_parts.append(f"Season: {agric_config.get('season_label')}")
+    if project.get("sponsor"):
+        meta_parts.append(f"Sponsor: {project.get('sponsor')}")
+    c.drawString(34, height - 112, " | ".join(meta_parts)[:130])
+
+    card_w = (width - 68 - 16) / 3
+    card_h = 54
+    top_y = height - 188
+    cards = [
+        ("Registered Farmers", _safe_int_value(summary.get("registered_farmers")), f"Verified { _safe_int_value(summary.get('verified_farmers')) }"),
+        ("Mapped Plots", _safe_int_value(summary.get("mapped_plots")), f"Area {_safe_float_value(summary.get('mapped_area_ha')):.2f} ha"),
+        ("Support Delivery", f"{_safe_int_value(summary.get('support_visit_done'))}/{_safe_int_value(summary.get('support_target_total'))}", f"Live {_safe_int_value(summary.get('support_visit_live'))}"),
+        ("Field Capture", f"{_safe_int_value(summary.get('field_capture_done'))}/{_safe_int_value(summary.get('field_capture_assigned'))}", f"Live {_safe_int_value(summary.get('field_capture_live'))}"),
+        ("Allocations", f"{_safe_float_value(summary.get('allocated_units')):,.0f}", "Units / packages"),
+        ("Est. Yield", f"{_safe_float_value(summary.get('estimated_yield_kg')):,.0f} kg", "Declared plot estimate"),
+    ]
+    for index, (label, value, sub) in enumerate(cards):
+        row = index // 3
+        col = index % 3
+        _draw_stat_card(
+            c,
+            34 + (col * (card_w + 8)),
+            top_y - (row * (card_h + 10)),
+            card_w,
+            card_h,
+            label,
+            value,
+            sub=sub,
+            color=HexColor("#f3faf5" if index % 2 == 0 else "#f8fbf8"),
+        )
+
+    top_crops = summary.get("top_commodities") or []
+    if top_crops:
+        bar_rows = []
+        colors = ["#166534", "#2f855a", "#38a169", "#68d391", "#0f766e", "#0ea5e9"]
+        for idx, item in enumerate(top_crops[:6]):
+            bar_rows.append((str(item.get("label") or "Unknown")[:16], _safe_float_value(item.get("area_ha")), colors[idx % len(colors)]))
+        _draw_bar_chart(c, 34, height - 510, width - 68, 122, bar_rows, title="Top Commodities by Mapped Area (ha)")
+
+    draw_fact_box(
+        "What Paying Organisations Usually Need",
+        34,
+        64,
+        (width - 78) / 2,
+        126,
+        [
+            "Verified farmer registry for targeting, de-duplication, and beneficiary accountability.",
+            "Georeferenced plot evidence with area, crop profile, season, and field-stage metadata.",
+            "Service-delivery proof: field capture completion, support visits, allocations, and photo evidence.",
+            "Readiness signals for compliance, finance, insurance, and traceability workflows.",
+        ],
+    )
+    draw_fact_box(
+        "This Export Packs",
+        44 + ((width - 78) / 2),
+        64,
+        (width - 78) / 2,
+        126,
+        [
+            f"Polygon-mapped plots: {_safe_int_value(summary.get('polygon_plots'))}/{max(_safe_int_value(summary.get('mapped_plots')), 1)} ({_safe_float_value(summary.get('geo_readiness_pct')):.1f}%).",
+            f"Plot photos available: {_safe_int_value(summary.get('photo_evidence_plots'))} ({_safe_float_value(summary.get('photo_readiness_pct')):.1f}%).",
+            f"Farmer identity ready: {_safe_int_value(summary.get('identity_ready_farmers'))}/{max(_safe_int_value(summary.get('registered_farmers')), 1)} ({_safe_float_value(summary.get('identity_readiness_pct')):.1f}%).",
+            f"Finance / insurance segmentation: {_safe_int_value(summary.get('finance_access_farmers'))} finance, {_safe_int_value(summary.get('insurance_access_farmers'))} insurance.",
+        ],
+    )
+
+    c.showPage()
+    draw_section_header("Programme Map & Readiness", "Satellite basemap with every mapped plot boundary in red.", report_label="Agric Programme Report")
+    map_box_x = 34
+    map_box_y = 190
+    map_box_w = width - 68
+    map_box_h = 290
+    _draw_agric_map_panel(
+        c,
+        x=map_box_x,
+        y=map_box_y,
+        w=map_box_w,
+        h=map_box_h,
+        map_png=overview_map_png,
+        map_view=overview_map_view,
+        plot_rows=plot_rows,
+        highlight_plot_id=None,
+    )
+    draw_fact_box(
+        "Traceability & Compliance Readiness",
+        34,
+        58,
+        (width - 78) / 2,
+        110,
+        [
+            f"Farmer-linked plots: {_safe_int_value(summary.get('farmer_linked_plots'))}/{max(_safe_int_value(summary.get('mapped_plots')), 1)}.",
+            f"Crop profile captured: {_safe_int_value(summary.get('crop_profile_plots'))} plots ({_safe_float_value(summary.get('crop_readiness_pct')):.1f}%).",
+            f"Season / reference date captured: {_safe_int_value(summary.get('season_profile_plots'))} plots ({_safe_float_value(summary.get('season_readiness_pct')):.1f}%).",
+            f"Reviewed or submitted plots: {_safe_int_value(summary.get('reviewed_plots'))} ({_safe_float_value(summary.get('review_readiness_pct')):.1f}%).",
+        ],
+    )
+    draw_fact_box(
+        "Registry & Service Segmentation",
+        44 + ((width - 78) / 2),
+        58,
+        (width - 78) / 2,
+        110,
+        [
+            f"Grouped farmers: {_safe_int_value(summary.get('grouped_farmers'))}/{max(_safe_int_value(summary.get('registered_farmers')), 1)}.",
+            f"Finance access flagged: {_safe_int_value(summary.get('finance_access_farmers'))} ({_safe_float_value(summary.get('finance_segmentation_pct')):.1f}%).",
+            f"Insurance access flagged: {_safe_int_value(summary.get('insurance_access_farmers'))} ({_safe_float_value(summary.get('insurance_segmentation_pct')):.1f}%).",
+            f"Support visits done / target: {_safe_int_value(summary.get('support_visit_done'))}/{_safe_int_value(summary.get('support_target_total'))}.",
+        ],
+    )
+
+    def draw_farmer_table_page(page_title: str, rows: list[dict], page_index: int, total_pages: int):
+        c.showPage()
+        draw_section_header(page_title, "Registry view used for programme targeting and follow-up.", report_label="Farmer Registry Export")
+        c.setFont("Helvetica-Bold", 7.1)
+        head_y = height - 96
+        for x_pos, label in [
+            (34, "Farmer"),
+            (118, "Code/ID"),
+            (182, "Phone"),
+            (244, "Group"),
+            (316, "State/LGA"),
+            (394, "Plots"),
+            (430, "Area ha"),
+            (476, "Units"),
+            (520, "SV D/T"),
+        ]:
+            c.drawString(x_pos, head_y, label)
+        c.setFont("Helvetica", 6.4)
+        c.setFillColorRGB(0.14, 0.14, 0.14)
+        y_pos = head_y - 12
+        for row in rows:
+            if y_pos < 42:
+                break
+            profile = row.get("profile_data") or {}
+            code_label = str(row.get("farmer_code") or row.get("national_id") or "-")[:11]
+            state_lga = " / ".join([str(profile.get("state_name") or row.get("community_name") or "-")[:10], str(row.get("local_government") or "-")[:8]])
+            c.drawString(34, y_pos, str(row.get("name") or "-")[:20])
+            c.drawString(118, y_pos, code_label)
+            c.drawString(182, y_pos, str(row.get("phone") or row.get("email") or "-")[:11])
+            c.drawString(244, y_pos, str(row.get("farmer_group") or "-")[:14])
+            c.drawString(316, y_pos, state_lga[:15])
+            c.drawRightString(422, y_pos, str(_safe_int_value(row.get("plot_count"))))
+            c.drawRightString(470, y_pos, f"{_safe_float_value(row.get('mapped_area_ha')):.2f}")
+            c.drawRightString(512, y_pos, f"{_safe_float_value(row.get('allocated_units')):.0f}")
+            c.drawRightString(560, y_pos, f"{_safe_int_value(row.get('support_visit_done'))}/{_safe_int_value(row.get('support_target'))}")
+            y_pos -= 10
+        c.setFont("Helvetica", 7)
+        c.setFillColorRGB(0.45, 0.45, 0.45)
+        c.drawRightString(width - 34, 24, f"Page {page_index}/{total_pages}")
+
+    farmer_page_size = 46
+    if farmer_rows:
+        chunks = [farmer_rows[idx: idx + farmer_page_size] for idx in range(0, len(farmer_rows), farmer_page_size)]
+        for index, chunk in enumerate(chunks, start=1):
+            draw_farmer_table_page(
+                "Farmer Registry Table" if index == 1 else "Farmer Registry Table (continued)",
+                chunk,
+                index,
+                len(chunks),
+            )
+
+    total_plots = len(plot_rows)
+    for plot_index, row in enumerate(plot_rows, start=1):
+        c.showPage()
+        subtitle = f"Plot detail {plot_index}/{max(total_plots, 1)}"
+        _draw_project_brand_header_bar(
+            c,
+            width,
+            height,
+            project,
+            report_label="Plot Evidence Page",
+            subtitle=subtitle,
+            bar_height=62,
+            bar_color="#163b2a",
+        )
+        record_profile = row.get("record_profile_data") or {}
+        farmer_profile = row.get("custodian_profile_data") or {}
+        plot_name = str(record_profile.get("plot_name") or record_profile.get("plot_code") or f"Plot #{row.get('id', '-')}")
+        commodity = str(record_profile.get("commodity") or row.get("species") or "-")
+        season_bits = [str(record_profile.get("season_name") or "").strip(), str(record_profile.get("season_year") or "").strip()]
+        season_label = " ".join([item for item in season_bits if item]).strip() or str(row.get("planting_date") or "-")
+        area_ha = _safe_float_value(record_profile.get("area_hectares") or row.get("existing_area_ha"))
+        c.setFont("Helvetica-Bold", 13)
+        c.setFillColorRGB(0.1, 0.1, 0.1)
+        c.drawString(34, height - 82, plot_name[:54])
+        c.setFont("Helvetica", 8.5)
+        c.setFillColorRGB(0.34, 0.34, 0.34)
+        c.drawString(
+            34,
+            height - 96,
+            f"Farmer: {str(row.get('custodian_name') or 'Farmer not linked')[:36]} | Crop: {commodity[:24]} | Area: {area_ha:.2f} ha | Season: {season_label[:22]}",
+        )
+
+        _draw_agric_map_panel(
+            c,
+            x=34,
+            y=height - 310,
+            w=250,
+            h=188,
+            map_png=overview_map_png,
+            map_view=overview_map_view,
+            plot_rows=plot_rows,
+            highlight_plot_id=_safe_int_value(row.get("id")),
+        )
+        _draw_plot_geometry_zoom_panel(
+            c,
+            x=310,
+            y=height - 310,
+            w=250,
+            h=188,
+            row=row,
+        )
+
+        left_lines = [
+            f"Farmer: {str(row.get('custodian_name') or '-')}",
+            f"Farmer code / ID: {str(farmer_profile.get('farmer_code') or farmer_profile.get('national_id') or '-')}",
+            f"Phone: {str(row.get('phone') or row.get('email') or '-')}",
+            f"Group: {str(farmer_profile.get('farmer_group') or '-')}",
+            f"Location: {str(farmer_profile.get('state_name') or row.get('community_name') or '-')}, {str(row.get('local_government') or '-')}",
+            f"Finance access: {_format_yes_no_label(farmer_profile.get('finance_access'))} | Insurance: {_format_yes_no_label(farmer_profile.get('insurance_access'))}",
+            f"Household size: {str(farmer_profile.get('household_size') or '-')}",
+            f"Land tenure: {_format_agric_label(farmer_profile.get('land_tenure'))}",
+        ]
+        right_lines = [
+            f"Commodity / variety: {commodity} / {str(record_profile.get('variety') or '-')}",
+            f"Irrigation: {_format_agric_label(record_profile.get('irrigation_type'))} | Stage: {_format_agric_label(record_profile.get('production_stage'))}",
+            f"Boundary capture: {_format_agric_label(record_profile.get('boundary_capture_method'))}",
+            f"Estimated yield: {_safe_float_value(record_profile.get('estimated_yield_kg')):,.0f} kg",
+            f"Field capture: {_safe_int_value(row.get('field_capture_done'))}/{_safe_int_value(row.get('field_capture_assigned'))} done",
+            f"Support visits: {_safe_int_value(row.get('support_visit_done'))}/{_safe_int_value(row.get('support_visit_assigned'))} done",
+            f"Review: {_format_agric_label(row.get('last_review_state'))} | Status: {_format_agric_label(row.get('status'))}",
+            f"Created by: {str(row.get('created_by') or '-')[:20]} | Date: {str(row.get('created_at') or '-')[:10]}",
+        ]
+        draw_fact_box("Farmer & Service Profile", 34, 176, 250, 124, left_lines)
+        draw_fact_box("Plot & Compliance Profile", 310, 176, 250, 124, right_lines)
+
+        notes_lines = [
+            f"GPS anchor: {str(row.get('lat') or '-')[:18]}, {str(row.get('lng') or '-')[:18]}",
+            f"Support-ready notes: {str(row.get('notes') or 'No extra notes captured for this plot.')}",
+        ]
+        if include_photos and _first_available_plot_photo_url(row):
+            draw_fact_box("Plot Coordinates & Notes", 34, 126, width - 68, 40, notes_lines)
+            _draw_plot_photo_panel(c, x=34, y=34, w=width - 68, h=86, row=row, image_cache=image_cache)
+        else:
+            draw_fact_box("Plot Coordinates & Notes", 34, 60, width - 68, 86, notes_lines)
+            if include_photos:
+                c.setFont("Helvetica-Oblique", 8)
+                c.setFillColorRGB(0.46, 0.46, 0.46)
+                c.drawString(34, 40, "Photo option was enabled, but no plot photo was available to embed for this record.")
+
+        c.setFont("Helvetica", 7)
+        c.setFillColorRGB(0.46, 0.46, 0.46)
+        c.drawRightString(width - 34, 22, f"Plot {plot_index}/{max(total_plots, 1)}")
 
     c.save()

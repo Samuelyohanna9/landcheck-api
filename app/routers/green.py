@@ -28,12 +28,13 @@ import requests
 
 import boto3
 from botocore.exceptions import ClientError
-from PIL import Image, ImageOps, UnidentifiedImageError
+from PIL import Image, ImageOps, ImageDraw, UnidentifiedImageError
 from pydantic import BaseModel
 
 from app.db import SessionLocal
 from app.utils.green_pdf import (
     render_green_report_pdf,
+    render_green_agric_programme_pdf,
     render_green_work_report_pdf,
     render_green_custodian_report_pdf,
     render_green_existing_trees_report_pdf,
@@ -4057,26 +4058,61 @@ def _guess_image_media_type(payload: bytes, source_url: str | None = None, fallb
     return fallback
 
 
-def _build_report_map_png(
+def _coerce_optional_float(value: object) -> float | None:
+    if value is None:
+        return None
+    try:
+        if isinstance(value, bool):
+            return None
+        return float(value)
+    except Exception:
+        return None
+
+
+def _extract_report_geometry_points(geometry: dict | str | None) -> list[tuple[float, float]]:
+    normalized = _normalize_work_area_geojson(geometry)
+    if not normalized:
+        return []
+    geom_type = str(normalized.get("type") or "").strip()
+    coords = normalized.get("coordinates") or []
+    points: list[tuple[float, float]] = []
+
+    def _append_ring(ring: object):
+        if not isinstance(ring, list):
+            return
+        for point in ring:
+            if not isinstance(point, list) or len(point) < 2:
+                continue
+            try:
+                points.append((float(point[0]), float(point[1])))
+            except Exception:
+                continue
+
+    if geom_type == "Polygon":
+        for ring in coords if isinstance(coords, list) else []:
+            _append_ring(ring)
+    elif geom_type == "MultiPolygon":
+        for polygon in coords if isinstance(coords, list) else []:
+            if not isinstance(polygon, list):
+                continue
+            for ring in polygon:
+                _append_ring(ring)
+    return points
+
+
+def _estimate_report_map_view(
     map_rows: list[dict],
     lng: float | None = None,
     lat: float | None = None,
     zoom: float | None = None,
     bearing: float | None = 0.0,
     pitch: float | None = 0.0,
-) -> bytes | None:
+    *,
+    width: int = 800,
+    height: int = 500,
+) -> dict | None:
     if not map_rows:
         return None
-
-    def _coerce_optional_float(value: object) -> float | None:
-        if value is None:
-            return None
-        try:
-            if isinstance(value, bool):
-                return None
-            return float(value)
-        except Exception:
-            return None
 
     lng_value = _coerce_optional_float(lng)
     lat_value = _coerce_optional_float(lat)
@@ -4084,8 +4120,18 @@ def _build_report_map_png(
     bearing_value = _coerce_optional_float(bearing)
     pitch_value = _coerce_optional_float(pitch)
 
-    lats = [r.get("lat") for r in map_rows if r.get("lat") is not None]
-    lngs = [r.get("lng") for r in map_rows if r.get("lng") is not None]
+    lats: list[float] = []
+    lngs: list[float] = []
+    for row in map_rows:
+        try:
+            if row.get("lat") is not None and row.get("lng") is not None:
+                lats.append(float(row.get("lat")))
+                lngs.append(float(row.get("lng")))
+        except Exception:
+            pass
+        for point_lng, point_lat in _extract_report_geometry_points(row.get("existing_area_geojson")):
+            lngs.append(point_lng)
+            lats.append(point_lat)
     if not lats or not lngs:
         return None
 
@@ -4094,7 +4140,6 @@ def _build_report_map_png(
     z = zoom_value if zoom_value is not None else 13
     b = bearing_value if bearing_value is not None else 0
     p = pitch_value if pitch_value is not None else 0
-
     has_explicit_view = lng_value is not None and lat_value is not None and zoom_value is not None
 
     def _estimate_zoom_to_fit() -> int:
@@ -4106,8 +4151,8 @@ def _build_report_map_png(
         max_lat = max(lats)
         lng_span = max(max_lng - min_lng, 0.0008)
         lat_span = max(max_lat - min_lat, 0.0008)
-        usable_width = 800 * 0.74
-        usable_height = 500 * 0.74
+        usable_width = width * 0.74
+        usable_height = height * 0.74
         zoom_x = math.log2((360.0 * usable_width) / (512.0 * lng_span))
         zoom_y = math.log2((170.1022 * usable_height) / (512.0 * lat_span))
         zoom_fit = math.floor(min(zoom_x, zoom_y))
@@ -4116,11 +4161,54 @@ def _build_report_map_png(
     if not has_explicit_view:
         z = _estimate_zoom_to_fit()
 
+    return {
+        "lng": center_lng,
+        "lat": center_lat,
+        "zoom": z,
+        "bearing": b,
+        "pitch": p,
+        "has_explicit_view": has_explicit_view,
+        "width": width,
+        "height": height,
+    }
+
+
+def _build_report_map_png(
+    map_rows: list[dict],
+    lng: float | None = None,
+    lat: float | None = None,
+    zoom: float | None = None,
+    bearing: float | None = 0.0,
+    pitch: float | None = 0.0,
+    *,
+    include_markers: bool = True,
+) -> bytes | None:
+    if not map_rows:
+        return None
+    map_view = _estimate_report_map_view(
+        map_rows,
+        lng=lng,
+        lat=lat,
+        zoom=zoom,
+        bearing=bearing,
+        pitch=pitch,
+        width=800,
+        height=500,
+    )
+    if not map_view:
+        return None
+    center_lng = float(map_view.get("lng") or 0.0)
+    center_lat = float(map_view.get("lat") or 0.0)
+    z = float(map_view.get("zoom") or 13)
+    b = float(map_view.get("bearing") or 0.0)
+    p = float(map_view.get("pitch") or 0.0)
+    has_explicit_view = bool(map_view.get("has_explicit_view"))
+
     token = _load_env_token()
     if token:
         markers = []
         for r in map_rows[:60]:
-            if r.get("lng") is None or r.get("lat") is None:
+            if not include_markers or r.get("lng") is None or r.get("lat") is None:
                 continue
             color = _tree_status_color_hex(r.get("status"))
             markers.append(f"pin-s+{color}({r['lng']},{r['lat']})")
@@ -4151,11 +4239,13 @@ def _build_report_map_png(
             if map_png:
                 return map_png
 
-    markers = "|".join([f"{r['lat']},{r['lng']},lightgreen1" for r in map_rows[:50] if r.get("lat") is not None and r.get("lng") is not None])
-    marker_qs = quote(markers, safe="|,")
+    marker_qs = ""
+    if include_markers:
+        markers = "|".join([f"{r['lat']},{r['lng']},lightgreen1" for r in map_rows[:50] if r.get("lat") is not None and r.get("lng") is not None])
+        marker_qs = f"&markers={quote(markers, safe='|,')}" if markers else ""
     osm_url = (
         "https://staticmap.openstreetmap.de/staticmap.php?"
-        f"center={center_lat},{center_lng}&zoom={int(round(z))}&size=800x500&markers={marker_qs}"
+        f"center={center_lat},{center_lng}&zoom={int(round(z))}&size=800x500{marker_qs}"
     )
     return _http_get_binary(osm_url)
 
@@ -14192,6 +14282,372 @@ def _summarize_existing_tree_export_rows(rows: list[dict]) -> dict:
     }
 
 
+def _is_export_task_complete(row: dict) -> bool:
+    status_key = _normalize_name(row.get("status"))
+    review_key = _normalize_name(row.get("review_state")) or "none"
+    if review_key == "approved":
+        return True
+    return status_key in {"done", "completed", "closed"} and review_key in {"none", "approved"}
+
+
+def _build_agric_programme_export_context(
+    project_id: int,
+    db: Session,
+) -> dict:
+    project = get_project(project_id, db)
+    project_copy = dict(project)
+    project_copy["agric_config"] = _normalize_agric_config(project.get("agric_config")) or {}
+
+    raw_plot_rows = _fetch_existing_tree_export_rows(project_id, db)
+    plot_rows: list[dict] = []
+    for source_row in raw_plot_rows:
+        if _is_hidden_tree_record(source_row.get("record_profile_data")):
+            continue
+        row = dict(source_row)
+        photo_urls = _normalize_photo_urls(row.get("photo_urls"))
+        primary_photo_url = str(row.get("photo_url") or "").strip()
+        if primary_photo_url:
+            photo_urls = [primary_photo_url, *[item for item in photo_urls if item != primary_photo_url]]
+        row["photo_urls"] = photo_urls
+        row["primary_photo_url"] = photo_urls[0] if photo_urls else primary_photo_url
+        row["record_profile_data"] = _normalize_tree_record_profile_data(
+            row.get("record_profile_data"),
+            existing_area_sqm=row.get("existing_area_sqm"),
+        ) or {}
+        row["custodian_profile_data"] = _normalize_custodian_profile_data(row.get("custodian_profile_data")) or {}
+        plot_rows.append(row)
+
+    farmer_rows = [
+        dict(row)
+        for row in db.execute(
+            text(
+                """
+                SELECT
+                    c.id,
+                    c.project_id,
+                    c.custodian_type,
+                    c.name,
+                    c.contact_person,
+                    c.phone,
+                    c.alt_phone,
+                    c.email,
+                    c.address_text,
+                    c.local_government,
+                    c.community_name,
+                    c.verification_status,
+                    c.notes,
+                    c.created_at,
+                    c.profile_data
+                FROM green_custodians c
+                WHERE c.project_id = :project_id
+                ORDER BY c.created_at DESC, c.id DESC
+                """
+            ),
+            {"project_id": project_id},
+        ).mappings().all()
+    ]
+    for row in farmer_rows:
+        row["profile_data"] = _normalize_custodian_profile_data(row.get("profile_data")) or {}
+    farmer_by_id = {int(row.get("id") or 0): row for row in farmer_rows if int(row.get("id") or 0) > 0}
+
+    allocation_rows = [
+        dict(row)
+        for row in db.execute(
+            text(
+                """
+                SELECT
+                    a.id,
+                    a.custodian_id,
+                    COALESCE(a.quantity_allocated, 0) AS quantity_allocated,
+                    COALESCE(a.supervision_target, 0) AS supervision_target,
+                    a.expected_planting_start,
+                    a.expected_planting_end,
+                    a.notes,
+                    a.created_at,
+                    e.event_date,
+                    e.species AS support_item
+                FROM green_distribution_allocations a
+                LEFT JOIN green_distribution_events e ON e.id = a.event_id
+                WHERE a.project_id = :project_id
+                ORDER BY a.created_at DESC, a.id DESC
+                """
+            ),
+            {"project_id": project_id},
+        ).mappings().all()
+    ]
+
+    task_rows = [
+        dict(row)
+        for row in db.execute(
+            text(
+                """
+                SELECT
+                    t.id,
+                    t.tree_id,
+                    t.custodian_id,
+                    LOWER(COALESCE(t.task_type, '')) AS task_type,
+                    LOWER(COALESCE(t.status, '')) AS status,
+                    LOWER(COALESCE(t.review_state, 'none')) AS review_state,
+                    t.assignee_name,
+                    t.created_at,
+                    t.completed_at,
+                    t.due_date,
+                    t.submitted_at,
+                    t.reviewed_at
+                FROM tree_tasks t
+                JOIN trees tr ON tr.id = t.tree_id
+                WHERE tr.project_id = :project_id
+                  AND t.custodian_id IS NOT NULL
+                  AND LOWER(COALESCE(t.task_type, '')) IN :task_types
+                ORDER BY COALESCE(t.reviewed_at, t.submitted_at, t.created_at) DESC, t.id DESC
+                """
+            ).bindparams(bindparam("task_types", expanding=True)),
+            {"project_id": project_id, "task_types": tuple(SUPPORT_ALLOCATION_TASK_TYPES)},
+        ).mappings().all()
+    ]
+
+    plot_ids = {int(row.get("id") or 0) for row in plot_rows if int(row.get("id") or 0) > 0}
+    farmer_ids = {int(row.get("id") or 0) for row in farmer_rows if int(row.get("id") or 0) > 0}
+
+    allocation_summary_by_farmer: dict[int, dict] = {}
+    for row in allocation_rows:
+        custodian_id = int(row.get("custodian_id") or 0)
+        if custodian_id <= 0:
+            continue
+        summary = allocation_summary_by_farmer.setdefault(
+            custodian_id,
+            {
+                "allocation_count": 0,
+                "allocated_units": 0.0,
+                "support_target": 0,
+                "latest_support_item": "",
+                "latest_event_date": None,
+            },
+        )
+        summary["allocation_count"] += 1
+        summary["allocated_units"] += float(row.get("quantity_allocated") or 0.0)
+        summary["support_target"] += int(row.get("supervision_target") or 0)
+        if not summary["latest_support_item"] and str(row.get("support_item") or "").strip():
+            summary["latest_support_item"] = str(row.get("support_item") or "").strip()
+        if summary["latest_event_date"] is None and row.get("event_date") is not None:
+            summary["latest_event_date"] = row.get("event_date")
+
+    task_summary_by_farmer: dict[int, dict] = {}
+    task_summary_by_plot: dict[int, dict] = {}
+    for row in task_rows:
+        custodian_id = int(row.get("custodian_id") or 0)
+        plot_id = int(row.get("tree_id") or 0)
+        task_type = _normalize_name(row.get("task_type"))
+        is_complete = _is_export_task_complete(row)
+        for target_map, target_id in ((task_summary_by_farmer, custodian_id), (task_summary_by_plot, plot_id)):
+            if target_id <= 0:
+                continue
+            summary = target_map.setdefault(
+                target_id,
+                {
+                    "field_capture_assigned": 0,
+                    "field_capture_done": 0,
+                    "support_visit_assigned": 0,
+                    "support_visit_done": 0,
+                    "last_task_date": None,
+                },
+            )
+            date_candidate = row.get("reviewed_at") or row.get("submitted_at") or row.get("completed_at") or row.get("created_at")
+            if date_candidate and summary["last_task_date"] is None:
+                summary["last_task_date"] = date_candidate
+            if task_type == FIELD_CAPTURE_TASK_TYPE:
+                summary["field_capture_assigned"] += 1
+                if is_complete:
+                    summary["field_capture_done"] += 1
+            elif task_type == SUPERVISION_TASK_TYPE:
+                summary["support_visit_assigned"] += 1
+                if is_complete:
+                    summary["support_visit_done"] += 1
+
+    plot_summary_by_farmer: dict[int, dict] = {}
+    commodity_counts: dict[str, dict] = {}
+    total_area_ha = 0.0
+    total_estimated_yield_kg = 0.0
+    polygon_plot_count = 0
+    photo_plot_count = 0
+    farmer_linked_plot_count = 0
+    crop_profile_count = 0
+    season_profile_count = 0
+    reviewed_plot_count = 0
+    for row in plot_rows:
+        plot_id = int(row.get("id") or 0)
+        custodian_id = int(row.get("custodian_id") or 0)
+        record_profile = row.get("record_profile_data") or {}
+        linked_farmer = farmer_by_id.get(custodian_id) or {}
+        if linked_farmer:
+            for key in (
+                "phone",
+                "alt_phone",
+                "email",
+                "address_text",
+                "local_government",
+                "community_name",
+                "verification_status",
+                "contact_person",
+            ):
+                row[key] = linked_farmer.get(key)
+        area_ha = float(record_profile.get("area_hectares") or row.get("existing_area_ha") or 0.0)
+        commodity = str(record_profile.get("commodity") or row.get("species") or "").strip()
+        if area_ha > 0:
+            total_area_ha += area_ha
+        estimated_yield_kg = float(record_profile.get("estimated_yield_kg") or 0.0)
+        if estimated_yield_kg > 0:
+            total_estimated_yield_kg += estimated_yield_kg
+        if _normalize_work_area_geojson(row.get("existing_area_geojson")):
+            polygon_plot_count += 1
+        if str(row.get("primary_photo_url") or "").strip():
+            photo_plot_count += 1
+        if custodian_id > 0:
+            farmer_linked_plot_count += 1
+            farmer_plot_summary = plot_summary_by_farmer.setdefault(custodian_id, {"plot_count": 0, "area_ha": 0.0, "estimated_yield_kg": 0.0})
+            farmer_plot_summary["plot_count"] += 1
+            farmer_plot_summary["area_ha"] += area_ha
+            farmer_plot_summary["estimated_yield_kg"] += estimated_yield_kg
+        if commodity:
+            crop_profile_count += 1
+            key = commodity.lower()
+            item = commodity_counts.setdefault(key, {"label": commodity, "plot_count": 0, "area_ha": 0.0})
+            item["plot_count"] += 1
+            item["area_ha"] += area_ha
+        if record_profile.get("season_name") or record_profile.get("season_year") or row.get("planting_date"):
+            season_profile_count += 1
+        if _normalize_name(row.get("last_review_state")) in {"approved", "metadata_edit", "submitted"}:
+            reviewed_plot_count += 1
+
+        plot_task_summary = task_summary_by_plot.get(plot_id) or {}
+        row["field_capture_assigned"] = int(plot_task_summary.get("field_capture_assigned") or 0)
+        row["field_capture_done"] = int(plot_task_summary.get("field_capture_done") or 0)
+        row["field_capture_live"] = max(row["field_capture_assigned"] - row["field_capture_done"], 0)
+        row["support_visit_assigned"] = int(plot_task_summary.get("support_visit_assigned") or 0)
+        row["support_visit_done"] = int(plot_task_summary.get("support_visit_done") or 0)
+        row["support_visit_live"] = max(row["support_visit_assigned"] - row["support_visit_done"], 0)
+        row["latest_task_date"] = plot_task_summary.get("last_task_date")
+
+    top_commodities = sorted(
+        commodity_counts.values(),
+        key=lambda item: (float(item.get("area_ha") or 0.0), int(item.get("plot_count") or 0)),
+        reverse=True,
+    )[:8]
+    for item in top_commodities:
+        item["area_ha"] = round(float(item.get("area_ha") or 0.0), 4)
+
+    for row in farmer_rows:
+        farmer_id = int(row.get("id") or 0)
+        profile = row.get("profile_data") or {}
+        allocation_summary = allocation_summary_by_farmer.get(farmer_id) or {}
+        task_summary = task_summary_by_farmer.get(farmer_id) or {}
+        plot_summary = plot_summary_by_farmer.get(farmer_id) or {}
+        row["allocation_count"] = int(allocation_summary.get("allocation_count") or 0)
+        row["allocated_units"] = round(float(allocation_summary.get("allocated_units") or 0.0), 2)
+        row["support_target"] = int(allocation_summary.get("support_target") or 0)
+        row["plot_count"] = int(plot_summary.get("plot_count") or 0)
+        row["mapped_area_ha"] = round(float(plot_summary.get("area_ha") or 0.0), 4)
+        row["estimated_yield_kg"] = round(float(plot_summary.get("estimated_yield_kg") or 0.0), 2)
+        row["field_capture_assigned"] = int(task_summary.get("field_capture_assigned") or 0)
+        row["field_capture_done"] = int(task_summary.get("field_capture_done") or 0)
+        row["field_capture_live"] = max(row["field_capture_assigned"] - row["field_capture_done"], 0)
+        row["support_visit_assigned"] = int(task_summary.get("support_visit_assigned") or 0)
+        row["support_visit_done"] = int(task_summary.get("support_visit_done") or 0)
+        row["support_visit_live"] = max(row["support_visit_assigned"] - row["support_visit_done"], 0)
+        row["latest_task_date"] = task_summary.get("last_task_date")
+        row["farmer_code"] = str(profile.get("farmer_code") or "").strip()
+        row["national_id"] = str(profile.get("national_id") or "").strip()
+        row["farmer_group"] = str(profile.get("farmer_group") or "").strip()
+        row["finance_access"] = bool(profile.get("finance_access")) if profile.get("finance_access") is not None else False
+        row["insurance_access"] = bool(profile.get("insurance_access")) if profile.get("insurance_access") is not None else False
+
+    verified_farmers = sum(1 for row in farmer_rows if _normalize_name(row.get("verification_status")) == "verified")
+    finance_access_farmers = sum(1 for row in farmer_rows if bool(row.get("finance_access")))
+    insurance_access_farmers = sum(1 for row in farmer_rows if bool(row.get("insurance_access")))
+    grouped_farmers = sum(1 for row in farmer_rows if str(row.get("farmer_group") or "").strip())
+    identity_ready_farmers = sum(1 for row in farmer_rows if str(row.get("farmer_code") or "").strip() or str(row.get("national_id") or "").strip())
+
+    field_capture_assigned_total = sum(int(row.get("field_capture_assigned") or 0) for row in farmer_rows)
+    field_capture_done_total = sum(int(row.get("field_capture_done") or 0) for row in farmer_rows)
+    support_visit_assigned_total = sum(int(row.get("support_visit_assigned") or 0) for row in farmer_rows)
+    support_visit_done_total = sum(int(row.get("support_visit_done") or 0) for row in farmer_rows)
+    support_target_total = sum(int(row.get("support_target") or 0) for row in farmer_rows)
+    allocated_units_total = round(sum(float(row.get("allocated_units") or 0.0) for row in farmer_rows), 2)
+
+    def _pct(value: int, total: int) -> float:
+        return round((float(value) / float(total)) * 100.0, 1) if total > 0 else 0.0
+
+    summary = {
+        "registered_farmers": len(farmer_rows),
+        "verified_farmers": verified_farmers,
+        "mapped_plots": len(plot_rows),
+        "mapped_area_ha": round(total_area_ha, 4),
+        "estimated_yield_kg": round(total_estimated_yield_kg, 2),
+        "allocated_units": allocated_units_total,
+        "field_capture_assigned": field_capture_assigned_total,
+        "field_capture_done": field_capture_done_total,
+        "field_capture_live": max(field_capture_assigned_total - field_capture_done_total, 0),
+        "support_visit_assigned": support_visit_assigned_total,
+        "support_visit_done": support_visit_done_total,
+        "support_visit_live": max(support_visit_assigned_total - support_visit_done_total, 0),
+        "support_target_total": support_target_total,
+        "polygon_plots": polygon_plot_count,
+        "photo_evidence_plots": photo_plot_count,
+        "farmer_linked_plots": farmer_linked_plot_count,
+        "crop_profile_plots": crop_profile_count,
+        "season_profile_plots": season_profile_count,
+        "reviewed_plots": reviewed_plot_count,
+        "finance_access_farmers": finance_access_farmers,
+        "insurance_access_farmers": insurance_access_farmers,
+        "grouped_farmers": grouped_farmers,
+        "identity_ready_farmers": identity_ready_farmers,
+        "top_commodities": top_commodities,
+        "geo_readiness_pct": _pct(polygon_plot_count, len(plot_rows)),
+        "photo_readiness_pct": _pct(photo_plot_count, len(plot_rows)),
+        "crop_readiness_pct": _pct(crop_profile_count, len(plot_rows)),
+        "season_readiness_pct": _pct(season_profile_count, len(plot_rows)),
+        "review_readiness_pct": _pct(reviewed_plot_count, len(plot_rows)),
+        "identity_readiness_pct": _pct(identity_ready_farmers, len(farmer_rows)),
+        "finance_segmentation_pct": _pct(finance_access_farmers, len(farmer_rows)),
+        "insurance_segmentation_pct": _pct(insurance_access_farmers, len(farmer_rows)),
+    }
+
+    overview_map_rows = []
+    for row in plot_rows:
+        overview_map_rows.append(
+            {
+                "id": row.get("id"),
+                "status": row.get("status"),
+                "lng": row.get("lng"),
+                "lat": row.get("lat"),
+                "existing_area_geojson": row.get("existing_area_geojson"),
+            }
+        )
+    overview_map_view = _estimate_report_map_view(overview_map_rows, width=800, height=500)
+    overview_map_png = (
+        _build_report_map_png(
+            overview_map_rows,
+            lng=overview_map_view.get("lng"),
+            lat=overview_map_view.get("lat"),
+            zoom=overview_map_view.get("zoom"),
+            bearing=overview_map_view.get("bearing"),
+            pitch=overview_map_view.get("pitch"),
+            include_markers=False,
+        )
+        if overview_map_view
+        else None
+    )
+
+    return {
+        "project": project_copy,
+        "summary": summary,
+        "farmer_rows": farmer_rows,
+        "plot_rows": plot_rows,
+        "overview_map_png": overview_map_png,
+        "overview_map_view": overview_map_view,
+    }
+
+
 @router.get("/projects/{project_id}/existing-trees/metrics")
 def get_existing_tree_metrics(project_id: int, db: Session = Depends(get_db)):
     _get_project_settings(db, project_id)
@@ -14830,6 +15286,20 @@ def _render_work_report_to_pdf(
 
     assignee_clean = (assignee_name or "").strip() or None
     project = get_project(project_id=project_id, db=db, assignee_name=assignee_clean)
+    workflow_profile = _normalize_workflow_profile(project.get("workflow_profile"))
+    if workflow_profile == "agric":
+        context = _build_agric_programme_export_context(project_id, db)
+        render_green_agric_programme_pdf(
+            pdf_path,
+            project=context["project"],
+            summary=context["summary"],
+            farmer_rows=context["farmer_rows"],
+            plot_rows=context["plot_rows"],
+            overview_map_png=context["overview_map_png"],
+            overview_map_view=context["overview_map_view"],
+            include_photos=include_photos,
+        )
+        return f"project_{project_id}_agric_programme_report.pdf", int(context["project"].get("organization_id") or 0) or None
     if assignee_name:
         rows = db.execute(text("""
             SELECT
