@@ -14684,9 +14684,194 @@ def get_existing_tree_metrics(project_id: int, db: Session = Depends(get_db)):
 @router.get("/projects/{project_id}/existing-trees/export/csv")
 def export_existing_trees_csv(project_id: int, db: Session = Depends(get_db)):
     project = get_project(project_id, db)
+    workflow_profile = _normalize_workflow_profile(project.get("workflow_profile"))
+    if workflow_profile == "agric":
+        context = _build_agric_programme_export_context(project_id, db)
+        project_copy = context["project"]
+        summary = context["summary"]
+        farmer_rows = context["farmer_rows"]
+        plot_rows = context["plot_rows"]
+        os.makedirs(REPORTS_DIR, exist_ok=True)
+        tmp_csv = tempfile.NamedTemporaryFile(suffix="_agric_programme.csv", delete=False)
+        csv_path = tmp_csv.name
+        tmp_csv.close()
+        with open(csv_path, "w", newline="", encoding="utf-8-sig") as f:
+            writer = _excel_csv_writer(f)
+            writer.writerow(["LandCheck Agric Programme Export"])
+            writer.writerow(["Project", project_copy.get("name", "")])
+            writer.writerow(["Location", project_copy.get("location_text", "")])
+            writer.writerow(["Workflow Profile", "agric"])
+            agric_config = project_copy.get("agric_config") if isinstance(project_copy.get("agric_config"), dict) else {}
+            writer.writerow([
+                "Agric Program",
+                agric_config.get("program_type") or "",
+                agric_config.get("focus_commodities") or "",
+                agric_config.get("support_packages") or "",
+                agric_config.get("season_label") or "",
+            ])
+            writer.writerow(["Generated At (UTC)", datetime.utcnow().isoformat()])
+            writer.writerow([])
+            writer.writerow([
+                "Summary",
+                f"Registered Farmers {summary.get('registered_farmers', 0)}",
+                f"Verified Farmers {summary.get('verified_farmers', 0)}",
+                f"Mapped Plots {summary.get('mapped_plots', 0)}",
+                f"Mapped Area {summary.get('mapped_area_ha', 0)} ha",
+                f"Est. Yield {summary.get('estimated_yield_kg', 0)} kg",
+                f"Allocated Units {summary.get('allocated_units', 0)}",
+                f"Field Capture {summary.get('field_capture_done', 0)}/{summary.get('field_capture_assigned', 0)}",
+                f"Support Visits {summary.get('support_visit_done', 0)}/{summary.get('support_target_total', 0)}",
+            ])
+            writer.writerow([])
+            writer.writerow(["Farmer Registry"])
+            writer.writerow([
+                "farmer_id",
+                "farmer_name",
+                "verification_status",
+                "phone",
+                "email",
+                "community_name",
+                "local_government",
+                "farmer_code",
+                "national_id",
+                "farmer_group",
+                "state_name",
+                "ward_name",
+                "primary_crop",
+                "secondary_crops",
+                "household_size",
+                "land_tenure",
+                "irrigation_access",
+                "finance_access",
+                "insurance_access",
+                "plot_count",
+                "mapped_area_ha",
+                "estimated_yield_kg",
+                "allocation_count",
+                "allocated_units",
+                "support_target",
+                "field_capture_assigned",
+                "field_capture_done",
+                "support_visit_assigned",
+                "support_visit_done",
+                "notes",
+            ])
+            for row in farmer_rows:
+                profile = row.get("profile_data") or {}
+                writer.writerow([
+                    row.get("id"),
+                    row.get("name"),
+                    row.get("verification_status"),
+                    row.get("phone"),
+                    row.get("email"),
+                    row.get("community_name"),
+                    row.get("local_government"),
+                    profile.get("farmer_code"),
+                    profile.get("national_id"),
+                    profile.get("farmer_group"),
+                    profile.get("state_name"),
+                    profile.get("ward_name"),
+                    profile.get("primary_crop"),
+                    profile.get("secondary_crops"),
+                    profile.get("household_size"),
+                    profile.get("land_tenure"),
+                    profile.get("irrigation_access"),
+                    profile.get("finance_access"),
+                    profile.get("insurance_access"),
+                    row.get("plot_count"),
+                    row.get("mapped_area_ha"),
+                    row.get("estimated_yield_kg"),
+                    row.get("allocation_count"),
+                    row.get("allocated_units"),
+                    row.get("support_target"),
+                    row.get("field_capture_assigned"),
+                    row.get("field_capture_done"),
+                    row.get("support_visit_assigned"),
+                    row.get("support_visit_done"),
+                    row.get("notes"),
+                ])
+            writer.writerow([])
+            writer.writerow(["Plot Records"])
+            writer.writerow([
+                "plot_id",
+                "project_tree_no",
+                "farmer_name",
+                "phone",
+                "community_name",
+                "local_government",
+                "plot_code",
+                "plot_name",
+                "commodity",
+                "variety",
+                "season_name",
+                "season_year",
+                "land_use",
+                "irrigation_type",
+                "production_stage",
+                "boundary_capture_method",
+                "existing_area_sqm",
+                "plot_area_hectares",
+                "estimated_yield_kg",
+                "status",
+                "field_capture_assigned",
+                "field_capture_done",
+                "support_visit_assigned",
+                "support_visit_done",
+                "created_by",
+                "created_at",
+                "lng",
+                "lat",
+                "photo_url",
+                "photo_urls",
+                "existing_area_geojson",
+                "record_profile_data_json",
+                "custodian_profile_data_json",
+                "notes",
+            ])
+            for row in plot_rows:
+                record_profile_data = row.get("record_profile_data") or {}
+                custodian_profile_data = row.get("custodian_profile_data") or {}
+                writer.writerow([
+                    row.get("id"),
+                    row.get("project_tree_no"),
+                    row.get("custodian_name"),
+                    row.get("phone"),
+                    row.get("community_name"),
+                    row.get("local_government"),
+                    record_profile_data.get("plot_code"),
+                    record_profile_data.get("plot_name"),
+                    record_profile_data.get("commodity"),
+                    record_profile_data.get("variety"),
+                    record_profile_data.get("season_name"),
+                    record_profile_data.get("season_year"),
+                    record_profile_data.get("land_use"),
+                    record_profile_data.get("irrigation_type"),
+                    record_profile_data.get("production_stage"),
+                    record_profile_data.get("boundary_capture_method"),
+                    row.get("existing_area_sqm"),
+                    record_profile_data.get("area_hectares"),
+                    record_profile_data.get("estimated_yield_kg"),
+                    row.get("status"),
+                    row.get("field_capture_assigned"),
+                    row.get("field_capture_done"),
+                    row.get("support_visit_assigned"),
+                    row.get("support_visit_done"),
+                    row.get("created_by"),
+                    _to_iso_text(row.get("created_at")),
+                    row.get("lng"),
+                    row.get("lat"),
+                    row.get("primary_photo_url") or row.get("photo_url"),
+                    json.dumps(_normalize_photo_urls(row.get("photo_urls"))),
+                    _safe_json(row.get("existing_area_geojson")) if row.get("existing_area_geojson") is not None else "",
+                    _safe_json(record_profile_data) if record_profile_data else "",
+                    _safe_json(custodian_profile_data) if custodian_profile_data else "",
+                    row.get("notes"),
+                ])
+        filename = f"project_{project_id}_agric_programme.csv"
+        return FileResponse(csv_path, media_type="text/csv", filename=filename)
+
     rows = _fetch_existing_tree_export_rows(project_id, db)
     summary = _summarize_existing_tree_export_rows(rows)
-    workflow_profile = _normalize_workflow_profile(project.get("workflow_profile"))
     agric_config = _normalize_agric_config(project.get("agric_config")) or {}
     export_title = (
         "LandCheck Agric Plot Records Detailed Export"
@@ -14896,6 +15081,31 @@ def export_existing_trees_pdf(
     db: Session = Depends(get_db),
 ):
     project = get_project(project_id, db)
+    workflow_profile = _normalize_workflow_profile(project.get("workflow_profile"))
+    if workflow_profile == "agric":
+        context = _build_agric_programme_export_context(project_id, db)
+        os.makedirs(REPORTS_DIR, exist_ok=True)
+        tmp_pdf = tempfile.NamedTemporaryFile(suffix="_agric_programme.pdf", delete=False)
+        pdf_path = tmp_pdf.name
+        tmp_pdf.close()
+        render_green_agric_programme_pdf(
+            pdf_path,
+            project=context["project"],
+            summary=context["summary"],
+            farmer_rows=context["farmer_rows"],
+            plot_rows=context["plot_rows"],
+            overview_map_png=context["overview_map_png"],
+            overview_map_view=context["overview_map_view"],
+            include_photos=include_photos,
+        )
+        filename = f"project_{project_id}_agric_programme_report.pdf"
+        return _pdf_response_with_r2(
+            pdf_path,
+            filename,
+            category="green-agric-programme-report",
+            project_id=project_id,
+            organization_id=int(context["project"].get("organization_id") or 0) or None,
+        )
     rows = _fetch_existing_tree_export_rows(project_id, db)
     summary = _summarize_existing_tree_export_rows(rows)
 
