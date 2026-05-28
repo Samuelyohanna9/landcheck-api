@@ -14293,6 +14293,8 @@ def _is_export_task_complete(row: dict) -> bool:
 def _build_agric_programme_export_context(
     project_id: int,
     db: Session,
+    *,
+    include_map: bool = False,
 ) -> dict:
     project = get_project(project_id, db)
     project_copy = dict(project)
@@ -14612,31 +14614,38 @@ def _build_agric_programme_export_context(
         "insurance_segmentation_pct": _pct(insurance_access_farmers, len(farmer_rows)),
     }
 
-    overview_map_rows = []
-    for row in plot_rows:
-        overview_map_rows.append(
-            {
-                "id": row.get("id"),
-                "status": row.get("status"),
-                "lng": row.get("lng"),
-                "lat": row.get("lat"),
-                "existing_area_geojson": row.get("existing_area_geojson"),
-            }
-        )
-    overview_map_view = _estimate_report_map_view(overview_map_rows, width=800, height=500)
-    overview_map_png = (
-        _build_report_map_png(
-            overview_map_rows,
-            lng=overview_map_view.get("lng"),
-            lat=overview_map_view.get("lat"),
-            zoom=overview_map_view.get("zoom"),
-            bearing=overview_map_view.get("bearing"),
-            pitch=overview_map_view.get("pitch"),
-            include_markers=False,
-        )
-        if overview_map_view
-        else None
-    )
+    overview_map_view = None
+    overview_map_png = None
+    if include_map:
+        overview_map_rows = []
+        for row in plot_rows:
+            overview_map_rows.append(
+                {
+                    "id": row.get("id"),
+                    "status": row.get("status"),
+                    "lng": row.get("lng"),
+                    "lat": row.get("lat"),
+                    "existing_area_geojson": row.get("existing_area_geojson"),
+                }
+            )
+        try:
+            overview_map_view = _estimate_report_map_view(overview_map_rows, width=800, height=500)
+            overview_map_png = (
+                _build_report_map_png(
+                    overview_map_rows,
+                    lng=overview_map_view.get("lng"),
+                    lat=overview_map_view.get("lat"),
+                    zoom=overview_map_view.get("zoom"),
+                    bearing=overview_map_view.get("bearing"),
+                    pitch=overview_map_view.get("pitch"),
+                    include_markers=False,
+                )
+                if overview_map_view
+                else None
+            )
+        except Exception:
+            overview_map_view = None
+            overview_map_png = None
 
     return {
         "project": project_copy,
@@ -14646,6 +14655,45 @@ def _build_agric_programme_export_context(
         "overview_map_png": overview_map_png,
         "overview_map_view": overview_map_view,
     }
+
+
+def _render_agric_programme_pdf_with_fallback(
+    pdf_path: str,
+    context: dict,
+    *,
+    include_photos: bool,
+) -> None:
+    map_png = context.get("overview_map_png")
+    map_view = context.get("overview_map_view")
+
+    attempts: list[tuple[bytes | None, dict | None, bool]] = [
+        (map_png, map_view, include_photos),
+    ]
+    if map_png is not None or map_view is not None:
+        attempts.append((None, None, include_photos))
+    if include_photos:
+        attempts.append((map_png, map_view, False))
+        if map_png is not None or map_view is not None:
+            attempts.append((None, None, False))
+
+    last_error: Exception | None = None
+    for next_map_png, next_map_view, next_include_photos in attempts:
+        try:
+            render_green_agric_programme_pdf(
+                pdf_path,
+                project=context["project"],
+                summary=context["summary"],
+                farmer_rows=context["farmer_rows"],
+                plot_rows=context["plot_rows"],
+                overview_map_png=next_map_png,
+                overview_map_view=next_map_view,
+                include_photos=next_include_photos,
+            )
+            return
+        except Exception as exc:
+            last_error = exc
+    if last_error is not None:
+        raise last_error
 
 
 @router.get("/projects/{project_id}/existing-trees/metrics")
@@ -14686,7 +14734,7 @@ def export_existing_trees_csv(project_id: int, db: Session = Depends(get_db)):
     project = get_project(project_id, db)
     workflow_profile = _normalize_workflow_profile(project.get("workflow_profile"))
     if workflow_profile == "agric":
-        context = _build_agric_programme_export_context(project_id, db)
+        context = _build_agric_programme_export_context(project_id, db, include_map=False)
         project_copy = context["project"]
         summary = context["summary"]
         farmer_rows = context["farmer_rows"]
@@ -15083,19 +15131,14 @@ def export_existing_trees_pdf(
     project = get_project(project_id, db)
     workflow_profile = _normalize_workflow_profile(project.get("workflow_profile"))
     if workflow_profile == "agric":
-        context = _build_agric_programme_export_context(project_id, db)
+        context = _build_agric_programme_export_context(project_id, db, include_map=True)
         os.makedirs(REPORTS_DIR, exist_ok=True)
         tmp_pdf = tempfile.NamedTemporaryFile(suffix="_agric_programme.pdf", delete=False)
         pdf_path = tmp_pdf.name
         tmp_pdf.close()
-        render_green_agric_programme_pdf(
+        _render_agric_programme_pdf_with_fallback(
             pdf_path,
-            project=context["project"],
-            summary=context["summary"],
-            farmer_rows=context["farmer_rows"],
-            plot_rows=context["plot_rows"],
-            overview_map_png=context["overview_map_png"],
-            overview_map_view=context["overview_map_view"],
+            context,
             include_photos=include_photos,
         )
         filename = f"project_{project_id}_agric_programme_report.pdf"
@@ -15498,15 +15541,10 @@ def _render_work_report_to_pdf(
     project = get_project(project_id=project_id, db=db, assignee_name=assignee_clean)
     workflow_profile = _normalize_workflow_profile(project.get("workflow_profile"))
     if workflow_profile == "agric":
-        context = _build_agric_programme_export_context(project_id, db)
-        render_green_agric_programme_pdf(
+        context = _build_agric_programme_export_context(project_id, db, include_map=True)
+        _render_agric_programme_pdf_with_fallback(
             pdf_path,
-            project=context["project"],
-            summary=context["summary"],
-            farmer_rows=context["farmer_rows"],
-            plot_rows=context["plot_rows"],
-            overview_map_png=context["overview_map_png"],
-            overview_map_view=context["overview_map_view"],
+            context,
             include_photos=include_photos,
         )
         return f"project_{project_id}_agric_programme_report.pdf", int(context["project"].get("organization_id") or 0) or None
