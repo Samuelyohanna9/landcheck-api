@@ -1578,13 +1578,19 @@ def _normalize_tree_record_profile_data(value: object, *, existing_area_sqm: flo
     return normalized or None
 
 
+HIDDEN_PLACEHOLDER_REASONS = {
+    "support_visit_before_plot_capture",
+    "field_capture_before_plot_capture",
+}
+
+
 def _is_hidden_tree_record(value: object) -> bool:
     raw = _normalize_json_object(value) or {}
     if _clean_bool(raw.get("hidden_from_records")) is True:
         return True
     if _clean_bool(raw.get("support_placeholder")) is True:
         return True
-    return _clean_text(raw.get("placeholder_reason"), 120) == "support_visit_before_plot_capture"
+    return _clean_text(raw.get("placeholder_reason"), 120) in HIDDEN_PLACEHOLDER_REASONS
 
 
 def _get_or_create_support_placeholder_tree(
@@ -1594,7 +1600,11 @@ def _get_or_create_support_placeholder_tree(
     custodian_id: int,
     event_species: str | None = None,
     actor_name: str | None = None,
+    placeholder_reason: str = "support_visit_before_plot_capture",
+    plot_name: str = "Plot pending capture",
+    notes: str | None = None,
 ) -> dict:
+    placeholder_reason_clean = _clean_text(placeholder_reason, 120) or "support_visit_before_plot_capture"
     existing = db.execute(
         text(
             """
@@ -1602,7 +1612,7 @@ def _get_or_create_support_placeholder_tree(
             FROM trees
             WHERE project_id = :project_id
               AND custodian_id = :custodian_id
-              AND LOWER(COALESCE(record_profile_data->>'placeholder_reason', '')) = 'support_visit_before_plot_capture'
+              AND LOWER(COALESCE(record_profile_data->>'placeholder_reason', '')) = :placeholder_reason
             ORDER BY created_at ASC, id ASC
             LIMIT 1
             """
@@ -1610,6 +1620,7 @@ def _get_or_create_support_placeholder_tree(
         {
             "project_id": int(project_id),
             "custodian_id": int(custodian_id),
+            "placeholder_reason": placeholder_reason_clean,
         },
     ).mappings().first()
     if existing:
@@ -1619,11 +1630,11 @@ def _get_or_create_support_placeholder_tree(
     placeholder_species = _clean_text(event_species, 160) or "Plot pending capture"
     placeholder_record_profile = _normalize_tree_record_profile_data(
         {
-            "plot_name": "Plot pending capture",
+            "plot_name": plot_name,
             "commodity": placeholder_species if placeholder_species != "Plot pending capture" else None,
             "support_placeholder": True,
             "hidden_from_records": True,
-            "placeholder_reason": "support_visit_before_plot_capture",
+            "placeholder_reason": placeholder_reason_clean,
         }
     )
     row = db.execute(
@@ -1667,7 +1678,12 @@ def _get_or_create_support_placeholder_tree(
             "project_id": int(project_id),
             "project_tree_no": int(project_tree_no),
             "species": placeholder_species,
-            "notes": "Hidden placeholder plot created automatically before the first support visit capture.",
+            "notes": (notes or "").strip()
+            or (
+                "Hidden placeholder plot created automatically before field activity capture."
+                if placeholder_reason_clean == "field_capture_before_plot_capture"
+                else "Hidden placeholder plot created automatically before the first support visit capture."
+            ),
             "photo_urls": _safe_json([]),
             "created_by": (actor_name or "").strip() or "system",
             "custodian_id": int(custodian_id),
@@ -1691,7 +1707,7 @@ def _get_or_create_support_placeholder_tree(
         actor=(actor_name or "").strip() or "system",
         details={
             "custodian_id": int(custodian_id),
-            "reason": "support_visit_before_plot_capture",
+            "reason": placeholder_reason_clean,
         },
     )
     return tree_row
@@ -6549,24 +6565,13 @@ def assign_distribution_supervision(
         },
     ).mappings().all()
     tree_rows = [dict(row) for row in tree_rows_all if not _is_hidden_tree_record(row.get("record_profile_data"))]
-    has_real_plot_records = bool(tree_rows)
-    if not tree_rows and workflow_profile == "agric":
-        tree_rows = [
-            _get_or_create_support_placeholder_tree(
-                db,
-                project_id=int(allocation.get("project_id") or 0),
-                custodian_id=int(allocation.get("custodian_id") or 0),
-                event_species=_clean_text(allocation.get("event_species"), 160),
-                actor_name=actor_name,
-            )
-        ]
     if not tree_rows:
         raise HTTPException(
             status_code=400,
             detail=f"No {entity_label}s linked to this {owner_label} yet. Capture at least one {entity_label} first.",
         )
-    assignment_mode = "field_capture" if workflow_profile == "agric" and not has_real_plot_records else "support_visit"
-    task_type_to_create = FIELD_CAPTURE_TASK_TYPE if assignment_mode == "field_capture" else SUPERVISION_TASK_TYPE
+    assignment_mode = "support_visit" if workflow_profile == "agric" else "supervision"
+    task_type_to_create = SUPERVISION_TASK_TYPE
 
     task_counts = db.execute(
         text(
@@ -6596,7 +6601,7 @@ def assign_distribution_supervision(
     if remaining_assignable <= 0:
         raise HTTPException(status_code=409, detail="All supervision visits for this allocation are already assigned")
 
-    create_count = min(1 if assignment_mode == "field_capture" else requested_visits, remaining_assignable)
+    create_count = min(requested_visits, remaining_assignable)
     due_date_value = _parse_date_value(due_date)
     cycle_days = int(allocation.get("followup_cycle_days") or 14)
     baseline_due = (
@@ -6614,12 +6619,7 @@ def assign_distribution_supervision(
         target_tree = tree_rows[(assigned_count + index) % len(tree_rows)]
         task_due_date = due_date_value or (baseline_due + timedelta(days=max(cycle_days * visit_no, 1)))
         task_notes = (
-            f"First field capture {visit_no}/{supervision_target}. "
-            f"{owner_label.title()}: {custodian_name or '-'} ({str(allocation.get('custodian_type') or '-').replace('_', ' ')}). "
-            f"Community: {community_text}. Contact: {contact_text}. "
-            "Open Map & Add Plot in the mobile app, capture the first farm boundary polygon, attach photos, and save the plot."
-            if assignment_mode == "field_capture"
-            else f"{visit_label} {visit_no}/{supervision_target}. "
+            f"{visit_label} {visit_no}/{supervision_target}. "
             f"{owner_label.title()}: {custodian_name or '-'} ({str(allocation.get('custodian_type') or '-').replace('_', ' ')}). "
             f"Community: {community_text}. Contact: {contact_text}. "
             + (
@@ -6707,6 +6707,205 @@ def assign_distribution_supervision(
         "assignment_mode": assignment_mode,
         "created_count": len(created_tasks),
         "tasks": created_tasks,
+    }
+
+
+@router.post("/projects/{project_id}/custodians/{custodian_id}/assign-field-capture")
+def assign_custodian_field_capture(
+    project_id: int,
+    custodian_id: int,
+    db: Session = Depends(get_db),
+    assignee_name: str = Body(...),
+    due_date: str | None = Body(default=None),
+    priority: str = Body(default="normal"),
+    actor_name: str | None = Body(default=None),
+):
+    assignee_clean = (assignee_name or "").strip()
+    if not assignee_clean:
+        raise HTTPException(status_code=400, detail="Assignee name is required")
+
+    project_settings = _get_project_settings(db, int(project_id))
+    workflow_profile = _normalize_workflow_profile(project_settings.get("workflow_profile"))
+    if workflow_profile != "agric":
+        raise HTTPException(status_code=400, detail="Field capture assignments are only available in Agric mode")
+
+    custodian = db.execute(
+        text(
+            """
+            SELECT
+                id,
+                project_id,
+                name,
+                custodian_type,
+                contact_person,
+                phone,
+                email,
+                community_name,
+                profile_data
+            FROM green_custodians
+            WHERE id = :custodian_id
+            """
+        ),
+        {"custodian_id": int(custodian_id)},
+    ).mappings().first()
+    if not custodian:
+        raise HTTPException(status_code=404, detail="Farmer not found")
+    if int(custodian.get("project_id") or 0) != int(project_id):
+        raise HTTPException(status_code=400, detail="Farmer and project must belong to the same record set")
+
+    tree_rows_all = db.execute(
+        text(
+            """
+            SELECT id, record_profile_data
+            FROM trees
+            WHERE project_id = :project_id
+              AND custodian_id = :custodian_id
+            ORDER BY created_at ASC, id ASC
+            """
+        ),
+        {"project_id": int(project_id), "custodian_id": int(custodian_id)},
+    ).mappings().all()
+    visible_plot_rows = [dict(row) for row in tree_rows_all if not _is_hidden_tree_record(row.get("record_profile_data"))]
+    if visible_plot_rows:
+        raise HTTPException(status_code=409, detail="This farmer already has mapped plots. Use Support Visits instead.")
+
+    existing_open_task = db.execute(
+        text(
+            """
+            SELECT t.id, t.assignee_name, t.due_date
+            FROM tree_tasks t
+            JOIN trees tr ON tr.id = t.tree_id
+            WHERE tr.project_id = :project_id
+              AND t.custodian_id = :custodian_id
+              AND LOWER(COALESCE(t.task_type, '')) = :task_type
+              AND NOT (
+                  LOWER(COALESCE(t.review_state, 'none')) = 'approved'
+                  OR (
+                      LOWER(COALESCE(t.status, '')) IN ('done', 'completed', 'closed')
+                      AND LOWER(COALESCE(t.review_state, 'none')) IN ('none', 'approved')
+                  )
+              )
+            ORDER BY t.created_at DESC, t.id DESC
+            LIMIT 1
+            """
+        ),
+        {
+            "project_id": int(project_id),
+            "custodian_id": int(custodian_id),
+            "task_type": FIELD_CAPTURE_TASK_TYPE,
+        },
+    ).mappings().first()
+    if existing_open_task:
+        raise HTTPException(
+            status_code=409,
+            detail="A first field capture task is already open for this farmer.",
+        )
+
+    profile_data = _normalize_json_object(custodian.get("profile_data")) or {}
+    primary_crop = _clean_text(profile_data.get("primary_crop"), 160)
+    placeholder_tree = _get_or_create_support_placeholder_tree(
+        db,
+        project_id=int(project_id),
+        custodian_id=int(custodian_id),
+        event_species=primary_crop,
+        actor_name=actor_name,
+        placeholder_reason="field_capture_before_plot_capture",
+        plot_name="Plot pending capture",
+        notes="Hidden placeholder plot created automatically before the first field capture assignment.",
+    )
+
+    due_date_value = _parse_date_value(due_date)
+    priority_value = _clean_text(priority, 32) or "normal"
+    custodian_name = str(custodian.get("name") or "").strip()
+    contact_text = str(custodian.get("phone") or custodian.get("email") or custodian.get("contact_person") or "-").strip()
+    community_text = str(custodian.get("community_name") or "-").strip()
+    crop_text = primary_crop or "Crop not set"
+    task_notes = (
+        f"First field capture. Farmer: {custodian_name or '-'} ({str(custodian.get('custodian_type') or '-').replace('_', ' ')}). "
+        f"Community: {community_text}. Contact: {contact_text}. Primary crop: {crop_text}. "
+        "Open Map & Add Plot in the mobile app, walk or draw the farm boundary polygon, attach plot photos, and save the first mapped plot."
+    )
+
+    row = db.execute(
+        text(
+            """
+            INSERT INTO tree_tasks (
+                tree_id, task_type, assignee_name, due_date, priority, status, notes, photo_url, photo_urls,
+                review_state, submitted_at, completed_at, model_season,
+                custodian_id, distribution_allocation_id, supervision_visit_no, supervision_total_visits
+            )
+            VALUES (
+                :tree_id, :task_type, :assignee_name, :due_date, :priority, 'pending', :notes, NULL, CAST(:photo_urls AS JSONB),
+                'none', NULL, NULL, NULL,
+                :custodian_id, NULL, NULL, NULL
+            )
+            RETURNING id, tree_id, due_date
+            """
+        ),
+        {
+            "tree_id": int(placeholder_tree.get("id") or 0),
+            "task_type": FIELD_CAPTURE_TASK_TYPE,
+            "assignee_name": assignee_clean,
+            "due_date": due_date_value,
+            "priority": priority_value,
+            "notes": task_notes,
+            "photo_urls": _safe_json([]),
+            "custodian_id": int(custodian_id),
+        },
+    ).mappings().first()
+
+    _log_audit_event(
+        db,
+        project_id=int(project_id),
+        entity_type="custodian",
+        entity_id=int(custodian_id),
+        action="field_capture_assigned",
+        actor=(actor_name or "").strip() or None,
+        details={
+            "assignee_name": assignee_clean,
+            "task_id": int(row.get("id") or 0),
+            "tree_id": int(placeholder_tree.get("id") or 0),
+        },
+    )
+    db.commit()
+
+    due_label = _safe_push_date_label(due_date_value)
+    _queue_green_push_to_assignee(
+        db,
+        project_id=int(project_id),
+        assignee_name=assignee_clean,
+        title="New task assigned",
+        body="A new field capture task has been assigned to you." + (f" Due {due_label}." if due_label else ""),
+        data={
+            "type": "task_assigned",
+            "project_id": int(project_id),
+            "task_id": int(row.get("id") or 0),
+            "task_type": FIELD_CAPTURE_TASK_TYPE,
+            "tree_id": int(placeholder_tree.get("id") or 0),
+        },
+    )
+
+    return {
+        "project_id": int(project_id),
+        "custodian_id": int(custodian_id),
+        "custodian_name": custodian_name,
+        "assignment_mode": "field_capture",
+        "created_count": 1,
+        "tasks": [
+            {
+                "task_id": int(row.get("id") or 0),
+                "tree_id": int(row.get("tree_id") or 0),
+                "task_type": FIELD_CAPTURE_TASK_TYPE,
+                "tree_species": placeholder_tree.get("species"),
+                "tree_status": placeholder_tree.get("status"),
+                "tree_lng": placeholder_tree.get("lng"),
+                "tree_lat": placeholder_tree.get("lat"),
+                "due_date": _to_date_input(row.get("due_date")),
+                "custodian_name": custodian_name,
+                "custodian_contact": contact_text,
+                "custodian_community": community_text,
+            }
+        ],
     }
 
 
