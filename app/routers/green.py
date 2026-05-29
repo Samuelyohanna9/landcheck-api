@@ -12821,13 +12821,13 @@ def export_donor_report_csv(project_id: int, db: Session = Depends(get_db)):
 @router.get("/projects/{project_id}/donor-report/pdf")
 def export_donor_report_pdf(
     project_id: int,
-    assignee_name: str | None = Query(default=None),
-    include_photos: bool = Query(default=False),
-    lng: float | None = Query(default=None),
-    lat: float | None = Query(default=None),
-    zoom: float | None = Query(default=None),
-    bearing: float | None = Query(default=0.0),
-    pitch: float | None = Query(default=0.0),
+    assignee_name: str | None = None,
+    include_photos: bool = False,
+    lng: float | None = None,
+    lat: float | None = None,
+    zoom: float | None = None,
+    bearing: float | None = 0.0,
+    pitch: float | None = 0.0,
     db: Session = Depends(get_db),
 ):
     # Use the comprehensive map report and include donor/review details in additional pages.
@@ -12855,13 +12855,13 @@ def export_donor_report_csv_alias(
 @router.get("/donor/export/pdf")
 def export_donor_report_pdf_alias(
     project_id: int = Query(...),
-    assignee_name: str | None = Query(default=None),
-    include_photos: bool = Query(default=False),
-    lng: float | None = Query(default=None),
-    lat: float | None = Query(default=None),
-    zoom: float | None = Query(default=None),
-    bearing: float | None = Query(default=0.0),
-    pitch: float | None = Query(default=0.0),
+    assignee_name: str | None = None,
+    include_photos: bool = False,
+    lng: float | None = None,
+    lat: float | None = None,
+    zoom: float | None = None,
+    bearing: float | None = 0.0,
+    pitch: float | None = 0.0,
     db: Session = Depends(get_db),
 ):
     return export_donor_report_pdf(
@@ -13599,7 +13599,7 @@ def export_work_stats_pdf(project_id: int, db: Session = Depends(get_db)):
 @router.get("/projects/{project_id}/custodians/export/pdf")
 def export_custodian_report_pdf(
     project_id: int,
-    include_photos: bool = Query(default=True),
+    include_photos: bool = True,
     db: Session = Depends(get_db),
 ):
     project = get_project(project_id, db)
@@ -15125,7 +15125,7 @@ def export_existing_trees_csv(project_id: int, db: Session = Depends(get_db)):
 @router.get("/projects/{project_id}/existing-trees/export/pdf")
 def export_existing_trees_pdf(
     project_id: int,
-    include_photos: bool = Query(default=False),
+    include_photos: bool = False,
     db: Session = Depends(get_db),
 ):
     project = get_project(project_id, db)
@@ -15537,7 +15537,7 @@ def _render_work_report_to_pdf(
     bearing_value = _coerce_optional_float(bearing)
     pitch_value = _coerce_optional_float(pitch)
 
-    assignee_clean = (assignee_name or "").strip() or None
+    assignee_clean = assignee_name.strip() if isinstance(assignee_name, str) else None
     project = get_project(project_id=project_id, db=db, assignee_name=assignee_clean)
     workflow_profile = _normalize_workflow_profile(project.get("workflow_profile"))
     if workflow_profile == "agric":
@@ -15767,8 +15767,8 @@ def _render_work_report_to_pdf(
             include_photos=include_photos,
         )
     filename = (
-        f"project_{project_id}_work_report_{assignee_name}.pdf"
-        if assignee_name
+        f"project_{project_id}_work_report_{assignee_clean}.pdf"
+        if assignee_clean
         else f"project_{project_id}_work_report_all.pdf"
     )
     return filename, int(project_copy.get("organization_id") or 0) or None
@@ -15778,12 +15778,12 @@ def _render_work_report_to_pdf(
 def export_work_report_pdf(
     project_id: int,
     assignee_name: str | None = None,
-    include_photos: bool = Query(default=False),
-    lng: float | None = Query(default=None),
-    lat: float | None = Query(default=None),
-    zoom: float | None = Query(default=None),
-    bearing: float | None = Query(default=0.0),
-    pitch: float | None = Query(default=0.0),
+    include_photos: bool = False,
+    lng: float | None = None,
+    lat: float | None = None,
+    zoom: float | None = None,
+    bearing: float | None = 0.0,
+    pitch: float | None = 0.0,
     db: Session = Depends(get_db),
 ):
     os.makedirs(REPORTS_DIR, exist_ok=True)
