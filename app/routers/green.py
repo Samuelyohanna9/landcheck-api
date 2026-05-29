@@ -5848,7 +5848,7 @@ def list_projects(
 def get_project(
     project_id: int,
     db: Session = Depends(get_db),
-    assignee_name: str | None = Query(default=None),
+    assignee_name: str | None = None,
 ):
     assignee_clean = (assignee_name or "").strip() or None
     project = db.execute(text("""
