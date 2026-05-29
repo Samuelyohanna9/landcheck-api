@@ -188,14 +188,14 @@ def _draw_project_brand_header_bar(
     c.setFont("Helvetica-Bold", 16 if bar_h <= 72 else 18)
     c.drawString(text_x, top - 28, heading[:64])
 
-    c.setFont("Helvetica", 9.5)
+    c.setFont("Helvetica", 10.2)
     c.setFillColorRGB(0.88, 0.96, 0.9)
     c.drawString(text_x, top - 43, line2[:96])
-    c.setFont("Helvetica-Oblique", 8)
+    c.setFont("Helvetica-Oblique", 8.8)
     powered_text = f"Powered by LandCheck{f' | {subtitle}' if subtitle else ''}"
     c.drawString(text_x, top - (58 if bar_h > 72 else 55), powered_text[:120])
 
-    c.setFont("Helvetica", 8.5)
+    c.setFont("Helvetica", 9)
     c.setFillColorRGB(0.82, 0.95, 0.86)
     c.drawRightString(width - right, top - 28, datetime.utcnow().strftime("Generated %d %b %Y %H:%M UTC"))
 
@@ -207,12 +207,12 @@ def _draw_stat_card(c, x, y, w, h, label, value, sub=None, color=None):
     c.setFillColorRGB(0.15, 0.15, 0.15)
     c.setFont("Helvetica-Bold", 18)
     c.drawCentredString(x + w / 2, y + h - 28, str(value))
-    c.setFont("Helvetica", 8)
-    c.setFillColorRGB(0.4, 0.4, 0.4)
+    c.setFont("Helvetica", 8.8)
+    c.setFillColorRGB(0.28, 0.28, 0.28)
     c.drawCentredString(x + w / 2, y + h - 40, label)
     if sub:
-        c.setFont("Helvetica", 7)
-        c.setFillColorRGB(0.55, 0.55, 0.55)
+        c.setFont("Helvetica", 7.8)
+        c.setFillColorRGB(0.4, 0.4, 0.4)
         c.drawCentredString(x + w / 2, y + 6, sub)
 
 
@@ -2472,9 +2472,15 @@ def render_green_agric_programme_pdf(
     c = canvas.Canvas(output_path, pagesize=A4)
     width, height = A4
     agric_config = project.get("agric_config") if isinstance(project.get("agric_config"), dict) else {}
+    body_font = "Helvetica"
+    body_font_size = 8.8
+    body_line_gap = 10.4
+    table_font_size = 7.9
+    table_header_size = 8.1
+    note_font_size = 8.1
     total_plots = len(plot_rows)
-    farmer_page_size = 28
-    plot_schedule_page_size = 28
+    farmer_page_size = 24
+    plot_schedule_page_size = 24
     farmer_page_count = int(math.ceil(len(farmer_rows) / float(farmer_page_size))) if farmer_rows else 0
     plot_schedule_page_count = int(math.ceil(total_plots / float(plot_schedule_page_size))) if plot_rows else 0
     total_pages = 2 + farmer_page_count + plot_schedule_page_count + total_plots
@@ -2516,8 +2522,8 @@ def render_green_agric_programme_pdf(
         c.setStrokeColor(HexColor("#d6dfd9"))
         c.setLineWidth(0.5)
         c.line(34, 22, width - 34, 22)
-        c.setFont("Helvetica", 7)
-        c.setFillColorRGB(0.42, 0.42, 0.42)
+        c.setFont("Helvetica", 7.8)
+        c.setFillColorRGB(0.34, 0.34, 0.34)
         c.drawString(34, 10, "LandCheck Agric programme report")
         c.drawRightString(width - 34, 10, f"Page {current_page} of {max(total_pages, 1)}")
 
@@ -2549,8 +2555,8 @@ def render_green_agric_programme_pdf(
         c.setFillColorRGB(0.08, 0.14, 0.11)
         c.setFont("Helvetica-Bold", 16)
         c.drawString(34, height - bar_height - 20, title[:76])
-        c.setFont("Helvetica", 8.5)
-        c.setFillColorRGB(0.38, 0.38, 0.38)
+        c.setFont("Helvetica", 9.3)
+        c.setFillColorRGB(0.26, 0.26, 0.26)
         c.drawString(34, height - bar_height - 33, subtitle[:118])
 
     def draw_list_box(
@@ -2566,22 +2572,22 @@ def render_green_agric_programme_pdf(
         bullet: bool = False,
     ) -> None:
         _draw_rounded_box(c, x, y, w, h, 7, fill_color=HexColor(fill_color), stroke_color=HexColor(stroke_color))
-        c.setFont("Helvetica-Bold", 9.2)
+        c.setFont("Helvetica-Bold", 10)
         c.setFillColorRGB(0.12, 0.12, 0.12)
         c.drawString(x + 10, y + h - 16, title[:54])
         current_y = y + h - 30
-        c.setFont("Helvetica", 7.6)
-        c.setFillColorRGB(0.34, 0.34, 0.34)
+        c.setFont(body_font, body_font_size)
+        c.setFillColorRGB(0.16, 0.16, 0.16)
         for line in lines:
             prefix = "- " if bullet else ""
-            wrapped = _wrap_pdf_text_lines(c, f"{prefix}{line}", "Helvetica", 7.6, w - 20)
+            wrapped = _wrap_pdf_text_lines(c, f"{prefix}{line}", body_font, body_font_size, w - 20)
             for idx, part in enumerate(wrapped[:4]):
                 if current_y < y + 10:
                     return
                 if bullet and idx > 0 and part.startswith("- "):
                     part = f"  {part[2:]}"
                 c.drawString(x + 10, current_y, part)
-                current_y -= 9
+                current_y -= body_line_gap
 
     def draw_table_shell(title: str, subtitle: str) -> tuple[float, float, float, float]:
         draw_section_header(title, subtitle, report_label="Agric Programme Report")
@@ -2669,8 +2675,8 @@ def render_green_agric_programme_pdf(
         bar_height=78,
     )
 
-    c.setFont("Helvetica", 8.6)
-    c.setFillColorRGB(0.34, 0.34, 0.34)
+    c.setFont("Helvetica", 9.4)
+    c.setFillColorRGB(0.22, 0.22, 0.22)
     meta_parts = []
     if project.get("location_text"):
         meta_parts.append(f"Location: {project.get('location_text')}")
@@ -2809,12 +2815,12 @@ def render_green_agric_programme_pdf(
             header_y = table_y + table_h - 34
             c.setFillColor(HexColor("#eff6f0"))
             c.rect(table_x + 1, header_y - 12, table_w - 2, 18, stroke=0, fill=1)
-            c.setFont("Helvetica-Bold", 7.3)
+            c.setFont("Helvetica-Bold", table_header_size)
             c.setFillColorRGB(0.13, 0.13, 0.13)
             for label, x_pos, _ in columns:
                 c.drawString(x_pos, header_y, label)
             row_y = header_y - 18
-            row_height = 18
+            row_height = 20
             for row_index, row in enumerate(chunk):
                 profile = row.get("profile_data") or {}
                 if row_index % 2 == 0:
@@ -2824,7 +2830,7 @@ def render_green_agric_programme_pdf(
                 c.setLineWidth(0.4)
                 c.line(table_x + 1, row_y - 10, table_x + table_w - 1, row_y - 10)
                 c.setFillColorRGB(0.18, 0.18, 0.18)
-                c.setFont("Helvetica", 6.9)
+                c.setFont("Helvetica", table_font_size)
                 farmer_name = str(row.get("name") or "-")[:24]
                 contact_text = str(row.get("phone") or row.get("email") or "-")[:16]
                 location_text = f"{str(profile.get('state_name') or row.get('community_name') or '-')[:10]} / {str(row.get('local_government') or '-')[:10]}"
@@ -2838,8 +2844,8 @@ def render_green_agric_programme_pdf(
                 c.drawRightString(506, row_y, f"{_safe_float_value(row.get('mapped_area_ha')):.2f}")
                 c.drawRightString(560, row_y, visit_text)
                 row_y -= row_height
-            c.setFont("Helvetica", 7)
-            c.setFillColorRGB(0.45, 0.45, 0.45)
+            c.setFont("Helvetica", note_font_size)
+            c.setFillColorRGB(0.32, 0.32, 0.32)
             c.drawString(table_x + 10, table_y + 10, f"Farmer records on this page: {len(chunk)}")
             c.drawRightString(table_x + table_w - 10, table_y + 10, f"Registry page {chunk_index}/{len(farmer_chunks)}")
             finish_page(final=(chunk_index == len(farmer_chunks) and plot_schedule_page_count == 0 and total_plots == 0))
@@ -2864,12 +2870,12 @@ def render_green_agric_programme_pdf(
             header_y = table_y + table_h - 34
             c.setFillColor(HexColor("#eff6f0"))
             c.rect(table_x + 1, header_y - 12, table_w - 2, 18, stroke=0, fill=1)
-            c.setFont("Helvetica-Bold", 7.2)
+            c.setFont("Helvetica-Bold", table_header_size)
             c.setFillColorRGB(0.13, 0.13, 0.13)
             for label, x_pos, _ in columns:
                 c.drawString(x_pos, header_y, label)
             row_y = header_y - 18
-            row_height = 18
+            row_height = 20
             for row_index, row in enumerate(chunk):
                 record_profile = row.get("record_profile_data") or {}
                 if row_index % 2 == 0:
@@ -2878,7 +2884,7 @@ def render_green_agric_programme_pdf(
                 c.setStrokeColor(HexColor("#e5ece6"))
                 c.setLineWidth(0.4)
                 c.line(table_x + 1, row_y - 10, table_x + table_w - 1, row_y - 10)
-                c.setFont("Helvetica", 6.8)
+                c.setFont("Helvetica", table_font_size)
                 c.setFillColorRGB(0.18, 0.18, 0.18)
                 season_bits = [str(record_profile.get("season_name") or "").strip(), str(record_profile.get("season_year") or "").strip()]
                 season_text = " ".join([item for item in season_bits if item]).strip() or "-"
@@ -2891,8 +2897,8 @@ def render_green_agric_programme_pdf(
                 c.drawString(494, row_y, _format_agric_label(row.get("last_review_state"))[:8])
                 c.drawString(530, row_y, "Yes" if _first_available_plot_photo_url(row) else "No")
                 row_y -= row_height
-            c.setFont("Helvetica", 7)
-            c.setFillColorRGB(0.45, 0.45, 0.45)
+            c.setFont("Helvetica", note_font_size)
+            c.setFillColorRGB(0.32, 0.32, 0.32)
             c.drawString(table_x + 10, table_y + 10, f"Plots on this page: {len(chunk)}")
             c.drawRightString(table_x + table_w - 10, table_y + 10, f"Schedule page {chunk_index}/{len(plot_chunks)}")
             finish_page(final=(chunk_index == len(plot_chunks) and total_plots == 0))
@@ -2921,8 +2927,8 @@ def render_green_agric_programme_pdf(
         c.setFillColorRGB(0.08, 0.14, 0.11)
         c.setFont("Helvetica-Bold", 15)
         c.drawString(34, height - 84, plot_name[:58])
-        c.setFont("Helvetica", 8.4)
-        c.setFillColorRGB(0.36, 0.36, 0.36)
+        c.setFont("Helvetica", 9.3)
+        c.setFillColorRGB(0.24, 0.24, 0.24)
         meta_line = f"Farmer: {str(row.get('custodian_name') or 'Farmer not linked')[:26]} | Crop: {commodity[:20]} | Area: {format_area(area_ha)} | Season: {season_label[:20]}"
         if plot_code:
             meta_line = f"Code: {plot_code[:14]} | {meta_line}"
