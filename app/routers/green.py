@@ -165,7 +165,7 @@ RELIEF_DAMAGE_LEVEL_VALUES = {"minor", "major", "destroyed", "habitable_with_rep
 RELIEF_OCCUPANCY_STATUS_VALUES = {"occupied", "vacant", "hosted", "temporary_site", "institutional_use", "unknown"}
 RELIEF_TENURE_STATUS_VALUES = {"owner", "tenant", "hosted", "informal", "disputed", "community_owned", "government_owned", "unknown"}
 RELIEF_RESPONSE_PATHWAY_VALUES = {"assessment_only", "repair", "rebuild", "cash_support", "materials_only", "contractor_rehab", "infrastructure_repair", "other"}
-RELIEF_BOUNDARY_CAPTURE_METHOD_VALUES = {"point", "polygon_map", "polygon_gps_walk"}
+RELIEF_BOUNDARY_CAPTURE_METHOD_VALUES = {"point", "line_map", "line_gps_walk", "polygon_map", "polygon_gps_walk"}
 TREE_ORIGIN_VALUES = {"new_planting", "existing_inventory", "natural_regeneration"}
 TREE_ATTRIBUTION_SCOPE_VALUES = {"full", "monitor_only"}
 CUSTODIAN_TYPE_VALUES = {"household", "school", "community_group", "small_business", "health_facility", "community_asset"}
@@ -1549,7 +1549,7 @@ def _get_workflow_labels(value: str | None) -> dict[str, str]:
             "field_capture_label": "Initial site assessment",
             "placeholder_name": "Site pending assessment",
             "placeholder_species": "Site pending assessment",
-            "field_capture_notes": "Open Map & Assess Sites in the mobile app, draw or walk the site boundary polygon, attach evidence photos, and save the first site assessment.",
+            "field_capture_notes": "Open Map & Assess Sites in the mobile app, capture the site as a point, line, or polygon based on the asset type, attach evidence photos, and save the first site assessment.",
             "support_visit_notes": "Review site condition, capture GPS, upload visit photos, and document relief delivery, construction progress, or recovery follow-up.",
         }
     return {
@@ -1985,18 +1985,27 @@ def _merge_photo_evidence(photo_url: str | None, photo_urls: object) -> tuple[st
     return primary, merged
 
 
+def _is_valid_position_pair(point: object) -> bool:
+    if not isinstance(point, (list, tuple)) or len(point) < 2:
+        return False
+    try:
+        float(point[0])
+        float(point[1])
+        return True
+    except Exception:
+        return False
+
+
+def _is_valid_line_string(points: object, minimum_points: int = 2) -> bool:
+    if not isinstance(points, list) or len(points) < minimum_points:
+        return False
+    return all(_is_valid_position_pair(point) for point in points)
+
+
 def _is_valid_linear_ring(ring: object) -> bool:
     if not isinstance(ring, list) or len(ring) < 4:
         return False
-    for point in ring:
-        if not isinstance(point, (list, tuple)) or len(point) < 2:
-            return False
-        try:
-            float(point[0])
-            float(point[1])
-        except Exception:
-            return False
-    return True
+    return _is_valid_line_string(ring, minimum_points=4)
 
 
 def _normalize_work_area_geojson(value: dict | str | None) -> dict | None:
@@ -2022,6 +2031,26 @@ def _normalize_work_area_geojson(value: dict | str | None) -> dict | None:
 
     geom_type = str(geometry.get("type") or "").strip()
     coords = geometry.get("coordinates")
+
+    if geom_type == "Point":
+        if not _is_valid_position_pair(coords):
+            return None
+        return {"type": "Point", "coordinates": [float(coords[0]), float(coords[1])]}
+
+    if geom_type == "LineString":
+        if not _is_valid_line_string(coords):
+            return None
+        return {"type": "LineString", "coordinates": [[float(point[0]), float(point[1])] for point in coords]}
+
+    if geom_type == "MultiLineString":
+        if not isinstance(coords, list) or len(coords) == 0:
+            return None
+        normalized_lines: list[list[list[float]]] = []
+        for line in coords:
+            if not _is_valid_line_string(line):
+                return None
+            normalized_lines.append([[float(point[0]), float(point[1])] for point in line])
+        return {"type": "MultiLineString", "coordinates": normalized_lines}
 
     if geom_type == "Polygon":
         if not isinstance(coords, list) or len(coords) == 0:
@@ -2051,6 +2080,49 @@ def _normalize_work_area_geojson(value: dict | str | None) -> dict | None:
         return {"type": "MultiPolygon", "coordinates": normalized_polygons}
 
     return None
+
+
+def _normalize_polygon_area_geojson(value: dict | str | None) -> dict | None:
+    normalized = _normalize_work_area_geojson(value)
+    if not normalized:
+        return None
+    if str(normalized.get("type") or "").strip() not in {"Polygon", "MultiPolygon"}:
+        return None
+    return normalized
+
+
+def _is_polygonal_work_area(value: dict | str | None) -> bool:
+    normalized = _normalize_work_area_geojson(value)
+    if not normalized:
+        return False
+    return str(normalized.get("type") or "").strip() in {"Polygon", "MultiPolygon"}
+
+
+def _compute_existing_area_sqm(db: Session, geometry: dict | None) -> float | None:
+    if not geometry:
+        return None
+    geom_type = str(geometry.get("type") or "").strip()
+    if geom_type not in {"Polygon", "MultiPolygon"}:
+        return 0.0
+    try:
+        return float(
+            db.execute(
+                text(
+                    """
+                    SELECT ST_Area(
+                        ST_Transform(
+                            ST_SetSRID(ST_GeomFromGeoJSON(:geojson), 4326),
+                            3857
+                        )
+                    )
+                    """
+                ),
+                {"geojson": _safe_json(geometry)},
+            ).scalar()
+            or 0.0
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="Invalid existing_area_geojson") from exc
 
 
 def _get_maintenance_intervals(activity: str, tree_age_days: int, season: str) -> dict:
@@ -4255,18 +4327,28 @@ def _extract_report_geometry_points(geometry: dict | str | None) -> list[tuple[f
     coords = normalized.get("coordinates") or []
     points: list[tuple[float, float]] = []
 
+    def _append_point(point: object):
+        if not isinstance(point, list) or len(point) < 2:
+            return
+        try:
+            points.append((float(point[0]), float(point[1])))
+        except Exception:
+            return
+
     def _append_ring(ring: object):
         if not isinstance(ring, list):
             return
         for point in ring:
-            if not isinstance(point, list) or len(point) < 2:
-                continue
-            try:
-                points.append((float(point[0]), float(point[1])))
-            except Exception:
-                continue
+            _append_point(point)
 
-    if geom_type == "Polygon":
+    if geom_type == "Point":
+        _append_point(coords)
+    elif geom_type == "LineString":
+        _append_ring(coords)
+    elif geom_type == "MultiLineString":
+        for line in coords if isinstance(coords, list) else []:
+            _append_ring(line)
+    elif geom_type == "Polygon":
         for ring in coords if isinstance(coords, list) else []:
             _append_ring(ring)
     elif geom_type == "MultiPolygon":
@@ -7792,27 +7874,7 @@ def add_tree(
                 detail="Draw a polygon area when capturing more than one existing tree in a single record",
             )
 
-    existing_area_sqm_value = None
-    if normalized_existing_area_geojson is not None:
-        try:
-            existing_area_sqm_value = float(
-                db.execute(
-                    text(
-                        """
-                        SELECT ST_Area(
-                            ST_Transform(
-                                ST_SetSRID(ST_GeomFromGeoJSON(:geojson), 4326),
-                                3857
-                            )
-                        )
-                        """
-                    ),
-                    {"geojson": _safe_json(normalized_existing_area_geojson)},
-                ).scalar()
-                or 0.0
-            )
-        except Exception:
-            raise HTTPException(status_code=400, detail="Invalid existing_area_geojson")
+    existing_area_sqm_value = _compute_existing_area_sqm(db, normalized_existing_area_geojson)
     normalized_record_profile_data = _normalize_tree_record_profile_data(
         record_profile_data,
         existing_area_sqm=existing_area_sqm_value,
@@ -8240,27 +8302,11 @@ def update_tree(
     effective_existing_area_geojson = (
         normalized_existing_area_geojson if existing_area_geojson is not None else existing.get("existing_area_geojson")
     )
-    existing_area_sqm_value = None
-    if existing_area_geojson is not None and normalized_existing_area_geojson is not None:
-        try:
-            existing_area_sqm_value = float(
-                db.execute(
-                    text(
-                        """
-                        SELECT ST_Area(
-                            ST_Transform(
-                                ST_SetSRID(ST_GeomFromGeoJSON(:geojson), 4326),
-                                3857
-                            )
-                        )
-                        """
-                    ),
-                    {"geojson": _safe_json(normalized_existing_area_geojson)},
-                ).scalar()
-                or 0.0
-            )
-        except Exception:
-            raise HTTPException(status_code=400, detail="Invalid existing_area_geojson")
+    existing_area_sqm_value = (
+        _compute_existing_area_sqm(db, normalized_existing_area_geojson)
+        if existing_area_geojson is not None and normalized_existing_area_geojson is not None
+        else None
+    )
     next_record_profile_data = (
         _normalize_tree_record_profile_data(
             record_profile_data,
@@ -13209,7 +13255,7 @@ def create_work_order(
         raise HTTPException(status_code=400, detail="Target trees must be greater than 0 for planting orders")
     auto_assign_first_cycle_maintenance = bool(auto_assign_first_cycle_maintenance) and work_type == "planting"
 
-    normalized_area_geojson = _normalize_work_area_geojson(area_geojson)
+    normalized_area_geojson = _normalize_polygon_area_geojson(area_geojson)
     area_label_clean = (area_label or "").strip() or None
     if area_enabled and normalized_area_geojson is None:
         raise HTTPException(
@@ -13482,7 +13528,7 @@ def analyze_remote_monitoring_area(
 ):
     project_id = int(payload.project_id)
     _get_project_settings(db, project_id)
-    normalized_area_geojson = _normalize_work_area_geojson(payload.area_geojson)
+    normalized_area_geojson = _normalize_polygon_area_geojson(payload.area_geojson)
     if normalized_area_geojson is None:
         raise HTTPException(status_code=400, detail="Draw a valid polygon area")
 
@@ -13525,7 +13571,7 @@ def create_remote_monitoring_area(
     name = str(payload.name or "").strip()
     if not name:
         raise HTTPException(status_code=400, detail="Area name is required")
-    normalized_area_geojson = _normalize_work_area_geojson(payload.area_geojson)
+    normalized_area_geojson = _normalize_polygon_area_geojson(payload.area_geojson)
     if normalized_area_geojson is None:
         raise HTTPException(status_code=400, detail="Draw a valid polygon area")
 
@@ -14704,7 +14750,7 @@ def _build_agric_programme_export_context(
         estimated_yield_kg = float(record_profile.get("estimated_yield_kg") or 0.0)
         if estimated_yield_kg > 0:
             total_estimated_yield_kg += estimated_yield_kg
-        if _normalize_work_area_geojson(row.get("existing_area_geojson")):
+        if _is_polygonal_work_area(row.get("existing_area_geojson")):
             polygon_plot_count += 1
         if str(row.get("primary_photo_url") or "").strip():
             photo_plot_count += 1
@@ -15073,7 +15119,7 @@ def _build_relief_programme_export_context(
             total_population_served += population_served
         if estimated_repair_cost > 0:
             total_estimated_repair_cost += estimated_repair_cost
-        if _normalize_work_area_geojson(row.get("existing_area_geojson")):
+        if _is_polygonal_work_area(row.get("existing_area_geojson")):
             polygon_site_count += 1
         if str(row.get("primary_photo_url") or "").strip():
             photo_site_count += 1
