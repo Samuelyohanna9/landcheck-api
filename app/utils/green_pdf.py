@@ -2277,6 +2277,8 @@ def _draw_agric_map_panel(
     map_view: dict | None,
     plot_rows: list[dict],
     highlight_plot_id: int | None = None,
+    entity_singular_label: str = "plot",
+    entity_plural_label: str = "plots",
 ):
     _draw_rounded_box(c, x, y, w, h, 6, fill_color=HexColor("#f8fbf8"), stroke_color=HexColor("#d9e7dc"))
     pad = 8
@@ -2284,7 +2286,7 @@ def _draw_agric_map_panel(
     if not plot_rows:
         c.setFont("Helvetica", 8)
         c.setFillColorRGB(0.42, 0.42, 0.42)
-        c.drawCentredString(x + (w / 2), y + (h / 2), "No mapped plots")
+        c.drawCentredString(x + (w / 2), y + (h / 2), f"No mapped {entity_plural_label}")
         return
 
     if not map_view:
@@ -2338,7 +2340,15 @@ def _draw_agric_map_panel(
             radius = 3.6 if is_highlight else 2.1
             c.circle(anchor_x, anchor_y, radius, stroke=1, fill=1)
         if is_highlight:
-            label = str((row.get("record_profile_data") or {}).get("plot_code") or row.get("custodian_name") or f"Plot #{row_id}")[:22]
+            record_profile = row.get("record_profile_data") or {}
+            label = str(
+                record_profile.get("plot_code")
+                or record_profile.get("plot_name")
+                or record_profile.get("asset_code")
+                or record_profile.get("asset_name")
+                or row.get("custodian_name")
+                or f"{entity_singular_label.title()} #{row_id}"
+            )[:22]
             label_x, label_y = _to_canvas(*(rings[0][0] if rings and rings[0] else _collect_agric_geometry_points(row)[0]))
             label_w = min(max(c.stringWidth(label, "Helvetica-Bold", 7.2) + 12, 56), w - 26)
             label_h = 14
@@ -2351,7 +2361,7 @@ def _draw_agric_map_panel(
             c.drawString(label_x + 6, label_y + 4, label)
 
 
-def _draw_plot_geometry_zoom_panel(c, *, x: float, y: float, w: float, h: float, row: dict):
+def _draw_plot_geometry_zoom_panel(c, *, x: float, y: float, w: float, h: float, row: dict, entity_singular_label: str = "plot"):
     _draw_rounded_box(c, x, y, w, h, 6, fill_color=HexColor("#faf7f5"), stroke_color=HexColor("#e6d9d4"))
     pad = 12
     plot_x = x + pad
@@ -2367,7 +2377,7 @@ def _draw_plot_geometry_zoom_panel(c, *, x: float, y: float, w: float, h: float,
     points = [point for ring in rings for point in ring] if rings else _collect_agric_geometry_points(row)
     c.setFont("Helvetica-Bold", 9)
     c.setFillColorRGB(0.14, 0.14, 0.14)
-    c.drawString(x + 12, y + h - 16, "Zoomed Plot Boundary")
+    c.drawString(x + 12, y + h - 16, f"Zoomed {entity_singular_label.title()} Boundary")
     if not points:
         c.setFont("Helvetica", 8)
         c.setFillColorRGB(0.42, 0.42, 0.42)
@@ -2422,16 +2432,24 @@ def _draw_plot_geometry_zoom_panel(c, *, x: float, y: float, w: float, h: float,
         pass
     c.setFont("Helvetica", 7)
     c.setFillColorRGB(0.46, 0.46, 0.46)
-    c.drawString(x + 12, y + 8, "Red boundary = mapped plot | point = capture anchor")
+    c.drawString(x + 12, y + 8, f"Red boundary = mapped {entity_singular_label} | point = capture anchor")
 
 
-def _draw_plot_photo_panel(c, *, x: float, y: float, w: float, h: float, row: dict, image_cache: dict):
+def _draw_plot_photo_panel(c, *, x: float, y: float, w: float, h: float, row: dict, image_cache: dict, entity_singular_label: str = "plot"):
     _draw_rounded_box(c, x, y, w, h, 6, fill_color=HexColor("#f8faf9"), stroke_color=HexColor("#d7e5db"))
     photo_url = _first_available_plot_photo_url(row)
-    caption = str((row.get("record_profile_data") or {}).get("plot_name") or row.get("custodian_name") or f"Plot #{row.get('id', '-')}")
+    record_profile = row.get("record_profile_data") or {}
+    caption = str(
+        record_profile.get("plot_name")
+        or record_profile.get("asset_name")
+        or record_profile.get("plot_code")
+        or record_profile.get("asset_code")
+        or row.get("custodian_name")
+        or f"{entity_singular_label.title()} #{row.get('id', '-')}"
+    )
     c.setFont("Helvetica-Bold", 9)
     c.setFillColorRGB(0.12, 0.12, 0.12)
-    c.drawString(x + 10, y + h - 16, "Plot Photo Evidence")
+    c.drawString(x + 10, y + h - 16, f"{entity_singular_label.title()} Photo Evidence")
     c.setFont("Helvetica", 7.5)
     c.setFillColorRGB(0.42, 0.42, 0.42)
     c.drawString(x + 10, y + h - 27, caption[:72])
@@ -2456,7 +2474,7 @@ def _draw_plot_photo_panel(c, *, x: float, y: float, w: float, h: float, row: di
         c.rect(img_x, img_y, img_w, img_h, stroke=1, fill=0)
         c.setFont("Helvetica-Oblique", 8)
         c.setFillColorRGB(0.46, 0.46, 0.46)
-        c.drawCentredString(img_x + (img_w / 2), img_y + (img_h / 2), "No photo embedded for this plot")
+        c.drawCentredString(img_x + (img_w / 2), img_y + (img_h / 2), f"No photo embedded for this {entity_singular_label}")
 
 
 def render_green_agric_programme_pdf(
@@ -2998,6 +3016,566 @@ def render_green_agric_programme_pdf(
             draw_list_box("Coordinates & Field Notes", 34, 72, width - 68, 134, notes_lines)
 
         finish_page(final=(plot_index == total_plots))
+
+    if total_pages == 0:
+        finish_page(final=True)
+
+    c.save()
+
+
+def render_green_relief_programme_pdf(
+    output_path: str,
+    project: dict,
+    summary: dict,
+    beneficiary_rows: list[dict],
+    site_rows: list[dict],
+    overview_map_png: bytes | None = None,
+    overview_map_view: dict | None = None,
+    include_photos: bool = False,
+):
+    c = canvas.Canvas(output_path, pagesize=A4)
+    width, height = A4
+    relief_config = project.get("relief_config") if isinstance(project.get("relief_config"), dict) else {}
+    body_font = "Helvetica"
+    body_font_size = 8.8
+    body_line_gap = 10.4
+    table_font_size = 7.9
+    table_header_size = 8.1
+    note_font_size = 8.1
+    total_sites = len(site_rows)
+    beneficiary_page_size = 24
+    site_schedule_page_size = 24
+    beneficiary_page_count = int(math.ceil(len(beneficiary_rows) / float(beneficiary_page_size))) if beneficiary_rows else 0
+    site_schedule_page_count = int(math.ceil(total_sites / float(site_schedule_page_size))) if site_rows else 0
+    total_pages = 2 + beneficiary_page_count + site_schedule_page_count + total_sites
+    current_page = 1
+
+    registered_beneficiaries = _safe_int_value(summary.get("registered_beneficiaries"))
+    verified_beneficiaries = _safe_int_value(summary.get("verified_beneficiaries"))
+    mapped_sites = _safe_int_value(summary.get("mapped_sites"))
+    mapped_area_ha = _safe_float_value(summary.get("mapped_area_ha"))
+    allocated_units = _safe_float_value(summary.get("allocated_units"))
+    support_visit_done = _safe_int_value(summary.get("support_visit_done"))
+    support_target_total = _safe_int_value(summary.get("support_target_total"))
+    support_visit_live = _safe_int_value(summary.get("support_visit_live"))
+    field_capture_done = _safe_int_value(summary.get("field_capture_done"))
+    field_capture_assigned = _safe_int_value(summary.get("field_capture_assigned"))
+    field_capture_live = _safe_int_value(summary.get("field_capture_live"))
+    polygon_sites = _safe_int_value(summary.get("polygon_sites"))
+    photo_evidence_sites = _safe_int_value(summary.get("photo_evidence_sites"))
+    linked_beneficiary_sites = _safe_int_value(summary.get("linked_beneficiary_sites"))
+    damage_profile_sites = _safe_int_value(summary.get("damage_profile_sites"))
+    response_profile_sites = _safe_int_value(summary.get("response_profile_sites"))
+    reviewed_sites = _safe_int_value(summary.get("reviewed_sites"))
+    identity_ready_beneficiaries = _safe_int_value(summary.get("identity_ready_beneficiaries"))
+    vulnerable_beneficiaries = _safe_int_value(summary.get("vulnerable_beneficiaries"))
+    displaced_beneficiaries = _safe_int_value(summary.get("displaced_beneficiaries"))
+    institutional_beneficiaries = _safe_int_value(summary.get("institutional_beneficiaries"))
+    total_population_served = _safe_int_value(summary.get("total_population_served"))
+    total_estimated_repair_cost = _safe_float_value(summary.get("total_estimated_repair_cost"))
+
+    def format_area(value: float) -> str:
+        return f"{value:.2f} ha" if value > 0 else "Not captured"
+
+    def format_currency(value: float) -> str:
+        return f"NGN {value:,.0f}" if value > 0 else "Not declared"
+
+    def format_quantity(value: float, suffix: str) -> str:
+        return f"{value:,.0f} {suffix}" if value > 0 else "Not declared"
+
+    def format_count_pair(done: int, target: int) -> str:
+        return f"{done}/{target}" if target > 0 else "0/0"
+
+    def format_site_label(row: dict) -> str:
+        record_profile = row.get("record_profile_data") or {}
+        return str(record_profile.get("asset_code") or record_profile.get("asset_name") or record_profile.get("plot_name") or f"Site #{row.get('id', '-')}")
+
+    def draw_footer() -> None:
+        c.setStrokeColor(HexColor("#d6dfd9"))
+        c.setLineWidth(0.5)
+        c.line(34, 22, width - 34, 22)
+        c.setFont("Helvetica", 7.8)
+        c.setFillColorRGB(0.34, 0.34, 0.34)
+        c.drawString(34, 10, "LandCheck Relief & Recovery programme report")
+        c.drawRightString(width - 34, 10, f"Page {current_page} of {max(total_pages, 1)}")
+
+    def finish_page(*, final: bool = False) -> None:
+        nonlocal current_page
+        draw_footer()
+        if not final:
+            c.showPage()
+            current_page += 1
+
+    def draw_section_header(
+        title: str,
+        subtitle: str,
+        *,
+        report_label: str,
+        bar_height: float = 74,
+        bar_color: str = "#113b24",
+    ) -> None:
+        _draw_project_brand_header_bar(
+            c,
+            width,
+            height,
+            project,
+            report_label=report_label,
+            subtitle=subtitle,
+            bar_height=bar_height,
+            bar_color=bar_color,
+        )
+        c.setFillColorRGB(0.08, 0.14, 0.11)
+        c.setFont("Helvetica-Bold", 16)
+        c.drawString(34, height - bar_height - 20, title[:76])
+        c.setFont("Helvetica", 9.3)
+        c.setFillColorRGB(0.26, 0.26, 0.26)
+        c.drawString(34, height - bar_height - 33, subtitle[:118])
+
+    def draw_list_box(
+        title: str,
+        x: float,
+        y: float,
+        w: float,
+        h: float,
+        lines: list[str],
+        *,
+        fill_color: str = "#f8faf9",
+        stroke_color: str = "#d7e5db",
+        bullet: bool = False,
+    ) -> None:
+        _draw_rounded_box(c, x, y, w, h, 7, fill_color=HexColor(fill_color), stroke_color=HexColor(stroke_color))
+        c.setFont("Helvetica-Bold", 10)
+        c.setFillColorRGB(0.12, 0.12, 0.12)
+        c.drawString(x + 10, y + h - 16, title[:54])
+        current_y = y + h - 30
+        c.setFont(body_font, body_font_size)
+        c.setFillColorRGB(0.16, 0.16, 0.16)
+        for line in lines:
+            prefix = "- " if bullet else ""
+            wrapped = _wrap_pdf_text_lines(c, f"{prefix}{line}", body_font, body_font_size, w - 20)
+            for idx, part in enumerate(wrapped[:4]):
+                if current_y < y + 10:
+                    return
+                if bullet and idx > 0 and part.startswith("- "):
+                    part = f"  {part[2:]}"
+                c.drawString(x + 10, current_y, part)
+                current_y -= body_line_gap
+
+    def draw_table_shell(title: str, subtitle: str) -> tuple[float, float, float, float]:
+        draw_section_header(title, subtitle, report_label="Relief & Recovery Report")
+        table_x = 34
+        table_y = 56
+        table_w = width - 68
+        table_h = height - 172
+        _draw_rounded_box(c, table_x, table_y, table_w, table_h, 8, fill_color=HexColor("#fbfcfb"), stroke_color=HexColor("#d7e5db"))
+        return table_x, table_y, table_w, table_h
+
+    def executive_summary_lines() -> list[str]:
+        lines = [
+            f"{registered_beneficiaries} beneficiary record(s) are linked to {mapped_sites} mapped site(s) covering {format_area(mapped_area_ha)}.",
+        ]
+        top_assets = summary.get("top_asset_types") or []
+        if top_assets:
+            top_asset = top_assets[0] or {}
+            lines.append(
+                f"Current site inventory is led by {str(top_asset.get('label') or 'Unknown')} ({_safe_int_value(top_asset.get('site_count'))} mapped site record(s))."
+            )
+        if support_target_total > 0:
+            lines.append(
+                f"Relief or recovery visits completed: {support_visit_done} of {support_target_total}, with {support_visit_live} still outstanding."
+            )
+        if allocated_units > 0:
+            lines.append(f"Recorded support allocations total {allocated_units:,.0f} units, kits, or material packages for this project snapshot.")
+        if field_capture_assigned > 0:
+            lines.append(
+                f"Initial site capture tasks closed: {field_capture_done} of {field_capture_assigned}, with {field_capture_live} still open."
+            )
+        elif mapped_sites > 0:
+            lines.append("Mapped sites are already on record; no separate first-capture task backlog is currently open.")
+        return lines[:5]
+
+    def coverage_snapshot_lines() -> list[str]:
+        return [
+            f"Polygon boundary coverage: {polygon_sites}/{max(mapped_sites, 1)} site(s) ({_safe_float_value(summary.get('geo_readiness_pct')):.1f}%).",
+            f"Photo evidence captured: {photo_evidence_sites}/{max(mapped_sites, 1)} site(s) ({_safe_float_value(summary.get('photo_readiness_pct')):.1f}%).",
+            f"Beneficiary ID / code ready: {identity_ready_beneficiaries}/{max(registered_beneficiaries, 1)} beneficiary record(s) ({_safe_float_value(summary.get('identity_readiness_pct')):.1f}%).",
+            f"Damage and response profiling: {damage_profile_sites}/{max(mapped_sites, 1)} damage-ready, {response_profile_sites}/{max(mapped_sites, 1)} response-ready.",
+            f"Submitted or reviewed site records: {reviewed_sites}/{max(mapped_sites, 1)} ({_safe_float_value(summary.get('review_readiness_pct')):.1f}%).",
+        ]
+
+    def follow_up_lines() -> list[str]:
+        lines: list[str] = []
+        missing_identity = max(registered_beneficiaries - identity_ready_beneficiaries, 0)
+        missing_photos = max(mapped_sites - photo_evidence_sites, 0)
+        missing_reviews = max(mapped_sites - reviewed_sites, 0)
+        missing_geo = max(mapped_sites - polygon_sites, 0)
+        missing_damage = max(mapped_sites - damage_profile_sites, 0)
+        if missing_identity > 0:
+            lines.append(f"Complete beneficiary code or government ID for {missing_identity} registry record(s).")
+        if missing_geo > 0:
+            lines.append(f"Close boundary mapping for {missing_geo} site record(s) without polygon coverage.")
+        if missing_damage > 0:
+            lines.append(f"Capture damage level and response pathway for {missing_damage} site record(s) still missing assessment profiling.")
+        if missing_photos > 0:
+            lines.append(f"Capture site photos for {missing_photos} mapped site record(s) to strengthen field evidence.")
+        if missing_reviews > 0:
+            lines.append(f"Submit or review {missing_reviews} site record(s) still outside the review-ready set.")
+        if support_target_total > support_visit_done:
+            lines.append(f"Complete {support_target_total - support_visit_done} planned relief or recovery visit(s) still outstanding.")
+        if field_capture_assigned > field_capture_done:
+            lines.append(f"Close {field_capture_assigned - field_capture_done} remaining initial site-capture task(s).")
+        if not lines:
+            lines.append("No major registry or field-evidence gaps are flagged in the current project snapshot.")
+        return lines[:5]
+
+    image_cache: dict = {}
+    if include_photos:
+        photo_seed_rows = []
+        for row in site_rows:
+            photo_url = _first_available_plot_photo_url(row)
+            if photo_url:
+                item = dict(row)
+                item["photo_url"] = photo_url
+                photo_seed_rows.append(item)
+        _prefetch_photo_readers(photo_seed_rows, image_cache)
+
+    draw_section_header(
+        "Programme Summary",
+        "Organisation-ready beneficiary registry, mapped site evidence, and relief-delivery snapshot.",
+        report_label="Relief & Recovery Report",
+        bar_height=78,
+    )
+
+    c.setFont("Helvetica", 9.4)
+    c.setFillColorRGB(0.22, 0.22, 0.22)
+    meta_parts = []
+    if project.get("location_text"):
+        meta_parts.append(f"Location: {project.get('location_text')}")
+    if relief_config.get("program_type"):
+        meta_parts.append(f"Programme: {_format_agric_label(relief_config.get('program_type'))}")
+    if relief_config.get("intervention_focus"):
+        meta_parts.append(f"Focus: {str(relief_config.get('intervention_focus'))[:34]}")
+    if relief_config.get("package_types"):
+        meta_parts.append(f"Packages: {str(relief_config.get('package_types'))[:34]}")
+    if relief_config.get("target_zone"):
+        meta_parts.append(f"Target Zone: {str(relief_config.get('target_zone'))[:24]}")
+    if project.get("sponsor"):
+        meta_parts.append(f"Sponsor: {project.get('sponsor')}")
+    c.drawString(34, height - 125, " | ".join(meta_parts)[:128])
+
+    card_w = (width - 68 - 16) / 3
+    card_h = 56
+    top_y = height - 205
+    cards = [
+        ("Registered Beneficiaries", registered_beneficiaries, f"Verified {verified_beneficiaries}"),
+        ("Mapped Sites", mapped_sites, f"Beneficiary linked {linked_beneficiary_sites}"),
+        ("Mapped Area", f"{mapped_area_ha:.2f} ha" if mapped_area_ha > 0 else "0.00 ha", "Portfolio footprint"),
+        ("Relief Visits", format_count_pair(support_visit_done, support_target_total), f"Open {support_visit_live}"),
+        ("Photo Evidence", format_count_pair(photo_evidence_sites, mapped_sites), "Sites with photo"),
+        ("Review Coverage", format_count_pair(reviewed_sites, mapped_sites), "Submitted or approved"),
+    ]
+    for index, (label, value, sub) in enumerate(cards):
+        row_index = index // 3
+        col_index = index % 3
+        _draw_stat_card(
+            c,
+            34 + (col_index * (card_w + 8)),
+            top_y - (row_index * (card_h + 10)),
+            card_w,
+            card_h,
+            label,
+            value,
+            sub=sub,
+            color=HexColor("#f4faf6" if index % 2 == 0 else "#fbfcfb"),
+        )
+
+    top_assets = summary.get("top_asset_types") or []
+    if top_assets:
+        bar_rows = []
+        colors = ["#8b1e3f", "#b42318", "#cf5c36", "#6857a6", "#0f766e", "#2563eb"]
+        for idx, item in enumerate(top_assets[:6]):
+            bar_rows.append(
+                (
+                    str(item.get("label") or "Unknown")[:18],
+                    _safe_float_value(item.get("site_count")),
+                    colors[idx % len(colors)],
+                )
+            )
+        _draw_bar_chart(c, 34, 214, width - 68, 110, bar_rows, title="Mapped Asset Mix (site count)")
+
+    draw_list_box(
+        "Executive Summary",
+        34,
+        52,
+        (width - 78) / 2,
+        148,
+        executive_summary_lines(),
+        bullet=True,
+    )
+    draw_list_box(
+        "Data Coverage Snapshot",
+        44 + ((width - 78) / 2),
+        52,
+        (width - 78) / 2,
+        148,
+        coverage_snapshot_lines(),
+        bullet=True,
+        fill_color="#f7faf8",
+    )
+    finish_page()
+
+    draw_section_header(
+        "Portfolio Map & Operational Readiness",
+        "Project map, mapped site-boundary coverage, and immediate follow-up priorities.",
+        report_label="Relief & Recovery Report",
+    )
+    _draw_agric_map_panel(
+        c,
+        x=34,
+        y=230,
+        w=width - 68,
+        h=340,
+        map_png=overview_map_png,
+        map_view=overview_map_view,
+        plot_rows=site_rows,
+        highlight_plot_id=None,
+        entity_singular_label="site",
+        entity_plural_label="sites",
+    )
+    draw_list_box(
+        "Portfolio Readiness",
+        34,
+        62,
+        (width - 78) / 2,
+        148,
+        [
+            f"Beneficiary-linked sites: {linked_beneficiary_sites}/{max(mapped_sites, 1)}.",
+            f"Damage profiling complete: {damage_profile_sites}/{max(mapped_sites, 1)} site(s).",
+            f"Response pathway captured: {response_profile_sites}/{max(mapped_sites, 1)} site(s).",
+            f"Vulnerability flags on record: {vulnerable_beneficiaries}/{max(registered_beneficiaries, 1)} beneficiary record(s).",
+            f"Displacement-sensitive cases: {displaced_beneficiaries}; institutional or community records: {institutional_beneficiaries}.",
+            f"Population served on record: {total_population_served}; estimated repair exposure: {format_currency(total_estimated_repair_cost)}.",
+        ],
+        bullet=True,
+    )
+    draw_list_box(
+        "Recommended Follow-up",
+        44 + ((width - 78) / 2),
+        62,
+        (width - 78) / 2,
+        148,
+        follow_up_lines(),
+        bullet=True,
+        fill_color="#fcfaf7",
+        stroke_color="#e4ddd0",
+    )
+    finish_page(final=(beneficiary_page_count == 0 and site_schedule_page_count == 0 and total_sites == 0))
+
+    if beneficiary_rows:
+        beneficiary_chunks = [beneficiary_rows[idx : idx + beneficiary_page_size] for idx in range(0, len(beneficiary_rows), beneficiary_page_size)]
+        for chunk_index, chunk in enumerate(beneficiary_chunks, start=1):
+            table_x, table_y, table_w, table_h = draw_table_shell(
+                "Beneficiary Registry",
+                "Programme registry view for targeting, distribution planning, and follow-up accountability.",
+            )
+            columns = [
+                ("Beneficiary", 34, 118),
+                ("Type", 152, 64),
+                ("Contact", 216, 88),
+                ("Settlement", 304, 86),
+                ("Support", 390, 76),
+                ("Sites", 466, 36),
+                ("Visits", 510, 52),
+            ]
+            header_y = table_y + table_h - 34
+            c.setFillColor(HexColor("#eff6f0"))
+            c.rect(table_x + 1, header_y - 12, table_w - 2, 18, stroke=0, fill=1)
+            c.setFont("Helvetica-Bold", table_header_size)
+            c.setFillColorRGB(0.13, 0.13, 0.13)
+            for label, x_pos, _ in columns:
+                c.drawString(x_pos, header_y, label)
+            row_y = header_y - 18
+            row_height = 20
+            for row_index, row in enumerate(chunk):
+                profile = row.get("profile_data") or {}
+                if row_index % 2 == 0:
+                    c.setFillColor(HexColor("#fafcfa"))
+                    c.rect(table_x + 1, row_y - 10, table_w - 2, row_height, stroke=0, fill=1)
+                c.setStrokeColor(HexColor("#e5ece6"))
+                c.setLineWidth(0.4)
+                c.line(table_x + 1, row_y - 10, table_x + table_w - 1, row_y - 10)
+                c.setFillColorRGB(0.18, 0.18, 0.18)
+                c.setFont("Helvetica", table_font_size)
+                beneficiary_name = str(row.get("name") or "-")[:22]
+                type_text = _format_agric_label(row.get("custodian_type"))[:10]
+                contact_text = str(row.get("phone") or row.get("email") or "-")[:16]
+                location_text = str(profile.get("current_settlement") or row.get("community_name") or row.get("local_government") or "-")[:16]
+                support_text = str(profile.get("support_category") or profile.get("priority_needs") or "-")[:12]
+                visit_text = f"{_safe_int_value(row.get('support_visit_done'))}/{_safe_int_value(row.get('support_target'))}"
+                c.drawString(34, row_y, beneficiary_name)
+                c.drawString(152, row_y, type_text)
+                c.drawString(216, row_y, contact_text)
+                c.drawString(304, row_y, location_text)
+                c.drawString(390, row_y, support_text)
+                c.drawRightString(502, row_y, str(_safe_int_value(row.get("site_count"))))
+                c.drawRightString(560, row_y, visit_text)
+                row_y -= row_height
+            c.setFont("Helvetica", note_font_size)
+            c.setFillColorRGB(0.32, 0.32, 0.32)
+            c.drawString(table_x + 10, table_y + 10, f"Beneficiary records on this page: {len(chunk)}")
+            c.drawRightString(table_x + table_w - 10, table_y + 10, f"Registry page {chunk_index}/{len(beneficiary_chunks)}")
+            finish_page(final=(chunk_index == len(beneficiary_chunks) and site_schedule_page_count == 0 and total_sites == 0))
+
+    if site_rows:
+        site_chunks = [site_rows[idx : idx + site_schedule_page_size] for idx in range(0, len(site_rows), site_schedule_page_size)]
+        for chunk_index, chunk in enumerate(site_chunks, start=1):
+            table_x, table_y, table_w, table_h = draw_table_shell(
+                "Site Inventory Schedule",
+                "Mapped site register for assessment evidence, recovery prioritisation, and donor or government reporting.",
+            )
+            columns = [
+                ("Site", 34, 112),
+                ("Beneficiary", 146, 92),
+                ("Asset", 238, 74),
+                ("Damage", 312, 64),
+                ("Response", 376, 68),
+                ("Area", 444, 38),
+                ("Review", 484, 40),
+                ("Photo", 528, 30),
+            ]
+            header_y = table_y + table_h - 34
+            c.setFillColor(HexColor("#eff6f0"))
+            c.rect(table_x + 1, header_y - 12, table_w - 2, 18, stroke=0, fill=1)
+            c.setFont("Helvetica-Bold", table_header_size)
+            c.setFillColorRGB(0.13, 0.13, 0.13)
+            for label, x_pos, _ in columns:
+                c.drawString(x_pos, header_y, label)
+            row_y = header_y - 18
+            row_height = 20
+            for row_index, row in enumerate(chunk):
+                record_profile = row.get("record_profile_data") or {}
+                if row_index % 2 == 0:
+                    c.setFillColor(HexColor("#fafcfa"))
+                    c.rect(table_x + 1, row_y - 10, table_w - 2, row_height, stroke=0, fill=1)
+                c.setStrokeColor(HexColor("#e5ece6"))
+                c.setLineWidth(0.4)
+                c.line(table_x + 1, row_y - 10, table_x + table_w - 1, row_y - 10)
+                c.setFont("Helvetica", table_font_size)
+                c.setFillColorRGB(0.18, 0.18, 0.18)
+                c.drawString(34, row_y, format_site_label(row)[:20])
+                c.drawString(146, row_y, str(row.get("custodian_name") or "-")[:16])
+                c.drawString(238, row_y, _format_agric_label(record_profile.get("asset_type") or row.get("species"))[:12])
+                c.drawString(312, row_y, _format_agric_label(record_profile.get("damage_level"))[:10])
+                c.drawString(376, row_y, _format_agric_label(record_profile.get("response_pathway"))[:11])
+                c.drawRightString(478, row_y, f"{_safe_float_value(record_profile.get('area_hectares') or row.get('existing_area_ha')):.2f}")
+                c.drawString(484, row_y, _format_agric_label(row.get("last_review_state"))[:8])
+                c.drawString(528, row_y, "Yes" if _first_available_plot_photo_url(row) else "No")
+                row_y -= row_height
+            c.setFont("Helvetica", note_font_size)
+            c.setFillColorRGB(0.32, 0.32, 0.32)
+            c.drawString(table_x + 10, table_y + 10, f"Sites on this page: {len(chunk)}")
+            c.drawRightString(table_x + table_w - 10, table_y + 10, f"Schedule page {chunk_index}/{len(site_chunks)}")
+            finish_page(final=(chunk_index == len(site_chunks) and total_sites == 0))
+
+    for site_index, row in enumerate(site_rows, start=1):
+        record_profile = row.get("record_profile_data") or {}
+        beneficiary_profile = row.get("custodian_profile_data") or {}
+        site_name = format_site_label(row)
+        site_code = str(record_profile.get("asset_code") or "").strip()
+        asset_type = _format_agric_label(record_profile.get("asset_type") or row.get("species"))
+        damage_label = _format_agric_label(record_profile.get("damage_level"))
+        response_label = _format_agric_label(record_profile.get("response_pathway"))
+        area_ha = _safe_float_value(record_profile.get("area_hectares") or row.get("existing_area_ha"))
+        photo_url = _first_available_plot_photo_url(row)
+
+        _draw_project_brand_header_bar(
+            c,
+            width,
+            height,
+            project,
+            report_label="Site Evidence Page",
+            subtitle=f"Site evidence page {site_index} of {max(total_sites, 1)}",
+            bar_height=64,
+            bar_color="#163b2a",
+        )
+        c.setFillColorRGB(0.08, 0.14, 0.11)
+        c.setFont("Helvetica-Bold", 15)
+        c.drawString(34, height - 84, site_name[:58])
+        c.setFont("Helvetica", 9.3)
+        c.setFillColorRGB(0.24, 0.24, 0.24)
+        meta_line = f"Beneficiary: {str(row.get('custodian_name') or 'Beneficiary not linked')[:24]} | Asset: {asset_type[:20]} | Area: {format_area(area_ha)} | Damage: {damage_label[:18]}"
+        if site_code:
+            meta_line = f"Code: {site_code[:14]} | {meta_line}"
+        c.drawString(34, height - 98, meta_line[:126])
+
+        _draw_agric_map_panel(
+            c,
+            x=34,
+            y=404,
+            w=252,
+            h=228,
+            map_png=overview_map_png,
+            map_view=overview_map_view,
+            plot_rows=site_rows,
+            highlight_plot_id=_safe_int_value(row.get("id")),
+            entity_singular_label="site",
+            entity_plural_label="sites",
+        )
+        _draw_plot_geometry_zoom_panel(
+            c,
+            x=308,
+            y=404,
+            w=252,
+            h=228,
+            row=row,
+            entity_singular_label="site",
+        )
+
+        beneficiary_lines = [
+            f"Beneficiary: {str(row.get('custodian_name') or '-')}",
+            f"Beneficiary code / ID: {str(beneficiary_profile.get('beneficiary_code') or beneficiary_profile.get('government_id') or '-')}",
+            f"Contact: {str(row.get('phone') or row.get('email') or '-')}",
+            f"Displacement status: {_format_agric_label(beneficiary_profile.get('displacement_status'))}",
+            f"Settlement: {str(beneficiary_profile.get('current_settlement') or row.get('community_name') or '-')}",
+            f"Support category: {str(beneficiary_profile.get('support_category') or '-')}",
+            f"Household / flags: {str(beneficiary_profile.get('household_size') or '-')} / {str(beneficiary_profile.get('vulnerability_flags') or '-')[:34]}",
+        ]
+        site_lines = [
+            f"Asset type: {asset_type}",
+            f"Damage level: {damage_label}",
+            f"Response pathway: {response_label}",
+            f"Area: {format_area(area_ha)}",
+            f"Occupancy / tenure: {_format_agric_label(record_profile.get('occupancy_status'))} / {_format_agric_label(record_profile.get('tenure_status'))}",
+            f"Population served: {_safe_int_value(record_profile.get('population_served'))}",
+            f"Estimated repair cost: {format_currency(_safe_float_value(record_profile.get('estimated_repair_cost')))}",
+        ]
+        status_lines = [
+            f"Initial capture tasks: {format_count_pair(_safe_int_value(row.get('field_capture_done')), _safe_int_value(row.get('field_capture_assigned')))} closed",
+            f"Relief visits: {format_count_pair(_safe_int_value(row.get('support_visit_done')), _safe_int_value(row.get('support_visit_assigned')))} completed",
+            f"Review state: {_format_agric_label(row.get('last_review_state'))}",
+            f"Record status: {_format_agric_label(row.get('status'))}",
+            f"Created by: {str(row.get('created_by') or '-')[:20]}",
+            f"Created date: {str(row.get('created_at') or '-')[:10]}",
+        ]
+        box_w = (width - 68 - 16) / 3
+        draw_list_box("Beneficiary Profile", 34, 220, box_w, 152, beneficiary_lines)
+        draw_list_box("Site Profile", 42 + box_w, 220, box_w, 152, site_lines, fill_color="#fbfcfb")
+        draw_list_box("Programme Status", 50 + (box_w * 2), 220, box_w, 152, status_lines, fill_color="#fcfaf7", stroke_color="#e4ddd0")
+
+        notes_lines = [
+            f"GPS anchor: {str(row.get('lat') or '-')[:18]}, {str(row.get('lng') or '-')[:18]}",
+            f"Support package: {str(record_profile.get('support_package') or 'Not recorded')}",
+            f"Field notes: {str(row.get('notes') or record_profile.get('reported_need') or 'No additional field notes were captured for this site.')}",
+        ]
+        if include_photos and photo_url:
+            draw_list_box("Coordinates, Support & Field Notes", 34, 144, width - 68, 62, notes_lines)
+            _draw_plot_photo_panel(c, x=34, y=34, w=width - 68, h=98, row=row, image_cache=image_cache, entity_singular_label="site")
+        else:
+            if include_photos and not photo_url:
+                notes_lines.append("Photo evidence: No site photo was available to embed for this record.")
+            draw_list_box("Coordinates, Support & Field Notes", 34, 72, width - 68, 134, notes_lines)
+
+        finish_page(final=(site_index == total_sites))
 
     if total_pages == 0:
         finish_page(final=True)

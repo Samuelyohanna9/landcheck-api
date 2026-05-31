@@ -35,6 +35,7 @@ from app.db import SessionLocal
 from app.utils.green_pdf import (
     render_green_report_pdf,
     render_green_agric_programme_pdf,
+    render_green_relief_programme_pdf,
     render_green_work_report_pdf,
     render_green_custodian_report_pdf,
     render_green_existing_trees_report_pdf,
@@ -112,13 +113,21 @@ PLANTING_MODEL_VALUES = {"direct", "community_distributed", "mixed"}
 DEFAULT_PLANTING_MODEL = "direct"
 EXISTING_TREE_SCOPE_VALUES = {"exclude_from_planting_kpi", "include_in_planting_kpi"}
 DEFAULT_EXISTING_TREE_SCOPE = "exclude_from_planting_kpi"
-WORKFLOW_PROFILE_VALUES = {"green", "agric"}
+WORKFLOW_PROFILE_VALUES = {"green", "agric", "relief_recovery"}
 DEFAULT_WORKFLOW_PROFILE = "green"
 AGRIC_PROGRAM_TYPE_VALUES = {
     "extension_support",
     "input_support",
     "traceability",
     "finance_insurance",
+    "mixed",
+}
+RELIEF_PROGRAM_TYPE_VALUES = {
+    "emergency_relief",
+    "shelter_recovery",
+    "construction_materials",
+    "infrastructure_rehab",
+    "cash_voucher",
     "mixed",
 }
 AGRIC_GENDER_VALUES = {"male", "female"}
@@ -136,9 +145,30 @@ AGRIC_PRODUCTION_STAGE_VALUES = {
     "post_harvest",
 }
 AGRIC_BOUNDARY_CAPTURE_METHOD_VALUES = {"point", "polygon_map", "polygon_gps_walk"}
+RELIEF_DISPLACEMENT_STATUS_VALUES = {"idp", "returnee", "host", "resident", "relocated", "other"}
+RELIEF_GENDER_VALUES = {"male", "female"}
+RELIEF_SHELTER_STATUS_VALUES = {"displaced", "hosted", "damaged_home", "destroyed_home", "temporary_shelter", "resettled", "other"}
+RELIEF_ASSET_TYPE_VALUES = {
+    "house",
+    "shelter_unit",
+    "shop",
+    "school_block",
+    "health_facility",
+    "water_point",
+    "latrine_block",
+    "road_segment",
+    "drainage",
+    "community_asset",
+    "other",
+}
+RELIEF_DAMAGE_LEVEL_VALUES = {"minor", "major", "destroyed", "habitable_with_repair", "not_habitable", "unknown"}
+RELIEF_OCCUPANCY_STATUS_VALUES = {"occupied", "vacant", "hosted", "temporary_site", "institutional_use", "unknown"}
+RELIEF_TENURE_STATUS_VALUES = {"owner", "tenant", "hosted", "informal", "disputed", "community_owned", "government_owned", "unknown"}
+RELIEF_RESPONSE_PATHWAY_VALUES = {"assessment_only", "repair", "rebuild", "cash_support", "materials_only", "contractor_rehab", "infrastructure_repair", "other"}
+RELIEF_BOUNDARY_CAPTURE_METHOD_VALUES = {"point", "polygon_map", "polygon_gps_walk"}
 TREE_ORIGIN_VALUES = {"new_planting", "existing_inventory", "natural_regeneration"}
 TREE_ATTRIBUTION_SCOPE_VALUES = {"full", "monitor_only"}
-CUSTODIAN_TYPE_VALUES = {"household", "school", "community_group"}
+CUSTODIAN_TYPE_VALUES = {"household", "school", "community_group", "small_business", "health_facility", "community_asset"}
 TREE_PROJECT_LINK_TYPE_VALUES = {"owner", "reference"}
 PRIVACY_CONSENT_SCOPE_VALUES = {
     "public_site_notice",
@@ -1484,6 +1514,59 @@ def _normalize_workflow_profile(value: str | None) -> str:
     return DEFAULT_WORKFLOW_PROFILE
 
 
+def _is_agric_workflow_profile(value: str | None) -> bool:
+    return _normalize_workflow_profile(value) == "agric"
+
+
+def _is_relief_workflow_profile(value: str | None) -> bool:
+    return _normalize_workflow_profile(value) == "relief_recovery"
+
+
+def _get_workflow_labels(value: str | None) -> dict[str, str]:
+    workflow_profile = _normalize_workflow_profile(value)
+    if workflow_profile == "agric":
+        return {
+            "mode_label": "Agric",
+            "owner_singular": "farmer",
+            "owner_plural": "farmers",
+            "entity_singular": "plot",
+            "entity_plural": "plots",
+            "visit_label": "Farmer support visit",
+            "field_capture_label": "First field capture",
+            "placeholder_name": "Plot pending capture",
+            "placeholder_species": "Plot pending capture",
+            "field_capture_notes": "Open Map & Add Plot in the mobile app, walk or draw the farm boundary polygon, attach plot photos, and save the first mapped plot.",
+            "support_visit_notes": "Check plot condition, capture GPS, upload visit photos, and document support actions.",
+        }
+    if workflow_profile == "relief_recovery":
+        return {
+            "mode_label": "Relief & Recovery",
+            "owner_singular": "beneficiary",
+            "owner_plural": "beneficiaries",
+            "entity_singular": "site",
+            "entity_plural": "sites",
+            "visit_label": "Relief follow-up visit",
+            "field_capture_label": "Initial site assessment",
+            "placeholder_name": "Site pending assessment",
+            "placeholder_species": "Site pending assessment",
+            "field_capture_notes": "Open Map & Assess Sites in the mobile app, draw or walk the site boundary polygon, attach evidence photos, and save the first site assessment.",
+            "support_visit_notes": "Review site condition, capture GPS, upload visit photos, and document relief delivery, construction progress, or recovery follow-up.",
+        }
+    return {
+        "mode_label": "Green",
+        "owner_singular": "custodian",
+        "owner_plural": "custodians",
+        "entity_singular": "tree",
+        "entity_plural": "trees",
+        "visit_label": "Custodian supervision visit",
+        "field_capture_label": "Field capture",
+        "placeholder_name": "Tree pending capture",
+        "placeholder_species": "Tree pending capture",
+        "field_capture_notes": "Open Map & Add Trees in the mobile app and save the first field record.",
+        "support_visit_notes": "Check tree condition, capture GPS, upload visit photos, and document support actions.",
+    }
+
+
 def _normalize_agric_config(value: object) -> dict | None:
     raw = _normalize_json_object(value) or {}
     if not raw:
@@ -1501,6 +1584,26 @@ def _normalize_agric_config(value: object) -> dict | None:
     season_label = _clean_text(raw.get("season_label"), 120)
     if season_label:
         normalized["season_label"] = season_label
+    return normalized or None
+
+
+def _normalize_relief_config(value: object) -> dict | None:
+    raw = _normalize_json_object(value) or {}
+    if not raw:
+        return None
+    normalized: dict[str, object] = {}
+    program_type = _clean_choice(raw.get("program_type"), RELIEF_PROGRAM_TYPE_VALUES)
+    if program_type:
+        normalized["program_type"] = program_type
+    intervention_focus = _clean_text(raw.get("intervention_focus"), 240)
+    if intervention_focus:
+        normalized["intervention_focus"] = intervention_focus
+    package_types = _clean_text(raw.get("package_types"), 240)
+    if package_types:
+        normalized["package_types"] = package_types
+    target_zone = _clean_text(raw.get("target_zone"), 160)
+    if target_zone:
+        normalized["target_zone"] = target_zone
     return normalized or None
 
 
@@ -1534,6 +1637,40 @@ def _normalize_custodian_profile_data(value: object) -> dict | None:
     insurance_access = _clean_bool(raw.get("insurance_access"))
     if insurance_access is not None:
         normalized["insurance_access"] = insurance_access
+    for key in (
+        "beneficiary_code",
+        "government_id",
+        "origin_location",
+        "current_settlement",
+        "support_category",
+        "priority_needs",
+        "livelihood_type",
+        "vulnerability_flags",
+    ):
+        text_value = _clean_text(raw.get(key), 240 if key in {"priority_needs", "vulnerability_flags"} else 160)
+        if text_value:
+            normalized[key] = text_value
+    relief_gender = _clean_choice(raw.get("relief_gender"), RELIEF_GENDER_VALUES)
+    if relief_gender:
+        normalized["relief_gender"] = relief_gender
+    displacement_status = _clean_choice(raw.get("displacement_status"), RELIEF_DISPLACEMENT_STATUS_VALUES)
+    if displacement_status:
+        normalized["displacement_status"] = displacement_status
+    shelter_status = _clean_choice(raw.get("shelter_status"), RELIEF_SHELTER_STATUS_VALUES)
+    if shelter_status:
+        normalized["shelter_status"] = shelter_status
+    women_count = _clean_int(raw.get("women_count"), minimum=0, maximum=500)
+    if women_count is not None:
+        normalized["women_count"] = women_count
+    children_under_five = _clean_int(raw.get("children_under_five"), minimum=0, maximum=500)
+    if children_under_five is not None:
+        normalized["children_under_five"] = children_under_five
+    elderly_count = _clean_int(raw.get("elderly_count"), minimum=0, maximum=500)
+    if elderly_count is not None:
+        normalized["elderly_count"] = elderly_count
+    disability_count = _clean_int(raw.get("disability_count"), minimum=0, maximum=500)
+    if disability_count is not None:
+        normalized["disability_count"] = disability_count
     return normalized or None
 
 
@@ -1576,6 +1713,40 @@ def _normalize_tree_record_profile_data(value: object, *, existing_area_sqm: flo
     placeholder_reason = _clean_text(raw.get("placeholder_reason"), 120)
     if placeholder_reason:
         normalized["placeholder_reason"] = placeholder_reason
+    for key in ("asset_code", "asset_name", "support_package", "safety_risks", "reported_need"):
+        text_value = _clean_text(raw.get(key), 240 if key in {"safety_risks", "reported_need"} else 160)
+        if text_value:
+            normalized[key] = text_value
+    asset_type = _clean_choice(raw.get("asset_type"), RELIEF_ASSET_TYPE_VALUES)
+    if asset_type:
+        normalized["asset_type"] = asset_type
+    damage_level = _clean_choice(raw.get("damage_level"), RELIEF_DAMAGE_LEVEL_VALUES)
+    if damage_level:
+        normalized["damage_level"] = damage_level
+    occupancy_status = _clean_choice(raw.get("occupancy_status"), RELIEF_OCCUPANCY_STATUS_VALUES)
+    if occupancy_status:
+        normalized["occupancy_status"] = occupancy_status
+    tenure_status = _clean_choice(raw.get("tenure_status"), RELIEF_TENURE_STATUS_VALUES)
+    if tenure_status:
+        normalized["tenure_status"] = tenure_status
+    response_pathway = _clean_choice(raw.get("response_pathway"), RELIEF_RESPONSE_PATHWAY_VALUES)
+    if response_pathway:
+        normalized["response_pathway"] = response_pathway
+    relief_boundary_capture_method = _clean_choice(raw.get("relief_boundary_capture_method"), RELIEF_BOUNDARY_CAPTURE_METHOD_VALUES)
+    if relief_boundary_capture_method:
+        normalized["relief_boundary_capture_method"] = relief_boundary_capture_method
+    floor_area_sqm = _clean_float(raw.get("floor_area_sqm"), minimum=0, maximum=100000000)
+    if floor_area_sqm is not None:
+        normalized["floor_area_sqm"] = floor_area_sqm
+    rooms_count = _clean_int(raw.get("rooms_count"), minimum=0, maximum=10000)
+    if rooms_count is not None:
+        normalized["rooms_count"] = rooms_count
+    estimated_repair_cost = _clean_float(raw.get("estimated_repair_cost"), minimum=0, maximum=100000000000)
+    if estimated_repair_cost is not None:
+        normalized["estimated_repair_cost"] = estimated_repair_cost
+    population_served = _clean_int(raw.get("population_served"), minimum=0, maximum=100000000)
+    if population_served is not None:
+        normalized["population_served"] = population_served
     return normalized or None
 
 
@@ -1599,12 +1770,14 @@ def _get_or_create_support_placeholder_tree(
     *,
     project_id: int,
     custodian_id: int,
+    workflow_profile: str | None = None,
     event_species: str | None = None,
     actor_name: str | None = None,
     placeholder_reason: str = "support_visit_before_plot_capture",
     plot_name: str = "Plot pending capture",
     notes: str | None = None,
 ) -> dict:
+    labels = _get_workflow_labels(workflow_profile)
     placeholder_reason_clean = _clean_text(placeholder_reason, 120) or "support_visit_before_plot_capture"
     existing = db.execute(
         text(
@@ -1628,11 +1801,13 @@ def _get_or_create_support_placeholder_tree(
         return dict(existing)
 
     project_tree_no = _next_project_tree_no(db, int(project_id))
-    placeholder_species = _clean_text(event_species, 160) or "Plot pending capture"
+    placeholder_species = _clean_text(event_species, 160) or labels["placeholder_species"]
     placeholder_record_profile = _normalize_tree_record_profile_data(
         {
             "plot_name": plot_name,
-            "commodity": placeholder_species if placeholder_species != "Plot pending capture" else None,
+            "commodity": placeholder_species if placeholder_species != labels["placeholder_species"] else None,
+            "asset_name": plot_name,
+            "support_package": placeholder_species if placeholder_species != labels["placeholder_species"] else None,
             "support_placeholder": True,
             "hidden_from_records": True,
             "placeholder_reason": placeholder_reason_clean,
@@ -1681,9 +1856,9 @@ def _get_or_create_support_placeholder_tree(
             "species": placeholder_species,
             "notes": (notes or "").strip()
             or (
-                "Hidden placeholder plot created automatically before field activity capture."
+                f"Hidden placeholder {labels['entity_singular']} created automatically before field activity capture."
                 if placeholder_reason_clean == "field_capture_before_plot_capture"
-                else "Hidden placeholder plot created automatically before the first support visit capture."
+                else f"Hidden placeholder {labels['entity_singular']} created automatically before the first support visit capture."
             ),
             "photo_urls": _safe_json([]),
             "created_by": (actor_name or "").strip() or "system",
@@ -2305,7 +2480,7 @@ def _get_project_settings(db: Session, project_id: int) -> dict:
     row = db.execute(
         text(
             """
-            SELECT id, workflow_profile, agric_config, planting_model, allow_existing_tree_link, default_existing_tree_scope
+            SELECT id, workflow_profile, agric_config, relief_config, planting_model, allow_existing_tree_link, default_existing_tree_scope
             FROM tree_projects
             WHERE id = :project_id
             """
@@ -2318,6 +2493,7 @@ def _get_project_settings(db: Session, project_id: int) -> dict:
         "id": int(row.get("id")),
         "workflow_profile": _normalize_workflow_profile(row.get("workflow_profile")),
         "agric_config": _normalize_agric_config(row.get("agric_config")),
+        "relief_config": _normalize_relief_config(row.get("relief_config")),
         "planting_model": _normalize_planting_model(row.get("planting_model")),
         "allow_existing_tree_link": bool(row.get("allow_existing_tree_link")),
         "default_existing_tree_scope": _normalize_existing_tree_scope(row.get("default_existing_tree_scope")),
@@ -3121,6 +3297,7 @@ def ensure_green_tables(db: Session):
             sponsor TEXT,
             workflow_profile TEXT NOT NULL DEFAULT 'green',
             agric_config JSONB,
+            relief_config JSONB,
             planting_model TEXT NOT NULL DEFAULT 'direct',
             allow_existing_tree_link BOOLEAN NOT NULL DEFAULT FALSE,
             default_existing_tree_scope TEXT NOT NULL DEFAULT 'exclude_from_planting_kpi',
@@ -3253,6 +3430,7 @@ def ensure_green_tables(db: Session):
         db.execute(text("ALTER TABLE tree_projects ADD COLUMN IF NOT EXISTS organization_id INTEGER"))
         db.execute(text("ALTER TABLE tree_projects ADD COLUMN IF NOT EXISTS workflow_profile TEXT NOT NULL DEFAULT 'green'"))
         db.execute(text("ALTER TABLE tree_projects ADD COLUMN IF NOT EXISTS agric_config JSONB"))
+        db.execute(text("ALTER TABLE tree_projects ADD COLUMN IF NOT EXISTS relief_config JSONB"))
         db.execute(text("ALTER TABLE tree_projects ADD COLUMN IF NOT EXISTS planting_model TEXT NOT NULL DEFAULT 'direct'"))
         db.execute(text("ALTER TABLE tree_projects ADD COLUMN IF NOT EXISTS allow_existing_tree_link BOOLEAN NOT NULL DEFAULT FALSE"))
         db.execute(
@@ -4935,12 +5113,14 @@ def create_project(
     organization_id: int | None = Body(default=None),
     workflow_profile: str = Body(default=DEFAULT_WORKFLOW_PROFILE),
     agric_config: dict | None = Body(default=None),
+    relief_config: dict | None = Body(default=None),
     planting_model: str = Body(default=DEFAULT_PLANTING_MODEL),
     allow_existing_tree_link: bool = Body(default=False),
     default_existing_tree_scope: str = Body(default=DEFAULT_EXISTING_TREE_SCOPE),
 ):
     normalized_workflow_profile = _normalize_workflow_profile(workflow_profile)
     normalized_agric_config = _normalize_agric_config(agric_config)
+    normalized_relief_config = _normalize_relief_config(relief_config)
     normalized_model = _normalize_planting_model(planting_model)
     normalized_existing_scope = _normalize_existing_tree_scope(default_existing_tree_scope)
     org_id_value = int(organization_id) if organization_id is not None else None
@@ -4956,14 +5136,14 @@ def create_project(
     row = db.execute(
         text("""
             INSERT INTO tree_projects (
-                organization_id, name, location_text, sponsor, workflow_profile, agric_config,
+                organization_id, name, location_text, sponsor, workflow_profile, agric_config, relief_config,
                 planting_model, allow_existing_tree_link, default_existing_tree_scope
             )
             VALUES (
-                :organization_id, :name, :location_text, :sponsor, :workflow_profile, CAST(:agric_config AS JSONB),
+                :organization_id, :name, :location_text, :sponsor, :workflow_profile, CAST(:agric_config AS JSONB), CAST(:relief_config AS JSONB),
                 :planting_model, :allow_existing_tree_link, :default_existing_tree_scope
             )
-            RETURNING id, organization_id, name, location_text, sponsor, workflow_profile, agric_config,
+            RETURNING id, organization_id, name, location_text, sponsor, workflow_profile, agric_config, relief_config,
                       planting_model, allow_existing_tree_link, default_existing_tree_scope, created_at
         """),
         {
@@ -4973,6 +5153,7 @@ def create_project(
             "sponsor": sponsor,
             "workflow_profile": normalized_workflow_profile,
             "agric_config": _safe_json(normalized_agric_config),
+            "relief_config": _safe_json(normalized_relief_config),
             "planting_model": normalized_model,
             "allow_existing_tree_link": bool(allow_existing_tree_link),
             "default_existing_tree_scope": normalized_existing_scope,
@@ -4981,6 +5162,7 @@ def create_project(
     project = dict(row)
     project["workflow_profile"] = _normalize_workflow_profile(project.get("workflow_profile"))
     project["agric_config"] = _normalize_agric_config(project.get("agric_config"))
+    project["relief_config"] = _normalize_relief_config(project.get("relief_config"))
     _log_audit_event(
         db,
         project_id=project["id"],
@@ -4993,6 +5175,7 @@ def create_project(
             "organization_id": project.get("organization_id"),
             "workflow_profile": project.get("workflow_profile"),
             "agric_config": project.get("agric_config"),
+            "relief_config": project.get("relief_config"),
             "planting_model": project.get("planting_model"),
             "allow_existing_tree_link": bool(project.get("allow_existing_tree_link")),
             "default_existing_tree_scope": project.get("default_existing_tree_scope"),
@@ -5121,6 +5304,7 @@ def update_project_settings(
     db: Session = Depends(get_db),
     workflow_profile: str | None = Body(default=None),
     agric_config: dict | None = Body(default=None),
+    relief_config: dict | None = Body(default=None),
     planting_model: str | None = Body(default=None),
     allow_existing_tree_link: bool | None = Body(default=None),
     default_existing_tree_scope: str | None = Body(default=None),
@@ -5128,7 +5312,7 @@ def update_project_settings(
     existing = db.execute(
         text(
             """
-            SELECT id, workflow_profile, agric_config, planting_model, allow_existing_tree_link, default_existing_tree_scope
+            SELECT id, workflow_profile, agric_config, relief_config, planting_model, allow_existing_tree_link, default_existing_tree_scope
             FROM tree_projects
             WHERE id = :project_id
             """
@@ -5148,6 +5332,11 @@ def update_project_settings(
         if agric_config is not None
         else _normalize_agric_config(existing.get("agric_config"))
     )
+    next_relief_config = (
+        _normalize_relief_config(relief_config)
+        if relief_config is not None
+        else _normalize_relief_config(existing.get("relief_config"))
+    )
     next_model = _normalize_planting_model(planting_model) if planting_model is not None else _normalize_planting_model(existing.get("planting_model"))
     next_allow_existing = (
         bool(allow_existing_tree_link)
@@ -5166,11 +5355,12 @@ def update_project_settings(
             UPDATE tree_projects
             SET workflow_profile = :workflow_profile,
                 agric_config = CAST(:agric_config AS JSONB),
+                relief_config = CAST(:relief_config AS JSONB),
                 planting_model = :planting_model,
                 allow_existing_tree_link = :allow_existing_tree_link,
                 default_existing_tree_scope = :default_existing_tree_scope
             WHERE id = :project_id
-            RETURNING id, name, location_text, sponsor, workflow_profile, agric_config,
+            RETURNING id, name, location_text, sponsor, workflow_profile, agric_config, relief_config,
                       planting_model, allow_existing_tree_link, default_existing_tree_scope, created_at
             """
         ),
@@ -5178,6 +5368,7 @@ def update_project_settings(
             "project_id": project_id,
             "workflow_profile": next_workflow_profile,
             "agric_config": _safe_json(next_agric_config),
+            "relief_config": _safe_json(next_relief_config),
             "planting_model": next_model,
             "allow_existing_tree_link": next_allow_existing,
             "default_existing_tree_scope": next_scope,
@@ -5186,6 +5377,7 @@ def update_project_settings(
     payload = dict(row)
     payload["workflow_profile"] = _normalize_workflow_profile(payload.get("workflow_profile"))
     payload["agric_config"] = _normalize_agric_config(payload.get("agric_config"))
+    payload["relief_config"] = _normalize_relief_config(payload.get("relief_config"))
     _log_audit_event(
         db,
         project_id=project_id,
@@ -5197,6 +5389,7 @@ def update_project_settings(
             "after": {
                 "workflow_profile": next_workflow_profile,
                 "agric_config": next_agric_config,
+                "relief_config": next_relief_config,
                 "planting_model": next_model,
                 "allow_existing_tree_link": next_allow_existing,
                 "default_existing_tree_scope": next_scope,
@@ -5802,7 +5995,7 @@ def list_projects(
     rows = db.execute(text("""
         SELECT
             p.id, p.organization_id, p.name, p.location_text, p.sponsor,
-            p.workflow_profile, p.agric_config,
+            p.workflow_profile, p.agric_config, p.relief_config,
             p.planting_model, p.allow_existing_tree_link, p.default_existing_tree_scope, p.created_at,
             o.name AS organization_name, o.slug AS organization_slug, o.status AS organization_status,
             o.logo_url AS organization_logo_url
@@ -5840,6 +6033,7 @@ def list_projects(
     for item in items:
         item["workflow_profile"] = _normalize_workflow_profile(item.get("workflow_profile"))
         item["agric_config"] = _normalize_agric_config(item.get("agric_config"))
+        item["relief_config"] = _normalize_relief_config(item.get("relief_config"))
         item["organization_logo_url"] = _normalize_logo_asset_path(item.get("organization_logo_url"))
     return items
 
@@ -5854,7 +6048,7 @@ def get_project(
     project = db.execute(text("""
         SELECT
             p.id, p.organization_id, p.name, p.location_text, p.sponsor,
-            p.workflow_profile, p.agric_config,
+            p.workflow_profile, p.agric_config, p.relief_config,
             p.planting_model, p.allow_existing_tree_link, p.default_existing_tree_scope, p.created_at,
             o.name AS organization_name, o.slug AS organization_slug, o.status AS organization_status,
             o.logo_url AS organization_logo_url
@@ -5867,6 +6061,7 @@ def get_project(
     project = dict(project)
     project["workflow_profile"] = _normalize_workflow_profile(project.get("workflow_profile"))
     project["agric_config"] = _normalize_agric_config(project.get("agric_config"))
+    project["relief_config"] = _normalize_relief_config(project.get("relief_config"))
     project["organization_logo_url"] = _normalize_logo_asset_path(project.get("organization_logo_url"))
 
     if assignee_clean:
@@ -5989,6 +6184,7 @@ def get_project(
         "settings": {
             "workflow_profile": _normalize_workflow_profile(project.get("workflow_profile")),
             "agric_config": _normalize_agric_config(project.get("agric_config")),
+            "relief_config": _normalize_relief_config(project.get("relief_config")),
             "planting_model": _normalize_planting_model(project.get("planting_model")),
             "allow_existing_tree_link": bool(project.get("allow_existing_tree_link")),
             "default_existing_tree_scope": _normalize_existing_tree_scope(project.get("default_existing_tree_scope")),
@@ -6635,9 +6831,10 @@ def assign_distribution_supervision(
 
     project_settings = _get_project_settings(db, int(allocation.get("project_id") or 0))
     workflow_profile = _normalize_workflow_profile(project_settings.get("workflow_profile"))
-    owner_label = "farmer" if workflow_profile == "agric" else "custodian"
-    entity_label = "plot" if workflow_profile == "agric" else "tree"
-    visit_label = "Farmer support visit" if workflow_profile == "agric" else "Custodian supervision visit"
+    workflow_labels = _get_workflow_labels(workflow_profile)
+    owner_label = workflow_labels["owner_singular"]
+    entity_label = workflow_labels["entity_singular"]
+    visit_label = workflow_labels["visit_label"]
 
     tree_rows_all = db.execute(
         text(
@@ -6660,7 +6857,7 @@ def assign_distribution_supervision(
             status_code=400,
             detail=f"No {entity_label}s linked to this {owner_label} yet. Capture at least one {entity_label} first.",
         )
-    assignment_mode = "support_visit" if workflow_profile == "agric" else "supervision"
+    assignment_mode = "support_visit" if workflow_profile in {"agric", "relief_recovery"} else "supervision"
     task_type_to_create = SUPERVISION_TASK_TYPE
 
     task_counts = db.execute(
@@ -6712,11 +6909,7 @@ def assign_distribution_supervision(
             f"{visit_label} {visit_no}/{supervision_target}. "
             f"{owner_label.title()}: {custodian_name or '-'} ({str(allocation.get('custodian_type') or '-').replace('_', ' ')}). "
             f"Community: {community_text}. Contact: {contact_text}. "
-            + (
-                "Check plot condition, capture GPS, upload visit photos, and document support actions."
-                if workflow_profile == "agric"
-                else "Check tree condition, capture GPS, upload visit photos, and document support actions."
-            )
+            + workflow_labels["support_visit_notes"]
         )
         row = db.execute(
             text(
@@ -6816,8 +7009,9 @@ def assign_custodian_field_capture(
 
     project_settings = _get_project_settings(db, int(project_id))
     workflow_profile = _normalize_workflow_profile(project_settings.get("workflow_profile"))
-    if workflow_profile != "agric":
-        raise HTTPException(status_code=400, detail="Field capture assignments are only available in Agric mode")
+    if workflow_profile not in {"agric", "relief_recovery"}:
+        raise HTTPException(status_code=400, detail="Field capture assignments are only available in Agric or Relief mode")
+    workflow_labels = _get_workflow_labels(workflow_profile)
 
     custodian = db.execute(
         text(
@@ -6839,9 +7033,9 @@ def assign_custodian_field_capture(
         {"custodian_id": int(custodian_id)},
     ).mappings().first()
     if not custodian:
-        raise HTTPException(status_code=404, detail="Farmer not found")
+        raise HTTPException(status_code=404, detail=f"{workflow_labels['owner_singular'].title()} not found")
     if int(custodian.get("project_id") or 0) != int(project_id):
-        raise HTTPException(status_code=400, detail="Farmer and project must belong to the same record set")
+        raise HTTPException(status_code=400, detail=f"{workflow_labels['owner_singular'].title()} and project must belong to the same record set")
 
     tree_rows_all = db.execute(
         text(
@@ -6857,7 +7051,10 @@ def assign_custodian_field_capture(
     ).mappings().all()
     visible_plot_rows = [dict(row) for row in tree_rows_all if not _is_hidden_tree_record(row.get("record_profile_data"))]
     if visible_plot_rows:
-        raise HTTPException(status_code=409, detail="This farmer already has mapped plots. Use Support Visits instead.")
+        raise HTTPException(
+            status_code=409,
+            detail=f"This {workflow_labels['owner_singular']} already has mapped {workflow_labels['entity_plural']}. Use Support Visits instead.",
+        )
 
     existing_open_task = db.execute(
         text(
@@ -6888,20 +7085,22 @@ def assign_custodian_field_capture(
     if existing_open_task:
         raise HTTPException(
             status_code=409,
-            detail="A first field capture task is already open for this farmer.",
+            detail=f"A {workflow_labels['field_capture_label'].lower()} task is already open for this {workflow_labels['owner_singular']}.",
         )
 
     profile_data = _normalize_json_object(custodian.get("profile_data")) or {}
     primary_crop = _clean_text(profile_data.get("primary_crop"), 160)
+    relief_support_category = _clean_text(profile_data.get("support_category"), 160)
     placeholder_tree = _get_or_create_support_placeholder_tree(
         db,
         project_id=int(project_id),
         custodian_id=int(custodian_id),
-        event_species=primary_crop,
+        workflow_profile=workflow_profile,
+        event_species=primary_crop if workflow_profile == "agric" else relief_support_category,
         actor_name=actor_name,
         placeholder_reason="field_capture_before_plot_capture",
-        plot_name="Plot pending capture",
-        notes="Hidden placeholder plot created automatically before the first field capture assignment.",
+        plot_name=workflow_labels["placeholder_name"],
+        notes=f"Hidden placeholder {workflow_labels['entity_singular']} created automatically before the first field capture assignment.",
     )
 
     due_date_value = _parse_date_value(due_date)
@@ -6910,10 +7109,15 @@ def assign_custodian_field_capture(
     contact_text = str(custodian.get("phone") or custodian.get("email") or custodian.get("contact_person") or "-").strip()
     community_text = str(custodian.get("community_name") or "-").strip()
     crop_text = primary_crop or "Crop not set"
+    support_category_text = relief_support_category or "Support category not set"
     task_notes = (
-        f"First field capture. Farmer: {custodian_name or '-'} ({str(custodian.get('custodian_type') or '-').replace('_', ' ')}). "
-        f"Community: {community_text}. Contact: {contact_text}. Primary crop: {crop_text}. "
-        "Open Map & Add Plot in the mobile app, walk or draw the farm boundary polygon, attach plot photos, and save the first mapped plot."
+        f"{workflow_labels['field_capture_label']}. {workflow_labels['owner_singular'].title()}: {custodian_name or '-'} "
+        f"({str(custodian.get('custodian_type') or '-').replace('_', ' ')}). Community: {community_text}. Contact: {contact_text}. "
+        + (
+            f"Primary crop: {crop_text}. {workflow_labels['field_capture_notes']}"
+            if workflow_profile == "agric"
+            else f"Support category: {support_category_text}. {workflow_labels['field_capture_notes']}"
+        )
     )
 
     row = db.execute(
@@ -7805,7 +8009,7 @@ def add_tree(
                 )
 
     if (
-        _normalize_workflow_profile(project_settings.get("workflow_profile")) == "agric"
+        _normalize_workflow_profile(project_settings.get("workflow_profile")) in {"agric", "relief_recovery"}
         and custodian_id_value is not None
         and not _is_hidden_tree_record(normalized_record_profile_data)
     ):
@@ -14657,6 +14861,404 @@ def _build_agric_programme_export_context(
     }
 
 
+def _build_relief_programme_export_context(
+    project_id: int,
+    db: Session,
+    *,
+    include_map: bool = False,
+) -> dict:
+    project = get_project(project_id, db)
+    project_copy = dict(project)
+    project_copy["relief_config"] = _normalize_relief_config(project.get("relief_config")) or {}
+
+    raw_site_rows = _fetch_existing_tree_export_rows(project_id, db)
+    site_rows: list[dict] = []
+    for source_row in raw_site_rows:
+        if _is_hidden_tree_record(source_row.get("record_profile_data")):
+            continue
+        row = dict(source_row)
+        photo_urls = _normalize_photo_urls(row.get("photo_urls"))
+        primary_photo_url = str(row.get("photo_url") or "").strip()
+        if primary_photo_url:
+            photo_urls = [primary_photo_url, *[item for item in photo_urls if item != primary_photo_url]]
+        row["photo_urls"] = photo_urls
+        row["primary_photo_url"] = photo_urls[0] if photo_urls else primary_photo_url
+        row["record_profile_data"] = _normalize_tree_record_profile_data(
+            row.get("record_profile_data"),
+            existing_area_sqm=row.get("existing_area_sqm"),
+        ) or {}
+        row["custodian_profile_data"] = _normalize_custodian_profile_data(row.get("custodian_profile_data")) or {}
+        site_rows.append(row)
+
+    beneficiary_rows = [
+        dict(row)
+        for row in db.execute(
+            text(
+                """
+                SELECT
+                    c.id,
+                    c.project_id,
+                    c.custodian_type,
+                    c.name,
+                    c.contact_person,
+                    c.phone,
+                    c.alt_phone,
+                    c.email,
+                    c.address_text,
+                    c.local_government,
+                    c.community_name,
+                    c.verification_status,
+                    c.notes,
+                    c.created_at,
+                    c.profile_data
+                FROM green_custodians c
+                WHERE c.project_id = :project_id
+                ORDER BY c.created_at DESC, c.id DESC
+                """
+            ),
+            {"project_id": project_id},
+        ).mappings().all()
+    ]
+    for row in beneficiary_rows:
+        row["profile_data"] = _normalize_custodian_profile_data(row.get("profile_data")) or {}
+    beneficiary_by_id = {int(row.get("id") or 0): row for row in beneficiary_rows if int(row.get("id") or 0) > 0}
+
+    allocation_rows = [
+        dict(row)
+        for row in db.execute(
+            text(
+                """
+                SELECT
+                    a.id,
+                    a.custodian_id,
+                    COALESCE(a.quantity_allocated, 0) AS quantity_allocated,
+                    COALESCE(a.supervision_target, 0) AS supervision_target,
+                    a.expected_planting_start,
+                    a.expected_planting_end,
+                    a.notes,
+                    a.created_at,
+                    e.event_date,
+                    e.species AS support_item
+                FROM green_distribution_allocations a
+                LEFT JOIN green_distribution_events e ON e.id = a.event_id
+                WHERE a.project_id = :project_id
+                ORDER BY a.created_at DESC, a.id DESC
+                """
+            ),
+            {"project_id": project_id},
+        ).mappings().all()
+    ]
+
+    task_rows = [
+        dict(row)
+        for row in db.execute(
+            text(
+                """
+                SELECT
+                    t.id,
+                    t.tree_id,
+                    t.custodian_id,
+                    LOWER(COALESCE(t.task_type, '')) AS task_type,
+                    LOWER(COALESCE(t.status, '')) AS status,
+                    LOWER(COALESCE(t.review_state, 'none')) AS review_state,
+                    t.assignee_name,
+                    t.created_at,
+                    t.completed_at,
+                    t.due_date,
+                    t.submitted_at,
+                    t.reviewed_at
+                FROM tree_tasks t
+                JOIN trees tr ON tr.id = t.tree_id
+                WHERE tr.project_id = :project_id
+                  AND t.custodian_id IS NOT NULL
+                  AND LOWER(COALESCE(t.task_type, '')) IN :task_types
+                ORDER BY COALESCE(t.reviewed_at, t.submitted_at, t.created_at) DESC, t.id DESC
+                """
+            ).bindparams(bindparam("task_types", expanding=True)),
+            {"project_id": project_id, "task_types": tuple(SUPPORT_ALLOCATION_TASK_TYPES)},
+        ).mappings().all()
+    ]
+
+    allocation_summary_by_beneficiary: dict[int, dict] = {}
+    for row in allocation_rows:
+        custodian_id = int(row.get("custodian_id") or 0)
+        if custodian_id <= 0:
+            continue
+        summary = allocation_summary_by_beneficiary.setdefault(
+            custodian_id,
+            {
+                "allocation_count": 0,
+                "allocated_units": 0.0,
+                "support_target": 0,
+                "latest_support_item": "",
+                "latest_event_date": None,
+            },
+        )
+        summary["allocation_count"] += 1
+        summary["allocated_units"] += float(row.get("quantity_allocated") or 0.0)
+        summary["support_target"] += int(row.get("supervision_target") or 0)
+        if not summary["latest_support_item"] and str(row.get("support_item") or "").strip():
+            summary["latest_support_item"] = str(row.get("support_item") or "").strip()
+        if summary["latest_event_date"] is None and row.get("event_date") is not None:
+            summary["latest_event_date"] = row.get("event_date")
+
+    task_summary_by_beneficiary: dict[int, dict] = {}
+    task_summary_by_site: dict[int, dict] = {}
+    for row in task_rows:
+        custodian_id = int(row.get("custodian_id") or 0)
+        site_id = int(row.get("tree_id") or 0)
+        task_type = _normalize_name(row.get("task_type"))
+        is_complete = _is_export_task_complete(row)
+        for target_map, target_id in ((task_summary_by_beneficiary, custodian_id), (task_summary_by_site, site_id)):
+            if target_id <= 0:
+                continue
+            summary = target_map.setdefault(
+                target_id,
+                {
+                    "field_capture_assigned": 0,
+                    "field_capture_done": 0,
+                    "support_visit_assigned": 0,
+                    "support_visit_done": 0,
+                    "last_task_date": None,
+                },
+            )
+            date_candidate = row.get("reviewed_at") or row.get("submitted_at") or row.get("completed_at") or row.get("created_at")
+            if date_candidate and summary["last_task_date"] is None:
+                summary["last_task_date"] = date_candidate
+            if task_type == FIELD_CAPTURE_TASK_TYPE:
+                summary["field_capture_assigned"] += 1
+                if is_complete:
+                    summary["field_capture_done"] += 1
+            elif task_type == SUPERVISION_TASK_TYPE:
+                summary["support_visit_assigned"] += 1
+                if is_complete:
+                    summary["support_visit_done"] += 1
+
+    site_summary_by_beneficiary: dict[int, dict] = {}
+    asset_type_counts: dict[str, dict] = {}
+    total_area_ha = 0.0
+    total_population_served = 0
+    total_estimated_repair_cost = 0.0
+    polygon_site_count = 0
+    photo_site_count = 0
+    linked_beneficiary_site_count = 0
+    damage_profile_count = 0
+    response_profile_count = 0
+    reviewed_site_count = 0
+    for row in site_rows:
+        site_id = int(row.get("id") or 0)
+        custodian_id = int(row.get("custodian_id") or 0)
+        record_profile = row.get("record_profile_data") or {}
+        linked_beneficiary = beneficiary_by_id.get(custodian_id) or {}
+        if linked_beneficiary:
+            for key in (
+                "phone",
+                "alt_phone",
+                "email",
+                "address_text",
+                "local_government",
+                "community_name",
+                "verification_status",
+                "contact_person",
+            ):
+                row[key] = linked_beneficiary.get(key)
+
+        area_ha = float(record_profile.get("area_hectares") or row.get("existing_area_ha") or 0.0)
+        asset_type = str(record_profile.get("asset_type") or row.get("species") or "").strip()
+        population_served = int(record_profile.get("population_served") or 0)
+        estimated_repair_cost = float(record_profile.get("estimated_repair_cost") or 0.0)
+        if area_ha > 0:
+            total_area_ha += area_ha
+        if population_served > 0:
+            total_population_served += population_served
+        if estimated_repair_cost > 0:
+            total_estimated_repair_cost += estimated_repair_cost
+        if _normalize_work_area_geojson(row.get("existing_area_geojson")):
+            polygon_site_count += 1
+        if str(row.get("primary_photo_url") or "").strip():
+            photo_site_count += 1
+        if custodian_id > 0:
+            linked_beneficiary_site_count += 1
+            beneficiary_site_summary = site_summary_by_beneficiary.setdefault(
+                custodian_id,
+                {"site_count": 0, "area_ha": 0.0, "population_served": 0, "estimated_repair_cost": 0.0},
+            )
+            beneficiary_site_summary["site_count"] += 1
+            beneficiary_site_summary["area_ha"] += area_ha
+            beneficiary_site_summary["population_served"] += population_served
+            beneficiary_site_summary["estimated_repair_cost"] += estimated_repair_cost
+        if asset_type:
+            key = asset_type.lower()
+            item = asset_type_counts.setdefault(key, {"label": asset_type, "site_count": 0, "area_ha": 0.0})
+            item["site_count"] += 1
+            item["area_ha"] += area_ha
+        if record_profile.get("damage_level"):
+            damage_profile_count += 1
+        if record_profile.get("response_pathway"):
+            response_profile_count += 1
+        if _normalize_name(row.get("last_review_state")) in {"approved", "metadata_edit", "submitted"}:
+            reviewed_site_count += 1
+
+        site_task_summary = task_summary_by_site.get(site_id) or {}
+        row["field_capture_assigned"] = int(site_task_summary.get("field_capture_assigned") or 0)
+        row["field_capture_done"] = int(site_task_summary.get("field_capture_done") or 0)
+        row["field_capture_live"] = max(row["field_capture_assigned"] - row["field_capture_done"], 0)
+        row["support_visit_assigned"] = int(site_task_summary.get("support_visit_assigned") or 0)
+        row["support_visit_done"] = int(site_task_summary.get("support_visit_done") or 0)
+        row["support_visit_live"] = max(row["support_visit_assigned"] - row["support_visit_done"], 0)
+        row["latest_task_date"] = site_task_summary.get("last_task_date")
+
+    top_asset_types = sorted(
+        asset_type_counts.values(),
+        key=lambda item: (int(item.get("site_count") or 0), float(item.get("area_ha") or 0.0)),
+        reverse=True,
+    )[:8]
+    for item in top_asset_types:
+        item["area_ha"] = round(float(item.get("area_ha") or 0.0), 4)
+
+    for row in beneficiary_rows:
+        beneficiary_id = int(row.get("id") or 0)
+        profile = row.get("profile_data") or {}
+        allocation_summary = allocation_summary_by_beneficiary.get(beneficiary_id) or {}
+        task_summary = task_summary_by_beneficiary.get(beneficiary_id) or {}
+        site_summary = site_summary_by_beneficiary.get(beneficiary_id) or {}
+        row["allocation_count"] = int(allocation_summary.get("allocation_count") or 0)
+        row["allocated_units"] = round(float(allocation_summary.get("allocated_units") or 0.0), 2)
+        row["support_target"] = int(allocation_summary.get("support_target") or 0)
+        row["site_count"] = int(site_summary.get("site_count") or 0)
+        row["mapped_area_ha"] = round(float(site_summary.get("area_ha") or 0.0), 4)
+        row["population_served"] = int(site_summary.get("population_served") or 0)
+        row["estimated_repair_cost"] = round(float(site_summary.get("estimated_repair_cost") or 0.0), 2)
+        row["field_capture_assigned"] = int(task_summary.get("field_capture_assigned") or 0)
+        row["field_capture_done"] = int(task_summary.get("field_capture_done") or 0)
+        row["field_capture_live"] = max(row["field_capture_assigned"] - row["field_capture_done"], 0)
+        row["support_visit_assigned"] = int(task_summary.get("support_visit_assigned") or 0)
+        row["support_visit_done"] = int(task_summary.get("support_visit_done") or 0)
+        row["support_visit_live"] = max(row["support_visit_assigned"] - row["support_visit_done"], 0)
+        row["latest_task_date"] = task_summary.get("last_task_date")
+        row["beneficiary_code"] = str(profile.get("beneficiary_code") or "").strip()
+        row["government_id"] = str(profile.get("government_id") or "").strip()
+        row["displacement_status"] = str(profile.get("displacement_status") or "").strip()
+        row["support_category"] = str(profile.get("support_category") or "").strip()
+        row["vulnerability_flags"] = str(profile.get("vulnerability_flags") or "").strip()
+        row["household_size_value"] = int(profile.get("household_size") or 0)
+        row["women_count_value"] = int(profile.get("women_count") or 0)
+        row["children_under_five_value"] = int(profile.get("children_under_five") or 0)
+        row["elderly_count_value"] = int(profile.get("elderly_count") or 0)
+        row["disability_count_value"] = int(profile.get("disability_count") or 0)
+
+    verified_beneficiaries = sum(1 for row in beneficiary_rows if _normalize_name(row.get("verification_status")) == "verified")
+    identity_ready_beneficiaries = sum(
+        1
+        for row in beneficiary_rows
+        if str(row.get("beneficiary_code") or "").strip() or str(row.get("government_id") or "").strip()
+    )
+    displaced_beneficiaries = sum(
+        1
+        for row in beneficiary_rows
+        if _normalize_name(row.get("displacement_status")) in {"idp", "returnee", "refugee", "host_community"}
+    )
+    vulnerable_beneficiaries = sum(
+        1
+        for row in beneficiary_rows
+        if str(row.get("vulnerability_flags") or "").strip()
+        or int(row.get("disability_count_value") or 0) > 0
+        or int(row.get("children_under_five_value") or 0) > 0
+        or int(row.get("elderly_count_value") or 0) > 0
+    )
+    institutional_beneficiaries = sum(
+        1
+        for row in beneficiary_rows
+        if _normalize_name(row.get("custodian_type")) in {"school", "health_facility", "community_asset", "small_business"}
+    )
+
+    field_capture_assigned_total = sum(int(row.get("field_capture_assigned") or 0) for row in beneficiary_rows)
+    field_capture_done_total = sum(int(row.get("field_capture_done") or 0) for row in beneficiary_rows)
+    support_visit_assigned_total = sum(int(row.get("support_visit_assigned") or 0) for row in beneficiary_rows)
+    support_visit_done_total = sum(int(row.get("support_visit_done") or 0) for row in beneficiary_rows)
+    support_target_total = sum(int(row.get("support_target") or 0) for row in beneficiary_rows)
+    allocated_units_total = round(sum(float(row.get("allocated_units") or 0.0) for row in beneficiary_rows), 2)
+
+    def _pct(value: int, total: int) -> float:
+        return round((float(value) / float(total)) * 100.0, 1) if total > 0 else 0.0
+
+    summary = {
+        "registered_beneficiaries": len(beneficiary_rows),
+        "verified_beneficiaries": verified_beneficiaries,
+        "mapped_sites": len(site_rows),
+        "mapped_area_ha": round(total_area_ha, 4),
+        "allocated_units": allocated_units_total,
+        "field_capture_assigned": field_capture_assigned_total,
+        "field_capture_done": field_capture_done_total,
+        "field_capture_live": max(field_capture_assigned_total - field_capture_done_total, 0),
+        "support_visit_assigned": support_visit_assigned_total,
+        "support_visit_done": support_visit_done_total,
+        "support_visit_live": max(support_visit_assigned_total - support_visit_done_total, 0),
+        "support_target_total": support_target_total,
+        "polygon_sites": polygon_site_count,
+        "photo_evidence_sites": photo_site_count,
+        "linked_beneficiary_sites": linked_beneficiary_site_count,
+        "damage_profile_sites": damage_profile_count,
+        "response_profile_sites": response_profile_count,
+        "reviewed_sites": reviewed_site_count,
+        "identity_ready_beneficiaries": identity_ready_beneficiaries,
+        "vulnerable_beneficiaries": vulnerable_beneficiaries,
+        "displaced_beneficiaries": displaced_beneficiaries,
+        "institutional_beneficiaries": institutional_beneficiaries,
+        "total_population_served": total_population_served,
+        "total_estimated_repair_cost": round(total_estimated_repair_cost, 2),
+        "top_asset_types": top_asset_types,
+        "geo_readiness_pct": _pct(polygon_site_count, len(site_rows)),
+        "photo_readiness_pct": _pct(photo_site_count, len(site_rows)),
+        "damage_readiness_pct": _pct(damage_profile_count, len(site_rows)),
+        "response_readiness_pct": _pct(response_profile_count, len(site_rows)),
+        "review_readiness_pct": _pct(reviewed_site_count, len(site_rows)),
+        "identity_readiness_pct": _pct(identity_ready_beneficiaries, len(beneficiary_rows)),
+    }
+
+    overview_map_view = None
+    overview_map_png = None
+    if include_map:
+        overview_map_rows = []
+        for row in site_rows:
+            overview_map_rows.append(
+                {
+                    "id": row.get("id"),
+                    "status": row.get("status"),
+                    "lng": row.get("lng"),
+                    "lat": row.get("lat"),
+                    "existing_area_geojson": row.get("existing_area_geojson"),
+                }
+            )
+        try:
+            overview_map_view = _estimate_report_map_view(overview_map_rows, width=800, height=500)
+            overview_map_png = (
+                _build_report_map_png(
+                    overview_map_rows,
+                    lng=overview_map_view.get("lng"),
+                    lat=overview_map_view.get("lat"),
+                    zoom=overview_map_view.get("zoom"),
+                    bearing=overview_map_view.get("bearing"),
+                    pitch=overview_map_view.get("pitch"),
+                    include_markers=False,
+                )
+                if overview_map_view
+                else None
+            )
+        except Exception:
+            overview_map_view = None
+            overview_map_png = None
+
+    return {
+        "project": project_copy,
+        "summary": summary,
+        "beneficiary_rows": beneficiary_rows,
+        "site_rows": site_rows,
+        "overview_map_png": overview_map_png,
+        "overview_map_view": overview_map_view,
+    }
+
+
 def _render_agric_programme_pdf_with_fallback(
     pdf_path: str,
     context: dict,
@@ -14685,6 +15287,45 @@ def _render_agric_programme_pdf_with_fallback(
                 summary=context["summary"],
                 farmer_rows=context["farmer_rows"],
                 plot_rows=context["plot_rows"],
+                overview_map_png=next_map_png,
+                overview_map_view=next_map_view,
+                include_photos=next_include_photos,
+            )
+            return
+        except Exception as exc:
+            last_error = exc
+    if last_error is not None:
+        raise last_error
+
+
+def _render_relief_programme_pdf_with_fallback(
+    pdf_path: str,
+    context: dict,
+    *,
+    include_photos: bool,
+) -> None:
+    map_png = context.get("overview_map_png")
+    map_view = context.get("overview_map_view")
+
+    attempts: list[tuple[bytes | None, dict | None, bool]] = [
+        (map_png, map_view, include_photos),
+    ]
+    if map_png is not None or map_view is not None:
+        attempts.append((None, None, include_photos))
+    if include_photos:
+        attempts.append((map_png, map_view, False))
+        if map_png is not None or map_view is not None:
+            attempts.append((None, None, False))
+
+    last_error: Exception | None = None
+    for next_map_png, next_map_view, next_include_photos in attempts:
+        try:
+            render_green_relief_programme_pdf(
+                pdf_path,
+                project=context["project"],
+                summary=context["summary"],
+                beneficiary_rows=context["beneficiary_rows"],
+                site_rows=context["site_rows"],
                 overview_map_png=next_map_png,
                 overview_map_view=next_map_view,
                 include_photos=next_include_photos,
@@ -14917,6 +15558,209 @@ def export_existing_trees_csv(project_id: int, db: Session = Depends(get_db)):
                 ])
         filename = f"project_{project_id}_agric_programme.csv"
         return FileResponse(csv_path, media_type="text/csv", filename=filename)
+    if workflow_profile == "relief_recovery":
+        context = _build_relief_programme_export_context(project_id, db, include_map=False)
+        project_copy = context["project"]
+        summary = context["summary"]
+        beneficiary_rows = context["beneficiary_rows"]
+        site_rows = context["site_rows"]
+        os.makedirs(REPORTS_DIR, exist_ok=True)
+        tmp_csv = tempfile.NamedTemporaryFile(suffix="_relief_programme.csv", delete=False)
+        csv_path = tmp_csv.name
+        tmp_csv.close()
+        with open(csv_path, "w", newline="", encoding="utf-8-sig") as f:
+            writer = _excel_csv_writer(f)
+            writer.writerow(["LandCheck Relief & Recovery Programme Export"])
+            writer.writerow(["Project", project_copy.get("name", "")])
+            writer.writerow(["Location", project_copy.get("location_text", "")])
+            writer.writerow(["Workflow Profile", "relief_recovery"])
+            relief_config = project_copy.get("relief_config") if isinstance(project_copy.get("relief_config"), dict) else {}
+            writer.writerow([
+                "Relief Program",
+                relief_config.get("program_type") or "",
+                relief_config.get("intervention_focus") or "",
+                relief_config.get("package_types") or "",
+                relief_config.get("target_zone") or "",
+            ])
+            writer.writerow(["Generated At (UTC)", datetime.utcnow().isoformat()])
+            writer.writerow([])
+            writer.writerow([
+                "Summary",
+                f"Registered Beneficiaries {summary.get('registered_beneficiaries', 0)}",
+                f"Verified Beneficiaries {summary.get('verified_beneficiaries', 0)}",
+                f"Mapped Sites {summary.get('mapped_sites', 0)}",
+                f"Mapped Area {summary.get('mapped_area_ha', 0)} ha",
+                f"Population Served {summary.get('total_population_served', 0)}",
+                f"Repair Exposure {summary.get('total_estimated_repair_cost', 0)}",
+                f"Allocated Units {summary.get('allocated_units', 0)}",
+                f"Site Capture {summary.get('field_capture_done', 0)}/{summary.get('field_capture_assigned', 0)}",
+                f"Relief Visits {summary.get('support_visit_done', 0)}/{summary.get('support_target_total', 0)}",
+            ])
+            writer.writerow([])
+            writer.writerow(["Beneficiary Registry"])
+            writer.writerow([
+                "beneficiary_id",
+                "beneficiary_name",
+                "beneficiary_type",
+                "verification_status",
+                "phone",
+                "email",
+                "community_name",
+                "local_government",
+                "beneficiary_code",
+                "government_id",
+                "displacement_status",
+                "shelter_status",
+                "origin_location",
+                "current_settlement",
+                "support_category",
+                "priority_needs",
+                "livelihood_type",
+                "vulnerability_flags",
+                "household_size",
+                "women_count",
+                "children_under_five",
+                "elderly_count",
+                "disability_count",
+                "site_count",
+                "mapped_area_ha",
+                "population_served",
+                "estimated_repair_cost",
+                "allocation_count",
+                "allocated_units",
+                "support_target",
+                "field_capture_assigned",
+                "field_capture_done",
+                "support_visit_assigned",
+                "support_visit_done",
+                "notes",
+            ])
+            for row in beneficiary_rows:
+                profile = row.get("profile_data") or {}
+                writer.writerow([
+                    row.get("id"),
+                    row.get("name"),
+                    row.get("custodian_type"),
+                    row.get("verification_status"),
+                    row.get("phone"),
+                    row.get("email"),
+                    row.get("community_name"),
+                    row.get("local_government"),
+                    profile.get("beneficiary_code"),
+                    profile.get("government_id"),
+                    profile.get("displacement_status"),
+                    profile.get("shelter_status"),
+                    profile.get("origin_location"),
+                    profile.get("current_settlement"),
+                    profile.get("support_category"),
+                    profile.get("priority_needs"),
+                    profile.get("livelihood_type"),
+                    profile.get("vulnerability_flags"),
+                    profile.get("household_size"),
+                    profile.get("women_count"),
+                    profile.get("children_under_five"),
+                    profile.get("elderly_count"),
+                    profile.get("disability_count"),
+                    row.get("site_count"),
+                    row.get("mapped_area_ha"),
+                    row.get("population_served"),
+                    row.get("estimated_repair_cost"),
+                    row.get("allocation_count"),
+                    row.get("allocated_units"),
+                    row.get("support_target"),
+                    row.get("field_capture_assigned"),
+                    row.get("field_capture_done"),
+                    row.get("support_visit_assigned"),
+                    row.get("support_visit_done"),
+                    row.get("notes"),
+                ])
+            writer.writerow([])
+            writer.writerow(["Site Records"])
+            writer.writerow([
+                "site_id",
+                "project_tree_no",
+                "beneficiary_name",
+                "phone",
+                "community_name",
+                "local_government",
+                "asset_code",
+                "asset_name",
+                "asset_type",
+                "damage_level",
+                "occupancy_status",
+                "tenure_status",
+                "response_pathway",
+                "relief_boundary_capture_method",
+                "existing_area_sqm",
+                "site_area_hectares",
+                "floor_area_sqm",
+                "rooms_count",
+                "estimated_repair_cost",
+                "population_served",
+                "support_package",
+                "safety_risks",
+                "reported_need",
+                "status",
+                "field_capture_assigned",
+                "field_capture_done",
+                "support_visit_assigned",
+                "support_visit_done",
+                "created_by",
+                "created_at",
+                "lng",
+                "lat",
+                "photo_url",
+                "photo_urls",
+                "existing_area_geojson",
+                "record_profile_data_json",
+                "beneficiary_profile_data_json",
+                "notes",
+            ])
+            for row in site_rows:
+                record_profile_data = row.get("record_profile_data") or {}
+                beneficiary_profile_data = row.get("custodian_profile_data") or {}
+                writer.writerow([
+                    row.get("id"),
+                    row.get("project_tree_no"),
+                    row.get("custodian_name"),
+                    row.get("phone"),
+                    row.get("community_name"),
+                    row.get("local_government"),
+                    record_profile_data.get("asset_code"),
+                    record_profile_data.get("asset_name"),
+                    record_profile_data.get("asset_type"),
+                    record_profile_data.get("damage_level"),
+                    record_profile_data.get("occupancy_status"),
+                    record_profile_data.get("tenure_status"),
+                    record_profile_data.get("response_pathway"),
+                    record_profile_data.get("relief_boundary_capture_method"),
+                    row.get("existing_area_sqm"),
+                    record_profile_data.get("area_hectares"),
+                    record_profile_data.get("floor_area_sqm"),
+                    record_profile_data.get("rooms_count"),
+                    record_profile_data.get("estimated_repair_cost"),
+                    record_profile_data.get("population_served"),
+                    record_profile_data.get("support_package"),
+                    record_profile_data.get("safety_risks"),
+                    record_profile_data.get("reported_need"),
+                    row.get("status"),
+                    row.get("field_capture_assigned"),
+                    row.get("field_capture_done"),
+                    row.get("support_visit_assigned"),
+                    row.get("support_visit_done"),
+                    row.get("created_by"),
+                    _to_iso_text(row.get("created_at")),
+                    row.get("lng"),
+                    row.get("lat"),
+                    row.get("primary_photo_url") or row.get("photo_url"),
+                    json.dumps(_normalize_photo_urls(row.get("photo_urls"))),
+                    _safe_json(row.get("existing_area_geojson")) if row.get("existing_area_geojson") is not None else "",
+                    _safe_json(record_profile_data) if record_profile_data else "",
+                    _safe_json(beneficiary_profile_data) if beneficiary_profile_data else "",
+                    row.get("notes"),
+                ])
+        filename = f"project_{project_id}_relief_programme.csv"
+        return FileResponse(csv_path, media_type="text/csv", filename=filename)
 
     rows = _fetch_existing_tree_export_rows(project_id, db)
     summary = _summarize_existing_tree_export_rows(rows)
@@ -15146,6 +15990,25 @@ def export_existing_trees_pdf(
             pdf_path,
             filename,
             category="green-agric-programme-report",
+            project_id=project_id,
+            organization_id=int(context["project"].get("organization_id") or 0) or None,
+        )
+    if workflow_profile == "relief_recovery":
+        context = _build_relief_programme_export_context(project_id, db, include_map=True)
+        os.makedirs(REPORTS_DIR, exist_ok=True)
+        tmp_pdf = tempfile.NamedTemporaryFile(suffix="_relief_programme.pdf", delete=False)
+        pdf_path = tmp_pdf.name
+        tmp_pdf.close()
+        _render_relief_programme_pdf_with_fallback(
+            pdf_path,
+            context,
+            include_photos=include_photos,
+        )
+        filename = f"project_{project_id}_relief_programme_report.pdf"
+        return _pdf_response_with_r2(
+            pdf_path,
+            filename,
+            category="green-relief-programme-report",
             project_id=project_id,
             organization_id=int(context["project"].get("organization_id") or 0) or None,
         )
@@ -15548,6 +16411,14 @@ def _render_work_report_to_pdf(
             include_photos=include_photos,
         )
         return f"project_{project_id}_agric_programme_report.pdf", int(context["project"].get("organization_id") or 0) or None
+    if workflow_profile == "relief_recovery":
+        context = _build_relief_programme_export_context(project_id, db, include_map=True)
+        _render_relief_programme_pdf_with_fallback(
+            pdf_path,
+            context,
+            include_photos=include_photos,
+        )
+        return f"project_{project_id}_relief_programme_report.pdf", int(context["project"].get("organization_id") or 0) or None
     if assignee_name:
         rows = db.execute(text("""
             SELECT
