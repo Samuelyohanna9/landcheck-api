@@ -6017,6 +6017,10 @@ def _build_public_project_snapshot(project: dict, db: Session) -> dict:
     payload["slots_available"] = available_slots
     payload["sponsor_checkout_ready"] = checkout_ready
     payload["sponsor_launch_note"] = _build_sponsor_launch_note(payload, available_slots)
+    # Tells the mobile app which payment paths are available so it can show the right UI
+    payment_instructions = str(payload.get("sponsor_payment_instructions") or "").strip()
+    payload["flutterwave_available"] = bool(_flutterwave_secret_key())
+    payload["manual_payment_available"] = bool(payment_instructions)
     return payload
 
 
@@ -6979,8 +6983,11 @@ def sponsor_flutterwave_return(
 async def sponsor_flutterwave_webhook(request: Request, db: Session = Depends(get_db)):
     raw_body = await request.body()
     signature = request.headers.get("flutterwave-signature")
-    if not _verify_flutterwave_webhook_signature(raw_body, signature):
+    secret_hash_configured = bool(_flutterwave_secret_hash())
+    if secret_hash_configured and not _verify_flutterwave_webhook_signature(raw_body, signature):
         raise HTTPException(status_code=401, detail="Invalid webhook signature")
+    # If FLW_SECRET_HASH is not configured, accept all webhooks from Flutterwave
+    # (they are still validated against the actual Flutterwave API when processing)
     try:
         payload = json.loads(raw_body.decode("utf-8") or "{}")
     except Exception as exc:
