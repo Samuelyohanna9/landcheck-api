@@ -7277,8 +7277,7 @@ def list_admin_sponsors(db: Session = Depends(get_db)):
     } for row in rows]
 
 
-@router.get("/admin/sponsorship-orders")
-def list_admin_sponsorship_orders(project_id: int | None = Query(default=None), db: Session = Depends(get_db)):
+def _list_admin_sponsorship_orders(db: Session, project_id: int | None = None, sync_gateway: bool = True) -> list[dict]:
     query = text(
         """
         SELECT
@@ -7302,33 +7301,34 @@ def list_admin_sponsorship_orders(project_id: int | None = Query(default=None), 
     query_params = {"project_id": int(project_id) if project_id is not None else None}
     rows = db.execute(query, query_params).mappings().all()
     refreshed_any = False
-    for row in rows:
-        item = dict(row)
-        if _normalize_name(item.get("payment_method")) != "flutterwave_standard":
-            continue
-        if _normalize_name(item.get("payment_status")) == "verified":
-            continue
-        transaction_id = int(item.get("payment_gateway_transaction_id") or 0) or None
-        gateway_reference = str(item.get("payment_gateway_reference") or item.get("order_uid") or "").strip()
-        if not transaction_id and not gateway_reference:
-            continue
-        try:
-            _sync_sponsorship_order_flutterwave_payment(
-                db,
-                item,
-                transaction_id=transaction_id,
-                tx_ref=gateway_reference,
-                actor="work_admin_sync",
-                review_notes="Synced while loading sponsorship orders in Work",
-            )
-            db.commit()
-            refreshed_any = True
-        except HTTPException:
-            db.rollback()
-            continue
-        except Exception:
-            db.rollback()
-            continue
+    if sync_gateway:
+        for row in rows:
+            item = dict(row)
+            if _normalize_name(item.get("payment_method")) != "flutterwave_standard":
+                continue
+            if _normalize_name(item.get("payment_status")) == "verified":
+                continue
+            transaction_id = int(item.get("payment_gateway_transaction_id") or 0) or None
+            gateway_reference = str(item.get("payment_gateway_reference") or item.get("order_uid") or "").strip()
+            if not transaction_id and not gateway_reference:
+                continue
+            try:
+                _sync_sponsorship_order_flutterwave_payment(
+                    db,
+                    item,
+                    transaction_id=transaction_id,
+                    tx_ref=gateway_reference,
+                    actor="work_admin_sync",
+                    review_notes="Synced while loading sponsorship orders in Work",
+                )
+                db.commit()
+                refreshed_any = True
+            except HTTPException:
+                db.rollback()
+                continue
+            except Exception:
+                db.rollback()
+                continue
     if refreshed_any:
         rows = db.execute(query, query_params).mappings().all()
     order_ids = [int(row["id"]) for row in rows]
@@ -7368,6 +7368,11 @@ def list_admin_sponsorship_orders(project_id: int | None = Query(default=None), 
         item.update(unit_counts.get(int(item["id"]), {"total_units": 0, "linked_units": 0, "awaiting_tree_units": 0, "awaiting_payment_units": 0}))
         payload.append(item)
     return payload
+
+
+@router.get("/admin/sponsorship-orders")
+def list_admin_sponsorship_orders(project_id: int | None = Query(default=None), db: Session = Depends(get_db)):
+    return _list_admin_sponsorship_orders(db, project_id=project_id, sync_gateway=True)
 
 
 @router.patch("/admin/sponsorship-orders/{order_id}/payment")
@@ -8181,6 +8186,7 @@ def get_project(
         ),
         {"project_id": project_id},
     ).mappings().first() or {}
+    sponsorship_orders = _list_admin_sponsorship_orders(db, project_id=project_id, sync_gateway=False) if _is_public_sponsorship_project(project) else []
 
     return {
         **dict(project),
@@ -8221,6 +8227,7 @@ def get_project(
             "trees_with_fallback_age": carbon.get("trees_with_fallback_age", 0),
             "trees_pending_review": carbon.get("trees_pending_review", 0),
         },
+        "sponsorship_orders": sponsorship_orders,
     }
 
 
