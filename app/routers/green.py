@@ -7270,13 +7270,39 @@ def list_admin_sponsors(db: Session = Depends(get_db)):
             SELECT
                 sa.id, sa.sponsor_uid, sa.account_type, sa.full_name, sa.organization_name, sa.email, sa.phone,
                 sa.is_active, sa.created_at,
-                COUNT(DISTINCT o.id) AS orders_count,
-                COALESCE(SUM(o.amount_total), 0) AS amount_total,
-                COUNT(DISTINCT u.id) FILTER (WHERE u.tree_id IS NOT NULL) AS linked_trees
+                COALESCE(order_stats.orders_count, 0) AS orders_count,
+                COALESCE(order_stats.amount_total, 0) AS amount_total,
+                COALESCE(order_stats.verified_orders_count, 0) AS verified_orders_count,
+                COALESCE(order_stats.pending_orders_count, 0) AS pending_orders_count,
+                COALESCE(order_stats.issue_orders_count, 0) AS issue_orders_count,
+                COALESCE(unit_stats.linked_trees, 0) AS linked_trees,
+                COALESCE(unit_stats.awaiting_tree_units, 0) AS awaiting_tree_units
             FROM green_sponsor_accounts sa
-            LEFT JOIN green_sponsorship_orders o ON o.sponsor_account_id = sa.id
-            LEFT JOIN green_sponsorship_units u ON u.sponsor_account_id = sa.id
-            GROUP BY sa.id
+            LEFT JOIN (
+                SELECT
+                    sponsor_account_id,
+                    COUNT(*) AS orders_count,
+                    COALESCE(SUM(amount_total), 0) AS amount_total,
+                    COUNT(*) FILTER (WHERE LOWER(COALESCE(payment_status, '')) = 'verified') AS verified_orders_count,
+                    COUNT(*) FILTER (
+                        WHERE LOWER(COALESCE(payment_status, '')) IN ('pending', 'proof_submitted')
+                    ) AS pending_orders_count,
+                    COUNT(*) FILTER (
+                        WHERE LOWER(COALESCE(payment_status, '')) IN ('rejected', 'refunded')
+                    ) AS issue_orders_count
+                FROM green_sponsorship_orders
+                GROUP BY sponsor_account_id
+            ) order_stats ON order_stats.sponsor_account_id = sa.id
+            LEFT JOIN (
+                SELECT
+                    sponsor_account_id,
+                    COUNT(*) FILTER (WHERE tree_id IS NOT NULL) AS linked_trees,
+                    COUNT(*) FILTER (
+                        WHERE LOWER(COALESCE(sponsorship_status, '')) = 'awaiting_tree'
+                    ) AS awaiting_tree_units
+                FROM green_sponsorship_units
+                GROUP BY sponsor_account_id
+            ) unit_stats ON unit_stats.sponsor_account_id = sa.id
             ORDER BY sa.created_at DESC, sa.id DESC
             """
         )
@@ -7285,6 +7311,10 @@ def list_admin_sponsors(db: Session = Depends(get_db)):
         "orders_count": int(row.get("orders_count") or 0),
         "amount_total": round(float(row.get("amount_total") or 0), 2),
         "linked_trees": int(row.get("linked_trees") or 0),
+        "verified_orders_count": int(row.get("verified_orders_count") or 0),
+        "pending_orders_count": int(row.get("pending_orders_count") or 0),
+        "issue_orders_count": int(row.get("issue_orders_count") or 0),
+        "awaiting_tree_units": int(row.get("awaiting_tree_units") or 0),
         "created_at": row.get("created_at"),
     } for row in rows]
 
@@ -8245,7 +8275,7 @@ def get_project(
                 sponsorship_scope_note = (
                     "No sponsorship orders matched this project yet. Showing all public sponsorship payments across projects so paid sponsors stay visible in Work."
                 )
-        sponsor_accounts = _summarize_sponsorship_accounts_from_orders(sponsorship_orders)
+        sponsor_accounts = list_admin_sponsors(db)
 
     return {
         **dict(project),
@@ -8336,9 +8366,43 @@ def list_trees(
                t.existing_area_geojson,
                t.existing_area_sqm,
                t.record_profile_data,
+               COALESCE(sponsor_summary.sponsor_linked_units, 0) AS sponsor_linked_units,
+               COALESCE(sponsor_summary.sponsor_paid_units, 0) AS sponsor_paid_units,
+               COALESCE(sponsor_summary.sponsor_pending_units, 0) AS sponsor_pending_units,
+               COALESCE(sponsor_summary.sponsor_problem_units, 0) AS sponsor_problem_units,
+               sponsor_summary.sponsor_display_names,
                ST_X(geom) AS lng, ST_Y(geom) AS lat
         FROM trees t
         LEFT JOIN green_custodians c ON c.id = t.custodian_id
+        LEFT JOIN (
+            SELECT
+                u.tree_id,
+                COUNT(*) FILTER (
+                    WHERE LOWER(COALESCE(u.sponsorship_status, '')) IN ('linked', 'active', 'replaced')
+                ) AS sponsor_linked_units,
+                COUNT(*) FILTER (
+                    WHERE LOWER(COALESCE(o.payment_status, '')) = 'verified'
+                      AND LOWER(COALESCE(u.sponsorship_status, '')) IN ('linked', 'active', 'replaced')
+                ) AS sponsor_paid_units,
+                COUNT(*) FILTER (
+                    WHERE LOWER(COALESCE(o.payment_status, '')) IN ('pending', 'proof_submitted')
+                      AND LOWER(COALESCE(u.sponsorship_status, '')) IN ('linked', 'active', 'replaced')
+                ) AS sponsor_pending_units,
+                COUNT(*) FILTER (
+                    WHERE LOWER(COALESCE(o.payment_status, '')) IN ('rejected', 'refunded')
+                      AND LOWER(COALESCE(u.sponsorship_status, '')) IN ('linked', 'active', 'replaced')
+                ) AS sponsor_problem_units,
+                STRING_AGG(
+                    DISTINCT COALESCE(NULLIF(TRIM(sa.organization_name), ''), NULLIF(TRIM(sa.full_name), '')),
+                    ', '
+                ) AS sponsor_display_names
+            FROM green_sponsorship_units u
+            JOIN green_sponsorship_orders o ON o.id = u.order_id
+            JOIN green_sponsor_accounts sa ON sa.id = u.sponsor_account_id
+            WHERE u.tree_id IS NOT NULL
+              AND LOWER(COALESCE(u.sponsorship_status, '')) <> 'cancelled'
+            GROUP BY u.tree_id
+        ) sponsor_summary ON sponsor_summary.tree_id = t.id
         WHERE t.project_id = :project_id
           AND (:assignee_name IS NULL OR LOWER(TRIM(COALESCE(t.created_by, ''))) = LOWER(TRIM(:assignee_name)))
         ORDER BY t.created_at DESC
