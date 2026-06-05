@@ -342,8 +342,13 @@ class SponsorOrderPayload(BaseModel):
 
 class SponsorOrderReviewPayload(BaseModel):
     payment_status: str
-    reviewer_name: str | None = None
+    reviewed_by: str | None = None
+    reviewer_name: str | None = None  # legacy alias – prefer reviewed_by
     review_notes: str | None = None
+
+    @property
+    def resolved_reviewer(self) -> str | None:
+        return (self.reviewed_by or self.reviewer_name or "").strip() or None
 
 
 def _normalize_privacy_scope(value: str | None) -> str:
@@ -7400,8 +7405,14 @@ def _summarize_sponsorship_accounts_from_orders(orders: list[dict]) -> list[dict
 
 
 @router.get("/admin/sponsorship-orders")
-def list_admin_sponsorship_orders(project_id: int | None = Query(default=None), db: Session = Depends(get_db)):
-    return _list_admin_sponsorship_orders(db, project_id=project_id, sync_gateway=True)
+def list_admin_sponsorship_orders(
+    project_id: int | None = Query(default=None),
+    sync: bool = Query(default=False),
+    db: Session = Depends(get_db),
+):
+    # sync_gateway=False by default – avoids blocking on Flutterwave API calls during listing.
+    # Pass ?sync=1 to explicitly trigger gateway sync for the returned orders.
+    return _list_admin_sponsorship_orders(db, project_id=project_id, sync_gateway=sync)
 
 
 @router.patch("/admin/sponsorship-orders/{order_id}/payment")
@@ -7439,7 +7450,7 @@ def review_admin_sponsorship_order_payment(
         {
             "order_id": int(order_id),
             "payment_status": next_payment_status,
-            "reviewed_by": _clean_text(payload.reviewer_name, 120),
+            "reviewed_by": _clean_text(payload.resolved_reviewer, 120),
             "review_notes": _clean_text(payload.review_notes, 500),
         },
     )
@@ -7490,7 +7501,7 @@ def review_admin_sponsorship_order_payment(
         entity_type="sponsorship_order",
         entity_id=int(order_id),
         action="sponsorship_payment_reviewed",
-        actor=_clean_text(payload.reviewer_name, 120),
+        actor=_clean_text(payload.resolved_reviewer, 120),
         details={"payment_status": next_payment_status, "review_notes": _clean_text(payload.review_notes, 500)},
     )
     db.commit()
@@ -8241,11 +8252,19 @@ def get_project(
         },
         "settings": {
             "workflow_profile": _normalize_workflow_profile(project.get("workflow_profile")),
+            "access_model": _normalize_project_access_model(project.get("access_model")),
             "agric_config": _normalize_agric_config(project.get("agric_config")),
             "relief_config": _normalize_relief_config(project.get("relief_config")),
             "planting_model": _normalize_planting_model(project.get("planting_model")),
             "allow_existing_tree_link": bool(project.get("allow_existing_tree_link")),
             "default_existing_tree_scope": _normalize_existing_tree_scope(project.get("default_existing_tree_scope")),
+            "public_sponsor_enabled": bool(project.get("public_sponsor_enabled")),
+            "sponsor_price_per_tree": project.get("sponsor_price_per_tree"),
+            "sponsor_currency": project.get("sponsor_currency"),
+            "sponsor_capacity": project.get("sponsor_capacity"),
+            "sponsor_max_per_order": project.get("sponsor_max_per_order"),
+            "sponsor_dedication_enabled": bool(project.get("sponsor_dedication_enabled", True)),
+            "sponsor_payment_instructions": project.get("sponsor_payment_instructions"),
         },
         "community": {
             "custodians_total": int(custodian_summary.get("total_custodians") or 0),
