@@ -327,6 +327,7 @@ class SponsorLoginPayload(BaseModel):
 
 
 class SponsorOrderPayload(BaseModel):
+    sponsor_id: int | None = None
     project_id: int
     quantity: int
     dedication_type: str | None = None
@@ -6636,9 +6637,11 @@ def sponsor_auth_login(payload: SponsorLoginPayload, db: Session = Depends(get_d
 def create_sponsor_order(
     payload: SponsorOrderPayload,
     request: Request,
-    sponsor_id: int = Body(..., embed=True),
     db: Session = Depends(get_db),
 ):
+    sponsor_id = int(payload.sponsor_id or 0)
+    if sponsor_id <= 0:
+        raise HTTPException(status_code=400, detail="Sponsor account is required")
     sponsor_row = db.execute(
         text("SELECT id, full_name, email, phone, is_active FROM green_sponsor_accounts WHERE id = :sponsor_id"),
         {"sponsor_id": int(sponsor_id)},
