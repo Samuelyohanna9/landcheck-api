@@ -7279,29 +7279,58 @@ def list_admin_sponsors(db: Session = Depends(get_db)):
 
 @router.get("/admin/sponsorship-orders")
 def list_admin_sponsorship_orders(project_id: int | None = Query(default=None), db: Session = Depends(get_db)):
-    rows = db.execute(
-        text(
-            """
-            SELECT
-                o.id, o.order_uid, o.project_id, o.quantity, o.amount_per_tree, o.amount_total, o.currency,
-                o.payment_method, o.payment_reference, o.payment_status, o.order_status,
-                o.payment_provider, o.payment_link, o.payment_gateway_reference, o.payment_gateway_transaction_id,
-                o.payment_gateway_status, o.payment_verified_at,
-                o.payment_proof_url, o.payment_proof_urls, o.dedication_type, o.dedication_name,
-                o.dedication_message, o.purchaser_note, o.reviewed_by, o.reviewed_at, o.review_notes,
-                o.created_at, o.updated_at,
-                sa.id AS sponsor_account_id, sa.full_name AS sponsor_name, sa.organization_name AS sponsor_organization_name,
-                sa.email AS sponsor_email, sa.account_type AS sponsor_account_type,
-                p.name AS project_name, p.location_text
-            FROM green_sponsorship_orders o
-            JOIN green_sponsor_accounts sa ON sa.id = o.sponsor_account_id
-            JOIN tree_projects p ON p.id = o.project_id
-            WHERE (:project_id IS NULL OR o.project_id = :project_id)
-            ORDER BY o.created_at DESC, o.id DESC
-            """
-        ),
-        {"project_id": int(project_id) if project_id is not None else None},
-    ).mappings().all()
+    query = text(
+        """
+        SELECT
+            o.id, o.order_uid, o.project_id, o.quantity, o.amount_per_tree, o.amount_total, o.currency,
+            o.payment_method, o.payment_reference, o.payment_status, o.order_status,
+            o.payment_provider, o.payment_link, o.payment_gateway_reference, o.payment_gateway_transaction_id,
+            o.payment_gateway_status, o.payment_verified_at,
+            o.payment_proof_url, o.payment_proof_urls, o.dedication_type, o.dedication_name,
+            o.dedication_message, o.purchaser_note, o.reviewed_by, o.reviewed_at, o.review_notes,
+            o.created_at, o.updated_at,
+            sa.id AS sponsor_account_id, sa.full_name AS sponsor_name, sa.organization_name AS sponsor_organization_name,
+            sa.email AS sponsor_email, sa.account_type AS sponsor_account_type,
+            p.name AS project_name, p.location_text
+        FROM green_sponsorship_orders o
+        JOIN green_sponsor_accounts sa ON sa.id = o.sponsor_account_id
+        JOIN tree_projects p ON p.id = o.project_id
+        WHERE (:project_id IS NULL OR o.project_id = :project_id)
+        ORDER BY o.created_at DESC, o.id DESC
+        """
+    )
+    query_params = {"project_id": int(project_id) if project_id is not None else None}
+    rows = db.execute(query, query_params).mappings().all()
+    refreshed_any = False
+    for row in rows:
+        item = dict(row)
+        if _normalize_name(item.get("payment_method")) != "flutterwave_standard":
+            continue
+        if _normalize_name(item.get("payment_status")) == "verified":
+            continue
+        transaction_id = int(item.get("payment_gateway_transaction_id") or 0) or None
+        gateway_reference = str(item.get("payment_gateway_reference") or item.get("order_uid") or "").strip()
+        if not transaction_id and not gateway_reference:
+            continue
+        try:
+            _sync_sponsorship_order_flutterwave_payment(
+                db,
+                item,
+                transaction_id=transaction_id,
+                tx_ref=gateway_reference,
+                actor="work_admin_sync",
+                review_notes="Synced while loading sponsorship orders in Work",
+            )
+            db.commit()
+            refreshed_any = True
+        except HTTPException:
+            db.rollback()
+            continue
+        except Exception:
+            db.rollback()
+            continue
+    if refreshed_any:
+        rows = db.execute(query, query_params).mappings().all()
     order_ids = [int(row["id"]) for row in rows]
     unit_counts: dict[int, dict[str, int]] = {}
     if order_ids:
