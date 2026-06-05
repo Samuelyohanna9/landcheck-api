@@ -2090,7 +2090,57 @@ def _apply_project_access_fields(payload: dict) -> dict:
     payload["public_sponsor_title"] = _clean_text(payload.get("public_sponsor_title"), 160)
     payload["public_sponsor_description"] = _clean_text(payload.get("public_sponsor_description"), 1200)
     payload["sponsor_payment_instructions"] = _clean_text(payload.get("sponsor_payment_instructions"), 1200)
+    payload["public_sponsor_agent_user_ids"] = _normalize_positive_int_list(payload.get("public_sponsor_agent_user_ids"))
     return payload
+
+
+def _normalize_positive_int_list(value: object) -> list[int]:
+    if value is None:
+        return []
+    items = value if isinstance(value, (list, tuple, set)) else []
+    seen: set[int] = set()
+    normalized: list[int] = []
+    for item in items:
+        try:
+            numeric = int(item)
+        except Exception:
+            continue
+        if numeric <= 0 or numeric in seen:
+            continue
+        seen.add(numeric)
+        normalized.append(numeric)
+    return normalized
+
+
+def _validate_public_sponsor_agent_user_ids(
+    db: Session,
+    *,
+    organization_id: int | None,
+    user_ids: list[int],
+) -> list[int]:
+    normalized = _normalize_positive_int_list(user_ids)
+    if not normalized:
+        return []
+    valid_rows = db.execute(
+        text(
+            """
+            SELECT id
+            FROM green_users
+            WHERE id IN :user_ids
+              AND COALESCE(is_active, TRUE) = TRUE
+              AND COALESCE(allow_green, TRUE) = TRUE
+              AND (:organization_id IS NULL OR organization_id = :organization_id)
+            """
+        ).bindparams(bindparam("user_ids", expanding=True)),
+        {"user_ids": normalized, "organization_id": organization_id},
+    ).scalars().all()
+    valid_ids = {int(row) for row in valid_rows}
+    if len(valid_ids) != len(normalized):
+        raise HTTPException(
+            status_code=400,
+            detail="Some selected sponsor agents are inactive, not Green-enabled, or outside this organization.",
+        )
+    return [user_id for user_id in normalized if user_id in valid_ids]
 
 
 def _normalize_custodian_profile_data(value: object) -> dict | None:
@@ -3864,6 +3914,7 @@ def ensure_green_tables(db: Session):
             sponsor_max_per_order INTEGER NOT NULL DEFAULT 100,
             sponsor_dedication_enabled BOOLEAN NOT NULL DEFAULT TRUE,
             sponsor_payment_instructions TEXT,
+            public_sponsor_agent_user_ids JSONB,
             agric_config JSONB,
             relief_config JSONB,
             planting_model TEXT NOT NULL DEFAULT 'direct',
@@ -4022,6 +4073,7 @@ def ensure_green_tables(db: Session):
         db.execute(text("ALTER TABLE tree_projects ADD COLUMN IF NOT EXISTS public_sponsor_enabled BOOLEAN NOT NULL DEFAULT FALSE"))
         db.execute(text("ALTER TABLE tree_projects ADD COLUMN IF NOT EXISTS public_sponsor_title TEXT"))
         db.execute(text("ALTER TABLE tree_projects ADD COLUMN IF NOT EXISTS public_sponsor_description TEXT"))
+        db.execute(text("ALTER TABLE tree_projects ADD COLUMN IF NOT EXISTS public_sponsor_agent_user_ids JSONB"))
         db.execute(text("ALTER TABLE tree_projects ADD COLUMN IF NOT EXISTS sponsor_price_per_tree NUMERIC"))
         db.execute(text("ALTER TABLE tree_projects ADD COLUMN IF NOT EXISTS sponsor_currency TEXT NOT NULL DEFAULT 'NGN'"))
         db.execute(text("ALTER TABLE tree_projects ADD COLUMN IF NOT EXISTS sponsor_capacity INTEGER"))
@@ -5825,6 +5877,7 @@ def create_project(
     sponsor_max_per_order: int = Body(default=100),
     sponsor_dedication_enabled: bool = Body(default=True),
     sponsor_payment_instructions: str | None = Body(default=None),
+    public_sponsor_agent_user_ids: list[int] | None = Body(default=None),
     agric_config: dict | None = Body(default=None),
     relief_config: dict | None = Body(default=None),
     planting_model: str = Body(default=DEFAULT_PLANTING_MODEL),
@@ -5854,13 +5907,22 @@ def create_project(
         ).scalar()
         if not org_exists:
             raise HTTPException(status_code=400, detail="Selected organization not found or inactive")
+    normalized_public_sponsor_agent_user_ids = (
+        _validate_public_sponsor_agent_user_ids(
+            db,
+            organization_id=org_id_value,
+            user_ids=public_sponsor_agent_user_ids or [],
+        )
+        if normalized_access_model == "public_sponsorship"
+        else []
+    )
     row = db.execute(
         text("""
             INSERT INTO tree_projects (
                 organization_id, name, location_text, sponsor, workflow_profile, access_model,
                 public_sponsor_enabled, public_sponsor_title, public_sponsor_description,
                 sponsor_price_per_tree, sponsor_currency, sponsor_capacity, sponsor_max_per_order,
-                sponsor_dedication_enabled, sponsor_payment_instructions,
+                sponsor_dedication_enabled, sponsor_payment_instructions, public_sponsor_agent_user_ids,
                 agric_config, relief_config,
                 planting_model, allow_existing_tree_link, default_existing_tree_scope
             )
@@ -5868,14 +5930,14 @@ def create_project(
                 :organization_id, :name, :location_text, :sponsor, :workflow_profile, :access_model,
                 :public_sponsor_enabled, :public_sponsor_title, :public_sponsor_description,
                 :sponsor_price_per_tree, :sponsor_currency, :sponsor_capacity, :sponsor_max_per_order,
-                :sponsor_dedication_enabled, :sponsor_payment_instructions,
+                :sponsor_dedication_enabled, :sponsor_payment_instructions, CAST(:public_sponsor_agent_user_ids AS JSONB),
                 CAST(:agric_config AS JSONB), CAST(:relief_config AS JSONB),
                 :planting_model, :allow_existing_tree_link, :default_existing_tree_scope
             )
             RETURNING id, organization_id, name, location_text, sponsor, workflow_profile, access_model,
                       public_sponsor_enabled, public_sponsor_title, public_sponsor_description,
                       sponsor_price_per_tree, sponsor_currency, sponsor_capacity, sponsor_max_per_order,
-                      sponsor_dedication_enabled, sponsor_payment_instructions,
+                      sponsor_dedication_enabled, sponsor_payment_instructions, public_sponsor_agent_user_ids,
                       agric_config, relief_config,
                       planting_model, allow_existing_tree_link, default_existing_tree_scope, created_at
         """),
@@ -5895,6 +5957,7 @@ def create_project(
             "sponsor_max_per_order": normalized_max_per_order,
             "sponsor_dedication_enabled": bool(sponsor_dedication_enabled),
             "sponsor_payment_instructions": normalized_payment_instructions,
+            "public_sponsor_agent_user_ids": _safe_json(normalized_public_sponsor_agent_user_ids),
             "agric_config": _safe_json(normalized_agric_config),
             "relief_config": _safe_json(normalized_relief_config),
             "planting_model": normalized_model,
@@ -6296,6 +6359,7 @@ def update_project_settings(
     sponsor_max_per_order: int | None = Body(default=None),
     sponsor_dedication_enabled: bool | None = Body(default=None),
     sponsor_payment_instructions: str | None = Body(default=None),
+    public_sponsor_agent_user_ids: list[int] | None = Body(default=None),
     agric_config: dict | None = Body(default=None),
     relief_config: dict | None = Body(default=None),
     planting_model: str | None = Body(default=None),
@@ -6307,7 +6371,7 @@ def update_project_settings(
             """
             SELECT id, workflow_profile, access_model, public_sponsor_enabled, public_sponsor_title, public_sponsor_description,
                    sponsor_price_per_tree, sponsor_currency, sponsor_capacity, sponsor_max_per_order,
-                   sponsor_dedication_enabled, sponsor_payment_instructions,
+                   sponsor_dedication_enabled, sponsor_payment_instructions, public_sponsor_agent_user_ids, organization_id,
                    agric_config, relief_config, planting_model, allow_existing_tree_link, default_existing_tree_scope
             FROM tree_projects
             WHERE id = :project_id
@@ -6373,6 +6437,19 @@ def update_project_settings(
         if sponsor_payment_instructions is not None
         else _clean_text(existing.get("sponsor_payment_instructions"), 1200)
     )
+    next_public_sponsor_agent_user_ids = (
+        _validate_public_sponsor_agent_user_ids(
+            db,
+            organization_id=int(existing.get("organization_id")) if existing.get("organization_id") is not None else None,
+            user_ids=public_sponsor_agent_user_ids,
+        )
+        if public_sponsor_agent_user_ids is not None and next_access_model == "public_sponsorship"
+        else (
+            _normalize_positive_int_list(existing.get("public_sponsor_agent_user_ids"))
+            if next_access_model == "public_sponsorship"
+            else []
+        )
+    )
     next_agric_config = (
         _normalize_agric_config(agric_config)
         if agric_config is not None
@@ -6410,6 +6487,7 @@ def update_project_settings(
                 sponsor_max_per_order = :sponsor_max_per_order,
                 sponsor_dedication_enabled = :sponsor_dedication_enabled,
                 sponsor_payment_instructions = :sponsor_payment_instructions,
+                public_sponsor_agent_user_ids = CAST(:public_sponsor_agent_user_ids AS JSONB),
                 agric_config = CAST(:agric_config AS JSONB),
                 relief_config = CAST(:relief_config AS JSONB),
                 planting_model = :planting_model,
@@ -6419,7 +6497,7 @@ def update_project_settings(
             RETURNING id, name, location_text, sponsor, workflow_profile, access_model,
                       public_sponsor_enabled, public_sponsor_title, public_sponsor_description,
                       sponsor_price_per_tree, sponsor_currency, sponsor_capacity, sponsor_max_per_order,
-                      sponsor_dedication_enabled, sponsor_payment_instructions,
+                      sponsor_dedication_enabled, sponsor_payment_instructions, public_sponsor_agent_user_ids,
                       agric_config, relief_config,
                       planting_model, allow_existing_tree_link, default_existing_tree_scope, created_at
             """
@@ -6437,6 +6515,7 @@ def update_project_settings(
             "sponsor_max_per_order": next_sponsor_max_per_order,
             "sponsor_dedication_enabled": next_sponsor_dedication_enabled,
             "sponsor_payment_instructions": next_sponsor_payment_instructions,
+            "public_sponsor_agent_user_ids": _safe_json(next_public_sponsor_agent_user_ids),
             "agric_config": _safe_json(next_agric_config),
             "relief_config": _safe_json(next_relief_config),
             "planting_model": next_model,
@@ -6462,6 +6541,7 @@ def update_project_settings(
                 "access_model": next_access_model,
                 "public_sponsor_enabled": next_public_sponsor_enabled,
                 "sponsor_price_per_tree": next_sponsor_price,
+                "public_sponsor_agent_user_ids": next_public_sponsor_agent_user_ids,
                 "agric_config": next_agric_config,
                 "relief_config": next_relief_config,
                 "planting_model": next_model,
@@ -7342,6 +7422,16 @@ def _list_admin_sponsorship_orders(db: Session, project_id: int | None = None, s
     )
     query_params = {"project_id": int(project_id) if project_id is not None else None}
     rows = db.execute(query, query_params).mappings().all()
+    deduped_rows: list[dict] = []
+    seen_order_ids: set[int] = set()
+    for row in rows:
+        order_id = int(row.get("id") or 0)
+        if order_id > 0 and order_id in seen_order_ids:
+            continue
+        if order_id > 0:
+            seen_order_ids.add(order_id)
+        deduped_rows.append(dict(row))
+    rows = deduped_rows
     refreshed_any = False
     if sync_gateway:
         for row in rows:
@@ -7372,8 +7462,17 @@ def _list_admin_sponsorship_orders(db: Session, project_id: int | None = None, s
                 db.rollback()
                 continue
     if refreshed_any:
-        rows = db.execute(query, query_params).mappings().all()
-    order_ids = [int(row["id"]) for row in rows]
+        refreshed_rows = db.execute(query, query_params).mappings().all()
+        rows = []
+        seen_order_ids = set()
+        for row in refreshed_rows:
+            order_id = int(row.get("id") or 0)
+            if order_id > 0 and order_id in seen_order_ids:
+                continue
+            if order_id > 0:
+                seen_order_ids.add(order_id)
+            rows.append(dict(row))
+    order_ids = [int(row["id"]) for row in rows if int(row.get("id") or 0) > 0]
     unit_counts: dict[int, dict[str, int]] = {}
     if order_ids:
         count_rows = db.execute(
@@ -8082,7 +8181,7 @@ def list_projects(
             p.id, p.organization_id, p.name, p.location_text, p.sponsor,
             p.access_model, p.public_sponsor_enabled, p.public_sponsor_title, p.public_sponsor_description,
             p.sponsor_price_per_tree, p.sponsor_currency, p.sponsor_capacity, p.sponsor_max_per_order,
-            p.sponsor_dedication_enabled, p.sponsor_payment_instructions,
+            p.sponsor_dedication_enabled, p.sponsor_payment_instructions, p.public_sponsor_agent_user_ids,
             p.workflow_profile, p.agric_config, p.relief_config,
             p.planting_model, p.allow_existing_tree_link, p.default_existing_tree_scope, p.created_at,
             o.name AS organization_name, o.slug AS organization_slug, o.status AS organization_status,
@@ -8139,7 +8238,7 @@ def get_project(
             p.id, p.organization_id, p.name, p.location_text, p.sponsor,
             p.access_model, p.public_sponsor_enabled, p.public_sponsor_title, p.public_sponsor_description,
             p.sponsor_price_per_tree, p.sponsor_currency, p.sponsor_capacity, p.sponsor_max_per_order,
-            p.sponsor_dedication_enabled, p.sponsor_payment_instructions,
+            p.sponsor_dedication_enabled, p.sponsor_payment_instructions, p.public_sponsor_agent_user_ids,
             p.workflow_profile, p.agric_config, p.relief_config,
             p.planting_model, p.allow_existing_tree_link, p.default_existing_tree_scope, p.created_at,
             o.name AS organization_name, o.slug AS organization_slug, o.status AS organization_status,
@@ -8302,6 +8401,7 @@ def get_project(
             "sponsor_max_per_order": project.get("sponsor_max_per_order"),
             "sponsor_dedication_enabled": bool(project.get("sponsor_dedication_enabled", True)),
             "sponsor_payment_instructions": project.get("sponsor_payment_instructions"),
+            "public_sponsor_agent_user_ids": _normalize_positive_int_list(project.get("public_sponsor_agent_user_ids")),
         },
         "community": {
             "custodians_total": int(custodian_summary.get("total_custodians") or 0),
