@@ -5592,14 +5592,36 @@ def _is_public_sponsorship_project(project: dict | None) -> bool:
     if not project:
         return False
     access_model = _normalize_project_access_model(project.get("access_model"))
-    if access_model != "public_sponsorship":
-        return False
-    if not bool(project.get("public_sponsor_enabled")):
+    return access_model == "public_sponsorship"
+
+
+def _is_sponsor_checkout_ready(project: dict | None, available_slots: int | None = None) -> bool:
+    if not _is_public_sponsorship_project(project):
         return False
     try:
-        return float(project.get("sponsor_price_per_tree") or 0) > 0
+        if float(project.get("sponsor_price_per_tree") or 0) <= 0:
+            return False
     except Exception:
         return False
+    capacity = project.get("sponsor_capacity")
+    if capacity is not None and available_slots is not None and int(available_slots) <= 0:
+        return False
+    return True
+
+
+def _build_sponsor_launch_note(project: dict | None, available_slots: int | None = None) -> str:
+    if not _is_public_sponsorship_project(project):
+        return "This project is not open for public sponsorship."
+    try:
+        price_ready = float(project.get("sponsor_price_per_tree") or 0) > 0
+    except Exception:
+        price_ready = False
+    if not price_ready:
+        return "This project is being prepared for sponsorship. Pricing and payment instructions will appear here shortly."
+    capacity = project.get("sponsor_capacity")
+    if capacity is not None and available_slots is not None and int(available_slots) <= 0:
+        return "All currently prepared sponsor slots have been reserved. More trees will open as new planting space is released."
+    return "Ready for sponsorship. Reserve trees now and follow verified updates as planting and maintenance happen."
 
 
 def _project_sponsorship_usage(db: Session, project_id: int) -> dict:
@@ -5630,13 +5652,17 @@ def _build_public_project_snapshot(project: dict, db: Session) -> dict:
     usage = _project_sponsorship_usage(db, int(payload.get("id") or 0))
     capacity = payload.get("sponsor_capacity")
     available_slots = None if capacity is None else max(int(capacity) - int(usage["reserved_slots"]), 0)
+    checkout_ready = _is_sponsor_checkout_ready(payload, available_slots)
     payload["public_title"] = payload.get("public_sponsor_title") or payload.get("name")
     payload["public_description"] = payload.get("public_sponsor_description") or payload.get("location_text") or ""
+    payload["public_sponsor_enabled"] = _is_public_sponsorship_project(payload)
     payload["slots_reserved"] = usage["reserved_slots"]
     payload["slots_awaiting_payment"] = usage["awaiting_payment_slots"]
     payload["slots_awaiting_tree"] = usage["awaiting_tree_slots"]
     payload["slots_linked"] = usage["linked_slots"]
     payload["slots_available"] = available_slots
+    payload["sponsor_checkout_ready"] = checkout_ready
+    payload["sponsor_launch_note"] = _build_sponsor_launch_note(payload, available_slots)
     return payload
 
 
@@ -6167,10 +6193,10 @@ def list_public_sponsorship_projects(db: Session = Depends(get_db)):
             FROM tree_projects p
             LEFT JOIN green_organizations o ON o.id = p.organization_id
             WHERE LOWER(COALESCE(p.access_model, 'partner_org')) = 'public_sponsorship'
-              AND COALESCE(p.public_sponsor_enabled, FALSE) = TRUE
-              AND COALESCE(p.sponsor_price_per_tree, 0) > 0
               AND (o.id IS NULL OR COALESCE(o.is_active, TRUE) = TRUE)
-            ORDER BY p.created_at DESC
+            ORDER BY
+                CASE WHEN COALESCE(p.sponsor_price_per_tree, 0) > 0 THEN 0 ELSE 1 END,
+                p.created_at DESC
             """
         )
     ).mappings().all()
@@ -6283,7 +6309,10 @@ def create_sponsor_order(
         raise HTTPException(status_code=409, detail="Not enough sponsorship slots remaining in this project")
     amount_per_tree = round(float(project.get("sponsor_price_per_tree") or 0), 2)
     if amount_per_tree <= 0:
-        raise HTTPException(status_code=400, detail="Tree sponsorship price is not configured")
+        raise HTTPException(
+            status_code=400,
+            detail="This sponsor project is visible, but pricing is still being finalized. Please try again after the project team updates payment details.",
+        )
     primary_proof_url, proof_urls = _merge_photo_evidence(payload.payment_proof_url, payload.payment_proof_urls)
     payment_reference = _clean_text(payload.payment_reference, 120)
     if not primary_proof_url and not payment_reference:
