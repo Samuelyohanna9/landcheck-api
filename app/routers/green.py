@@ -40,6 +40,7 @@ from app.utils.green_pdf import (
     render_green_custodian_report_pdf,
     render_green_existing_trees_report_pdf,
     render_green_org_credentials_pdf,
+    render_green_sponsor_certificate_pdf,
 )
 from app.utils.green_remote_monitoring import compute_remote_monitoring_report
 from app.utils.r2_exports import upload_export_file_best_effort, _build_export_r2_settings
@@ -115,6 +116,13 @@ EXISTING_TREE_SCOPE_VALUES = {"exclude_from_planting_kpi", "include_in_planting_
 DEFAULT_EXISTING_TREE_SCOPE = "exclude_from_planting_kpi"
 WORKFLOW_PROFILE_VALUES = {"green", "agric", "relief_recovery"}
 DEFAULT_WORKFLOW_PROFILE = "green"
+PROJECT_ACCESS_MODEL_VALUES = {"partner_org", "public_sponsorship"}
+DEFAULT_PROJECT_ACCESS_MODEL = "partner_org"
+SPONSOR_ACCOUNT_TYPE_VALUES = {"individual", "organization"}
+SPONSOR_PAYMENT_STATUS_VALUES = {"pending", "proof_submitted", "verified", "rejected", "refunded"}
+SPONSOR_ORDER_STATUS_VALUES = {"pending_payment", "payment_review", "paid", "allocated", "completed", "cancelled"}
+SPONSOR_UNIT_STATUS_VALUES = {"awaiting_payment", "awaiting_tree", "linked", "active", "replaced", "cancelled"}
+SPONSOR_DEDICATION_TYPE_VALUES = {"self", "memorial", "birthday", "celebration", "honor", "organization", "other"}
 AGRIC_PROGRAM_TYPE_VALUES = {
     "extension_support",
     "input_support",
@@ -299,6 +307,39 @@ class MobilePushTokenPayload(BaseModel):
 class MobilePushTokenDeactivatePayload(BaseModel):
     token: str
     user_id: int | None = None
+
+
+class SponsorSignupPayload(BaseModel):
+    account_type: str = "individual"
+    full_name: str
+    organization_name: str | None = None
+    email: str
+    phone: str | None = None
+    password: str
+
+
+class SponsorLoginPayload(BaseModel):
+    email: str
+    password: str
+
+
+class SponsorOrderPayload(BaseModel):
+    project_id: int
+    quantity: int
+    dedication_type: str | None = None
+    dedication_name: str | None = None
+    dedication_message: str | None = None
+    payment_method: str | None = None
+    payment_reference: str | None = None
+    payment_proof_url: str | None = None
+    payment_proof_urls: list[str] | None = None
+    purchaser_note: str | None = None
+
+
+class SponsorOrderReviewPayload(BaseModel):
+    payment_status: str
+    reviewer_name: str | None = None
+    review_notes: str | None = None
 
 
 def _normalize_privacy_scope(value: str | None) -> str:
@@ -649,6 +690,38 @@ def _ensure_unique_user_uid(db: Session, candidate: str | None = None, exclude_u
         value = _generate_prefixed_uid("USR")
 
 
+def _ensure_unique_sponsor_uid(db: Session, candidate: str | None = None, exclude_sponsor_id: int | None = None) -> str:
+    base = (candidate or "").strip().upper()
+    if not base:
+        base = _generate_prefixed_uid("SPN")
+    if not re.fullmatch(r"[A-Z0-9][A-Z0-9._-]{2,63}", base):
+        base = re.sub(r"[^A-Z0-9._-]+", "-", base.upper()).strip("-")
+        if not base:
+            base = _generate_prefixed_uid("SPN")
+    value = base
+    while True:
+        if exclude_sponsor_id is None:
+            found = db.execute(
+                text("SELECT id FROM green_sponsor_accounts WHERE UPPER(COALESCE(sponsor_uid, '')) = :uid LIMIT 1"),
+                {"uid": value},
+            ).first()
+        else:
+            found = db.execute(
+                text(
+                    """
+                    SELECT id FROM green_sponsor_accounts
+                    WHERE UPPER(COALESCE(sponsor_uid, '')) = :uid
+                      AND id <> :sponsor_id
+                    LIMIT 1
+                    """
+                ),
+                {"uid": value, "sponsor_id": int(exclude_sponsor_id)},
+            ).first()
+        if not found:
+            return value
+        value = _generate_prefixed_uid("SPN")
+
+
 def _ensure_unique_role_uid(db: Session, candidate: str | None = None, exclude_role_id: int | None = None) -> str:
     base = (candidate or "").strip().upper()
     if not base:
@@ -737,6 +810,13 @@ def _generate_temporary_login_password(length: int = 12) -> str:
     alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789"
     size = max(8, int(length or 12))
     return "".join(secrets.choice(alphabet) for _ in range(size))
+
+
+def _normalize_email_address(value: str | None) -> str:
+    email = str(value or "").strip().lower()
+    if not email or "@" not in email or "." not in email.split("@")[-1]:
+        raise HTTPException(status_code=400, detail="Valid email address required")
+    return email
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -1514,6 +1594,13 @@ def _normalize_workflow_profile(value: str | None) -> str:
     return DEFAULT_WORKFLOW_PROFILE
 
 
+def _normalize_project_access_model(value: str | None) -> str:
+    normalized = _normalize_name(value)
+    if normalized in PROJECT_ACCESS_MODEL_VALUES:
+        return normalized
+    return DEFAULT_PROJECT_ACCESS_MODEL
+
+
 def _is_agric_workflow_profile(value: str | None) -> bool:
     return _normalize_workflow_profile(value) == "agric"
 
@@ -1605,6 +1692,67 @@ def _normalize_relief_config(value: object) -> dict | None:
     if target_zone:
         normalized["target_zone"] = target_zone
     return normalized or None
+
+
+def _normalize_sponsor_account_type(value: str | None) -> str:
+    normalized = _normalize_name(value)
+    if normalized in SPONSOR_ACCOUNT_TYPE_VALUES:
+        return normalized
+    return "individual"
+
+
+def _normalize_sponsor_payment_status(value: str | None) -> str:
+    normalized = _normalize_name(value)
+    if normalized in SPONSOR_PAYMENT_STATUS_VALUES:
+        return normalized
+    return "pending"
+
+
+def _normalize_sponsor_order_status(value: str | None) -> str:
+    normalized = _normalize_name(value)
+    if normalized in SPONSOR_ORDER_STATUS_VALUES:
+        return normalized
+    return "pending_payment"
+
+
+def _normalize_sponsor_unit_status(value: str | None) -> str:
+    normalized = _normalize_name(value)
+    if normalized in SPONSOR_UNIT_STATUS_VALUES:
+        return normalized
+    return "awaiting_payment"
+
+
+def _normalize_sponsor_dedication_type(value: str | None) -> str:
+    normalized = _normalize_name(value)
+    if normalized in SPONSOR_DEDICATION_TYPE_VALUES:
+        return normalized
+    return "self"
+
+
+def _apply_project_access_fields(payload: dict) -> dict:
+    payload["access_model"] = _normalize_project_access_model(payload.get("access_model"))
+    payload["public_sponsor_enabled"] = bool(payload.get("public_sponsor_enabled"))
+    price_value = payload.get("sponsor_price_per_tree")
+    try:
+        payload["sponsor_price_per_tree"] = round(float(price_value), 2) if price_value is not None else None
+    except Exception:
+        payload["sponsor_price_per_tree"] = None
+    capacity_value = payload.get("sponsor_capacity")
+    try:
+        payload["sponsor_capacity"] = int(capacity_value) if capacity_value is not None else None
+    except Exception:
+        payload["sponsor_capacity"] = None
+    max_per_order = payload.get("sponsor_max_per_order")
+    try:
+        payload["sponsor_max_per_order"] = max(1, int(max_per_order or 100))
+    except Exception:
+        payload["sponsor_max_per_order"] = 100
+    payload["sponsor_currency"] = (str(payload.get("sponsor_currency") or "NGN").strip().upper() or "NGN")[:8]
+    payload["sponsor_dedication_enabled"] = bool(payload.get("sponsor_dedication_enabled", True))
+    payload["public_sponsor_title"] = _clean_text(payload.get("public_sponsor_title"), 160)
+    payload["public_sponsor_description"] = _clean_text(payload.get("public_sponsor_description"), 1200)
+    payload["sponsor_payment_instructions"] = _clean_text(payload.get("sponsor_payment_instructions"), 1200)
+    return payload
 
 
 def _normalize_custodian_profile_data(value: object) -> dict | None:
@@ -3368,6 +3516,16 @@ def ensure_green_tables(db: Session):
             location_text TEXT,
             sponsor TEXT,
             workflow_profile TEXT NOT NULL DEFAULT 'green',
+            access_model TEXT NOT NULL DEFAULT 'partner_org',
+            public_sponsor_enabled BOOLEAN NOT NULL DEFAULT FALSE,
+            public_sponsor_title TEXT,
+            public_sponsor_description TEXT,
+            sponsor_price_per_tree NUMERIC,
+            sponsor_currency TEXT NOT NULL DEFAULT 'NGN',
+            sponsor_capacity INTEGER,
+            sponsor_max_per_order INTEGER NOT NULL DEFAULT 100,
+            sponsor_dedication_enabled BOOLEAN NOT NULL DEFAULT TRUE,
+            sponsor_payment_instructions TEXT,
             agric_config JSONB,
             relief_config JSONB,
             planting_model TEXT NOT NULL DEFAULT 'direct',
@@ -3440,6 +3598,21 @@ def ensure_green_tables(db: Session):
         )
     """))
     db.execute(text("""
+        CREATE TABLE IF NOT EXISTS green_sponsor_accounts (
+            id SERIAL PRIMARY KEY,
+            sponsor_uid TEXT,
+            account_type TEXT NOT NULL DEFAULT 'individual',
+            full_name TEXT NOT NULL,
+            organization_name TEXT,
+            email TEXT NOT NULL,
+            phone TEXT,
+            password_hash TEXT NOT NULL,
+            is_active BOOLEAN NOT NULL DEFAULT TRUE,
+            created_at TIMESTAMP DEFAULT NOW(),
+            updated_at TIMESTAMP DEFAULT NOW()
+        )
+    """))
+    db.execute(text("""
         CREATE TABLE IF NOT EXISTS green_push_tokens (
             id SERIAL PRIMARY KEY,
             user_id INTEGER NOT NULL REFERENCES green_users(id) ON DELETE CASCADE,
@@ -3482,6 +3655,12 @@ def ensure_green_tables(db: Session):
         db.execute(text("ALTER TABLE green_users ADD COLUMN IF NOT EXISTS notes TEXT"))
         db.execute(text("ALTER TABLE green_users ADD COLUMN IF NOT EXISTS is_active BOOLEAN NOT NULL DEFAULT TRUE"))
         db.execute(text("ALTER TABLE green_users ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW()"))
+        db.execute(text("ALTER TABLE green_sponsor_accounts ADD COLUMN IF NOT EXISTS sponsor_uid TEXT"))
+        db.execute(text("ALTER TABLE green_sponsor_accounts ADD COLUMN IF NOT EXISTS account_type TEXT NOT NULL DEFAULT 'individual'"))
+        db.execute(text("ALTER TABLE green_sponsor_accounts ADD COLUMN IF NOT EXISTS organization_name TEXT"))
+        db.execute(text("ALTER TABLE green_sponsor_accounts ADD COLUMN IF NOT EXISTS phone TEXT"))
+        db.execute(text("ALTER TABLE green_sponsor_accounts ADD COLUMN IF NOT EXISTS is_active BOOLEAN NOT NULL DEFAULT TRUE"))
+        db.execute(text("ALTER TABLE green_sponsor_accounts ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW()"))
         db.execute(text("ALTER TABLE green_push_tokens ADD COLUMN IF NOT EXISTS organization_id INTEGER"))
         db.execute(text("ALTER TABLE green_push_tokens ADD COLUMN IF NOT EXISTS platform TEXT"))
         db.execute(text("ALTER TABLE green_push_tokens ADD COLUMN IF NOT EXISTS app_version TEXT"))
@@ -3501,6 +3680,16 @@ def ensure_green_tables(db: Session):
         db.execute(text("ALTER TABLE green_roles ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW()"))
         db.execute(text("ALTER TABLE tree_projects ADD COLUMN IF NOT EXISTS organization_id INTEGER"))
         db.execute(text("ALTER TABLE tree_projects ADD COLUMN IF NOT EXISTS workflow_profile TEXT NOT NULL DEFAULT 'green'"))
+        db.execute(text("ALTER TABLE tree_projects ADD COLUMN IF NOT EXISTS access_model TEXT NOT NULL DEFAULT 'partner_org'"))
+        db.execute(text("ALTER TABLE tree_projects ADD COLUMN IF NOT EXISTS public_sponsor_enabled BOOLEAN NOT NULL DEFAULT FALSE"))
+        db.execute(text("ALTER TABLE tree_projects ADD COLUMN IF NOT EXISTS public_sponsor_title TEXT"))
+        db.execute(text("ALTER TABLE tree_projects ADD COLUMN IF NOT EXISTS public_sponsor_description TEXT"))
+        db.execute(text("ALTER TABLE tree_projects ADD COLUMN IF NOT EXISTS sponsor_price_per_tree NUMERIC"))
+        db.execute(text("ALTER TABLE tree_projects ADD COLUMN IF NOT EXISTS sponsor_currency TEXT NOT NULL DEFAULT 'NGN'"))
+        db.execute(text("ALTER TABLE tree_projects ADD COLUMN IF NOT EXISTS sponsor_capacity INTEGER"))
+        db.execute(text("ALTER TABLE tree_projects ADD COLUMN IF NOT EXISTS sponsor_max_per_order INTEGER NOT NULL DEFAULT 100"))
+        db.execute(text("ALTER TABLE tree_projects ADD COLUMN IF NOT EXISTS sponsor_dedication_enabled BOOLEAN NOT NULL DEFAULT TRUE"))
+        db.execute(text("ALTER TABLE tree_projects ADD COLUMN IF NOT EXISTS sponsor_payment_instructions TEXT"))
         db.execute(text("ALTER TABLE tree_projects ADD COLUMN IF NOT EXISTS agric_config JSONB"))
         db.execute(text("ALTER TABLE tree_projects ADD COLUMN IF NOT EXISTS relief_config JSONB"))
         db.execute(text("ALTER TABLE tree_projects ADD COLUMN IF NOT EXISTS planting_model TEXT NOT NULL DEFAULT 'direct'"))
@@ -3718,6 +3907,73 @@ def ensure_green_tables(db: Session):
                 "ALTER TABLE green_work_orders ADD COLUMN IF NOT EXISTS allow_existing_tree_area_reuse BOOLEAN NOT NULL DEFAULT FALSE"
             )
         )
+    except Exception:
+        db.rollback()
+    db.execute(text("""
+        CREATE TABLE IF NOT EXISTS green_sponsorship_orders (
+            id SERIAL PRIMARY KEY,
+            order_uid TEXT NOT NULL,
+            sponsor_account_id INTEGER NOT NULL REFERENCES green_sponsor_accounts(id) ON DELETE CASCADE,
+            project_id INTEGER NOT NULL REFERENCES tree_projects(id) ON DELETE CASCADE,
+            quantity INTEGER NOT NULL DEFAULT 1,
+            amount_per_tree NUMERIC NOT NULL DEFAULT 0,
+            amount_total NUMERIC NOT NULL DEFAULT 0,
+            currency TEXT NOT NULL DEFAULT 'NGN',
+            payment_method TEXT,
+            payment_reference TEXT,
+            payment_status TEXT NOT NULL DEFAULT 'pending',
+            order_status TEXT NOT NULL DEFAULT 'pending_payment',
+            payment_proof_url TEXT,
+            payment_proof_urls JSONB,
+            dedication_type TEXT,
+            dedication_name TEXT,
+            dedication_message TEXT,
+            purchaser_note TEXT,
+            reviewed_by TEXT,
+            reviewed_at TIMESTAMP,
+            review_notes TEXT,
+            created_at TIMESTAMP DEFAULT NOW(),
+            updated_at TIMESTAMP DEFAULT NOW()
+        )
+    """))
+    db.execute(text("""
+        CREATE TABLE IF NOT EXISTS green_sponsorship_units (
+            id SERIAL PRIMARY KEY,
+            unit_uid TEXT NOT NULL,
+            order_id INTEGER NOT NULL REFERENCES green_sponsorship_orders(id) ON DELETE CASCADE,
+            sponsor_account_id INTEGER NOT NULL REFERENCES green_sponsor_accounts(id) ON DELETE CASCADE,
+            project_id INTEGER NOT NULL REFERENCES tree_projects(id) ON DELETE CASCADE,
+            tree_id INTEGER REFERENCES trees(id) ON DELETE SET NULL,
+            tree_project_no INTEGER,
+            sponsorship_status TEXT NOT NULL DEFAULT 'awaiting_payment',
+            dedication_type TEXT,
+            dedication_name TEXT,
+            dedication_message TEXT,
+            linked_at TIMESTAMP,
+            last_certificate_at TIMESTAMP,
+            created_at TIMESTAMP DEFAULT NOW(),
+            updated_at TIMESTAMP DEFAULT NOW()
+        )
+    """))
+    try:
+        db.execute(text("ALTER TABLE green_sponsorship_orders ADD COLUMN IF NOT EXISTS order_uid TEXT"))
+        db.execute(text("ALTER TABLE green_sponsorship_orders ADD COLUMN IF NOT EXISTS payment_proof_urls JSONB"))
+        db.execute(text("ALTER TABLE green_sponsorship_orders ADD COLUMN IF NOT EXISTS dedication_type TEXT"))
+        db.execute(text("ALTER TABLE green_sponsorship_orders ADD COLUMN IF NOT EXISTS dedication_name TEXT"))
+        db.execute(text("ALTER TABLE green_sponsorship_orders ADD COLUMN IF NOT EXISTS dedication_message TEXT"))
+        db.execute(text("ALTER TABLE green_sponsorship_orders ADD COLUMN IF NOT EXISTS purchaser_note TEXT"))
+        db.execute(text("ALTER TABLE green_sponsorship_orders ADD COLUMN IF NOT EXISTS reviewed_by TEXT"))
+        db.execute(text("ALTER TABLE green_sponsorship_orders ADD COLUMN IF NOT EXISTS reviewed_at TIMESTAMP"))
+        db.execute(text("ALTER TABLE green_sponsorship_orders ADD COLUMN IF NOT EXISTS review_notes TEXT"))
+        db.execute(text("ALTER TABLE green_sponsorship_orders ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW()"))
+        db.execute(text("ALTER TABLE green_sponsorship_units ADD COLUMN IF NOT EXISTS unit_uid TEXT"))
+        db.execute(text("ALTER TABLE green_sponsorship_units ADD COLUMN IF NOT EXISTS tree_project_no INTEGER"))
+        db.execute(text("ALTER TABLE green_sponsorship_units ADD COLUMN IF NOT EXISTS dedication_type TEXT"))
+        db.execute(text("ALTER TABLE green_sponsorship_units ADD COLUMN IF NOT EXISTS dedication_name TEXT"))
+        db.execute(text("ALTER TABLE green_sponsorship_units ADD COLUMN IF NOT EXISTS dedication_message TEXT"))
+        db.execute(text("ALTER TABLE green_sponsorship_units ADD COLUMN IF NOT EXISTS linked_at TIMESTAMP"))
+        db.execute(text("ALTER TABLE green_sponsorship_units ADD COLUMN IF NOT EXISTS last_certificate_at TIMESTAMP"))
+        db.execute(text("ALTER TABLE green_sponsorship_units ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW()"))
     except Exception:
         db.rollback()
     db.execute(text("""
@@ -3952,6 +4208,8 @@ def ensure_green_tables(db: Session):
     db.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS idx_green_users_work_username ON green_users(LOWER(work_username))"))
     db.execute(text("CREATE INDEX IF NOT EXISTS idx_green_users_org ON green_users(organization_id)"))
     db.execute(text("CREATE INDEX IF NOT EXISTS idx_green_users_role_id ON green_users(role_id)"))
+    db.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS idx_green_sponsors_uid ON green_sponsor_accounts(UPPER(sponsor_uid))"))
+    db.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS idx_green_sponsors_email ON green_sponsor_accounts(LOWER(email))"))
     db.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS idx_green_push_tokens_token ON green_push_tokens(expo_push_token)"))
     db.execute(text("CREATE INDEX IF NOT EXISTS idx_green_push_tokens_user ON green_push_tokens(user_id, is_active)"))
     db.execute(text("CREATE INDEX IF NOT EXISTS idx_green_push_tokens_org ON green_push_tokens(organization_id, is_active)"))
@@ -3980,6 +4238,7 @@ def ensure_green_tables(db: Session):
     db.execute(text("CREATE INDEX IF NOT EXISTS idx_green_remote_monitoring_project_created ON green_remote_monitoring_areas(project_id, created_at DESC)"))
     db.execute(text("CREATE INDEX IF NOT EXISTS idx_tree_projects_model ON tree_projects(planting_model)"))
     db.execute(text("CREATE INDEX IF NOT EXISTS idx_tree_projects_workflow_profile ON tree_projects(workflow_profile)"))
+    db.execute(text("CREATE INDEX IF NOT EXISTS idx_tree_projects_access_model ON tree_projects(access_model, public_sponsor_enabled)"))
     db.execute(text("CREATE INDEX IF NOT EXISTS idx_tree_projects_org ON tree_projects(organization_id)"))
     db.execute(text("CREATE INDEX IF NOT EXISTS idx_trees_origin ON trees(tree_origin)"))
     db.execute(text("CREATE INDEX IF NOT EXISTS idx_trees_scope_flags ON trees(project_id, count_in_planting_kpis, count_in_carbon_scope)"))
@@ -3989,6 +4248,14 @@ def ensure_green_tables(db: Session):
     db.execute(text("CREATE INDEX IF NOT EXISTS idx_dist_events_project ON green_distribution_events(project_id, event_date DESC)"))
     db.execute(text("CREATE INDEX IF NOT EXISTS idx_dist_alloc_project ON green_distribution_allocations(project_id, created_at DESC)"))
     db.execute(text("CREATE INDEX IF NOT EXISTS idx_dist_alloc_custodian ON green_distribution_allocations(custodian_id, created_at DESC)"))
+    db.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS idx_sponsor_orders_uid ON green_sponsorship_orders(UPPER(order_uid))"))
+    db.execute(text("CREATE INDEX IF NOT EXISTS idx_sponsor_orders_project_created ON green_sponsorship_orders(project_id, created_at DESC)"))
+    db.execute(text("CREATE INDEX IF NOT EXISTS idx_sponsor_orders_sponsor_created ON green_sponsorship_orders(sponsor_account_id, created_at DESC)"))
+    db.execute(text("CREATE INDEX IF NOT EXISTS idx_sponsor_orders_payment_status ON green_sponsorship_orders(payment_status, created_at DESC)"))
+    db.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS idx_sponsor_units_uid ON green_sponsorship_units(UPPER(unit_uid))"))
+    db.execute(text("CREATE INDEX IF NOT EXISTS idx_sponsor_units_project_status ON green_sponsorship_units(project_id, sponsorship_status, created_at DESC)"))
+    db.execute(text("CREATE INDEX IF NOT EXISTS idx_sponsor_units_sponsor_status ON green_sponsorship_units(sponsor_account_id, sponsorship_status, created_at DESC)"))
+    db.execute(text("CREATE INDEX IF NOT EXISTS idx_sponsor_units_tree ON green_sponsorship_units(tree_id)"))
     db.execute(text("CREATE INDEX IF NOT EXISTS idx_tree_project_links_target ON tree_project_links(target_project_id, created_at DESC)"))
     for role_key, role_name, is_system in [
         ("admin", "Admin", True),
@@ -5194,6 +5461,16 @@ def create_project(
     sponsor: str = Body(default=""),
     organization_id: int | None = Body(default=None),
     workflow_profile: str = Body(default=DEFAULT_WORKFLOW_PROFILE),
+    access_model: str = Body(default=DEFAULT_PROJECT_ACCESS_MODEL),
+    public_sponsor_enabled: bool = Body(default=False),
+    public_sponsor_title: str | None = Body(default=None),
+    public_sponsor_description: str | None = Body(default=None),
+    sponsor_price_per_tree: float | None = Body(default=None),
+    sponsor_currency: str = Body(default="NGN"),
+    sponsor_capacity: int | None = Body(default=None),
+    sponsor_max_per_order: int = Body(default=100),
+    sponsor_dedication_enabled: bool = Body(default=True),
+    sponsor_payment_instructions: str | None = Body(default=None),
     agric_config: dict | None = Body(default=None),
     relief_config: dict | None = Body(default=None),
     planting_model: str = Body(default=DEFAULT_PLANTING_MODEL),
@@ -5201,10 +5478,18 @@ def create_project(
     default_existing_tree_scope: str = Body(default=DEFAULT_EXISTING_TREE_SCOPE),
 ):
     normalized_workflow_profile = _normalize_workflow_profile(workflow_profile)
+    normalized_access_model = _normalize_project_access_model(access_model)
     normalized_agric_config = _normalize_agric_config(agric_config)
     normalized_relief_config = _normalize_relief_config(relief_config)
     normalized_model = _normalize_planting_model(planting_model)
     normalized_existing_scope = _normalize_existing_tree_scope(default_existing_tree_scope)
+    normalized_public_title = _clean_text(public_sponsor_title, 160)
+    normalized_public_description = _clean_text(public_sponsor_description, 1200)
+    normalized_price = round(float(sponsor_price_per_tree), 2) if sponsor_price_per_tree is not None else None
+    normalized_currency = (str(sponsor_currency or "NGN").strip().upper() or "NGN")[:8]
+    normalized_capacity = int(sponsor_capacity) if sponsor_capacity is not None else None
+    normalized_max_per_order = max(1, int(sponsor_max_per_order or 100))
+    normalized_payment_instructions = _clean_text(sponsor_payment_instructions, 1200)
     org_id_value = int(organization_id) if organization_id is not None else None
     if org_id_value is not None and org_id_value <= 0:
         org_id_value = None
@@ -5218,14 +5503,26 @@ def create_project(
     row = db.execute(
         text("""
             INSERT INTO tree_projects (
-                organization_id, name, location_text, sponsor, workflow_profile, agric_config, relief_config,
+                organization_id, name, location_text, sponsor, workflow_profile, access_model,
+                public_sponsor_enabled, public_sponsor_title, public_sponsor_description,
+                sponsor_price_per_tree, sponsor_currency, sponsor_capacity, sponsor_max_per_order,
+                sponsor_dedication_enabled, sponsor_payment_instructions,
+                agric_config, relief_config,
                 planting_model, allow_existing_tree_link, default_existing_tree_scope
             )
             VALUES (
-                :organization_id, :name, :location_text, :sponsor, :workflow_profile, CAST(:agric_config AS JSONB), CAST(:relief_config AS JSONB),
+                :organization_id, :name, :location_text, :sponsor, :workflow_profile, :access_model,
+                :public_sponsor_enabled, :public_sponsor_title, :public_sponsor_description,
+                :sponsor_price_per_tree, :sponsor_currency, :sponsor_capacity, :sponsor_max_per_order,
+                :sponsor_dedication_enabled, :sponsor_payment_instructions,
+                CAST(:agric_config AS JSONB), CAST(:relief_config AS JSONB),
                 :planting_model, :allow_existing_tree_link, :default_existing_tree_scope
             )
-            RETURNING id, organization_id, name, location_text, sponsor, workflow_profile, agric_config, relief_config,
+            RETURNING id, organization_id, name, location_text, sponsor, workflow_profile, access_model,
+                      public_sponsor_enabled, public_sponsor_title, public_sponsor_description,
+                      sponsor_price_per_tree, sponsor_currency, sponsor_capacity, sponsor_max_per_order,
+                      sponsor_dedication_enabled, sponsor_payment_instructions,
+                      agric_config, relief_config,
                       planting_model, allow_existing_tree_link, default_existing_tree_scope, created_at
         """),
         {
@@ -5234,6 +5531,16 @@ def create_project(
             "location_text": location_text,
             "sponsor": sponsor,
             "workflow_profile": normalized_workflow_profile,
+            "access_model": normalized_access_model,
+            "public_sponsor_enabled": bool(public_sponsor_enabled),
+            "public_sponsor_title": normalized_public_title,
+            "public_sponsor_description": normalized_public_description,
+            "sponsor_price_per_tree": normalized_price,
+            "sponsor_currency": normalized_currency,
+            "sponsor_capacity": normalized_capacity,
+            "sponsor_max_per_order": normalized_max_per_order,
+            "sponsor_dedication_enabled": bool(sponsor_dedication_enabled),
+            "sponsor_payment_instructions": normalized_payment_instructions,
             "agric_config": _safe_json(normalized_agric_config),
             "relief_config": _safe_json(normalized_relief_config),
             "planting_model": normalized_model,
@@ -5245,6 +5552,7 @@ def create_project(
     project["workflow_profile"] = _normalize_workflow_profile(project.get("workflow_profile"))
     project["agric_config"] = _normalize_agric_config(project.get("agric_config"))
     project["relief_config"] = _normalize_relief_config(project.get("relief_config"))
+    project = _apply_project_access_fields(project)
     _log_audit_event(
         db,
         project_id=project["id"],
@@ -5256,6 +5564,9 @@ def create_project(
             "location_text": project.get("location_text"),
             "organization_id": project.get("organization_id"),
             "workflow_profile": project.get("workflow_profile"),
+            "access_model": project.get("access_model"),
+            "public_sponsor_enabled": project.get("public_sponsor_enabled"),
+            "sponsor_price_per_tree": project.get("sponsor_price_per_tree"),
             "agric_config": project.get("agric_config"),
             "relief_config": project.get("relief_config"),
             "planting_model": project.get("planting_model"),
@@ -5275,6 +5586,212 @@ def create_project(
             project["organization_logo_url"] = _normalize_logo_asset_path(org_meta.get("logo_url"))
     db.commit()
     return project
+
+
+def _is_public_sponsorship_project(project: dict | None) -> bool:
+    if not project:
+        return False
+    access_model = _normalize_project_access_model(project.get("access_model"))
+    if access_model != "public_sponsorship":
+        return False
+    if not bool(project.get("public_sponsor_enabled")):
+        return False
+    try:
+        return float(project.get("sponsor_price_per_tree") or 0) > 0
+    except Exception:
+        return False
+
+
+def _project_sponsorship_usage(db: Session, project_id: int) -> dict:
+    row = db.execute(
+        text(
+            """
+            SELECT
+                COUNT(*) FILTER (WHERE LOWER(COALESCE(sponsorship_status, '')) <> 'cancelled') AS reserved_slots,
+                COUNT(*) FILTER (WHERE LOWER(COALESCE(sponsorship_status, '')) = 'awaiting_payment') AS awaiting_payment_slots,
+                COUNT(*) FILTER (WHERE LOWER(COALESCE(sponsorship_status, '')) = 'awaiting_tree') AS awaiting_tree_slots,
+                COUNT(*) FILTER (WHERE LOWER(COALESCE(sponsorship_status, '')) IN ('linked', 'active', 'replaced')) AS linked_slots
+            FROM green_sponsorship_units
+            WHERE project_id = :project_id
+            """
+        ),
+        {"project_id": int(project_id)},
+    ).mappings().first() or {}
+    return {
+        "reserved_slots": int(row.get("reserved_slots") or 0),
+        "awaiting_payment_slots": int(row.get("awaiting_payment_slots") or 0),
+        "awaiting_tree_slots": int(row.get("awaiting_tree_slots") or 0),
+        "linked_slots": int(row.get("linked_slots") or 0),
+    }
+
+
+def _build_public_project_snapshot(project: dict, db: Session) -> dict:
+    payload = _apply_project_access_fields(dict(project))
+    usage = _project_sponsorship_usage(db, int(payload.get("id") or 0))
+    capacity = payload.get("sponsor_capacity")
+    available_slots = None if capacity is None else max(int(capacity) - int(usage["reserved_slots"]), 0)
+    payload["public_title"] = payload.get("public_sponsor_title") or payload.get("name")
+    payload["public_description"] = payload.get("public_sponsor_description") or payload.get("location_text") or ""
+    payload["slots_reserved"] = usage["reserved_slots"]
+    payload["slots_awaiting_payment"] = usage["awaiting_payment_slots"]
+    payload["slots_awaiting_tree"] = usage["awaiting_tree_slots"]
+    payload["slots_linked"] = usage["linked_slots"]
+    payload["slots_available"] = available_slots
+    return payload
+
+
+def _serialize_sponsor_account(row: dict) -> dict:
+    return {
+        "id": int(row.get("id") or 0),
+        "sponsor_uid": str(row.get("sponsor_uid") or "").strip() or None,
+        "full_name": str(row.get("full_name") or "").strip(),
+        "account_type": _normalize_sponsor_account_type(row.get("account_type")),
+        "organization_name": str(row.get("organization_name") or "").strip() or None,
+        "email": str(row.get("email") or "").strip().lower(),
+        "phone": str(row.get("phone") or "").strip() or None,
+        "is_active": bool(row.get("is_active", True)),
+    }
+
+
+def _build_sponsor_auth_payload(row: dict) -> dict:
+    account = _serialize_sponsor_account(row)
+    return {
+        "ok": True,
+        "auth_mode": "sponsor_user",
+        "user": {
+            "id": account["id"],
+            "user_uid": account["sponsor_uid"],
+            "full_name": account["full_name"],
+            "role": "sponsor",
+            "role_key": "sponsor",
+            "role_name": "Sponsor",
+            "allow_work": False,
+            "allow_green": True,
+            "organization_id": None,
+            "organization_name": account["organization_name"],
+            "organization_slug": None,
+            "organization_status": "active",
+            "organization_is_active": True,
+            "organization_logo_url": None,
+            "email": account["email"],
+            "phone": account["phone"],
+            "account_type": account["account_type"],
+            "sponsor_uid": account["sponsor_uid"],
+        },
+    }
+
+
+def _refresh_sponsorship_order_status(db: Session, order_id: int):
+    counts = db.execute(
+        text(
+            """
+            SELECT
+                COUNT(*) AS total_units,
+                COUNT(*) FILTER (WHERE tree_id IS NOT NULL) AS linked_units,
+                COUNT(*) FILTER (WHERE LOWER(COALESCE(sponsorship_status, '')) = 'awaiting_payment') AS awaiting_payment_units
+            FROM green_sponsorship_units
+            WHERE order_id = :order_id
+            """
+        ),
+        {"order_id": int(order_id)},
+    ).mappings().first() or {}
+    order_row = db.execute(
+        text("SELECT id, payment_status, order_status FROM green_sponsorship_orders WHERE id = :order_id"),
+        {"order_id": int(order_id)},
+    ).mappings().first()
+    if not order_row:
+        return
+    payment_status = _normalize_sponsor_payment_status(order_row.get("payment_status"))
+    total_units = int(counts.get("total_units") or 0)
+    linked_units = int(counts.get("linked_units") or 0)
+    awaiting_payment_units = int(counts.get("awaiting_payment_units") or 0)
+    next_status = _normalize_sponsor_order_status(order_row.get("order_status"))
+    if payment_status in {"pending", "rejected"} or awaiting_payment_units > 0:
+        next_status = "payment_review" if payment_status == "proof_submitted" else "pending_payment"
+    elif linked_units >= total_units and total_units > 0:
+        next_status = "completed"
+    elif linked_units > 0:
+        next_status = "allocated"
+    else:
+        next_status = "paid"
+    db.execute(
+        text(
+            """
+            UPDATE green_sponsorship_orders
+            SET order_status = :order_status,
+                updated_at = NOW()
+            WHERE id = :order_id
+            """
+        ),
+        {"order_id": int(order_id), "order_status": next_status},
+    )
+
+
+def _link_tree_to_pending_sponsorship_unit(db: Session, project_id: int, tree_id: int) -> dict | None:
+    unit = db.execute(
+        text(
+            """
+            SELECT id, order_id
+            FROM green_sponsorship_units
+            WHERE project_id = :project_id
+              AND tree_id IS NULL
+              AND LOWER(COALESCE(sponsorship_status, '')) = 'awaiting_tree'
+            ORDER BY created_at ASC, id ASC
+            LIMIT 1
+            """
+        ),
+        {"project_id": int(project_id)},
+    ).mappings().first()
+    if not unit:
+        return None
+    tree_row = db.execute(
+        text("SELECT id, project_tree_no FROM trees WHERE id = :tree_id AND project_id = :project_id"),
+        {"tree_id": int(tree_id), "project_id": int(project_id)},
+    ).mappings().first()
+    if not tree_row:
+        return None
+    updated = db.execute(
+        text(
+            """
+            UPDATE green_sponsorship_units
+            SET tree_id = :tree_id,
+                tree_project_no = :tree_project_no,
+                sponsorship_status = 'linked',
+                linked_at = NOW(),
+                updated_at = NOW()
+            WHERE id = :unit_id
+            RETURNING id, order_id
+            """
+        ),
+        {
+            "unit_id": int(unit["id"]),
+            "tree_id": int(tree_id),
+            "tree_project_no": int(tree_row.get("project_tree_no") or 0) or None,
+        },
+    ).mappings().first()
+    if updated:
+        _refresh_sponsorship_order_status(db, int(updated["order_id"]))
+        return dict(updated)
+    return None
+
+
+def _build_tree_carbon_summary(tree_row: dict) -> dict:
+    if not bool(tree_row.get("count_in_carbon_scope", True)):
+        return {"current_co2_kg": 0.0, "annual_co2_kg": 0.0, "lifetime_co2_kg": 0.0}
+    age_years = 0.0
+    if tree_row.get("tree_age_months") is not None:
+        try:
+            age_years = max(float(tree_row.get("tree_age_months") or 0) / 12.0, 0.0)
+        except Exception:
+            age_years = 0.0
+    if age_years <= 0:
+        planting_date = _parse_date_value(tree_row.get("planting_date"))
+        age_years = tree_age_years(planting_date, date.today()) if planting_date else 0.0
+    multiplier = max(int(tree_row.get("inventory_tree_count") or 1), 1)
+    current = round(estimate_tree_co2_kg(tree_row.get("species"), age_years) * multiplier, 2)
+    annual = round(estimate_annual_co2_kg(tree_row.get("species"), max(age_years, 0.5)) * multiplier, 2)
+    lifetime = round(estimate_lifetime_co2_kg(tree_row.get("species"), 40) * multiplier, 2)
+    return {"current_co2_kg": current, "annual_co2_kg": annual, "lifetime_co2_kg": lifetime}
 
 
 @router.delete("/projects/{project_id}")
@@ -5385,6 +5902,16 @@ def update_project_settings(
     project_id: int,
     db: Session = Depends(get_db),
     workflow_profile: str | None = Body(default=None),
+    access_model: str | None = Body(default=None),
+    public_sponsor_enabled: bool | None = Body(default=None),
+    public_sponsor_title: str | None = Body(default=None),
+    public_sponsor_description: str | None = Body(default=None),
+    sponsor_price_per_tree: float | None = Body(default=None),
+    sponsor_currency: str | None = Body(default=None),
+    sponsor_capacity: int | None = Body(default=None),
+    sponsor_max_per_order: int | None = Body(default=None),
+    sponsor_dedication_enabled: bool | None = Body(default=None),
+    sponsor_payment_instructions: str | None = Body(default=None),
     agric_config: dict | None = Body(default=None),
     relief_config: dict | None = Body(default=None),
     planting_model: str | None = Body(default=None),
@@ -5394,7 +5921,10 @@ def update_project_settings(
     existing = db.execute(
         text(
             """
-            SELECT id, workflow_profile, agric_config, relief_config, planting_model, allow_existing_tree_link, default_existing_tree_scope
+            SELECT id, workflow_profile, access_model, public_sponsor_enabled, public_sponsor_title, public_sponsor_description,
+                   sponsor_price_per_tree, sponsor_currency, sponsor_capacity, sponsor_max_per_order,
+                   sponsor_dedication_enabled, sponsor_payment_instructions,
+                   agric_config, relief_config, planting_model, allow_existing_tree_link, default_existing_tree_scope
             FROM tree_projects
             WHERE id = :project_id
             """
@@ -5408,6 +5938,56 @@ def update_project_settings(
         _normalize_workflow_profile(workflow_profile)
         if workflow_profile is not None
         else _normalize_workflow_profile(existing.get("workflow_profile"))
+    )
+    next_access_model = (
+        _normalize_project_access_model(access_model)
+        if access_model is not None
+        else _normalize_project_access_model(existing.get("access_model"))
+    )
+    next_public_sponsor_enabled = (
+        bool(public_sponsor_enabled)
+        if public_sponsor_enabled is not None
+        else bool(existing.get("public_sponsor_enabled"))
+    )
+    next_public_title = (
+        _clean_text(public_sponsor_title, 160)
+        if public_sponsor_title is not None
+        else _clean_text(existing.get("public_sponsor_title"), 160)
+    )
+    next_public_description = (
+        _clean_text(public_sponsor_description, 1200)
+        if public_sponsor_description is not None
+        else _clean_text(existing.get("public_sponsor_description"), 1200)
+    )
+    next_sponsor_price = (
+        round(float(sponsor_price_per_tree), 2)
+        if sponsor_price_per_tree is not None
+        else (round(float(existing.get("sponsor_price_per_tree")), 2) if existing.get("sponsor_price_per_tree") is not None else None)
+    )
+    next_sponsor_currency = (
+        (str(sponsor_currency or "NGN").strip().upper() or "NGN")[:8]
+        if sponsor_currency is not None
+        else (str(existing.get("sponsor_currency") or "NGN").strip().upper() or "NGN")[:8]
+    )
+    next_sponsor_capacity = (
+        int(sponsor_capacity)
+        if sponsor_capacity is not None
+        else (int(existing.get("sponsor_capacity")) if existing.get("sponsor_capacity") is not None else None)
+    )
+    next_sponsor_max_per_order = (
+        max(1, int(sponsor_max_per_order or 1))
+        if sponsor_max_per_order is not None
+        else max(1, int(existing.get("sponsor_max_per_order") or 100))
+    )
+    next_sponsor_dedication_enabled = (
+        bool(sponsor_dedication_enabled)
+        if sponsor_dedication_enabled is not None
+        else bool(existing.get("sponsor_dedication_enabled", True))
+    )
+    next_sponsor_payment_instructions = (
+        _clean_text(sponsor_payment_instructions, 1200)
+        if sponsor_payment_instructions is not None
+        else _clean_text(existing.get("sponsor_payment_instructions"), 1200)
     )
     next_agric_config = (
         _normalize_agric_config(agric_config)
@@ -5436,19 +6016,43 @@ def update_project_settings(
             """
             UPDATE tree_projects
             SET workflow_profile = :workflow_profile,
+                access_model = :access_model,
+                public_sponsor_enabled = :public_sponsor_enabled,
+                public_sponsor_title = :public_sponsor_title,
+                public_sponsor_description = :public_sponsor_description,
+                sponsor_price_per_tree = :sponsor_price_per_tree,
+                sponsor_currency = :sponsor_currency,
+                sponsor_capacity = :sponsor_capacity,
+                sponsor_max_per_order = :sponsor_max_per_order,
+                sponsor_dedication_enabled = :sponsor_dedication_enabled,
+                sponsor_payment_instructions = :sponsor_payment_instructions,
                 agric_config = CAST(:agric_config AS JSONB),
                 relief_config = CAST(:relief_config AS JSONB),
                 planting_model = :planting_model,
                 allow_existing_tree_link = :allow_existing_tree_link,
                 default_existing_tree_scope = :default_existing_tree_scope
             WHERE id = :project_id
-            RETURNING id, name, location_text, sponsor, workflow_profile, agric_config, relief_config,
+            RETURNING id, name, location_text, sponsor, workflow_profile, access_model,
+                      public_sponsor_enabled, public_sponsor_title, public_sponsor_description,
+                      sponsor_price_per_tree, sponsor_currency, sponsor_capacity, sponsor_max_per_order,
+                      sponsor_dedication_enabled, sponsor_payment_instructions,
+                      agric_config, relief_config,
                       planting_model, allow_existing_tree_link, default_existing_tree_scope, created_at
             """
         ),
         {
             "project_id": project_id,
             "workflow_profile": next_workflow_profile,
+            "access_model": next_access_model,
+            "public_sponsor_enabled": next_public_sponsor_enabled,
+            "public_sponsor_title": next_public_title,
+            "public_sponsor_description": next_public_description,
+            "sponsor_price_per_tree": next_sponsor_price,
+            "sponsor_currency": next_sponsor_currency,
+            "sponsor_capacity": next_sponsor_capacity,
+            "sponsor_max_per_order": next_sponsor_max_per_order,
+            "sponsor_dedication_enabled": next_sponsor_dedication_enabled,
+            "sponsor_payment_instructions": next_sponsor_payment_instructions,
             "agric_config": _safe_json(next_agric_config),
             "relief_config": _safe_json(next_relief_config),
             "planting_model": next_model,
@@ -5460,6 +6064,7 @@ def update_project_settings(
     payload["workflow_profile"] = _normalize_workflow_profile(payload.get("workflow_profile"))
     payload["agric_config"] = _normalize_agric_config(payload.get("agric_config"))
     payload["relief_config"] = _normalize_relief_config(payload.get("relief_config"))
+    payload = _apply_project_access_fields(payload)
     _log_audit_event(
         db,
         project_id=project_id,
@@ -5470,6 +6075,9 @@ def update_project_settings(
             "before": dict(existing),
             "after": {
                 "workflow_profile": next_workflow_profile,
+                "access_model": next_access_model,
+                "public_sponsor_enabled": next_public_sponsor_enabled,
+                "sponsor_price_per_tree": next_sponsor_price,
                 "agric_config": next_agric_config,
                 "relief_config": next_relief_config,
                 "planting_model": next_model,
@@ -5540,6 +6148,627 @@ def assign_project_organization(
         payload["organization_status"] = None
         payload["organization_logo_url"] = None
     return payload
+
+
+@router.get("/public-projects")
+def list_public_sponsorship_projects(db: Session = Depends(get_db)):
+    rows = db.execute(
+        text(
+            """
+            SELECT
+                p.id, p.organization_id, p.name, p.location_text, p.sponsor,
+                p.access_model, p.public_sponsor_enabled, p.public_sponsor_title, p.public_sponsor_description,
+                p.sponsor_price_per_tree, p.sponsor_currency, p.sponsor_capacity, p.sponsor_max_per_order,
+                p.sponsor_dedication_enabled, p.sponsor_payment_instructions,
+                p.workflow_profile, p.created_at,
+                o.name AS organization_name, o.slug AS organization_slug, o.status AS organization_status,
+                COALESCE(o.is_active, TRUE) AS organization_is_active,
+                o.logo_url AS organization_logo_url
+            FROM tree_projects p
+            LEFT JOIN green_organizations o ON o.id = p.organization_id
+            WHERE LOWER(COALESCE(p.access_model, 'partner_org')) = 'public_sponsorship'
+              AND COALESCE(p.public_sponsor_enabled, FALSE) = TRUE
+              AND COALESCE(p.sponsor_price_per_tree, 0) > 0
+              AND (o.id IS NULL OR COALESCE(o.is_active, TRUE) = TRUE)
+            ORDER BY p.created_at DESC
+            """
+        )
+    ).mappings().all()
+    items: list[dict] = []
+    for row in rows:
+        item = dict(row)
+        item["organization_logo_url"] = _normalize_logo_asset_path(item.get("organization_logo_url"))
+        items.append(_build_public_project_snapshot(item, db))
+    return items
+
+
+@router.get("/public-projects/{project_id}")
+def get_public_sponsorship_project(project_id: int, db: Session = Depends(get_db)):
+    project = get_project(project_id=project_id, db=db, assignee_name=None)
+    if not _is_public_sponsorship_project(project):
+        raise HTTPException(status_code=404, detail="Public sponsorship project not found")
+    return _build_public_project_snapshot(project, db)
+
+
+@router.post("/sponsor-auth/signup")
+def sponsor_auth_signup(payload: SponsorSignupPayload, db: Session = Depends(get_db)):
+    full_name = str(payload.full_name or "").strip()
+    if not full_name:
+        raise HTTPException(status_code=400, detail="Full name is required")
+    email = _normalize_email_address(payload.email)
+    existing = db.execute(
+        text("SELECT id FROM green_sponsor_accounts WHERE LOWER(email) = LOWER(:email) LIMIT 1"),
+        {"email": email},
+    ).scalar()
+    if existing:
+        raise HTTPException(status_code=409, detail="Email already registered")
+    row = db.execute(
+        text(
+            """
+            INSERT INTO green_sponsor_accounts (
+                sponsor_uid, account_type, full_name, organization_name, email, phone, password_hash, is_active
+            )
+            VALUES (
+                :sponsor_uid, :account_type, :full_name, :organization_name, :email, :phone, :password_hash, TRUE
+            )
+            RETURNING id, sponsor_uid, account_type, full_name, organization_name, email, phone, is_active
+            """
+        ),
+        {
+            "sponsor_uid": _ensure_unique_sponsor_uid(db, None),
+            "account_type": _normalize_sponsor_account_type(payload.account_type),
+            "full_name": full_name,
+            "organization_name": _clean_text(payload.organization_name, 160),
+            "email": email,
+            "phone": _clean_text(payload.phone, 80),
+            "password_hash": _hash_password_value(payload.password),
+        },
+    ).mappings().first()
+    _log_audit_event(
+        db,
+        project_id=None,
+        entity_type="sponsor_account",
+        entity_id=int(row["id"]),
+        action="sponsor_account_created",
+        actor=full_name,
+        details={"account_type": row.get("account_type"), "email": row.get("email")},
+    )
+    db.commit()
+    return _build_sponsor_auth_payload(dict(row))
+
+
+@router.post("/sponsor-auth/login")
+def sponsor_auth_login(payload: SponsorLoginPayload, db: Session = Depends(get_db)):
+    email = _normalize_email_address(payload.email)
+    row = db.execute(
+        text(
+            """
+            SELECT id, sponsor_uid, account_type, full_name, organization_name, email, phone, password_hash, is_active
+            FROM green_sponsor_accounts
+            WHERE LOWER(email) = LOWER(:email)
+            LIMIT 1
+            """
+        ),
+        {"email": email},
+    ).mappings().first()
+    if not row or not _verify_password_value(payload.password, row.get("password_hash")):
+        raise HTTPException(status_code=401, detail="Invalid email or password")
+    if not bool(row.get("is_active", True)):
+        raise HTTPException(status_code=403, detail="Sponsor account is inactive")
+    return _build_sponsor_auth_payload(dict(row))
+
+
+@router.post("/sponsor/orders")
+def create_sponsor_order(
+    payload: SponsorOrderPayload,
+    sponsor_id: int = Body(..., embed=True),
+    db: Session = Depends(get_db),
+):
+    sponsor_row = db.execute(
+        text("SELECT id, full_name, email, is_active FROM green_sponsor_accounts WHERE id = :sponsor_id"),
+        {"sponsor_id": int(sponsor_id)},
+    ).mappings().first()
+    if not sponsor_row or not bool(sponsor_row.get("is_active", True)):
+        raise HTTPException(status_code=404, detail="Sponsor account not found")
+    project = get_project(project_id=int(payload.project_id), db=db, assignee_name=None)
+    if not _is_public_sponsorship_project(project):
+        raise HTTPException(status_code=400, detail="Project is not open for public sponsorship")
+    quantity = max(1, int(payload.quantity or 1))
+    max_per_order = max(1, int(project.get("sponsor_max_per_order") or 100))
+    if quantity > max_per_order:
+        raise HTTPException(status_code=400, detail=f"Maximum trees per order is {max_per_order}")
+    usage = _project_sponsorship_usage(db, int(project["id"]))
+    capacity = project.get("sponsor_capacity")
+    if capacity is not None and int(usage["reserved_slots"]) + quantity > int(capacity):
+        raise HTTPException(status_code=409, detail="Not enough sponsorship slots remaining in this project")
+    amount_per_tree = round(float(project.get("sponsor_price_per_tree") or 0), 2)
+    if amount_per_tree <= 0:
+        raise HTTPException(status_code=400, detail="Tree sponsorship price is not configured")
+    primary_proof_url, proof_urls = _merge_photo_evidence(payload.payment_proof_url, payload.payment_proof_urls)
+    payment_reference = _clean_text(payload.payment_reference, 120)
+    if not primary_proof_url and not payment_reference:
+        raise HTTPException(status_code=400, detail="Attach payment proof or provide payment reference")
+    payment_status = "proof_submitted"
+    order_status = "payment_review"
+    order_row = db.execute(
+        text(
+            """
+            INSERT INTO green_sponsorship_orders (
+                order_uid, sponsor_account_id, project_id, quantity, amount_per_tree, amount_total, currency,
+                payment_method, payment_reference, payment_status, order_status,
+                payment_proof_url, payment_proof_urls,
+                dedication_type, dedication_name, dedication_message, purchaser_note
+            )
+            VALUES (
+                :order_uid, :sponsor_account_id, :project_id, :quantity, :amount_per_tree, :amount_total, :currency,
+                :payment_method, :payment_reference, :payment_status, :order_status,
+                :payment_proof_url, CAST(:payment_proof_urls AS JSONB),
+                :dedication_type, :dedication_name, :dedication_message, :purchaser_note
+            )
+            RETURNING id, order_uid
+            """
+        ),
+        {
+            "order_uid": _generate_prefixed_uid("ORD"),
+            "sponsor_account_id": int(sponsor_id),
+            "project_id": int(project["id"]),
+            "quantity": quantity,
+            "amount_per_tree": amount_per_tree,
+            "amount_total": round(amount_per_tree * quantity, 2),
+            "currency": str(project.get("sponsor_currency") or "NGN"),
+            "payment_method": _clean_text(payload.payment_method or "manual_transfer", 80),
+            "payment_reference": payment_reference,
+            "payment_status": payment_status,
+            "order_status": order_status,
+            "payment_proof_url": primary_proof_url,
+            "payment_proof_urls": _safe_json(proof_urls),
+            "dedication_type": _normalize_sponsor_dedication_type(payload.dedication_type),
+            "dedication_name": _clean_text(payload.dedication_name, 160),
+            "dedication_message": _clean_text(payload.dedication_message, 500),
+            "purchaser_note": _clean_text(payload.purchaser_note, 500),
+        },
+    ).mappings().first()
+    order_id = int(order_row["id"])
+    dedication_type = _normalize_sponsor_dedication_type(payload.dedication_type)
+    dedication_name = _clean_text(payload.dedication_name, 160)
+    dedication_message = _clean_text(payload.dedication_message, 500)
+    for _ in range(quantity):
+        db.execute(
+            text(
+                """
+                INSERT INTO green_sponsorship_units (
+                    unit_uid, order_id, sponsor_account_id, project_id, sponsorship_status,
+                    dedication_type, dedication_name, dedication_message
+                )
+                VALUES (
+                    :unit_uid, :order_id, :sponsor_account_id, :project_id, 'awaiting_payment',
+                    :dedication_type, :dedication_name, :dedication_message
+                )
+                """
+            ),
+            {
+                "unit_uid": _generate_prefixed_uid("UNT"),
+                "order_id": order_id,
+                "sponsor_account_id": int(sponsor_id),
+                "project_id": int(project["id"]),
+                "dedication_type": dedication_type,
+                "dedication_name": dedication_name,
+                "dedication_message": dedication_message,
+            },
+        )
+    _refresh_sponsorship_order_status(db, order_id)
+    _log_audit_event(
+        db,
+        project_id=int(project["id"]),
+        entity_type="sponsorship_order",
+        entity_id=order_id,
+        action="sponsorship_order_created",
+        actor=str(sponsor_row.get("full_name") or "").strip() or str(sponsor_row.get("email") or "").strip(),
+        details={"quantity": quantity, "payment_status": payment_status, "amount_total": round(amount_per_tree * quantity, 2)},
+    )
+    db.commit()
+    return {"ok": True, "order_id": order_id, "order_uid": order_row.get("order_uid")}
+
+
+@router.get("/sponsor/orders")
+def list_sponsor_orders(sponsor_id: int = Query(...), db: Session = Depends(get_db)):
+    sponsor_row = db.execute(
+        text("SELECT id FROM green_sponsor_accounts WHERE id = :sponsor_id AND COALESCE(is_active, TRUE) = TRUE"),
+        {"sponsor_id": int(sponsor_id)},
+    ).scalar()
+    if not sponsor_row:
+        raise HTTPException(status_code=404, detail="Sponsor account not found")
+    rows = db.execute(
+        text(
+            """
+            SELECT
+                o.id, o.order_uid, o.project_id, o.quantity, o.amount_per_tree, o.amount_total, o.currency,
+                o.payment_method, o.payment_reference, o.payment_status, o.order_status,
+                o.payment_proof_url, o.payment_proof_urls, o.dedication_type, o.dedication_name,
+                o.dedication_message, o.purchaser_note, o.reviewed_by, o.reviewed_at, o.review_notes,
+                o.created_at, o.updated_at,
+                p.name AS project_name, p.location_text
+            FROM green_sponsorship_orders o
+            JOIN tree_projects p ON p.id = o.project_id
+            WHERE o.sponsor_account_id = :sponsor_id
+            ORDER BY o.created_at DESC, o.id DESC
+            """
+        ),
+        {"sponsor_id": int(sponsor_id)},
+    ).mappings().all()
+    order_ids = [int(row["id"]) for row in rows]
+    unit_counts: dict[int, dict[str, int]] = {}
+    if order_ids:
+        count_rows = db.execute(
+            text(
+                """
+                SELECT
+                    order_id,
+                    COUNT(*) AS total_units,
+                    COUNT(*) FILTER (WHERE tree_id IS NOT NULL) AS linked_units,
+                    COUNT(*) FILTER (WHERE LOWER(COALESCE(sponsorship_status, '')) = 'awaiting_tree') AS awaiting_tree_units
+                FROM green_sponsorship_units
+                WHERE order_id IN :order_ids
+                GROUP BY order_id
+                """
+            ).bindparams(bindparam("order_ids", expanding=True)),
+            {"order_ids": order_ids},
+        ).mappings().all()
+        unit_counts = {
+            int(item["order_id"]): {
+                "total_units": int(item.get("total_units") or 0),
+                "linked_units": int(item.get("linked_units") or 0),
+                "awaiting_tree_units": int(item.get("awaiting_tree_units") or 0),
+            }
+            for item in count_rows
+        }
+    payload: list[dict] = []
+    for row in rows:
+        item = dict(row)
+        counts = unit_counts.get(int(item["id"]), {"total_units": 0, "linked_units": 0, "awaiting_tree_units": 0})
+        item["payment_status"] = _normalize_sponsor_payment_status(item.get("payment_status"))
+        item["order_status"] = _normalize_sponsor_order_status(item.get("order_status"))
+        item["payment_proof_urls"] = _normalize_photo_urls(item.get("payment_proof_urls"))
+        item["linked_units"] = counts["linked_units"]
+        item["awaiting_tree_units"] = counts["awaiting_tree_units"]
+        item["total_units"] = counts["total_units"]
+        payload.append(item)
+    return payload
+
+
+@router.get("/sponsor/trees")
+def list_sponsor_trees(sponsor_id: int = Query(...), db: Session = Depends(get_db)):
+    sponsor_row = db.execute(
+        text("SELECT id FROM green_sponsor_accounts WHERE id = :sponsor_id AND COALESCE(is_active, TRUE) = TRUE"),
+        {"sponsor_id": int(sponsor_id)},
+    ).scalar()
+    if not sponsor_row:
+        raise HTTPException(status_code=404, detail="Sponsor account not found")
+    rows = db.execute(
+        text(
+            """
+            SELECT
+                u.id AS unit_id, u.unit_uid, u.sponsorship_status, u.linked_at,
+                u.dedication_type, u.dedication_name, u.dedication_message,
+                o.id AS order_id, o.order_uid, o.payment_status, o.order_status, o.created_at AS order_created_at,
+                p.id AS project_id, p.name AS project_name, p.location_text,
+                t.id AS tree_id, t.project_tree_no, t.species, t.status AS tree_status,
+                t.planting_date, t.photo_url, t.photo_urls, t.tree_height_m, t.tree_age_months,
+                t.inventory_tree_count, t.count_in_carbon_scope, t.created_at AS tree_created_at,
+                ST_X(t.geom) AS lng, ST_Y(t.geom) AS lat
+            FROM green_sponsorship_units u
+            JOIN green_sponsorship_orders o ON o.id = u.order_id
+            JOIN tree_projects p ON p.id = u.project_id
+            LEFT JOIN trees t ON t.id = u.tree_id
+            WHERE u.sponsor_account_id = :sponsor_id
+            ORDER BY u.created_at DESC, u.id DESC
+            """
+        ),
+        {"sponsor_id": int(sponsor_id)},
+    ).mappings().all()
+    payload: list[dict] = []
+    for row in rows:
+        item = dict(row)
+        item["sponsorship_status"] = _normalize_sponsor_unit_status(item.get("sponsorship_status"))
+        item["payment_status"] = _normalize_sponsor_payment_status(item.get("payment_status"))
+        item["order_status"] = _normalize_sponsor_order_status(item.get("order_status"))
+        item["photo_urls"] = _normalize_photo_urls(item.get("photo_urls"))
+        if item.get("tree_id"):
+            item["carbon"] = _build_tree_carbon_summary(item)
+        else:
+            item["carbon"] = {"current_co2_kg": 0.0, "annual_co2_kg": 0.0, "lifetime_co2_kg": 0.0}
+        payload.append(item)
+    return payload
+
+
+@router.get("/sponsor/trees/{unit_id}")
+def get_sponsor_tree_detail(unit_id: int, sponsor_id: int = Query(...), db: Session = Depends(get_db)):
+    row = db.execute(
+        text(
+            """
+            SELECT
+                u.id AS unit_id, u.unit_uid, u.sponsorship_status, u.linked_at,
+                u.dedication_type, u.dedication_name, u.dedication_message,
+                o.id AS order_id, o.order_uid, o.payment_status, o.order_status, o.created_at AS order_created_at,
+                p.id AS project_id, p.name AS project_name, p.location_text, p.organization_id,
+                t.id AS tree_id, t.project_tree_no, t.species, t.status AS tree_status, t.notes AS tree_notes,
+                t.planting_date, t.photo_url, t.photo_urls, t.tree_height_m, t.tree_age_months, t.inventory_tree_count,
+                t.count_in_carbon_scope, t.created_by, t.created_at AS tree_created_at,
+                ST_X(t.geom) AS lng, ST_Y(t.geom) AS lat
+            FROM green_sponsorship_units u
+            JOIN green_sponsorship_orders o ON o.id = u.order_id
+            JOIN tree_projects p ON p.id = u.project_id
+            LEFT JOIN trees t ON t.id = u.tree_id
+            WHERE u.id = :unit_id
+              AND u.sponsor_account_id = :sponsor_id
+            LIMIT 1
+            """
+        ),
+        {"unit_id": int(unit_id), "sponsor_id": int(sponsor_id)},
+    ).mappings().first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Sponsored tree not found")
+    item = dict(row)
+    item["sponsorship_status"] = _normalize_sponsor_unit_status(item.get("sponsorship_status"))
+    item["payment_status"] = _normalize_sponsor_payment_status(item.get("payment_status"))
+    item["order_status"] = _normalize_sponsor_order_status(item.get("order_status"))
+    item["photo_urls"] = _normalize_photo_urls(item.get("photo_urls"))
+    item["carbon"] = _build_tree_carbon_summary(item) if item.get("tree_id") else {"current_co2_kg": 0.0, "annual_co2_kg": 0.0, "lifetime_co2_kg": 0.0}
+    timeline: list[dict] = []
+    if item.get("tree_id"):
+        task_rows = db.execute(
+            text(
+                """
+                SELECT
+                    id, task_type, status, review_state, notes, photo_url, photo_urls,
+                    completed_at, submitted_at, reviewed_at, reviewed_by, review_notes,
+                    reported_tree_status, activity_lng, activity_lat, activity_recorded_at
+                FROM tree_tasks
+                WHERE tree_id = :tree_id
+                  AND LOWER(COALESCE(review_state, 'none')) IN ('approved', 'none')
+                  AND LOWER(COALESCE(status, 'pending')) = 'done'
+                ORDER BY COALESCE(reviewed_at, completed_at, submitted_at, created_at) DESC, id DESC
+                """
+            ),
+            {"tree_id": int(item["tree_id"])},
+        ).mappings().all()
+        for task in task_rows:
+            task_item = dict(task)
+            task_item["photo_urls"] = _normalize_photo_urls(task_item.get("photo_urls"))
+            primary_photo = str(task_item.get("photo_url") or "").strip()
+            if primary_photo and primary_photo not in task_item["photo_urls"]:
+                task_item["photo_urls"].insert(0, primary_photo)
+            timeline.append(task_item)
+    item["timeline"] = timeline
+    return item
+
+
+@router.get("/sponsor/trees/{unit_id}/certificate/pdf")
+def export_sponsor_tree_certificate(
+    unit_id: int,
+    sponsor_id: int = Query(...),
+    db: Session = Depends(get_db),
+):
+    row = db.execute(
+        text(
+            """
+            SELECT
+                sa.full_name AS sponsor_name,
+                sa.organization_name AS sponsor_organization_name,
+                u.id AS unit_id, u.unit_uid, u.dedication_type, u.dedication_name, u.dedication_message,
+                p.id AS project_id, p.name AS project_name, p.location_text,
+                t.id AS tree_id, t.project_tree_no, t.species, t.status, t.planting_date,
+                t.photo_url, t.photo_urls, t.tree_height_m, t.tree_age_months, t.inventory_tree_count,
+                t.count_in_carbon_scope, t.created_at AS tree_created_at
+            FROM green_sponsorship_units u
+            JOIN green_sponsor_accounts sa ON sa.id = u.sponsor_account_id
+            JOIN tree_projects p ON p.id = u.project_id
+            JOIN trees t ON t.id = u.tree_id
+            WHERE u.id = :unit_id
+              AND u.sponsor_account_id = :sponsor_id
+            LIMIT 1
+            """
+        ),
+        {"unit_id": int(unit_id), "sponsor_id": int(sponsor_id)},
+    ).mappings().first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Sponsored tree certificate not found")
+    item = dict(row)
+    item["photo_urls"] = _normalize_photo_urls(item.get("photo_urls"))
+    carbon = _build_tree_carbon_summary(item)
+    pdf_bytes = render_green_sponsor_certificate_pdf(item, carbon)
+    db.execute(
+        text("UPDATE green_sponsorship_units SET last_certificate_at = NOW(), updated_at = NOW() WHERE id = :unit_id"),
+        {"unit_id": int(unit_id)},
+    )
+    db.commit()
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'inline; filename=\"sponsor_tree_certificate_{int(unit_id)}.pdf\"'},
+    )
+
+
+@router.get("/admin/sponsors")
+def list_admin_sponsors(db: Session = Depends(get_db)):
+    rows = db.execute(
+        text(
+            """
+            SELECT
+                sa.id, sa.sponsor_uid, sa.account_type, sa.full_name, sa.organization_name, sa.email, sa.phone,
+                sa.is_active, sa.created_at,
+                COUNT(DISTINCT o.id) AS orders_count,
+                COALESCE(SUM(o.amount_total), 0) AS amount_total,
+                COUNT(DISTINCT u.id) FILTER (WHERE u.tree_id IS NOT NULL) AS linked_trees
+            FROM green_sponsor_accounts sa
+            LEFT JOIN green_sponsorship_orders o ON o.sponsor_account_id = sa.id
+            LEFT JOIN green_sponsorship_units u ON u.sponsor_account_id = sa.id
+            GROUP BY sa.id
+            ORDER BY sa.created_at DESC, sa.id DESC
+            """
+        )
+    ).mappings().all()
+    return [_serialize_sponsor_account(dict(row)) | {
+        "orders_count": int(row.get("orders_count") or 0),
+        "amount_total": round(float(row.get("amount_total") or 0), 2),
+        "linked_trees": int(row.get("linked_trees") or 0),
+        "created_at": row.get("created_at"),
+    } for row in rows]
+
+
+@router.get("/admin/sponsorship-orders")
+def list_admin_sponsorship_orders(project_id: int | None = Query(default=None), db: Session = Depends(get_db)):
+    rows = db.execute(
+        text(
+            """
+            SELECT
+                o.id, o.order_uid, o.project_id, o.quantity, o.amount_per_tree, o.amount_total, o.currency,
+                o.payment_method, o.payment_reference, o.payment_status, o.order_status,
+                o.payment_proof_url, o.payment_proof_urls, o.dedication_type, o.dedication_name,
+                o.dedication_message, o.purchaser_note, o.reviewed_by, o.reviewed_at, o.review_notes,
+                o.created_at, o.updated_at,
+                sa.id AS sponsor_account_id, sa.full_name AS sponsor_name, sa.organization_name AS sponsor_organization_name,
+                sa.email AS sponsor_email, sa.account_type AS sponsor_account_type,
+                p.name AS project_name, p.location_text
+            FROM green_sponsorship_orders o
+            JOIN green_sponsor_accounts sa ON sa.id = o.sponsor_account_id
+            JOIN tree_projects p ON p.id = o.project_id
+            WHERE (:project_id IS NULL OR o.project_id = :project_id)
+            ORDER BY o.created_at DESC, o.id DESC
+            """
+        ),
+        {"project_id": int(project_id) if project_id is not None else None},
+    ).mappings().all()
+    order_ids = [int(row["id"]) for row in rows]
+    unit_counts: dict[int, dict[str, int]] = {}
+    if order_ids:
+        count_rows = db.execute(
+            text(
+                """
+                SELECT
+                    order_id,
+                    COUNT(*) AS total_units,
+                    COUNT(*) FILTER (WHERE tree_id IS NOT NULL) AS linked_units,
+                    COUNT(*) FILTER (WHERE LOWER(COALESCE(sponsorship_status, '')) = 'awaiting_tree') AS awaiting_tree_units,
+                    COUNT(*) FILTER (WHERE LOWER(COALESCE(sponsorship_status, '')) = 'awaiting_payment') AS awaiting_payment_units
+                FROM green_sponsorship_units
+                WHERE order_id IN :order_ids
+                GROUP BY order_id
+                """
+            ).bindparams(bindparam("order_ids", expanding=True)),
+            {"order_ids": order_ids},
+        ).mappings().all()
+        unit_counts = {
+            int(item["order_id"]): {
+                "total_units": int(item.get("total_units") or 0),
+                "linked_units": int(item.get("linked_units") or 0),
+                "awaiting_tree_units": int(item.get("awaiting_tree_units") or 0),
+                "awaiting_payment_units": int(item.get("awaiting_payment_units") or 0),
+            }
+            for item in count_rows
+        }
+    payload: list[dict] = []
+    for row in rows:
+        item = dict(row)
+        item["payment_status"] = _normalize_sponsor_payment_status(item.get("payment_status"))
+        item["order_status"] = _normalize_sponsor_order_status(item.get("order_status"))
+        item["payment_proof_urls"] = _normalize_photo_urls(item.get("payment_proof_urls"))
+        item.update(unit_counts.get(int(item["id"]), {"total_units": 0, "linked_units": 0, "awaiting_tree_units": 0, "awaiting_payment_units": 0}))
+        payload.append(item)
+    return payload
+
+
+@router.patch("/admin/sponsorship-orders/{order_id}/payment")
+def review_admin_sponsorship_order_payment(
+    order_id: int,
+    payload: SponsorOrderReviewPayload,
+    db: Session = Depends(get_db),
+):
+    existing = db.execute(
+        text(
+            """
+            SELECT id, project_id, sponsor_account_id, payment_status, order_status
+            FROM green_sponsorship_orders
+            WHERE id = :order_id
+            LIMIT 1
+            """
+        ),
+        {"order_id": int(order_id)},
+    ).mappings().first()
+    if not existing:
+        raise HTTPException(status_code=404, detail="Sponsorship order not found")
+    next_payment_status = _normalize_sponsor_payment_status(payload.payment_status)
+    db.execute(
+        text(
+            """
+            UPDATE green_sponsorship_orders
+            SET payment_status = :payment_status,
+                reviewed_by = :reviewed_by,
+                reviewed_at = NOW(),
+                review_notes = :review_notes,
+                updated_at = NOW()
+            WHERE id = :order_id
+            """
+        ),
+        {
+            "order_id": int(order_id),
+            "payment_status": next_payment_status,
+            "reviewed_by": _clean_text(payload.reviewer_name, 120),
+            "review_notes": _clean_text(payload.review_notes, 500),
+        },
+    )
+    if next_payment_status == "verified":
+        db.execute(
+            text(
+                """
+                UPDATE green_sponsorship_units
+                SET sponsorship_status = 'awaiting_tree',
+                    updated_at = NOW()
+                WHERE order_id = :order_id
+                  AND tree_id IS NULL
+                  AND LOWER(COALESCE(sponsorship_status, '')) = 'awaiting_payment'
+                """
+            ),
+            {"order_id": int(order_id)},
+        )
+    elif next_payment_status == "refunded":
+        db.execute(
+            text(
+                """
+                UPDATE green_sponsorship_units
+                SET sponsorship_status = 'cancelled',
+                    updated_at = NOW()
+                WHERE order_id = :order_id
+                  AND tree_id IS NULL
+                """
+            ),
+            {"order_id": int(order_id)},
+        )
+    elif next_payment_status in {"pending", "rejected", "proof_submitted"}:
+        db.execute(
+            text(
+                """
+                UPDATE green_sponsorship_units
+                SET sponsorship_status = 'awaiting_payment',
+                    updated_at = NOW()
+                WHERE order_id = :order_id
+                  AND tree_id IS NULL
+                """
+            ),
+            {"order_id": int(order_id)},
+        )
+    _refresh_sponsorship_order_status(db, int(order_id))
+    _log_audit_event(
+        db,
+        project_id=int(existing.get("project_id") or 0) or None,
+        entity_type="sponsorship_order",
+        entity_id=int(order_id),
+        action="sponsorship_payment_reviewed",
+        actor=_clean_text(payload.reviewer_name, 120),
+        details={"payment_status": next_payment_status, "review_notes": _clean_text(payload.review_notes, 500)},
+    )
+    db.commit()
+    return {"ok": True, "order_id": int(order_id), "payment_status": next_payment_status}
 
 
 @router.get("/admin/organizations")
@@ -6077,6 +7306,9 @@ def list_projects(
     rows = db.execute(text("""
         SELECT
             p.id, p.organization_id, p.name, p.location_text, p.sponsor,
+            p.access_model, p.public_sponsor_enabled, p.public_sponsor_title, p.public_sponsor_description,
+            p.sponsor_price_per_tree, p.sponsor_currency, p.sponsor_capacity, p.sponsor_max_per_order,
+            p.sponsor_dedication_enabled, p.sponsor_payment_instructions,
             p.workflow_profile, p.agric_config, p.relief_config,
             p.planting_model, p.allow_existing_tree_link, p.default_existing_tree_scope, p.created_at,
             o.name AS organization_name, o.slug AS organization_slug, o.status AS organization_status,
@@ -6117,6 +7349,7 @@ def list_projects(
         item["agric_config"] = _normalize_agric_config(item.get("agric_config"))
         item["relief_config"] = _normalize_relief_config(item.get("relief_config"))
         item["organization_logo_url"] = _normalize_logo_asset_path(item.get("organization_logo_url"))
+        _apply_project_access_fields(item)
     return items
 
 
@@ -6130,6 +7363,9 @@ def get_project(
     project = db.execute(text("""
         SELECT
             p.id, p.organization_id, p.name, p.location_text, p.sponsor,
+            p.access_model, p.public_sponsor_enabled, p.public_sponsor_title, p.public_sponsor_description,
+            p.sponsor_price_per_tree, p.sponsor_currency, p.sponsor_capacity, p.sponsor_max_per_order,
+            p.sponsor_dedication_enabled, p.sponsor_payment_instructions,
             p.workflow_profile, p.agric_config, p.relief_config,
             p.planting_model, p.allow_existing_tree_link, p.default_existing_tree_scope, p.created_at,
             o.name AS organization_name, o.slug AS organization_slug, o.status AS organization_status,
@@ -6145,6 +7381,7 @@ def get_project(
     project["agric_config"] = _normalize_agric_config(project.get("agric_config"))
     project["relief_config"] = _normalize_relief_config(project.get("relief_config"))
     project["organization_logo_url"] = _normalize_logo_asset_path(project.get("organization_logo_url"))
+    project = _apply_project_access_fields(project)
 
     if assignee_clean:
         has_access = db.execute(
@@ -10070,6 +11307,11 @@ def review_submitted_task(
                 source_task_id=task_id,
                 changed_by=reviewer_name or None,
                 notes=review_notes or None,
+            )
+            _link_tree_to_pending_sponsorship_unit(
+                db,
+                project_id=project_id,
+                tree_id=int(task["tree_id"]),
             )
         elif reported_tree_status in TREE_STATUS_VALUES:
             db.execute(

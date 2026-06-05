@@ -101,6 +101,119 @@ def render_green_org_credentials_pdf(organization: dict, users: list[dict]) -> b
     return buffer.getvalue()
 
 
+def render_green_sponsor_certificate_pdf(sponsorship: dict, carbon: dict | None = None) -> bytes:
+    buffer = io.BytesIO()
+    c = canvas.Canvas(buffer, pagesize=A4)
+    page_w, page_h = A4
+
+    carbon_data = carbon or {}
+    sponsor_name = str(sponsorship.get("sponsor_name") or "").strip() or "Sponsor"
+    sponsor_org = str(sponsorship.get("sponsor_organization_name") or "").strip()
+    project_name = str(sponsorship.get("project_name") or "").strip() or "LandCheck Green Project"
+    tree_label = f"Tree #{int(sponsorship.get('project_tree_no') or 0)}" if sponsorship.get("project_tree_no") else f"Tree ID {int(sponsorship.get('tree_id') or 0)}"
+    species_label = str(sponsorship.get("species") or "").strip() or "Tree"
+    planting_date = str(sponsorship.get("planting_date") or "").strip() or "-"
+    location_text = str(sponsorship.get("location_text") or "").strip() or "-"
+    dedication_type = str(sponsorship.get("dedication_type") or "").strip()
+    dedication_name = str(sponsorship.get("dedication_name") or "").strip()
+    dedication_message = str(sponsorship.get("dedication_message") or "").strip()
+
+    c.setFillColor(HexColor("#f4fbf5"))
+    c.rect(0, 0, page_w, page_h, stroke=0, fill=1)
+    c.setFillColor(HexColor("#0f4f2a"))
+    c.rect(28, page_h - 96, page_w - 56, 54, stroke=0, fill=1)
+    c.setFillColor(HexColor("#ffffff"))
+    c.setFont("Helvetica-Bold", 22)
+    c.drawString(44, page_h - 66, "LandCheck Green Sponsorship Certificate")
+    c.setFont("Helvetica", 10)
+    c.drawString(44, page_h - 82, "Verified tree sponsorship linked to approved field evidence and live maintenance records")
+
+    _draw_rounded_box(c, 34, 470, page_w - 68, 220, 18, fill_color=HexColor("#ffffff"), stroke_color=HexColor("#d7ead9"))
+    c.setFillColor(HexColor("#0f2d1a"))
+    c.setFont("Helvetica-Bold", 14)
+    c.drawString(52, 664, "Awarded to")
+    c.setFont("Helvetica-Bold", 26)
+    c.drawString(52, 632, sponsor_name)
+    if sponsor_org:
+        c.setFont("Helvetica", 12)
+        c.setFillColor(HexColor("#315e46"))
+        c.drawString(52, 612, sponsor_org)
+
+    c.setFillColor(HexColor("#163826"))
+    c.setFont("Helvetica", 12)
+    c.drawString(52, 582, f"Project: {project_name}")
+    c.drawString(52, 564, f"Location: {location_text}")
+    c.drawString(52, 546, f"Sponsored tree: {tree_label} | Species: {species_label}")
+    c.drawString(52, 528, f"Planting date: {planting_date}")
+    c.drawString(52, 510, f"Issued: {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}")
+
+    if dedication_type or dedication_name or dedication_message:
+        _draw_rounded_box(c, 52, 438, page_w - 104, 54, 12, fill_color=HexColor("#f6fbf7"), stroke_color=HexColor("#d7ead9"))
+        c.setFillColor(HexColor("#0f2d1a"))
+        c.setFont("Helvetica-Bold", 11)
+        c.drawString(64, 474, "Dedication")
+        c.setFont("Helvetica", 10)
+        dedication_line = " | ".join(part for part in [dedication_type.replace("_", " ").title() if dedication_type else "", dedication_name] if part)
+        if dedication_line:
+            c.drawString(64, 458, dedication_line[:90])
+        if dedication_message:
+            c.drawString(64, 444, dedication_message[:106])
+
+    _draw_rounded_box(c, 34, 280, page_w - 68, 150, 18, fill_color=HexColor("#ffffff"), stroke_color=HexColor("#d7ead9"))
+    c.setFillColor(HexColor("#0f2d1a"))
+    c.setFont("Helvetica-Bold", 14)
+    c.drawString(52, 406, "Carbon impact snapshot")
+    c.setFont("Helvetica-Bold", 22)
+    c.drawString(52, 372, f"{float(carbon_data.get('current_co2_kg') or 0):,.2f} kg")
+    c.setFont("Helvetica", 11)
+    c.setFillColor(HexColor("#315e46"))
+    c.drawString(52, 356, "Current stored CO2")
+    c.setFillColor(HexColor("#0f2d1a"))
+    c.setFont("Helvetica-Bold", 16)
+    c.drawString(220, 372, f"{float(carbon_data.get('annual_co2_kg') or 0):,.2f} kg/yr")
+    c.setFont("Helvetica", 11)
+    c.setFillColor(HexColor("#315e46"))
+    c.drawString(220, 356, "Annual sequestration")
+    c.setFillColor(HexColor("#0f2d1a"))
+    c.setFont("Helvetica-Bold", 16)
+    c.drawString(394, 372, f"{float(carbon_data.get('lifetime_co2_kg') or 0):,.2f} kg")
+    c.setFont("Helvetica", 11)
+    c.setFillColor(HexColor("#315e46"))
+    c.drawString(394, 356, "Projected 40-year stock")
+
+    primary_photo = str(sponsorship.get("photo_url") or "").strip()
+    photo_urls = sponsorship.get("photo_urls") or []
+    if isinstance(photo_urls, list):
+        for candidate in photo_urls:
+            candidate_url = str(candidate or "").strip()
+            if candidate_url:
+                primary_photo = primary_photo or candidate_url
+                break
+    if primary_photo:
+        reader = _load_photo_reader(primary_photo, {})
+        if reader is not None:
+            _draw_rounded_box(c, page_w - 188, 500, 134, 134, 14, fill_color=HexColor("#ffffff"), stroke_color=HexColor("#d7ead9"))
+            try:
+                c.drawImage(reader, page_w - 180, 508, 118, 118, preserveAspectRatio=True, anchor="c")
+            except Exception:
+                pass
+
+    c.setStrokeColor(HexColor("#b7d6be"))
+    c.line(52, 202, 220, 202)
+    c.line(page_w - 220, 202, page_w - 52, 202)
+    c.setFillColor(HexColor("#315e46"))
+    c.setFont("Helvetica", 10)
+    c.drawString(52, 188, "LandCheck Green verification")
+    c.drawString(page_w - 220, 188, "Sponsor reference")
+    c.setFillColor(HexColor("#0f2d1a"))
+    c.setFont("Helvetica-Bold", 11)
+    c.drawString(page_w - 220, 172, str(sponsorship.get("unit_uid") or sponsorship.get("tree_id") or "-"))
+
+    c.save()
+    buffer.seek(0)
+    return buffer.getvalue()
+
+
 def _draw_rounded_box(c, x, y, w, h, r, fill_color=None, stroke_color=None):
     """Draw a rounded rectangle."""
     c.saveState()
