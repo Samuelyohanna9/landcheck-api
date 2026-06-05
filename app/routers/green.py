@@ -1729,6 +1729,14 @@ def _normalize_sponsor_dedication_type(value: str | None) -> str:
     return "self"
 
 
+def _normalize_currency_code(value: str | None, default: str = "NGN") -> str:
+    raw = str(value or "").strip().upper()
+    letters_only = "".join(ch for ch in raw if ch.isalpha())
+    if len(letters_only) == 3:
+        return letters_only
+    return default
+
+
 def _apply_project_access_fields(payload: dict) -> dict:
     payload["access_model"] = _normalize_project_access_model(payload.get("access_model"))
     payload["public_sponsor_enabled"] = bool(payload.get("public_sponsor_enabled"))
@@ -1747,7 +1755,7 @@ def _apply_project_access_fields(payload: dict) -> dict:
         payload["sponsor_max_per_order"] = max(1, int(max_per_order or 100))
     except Exception:
         payload["sponsor_max_per_order"] = 100
-    payload["sponsor_currency"] = (str(payload.get("sponsor_currency") or "NGN").strip().upper() or "NGN")[:8]
+    payload["sponsor_currency"] = _normalize_currency_code(payload.get("sponsor_currency"), "NGN")
     payload["sponsor_dedication_enabled"] = bool(payload.get("sponsor_dedication_enabled", True))
     payload["public_sponsor_title"] = _clean_text(payload.get("public_sponsor_title"), 160)
     payload["public_sponsor_description"] = _clean_text(payload.get("public_sponsor_description"), 1200)
@@ -5486,7 +5494,7 @@ def create_project(
     normalized_public_title = _clean_text(public_sponsor_title, 160)
     normalized_public_description = _clean_text(public_sponsor_description, 1200)
     normalized_price = round(float(sponsor_price_per_tree), 2) if sponsor_price_per_tree is not None else None
-    normalized_currency = (str(sponsor_currency or "NGN").strip().upper() or "NGN")[:8]
+    normalized_currency = _normalize_currency_code(sponsor_currency, "NGN")
     normalized_capacity = int(sponsor_capacity) if sponsor_capacity is not None else None
     normalized_max_per_order = max(1, int(sponsor_max_per_order or 100))
     normalized_payment_instructions = _clean_text(sponsor_payment_instructions, 1200)
@@ -5991,9 +5999,9 @@ def update_project_settings(
         else (round(float(existing.get("sponsor_price_per_tree")), 2) if existing.get("sponsor_price_per_tree") is not None else None)
     )
     next_sponsor_currency = (
-        (str(sponsor_currency or "NGN").strip().upper() or "NGN")[:8]
+        _normalize_currency_code(sponsor_currency, "NGN")
         if sponsor_currency is not None
-        else (str(existing.get("sponsor_currency") or "NGN").strip().upper() or "NGN")[:8]
+        else _normalize_currency_code(existing.get("sponsor_currency"), "NGN")
     )
     next_sponsor_capacity = (
         int(sponsor_capacity)
