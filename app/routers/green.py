@@ -123,6 +123,9 @@ SPONSOR_PAYMENT_STATUS_VALUES = {"pending", "proof_submitted", "verified", "reje
 SPONSOR_ORDER_STATUS_VALUES = {"pending_payment", "payment_review", "paid", "allocated", "completed", "cancelled"}
 SPONSOR_UNIT_STATUS_VALUES = {"awaiting_payment", "awaiting_tree", "linked", "active", "replaced", "cancelled"}
 SPONSOR_DEDICATION_TYPE_VALUES = {"self", "memorial", "birthday", "celebration", "honor", "organization", "other"}
+FLUTTERWAVE_API_BASE_URL = str(os.getenv("FLUTTERWAVE_API_BASE_URL") or "https://api.flutterwave.com/v3").strip().rstrip("/")
+LANDCHECK_API_PUBLIC_URL = str(os.getenv("LANDCHECK_API_PUBLIC_URL") or "").strip().rstrip("/")
+LANDCHECK_MOBILE_SCHEME = str(os.getenv("LANDCHECK_MOBILE_SCHEME") or "landcheckmobile").strip() or "landcheckmobile"
 AGRIC_PROGRAM_TYPE_VALUES = {
     "extension_support",
     "input_support",
@@ -1735,6 +1738,327 @@ def _normalize_currency_code(value: str | None, default: str = "NGN") -> str:
     if len(letters_only) == 3:
         return letters_only
     return default
+
+
+def _flutterwave_secret_key() -> str | None:
+    return str(os.getenv("FLW_SECRET_KEY") or os.getenv("FLUTTERWAVE_SECRET_KEY") or "").strip() or None
+
+
+def _flutterwave_secret_hash() -> str | None:
+    return str(os.getenv("FLW_SECRET_HASH") or os.getenv("FLUTTERWAVE_SECRET_HASH") or "").strip() or None
+
+
+def _build_public_api_base_url(request: Request | None = None) -> str:
+    if LANDCHECK_API_PUBLIC_URL:
+        return LANDCHECK_API_PUBLIC_URL
+    if request is not None:
+        forwarded_proto = str(request.headers.get("x-forwarded-proto") or request.url.scheme or "https").split(",")[0].strip()
+        forwarded_host = str(request.headers.get("x-forwarded-host") or request.headers.get("host") or request.url.netloc).split(",")[0].strip()
+        if forwarded_proto and forwarded_host:
+            return f"{forwarded_proto}://{forwarded_host}".rstrip("/")
+        return str(request.base_url).rstrip("/")
+    return ""
+
+
+def _build_flutterwave_return_url(request: Request, order_uid: str) -> str:
+    base_url = _build_public_api_base_url(request)
+    if not base_url:
+        raise HTTPException(status_code=500, detail="Could not determine the public API URL for payment callbacks")
+    return f"{base_url}/green/sponsor/payments/flutterwave/return?order_uid={quote(str(order_uid or '').strip())}"
+
+
+def _build_sponsor_payment_app_url(order_uid: str, status: str, message: str | None = None) -> str:
+    query = f"order_uid={quote(str(order_uid or '').strip())}&status={quote(str(status or '').strip() or 'pending')}"
+    if message:
+        query += f"&message={quote(str(message).strip())}"
+    return f"{LANDCHECK_MOBILE_SCHEME}://sponsor/payment-result?{query}"
+
+
+def _render_sponsor_payment_return_page(title: str, message: str, deep_link_url: str) -> str:
+    safe_title = html.escape(title)
+    safe_message = html.escape(message)
+    safe_link = html.escape(deep_link_url, quote=True)
+    return f"""<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>{safe_title}</title>
+    <style>
+      body {{
+        margin: 0;
+        font-family: Arial, sans-serif;
+        background: linear-gradient(160deg, #0f5b2f 0%, #1f7d43 55%, #66be6d 100%);
+        color: #ffffff;
+        min-height: 100vh;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        padding: 24px;
+      }}
+      .card {{
+        width: min(520px, 100%);
+        background: rgba(7, 24, 14, 0.24);
+        border: 1px solid rgba(255,255,255,0.16);
+        border-radius: 24px;
+        padding: 28px;
+        box-shadow: 0 24px 48px rgba(7, 24, 14, 0.24);
+      }}
+      h1 {{
+        margin: 0 0 12px;
+        font-size: 28px;
+        line-height: 1.15;
+      }}
+      p {{
+        margin: 0 0 18px;
+        line-height: 1.6;
+        color: rgba(255,255,255,0.9);
+      }}
+      a {{
+        display: inline-block;
+        background: #ffffff;
+        color: #0f5b2f;
+        font-weight: 700;
+        text-decoration: none;
+        padding: 14px 18px;
+        border-radius: 999px;
+      }}
+      small {{
+        display: block;
+        margin-top: 14px;
+        color: rgba(255,255,255,0.72);
+      }}
+    </style>
+  </head>
+  <body>
+    <div class="card">
+      <h1>{safe_title}</h1>
+      <p>{safe_message}</p>
+      <a href="{safe_link}">Return to LC Green</a>
+      <small>If the app does not open automatically, tap the button above.</small>
+    </div>
+    <script>
+      window.setTimeout(function () {{
+        window.location.href = "{safe_link}";
+      }}, 250);
+    </script>
+  </body>
+</html>"""
+
+
+def _flutterwave_headers() -> dict[str, str]:
+    secret_key = _flutterwave_secret_key()
+    if not secret_key:
+        raise HTTPException(status_code=503, detail="Flutterwave payment gateway is not configured on this server")
+    return {
+        "Authorization": f"Bearer {secret_key}",
+        "Content-Type": "application/json",
+    }
+
+
+def _call_flutterwave_api(
+    method: str,
+    path: str,
+    payload: dict | None = None,
+    params: dict | None = None,
+    timeout: int = 30,
+) -> dict:
+    try:
+        response = requests.request(
+            method.upper(),
+            f"{FLUTTERWAVE_API_BASE_URL}{path}",
+            headers=_flutterwave_headers(),
+            json=payload,
+            params=params,
+            timeout=timeout,
+        )
+    except requests.RequestException as exc:
+        raise HTTPException(status_code=502, detail="Could not reach Flutterwave. Please try again.") from exc
+    try:
+        body = response.json()
+    except ValueError:
+        body = {}
+    if response.status_code >= 400:
+        detail = str(body.get("message") or body.get("error") or "Flutterwave rejected the payment request.")
+        raise HTTPException(status_code=502, detail=detail)
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=502, detail="Flutterwave returned an unreadable response")
+    return body
+
+
+def _create_flutterwave_payment_link(request: Request, order_row: dict, sponsor_row: dict, project: dict) -> dict:
+    tx_ref = str(order_row.get("payment_gateway_reference") or order_row.get("order_uid") or "").strip()
+    if not tx_ref:
+        raise HTTPException(status_code=500, detail="Sponsorship order is missing a transaction reference")
+    amount_total = round(float(order_row.get("amount_total") or 0), 2)
+    currency = _normalize_currency_code(order_row.get("currency"), "NGN")
+    response = _call_flutterwave_api(
+        "POST",
+        "/payments",
+        payload={
+            "tx_ref": tx_ref,
+            "amount": f"{amount_total:.2f}",
+            "currency": currency,
+            "redirect_url": _build_flutterwave_return_url(request, str(order_row.get("order_uid") or tx_ref)),
+            "customer": {
+                "email": str(sponsor_row.get("email") or "").strip(),
+                "name": str(sponsor_row.get("full_name") or "").strip(),
+                "phonenumber": str(sponsor_row.get("phone") or "").strip() or None,
+            },
+            "customizations": {
+                "title": str(project.get("public_sponsor_title") or project.get("name") or "LandCheck Green").strip(),
+                "description": "Secure sponsorship payment for verified tree planting and field updates.",
+            },
+            "meta": {
+                "order_id": int(order_row.get("id") or 0),
+                "order_uid": str(order_row.get("order_uid") or "").strip(),
+                "project_id": int(order_row.get("project_id") or 0),
+                "sponsor_account_id": int(order_row.get("sponsor_account_id") or 0),
+            },
+            "configurations": {
+                "session_duration": 30,
+                "max_retry_attempt": 3,
+            },
+        },
+    )
+    data = response.get("data") or {}
+    link = str(data.get("link") or "").strip()
+    if not link:
+        raise HTTPException(status_code=502, detail="Flutterwave did not return a hosted checkout link")
+    return {
+        "link": link,
+        "tx_ref": tx_ref,
+        "raw": response,
+    }
+
+
+def _verify_flutterwave_webhook_signature(raw_body: bytes, signature: str | None) -> bool:
+    secret_hash = _flutterwave_secret_hash()
+    provided_signature = str(signature or "").strip()
+    if not secret_hash or not provided_signature:
+        return False
+    expected_signature = hmac.new(secret_hash.encode("utf-8"), raw_body, hashlib.sha256).digest()
+    expected_b64 = base64.b64encode(expected_signature).decode("utf-8")
+    return hmac.compare_digest(expected_b64, provided_signature)
+
+
+def _verify_flutterwave_transaction(transaction_id: int | None = None, tx_ref: str | None = None) -> dict:
+    if int(transaction_id or 0) > 0:
+        return _call_flutterwave_api("GET", f"/transactions/{int(transaction_id)}/verify")
+    reference = str(tx_ref or "").strip()
+    if not reference:
+        raise HTTPException(status_code=400, detail="Missing Flutterwave transaction reference")
+    return _call_flutterwave_api("GET", "/transactions/verify_by_reference", params={"tx_ref": reference})
+
+
+def _sync_sponsorship_order_flutterwave_payment(
+    db: Session,
+    order_row: dict,
+    transaction_id: int | None = None,
+    tx_ref: str | None = None,
+    actor: str | None = None,
+    review_notes: str | None = None,
+) -> dict:
+    verification = _verify_flutterwave_transaction(transaction_id=transaction_id, tx_ref=tx_ref or order_row.get("payment_gateway_reference"))
+    data = verification.get("data") or {}
+    order_id = int(order_row.get("id") or 0)
+    expected_amount = round(float(order_row.get("amount_total") or 0), 2)
+    expected_currency = _normalize_currency_code(order_row.get("currency"), "NGN")
+    expected_tx_ref = str(order_row.get("payment_gateway_reference") or order_row.get("order_uid") or "").strip()
+    actual_status = _normalize_name(data.get("status"))
+    actual_tx_ref = str(data.get("tx_ref") or tx_ref or expected_tx_ref).strip()
+    actual_currency = _normalize_currency_code(data.get("currency"), expected_currency)
+    charged_amount = round(float(data.get("charged_amount") or data.get("amount") or 0), 2)
+    gateway_transaction_id = int(data.get("id") or transaction_id or 0) or None
+    gateway_state = actual_status or "pending"
+    flw_reference = str(data.get("flw_ref") or "").strip() or None
+    note = _clean_text(review_notes, 500)
+    matches_reference = not expected_tx_ref or actual_tx_ref == expected_tx_ref
+    matches_currency = actual_currency == expected_currency
+    matches_amount = charged_amount + 0.01 >= expected_amount
+    is_verified = actual_status in {"successful", "succeeded"} and matches_reference and matches_currency and matches_amount
+    if is_verified:
+        db.execute(
+            text(
+                """
+                UPDATE green_sponsorship_orders
+                SET payment_status = 'verified',
+                    payment_reference = COALESCE(:payment_reference, payment_reference),
+                    payment_gateway_transaction_id = :payment_gateway_transaction_id,
+                    payment_gateway_status = :payment_gateway_status,
+                    payment_gateway_payload = CAST(:payment_gateway_payload AS JSONB),
+                    reviewed_by = COALESCE(:reviewed_by, reviewed_by),
+                    reviewed_at = NOW(),
+                    review_notes = COALESCE(:review_notes, review_notes),
+                    payment_verified_at = NOW(),
+                    updated_at = NOW()
+                WHERE id = :order_id
+                """
+            ),
+            {
+                "order_id": order_id,
+                "payment_reference": flw_reference,
+                "payment_gateway_transaction_id": gateway_transaction_id,
+                "payment_gateway_status": gateway_state,
+                "payment_gateway_payload": _safe_json(data),
+                "reviewed_by": _clean_text(actor, 120),
+                "review_notes": note,
+            },
+        )
+        db.execute(
+            text(
+                """
+                UPDATE green_sponsorship_units
+                SET sponsorship_status = 'awaiting_tree',
+                    updated_at = NOW()
+                WHERE order_id = :order_id
+                  AND tree_id IS NULL
+                  AND LOWER(COALESCE(sponsorship_status, '')) = 'awaiting_payment'
+                """
+            ),
+            {"order_id": order_id},
+        )
+        _refresh_sponsorship_order_status(db, order_id)
+        return {
+            "verified": True,
+            "payment_status": "verified",
+            "gateway_status": gateway_state,
+            "transaction_id": gateway_transaction_id,
+            "tx_ref": actual_tx_ref,
+            "message": "Payment verified successfully.",
+        }
+    db.execute(
+        text(
+            """
+            UPDATE green_sponsorship_orders
+            SET payment_gateway_transaction_id = COALESCE(:payment_gateway_transaction_id, payment_gateway_transaction_id),
+                payment_gateway_status = :payment_gateway_status,
+                payment_gateway_payload = CAST(:payment_gateway_payload AS JSONB),
+                updated_at = NOW()
+            WHERE id = :order_id
+            """
+        ),
+        {
+            "order_id": order_id,
+            "payment_gateway_transaction_id": gateway_transaction_id,
+            "payment_gateway_status": gateway_state,
+            "payment_gateway_payload": _safe_json(data),
+        },
+    )
+    _refresh_sponsorship_order_status(db, order_id)
+    failure_message = "Payment is still pending confirmation."
+    if actual_status in {"failed", "cancelled", "canceled"}:
+        failure_message = "Payment was not completed. You can try again from the app."
+    elif not matches_reference or not matches_currency or not matches_amount:
+        failure_message = "Payment details did not match this sponsorship order."
+    return {
+        "verified": False,
+        "payment_status": _normalize_sponsor_payment_status(order_row.get("payment_status")),
+        "gateway_status": gateway_state,
+        "transaction_id": gateway_transaction_id,
+        "tx_ref": actual_tx_ref,
+        "message": failure_message,
+    }
 
 
 def _apply_project_access_fields(payload: dict) -> dict:
@@ -3931,6 +4255,13 @@ def ensure_green_tables(db: Session):
             payment_reference TEXT,
             payment_status TEXT NOT NULL DEFAULT 'pending',
             order_status TEXT NOT NULL DEFAULT 'pending_payment',
+            payment_provider TEXT,
+            payment_link TEXT,
+            payment_gateway_reference TEXT,
+            payment_gateway_transaction_id BIGINT,
+            payment_gateway_status TEXT,
+            payment_gateway_payload JSONB,
+            payment_verified_at TIMESTAMP,
             payment_proof_url TEXT,
             payment_proof_urls JSONB,
             dedication_type TEXT,
@@ -3965,6 +4296,13 @@ def ensure_green_tables(db: Session):
     """))
     try:
         db.execute(text("ALTER TABLE green_sponsorship_orders ADD COLUMN IF NOT EXISTS order_uid TEXT"))
+        db.execute(text("ALTER TABLE green_sponsorship_orders ADD COLUMN IF NOT EXISTS payment_provider TEXT"))
+        db.execute(text("ALTER TABLE green_sponsorship_orders ADD COLUMN IF NOT EXISTS payment_link TEXT"))
+        db.execute(text("ALTER TABLE green_sponsorship_orders ADD COLUMN IF NOT EXISTS payment_gateway_reference TEXT"))
+        db.execute(text("ALTER TABLE green_sponsorship_orders ADD COLUMN IF NOT EXISTS payment_gateway_transaction_id BIGINT"))
+        db.execute(text("ALTER TABLE green_sponsorship_orders ADD COLUMN IF NOT EXISTS payment_gateway_status TEXT"))
+        db.execute(text("ALTER TABLE green_sponsorship_orders ADD COLUMN IF NOT EXISTS payment_gateway_payload JSONB"))
+        db.execute(text("ALTER TABLE green_sponsorship_orders ADD COLUMN IF NOT EXISTS payment_verified_at TIMESTAMP"))
         db.execute(text("ALTER TABLE green_sponsorship_orders ADD COLUMN IF NOT EXISTS payment_proof_urls JSONB"))
         db.execute(text("ALTER TABLE green_sponsorship_orders ADD COLUMN IF NOT EXISTS dedication_type TEXT"))
         db.execute(text("ALTER TABLE green_sponsorship_orders ADD COLUMN IF NOT EXISTS dedication_name TEXT"))
@@ -4260,6 +4598,8 @@ def ensure_green_tables(db: Session):
     db.execute(text("CREATE INDEX IF NOT EXISTS idx_sponsor_orders_project_created ON green_sponsorship_orders(project_id, created_at DESC)"))
     db.execute(text("CREATE INDEX IF NOT EXISTS idx_sponsor_orders_sponsor_created ON green_sponsorship_orders(sponsor_account_id, created_at DESC)"))
     db.execute(text("CREATE INDEX IF NOT EXISTS idx_sponsor_orders_payment_status ON green_sponsorship_orders(payment_status, created_at DESC)"))
+    db.execute(text("CREATE INDEX IF NOT EXISTS idx_sponsor_orders_gateway_reference ON green_sponsorship_orders(UPPER(payment_gateway_reference))"))
+    db.execute(text("CREATE INDEX IF NOT EXISTS idx_sponsor_orders_gateway_transaction ON green_sponsorship_orders(payment_gateway_transaction_id)"))
     db.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS idx_sponsor_units_uid ON green_sponsorship_units(UPPER(unit_uid))"))
     db.execute(text("CREATE INDEX IF NOT EXISTS idx_sponsor_units_project_status ON green_sponsorship_units(project_id, sponsorship_status, created_at DESC)"))
     db.execute(text("CREATE INDEX IF NOT EXISTS idx_sponsor_units_sponsor_status ON green_sponsorship_units(sponsor_account_id, sponsorship_status, created_at DESC)"))
@@ -6295,11 +6635,12 @@ def sponsor_auth_login(payload: SponsorLoginPayload, db: Session = Depends(get_d
 @router.post("/sponsor/orders")
 def create_sponsor_order(
     payload: SponsorOrderPayload,
+    request: Request,
     sponsor_id: int = Body(..., embed=True),
     db: Session = Depends(get_db),
 ):
     sponsor_row = db.execute(
-        text("SELECT id, full_name, email, is_active FROM green_sponsor_accounts WHERE id = :sponsor_id"),
+        text("SELECT id, full_name, email, phone, is_active FROM green_sponsor_accounts WHERE id = :sponsor_id"),
         {"sponsor_id": int(sponsor_id)},
     ).mappings().first()
     if not sponsor_row or not bool(sponsor_row.get("is_active", True)):
@@ -6323,88 +6664,366 @@ def create_sponsor_order(
         )
     primary_proof_url, proof_urls = _merge_photo_evidence(payload.payment_proof_url, payload.payment_proof_urls)
     payment_reference = _clean_text(payload.payment_reference, 120)
-    if not primary_proof_url and not payment_reference:
+    raw_payment_method = _normalize_name(payload.payment_method)
+    manual_payment_requested = raw_payment_method in {"manual_transfer", "manual", "bank_transfer"} or bool(primary_proof_url or payment_reference)
+    use_flutterwave = not manual_payment_requested
+    if use_flutterwave and not _flutterwave_secret_key():
+        raise HTTPException(status_code=503, detail="Flutterwave payment gateway is not configured on this server")
+    if manual_payment_requested and not primary_proof_url and not payment_reference:
         raise HTTPException(status_code=400, detail="Attach payment proof or provide payment reference")
-    payment_status = "proof_submitted"
-    order_status = "payment_review"
-    order_row = db.execute(
-        text(
-            """
-            INSERT INTO green_sponsorship_orders (
-                order_uid, sponsor_account_id, project_id, quantity, amount_per_tree, amount_total, currency,
-                payment_method, payment_reference, payment_status, order_status,
-                payment_proof_url, payment_proof_urls,
-                dedication_type, dedication_name, dedication_message, purchaser_note
-            )
-            VALUES (
-                :order_uid, :sponsor_account_id, :project_id, :quantity, :amount_per_tree, :amount_total, :currency,
-                :payment_method, :payment_reference, :payment_status, :order_status,
-                :payment_proof_url, CAST(:payment_proof_urls AS JSONB),
-                :dedication_type, :dedication_name, :dedication_message, :purchaser_note
-            )
-            RETURNING id, order_uid
-            """
-        ),
-        {
-            "order_uid": _generate_prefixed_uid("ORD"),
-            "sponsor_account_id": int(sponsor_id),
-            "project_id": int(project["id"]),
-            "quantity": quantity,
-            "amount_per_tree": amount_per_tree,
-            "amount_total": round(amount_per_tree * quantity, 2),
-            "currency": str(project.get("sponsor_currency") or "NGN"),
-            "payment_method": _clean_text(payload.payment_method or "manual_transfer", 80),
-            "payment_reference": payment_reference,
-            "payment_status": payment_status,
-            "order_status": order_status,
-            "payment_proof_url": primary_proof_url,
-            "payment_proof_urls": _safe_json(proof_urls),
-            "dedication_type": _normalize_sponsor_dedication_type(payload.dedication_type),
-            "dedication_name": _clean_text(payload.dedication_name, 160),
-            "dedication_message": _clean_text(payload.dedication_message, 500),
-            "purchaser_note": _clean_text(payload.purchaser_note, 500),
-        },
-    ).mappings().first()
-    order_id = int(order_row["id"])
+    payment_status = "pending" if use_flutterwave else "proof_submitted"
+    order_status = "pending_payment" if use_flutterwave else "payment_review"
+    payment_method = "flutterwave_standard" if use_flutterwave else _clean_text(payload.payment_method or "manual_transfer", 80)
     dedication_type = _normalize_sponsor_dedication_type(payload.dedication_type)
     dedication_name = _clean_text(payload.dedication_name, 160)
     dedication_message = _clean_text(payload.dedication_message, 500)
-    for _ in range(quantity):
-        db.execute(
+    order_uid = _generate_prefixed_uid("ORD")
+    amount_total = round(amount_per_tree * quantity, 2)
+    payment_session: dict | None = None
+    order_id = 0
+    try:
+        order_row = db.execute(
             text(
                 """
-                INSERT INTO green_sponsorship_units (
-                    unit_uid, order_id, sponsor_account_id, project_id, sponsorship_status,
-                    dedication_type, dedication_name, dedication_message
+                INSERT INTO green_sponsorship_orders (
+                    order_uid, sponsor_account_id, project_id, quantity, amount_per_tree, amount_total, currency,
+                    payment_method, payment_reference, payment_status, order_status,
+                    payment_provider, payment_link, payment_gateway_reference, payment_gateway_status, payment_gateway_payload,
+                    payment_proof_url, payment_proof_urls,
+                    dedication_type, dedication_name, dedication_message, purchaser_note
                 )
                 VALUES (
-                    :unit_uid, :order_id, :sponsor_account_id, :project_id, 'awaiting_payment',
-                    :dedication_type, :dedication_name, :dedication_message
+                    :order_uid, :sponsor_account_id, :project_id, :quantity, :amount_per_tree, :amount_total, :currency,
+                    :payment_method, :payment_reference, :payment_status, :order_status,
+                    :payment_provider, :payment_link, :payment_gateway_reference, :payment_gateway_status, CAST(:payment_gateway_payload AS JSONB),
+                    :payment_proof_url, CAST(:payment_proof_urls AS JSONB),
+                    :dedication_type, :dedication_name, :dedication_message, :purchaser_note
                 )
+                RETURNING id, order_uid
                 """
             ),
             {
-                "unit_uid": _generate_prefixed_uid("UNT"),
-                "order_id": order_id,
+                "order_uid": order_uid,
                 "sponsor_account_id": int(sponsor_id),
                 "project_id": int(project["id"]),
+                "quantity": quantity,
+                "amount_per_tree": amount_per_tree,
+                "amount_total": amount_total,
+                "currency": str(project.get("sponsor_currency") or "NGN"),
+                "payment_method": payment_method,
+                "payment_reference": payment_reference,
+                "payment_status": payment_status,
+                "order_status": order_status,
+                "payment_provider": "flutterwave" if use_flutterwave else None,
+                "payment_link": None,
+                "payment_gateway_reference": order_uid if use_flutterwave else None,
+                "payment_gateway_status": "created" if use_flutterwave else None,
+                "payment_gateway_payload": _safe_json({}) if use_flutterwave else None,
+                "payment_proof_url": primary_proof_url,
+                "payment_proof_urls": _safe_json(proof_urls),
                 "dedication_type": dedication_type,
                 "dedication_name": dedication_name,
                 "dedication_message": dedication_message,
+                "purchaser_note": _clean_text(payload.purchaser_note, 500),
+            },
+        ).mappings().first()
+        order_id = int(order_row["id"])
+        for _ in range(quantity):
+            db.execute(
+                text(
+                    """
+                    INSERT INTO green_sponsorship_units (
+                        unit_uid, order_id, sponsor_account_id, project_id, sponsorship_status,
+                        dedication_type, dedication_name, dedication_message
+                    )
+                    VALUES (
+                        :unit_uid, :order_id, :sponsor_account_id, :project_id, 'awaiting_payment',
+                        :dedication_type, :dedication_name, :dedication_message
+                    )
+                    """
+                ),
+                {
+                    "unit_uid": _generate_prefixed_uid("UNT"),
+                    "order_id": order_id,
+                    "sponsor_account_id": int(sponsor_id),
+                    "project_id": int(project["id"]),
+                    "dedication_type": dedication_type,
+                    "dedication_name": dedication_name,
+                    "dedication_message": dedication_message,
+                },
+            )
+        _refresh_sponsorship_order_status(db, order_id)
+        if use_flutterwave:
+            payment_session = _create_flutterwave_payment_link(
+                request=request,
+                order_row={
+                    "id": order_id,
+                    "order_uid": order_uid,
+                    "project_id": int(project["id"]),
+                    "sponsor_account_id": int(sponsor_id),
+                    "amount_total": amount_total,
+                    "currency": str(project.get("sponsor_currency") or "NGN"),
+                    "payment_gateway_reference": order_uid,
+                },
+                sponsor_row=dict(sponsor_row),
+                project=project,
+            )
+            db.execute(
+                text(
+                    """
+                    UPDATE green_sponsorship_orders
+                    SET payment_link = :payment_link,
+                        payment_gateway_reference = :payment_gateway_reference,
+                        payment_gateway_status = :payment_gateway_status,
+                        payment_gateway_payload = CAST(:payment_gateway_payload AS JSONB),
+                        updated_at = NOW()
+                    WHERE id = :order_id
+                    """
+                ),
+                {
+                    "order_id": order_id,
+                    "payment_link": payment_session.get("link"),
+                    "payment_gateway_reference": payment_session.get("tx_ref") or order_uid,
+                    "payment_gateway_status": "created",
+                    "payment_gateway_payload": _safe_json(payment_session.get("raw") or {}),
+                },
+            )
+        _log_audit_event(
+            db,
+            project_id=int(project["id"]),
+            entity_type="sponsorship_order",
+            entity_id=order_id,
+            action="sponsorship_order_created",
+            actor=str(sponsor_row.get("full_name") or "").strip() or str(sponsor_row.get("email") or "").strip(),
+            details={
+                "quantity": quantity,
+                "payment_status": payment_status,
+                "amount_total": amount_total,
+                "payment_method": payment_method,
             },
         )
-    _refresh_sponsorship_order_status(db, order_id)
-    _log_audit_event(
-        db,
-        project_id=int(project["id"]),
-        entity_type="sponsorship_order",
-        entity_id=order_id,
-        action="sponsorship_order_created",
-        actor=str(sponsor_row.get("full_name") or "").strip() or str(sponsor_row.get("email") or "").strip(),
-        details={"quantity": quantity, "payment_status": payment_status, "amount_total": round(amount_per_tree * quantity, 2)},
-    )
-    db.commit()
-    return {"ok": True, "order_id": order_id, "order_uid": order_row.get("order_uid")}
+        db.commit()
+    except HTTPException:
+        db.rollback()
+        raise
+    except Exception:
+        db.rollback()
+        raise
+    return {
+        "ok": True,
+        "order_id": order_id,
+        "order_uid": order_uid,
+        "payment_method": payment_method,
+        "payment_status": payment_status,
+        "payment_link": payment_session.get("link") if payment_session else None,
+    }
+
+
+@router.get("/sponsor/orders/{order_uid}/payment-status")
+def get_sponsor_order_payment_status(
+    order_uid: str,
+    sponsor_id: int = Query(...),
+    refresh: bool = Query(default=False),
+    db: Session = Depends(get_db),
+):
+    row = db.execute(
+        text(
+            """
+            SELECT
+                o.id, o.order_uid, o.project_id, o.quantity, o.amount_per_tree, o.amount_total, o.currency,
+                o.payment_method, o.payment_reference, o.payment_status, o.order_status,
+                o.payment_provider, o.payment_link, o.payment_gateway_reference, o.payment_gateway_transaction_id,
+                o.payment_gateway_status, o.payment_verified_at,
+                o.payment_proof_url, o.payment_proof_urls, o.dedication_type, o.dedication_name,
+                o.dedication_message, o.purchaser_note, o.reviewed_by, o.reviewed_at, o.review_notes,
+                o.created_at, o.updated_at,
+                p.name AS project_name, p.location_text
+            FROM green_sponsorship_orders o
+            JOIN tree_projects p ON p.id = o.project_id
+            WHERE o.sponsor_account_id = :sponsor_id
+              AND UPPER(o.order_uid) = UPPER(:order_uid)
+            LIMIT 1
+            """
+        ),
+        {"sponsor_id": int(sponsor_id), "order_uid": str(order_uid or "").strip()},
+    ).mappings().first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Sponsorship order not found")
+    item = dict(row)
+    if refresh and _normalize_name(item.get("payment_method")) == "flutterwave_standard" and item.get("payment_status") != "verified":
+        try:
+            _sync_sponsorship_order_flutterwave_payment(
+                db,
+                item,
+                transaction_id=int(item.get("payment_gateway_transaction_id") or 0) or None,
+                tx_ref=item.get("payment_gateway_reference"),
+                actor="sponsor_app",
+            )
+            db.commit()
+        except HTTPException:
+            db.rollback()
+        row = db.execute(
+            text(
+                """
+                SELECT
+                    o.id, o.order_uid, o.project_id, o.quantity, o.amount_per_tree, o.amount_total, o.currency,
+                    o.payment_method, o.payment_reference, o.payment_status, o.order_status,
+                    o.payment_provider, o.payment_link, o.payment_gateway_reference, o.payment_gateway_transaction_id,
+                    o.payment_gateway_status, o.payment_verified_at,
+                    o.payment_proof_url, o.payment_proof_urls, o.dedication_type, o.dedication_name,
+                    o.dedication_message, o.purchaser_note, o.reviewed_by, o.reviewed_at, o.review_notes,
+                    o.created_at, o.updated_at,
+                    p.name AS project_name, p.location_text
+                FROM green_sponsorship_orders o
+                JOIN tree_projects p ON p.id = o.project_id
+                WHERE o.sponsor_account_id = :sponsor_id
+                  AND UPPER(o.order_uid) = UPPER(:order_uid)
+                LIMIT 1
+                """
+            ),
+            {"sponsor_id": int(sponsor_id), "order_uid": str(order_uid or "").strip()},
+        ).mappings().first()
+        item = dict(row or {})
+    counts = db.execute(
+        text(
+            """
+            SELECT
+                COUNT(*) AS total_units,
+                COUNT(*) FILTER (WHERE tree_id IS NOT NULL) AS linked_units,
+                COUNT(*) FILTER (WHERE LOWER(COALESCE(sponsorship_status, '')) = 'awaiting_tree') AS awaiting_tree_units,
+                COUNT(*) FILTER (WHERE LOWER(COALESCE(sponsorship_status, '')) = 'awaiting_payment') AS awaiting_payment_units
+            FROM green_sponsorship_units
+            WHERE order_id = :order_id
+            """
+        ),
+        {"order_id": int(item.get("id") or 0)},
+    ).mappings().first() or {}
+    item["payment_status"] = _normalize_sponsor_payment_status(item.get("payment_status"))
+    item["order_status"] = _normalize_sponsor_order_status(item.get("order_status"))
+    item["payment_proof_urls"] = _normalize_photo_urls(item.get("payment_proof_urls"))
+    item["total_units"] = int(counts.get("total_units") or 0)
+    item["linked_units"] = int(counts.get("linked_units") or 0)
+    item["awaiting_tree_units"] = int(counts.get("awaiting_tree_units") or 0)
+    item["awaiting_payment_units"] = int(counts.get("awaiting_payment_units") or 0)
+    return item
+
+
+@router.get("/sponsor/payments/flutterwave/return")
+def sponsor_flutterwave_return(
+    order_uid: str,
+    status: str | None = Query(default=None),
+    tx_ref: str | None = Query(default=None),
+    transaction_id: int | None = Query(default=None),
+    db: Session = Depends(get_db),
+):
+    order = db.execute(
+        text(
+            """
+            SELECT
+                id, order_uid, sponsor_account_id, project_id, amount_total, currency,
+                payment_method, payment_status, payment_gateway_reference, payment_gateway_transaction_id
+            FROM green_sponsorship_orders
+            WHERE UPPER(order_uid) = UPPER(:order_uid)
+            LIMIT 1
+            """
+        ),
+        {"order_uid": str(order_uid or "").strip()},
+    ).mappings().first()
+    if not order:
+        deep_link = _build_sponsor_payment_app_url(str(order_uid or "").strip(), "failed", "We could not find that sponsorship order.")
+        return Response(
+            content=_render_sponsor_payment_return_page("Order not found", "We could not find that sponsorship order. Return to the app and try again.", deep_link),
+            media_type="text/html",
+        )
+    payment_state = "pending"
+    message = "We are checking your payment. Return to the app to see the latest status."
+    status_key = _normalize_name(status)
+    if status_key in {"failed", "cancelled", "canceled"}:
+        payment_state = "failed"
+        message = "Payment was not completed. You can try again from the app."
+    if status_key in {"successful", "completed", "pending"} or tx_ref or transaction_id:
+        try:
+            result = _sync_sponsorship_order_flutterwave_payment(
+                db,
+                dict(order),
+                transaction_id=int(transaction_id or 0) or None,
+                tx_ref=tx_ref or order.get("payment_gateway_reference"),
+                actor="flutterwave_redirect",
+                review_notes="Verified after Flutterwave redirect",
+            )
+            db.commit()
+            payment_state = "verified" if result.get("verified") else ("failed" if result.get("gateway_status") in {"failed", "cancelled", "canceled"} else "pending")
+            message = str(result.get("message") or message)
+        except HTTPException:
+            db.rollback()
+            payment_state = "pending"
+            message = "We could not confirm the payment automatically yet. Return to the app and refresh the order status."
+    deep_link = _build_sponsor_payment_app_url(str(order.get("order_uid") or order_uid), payment_state, message)
+    title = "Payment pending"
+    if payment_state == "verified":
+        title = "Payment received"
+    elif payment_state == "failed":
+        title = "Payment incomplete"
+    return Response(content=_render_sponsor_payment_return_page(title, message, deep_link), media_type="text/html")
+
+
+@router.post("/sponsor/payments/flutterwave/webhook")
+async def sponsor_flutterwave_webhook(request: Request, db: Session = Depends(get_db)):
+    raw_body = await request.body()
+    signature = request.headers.get("flutterwave-signature")
+    if not _verify_flutterwave_webhook_signature(raw_body, signature):
+        raise HTTPException(status_code=401, detail="Invalid webhook signature")
+    try:
+        payload = json.loads(raw_body.decode("utf-8") or "{}")
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="Invalid webhook payload") from exc
+    event_type = _normalize_name(payload.get("type"))
+    data = payload.get("data") or {}
+    tx_ref = str(data.get("tx_ref") or data.get("reference") or "").strip()
+    gateway_transaction_id = int(data.get("id") or 0) or None
+    if event_type != "charge.completed" or not tx_ref:
+        return {"ok": True, "ignored": True}
+    order = db.execute(
+        text(
+            """
+            SELECT
+                id, order_uid, sponsor_account_id, project_id, amount_total, currency,
+                payment_method, payment_status, payment_gateway_reference, payment_gateway_transaction_id
+            FROM green_sponsorship_orders
+            WHERE UPPER(COALESCE(payment_gateway_reference, order_uid)) = UPPER(:tx_ref)
+               OR UPPER(order_uid) = UPPER(:tx_ref)
+            LIMIT 1
+            """
+        ),
+        {"tx_ref": tx_ref},
+    ).mappings().first()
+    if not order:
+        return {"ok": True, "ignored": True}
+    try:
+        result = _sync_sponsorship_order_flutterwave_payment(
+            db,
+            dict(order),
+            transaction_id=gateway_transaction_id,
+            tx_ref=tx_ref,
+            actor="flutterwave_webhook",
+            review_notes="Verified by Flutterwave webhook",
+        )
+        _log_audit_event(
+            db,
+            project_id=int(order.get("project_id") or 0) or None,
+            entity_type="sponsorship_order",
+            entity_id=int(order.get("id") or 0),
+            action="sponsorship_payment_webhook",
+            actor="flutterwave_webhook",
+            details={"tx_ref": tx_ref, "verified": bool(result.get("verified")), "gateway_status": result.get("gateway_status")},
+        )
+        db.commit()
+        return {"ok": True, "verified": bool(result.get("verified"))}
+    except HTTPException as exc:
+        db.rollback()
+        if exc.status_code >= 500:
+            raise
+        return {"ok": False, "detail": exc.detail}
 
 
 @router.get("/sponsor/orders")
@@ -6421,6 +7040,8 @@ def list_sponsor_orders(sponsor_id: int = Query(...), db: Session = Depends(get_
             SELECT
                 o.id, o.order_uid, o.project_id, o.quantity, o.amount_per_tree, o.amount_total, o.currency,
                 o.payment_method, o.payment_reference, o.payment_status, o.order_status,
+                o.payment_provider, o.payment_link, o.payment_gateway_reference, o.payment_gateway_transaction_id,
+                o.payment_gateway_status, o.payment_verified_at,
                 o.payment_proof_url, o.payment_proof_urls, o.dedication_type, o.dedication_name,
                 o.dedication_message, o.purchaser_note, o.reviewed_by, o.reviewed_at, o.review_notes,
                 o.created_at, o.updated_at,
@@ -6661,6 +7282,8 @@ def list_admin_sponsorship_orders(project_id: int | None = Query(default=None), 
             SELECT
                 o.id, o.order_uid, o.project_id, o.quantity, o.amount_per_tree, o.amount_total, o.currency,
                 o.payment_method, o.payment_reference, o.payment_status, o.order_status,
+                o.payment_provider, o.payment_link, o.payment_gateway_reference, o.payment_gateway_transaction_id,
+                o.payment_gateway_status, o.payment_verified_at,
                 o.payment_proof_url, o.payment_proof_urls, o.dedication_type, o.dedication_name,
                 o.dedication_message, o.purchaser_note, o.reviewed_by, o.reviewed_at, o.review_notes,
                 o.created_at, o.updated_at,
