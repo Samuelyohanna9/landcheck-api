@@ -7370,6 +7370,35 @@ def _list_admin_sponsorship_orders(db: Session, project_id: int | None = None, s
     return payload
 
 
+def _summarize_sponsorship_accounts_from_orders(orders: list[dict]) -> list[dict]:
+    by_id: dict[int, dict] = {}
+    for row in orders:
+        sponsor_id = int(row.get("sponsor_account_id") or 0)
+        if sponsor_id <= 0:
+            continue
+        current = by_id.get(sponsor_id)
+        if current:
+            current["orders_count"] += 1
+            current["amount_total"] = round(float(current.get("amount_total") or 0) + float(row.get("amount_total") or 0), 2)
+            current["linked_trees"] += int(row.get("linked_units") or 0)
+            continue
+        current = {
+            "id": sponsor_id,
+            "sponsor_uid": str(row.get("sponsor_uid") or "").strip() or None,
+            "full_name": str(row.get("sponsor_name") or "").strip() or f"Sponsor #{sponsor_id}",
+            "account_type": _normalize_sponsor_account_type(row.get("sponsor_account_type")),
+            "organization_name": str(row.get("sponsor_organization_name") or "").strip() or None,
+            "email": str(row.get("sponsor_email") or "").strip().lower() or None,
+            "phone": None,
+            "is_active": True,
+            "orders_count": 1,
+            "amount_total": round(float(row.get("amount_total") or 0), 2),
+            "linked_trees": int(row.get("linked_units") or 0),
+        }
+        by_id[sponsor_id] = current
+    return [by_id[key] for key in sorted(by_id.keys(), key=lambda item: (str(by_id[item].get("full_name") or "").lower(), item))]
+
+
 @router.get("/admin/sponsorship-orders")
 def list_admin_sponsorship_orders(project_id: int | None = Query(default=None), db: Session = Depends(get_db)):
     return _list_admin_sponsorship_orders(db, project_id=project_id, sync_gateway=True)
@@ -8186,7 +8215,19 @@ def get_project(
         ),
         {"project_id": project_id},
     ).mappings().first() or {}
-    sponsorship_orders = _list_admin_sponsorship_orders(db, project_id=project_id, sync_gateway=False) if _is_public_sponsorship_project(project) else []
+    sponsorship_orders: list[dict] = []
+    sponsorship_scope_note: str | None = None
+    sponsor_accounts: list[dict] = []
+    if _is_public_sponsorship_project(project):
+        sponsorship_orders = _list_admin_sponsorship_orders(db, project_id=project_id, sync_gateway=False)
+        if not sponsorship_orders:
+            fallback_orders = _list_admin_sponsorship_orders(db, project_id=None, sync_gateway=False)
+            if fallback_orders:
+                sponsorship_orders = fallback_orders
+                sponsorship_scope_note = (
+                    "No sponsorship orders matched this project yet. Showing all public sponsorship payments across projects so paid sponsors stay visible in Work."
+                )
+        sponsor_accounts = _summarize_sponsorship_accounts_from_orders(sponsorship_orders)
 
     return {
         **dict(project),
@@ -8228,6 +8269,8 @@ def get_project(
             "trees_pending_review": carbon.get("trees_pending_review", 0),
         },
         "sponsorship_orders": sponsorship_orders,
+        "sponsor_accounts": sponsor_accounts,
+        "sponsorship_scope_note": sponsorship_scope_note,
     }
 
 
