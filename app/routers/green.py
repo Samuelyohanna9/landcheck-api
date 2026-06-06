@@ -9158,7 +9158,7 @@ def _render_public_sponsor_tree_story_html(item: dict) -> str:
 
 
 @router.get("/sponsor/trees/{unit_id}")
-def get_sponsor_tree_detail(unit_id: int, sponsor_id: int = Query(...), request: Request | None = None, db: Session = Depends(get_db)):
+def get_sponsor_tree_detail(unit_id: int, sponsor_id: int = Query(...), request: Request, db: Session = Depends(get_db)):
     row = db.execute(
         text(
             """
