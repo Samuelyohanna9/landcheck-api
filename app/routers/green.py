@@ -373,6 +373,7 @@ class SponsorAgentBankResolvePayload(BaseModel):
 class SponsorAgentPayoutRequestPayload(BaseModel):
     user_id: int
     organization_id: int | None = None
+    project_id: int | None = None
 
 
 class SponsorAgentPayoutReviewPayload(BaseModel):
@@ -6418,9 +6419,9 @@ def _get_green_user_for_sponsor_agent(
     payload = dict(row)
     if not bool(payload.get("is_active", True)) or not bool(payload.get("allow_green", True)):
         raise HTTPException(status_code=403, detail="This user is not enabled for sponsor-funded Green work")
-    if payload.get("organization_id") is None or not bool(payload.get("organization_is_active", True)):
+    if payload.get("organization_id") is not None and not bool(payload.get("organization_is_active", True)):
         raise HTTPException(status_code=403, detail="This user is not linked to an active organization")
-    if _normalize_name(payload.get("organization_status")) == "suspended":
+    if payload.get("organization_id") is not None and _normalize_name(payload.get("organization_status")) == "suspended":
         raise HTTPException(status_code=403, detail="This organization is suspended")
     return payload
 
@@ -6524,6 +6525,7 @@ def _list_public_sponsor_projects_for_agent(
     *,
     user_id: int,
     organization_id: int | None = None,
+    project_id: int | None = None,
 ) -> list[dict]:
     rows = db.execute(
         text(
@@ -6543,8 +6545,9 @@ def _list_public_sponsor_projects_for_agent(
               AND (
                     :organization_id IS NULL
                  OR p.organization_id = :organization_id
-                 OR p.organization_id IS NULL
+                  OR p.organization_id IS NULL
               )
+              AND (:project_id IS NULL OR p.id = :project_id)
               AND EXISTS (
                     SELECT 1
                     FROM jsonb_array_elements_text(COALESCE(p.public_sponsor_agent_user_ids, '[]'::jsonb)) AS selected(user_id_text)
@@ -6553,7 +6556,11 @@ def _list_public_sponsor_projects_for_agent(
             ORDER BY p.created_at DESC
             """
         ),
-        {"user_id": int(user_id), "organization_id": int(organization_id) if organization_id is not None else None},
+        {
+            "user_id": int(user_id),
+            "organization_id": int(organization_id) if organization_id is not None else None,
+            "project_id": int(project_id) if project_id is not None else None,
+        },
     ).mappings().all()
     items: list[dict] = []
     for row in rows:
@@ -6591,30 +6598,128 @@ def _load_sponsor_agent_bank_account(db: Session, *, user_id: int) -> dict | Non
 def _load_sponsor_agent_payout_requests(
     db: Session,
     *,
-    organization_id: int,
+    organization_id: int | None = None,
     user_id: int | None = None,
+    user_ids: list[int] | None = None,
+    project_id: int | None = None,
 ) -> list[dict]:
-    rows = db.execute(
-        text(
+    normalized_user_ids = _normalize_positive_int_list(user_ids or []) if user_ids is not None else None
+    if user_ids is not None and not normalized_user_ids:
+        return []
+    where_clauses: list[str] = []
+    params: dict[str, object] = {}
+    bind_params = []
+    if organization_id is not None:
+        where_clauses.append("pr.organization_id = :organization_id")
+        params["organization_id"] = int(organization_id)
+    if user_id is not None:
+        where_clauses.append("pr.user_id = :user_id")
+        params["user_id"] = int(user_id)
+    if normalized_user_ids is not None:
+        where_clauses.append("pr.user_id IN :user_ids")
+        params["user_ids"] = normalized_user_ids
+        bind_params.append(bindparam("user_ids", expanding=True))
+    if project_id is not None:
+        where_clauses.append(
             """
-            SELECT
-                pr.id, pr.request_uid, pr.user_id, pr.organization_id, pr.currency, pr.amount_total, pr.payout_minimum,
-                pr.status, pr.bank_code, pr.bank_name, pr.account_number, pr.account_name,
-                pr.earning_keys, pr.earning_rows, pr.project_ids,
-                pr.review_notes, pr.reviewed_by, pr.reviewed_at,
-                pr.transfer_reference, pr.transfer_id, pr.transfer_status, pr.transfer_payload,
-                pr.transfer_processed_at, pr.paid_at, pr.created_at, pr.updated_at,
-                u.full_name AS user_name, u.user_uid
-            FROM green_sponsor_agent_payout_requests pr
-            JOIN green_users u ON u.id = pr.user_id
-            WHERE pr.organization_id = :organization_id
-              AND (:user_id IS NULL OR pr.user_id = :user_id)
-            ORDER BY pr.created_at DESC, pr.id DESC
+            EXISTS (
+                SELECT 1
+                FROM jsonb_array_elements_text(COALESCE(pr.project_ids, '[]'::jsonb)) AS selected(project_id_text)
+                WHERE CAST(selected.project_id_text AS INTEGER) = :project_id
+            )
             """
-        ),
-        {"organization_id": int(organization_id), "user_id": int(user_id) if user_id is not None else None},
-    ).mappings().all()
+        )
+        params["project_id"] = int(project_id)
+    query = text(
+        f"""
+        SELECT
+            pr.id, pr.request_uid, pr.user_id, pr.organization_id, pr.currency, pr.amount_total, pr.payout_minimum,
+            pr.status, pr.bank_code, pr.bank_name, pr.account_number, pr.account_name,
+            pr.earning_keys, pr.earning_rows, pr.project_ids,
+            pr.review_notes, pr.reviewed_by, pr.reviewed_at,
+            pr.transfer_reference, pr.transfer_id, pr.transfer_status, pr.transfer_payload,
+            pr.transfer_processed_at, pr.paid_at, pr.created_at, pr.updated_at,
+            u.full_name AS user_name, u.user_uid
+        FROM green_sponsor_agent_payout_requests pr
+        JOIN green_users u ON u.id = pr.user_id
+        {"WHERE " + " AND ".join(where_clauses) if where_clauses else ""}
+        ORDER BY pr.created_at DESC, pr.id DESC
+        """
+    )
+    if bind_params:
+        query = query.bindparams(*bind_params)
+    rows = db.execute(query, params).mappings().all()
     return [dict(row) for row in rows]
+
+
+def _filter_sponsor_agent_dashboard_to_project(dashboard: dict, *, project_id: int | None = None) -> dict:
+    project_id_value = int(project_id or 0)
+    if project_id_value <= 0:
+        return dashboard
+    filtered_projects = [
+        dict(item)
+        for item in (dashboard.get("projects") or [])
+        if int(item.get("project_id") or 0) == project_id_value
+    ]
+    filtered_project_summaries = [
+        dict(item)
+        for item in (dashboard.get("project_summaries") or [])
+        if int(item.get("project_id") or 0) == project_id_value
+    ]
+    filtered_earnings = [
+        dict(item)
+        for item in (dashboard.get("earnings") or [])
+        if int(item.get("project_id") or 0) == project_id_value
+    ]
+    filtered_requests = [
+        dict(item)
+        for item in (dashboard.get("requests") or [])
+        if project_id_value in _normalize_positive_int_list(item.get("project_ids") or [])
+    ]
+    available_amount = 0.0
+    requested_amount = 0.0
+    paid_amount = 0.0
+    planting_count = 0
+    maintenance_count = 0
+    for item in filtered_earnings:
+        amount = round(float(item.get("amount") or 0), 2)
+        payout_status = _normalize_sponsor_agent_payout_status(item.get("payout_status"))
+        if _normalize_name(item.get("work_type")) == "planting":
+            planting_count += 1
+        else:
+            maintenance_count += 1
+        if payout_status == "available":
+            available_amount += amount
+        elif payout_status in {"requested", "approved", "processing"}:
+            requested_amount += amount
+        elif payout_status == "paid":
+            paid_amount += amount
+    summary = dict(dashboard.get("summary") or {})
+    minimum_amount = round(float(dashboard.get("minimum_payout_amount") or SPONSOR_AGENT_MIN_PAYOUT_NAIRA), 2)
+    summary.update(
+        {
+            "eligible_project_count": len(filtered_projects),
+            "planting_count": planting_count,
+            "maintenance_count": maintenance_count,
+            "total_earnings_amount": round(available_amount + requested_amount + paid_amount, 2),
+            "available_amount": round(available_amount, 2),
+            "requested_amount": round(requested_amount, 2),
+            "paid_amount": round(paid_amount, 2),
+            "pending_request_count": sum(
+                1 for row in filtered_requests if _normalize_sponsor_agent_payout_status(row.get("status")) in {"requested", "approved", "processing"}
+            ),
+            "paid_request_count": sum(1 for row in filtered_requests if _normalize_sponsor_agent_payout_status(row.get("status")) == "paid"),
+            "payout_eligible": round(available_amount, 2) >= minimum_amount,
+        }
+    )
+    next_dashboard = dict(dashboard)
+    next_dashboard["eligible"] = len(filtered_projects) > 0
+    next_dashboard["projects"] = filtered_projects
+    next_dashboard["project_summaries"] = filtered_project_summaries
+    next_dashboard["earnings"] = filtered_earnings
+    next_dashboard["requests"] = filtered_requests
+    next_dashboard["summary"] = summary
+    return next_dashboard
 
 
 def _build_sponsor_agent_earning_rows(
@@ -6786,18 +6891,21 @@ def _build_sponsor_agent_dashboard(
     *,
     user_id: int,
     organization_id: int | None = None,
+    project_id: int | None = None,
 ) -> dict:
     user_row = _get_green_user_for_sponsor_agent(db, user_id=user_id, organization_id=organization_id)
     project_rows = _list_public_sponsor_projects_for_agent(
         db,
         user_id=int(user_row["id"]),
         organization_id=int(user_row["organization_id"]) if user_row.get("organization_id") is not None else None,
+        project_id=int(project_id) if project_id is not None else None,
     )
     bank_row = _load_sponsor_agent_bank_account(db, user_id=int(user_row["id"]))
     request_rows = _load_sponsor_agent_payout_requests(
         db,
-        organization_id=int(user_row["organization_id"]),
+        organization_id=int(user_row["organization_id"]) if user_row.get("organization_id") is not None else None,
         user_id=int(user_row["id"]),
+        project_id=int(project_id) if project_id is not None else None,
     )
     serialized_requests = [item for item in (_serialize_sponsor_agent_payout_request(row) for row in request_rows) if item]
     earnings = _build_sponsor_agent_earning_rows(db, user_row=user_row, project_rows=project_rows)
@@ -6853,7 +6961,7 @@ def _build_sponsor_agent_dashboard(
         earning_rows.append(enriched)
     minimum_amount = SPONSOR_AGENT_MIN_PAYOUT_NAIRA
     bank_payload = _serialize_sponsor_agent_bank_account(bank_row)
-    return {
+    dashboard = {
         "eligible": len(project_rows) > 0,
         "minimum_payout_amount": minimum_amount,
         "currency": SPONSOR_AGENT_ACCOUNT_CURRENCY,
@@ -6894,6 +7002,7 @@ def _build_sponsor_agent_dashboard(
         "earnings": earning_rows,
         "requests": serialized_requests,
     }
+    return _filter_sponsor_agent_dashboard_to_project(dashboard, project_id=project_id)
 
 
 def _flutterwave_payout_callback_url(request: Request) -> str:
@@ -8359,7 +8468,7 @@ def save_sponsor_agent_bank_account(payload: SponsorAgentBankAccountPayload, db:
             ),
             {
                 "account_id": int(existing["id"]),
-                "organization_id": int(user_row["organization_id"]),
+                "organization_id": int(user_row.get("organization_id") or 0) or None,
                 "currency": SPONSOR_AGENT_ACCOUNT_CURRENCY,
                 "bank_code": bank_code,
                 "bank_name": bank_name,
@@ -8385,7 +8494,7 @@ def save_sponsor_agent_bank_account(payload: SponsorAgentBankAccountPayload, db:
             ),
             {
                 "user_id": int(user_row["id"]),
-                "organization_id": int(user_row["organization_id"]),
+                "organization_id": int(user_row.get("organization_id") or 0) or None,
                 "currency": SPONSOR_AGENT_ACCOUNT_CURRENCY,
                 "bank_code": bank_code,
                 "bank_name": bank_name,
@@ -8402,12 +8511,14 @@ def save_sponsor_agent_bank_account(payload: SponsorAgentBankAccountPayload, db:
 def get_sponsor_agent_payout_dashboard(
     user_id: int = Query(...),
     organization_id: int | None = Query(default=None),
+    project_id: int | None = Query(default=None),
     db: Session = Depends(get_db),
 ):
     return _build_sponsor_agent_dashboard(
         db,
         user_id=int(user_id),
         organization_id=int(organization_id) if organization_id is not None else None,
+        project_id=int(project_id) if project_id is not None else None,
     )
 
 
@@ -8417,6 +8528,7 @@ def create_sponsor_agent_payout_request(payload: SponsorAgentPayoutRequestPayloa
         db,
         user_id=int(payload.user_id),
         organization_id=int(payload.organization_id) if payload.organization_id is not None else None,
+        project_id=int(payload.project_id) if payload.project_id is not None else None,
     )
     if not dashboard.get("eligible"):
         raise HTTPException(status_code=403, detail="This user is not selected as a public sponsor agent")
@@ -8786,7 +8898,7 @@ def list_admin_sponsor_agent_payouts(
     project_row = db.execute(
         text(
             """
-            SELECT id, organization_id, name
+            SELECT id, organization_id, name, public_sponsor_agent_user_ids
             FROM tree_projects
             WHERE id = :project_id
             LIMIT 1
@@ -8797,10 +8909,14 @@ def list_admin_sponsor_agent_payouts(
     if not project_row:
         raise HTTPException(status_code=404, detail="Project not found")
     organization_id = int(project_row.get("organization_id") or 0)
-    if organization_id <= 0:
-        raise HTTPException(status_code=400, detail="This project is not linked to an organization")
+    selected_agent_ids = _normalize_positive_int_list(_json_value_or(project_row.get("public_sponsor_agent_user_ids"), []))
     if sync:
-        request_rows = _load_sponsor_agent_payout_requests(db, organization_id=organization_id)
+        request_rows = _load_sponsor_agent_payout_requests(
+            db,
+            organization_id=organization_id if organization_id > 0 else None,
+            user_ids=selected_agent_ids,
+            project_id=int(project_id),
+        )
         for row in request_rows:
             if int(row.get("transfer_id") or 0) > 0 and _normalize_sponsor_agent_payout_status(row.get("status")) in {"approved", "processing"}:
                 try:
@@ -8808,46 +8924,42 @@ def list_admin_sponsor_agent_payouts(
                 except Exception:
                     continue
         db.commit()
-    agent_ids = db.execute(
-        text(
-            """
-            SELECT DISTINCT CAST(selected.user_id_text AS INTEGER) AS user_id
-            FROM tree_projects p
-            CROSS JOIN LATERAL jsonb_array_elements_text(COALESCE(p.public_sponsor_agent_user_ids, '[]'::jsonb)) AS selected(user_id_text)
-            WHERE p.organization_id = :organization_id
-              AND (
-                    LOWER(COALESCE(p.access_model, 'partner_org')) = 'public_sponsorship'
-                 OR COALESCE(p.public_sponsor_enabled, FALSE) = TRUE
-                  )
-            ORDER BY CAST(selected.user_id_text AS INTEGER)
-            """
-        ),
-        {"organization_id": organization_id},
-    ).scalars().all()
+    agent_ids = selected_agent_ids
     agents: list[dict] = []
     total_available = 0.0
     total_requested = 0.0
     total_paid = 0.0
+    requests_by_id: dict[int, dict] = {}
     for agent_id in agent_ids:
         try:
-            dashboard = _build_sponsor_agent_dashboard(db, user_id=int(agent_id), organization_id=organization_id)
+            dashboard = _build_sponsor_agent_dashboard(
+                db,
+                user_id=int(agent_id),
+                organization_id=organization_id if organization_id > 0 else None,
+                project_id=int(project_id),
+            )
         except HTTPException:
+            continue
+        if not dashboard.get("eligible"):
             continue
         summary = dashboard.get("summary") or {}
         total_available += float(summary.get("available_amount") or 0)
         total_requested += float(summary.get("requested_amount") or 0)
         total_paid += float(summary.get("paid_amount") or 0)
+        for request_item in dashboard.get("requests") or []:
+            request_id = int(request_item.get("id") or 0)
+            if request_id > 0:
+                requests_by_id[request_id] = dict(request_item)
         agents.append(dashboard)
-    request_rows = _load_sponsor_agent_payout_requests(db, organization_id=organization_id)
-    requests_payload = [
-        item
-        for item in (_serialize_sponsor_agent_payout_request(row) for row in request_rows)
-        if item
-    ]
+    requests_payload = sorted(
+        requests_by_id.values(),
+        key=lambda item: (str(item.get("created_at") or ""), int(item.get("id") or 0)),
+        reverse=True,
+    )
     return {
         "project_id": int(project_id),
         "project_name": str(project_row.get("name") or "").strip() or None,
-        "organization_id": organization_id,
+        "organization_id": organization_id or None,
         "minimum_payout_amount": SPONSOR_AGENT_MIN_PAYOUT_NAIRA,
         "currency": SPONSOR_AGENT_ACCOUNT_CURRENCY,
         "auto_payout_available": bool(_flutterwave_secret_key()),
