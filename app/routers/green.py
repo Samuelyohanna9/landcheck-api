@@ -6486,40 +6486,63 @@ def _collect_public_sponsor_agent_user_ids_for_project(
 ) -> list[int]:
     collected = _normalize_positive_int_list(explicit_user_ids or [])
     seen = set(collected)
-    name_rows = db.execute(
-        text(
-            """
-            WITH sponsor_tree_links AS (
-                SELECT DISTINCT u.tree_id
-                FROM green_sponsorship_units u
-                JOIN green_sponsorship_orders o ON o.id = u.order_id
-                WHERE u.project_id = :project_id
-                  AND u.tree_id IS NOT NULL
-                  AND LOWER(COALESCE(o.payment_status, '')) = 'verified'
-                  AND LOWER(COALESCE(u.sponsorship_status, '')) IN ('linked', 'active', 'replaced')
-            )
-            SELECT DISTINCT assignee_name
-            FROM (
-                SELECT NULLIF(BTRIM(COALESCE(wo.assignee_name, '')), '') AS assignee_name
-                FROM green_work_orders wo
-                WHERE wo.project_id = :project_id
-                  AND LOWER(REPLACE(REPLACE(COALESCE(wo.work_type, ''), '-', '_'), ' ', '_')) = 'planting'
-                UNION
-                SELECT NULLIF(BTRIM(COALESCE(tt.assignee_name, '')), '') AS assignee_name
-                FROM tree_tasks tt
-                WHERE tt.project_id = :project_id
-                  AND LOWER(REPLACE(REPLACE(COALESCE(tt.task_type, ''), '-', '_'), ' ', '_')) IN ('planting', 'maintenance')
-                UNION
-                SELECT NULLIF(BTRIM(COALESCE(tr.created_by, '')), '') AS assignee_name
-                FROM trees tr
-                JOIN sponsor_tree_links link ON link.tree_id = tr.id
-                WHERE tr.project_id = :project_id
-            ) names
-            WHERE assignee_name IS NOT NULL
-            """
-        ),
-        {"project_id": int(project_id)},
-    ).scalars().all()
+    try:
+        name_rows = db.execute(
+            text(
+                """
+                WITH sponsor_tree_links AS (
+                    SELECT DISTINCT u.tree_id
+                    FROM green_sponsorship_units u
+                    JOIN green_sponsorship_orders o ON o.id = u.order_id
+                    WHERE u.project_id = :project_id
+                      AND u.tree_id IS NOT NULL
+                      AND LOWER(COALESCE(o.payment_status, '')) = 'verified'
+                      AND LOWER(COALESCE(u.sponsorship_status, '')) IN ('linked', 'active', 'replaced')
+                )
+                SELECT DISTINCT assignee_name
+                FROM (
+                    SELECT NULLIF(BTRIM(COALESCE(wo.assignee_name, '')), '') AS assignee_name
+                    FROM green_work_orders wo
+                    WHERE wo.project_id = :project_id
+                      AND LOWER(REPLACE(REPLACE(COALESCE(wo.work_type, ''), '-', '_'), ' ', '_')) = 'planting'
+                    UNION
+                    SELECT NULLIF(BTRIM(COALESCE(tt.assignee_name, '')), '') AS assignee_name
+                    FROM tree_tasks tt
+                    WHERE tt.project_id = :project_id
+                      AND LOWER(REPLACE(REPLACE(COALESCE(tt.task_type, ''), '-', '_'), ' ', '_')) IN ('planting', 'maintenance')
+                    UNION
+                    SELECT NULLIF(BTRIM(COALESCE(tr.created_by, '')), '') AS assignee_name
+                    FROM trees tr
+                    JOIN sponsor_tree_links link ON link.tree_id = tr.id
+                    WHERE tr.project_id = :project_id
+                ) names
+                WHERE assignee_name IS NOT NULL
+                """
+            ),
+            {"project_id": int(project_id)},
+        ).scalars().all()
+    except Exception:
+        try:
+            name_rows = db.execute(
+                text(
+                    """
+                    SELECT DISTINCT assignee_name
+                    FROM (
+                        SELECT NULLIF(BTRIM(COALESCE(tt.assignee_name, '')), '') AS assignee_name
+                        FROM tree_tasks tt
+                        WHERE tt.project_id = :project_id
+                        UNION
+                        SELECT NULLIF(BTRIM(COALESCE(tr.created_by, '')), '') AS assignee_name
+                        FROM trees tr
+                        WHERE tr.project_id = :project_id
+                    ) names
+                    WHERE assignee_name IS NOT NULL
+                    """
+                ),
+                {"project_id": int(project_id)},
+            ).scalars().all()
+        except Exception:
+            name_rows = []
     for assignee_name in name_rows:
         matched_rows = _list_green_users_for_assignee_name(
             db,
@@ -6550,7 +6573,13 @@ def _list_public_sponsor_project_ids_for_user_ids(
             """
             SELECT DISTINCT p.id
             FROM tree_projects p
-            CROSS JOIN LATERAL jsonb_array_elements_text(COALESCE(p.public_sponsor_agent_user_ids, '[]'::jsonb)) AS selected(user_id_text)
+            CROSS JOIN LATERAL jsonb_array_elements_text(
+                CASE
+                    WHEN jsonb_typeof(COALESCE(p.public_sponsor_agent_user_ids, '[]'::jsonb)) = 'array'
+                    THEN COALESCE(p.public_sponsor_agent_user_ids, '[]'::jsonb)
+                    ELSE '[]'::jsonb
+                END
+            ) AS selected(user_id_text)
             WHERE (
                     LOWER(COALESCE(p.access_model, 'partner_org')) = 'public_sponsorship'
                  OR COALESCE(p.public_sponsor_enabled, FALSE) = TRUE
@@ -6612,7 +6641,13 @@ def _list_public_sponsor_projects_for_agent(
               AND (:project_id IS NULL OR p.id = :project_id)
               AND EXISTS (
                     SELECT 1
-                    FROM jsonb_array_elements_text(COALESCE(p.public_sponsor_agent_user_ids, '[]'::jsonb)) AS selected(user_id_text)
+                    FROM jsonb_array_elements_text(
+                        CASE
+                            WHEN jsonb_typeof(COALESCE(p.public_sponsor_agent_user_ids, '[]'::jsonb)) = 'array'
+                            THEN COALESCE(p.public_sponsor_agent_user_ids, '[]'::jsonb)
+                            ELSE '[]'::jsonb
+                        END
+                    ) AS selected(user_id_text)
                     WHERE CAST(selected.user_id_text AS INTEGER) = :user_id
               )
             ORDER BY p.created_at DESC
@@ -6686,7 +6721,13 @@ def _load_sponsor_agent_payout_requests(
             """
             EXISTS (
                 SELECT 1
-                FROM jsonb_array_elements_text(COALESCE(pr.project_ids, '[]'::jsonb)) AS selected(project_id_text)
+                FROM jsonb_array_elements_text(
+                    CASE
+                        WHEN jsonb_typeof(COALESCE(pr.project_ids, '[]'::jsonb)) = 'array'
+                        THEN COALESCE(pr.project_ids, '[]'::jsonb)
+                        ELSE '[]'::jsonb
+                    END
+                ) AS selected(project_id_text)
                 WHERE CAST(selected.project_id_text AS INTEGER) = :project_id
             )
             """
@@ -6824,64 +6865,70 @@ def _build_sponsor_agent_earning_rows(
             ORDER BY u.tree_id, COALESCE(u.linked_at, u.updated_at, u.created_at) DESC, u.id DESC
         )
     """
-    planting_rows = db.execute(
-        text(
-            sponsor_link_cte
-            + """
-            SELECT
-                t.project_id,
-                t.id AS tree_id,
-                t.project_tree_no,
-                t.species,
-                t.created_by,
-                t.planting_date,
-                COALESCE(t.created_at, NOW()) AS earned_at,
-                link.unit_id,
-                link.order_id,
-                link.order_uid,
-                link.sponsor_name,
-                link.sponsor_organization_name
-            FROM trees t
-            JOIN sponsor_tree_links link ON link.tree_id = t.id
-            WHERE t.project_id IN :project_ids
-              AND LOWER(TRIM(COALESCE(t.created_by, ''))) IN :aliases
-            ORDER BY COALESCE(t.planting_date::timestamp, t.created_at, NOW()) DESC, t.id DESC
-            """
-        ).bindparams(bindparam("project_ids", expanding=True), bindparam("aliases", expanding=True)),
-        {"project_ids": project_ids, "aliases": aliases},
-    ).mappings().all()
-    maintenance_rows = db.execute(
-        text(
-            sponsor_link_cte
-            + """
-            SELECT
-                tt.project_id,
-                tt.id AS task_id,
-                tt.tree_id,
-                tt.task_type,
-                tt.assignee_name,
-                tt.status,
-                tt.review_state,
-                COALESCE(tt.reviewed_at, tt.completed_at, tt.updated_at, tt.created_at, NOW()) AS earned_at,
-                t.project_tree_no,
-                t.species,
-                link.unit_id,
-                link.order_id,
-                link.order_uid,
-                link.sponsor_name,
-                link.sponsor_organization_name
-            FROM tree_tasks tt
-            JOIN trees t ON t.id = tt.tree_id
-            JOIN sponsor_tree_links link ON link.tree_id = tt.tree_id
-            WHERE tt.project_id IN :project_ids
-              AND LOWER(TRIM(COALESCE(tt.assignee_name, ''))) IN :aliases
-              AND LOWER(REPLACE(REPLACE(COALESCE(tt.task_type, ''), '-', '_'), ' ', '_')) NOT IN ('planting', 'field_capture', 'existing_inventory_intake')
-              AND LOWER(REPLACE(REPLACE(COALESCE(tt.review_state, ''), '-', '_'), ' ', '_')) = 'approved'
-            ORDER BY COALESCE(tt.reviewed_at, tt.completed_at, tt.updated_at, tt.created_at, NOW()) DESC, tt.id DESC
-            """
-        ).bindparams(bindparam("project_ids", expanding=True), bindparam("aliases", expanding=True)),
-        {"project_ids": project_ids, "aliases": aliases},
-    ).mappings().all()
+    try:
+        planting_rows = db.execute(
+            text(
+                sponsor_link_cte
+                + """
+                SELECT
+                    t.project_id,
+                    t.id AS tree_id,
+                    t.project_tree_no,
+                    t.species,
+                    t.created_by,
+                    t.planting_date,
+                    COALESCE(t.created_at, NOW()) AS earned_at,
+                    link.unit_id,
+                    link.order_id,
+                    link.order_uid,
+                    link.sponsor_name,
+                    link.sponsor_organization_name
+                FROM trees t
+                JOIN sponsor_tree_links link ON link.tree_id = t.id
+                WHERE t.project_id IN :project_ids
+                  AND LOWER(TRIM(COALESCE(t.created_by, ''))) IN :aliases
+                ORDER BY COALESCE(t.planting_date::timestamp, t.created_at, NOW()) DESC, t.id DESC
+                """
+            ).bindparams(bindparam("project_ids", expanding=True), bindparam("aliases", expanding=True)),
+            {"project_ids": project_ids, "aliases": aliases},
+        ).mappings().all()
+    except Exception:
+        planting_rows = []
+    try:
+        maintenance_rows = db.execute(
+            text(
+                sponsor_link_cte
+                + """
+                SELECT
+                    tt.project_id,
+                    tt.id AS task_id,
+                    tt.tree_id,
+                    tt.task_type,
+                    tt.assignee_name,
+                    tt.status,
+                    tt.review_state,
+                    COALESCE(tt.reviewed_at, tt.completed_at, tt.updated_at, tt.created_at, NOW()) AS earned_at,
+                    t.project_tree_no,
+                    t.species,
+                    link.unit_id,
+                    link.order_id,
+                    link.order_uid,
+                    link.sponsor_name,
+                    link.sponsor_organization_name
+                FROM tree_tasks tt
+                JOIN trees t ON t.id = tt.tree_id
+                JOIN sponsor_tree_links link ON link.tree_id = tt.tree_id
+                WHERE tt.project_id IN :project_ids
+                  AND LOWER(TRIM(COALESCE(tt.assignee_name, ''))) IN :aliases
+                  AND LOWER(REPLACE(REPLACE(COALESCE(tt.task_type, ''), '-', '_'), ' ', '_')) NOT IN ('planting', 'field_capture', 'existing_inventory_intake')
+                  AND LOWER(REPLACE(REPLACE(COALESCE(tt.review_state, ''), '-', '_'), ' ', '_')) = 'approved'
+                ORDER BY COALESCE(tt.reviewed_at, tt.completed_at, tt.updated_at, tt.created_at, NOW()) DESC, tt.id DESC
+                """
+            ).bindparams(bindparam("project_ids", expanding=True), bindparam("aliases", expanding=True)),
+            {"project_ids": project_ids, "aliases": aliases},
+        ).mappings().all()
+    except Exception:
+        maintenance_rows = []
     earnings: list[dict] = []
     for row in planting_rows:
         project_id = int(row.get("project_id") or 0)
