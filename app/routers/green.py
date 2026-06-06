@@ -6437,6 +6437,80 @@ def _build_sponsor_agent_aliases(user_row: dict) -> list[str]:
     return aliases
 
 
+def _list_green_users_for_assignee_name(
+    db: Session,
+    *,
+    assignee_name: str | None,
+    organization_id: int | None = None,
+) -> list[dict]:
+    assignee_clean = str(assignee_name or "").strip()
+    if not assignee_clean:
+        return []
+    rows = db.execute(
+        text(
+            """
+            SELECT
+                u.id, u.user_uid, u.full_name, u.work_username, u.email, u.organization_id
+            FROM green_users u
+            WHERE COALESCE(u.is_active, TRUE) = TRUE
+              AND COALESCE(u.allow_green, TRUE) = TRUE
+              AND (:organization_id IS NULL OR u.organization_id = :organization_id)
+              AND (
+                    LOWER(TRIM(COALESCE(u.full_name, ''))) = LOWER(TRIM(:assignee_name))
+                 OR LOWER(TRIM(COALESCE(u.work_username, ''))) = LOWER(TRIM(:assignee_name))
+                 OR LOWER(TRIM(COALESCE(u.user_uid, ''))) = LOWER(TRIM(:assignee_name))
+                 OR LOWER(TRIM(COALESCE(u.email, ''))) = LOWER(TRIM(:assignee_name))
+              )
+            ORDER BY u.id DESC
+            """
+        ),
+        {
+            "assignee_name": assignee_clean,
+            "organization_id": int(organization_id) if organization_id is not None else None,
+        },
+    ).mappings().all()
+    return [dict(row) for row in rows]
+
+
+def _list_public_sponsor_project_ids_for_user_ids(
+    db: Session,
+    *,
+    user_ids: list[int] | None,
+    organization_id: int | None = None,
+    project_id: int | None = None,
+) -> list[int]:
+    normalized_user_ids = _normalize_positive_int_list(user_ids or [])
+    if not normalized_user_ids:
+        return []
+    rows = db.execute(
+        text(
+            """
+            SELECT DISTINCT p.id
+            FROM tree_projects p
+            CROSS JOIN LATERAL jsonb_array_elements_text(COALESCE(p.public_sponsor_agent_user_ids, '[]'::jsonb)) AS selected(user_id_text)
+            WHERE CAST(selected.user_id_text AS INTEGER) IN :user_ids
+              AND (:organization_id IS NULL OR p.organization_id = :organization_id)
+              AND (:project_id IS NULL OR p.id = :project_id)
+            ORDER BY p.id DESC
+            """
+        ).bindparams(bindparam("user_ids", expanding=True)),
+        {
+            "user_ids": normalized_user_ids,
+            "organization_id": int(organization_id) if organization_id is not None else None,
+            "project_id": int(project_id) if project_id is not None else None,
+        },
+    ).scalars().all()
+    project_ids: list[int] = []
+    for row in rows:
+        try:
+            project_id_value = int(row)
+        except Exception:
+            continue
+        if project_id_value > 0:
+            project_ids.append(project_id_value)
+    return project_ids
+
+
 def _list_public_sponsor_projects_for_agent(
     db: Session,
     *,
@@ -9497,6 +9571,8 @@ def list_projects(
     organization_id: int | None = Query(default=None),
     assignee_name: str | None = Query(default=None),
 ):
+    organization_id_value = int(organization_id) if organization_id is not None else None
+    assignee_clean = (assignee_name or "").strip() or None
     rows = db.execute(text("""
         SELECT
             p.id, p.organization_id, p.name, p.location_text, p.sponsor,
@@ -9535,16 +9611,57 @@ def list_projects(
           )
         ORDER BY p.created_at DESC
     """), {
-        "organization_id": int(organization_id) if organization_id is not None else None,
-        "assignee_name": (assignee_name or "").strip() or None,
+        "organization_id": organization_id_value,
+        "assignee_name": assignee_clean,
     }).mappings().all()
     items = [dict(r) for r in rows]
+    if assignee_clean:
+        matched_users = _list_green_users_for_assignee_name(
+            db,
+            assignee_name=assignee_clean,
+            organization_id=organization_id_value,
+        )
+        sponsor_project_ids = _list_public_sponsor_project_ids_for_user_ids(
+            db,
+            user_ids=[int(row.get("id") or 0) for row in matched_users],
+            organization_id=organization_id_value,
+        )
+        existing_ids = {
+            int(item.get("id") or 0)
+            for item in items
+            if int(item.get("id") or 0) > 0
+        }
+        missing_ids = [project_id for project_id in sponsor_project_ids if project_id not in existing_ids]
+        if missing_ids:
+            extra_rows = db.execute(
+                text(
+                    """
+                    SELECT
+                        p.id, p.organization_id, p.name, p.location_text, p.sponsor,
+                        p.access_model, p.public_sponsor_enabled, p.public_sponsor_title, p.public_sponsor_description,
+                        p.sponsor_price_per_tree, p.sponsor_currency, p.sponsor_capacity, p.sponsor_max_per_order,
+                        p.sponsor_dedication_enabled, p.sponsor_payment_instructions, p.public_sponsor_agent_user_ids,
+                        p.sponsor_agent_planting_fee, p.sponsor_agent_maintenance_fee,
+                        p.workflow_profile, p.agric_config, p.relief_config,
+                        p.planting_model, p.allow_existing_tree_link, p.default_existing_tree_scope, p.created_at,
+                        o.name AS organization_name, o.slug AS organization_slug, o.status AS organization_status,
+                        o.logo_url AS organization_logo_url
+                    FROM tree_projects p
+                    LEFT JOIN green_organizations o ON o.id = p.organization_id
+                    WHERE p.id IN :project_ids
+                    ORDER BY p.created_at DESC
+                    """
+                ).bindparams(bindparam("project_ids", expanding=True)),
+                {"project_ids": missing_ids},
+            ).mappings().all()
+            items.extend(dict(row) for row in extra_rows)
     for item in items:
         item["workflow_profile"] = _normalize_workflow_profile(item.get("workflow_profile"))
         item["agric_config"] = _normalize_agric_config(item.get("agric_config"))
         item["relief_config"] = _normalize_relief_config(item.get("relief_config"))
         item["organization_logo_url"] = _normalize_logo_asset_path(item.get("organization_logo_url"))
         _apply_project_access_fields(item)
+    items.sort(key=lambda item: _to_iso_text(item.get("created_at")) or "", reverse=True)
     return items
 
 
@@ -9608,6 +9725,20 @@ def get_project(
             ),
             {"project_id": project_id, "assignee_name": assignee_clean},
         ).scalar()
+        if not bool(has_access):
+            matched_users = _list_green_users_for_assignee_name(
+                db,
+                assignee_name=assignee_clean,
+                organization_id=int(project.get("organization_id")) if project.get("organization_id") is not None else None,
+            )
+            has_access = bool(
+                _list_public_sponsor_project_ids_for_user_ids(
+                    db,
+                    user_ids=[int(row.get("id") or 0) for row in matched_users],
+                    organization_id=int(project.get("organization_id")) if project.get("organization_id") is not None else None,
+                    project_id=project_id,
+                )
+            )
         if not bool(has_access):
             raise HTTPException(status_code=404, detail="Project not found")
 
