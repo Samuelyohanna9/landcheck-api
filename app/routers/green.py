@@ -6111,7 +6111,7 @@ def create_project(
             organization_id=org_id_value,
             user_ids=public_sponsor_agent_user_ids or [],
         )
-        if normalized_access_model == "public_sponsorship"
+        if _is_public_sponsorship_enabled(normalized_access_model, public_sponsor_enabled)
         else []
     )
     row = db.execute(
@@ -6210,11 +6210,14 @@ def create_project(
     return project
 
 
+def _is_public_sponsorship_enabled(access_model: str | None = None, public_sponsor_enabled: object | None = None) -> bool:
+    return _normalize_project_access_model(access_model) == "public_sponsorship" or bool(public_sponsor_enabled)
+
+
 def _is_public_sponsorship_project(project: dict | None) -> bool:
     if not project:
         return False
-    access_model = _normalize_project_access_model(project.get("access_model"))
-    return access_model == "public_sponsorship" or bool(project.get("public_sponsor_enabled"))
+    return _is_public_sponsorship_enabled(project.get("access_model"), project.get("public_sponsor_enabled"))
 
 
 def _is_sponsor_checkout_ready(project: dict | None, available_slots: int | None = None) -> bool:
@@ -7485,10 +7488,10 @@ def update_project_settings(
             organization_id=int(existing.get("organization_id")) if existing.get("organization_id") is not None else None,
             user_ids=public_sponsor_agent_user_ids,
         )
-        if public_sponsor_agent_user_ids is not None and next_access_model == "public_sponsorship"
+        if public_sponsor_agent_user_ids is not None and _is_public_sponsorship_enabled(next_access_model, next_public_sponsor_enabled)
         else (
             _normalize_positive_int_list(existing.get("public_sponsor_agent_user_ids"))
-            if next_access_model == "public_sponsorship"
+            if _is_public_sponsorship_enabled(next_access_model, next_public_sponsor_enabled)
             else []
         )
     )
