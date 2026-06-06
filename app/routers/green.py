@@ -6544,11 +6544,24 @@ def _collect_public_sponsor_agent_user_ids_for_project(
         except Exception:
             name_rows = []
     for assignee_name in name_rows:
-        matched_rows = _list_green_users_for_assignee_name(
-            db,
-            assignee_name=str(assignee_name or "").strip(),
-            organization_id=int(organization_id) if organization_id is not None else None,
-        )
+        assignee_name_value = str(assignee_name or "").strip()
+        try:
+            matched_rows = _list_green_users_for_assignee_name(
+                db,
+                assignee_name=assignee_name_value,
+                organization_id=int(organization_id) if organization_id is not None else None,
+            )
+        except Exception:
+            matched_rows = []
+        if not matched_rows and organization_id is not None:
+            try:
+                matched_rows = _list_green_users_for_assignee_name(
+                    db,
+                    assignee_name=assignee_name_value,
+                    organization_id=None,
+                )
+            except Exception:
+                matched_rows = []
         for row in matched_rows:
             user_id = int(row.get("id") or 0)
             if user_id <= 0 or user_id in seen:
@@ -7002,49 +7015,75 @@ def _build_sponsor_agent_dashboard(
     organization_id: int | None = None,
     project_id: int | None = None,
 ) -> dict:
+    requested_project_id = int(project_id) if project_id is not None else None
     user_row = _get_green_user_for_sponsor_agent(db, user_id=user_id, organization_id=organization_id)
-    project_rows = _list_public_sponsor_projects_for_agent(
-        db,
-        user_id=int(user_row["id"]),
-        organization_id=int(user_row["organization_id"]) if user_row.get("organization_id") is not None else None,
-        project_id=int(project_id) if project_id is not None else None,
-    )
-    if not project_rows and project_id is not None:
-        fallback_project_row = db.execute(
-            text(
-                """
-                SELECT
-                    p.id, p.organization_id, p.name, p.location_text, p.sponsor,
-                    p.access_model, p.public_sponsor_enabled, p.public_sponsor_title, p.public_sponsor_description,
-                    p.sponsor_price_per_tree, p.sponsor_currency, p.sponsor_capacity, p.sponsor_max_per_order,
-                    p.sponsor_dedication_enabled, p.sponsor_payment_instructions, p.public_sponsor_agent_user_ids,
-                    p.sponsor_agent_planting_fee, p.sponsor_agent_maintenance_fee,
-                    p.workflow_profile, p.created_at
-                FROM tree_projects p
-                WHERE p.id = :project_id
-                LIMIT 1
-                """
-            ),
-            {"project_id": int(project_id)},
-        ).mappings().first()
+    try:
+        project_rows = _list_public_sponsor_projects_for_agent(
+            db,
+            user_id=int(user_row["id"]),
+            organization_id=int(user_row["organization_id"]) if user_row.get("organization_id") is not None else None,
+            project_id=requested_project_id,
+        )
+    except Exception:
+        project_rows = []
+    if not project_rows and requested_project_id is not None:
+        try:
+            fallback_project_row = db.execute(
+                text(
+                    """
+                    SELECT
+                        p.id, p.organization_id, p.name, p.location_text, p.sponsor,
+                        p.access_model, p.public_sponsor_enabled, p.public_sponsor_title, p.public_sponsor_description,
+                        p.sponsor_price_per_tree, p.sponsor_currency, p.sponsor_capacity, p.sponsor_max_per_order,
+                        p.sponsor_dedication_enabled, p.sponsor_payment_instructions, p.public_sponsor_agent_user_ids,
+                        p.sponsor_agent_planting_fee, p.sponsor_agent_maintenance_fee,
+                        p.workflow_profile, p.created_at
+                    FROM tree_projects p
+                    WHERE p.id = :project_id
+                    LIMIT 1
+                    """
+                ),
+                {"project_id": requested_project_id},
+            ).mappings().first()
+        except Exception:
+            fallback_project_row = None
         if fallback_project_row and _is_public_sponsorship_project(dict(fallback_project_row)):
-            candidate_user_ids = _collect_public_sponsor_agent_user_ids_for_project(
-                db,
-                project_id=int(project_id),
-                organization_id=int(fallback_project_row.get("organization_id")) if fallback_project_row.get("organization_id") is not None else None,
-                explicit_user_ids=_normalize_positive_int_list(_json_value_or(fallback_project_row.get("public_sponsor_agent_user_ids"), [])),
-            )
+            try:
+                candidate_user_ids = _collect_public_sponsor_agent_user_ids_for_project(
+                    db,
+                    project_id=requested_project_id,
+                    organization_id=int(fallback_project_row.get("organization_id")) if fallback_project_row.get("organization_id") is not None else None,
+                    explicit_user_ids=_normalize_positive_int_list(_json_value_or(fallback_project_row.get("public_sponsor_agent_user_ids"), [])),
+                )
+            except Exception:
+                candidate_user_ids = _normalize_positive_int_list(_json_value_or(fallback_project_row.get("public_sponsor_agent_user_ids"), []))
             if int(user_row["id"]) in set(candidate_user_ids):
                 project_rows = [_apply_project_access_fields(dict(fallback_project_row))]
-    bank_row = _load_sponsor_agent_bank_account(db, user_id=int(user_row["id"]))
-    request_rows = _load_sponsor_agent_payout_requests(
-        db,
-        organization_id=int(user_row["organization_id"]) if user_row.get("organization_id") is not None else None,
-        user_id=int(user_row["id"]),
-        project_id=int(project_id) if project_id is not None else None,
-    )
-    serialized_requests = [item for item in (_serialize_sponsor_agent_payout_request(row) for row in request_rows) if item]
-    earnings = _build_sponsor_agent_earning_rows(db, user_row=user_row, project_rows=project_rows)
+    try:
+        bank_row = _load_sponsor_agent_bank_account(db, user_id=int(user_row["id"]))
+    except Exception:
+        bank_row = None
+    try:
+        request_rows = _load_sponsor_agent_payout_requests(
+            db,
+            organization_id=int(user_row["organization_id"]) if user_row.get("organization_id") is not None else None,
+            user_id=int(user_row["id"]),
+            project_id=requested_project_id,
+        )
+    except Exception:
+        request_rows = []
+    serialized_requests: list[dict] = []
+    for row in request_rows:
+        try:
+            item = _serialize_sponsor_agent_payout_request(row)
+        except Exception:
+            continue
+        if item:
+            serialized_requests.append(item)
+    try:
+        earnings = _build_sponsor_agent_earning_rows(db, user_row=user_row, project_rows=project_rows)
+    except Exception:
+        earnings = []
     request_by_key: dict[str, dict] = {}
     for request in serialized_requests:
         for earning_key in request.get("earning_keys") or []:
@@ -7060,11 +7099,11 @@ def _build_sponsor_agent_dashboard(
         amount = round(float(item.get("amount") or 0), 2)
         payout_request = request_by_key.get(str(item.get("earning_key") or ""))
         payout_status = payout_request.get("status") if payout_request else "available"
-        project_id = int(item.get("project_id") or 0)
-        if project_id not in project_summaries:
-            project_summaries[project_id] = {
-                "project_id": project_id,
-                "project_name": item.get("project_name") or f"Project #{project_id}",
+        earning_project_id = int(item.get("project_id") or 0)
+        if earning_project_id not in project_summaries:
+            project_summaries[earning_project_id] = {
+                "project_id": earning_project_id,
+                "project_name": item.get("project_name") or f"Project #{earning_project_id}",
                 "currency": item.get("currency") or SPONSOR_AGENT_ACCOUNT_CURRENCY,
                 "available_amount": 0.0,
                 "requested_amount": 0.0,
@@ -7072,7 +7111,7 @@ def _build_sponsor_agent_dashboard(
                 "planting_count": 0,
                 "maintenance_count": 0,
             }
-        summary = project_summaries[project_id]
+        summary = project_summaries[earning_project_id]
         if item.get("work_type") == "planting":
             planting_count += 1
             summary["planting_count"] += 1
@@ -7138,7 +7177,7 @@ def _build_sponsor_agent_dashboard(
         "earnings": earning_rows,
         "requests": serialized_requests,
     }
-    return _filter_sponsor_agent_dashboard_to_project(dashboard, project_id=project_id)
+    return _filter_sponsor_agent_dashboard_to_project(dashboard, project_id=requested_project_id)
 
 
 def _flutterwave_payout_callback_url(request: Request) -> str:
@@ -9045,19 +9084,26 @@ def list_admin_sponsor_agent_payouts(
     if not project_row:
         raise HTTPException(status_code=404, detail="Project not found")
     organization_id = int(project_row.get("organization_id") or 0)
-    selected_agent_ids = _collect_public_sponsor_agent_user_ids_for_project(
-        db,
-        project_id=int(project_id),
-        organization_id=organization_id if organization_id > 0 else None,
-        explicit_user_ids=_normalize_positive_int_list(_json_value_or(project_row.get("public_sponsor_agent_user_ids"), [])),
-    )
-    if sync:
-        request_rows = _load_sponsor_agent_payout_requests(
+    explicit_agent_ids = _normalize_positive_int_list(_json_value_or(project_row.get("public_sponsor_agent_user_ids"), []))
+    try:
+        selected_agent_ids = _collect_public_sponsor_agent_user_ids_for_project(
             db,
-            organization_id=organization_id if organization_id > 0 else None,
-            user_ids=selected_agent_ids,
             project_id=int(project_id),
+            organization_id=organization_id if organization_id > 0 else None,
+            explicit_user_ids=explicit_agent_ids,
         )
+    except Exception:
+        selected_agent_ids = explicit_agent_ids
+    if sync:
+        try:
+            request_rows = _load_sponsor_agent_payout_requests(
+                db,
+                organization_id=organization_id if organization_id > 0 else None,
+                user_ids=selected_agent_ids,
+                project_id=int(project_id),
+            )
+        except Exception:
+            request_rows = []
         for row in request_rows:
             if int(row.get("transfer_id") or 0) > 0 and _normalize_sponsor_agent_payout_status(row.get("status")) in {"approved", "processing"}:
                 try:
@@ -9080,6 +9126,8 @@ def list_admin_sponsor_agent_payouts(
                 project_id=int(project_id),
             )
         except HTTPException:
+            continue
+        except Exception:
             continue
         if not dashboard.get("eligible"):
             continue
