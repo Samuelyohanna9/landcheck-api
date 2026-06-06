@@ -9681,7 +9681,6 @@ def _render_public_sponsor_tree_story_html(item: dict) -> str:
             <div class="chip">Project &middot; {project_name}</div>
           </div>
           <div class="action-row">
-            <a class="action-button" href="{public_certificate_url}" target="_blank" rel="noopener noreferrer">Open digital certificate</a>
             {maps_action_html}
           </div>
         </div>
@@ -10248,22 +10247,9 @@ def public_sponsor_tree_story(unit_uid: str, request: Request, db: Session = Dep
 
 @router.get("/sponsor/public/trees/{unit_uid}/certificate.pdf")
 def public_sponsor_tree_certificate(unit_uid: str, request: Request, db: Session = Depends(get_db)):
-    row = _load_public_sponsor_tree_story_row(db, unit_uid)
-    if not row:
-        raise HTTPException(status_code=404, detail="Public sponsor tree certificate not found")
-    item = _hydrate_sponsor_tree_story_item(dict(row), db, request=request)
-    carbon = _build_tree_carbon_summary(item)
-    pdf_bytes = render_green_sponsor_certificate_pdf(item, carbon, verification_url=item.get("public_story_url"))
-    db.execute(
-        text("UPDATE green_sponsorship_units SET last_certificate_at = NOW(), updated_at = NOW() WHERE id = :unit_id"),
-        {"unit_id": int(item["unit_id"])},
-    )
-    db.commit()
-    safe_uid = quote(str(item.get("unit_uid") or unit_uid).strip())
-    return Response(
-        content=pdf_bytes,
-        media_type="application/pdf",
-        headers={"Content-Disposition": f'inline; filename=\"sponsor_tree_certificate_{safe_uid}.pdf\"'},
+    raise HTTPException(
+        status_code=403,
+        detail="Certificates are private and can only be accessed by the sponsor."
     )
 
 
