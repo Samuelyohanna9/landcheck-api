@@ -9518,7 +9518,10 @@ def _render_public_sponsor_tree_story_html(item: dict) -> str:
               <p class="eyebrow">Verified map</p>
               <h2>Find this tree on the ground</h2>
             </div>
-            <a class="ghost-button" href="{maps_url}" target="_blank" rel="noopener noreferrer">Find this tree in Google Maps</a>
+            <a class="ghost-button" href="{maps_url}" target="_blank" rel="noopener noreferrer">
+              <svg style="width:16px;height:16px;fill:currentColor;" viewBox="0 0 24 24"><path d="M12 2C8.13 2 5 5.13 5 9c0 5.25 7 13 7 13s7-7.75 7-13c0-3.87-3.13-7-7-7zm0 9.5c-1.38 0-2.5-1.12-2.5-2.5s1.12-2.5 2.5-2.5 2.5 1.12 2.5 2.5-1.12 2.5-2.5 2.5z"/></svg>
+              Find this tree in Google Maps
+            </a>
           </div>
           <div id="story-map" class="map-box"></div>
           <p class="coords">Latitude {lat:.6f} &middot; Longitude {lng:.6f}</p>
@@ -9527,15 +9530,15 @@ def _render_public_sponsor_tree_story_html(item: dict) -> str:
         <script>
           (function () {{
             const map = L.map('story-map', {{ scrollWheelZoom: false }}).setView([{lat}, {lng}], 15);
-            L.tileLayer('https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png', {{
+            L.tileLayer('https://{{s}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png', {{
               maxZoom: 19,
               attribution: '&copy; OpenStreetMap contributors'
             }}).addTo(map);
             L.circleMarker([{lat}, {lng}], {{
-              radius: 11,
-              color: '#0f6f39',
-              weight: 3,
-              fillColor: '#7ee08e',
+              radius: 12,
+              color: '#c5a059',
+              weight: 4,
+              fillColor: '#0b2c1a',
               fillOpacity: 0.95
             }}).addTo(map).bindPopup('{species}');
           }})();
@@ -9569,30 +9572,34 @@ def _render_public_sponsor_tree_story_html(item: dict) -> str:
     <meta property="og:url" content="{public_story_url}" />
     <meta name="twitter:card" content="summary_large_image" />
     {og_image}
-    <meta name="theme-color" content="#0f6f39" />
-    <link rel="preconnect" href="https://unpkg.com" />
+    <meta name="theme-color" content="#0b2c1a" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700;800;900&family=Playfair+Display:ital,wght@0,400;0,600;0,700;1,400&display=swap" rel="stylesheet" />
     <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
     <style>
       :root {{
-        --bg: #eef8ef;
+        --bg: #f5faf6;
         --panel: rgba(255,255,255,0.96);
-        --panel-soft: rgba(245,250,246,0.94);
-        --border: rgba(17, 84, 42, 0.12);
-        --text: #163424;
-        --muted: #53705f;
-        --emerald: #0f6f39;
-        --emerald-dark: #0a4f28;
-        --emerald-soft: #dff6e5;
-        --shadow: 0 24px 48px rgba(11, 54, 28, 0.12);
+        --panel-soft: #fafdfb;
+        --border: rgba(11, 44, 26, 0.08);
+        --text: #0d2116;
+        --muted: #4e6b5a;
+        --emerald: #0b2c1a;
+        --emerald-dark: #071d11;
+        --emerald-soft: rgba(197, 160, 89, 0.12);
+        --gold: #c5a059;
+        --gold-dark: #a6813c;
+        --shadow: 0 20px 40px rgba(11, 44, 26, 0.06);
       }}
       * {{ box-sizing: border-box; }}
       body {{
         margin: 0;
-        font-family: Inter, "Segoe UI", system-ui, sans-serif;
+        font-family: 'Outfit', sans-serif;
         color: var(--text);
         background:
-          radial-gradient(circle at top right, rgba(126, 224, 142, 0.3), transparent 24rem),
-          linear-gradient(180deg, #f7fcf7 0%, var(--bg) 100%);
+          radial-gradient(circle at top right, rgba(197, 160, 89, 0.15), transparent 28rem),
+          linear-gradient(180deg, #fbfdfc 0%, var(--bg) 100%);
       }}
       a {{ color: inherit; text-decoration: none; }}
       .shell {{
@@ -9603,48 +9610,56 @@ def _render_public_sponsor_tree_story_html(item: dict) -> str:
       .hero {{
         position: relative;
         overflow: hidden;
-        border-radius: 34px;
-        min-height: 380px;
-        background: linear-gradient(140deg, rgba(7,48,21,0.94), rgba(15,111,57,0.84));
-        box-shadow: var(--shadow);
+        border-radius: 32px;
+        min-height: 400px;
+        background: linear-gradient(135deg, #071d11 0%, #0b2c1a 60%, #154c2e 100%);
+        box-shadow: 0 24px 50px rgba(7, 29, 17, 0.18);
+        border: 1px solid rgba(197, 160, 89, 0.2);
       }}
       .hero-media {{
         position: absolute;
         inset: 0;
         background-position: center;
         background-size: cover;
-        opacity: 0.36;
-        filter: saturate(1.05);
+        opacity: 0.20;
+        filter: saturate(1.1) brightness(0.85);
       }}
       .hero-overlay {{
         position: relative;
         z-index: 1;
-        display: grid;
-        gap: 18px;
-        padding: 26px;
+        display: flex;
+        flex-direction: column;
+        justify-content: space-between;
+        gap: 28px;
+        padding: 36px;
         color: #fff;
+        min-height: 400px;
       }}
       .eyebrow {{
         margin: 0 0 8px;
-        color: rgba(255,255,255,0.78);
-        font-size: 12px;
-        font-weight: 800;
-        letter-spacing: 0.12em;
+        color: var(--gold);
+        font-size: 11px;
+        font-weight: 900;
+        letter-spacing: 0.18em;
         text-transform: uppercase;
       }}
       .hero h1 {{
         margin: 0;
-        max-width: 620px;
-        font-size: clamp(2rem, 4vw, 3.5rem);
-        line-height: 1.02;
-        letter-spacing: -0.04em;
+        max-width: 680px;
+        font-family: 'Playfair Display', Georgia, serif;
+        font-size: clamp(2.2rem, 5vw, 3.8rem);
+        line-height: 1.05;
+        font-weight: 700;
+        letter-spacing: -0.02em;
+        color: #ffffff;
       }}
       .hero p {{
-        margin: 0;
+        margin: 12px 0 0;
         max-width: 620px;
-        color: rgba(255,255,255,0.9);
-        font-size: 1rem;
-        line-height: 1.65;
+        color: rgba(255,255,255,0.85);
+        font-size: 1.05rem;
+        line-height: 1.6;
+        font-weight: 400;
       }}
       .chip-row, .action-row, .metric-grid, .detail-grid, .gallery-grid, .timeline-grid {{
         display: grid;
@@ -9657,12 +9672,13 @@ def _render_public_sponsor_tree_story_html(item: dict) -> str:
         display: inline-flex;
         align-items: center;
         gap: 8px;
-        padding: 11px 14px;
+        padding: 10px 18px;
         border-radius: 999px;
-        background: rgba(255,255,255,0.12);
-        border: 1px solid rgba(255,255,255,0.16);
-        font-size: 0.92rem;
+        background: rgba(255,255,255,0.08);
+        border: 1px solid rgba(255,255,255,0.12);
+        font-size: 0.88rem;
         font-weight: 700;
+        color: #ffffff;
       }}
       .action-row {{
         grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
@@ -9678,107 +9694,169 @@ def _render_public_sponsor_tree_story_html(item: dict) -> str:
         font-weight: 800;
       }}
       .action-button {{
-        background: #fff;
-        color: var(--emerald-dark);
+        background: var(--gold);
+        color: #071d11;
+        box-shadow: 0 8px 20px rgba(197, 160, 89, 0.25);
+        border: 0;
+        cursor: pointer;
+        transition: all 0.3s ease;
+      }}
+      .action-button:hover {{
+        background: var(--gold-dark);
+        transform: translateY(-2px);
+        box-shadow: 0 12px 24px rgba(197, 160, 89, 0.35);
       }}
       .ghost-button {{
-        border: 1px solid rgba(17,84,42,0.14);
-        background: rgba(244,251,246,0.92);
-        color: var(--emerald-dark);
+        border: 1px solid rgba(197, 160, 89, 0.3);
+        background: rgba(255, 255, 255, 0.08);
+        backdrop-filter: blur(8px);
+        color: #ffffff;
+        cursor: pointer;
+        transition: all 0.3s ease;
+      }}
+      .ghost-button:hover {{
+        border-color: var(--gold);
+        background: rgba(255, 255, 255, 0.15);
+        transform: translateY(-2px);
       }}
       .metric-grid {{
         grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
         margin-top: 6px;
       }}
       .metric-card, .panel, .detail-card, .gallery-card, .timeline-card, .empty-card {{
-        border-radius: 26px;
+        border-radius: 24px;
         border: 1px solid var(--border);
         background: var(--panel);
         box-shadow: var(--shadow);
       }}
       .metric-card {{
-        padding: 18px 18px 16px;
+        padding: 24px 20px 20px;
+        border-left: 4px solid var(--gold);
+        transition: all 0.3s ease;
+      }}
+      .metric-card:hover {{
+        transform: translateY(-4px);
+        box-shadow: 0 24px 48px rgba(11, 44, 26, 0.12);
       }}
       .metric-card strong {{
         display: block;
-        margin-bottom: 8px;
-        font-size: 1.9rem;
+        margin-bottom: 6px;
+        font-size: 2.1rem;
+        font-weight: 800;
         line-height: 1.1;
+        color: var(--emerald);
       }}
       .metric-card span {{
         color: var(--muted);
         font-weight: 600;
+        font-size: 0.88rem;
+        line-height: 1.4;
       }}
       .stack {{
         display: grid;
-        gap: 18px;
-        margin-top: 18px;
+        gap: 22px;
+        margin-top: 22px;
       }}
       .panel {{
-        padding: 22px;
+        padding: 28px;
       }}
       .panel-head {{
         display: flex;
         align-items: flex-start;
         justify-content: space-between;
         gap: 14px;
-        margin-bottom: 16px;
+        margin-bottom: 22px;
+      }}
+      .panel-head .ghost-button {{
+        border: 1px solid rgba(197, 160, 89, 0.3);
+        background: #ffffff;
+        color: var(--emerald-dark);
+        box-shadow: 0 4px 12px rgba(197, 160, 89, 0.05);
+      }}
+      .panel-head .ghost-button:hover {{
+        border-color: var(--gold);
+        background: var(--emerald-soft);
+        color: var(--emerald-dark);
+        transform: translateY(-2px);
       }}
       .panel h2 {{
         margin: 0;
-        font-size: 1.45rem;
+        font-size: 1.5rem;
+        font-weight: 800;
         letter-spacing: -0.03em;
+        color: var(--emerald);
       }}
       .panel p {{
         margin: 6px 0 0;
         color: var(--muted);
-        line-height: 1.7;
+        line-height: 1.6;
+        font-size: 0.95rem;
       }}
       .detail-grid {{
+        display: grid;
         grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+        gap: 14px;
       }}
       .detail-card {{
-        padding: 16px 18px;
+        padding: 16px 20px;
         background: var(--panel-soft);
+        border-left: 3px solid rgba(197, 160, 89, 0.3);
       }}
       .detail-card label {{
         display: block;
         color: var(--muted);
-        font-size: 0.82rem;
-        font-weight: 800;
-        letter-spacing: 0.08em;
+        font-size: 0.8rem;
+        font-weight: 900;
+        letter-spacing: 0.1em;
         text-transform: uppercase;
       }}
       .detail-card strong {{
         display: block;
-        margin-top: 8px;
-        font-size: 1rem;
-        line-height: 1.55;
+        margin-top: 6px;
+        font-size: 1.05rem;
+        font-weight: 700;
+        color: var(--emerald-dark);
+        line-height: 1.4;
       }}
       .gallery-grid {{
         grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
       }}
       .gallery-card {{
         overflow: hidden;
+        transition: all 0.3s ease;
+      }}
+      .gallery-card:hover {{
+        transform: translateY(-4px);
+        box-shadow: 0 24px 48px rgba(11, 44, 26, 0.14);
       }}
       .gallery-card img {{
         display: block;
         width: 100%;
-        height: 220px;
+        height: 240px;
         object-fit: cover;
         background: #edf5ef;
+        transition: transform 0.5s ease;
+      }}
+      .gallery-card:hover img {{
+        transform: scale(1.05);
       }}
       .gallery-card figcaption {{
-        padding: 12px 14px 15px;
-        color: var(--muted);
-        font-size: 0.92rem;
-        font-weight: 700;
+        padding: 14px 16px 16px;
+        color: var(--emerald-dark);
+        font-weight: 800;
+        font-size: 0.95rem;
+        border-top: 1px solid var(--border);
       }}
       .timeline-grid {{
         grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
       }}
       .timeline-card {{
-        padding: 18px;
+        padding: 20px;
+        border-left: 4px solid var(--gold);
+        transition: all 0.3s ease;
+      }}
+      .timeline-card:hover {{
+        transform: translateY(-2px);
       }}
       .timeline-head {{
         display: flex;
@@ -9787,41 +9865,55 @@ def _render_public_sponsor_tree_story_html(item: dict) -> str:
         gap: 10px;
       }}
       .timeline-head strong {{
-        font-size: 1rem;
+        font-size: 1.1rem;
+        font-weight: 800;
+        color: var(--emerald);
       }}
       .timeline-head span {{
-        padding: 6px 10px;
+        padding: 4px 12px;
         border-radius: 999px;
-        background: var(--emerald-soft);
-        color: var(--emerald-dark);
+        background: rgba(197, 160, 89, 0.15);
+        color: var(--gold-dark);
         font-size: 0.8rem;
         font-weight: 800;
+        border: 1px solid rgba(197, 160, 89, 0.22);
       }}
       .timeline-date {{
         margin-top: 8px;
         color: var(--muted);
-        font-size: 0.82rem;
+        font-size: 0.85rem;
+        font-weight: 500;
+      }}
+      .timeline-card p {{
+        margin: 8px 0 0;
+        font-size: 0.92rem;
+        line-height: 1.6;
+        color: var(--text);
       }}
       .empty-card {{
-        padding: 22px;
+        padding: 24px;
         color: var(--muted);
         background: var(--panel-soft);
+        font-weight: 600;
       }}
       .map-box {{
         width: 100%;
-        height: 360px;
+        height: 380px;
         border-radius: 24px;
         overflow: hidden;
         border: 1px solid var(--border);
+        box-shadow: 0 12px 30px rgba(7, 29, 17, 0.08);
       }}
       .coords {{
         margin-top: 12px !important;
         font-size: 0.9rem;
+        font-weight: 700;
+        color: var(--muted);
       }}
       @media (max-width: 720px) {{
         .shell {{ padding: 16px 14px 40px; }}
-        .hero-overlay {{ padding: 20px; }}
-        .panel-head {{ flex-direction: column; }}
+        .hero-overlay {{ padding: 24px; }}
+        .panel-head {{ flex-direction: column; align-items: stretch; gap: 12px; }}
       }}
     </style>
   </head>
