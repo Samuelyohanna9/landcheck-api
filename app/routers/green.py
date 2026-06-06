@@ -1,5 +1,5 @@
 from fastapi import APIRouter, Body, Depends, HTTPException, Query, UploadFile, File, Form, Request
-from fastapi.responses import FileResponse, Response, StreamingResponse
+from fastapi.responses import FileResponse, HTMLResponse, Response, StreamingResponse
 from sqlalchemy.orm import Session
 from sqlalchemy import bindparam, text
 from datetime import datetime, date, timedelta, timezone
@@ -8560,8 +8560,605 @@ def list_sponsor_trees(sponsor_id: int = Query(...), db: Session = Depends(get_d
     return payload
 
 
+def _build_public_asset_url(raw_value: object, request: Request | None = None) -> str | None:
+    raw = str(raw_value or "").strip()
+    if not raw:
+        return None
+    if raw.startswith("//"):
+        raw = f"https:{raw}"
+    if raw.lower().startswith(("http://", "https://", "data:")):
+        return raw
+    normalized = _normalize_logo_asset_path(raw) or raw
+    if normalized.startswith("//"):
+        normalized = f"https:{normalized}"
+    if normalized.lower().startswith(("http://", "https://", "data:")):
+        return normalized
+    base_url = _build_public_api_base_url(request)
+    path = f"/{normalized.lstrip('/')}"
+    return f"{base_url}{path}" if base_url else path
+
+
+def _build_sponsor_public_story_url(unit_uid: object, request: Request | None = None) -> str | None:
+    uid = str(unit_uid or "").strip()
+    if not uid:
+        return None
+    base_url = _build_public_api_base_url(request)
+    if not base_url:
+        return None
+    return f"{base_url}/green/sponsor/public/trees/{quote(uid)}"
+
+
+def _build_sponsor_public_certificate_url(unit_uid: object, request: Request | None = None) -> str | None:
+    uid = str(unit_uid or "").strip()
+    if not uid:
+        return None
+    base_url = _build_public_api_base_url(request)
+    if not base_url:
+        return None
+    return f"{base_url}/green/sponsor/public/trees/{quote(uid)}/certificate.pdf"
+
+
+def _build_google_maps_direction_url(lat_value: object, lng_value: object) -> str | None:
+    try:
+        lat = float(lat_value)
+        lng = float(lng_value)
+    except Exception:
+        return None
+    return f"https://www.google.com/maps/dir/?api=1&destination={lat},{lng}"
+
+
+def _load_sponsor_tree_story_timeline(db: Session, tree_id: int, request: Request | None = None) -> list[dict]:
+    task_rows = db.execute(
+        text(
+            """
+            SELECT
+                id, task_type, status, review_state, notes, photo_url, photo_urls,
+                completed_at, submitted_at, reviewed_at, reviewed_by, review_notes,
+                reported_tree_status, activity_lng, activity_lat, activity_recorded_at
+            FROM tree_tasks
+            WHERE tree_id = :tree_id
+              AND LOWER(COALESCE(review_state, 'none')) IN ('approved', 'none')
+              AND LOWER(COALESCE(status, 'pending')) = 'done'
+            ORDER BY COALESCE(reviewed_at, completed_at, submitted_at, created_at) DESC, id DESC
+            """
+        ),
+        {"tree_id": int(tree_id)},
+    ).mappings().all()
+    timeline: list[dict] = []
+    for task in task_rows:
+        task_item = dict(task)
+        task_urls = _normalize_photo_urls(task_item.get("photo_urls"))
+        primary_photo = str(task_item.get("photo_url") or "").strip()
+        if primary_photo and primary_photo not in task_urls:
+            task_urls.insert(0, primary_photo)
+        task_item["photo_urls"] = [
+            candidate
+            for candidate in (_build_public_asset_url(url, request=request) for url in task_urls)
+            if candidate
+        ]
+        task_item["photo_url"] = task_item["photo_urls"][0] if task_item["photo_urls"] else _build_public_asset_url(primary_photo, request=request)
+        timeline.append(task_item)
+    return timeline
+
+
+def _hydrate_sponsor_tree_story_item(item: dict, db: Session, request: Request | None = None) -> dict:
+    item["sponsorship_status"] = _normalize_sponsor_unit_status(item.get("sponsorship_status"))
+    item["payment_status"] = _normalize_sponsor_payment_status(item.get("payment_status"))
+    item["order_status"] = _normalize_sponsor_order_status(item.get("order_status"))
+    item["carbon"] = _build_tree_carbon_summary(item) if item.get("tree_id") else {"current_co2_kg": 0.0, "annual_co2_kg": 0.0, "lifetime_co2_kg": 0.0}
+
+    root_photo_urls = _normalize_photo_urls(item.get("photo_urls"))
+    primary_root_photo = str(item.get("photo_url") or "").strip()
+    if primary_root_photo and primary_root_photo not in root_photo_urls:
+        root_photo_urls.insert(0, primary_root_photo)
+
+    timeline = _load_sponsor_tree_story_timeline(db, int(item["tree_id"]), request=request) if item.get("tree_id") else []
+    gallery_urls: list[str] = []
+    seen: set[str] = set()
+    for candidate in root_photo_urls:
+        public_url = _build_public_asset_url(candidate, request=request)
+        if public_url and public_url not in seen:
+            seen.add(public_url)
+            gallery_urls.append(public_url)
+    for event in timeline:
+        for candidate in event.get("photo_urls") or []:
+            public_url = _build_public_asset_url(candidate, request=request)
+            if public_url and public_url not in seen:
+                seen.add(public_url)
+                gallery_urls.append(public_url)
+
+    item["photo_urls"] = gallery_urls
+    item["photo_url"] = gallery_urls[0] if gallery_urls else _build_public_asset_url(primary_root_photo, request=request)
+    item["timeline"] = timeline
+    item["maps_url"] = _build_google_maps_direction_url(item.get("lat"), item.get("lng"))
+    item["public_story_url"] = _build_sponsor_public_story_url(item.get("unit_uid"), request=request)
+    item["public_certificate_url"] = _build_sponsor_public_certificate_url(item.get("unit_uid"), request=request)
+    return item
+
+
+def _render_public_sponsor_tree_story_html(item: dict) -> str:
+    sponsor_name = html.escape(str(item.get("sponsor_name") or "Climate sponsor").strip() or "Climate sponsor")
+    sponsor_org = html.escape(str(item.get("sponsor_organization_name") or "").strip())
+    project_name = html.escape(str(item.get("project_name") or "LandCheck Green project").strip() or "LandCheck Green project")
+    species = html.escape(str(item.get("species") or "Verified tree").strip() or "Verified tree")
+    tree_label = html.escape(
+        f"Tree #{int(item.get('project_tree_no') or 0)}" if item.get("project_tree_no") else str(item.get("unit_uid") or "Sponsored tree")
+    )
+    location_text = html.escape(str(item.get("location_text") or "Verified LandCheck Green project area").strip() or "Verified LandCheck Green project area")
+    reference = html.escape(str(item.get("unit_uid") or item.get("tree_id") or "-"))
+    status_label = html.escape(str(item.get("tree_status") or item.get("sponsorship_status") or "active").replace("_", " ").title())
+    planting_date = html.escape(str(item.get("planting_date") or "-"))
+    photo_url = str(item.get("photo_url") or "").strip()
+    public_certificate_url = html.escape(str(item.get("public_certificate_url") or "").strip())
+    public_story_url = html.escape(str(item.get("public_story_url") or "").strip())
+    maps_url = html.escape(str(item.get("maps_url") or "").strip())
+    maps_action_html = (
+        f'<a class="ghost-button" href="{maps_url}" target="_blank" rel="noopener noreferrer">Find this tree in Google Maps</a>'
+        if maps_url
+        else '<span class="ghost-button" style="opacity:0.58;">Map direction pending</span>'
+    )
+    current_co2 = float((item.get("carbon") or {}).get("current_co2_kg") or 0)
+    annual_co2 = float((item.get("carbon") or {}).get("annual_co2_kg") or 0)
+    lifetime_co2 = float((item.get("carbon") or {}).get("lifetime_co2_kg") or 0)
+    timeline = item.get("timeline") or []
+    photo_cards = []
+    for index, url in enumerate((item.get("photo_urls") or [])[:8], start=1):
+        safe_url = html.escape(str(url))
+        photo_cards.append(
+            f"""
+            <figure class="gallery-card">
+              <img src="{safe_url}" alt="Verified tree evidence {index}" loading="lazy" />
+              <figcaption>Verified field evidence {index}</figcaption>
+            </figure>
+            """
+        )
+    if not photo_cards:
+        photo_cards.append('<div class="empty-card">Approved field photos will appear here as the field team uploads verified evidence.</div>')
+
+    timeline_cards = []
+    for event in timeline[:8]:
+        event_title = html.escape(str(event.get("task_type") or "Field update").replace("_", " ").title())
+        event_status = html.escape(str(event.get("reported_tree_status") or event.get("status") or "done").replace("_", " ").title())
+        event_date = html.escape(str(event.get("reviewed_at") or event.get("completed_at") or event.get("submitted_at") or "-"))
+        event_notes = html.escape(str(event.get("notes") or "").strip())
+        timeline_cards.append(
+            f"""
+            <article class="timeline-card">
+              <div class="timeline-head">
+                <strong>{event_title}</strong>
+                <span>{event_status}</span>
+              </div>
+              <p class="timeline-date">{event_date}</p>
+              {f"<p>{event_notes}</p>" if event_notes else ""}
+            </article>
+            """
+        )
+    if not timeline_cards:
+        timeline_cards.append('<div class="empty-card">No reviewed maintenance records are published yet.</div>')
+
+    dedication_parts = []
+    if str(item.get("dedication_type") or "").strip():
+        dedication_parts.append(str(item.get("dedication_type") or "").replace("_", " ").title())
+    if str(item.get("dedication_name") or "").strip():
+        dedication_parts.append(str(item.get("dedication_name") or "").strip())
+    dedication_line = html.escape(" | ".join(dedication_parts))
+    dedication_message = html.escape(str(item.get("dedication_message") or "").strip())
+    map_block = ""
+    try:
+        lat = float(item.get("lat"))
+        lng = float(item.get("lng"))
+        map_block = f"""
+        <section class="panel">
+          <div class="panel-head">
+            <div>
+              <p class="eyebrow">Verified map</p>
+              <h2>Find this tree on the ground</h2>
+            </div>
+            <a class="ghost-button" href="{maps_url}" target="_blank" rel="noopener noreferrer">Find this tree in Google Maps</a>
+          </div>
+          <div id="story-map" class="map-box"></div>
+          <p class="coords">Latitude {lat:.6f} · Longitude {lng:.6f}</p>
+        </section>
+        <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+        <script>
+          (function () {{
+            const map = L.map('story-map', {{ scrollWheelZoom: false }}).setView([{lat}, {lng}], 15);
+            L.tileLayer('https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png', {{
+              maxZoom: 19,
+              attribution: '&copy; OpenStreetMap contributors'
+            }}).addTo(map);
+            L.circleMarker([{lat}, {lng}], {{
+              radius: 11,
+              color: '#0f6f39',
+              weight: 3,
+              fillColor: '#7ee08e',
+              fillOpacity: 0.95
+            }}).addTo(map).bindPopup('{species}');
+          }})();
+        </script>
+        """
+    except Exception:
+        map_block = """
+        <section class="panel">
+          <div class="panel-head">
+            <div>
+              <p class="eyebrow">Verified map</p>
+              <h2>Location will appear once coordinates are available</h2>
+            </div>
+          </div>
+          <div class="empty-card">This sponsored tree is linked to a verified project, but GPS coordinates are not attached yet.</div>
+        </section>
+        """
+
+    og_image = f'<meta property="og:image" content="{html.escape(photo_url)}" /><meta name="twitter:image" content="{html.escape(photo_url)}" />' if photo_url else ""
+    hero_style = f' style="background-image:url(\'{html.escape(photo_url)}\')"' if photo_url else ""
+    return f"""<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>LandCheck Green | {tree_label}</title>
+    <meta name="description" content="Verified LandCheck Green sponsor tree record with map, field photos, care history, and certificate." />
+    <meta property="og:title" content="LandCheck Green | {tree_label}" />
+    <meta property="og:description" content="See the verified map, field photos, care history, and digital certificate for this sponsored tree." />
+    <meta property="og:type" content="website" />
+    <meta property="og:url" content="{public_story_url}" />
+    <meta name="twitter:card" content="summary_large_image" />
+    {og_image}
+    <meta name="theme-color" content="#0f6f39" />
+    <link rel="preconnect" href="https://unpkg.com" />
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <style>
+      :root {{
+        --bg: #eef8ef;
+        --panel: rgba(255,255,255,0.96);
+        --panel-soft: rgba(245,250,246,0.94);
+        --border: rgba(17, 84, 42, 0.12);
+        --text: #163424;
+        --muted: #53705f;
+        --emerald: #0f6f39;
+        --emerald-dark: #0a4f28;
+        --emerald-soft: #dff6e5;
+        --shadow: 0 24px 48px rgba(11, 54, 28, 0.12);
+      }}
+      * {{ box-sizing: border-box; }}
+      body {{
+        margin: 0;
+        font-family: Inter, "Segoe UI", system-ui, sans-serif;
+        color: var(--text);
+        background:
+          radial-gradient(circle at top right, rgba(126, 224, 142, 0.3), transparent 24rem),
+          linear-gradient(180deg, #f7fcf7 0%, var(--bg) 100%);
+      }}
+      a {{ color: inherit; text-decoration: none; }}
+      .shell {{
+        max-width: 1080px;
+        margin: 0 auto;
+        padding: 24px 18px 60px;
+      }}
+      .hero {{
+        position: relative;
+        overflow: hidden;
+        border-radius: 34px;
+        min-height: 380px;
+        background: linear-gradient(140deg, rgba(7,48,21,0.94), rgba(15,111,57,0.84));
+        box-shadow: var(--shadow);
+      }}
+      .hero-media {{
+        position: absolute;
+        inset: 0;
+        background-position: center;
+        background-size: cover;
+        opacity: 0.36;
+        filter: saturate(1.05);
+      }}
+      .hero-overlay {{
+        position: relative;
+        z-index: 1;
+        display: grid;
+        gap: 18px;
+        padding: 26px;
+        color: #fff;
+      }}
+      .eyebrow {{
+        margin: 0 0 8px;
+        color: rgba(255,255,255,0.78);
+        font-size: 12px;
+        font-weight: 800;
+        letter-spacing: 0.12em;
+        text-transform: uppercase;
+      }}
+      .hero h1 {{
+        margin: 0;
+        max-width: 620px;
+        font-size: clamp(2rem, 4vw, 3.5rem);
+        line-height: 1.02;
+        letter-spacing: -0.04em;
+      }}
+      .hero p {{
+        margin: 0;
+        max-width: 620px;
+        color: rgba(255,255,255,0.9);
+        font-size: 1rem;
+        line-height: 1.65;
+      }}
+      .chip-row, .action-row, .metric-grid, .detail-grid, .gallery-grid, .timeline-grid {{
+        display: grid;
+        gap: 14px;
+      }}
+      .chip-row {{
+        grid-template-columns: repeat(auto-fit, minmax(160px, max-content));
+      }}
+      .chip {{
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        padding: 11px 14px;
+        border-radius: 999px;
+        background: rgba(255,255,255,0.12);
+        border: 1px solid rgba(255,255,255,0.16);
+        font-size: 0.92rem;
+        font-weight: 700;
+      }}
+      .action-row {{
+        grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      }}
+      .action-button, .ghost-button {{
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        gap: 10px;
+        min-height: 54px;
+        padding: 0 18px;
+        border-radius: 18px;
+        font-weight: 800;
+      }}
+      .action-button {{
+        background: #fff;
+        color: var(--emerald-dark);
+      }}
+      .ghost-button {{
+        border: 1px solid rgba(17,84,42,0.14);
+        background: rgba(244,251,246,0.92);
+        color: var(--emerald-dark);
+      }}
+      .metric-grid {{
+        grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+        margin-top: 6px;
+      }}
+      .metric-card, .panel, .detail-card, .gallery-card, .timeline-card, .empty-card {{
+        border-radius: 26px;
+        border: 1px solid var(--border);
+        background: var(--panel);
+        box-shadow: var(--shadow);
+      }}
+      .metric-card {{
+        padding: 18px 18px 16px;
+      }}
+      .metric-card strong {{
+        display: block;
+        margin-bottom: 8px;
+        font-size: 1.9rem;
+        line-height: 1.1;
+      }}
+      .metric-card span {{
+        color: var(--muted);
+        font-weight: 600;
+      }}
+      .stack {{
+        display: grid;
+        gap: 18px;
+        margin-top: 18px;
+      }}
+      .panel {{
+        padding: 22px;
+      }}
+      .panel-head {{
+        display: flex;
+        align-items: flex-start;
+        justify-content: space-between;
+        gap: 14px;
+        margin-bottom: 16px;
+      }}
+      .panel h2 {{
+        margin: 0;
+        font-size: 1.45rem;
+        letter-spacing: -0.03em;
+      }}
+      .panel p {{
+        margin: 6px 0 0;
+        color: var(--muted);
+        line-height: 1.7;
+      }}
+      .detail-grid {{
+        grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+      }}
+      .detail-card {{
+        padding: 16px 18px;
+        background: var(--panel-soft);
+      }}
+      .detail-card label {{
+        display: block;
+        color: var(--muted);
+        font-size: 0.82rem;
+        font-weight: 800;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+      }}
+      .detail-card strong {{
+        display: block;
+        margin-top: 8px;
+        font-size: 1rem;
+        line-height: 1.55;
+      }}
+      .gallery-grid {{
+        grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+      }}
+      .gallery-card {{
+        overflow: hidden;
+      }}
+      .gallery-card img {{
+        display: block;
+        width: 100%;
+        height: 220px;
+        object-fit: cover;
+        background: #edf5ef;
+      }}
+      .gallery-card figcaption {{
+        padding: 12px 14px 15px;
+        color: var(--muted);
+        font-size: 0.92rem;
+        font-weight: 700;
+      }}
+      .timeline-grid {{
+        grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+      }}
+      .timeline-card {{
+        padding: 18px;
+      }}
+      .timeline-head {{
+        display: flex;
+        align-items: flex-start;
+        justify-content: space-between;
+        gap: 10px;
+      }}
+      .timeline-head strong {{
+        font-size: 1rem;
+      }}
+      .timeline-head span {{
+        padding: 6px 10px;
+        border-radius: 999px;
+        background: var(--emerald-soft);
+        color: var(--emerald-dark);
+        font-size: 0.8rem;
+        font-weight: 800;
+      }}
+      .timeline-date {{
+        margin-top: 8px;
+        color: var(--muted);
+        font-size: 0.82rem;
+      }}
+      .empty-card {{
+        padding: 22px;
+        color: var(--muted);
+        background: var(--panel-soft);
+      }}
+      .map-box {{
+        width: 100%;
+        height: 360px;
+        border-radius: 24px;
+        overflow: hidden;
+        border: 1px solid var(--border);
+      }}
+      .coords {{
+        margin-top: 12px !important;
+        font-size: 0.9rem;
+      }}
+      @media (max-width: 720px) {{
+        .shell {{ padding: 16px 14px 40px; }}
+        .hero-overlay {{ padding: 20px; }}
+        .panel-head {{ flex-direction: column; }}
+      }}
+    </style>
+  </head>
+  <body>
+    <main class="shell">
+      <section class="hero">
+        <div class="hero-media"{hero_style}></div>
+        <div class="hero-overlay">
+          <div>
+            <p class="eyebrow">LandCheck Green verified tree story</p>
+            <h1>{tree_label} is a live, field-verified climate action record.</h1>
+            <p>This page shows the real map location, approved field photos, care history, and certificate for the sponsored tree linked to {sponsor_name}.</p>
+          </div>
+          <div class="chip-row">
+            <div class="chip">Status · {status_label}</div>
+            <div class="chip">Species · {species}</div>
+            <div class="chip">Project · {project_name}</div>
+          </div>
+          <div class="action-row">
+            <a class="action-button" href="{public_certificate_url}" target="_blank" rel="noopener noreferrer">Open digital certificate</a>
+            {maps_action_html}
+          </div>
+        </div>
+      </section>
+
+      <section class="metric-grid stack">
+        <article class="metric-card">
+          <label class="eyebrow" style="color: var(--muted);">Current stored CO2</label>
+          <strong>{current_co2:,.2f} kg</strong>
+          <span>Live carbon already attributed to this verified tree</span>
+        </article>
+        <article class="metric-card">
+          <label class="eyebrow" style="color: var(--muted);">Annual sequestration</label>
+          <strong>{annual_co2:,.2f} kg/yr</strong>
+          <span>Expected yearly climate contribution from this tree</span>
+        </article>
+        <article class="metric-card">
+          <label class="eyebrow" style="color: var(--muted);">40-year projection</label>
+          <strong>{lifetime_co2:,.2f} kg</strong>
+          <span>Long-range carbon value tied to the planting record</span>
+        </article>
+        <article class="metric-card">
+          <label class="eyebrow" style="color: var(--muted);">Reviewed care updates</label>
+          <strong>{len(timeline)}</strong>
+          <span>Published maintenance and field verification records</span>
+        </article>
+      </section>
+
+      <div class="stack">
+        <section class="panel">
+          <div class="panel-head">
+            <div>
+              <p class="eyebrow" style="color: var(--muted);">Sponsor record</p>
+              <h2>Verified sponsorship details</h2>
+            </div>
+          </div>
+          <div class="detail-grid">
+            <article class="detail-card"><label>Sponsor</label><strong>{sponsor_name}</strong></article>
+            <article class="detail-card"><label>Organization</label><strong>{sponsor_org or 'Individual sponsor'}</strong></article>
+            <article class="detail-card"><label>Project</label><strong>{project_name}</strong></article>
+            <article class="detail-card"><label>Location</label><strong>{location_text}</strong></article>
+            <article class="detail-card"><label>Planting date</label><strong>{planting_date}</strong></article>
+            <article class="detail-card"><label>Reference</label><strong>{reference}</strong></article>
+            {f'<article class="detail-card"><label>Dedication</label><strong>{dedication_line or "Supporter dedication"}</strong></article>' if dedication_line else ''}
+            {f'<article class="detail-card"><label>Message</label><strong>{dedication_message}</strong></article>' if dedication_message else ''}
+          </div>
+        </section>
+
+        {map_block}
+
+        <section class="panel">
+          <div class="panel-head">
+            <div>
+              <p class="eyebrow" style="color: var(--muted);">Field evidence</p>
+              <h2>Approved photo evidence</h2>
+            </div>
+          </div>
+          <div class="gallery-grid">
+            {''.join(photo_cards)}
+          </div>
+        </section>
+
+        <section class="panel">
+          <div class="panel-head">
+            <div>
+              <p class="eyebrow" style="color: var(--muted);">Care history</p>
+              <h2>Reviewed maintenance timeline</h2>
+            </div>
+          </div>
+          <div class="timeline-grid">
+            {''.join(timeline_cards)}
+          </div>
+        </section>
+      </div>
+    </main>
+  </body>
+</html>"""
+
+
 @router.get("/sponsor/trees/{unit_id}")
-def get_sponsor_tree_detail(unit_id: int, sponsor_id: int = Query(...), db: Session = Depends(get_db)):
+def get_sponsor_tree_detail(unit_id: int, sponsor_id: int = Query(...), request: Request | None = None, db: Session = Depends(get_db)):
     row = db.execute(
         text(
             """
@@ -8587,45 +9184,14 @@ def get_sponsor_tree_detail(unit_id: int, sponsor_id: int = Query(...), db: Sess
     ).mappings().first()
     if not row:
         raise HTTPException(status_code=404, detail="Sponsored tree not found")
-    item = dict(row)
-    item["sponsorship_status"] = _normalize_sponsor_unit_status(item.get("sponsorship_status"))
-    item["payment_status"] = _normalize_sponsor_payment_status(item.get("payment_status"))
-    item["order_status"] = _normalize_sponsor_order_status(item.get("order_status"))
-    item["photo_urls"] = _normalize_photo_urls(item.get("photo_urls"))
-    item["carbon"] = _build_tree_carbon_summary(item) if item.get("tree_id") else {"current_co2_kg": 0.0, "annual_co2_kg": 0.0, "lifetime_co2_kg": 0.0}
-    timeline: list[dict] = []
-    if item.get("tree_id"):
-        task_rows = db.execute(
-            text(
-                """
-                SELECT
-                    id, task_type, status, review_state, notes, photo_url, photo_urls,
-                    completed_at, submitted_at, reviewed_at, reviewed_by, review_notes,
-                    reported_tree_status, activity_lng, activity_lat, activity_recorded_at
-                FROM tree_tasks
-                WHERE tree_id = :tree_id
-                  AND LOWER(COALESCE(review_state, 'none')) IN ('approved', 'none')
-                  AND LOWER(COALESCE(status, 'pending')) = 'done'
-                ORDER BY COALESCE(reviewed_at, completed_at, submitted_at, created_at) DESC, id DESC
-                """
-            ),
-            {"tree_id": int(item["tree_id"])},
-        ).mappings().all()
-        for task in task_rows:
-            task_item = dict(task)
-            task_item["photo_urls"] = _normalize_photo_urls(task_item.get("photo_urls"))
-            primary_photo = str(task_item.get("photo_url") or "").strip()
-            if primary_photo and primary_photo not in task_item["photo_urls"]:
-                task_item["photo_urls"].insert(0, primary_photo)
-            timeline.append(task_item)
-    item["timeline"] = timeline
-    return item
+    return _hydrate_sponsor_tree_story_item(dict(row), db, request=request)
 
 
 @router.get("/sponsor/trees/{unit_id}/certificate/pdf")
 def export_sponsor_tree_certificate(
     unit_id: int,
     sponsor_id: int = Query(...),
+    request: Request | None = None,
     db: Session = Depends(get_db),
 ):
     row = db.execute(
@@ -8652,10 +9218,9 @@ def export_sponsor_tree_certificate(
     ).mappings().first()
     if not row:
         raise HTTPException(status_code=404, detail="Sponsored tree certificate not found")
-    item = dict(row)
-    item["photo_urls"] = _normalize_photo_urls(item.get("photo_urls"))
+    item = _hydrate_sponsor_tree_story_item(dict(row), db, request=request)
     carbon = _build_tree_carbon_summary(item)
-    pdf_bytes = render_green_sponsor_certificate_pdf(item, carbon)
+    pdf_bytes = render_green_sponsor_certificate_pdf(item, carbon, verification_url=item.get("public_story_url"))
     db.execute(
         text("UPDATE green_sponsorship_units SET last_certificate_at = NOW(), updated_at = NOW() WHERE id = :unit_id"),
         {"unit_id": int(unit_id)},
@@ -8665,6 +9230,72 @@ def export_sponsor_tree_certificate(
         content=pdf_bytes,
         media_type="application/pdf",
         headers={"Content-Disposition": f'inline; filename=\"sponsor_tree_certificate_{int(unit_id)}.pdf\"'},
+    )
+
+
+def _load_public_sponsor_tree_story_row(db: Session, unit_uid: str):
+    normalized_uid = str(unit_uid or "").strip()
+    if not normalized_uid:
+        return None
+    return db.execute(
+        text(
+            """
+            SELECT
+                sa.full_name AS sponsor_name,
+                sa.organization_name AS sponsor_organization_name,
+                u.id AS unit_id, u.unit_uid, u.sponsorship_status, u.linked_at,
+                u.dedication_type, u.dedication_name, u.dedication_message,
+                o.id AS order_id, o.order_uid, o.payment_status, o.order_status, o.created_at AS order_created_at,
+                p.id AS project_id, p.name AS project_name, p.location_text, p.organization_id,
+                t.id AS tree_id, t.project_tree_no, t.species, t.status AS tree_status, t.notes AS tree_notes,
+                t.planting_date, t.photo_url, t.photo_urls, t.tree_height_m, t.tree_age_months, t.inventory_tree_count,
+                t.count_in_carbon_scope, t.created_by, t.created_at AS tree_created_at,
+                ST_X(t.geom) AS lng, ST_Y(t.geom) AS lat
+            FROM green_sponsorship_units u
+            JOIN green_sponsor_accounts sa ON sa.id = u.sponsor_account_id
+            JOIN green_sponsorship_orders o ON o.id = u.order_id
+            JOIN tree_projects p ON p.id = u.project_id
+            JOIN trees t ON t.id = u.tree_id
+            WHERE UPPER(u.unit_uid) = UPPER(:unit_uid)
+              AND (
+                COALESCE(p.public_sponsor_enabled, FALSE) = TRUE
+                OR LOWER(COALESCE(p.project_access_model, 'partner_org')) = 'public_sponsorship'
+              )
+              AND LOWER(COALESCE(u.sponsorship_status, 'awaiting_tree')) IN ('linked', 'active', 'replaced')
+            LIMIT 1
+            """
+        ),
+        {"unit_uid": normalized_uid},
+    ).mappings().first()
+
+
+@router.get("/sponsor/public/trees/{unit_uid}", response_class=HTMLResponse)
+def public_sponsor_tree_story(unit_uid: str, request: Request, db: Session = Depends(get_db)):
+    row = _load_public_sponsor_tree_story_row(db, unit_uid)
+    if not row:
+        raise HTTPException(status_code=404, detail="Public sponsor tree story not found")
+    item = _hydrate_sponsor_tree_story_item(dict(row), db, request=request)
+    return HTMLResponse(content=_render_public_sponsor_tree_story_html(item))
+
+
+@router.get("/sponsor/public/trees/{unit_uid}/certificate.pdf")
+def public_sponsor_tree_certificate(unit_uid: str, request: Request, db: Session = Depends(get_db)):
+    row = _load_public_sponsor_tree_story_row(db, unit_uid)
+    if not row:
+        raise HTTPException(status_code=404, detail="Public sponsor tree certificate not found")
+    item = _hydrate_sponsor_tree_story_item(dict(row), db, request=request)
+    carbon = _build_tree_carbon_summary(item)
+    pdf_bytes = render_green_sponsor_certificate_pdf(item, carbon, verification_url=item.get("public_story_url"))
+    db.execute(
+        text("UPDATE green_sponsorship_units SET last_certificate_at = NOW(), updated_at = NOW() WHERE id = :unit_id"),
+        {"unit_id": int(item["unit_id"])},
+    )
+    db.commit()
+    safe_uid = quote(str(item.get("unit_uid") or unit_uid).strip())
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'inline; filename=\"sponsor_tree_certificate_{safe_uid}.pdf\"'},
     )
 
 
