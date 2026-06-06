@@ -6488,8 +6488,13 @@ def _list_public_sponsor_project_ids_for_user_ids(
             SELECT DISTINCT p.id
             FROM tree_projects p
             CROSS JOIN LATERAL jsonb_array_elements_text(COALESCE(p.public_sponsor_agent_user_ids, '[]'::jsonb)) AS selected(user_id_text)
-            WHERE CAST(selected.user_id_text AS INTEGER) IN :user_ids
-              AND (:organization_id IS NULL OR p.organization_id = :organization_id)
+            WHERE LOWER(COALESCE(p.access_model, 'partner_org')) = 'public_sponsorship'
+              AND CAST(selected.user_id_text AS INTEGER) IN :user_ids
+              AND (
+                    :organization_id IS NULL
+                 OR p.organization_id = :organization_id
+                 OR p.organization_id IS NULL
+              )
               AND (:project_id IS NULL OR p.id = :project_id)
             ORDER BY p.id DESC
             """
@@ -6529,7 +6534,11 @@ def _list_public_sponsor_projects_for_agent(
                 p.workflow_profile, p.created_at
             FROM tree_projects p
             WHERE LOWER(COALESCE(p.access_model, 'partner_org')) = 'public_sponsorship'
-              AND (:organization_id IS NULL OR p.organization_id = :organization_id)
+              AND (
+                    :organization_id IS NULL
+                 OR p.organization_id = :organization_id
+                 OR p.organization_id IS NULL
+              )
               AND EXISTS (
                     SELECT 1
                     FROM jsonb_array_elements_text(COALESCE(p.public_sponsor_agent_user_ids, '[]'::jsonb)) AS selected(user_id_text)
