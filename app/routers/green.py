@@ -381,6 +381,8 @@ class SponsorAgentPayoutReviewPayload(BaseModel):
     reviewer_name: str | None = None
     review_notes: str | None = None
     auto_transfer: bool = False
+    settlement_channel: str | None = None
+    settlement_reference: str | None = None
 
 
 def _normalize_privacy_scope(value: str | None) -> str:
@@ -1785,6 +1787,15 @@ def _normalize_sponsor_agent_payout_status(value: str | None) -> str:
     return "requested"
 
 
+def _normalize_sponsor_agent_settlement_channel(value: str | None) -> str | None:
+    normalized = _normalize_name(value)
+    if normalized in {"flutterwave", "flutterwave_auto", "auto", "automatic", "gateway"}:
+        return "flutterwave"
+    if normalized in {"manual", "manual_settlement", "external", "bank_transfer", "offline"}:
+        return "manual"
+    return None
+
+
 def _normalize_account_number(value: object) -> str:
     return "".join(ch for ch in str(value or "").strip() if ch.isdigit())
 
@@ -1930,14 +1941,30 @@ def _call_flutterwave_api(
     payload: dict | None = None,
     json: dict | None = None,
     params: dict | None = None,
+    trace_id: str | None = None,
+    idempotency_key: str | None = None,
+    extra_headers: dict[str, str] | None = None,
     timeout: int = 30,
 ) -> dict:
     request_payload = json if isinstance(json, dict) else payload
+    headers = dict(_flutterwave_headers())
+    normalized_trace_id = str(trace_id or "").strip()
+    normalized_idempotency_key = str(idempotency_key or "").strip()
+    if normalized_trace_id:
+        headers["X-Trace-Id"] = normalized_trace_id
+    if normalized_idempotency_key:
+        headers["X-Idempotency-Key"] = normalized_idempotency_key
+    if extra_headers:
+        for key, value in extra_headers.items():
+            key_text = str(key or "").strip()
+            value_text = str(value or "").strip()
+            if key_text and value_text:
+                headers[key_text] = value_text
     try:
         response = requests.request(
             method.upper(),
             f"{FLUTTERWAVE_API_BASE_URL}{path}",
-            headers=_flutterwave_headers(),
+            headers=headers,
             json=request_payload,
             params=params,
             timeout=timeout,
@@ -4495,6 +4522,8 @@ def ensure_green_tables(db: Session):
             review_notes TEXT,
             reviewed_by TEXT,
             reviewed_at TIMESTAMP,
+            settlement_channel TEXT,
+            settlement_reference TEXT,
             transfer_reference TEXT,
             transfer_id BIGINT,
             transfer_status TEXT,
@@ -4556,6 +4585,8 @@ def ensure_green_tables(db: Session):
         db.execute(text("ALTER TABLE green_sponsor_agent_payout_requests ADD COLUMN IF NOT EXISTS review_notes TEXT"))
         db.execute(text("ALTER TABLE green_sponsor_agent_payout_requests ADD COLUMN IF NOT EXISTS reviewed_by TEXT"))
         db.execute(text("ALTER TABLE green_sponsor_agent_payout_requests ADD COLUMN IF NOT EXISTS reviewed_at TIMESTAMP"))
+        db.execute(text("ALTER TABLE green_sponsor_agent_payout_requests ADD COLUMN IF NOT EXISTS settlement_channel TEXT"))
+        db.execute(text("ALTER TABLE green_sponsor_agent_payout_requests ADD COLUMN IF NOT EXISTS settlement_reference TEXT"))
         db.execute(text("ALTER TABLE green_sponsor_agent_payout_requests ADD COLUMN IF NOT EXISTS transfer_reference TEXT"))
         db.execute(text("ALTER TABLE green_sponsor_agent_payout_requests ADD COLUMN IF NOT EXISTS transfer_id BIGINT"))
         db.execute(text("ALTER TABLE green_sponsor_agent_payout_requests ADD COLUMN IF NOT EXISTS transfer_status TEXT"))
@@ -6386,6 +6417,8 @@ def _serialize_sponsor_agent_payout_request(row: dict | None) -> dict | None:
         "review_notes": str(row.get("review_notes") or "").strip() or None,
         "reviewed_by": str(row.get("reviewed_by") or "").strip() or None,
         "reviewed_at": row.get("reviewed_at"),
+        "settlement_channel": _normalize_sponsor_agent_settlement_channel(row.get("settlement_channel")),
+        "settlement_reference": str(row.get("settlement_reference") or "").strip() or None,
         "transfer_reference": str(row.get("transfer_reference") or "").strip() or None,
         "transfer_id": int(row.get("transfer_id") or 0) or None,
         "transfer_status": str(row.get("transfer_status") or "").strip() or None,
@@ -6754,7 +6787,7 @@ def _load_sponsor_agent_payout_requests(
             pr.id, pr.request_uid, pr.user_id, pr.organization_id, pr.currency, pr.amount_total, pr.payout_minimum,
             pr.status, pr.bank_code, pr.bank_name, pr.account_number, pr.account_name,
             pr.earning_keys, pr.earning_rows, pr.project_ids,
-            pr.review_notes, pr.reviewed_by, pr.reviewed_at,
+            pr.review_notes, pr.reviewed_by, pr.reviewed_at, pr.settlement_channel, pr.settlement_reference,
             pr.transfer_reference, pr.transfer_id, pr.transfer_status, pr.transfer_payload,
             pr.transfer_processed_at, pr.paid_at, pr.created_at, pr.updated_at,
             u.full_name AS user_name, u.user_uid
@@ -7240,6 +7273,8 @@ def _create_flutterwave_transfer_for_payout(request: Request, db: Session, payou
     bank_code = str(payout_row.get("bank_code") or "").strip()
     if not account_number or not bank_code:
         raise HTTPException(status_code=400, detail="Verified bank details are required before automatic payout")
+    payout_request_uid = str(payout_row.get("request_uid") or _generate_prefixed_uid("PAY")).strip()
+    trace_id = f"lc-payout-create-{int(payout_row.get('id') or 0)}-{uuid.uuid4().hex[:12]}"
     response = _call_flutterwave_api(
         "POST",
         "/transfers",
@@ -7250,10 +7285,12 @@ def _create_flutterwave_transfer_for_payout(request: Request, db: Session, payou
             "currency": _normalize_currency_code(payout_row.get("currency"), SPONSOR_AGENT_ACCOUNT_CURRENCY),
             "debit_currency": _normalize_currency_code(payout_row.get("currency"), SPONSOR_AGENT_ACCOUNT_CURRENCY),
             "beneficiary_name": str(payout_row.get("account_name") or payout_row.get("user_name") or "").strip() or None,
-            "reference": str(payout_row.get("request_uid") or _generate_prefixed_uid("PAY")).strip(),
+            "reference": payout_request_uid,
             "callback_url": _flutterwave_payout_callback_url(request),
-            "narration": f"LandCheck sponsor agent payout {str(payout_row.get('request_uid') or '').strip()}",
+            "narration": f"LandCheck sponsor agent payout {payout_request_uid}",
         },
+        trace_id=trace_id,
+        idempotency_key=f"lc-payout-create-{payout_request_uid.lower()}",
     )
     data = response.get("data") or {}
     transfer_status = str(data.get("status") or "").strip() or None
@@ -7266,6 +7303,8 @@ def _create_flutterwave_transfer_for_payout(request: Request, db: Session, payou
                 transfer_reference = COALESCE(:transfer_reference, transfer_reference),
                 transfer_id = COALESCE(:transfer_id, transfer_id),
                 transfer_status = :transfer_status,
+                settlement_channel = 'flutterwave',
+                settlement_reference = COALESCE(:settlement_reference, settlement_reference),
                 transfer_payload = CAST(:transfer_payload AS JSONB),
                 transfer_processed_at = NOW(),
                 paid_at = CASE WHEN :status = 'paid' THEN COALESCE(paid_at, NOW()) ELSE paid_at END,
@@ -7277,9 +7316,62 @@ def _create_flutterwave_transfer_for_payout(request: Request, db: Session, payou
         {
             "request_id": int(payout_row["id"]),
             "status": payout_status,
-            "transfer_reference": str(data.get("reference") or payout_row.get("request_uid") or "").strip() or None,
+            "transfer_reference": str(data.get("reference") or payout_request_uid).strip() or None,
             "transfer_id": int(data.get("id") or 0) or None,
             "transfer_status": transfer_status,
+            "settlement_reference": str(data.get("reference") or payout_request_uid).strip() or None,
+            "transfer_payload": _safe_json(data if isinstance(data, dict) else {}),
+        },
+    ).mappings().first()
+    return dict(updated) if updated else dict(payout_row)
+
+
+def _retry_flutterwave_transfer_for_payout(request: Request, db: Session, payout_row: dict) -> dict:
+    transfer_id = int(payout_row.get("transfer_id") or 0)
+    if transfer_id <= 0:
+        return _create_flutterwave_transfer_for_payout(request, db, payout_row)
+    retry_reference = _generate_prefixed_uid("PAYR")
+    trace_id = f"lc-payout-retry-{int(payout_row.get('id') or 0)}-{uuid.uuid4().hex[:12]}"
+    response = _call_flutterwave_api(
+        "POST",
+        f"/transfers/{transfer_id}/retries",
+        json={
+            "action": "retry",
+            "reference": retry_reference,
+            "callback_url": _flutterwave_payout_callback_url(request),
+            "meta": {"request_id": int(payout_row.get("id") or 0)},
+        },
+        trace_id=trace_id,
+        idempotency_key=f"lc-payout-retry-{int(payout_row.get('id') or 0)}-{transfer_id}",
+    )
+    data = response.get("data") or {}
+    transfer_status = str(data.get("status") or "").strip() or None
+    payout_status = _map_transfer_status_to_payout_status(transfer_status)
+    updated = db.execute(
+        text(
+            """
+            UPDATE green_sponsor_agent_payout_requests
+            SET status = :status,
+                transfer_reference = COALESCE(:transfer_reference, transfer_reference),
+                transfer_id = COALESCE(:transfer_id, transfer_id),
+                transfer_status = :transfer_status,
+                settlement_channel = 'flutterwave',
+                settlement_reference = COALESCE(:settlement_reference, settlement_reference),
+                transfer_payload = CAST(:transfer_payload AS JSONB),
+                transfer_processed_at = NOW(),
+                paid_at = CASE WHEN :status = 'paid' THEN COALESCE(paid_at, NOW()) ELSE paid_at END,
+                updated_at = NOW()
+            WHERE id = :request_id
+            RETURNING *
+            """
+        ),
+        {
+            "request_id": int(payout_row["id"]),
+            "status": payout_status,
+            "transfer_reference": str(data.get("reference") or retry_reference).strip() or None,
+            "transfer_id": int(data.get("id") or 0) or transfer_id or None,
+            "transfer_status": transfer_status,
+            "settlement_reference": str(data.get("reference") or retry_reference).strip() or None,
             "transfer_payload": _safe_json(data if isinstance(data, dict) else {}),
         },
     ).mappings().first()
@@ -7307,6 +7399,11 @@ def _sync_sponsor_agent_payout_transfer(db: Session, payout_row: dict) -> dict:
                 END,
                 transfer_reference = COALESCE(:transfer_reference, transfer_reference),
                 transfer_status = :transfer_status,
+                settlement_channel = CASE
+                    WHEN :transfer_reference IS NOT NULL THEN 'flutterwave'
+                    ELSE settlement_channel
+                END,
+                settlement_reference = COALESCE(:transfer_reference, settlement_reference),
                 transfer_payload = CAST(:transfer_payload AS JSONB),
                 transfer_processed_at = NOW(),
                 paid_at = CASE WHEN :status = 'paid' THEN COALESCE(paid_at, NOW()) ELSE paid_at END,
@@ -9194,8 +9291,12 @@ def review_admin_sponsor_agent_payout_request(
     action = _normalize_name(payload.action)
     reviewer_name = _clean_text(payload.reviewer_name, 120) or "super_admin"
     review_notes = _clean_text(payload.review_notes, 500)
+    settlement_reference = _clean_text(payload.settlement_reference, 160)
+    settlement_channel = _normalize_sponsor_agent_settlement_channel(payload.settlement_channel)
     transfer_error: str | None = None
     current_status = _normalize_sponsor_agent_payout_status(row.get("status"))
+    if action in {"reject", "rejected"} and not review_notes:
+        raise HTTPException(status_code=400, detail="Enter a rejection reason before rejecting this payout request")
     if action in {"reject", "rejected"}:
         updated = db.execute(
             text(
@@ -9237,6 +9338,8 @@ def review_admin_sponsor_agent_payout_request(
             },
         ).mappings().first()
     elif action in {"mark_paid", "paid"}:
+        if not settlement_reference:
+            raise HTTPException(status_code=400, detail="Manual settlement reference is required before marking this payout as paid")
         updated = db.execute(
             text(
                 """
@@ -9245,6 +9348,12 @@ def review_admin_sponsor_agent_payout_request(
                     reviewed_by = :reviewed_by,
                     reviewed_at = NOW(),
                     review_notes = :review_notes,
+                    settlement_channel = :settlement_channel,
+                    settlement_reference = :settlement_reference,
+                    transfer_status = CASE
+                        WHEN COALESCE(transfer_status, '') = '' THEN 'manual_paid'
+                        ELSE transfer_status
+                    END,
                     paid_at = COALESCE(paid_at, NOW()),
                     updated_at = NOW()
                 WHERE id = :request_id
@@ -9255,6 +9364,8 @@ def review_admin_sponsor_agent_payout_request(
                 "request_id": int(request_id),
                 "reviewed_by": reviewer_name,
                 "review_notes": review_notes,
+                "settlement_channel": settlement_channel or "manual",
+                "settlement_reference": settlement_reference,
             },
         ).mappings().first()
     else:
@@ -9281,7 +9392,11 @@ def review_admin_sponsor_agent_payout_request(
         should_transfer = bool(payload.auto_transfer) or action in {"approve_and_pay", "retry_transfer", "auto_transfer"}
         if should_transfer:
             try:
-                updated = _create_flutterwave_transfer_for_payout(request, db, updated)
+                updated = (
+                    _retry_flutterwave_transfer_for_payout(request, db, updated)
+                    if action == "retry_transfer"
+                    else _create_flutterwave_transfer_for_payout(request, db, updated)
+                )
             except HTTPException as exc:
                 transfer_error = str(exc.detail or "Automatic payout failed")
                 updated = db.execute(
@@ -9315,6 +9430,8 @@ def review_admin_sponsor_agent_payout_request(
         details={
             "action": action or "approve",
             "status": _normalize_sponsor_agent_payout_status((updated or row).get("status")),
+            "settlement_channel": _normalize_sponsor_agent_settlement_channel((updated or row).get("settlement_channel")),
+            "settlement_reference": str((updated or row).get("settlement_reference") or "").strip() or None,
             "transfer_error": transfer_error,
         },
     )
