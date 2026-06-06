@@ -10227,7 +10227,7 @@ def _load_public_sponsor_tree_story_row(db: Session, unit_uid: str):
             WHERE UPPER(u.unit_uid) = UPPER(:unit_uid)
               AND (
                 COALESCE(p.public_sponsor_enabled, FALSE) = TRUE
-                OR LOWER(COALESCE(p.project_access_model, 'partner_org')) = 'public_sponsorship'
+                OR LOWER(COALESCE(p.access_model, 'partner_org')) = 'public_sponsorship'
               )
               AND LOWER(COALESCE(u.sponsorship_status, 'awaiting_tree')) IN ('linked', 'active', 'replaced')
             LIMIT 1
