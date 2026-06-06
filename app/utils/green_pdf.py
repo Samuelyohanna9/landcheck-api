@@ -121,143 +121,169 @@ def render_green_sponsor_certificate_pdf(sponsorship: dict, carbon: dict | None 
     dedication_type = str(sponsorship.get("dedication_type") or "").strip()
     dedication_name = str(sponsorship.get("dedication_name") or "").strip()
     dedication_message = str(sponsorship.get("dedication_message") or "").strip()
-    climate_message = "This certificate recognizes a verified contribution to climate action, restoration, and long-term community resilience."
     evidence_message = "Each sponsored tree is linked to map-verified coordinates, approved field photos, reviewed care history, and a live digital reference."
 
     # Background
-    c.setFillColor(HexColor("#f4faf5"))
+    c.setFillColor(HexColor("#fafaf7"))
     c.rect(0, 0, page_w, page_h, stroke=0, fill=1)
 
-    # 1. Left Panel (Sidebar)
-    sidebar_w = 260
-    c.setFillColor(HexColor("#083e20"))
-    c.rect(0, 0, sidebar_w, page_h, stroke=0, fill=1)
-
-    # Sidebar decorative circles
+    # Decorative background circles/watermarks
     c.saveState()
-    c.setFillColor(HexColor("#0d572f"))
-    c.circle(0, page_h, 160, stroke=0, fill=1)
-    c.setFillColor(HexColor("#146b3b"))
-    c.circle(0, page_h, 100, stroke=0, fill=1)
+    c.setFillColor(HexColor("#f1f7f2"))
+    # Top-right background watermark
+    c.circle(page_w - 50, page_h - 50, 180, stroke=0, fill=1)
+    c.setFillColor(HexColor("#edf4ee"))
+    c.circle(page_w - 50, page_h - 50, 100, stroke=0, fill=1)
+    # Bottom-left background watermark
+    c.setFillColor(HexColor("#f1f7f2"))
+    c.circle(50, 50, 150, stroke=0, fill=1)
     c.restoreState()
 
-    # Badge: "LANDCHECK GREEN VERIFIED"
-    c.setFillColor(HexColor("#e2f8e6"))
-    c.roundRect(24, page_h - 52, 212, 24, 12, stroke=0, fill=1)
+    # Double Border
+    margin_outer = 20
+    margin_inner = 25
+    
+    # Outer gold border
+    c.saveState()
+    c.setStrokeColor(HexColor("#c5a059")) # Rich Gold
+    c.setLineWidth(1.8)
+    c.rect(margin_outer, margin_outer, page_w - 2*margin_outer, page_h - 2*margin_outer, stroke=1, fill=0)
+    
+    # Inner green border
+    c.setStrokeColor(HexColor("#083e20")) # Forest Green
+    c.setLineWidth(0.8)
+    c.rect(margin_inner, margin_inner, page_w - 2*margin_inner, page_h - 2*margin_inner, stroke=1, fill=0)
+    
+    # Accent Gold Circles at the corners
+    c.setFillColor(HexColor("#c5a059"))
+    corners = [
+        (margin_inner, margin_inner),
+        (page_w - margin_inner, margin_inner),
+        (margin_inner, page_h - margin_inner),
+        (page_w - margin_inner, page_h - margin_inner)
+    ]
+    for cx, cy in corners:
+        c.circle(cx, cy, 4, stroke=0, fill=1)
+    c.restoreState()
+
+    # --- HEADER SECTION ---
+    # Centered Organization Label / Brand
+    c.saveState()
+    header_text = "LANDCHECK GREEN RESTORATION REGISTRY"
+    char_space = 1.5
+    normal_w = c.stringWidth(header_text, "Helvetica-Bold", 10)
+    total_w = normal_w + (len(header_text) - 1) * char_space
+    tx = c.beginText(page_w / 2 - total_w / 2, 532)
+    tx.setFont("Helvetica-Bold", 10)
+    tx.setCharSpace(char_space)
+    tx.setFillColor(HexColor("#083e20"))
+    tx.textOut(header_text)
+    c.drawText(tx)
+    c.restoreState()
+
+    # Decorative small gold line under header
+    c.setStrokeColor(HexColor("#c5a059"))
+    c.setLineWidth(0.75)
+    c.line(page_w / 2 - 120, 523, page_w / 2 + 120, 523)
+    c.circle(page_w / 2, 523, 2.5, stroke=0, fill=1)
+
+    # --- TITLE ---
+    c.setFillColor(HexColor("#083e20"))
+    c.setFont("Times-Bold", 25)
+    c.drawCentredString(page_w / 2, 485, "CERTIFICATE OF TREE SPONSORSHIP")
+
+    # Presentation text
+    c.setFillColor(HexColor("#53705f"))
+    c.setFont("Times-Italic", 11)
+    c.drawCentredString(page_w / 2, 458, "This document certifies that a tree has been successfully sponsored and planted by")
+
+    # --- SPONSOR NAME ---
+    c.setFillColor(HexColor("#083e20"))
+    c.setFont("Times-Bold", 28)
+    c.drawCentredString(page_w / 2, 418, sponsor_name)
+    
+    curr_y = 398
+    if sponsor_org:
+        c.setFillColor(HexColor("#b8860b"))
+        c.setFont("Helvetica-Bold", 11)
+        c.drawCentredString(page_w / 2, curr_y, f"representing {sponsor_org}")
+        curr_y -= 15
+
+    # Decorative divider under Sponsor Name
+    c.saveState()
+    c.setStrokeColor(HexColor("#c5a059"))
+    c.setLineWidth(0.75)
+    c.line(page_w / 2 - 180, curr_y, page_w / 2 + 180, curr_y)
+    # Gold diamond accent
+    p = c.beginPath()
+    p.moveTo(page_w / 2 - 5, curr_y)
+    p.lineTo(page_w / 2, curr_y + 3)
+    p.lineTo(page_w / 2 + 5, curr_y)
+    p.lineTo(page_w / 2, curr_y - 3)
+    p.close()
+    c.setFillColor(HexColor("#c5a059"))
+    c.drawPath(p, stroke=0, fill=1)
+    c.restoreState()
+
+    # Initiative Description
+    c.setFillColor(HexColor("#4f6c59"))
+    c.setFont("Helvetica-Oblique", 9.5)
+    c.drawCentredString(page_w / 2, curr_y - 22, "under the LandCheck Green Restoration Initiative, contributing to environmental restoration and carbon sequestration.")
+
+    # --- MIDDLE CARDS ROW (y from 145 to 330) ---
+    middle_y = 145
+    middle_h = 185
+
+    # Card 1: Verified Tree Record (Left side)
+    card1_x = 45
+    card1_w = 345
+    _draw_rounded_box(c, card1_x, middle_y, card1_w, middle_h, 12, fill_color=HexColor("#ffffff"), stroke_color=HexColor("#dcdfdc"))
+    
+    # Title banner
+    c.setFillColor(HexColor("#f4faf5"))
+    c.roundRect(card1_x + 10, middle_y + middle_h - 26, card1_w - 20, 18, 4, stroke=0, fill=1)
     c.setFillColor(HexColor("#083e20"))
     c.setFont("Helvetica-Bold", 8.5)
-    c.drawString(38, page_h - 44, "LANDCHECK GREEN VERIFIED")
+    c.drawString(card1_x + 18, middle_y + middle_h - 21, "VERIFIED TREE RECORD")
 
-    # Title: "Tree Sponsorship Certificate"
-    c.setFillColor(HexColor("#ffffff"))
-    c.setFont("Helvetica-Bold", 20)
-    c.drawString(24, page_h - 96, "Tree Sponsorship")
-    c.drawString(24, page_h - 120, "Certificate")
-
-    # Subtitle
-    _draw_wrapped_text(
-        c,
-        "A verified digital record of tree planting, active custody, and live carbon sequestration.",
-        24,
-        page_h - 142,
-        212,
-        line_height=12,
-        font_name="Helvetica-Oblique",
-        font_size=8.5,
-        color=HexColor("#a1dbb2")
-    )
-
-    # Sponsor Name
-    c.setFillColor(HexColor("#ffffff"))
-    c.setFont("Helvetica-Bold", 24)
-    # Split/wrap name if it is too long for the sidebar
-    sponsor_name_y = page_h - 228
-    name_lines = simpleSplit(sponsor_name, "Helvetica-Bold", 24, 212)
-    for line in name_lines[:2]:
-        c.drawString(24, sponsor_name_y, str(line))
-        sponsor_name_y -= 28
-
-    if sponsor_org:
-        c.setFont("Helvetica", 11)
-        c.setFillColor(HexColor("#cff4d5"))
-        org_lines = simpleSplit(sponsor_org, "Helvetica", 11, 212)
-        for line in org_lines[:2]:
-            c.drawString(24, sponsor_name_y - 2, str(line))
-            sponsor_name_y -= 14
-
-    # QR Code + Scan info at the bottom
-    if verification_url:
-        _draw_qr_code(c, verification_url, 24, 86, 80)
-        c.setFillColor(HexColor("#ffffff"))
-        c.setFont("Helvetica-Bold", 9)
-        c.drawString(118, 154, "Scan to Verify")
-        c.setFont("Helvetica", 7.8)
-        c.setFillColor(HexColor("#a1dbb2"))
-        c.drawString(118, 138, "Open live history,")
-        c.drawString(118, 126, "map location, and")
-        c.drawString(118, 114, "field photos.")
-
-    # Reference
-    c.setFillColor(HexColor("#ffffff"))
-    c.setFont("Helvetica-Bold", 8)
-    c.drawString(24, 36, f"Ref: {sponsorship.get('unit_uid') or sponsorship.get('tree_id') or '-'}")
-
-    # Separator Line
-    c.setStrokeColor(HexColor("#dcdfdc"))
-    c.setLineWidth(0.5)
-    c.line(sidebar_w, 0, sidebar_w, page_h)
-
-    # 2. Right Panel (Main Content)
-    right_x = sidebar_w + 24
-    content_w = page_w - right_x - 24 # 533.89
-
-    # Card 1: Verified Tree Record
-    card1_y = 356
-    card1_h = 208
-    _draw_rounded_box(c, right_x, card1_y, content_w, card1_h, 20, fill_color=HexColor("#ffffff"), stroke_color=HexColor("#e3ebe4"))
-    
-    c.setFillColor(HexColor("#53705f"))
-    c.setFont("Helvetica-Bold", 9.5)
-    c.drawString(right_x + 20, card1_y + card1_h - 28, "VERIFIED TREE RECORD")
-
+    # Tree Designation
     c.setFillColor(HexColor("#083e20"))
-    c.setFont("Helvetica-Bold", 18)
-    c.drawString(right_x + 20, card1_y + card1_h - 54, tree_label)
+    c.setFont("Helvetica-Bold", 14)
+    c.drawString(card1_x + 16, middle_y + middle_h - 48, tree_label)
 
     # Details grid inside Card 1
-    # Column coordinates
-    col1_x = right_x + 20
-    col2_x = right_x + 196
+    grid_y = middle_y + middle_h - 58
+    labels = [
+        ("Project:", project_name[:42]),
+        ("Species:", species_label),
+        ("Location:", location_text[:40]),
+        ("Planting Date:", planting_date),
+        ("Issued Date:", datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC"))
+    ]
     
-    # Row 1
-    c.setFillColor(HexColor("#53705f"))
-    c.setFont("Helvetica-Bold", 9)
-    c.drawString(col1_x, card1_y + 124, "Project")
-    c.drawString(col2_x, card1_y + 124, "Species")
-    c.setFillColor(HexColor("#163826"))
-    c.setFont("Helvetica", 9.5)
-    c.drawString(col1_x, card1_y + 110, project_name[:32])
-    c.drawString(col2_x, card1_y + 110, species_label[:24])
+    curr_grid_y = grid_y - 12
+    for label, val in labels:
+        c.setFillColor(HexColor("#53705f"))
+        c.setFont("Helvetica-Bold", 8.5)
+        c.drawString(card1_x + 16, curr_grid_y, label)
+        c.setFillColor(HexColor("#163826"))
+        c.setFont("Helvetica", 8.5)
+        c.drawString(card1_x + 96, curr_grid_y, val)
+        curr_grid_y -= 17
 
-    # Row 2
-    c.setFillColor(HexColor("#53705f"))
-    c.setFont("Helvetica-Bold", 9)
-    c.drawString(col1_x, card1_y + 78, "Location")
-    c.drawString(col2_x, card1_y + 78, "Planting date")
-    c.setFillColor(HexColor("#163826"))
-    c.setFont("Helvetica", 9.5)
-    c.drawString(col1_x, card1_y + 64, location_text[:32])
-    c.drawString(col2_x, card1_y + 64, planting_date)
 
-    # Row 3
-    c.setFillColor(HexColor("#53705f"))
-    c.setFont("Helvetica-Bold", 9)
-    c.drawString(col1_x, card1_y + 34, "Issued")
-    c.setFillColor(HexColor("#163826"))
-    c.setFont("Helvetica", 8.5)
-    c.drawString(col1_x, card1_y + 20, datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC"))
+    # Card 2: Photo Evidence (Center-Right)
+    card2_x = 405
+    card2_w = 175
+    _draw_rounded_box(c, card2_x, middle_y, card2_w, middle_h, 12, fill_color=HexColor("#ffffff"), stroke_color=HexColor("#dcdfdc"))
+    
+    # Inner Polaroid Box
+    photo_size_w = 155
+    photo_size_h = 135
+    photo_x = card2_x + 10
+    photo_y = middle_y + 40
+    _draw_rounded_box(c, photo_x, photo_y, photo_size_w, photo_size_h, 4, fill_color=HexColor("#f8faf8"), stroke_color=HexColor("#e3ebe4"))
 
-    # Image inside Card 1 (on the right)
     primary_photo = str(sponsorship.get("photo_url") or "").strip()
     photo_urls = sponsorship.get("photo_urls") or []
     if isinstance(photo_urls, list):
@@ -266,134 +292,135 @@ def render_green_sponsor_certificate_pdf(sponsorship: dict, carbon: dict | None 
             if candidate_url:
                 primary_photo = primary_photo or candidate_url
                 break
-    
-    photo_box_size = 140
-    photo_box_x = right_x + content_w - photo_box_size - 20
-    photo_box_y = card1_y + 20
-    
-    _draw_rounded_box(c, photo_box_x, photo_box_y, photo_box_size, photo_box_size, 16, fill_color=HexColor("#f8faf8"), stroke_color=HexColor("#e3ebe4"))
-    
+
     if primary_photo:
         reader = _load_photo_reader(primary_photo, {})
         if reader is not None:
             try:
-                c.drawImage(reader, photo_box_x + 6, photo_box_y + 6, photo_box_size - 12, photo_box_size - 12, preserveAspectRatio=True, anchor="c")
+                c.drawImage(reader, photo_x + 4, photo_y + 4, photo_size_w - 8, photo_size_h - 8, preserveAspectRatio=True, anchor="c")
             except Exception:
                 pass
         else:
-            # Draw placeholder icon
             c.saveState()
-            c.setStrokeColor(HexColor("#b7cbbd"))
             c.setFillColor(HexColor("#53705f"))
-            c.setFont("Helvetica-Bold", 10)
-            c.drawCentredString(photo_box_x + photo_box_size/2, photo_box_y + photo_box_size/2 - 4, "Photo Verified")
+            c.setFont("Helvetica-Bold", 9)
+            c.drawCentredString(photo_x + photo_size_w/2, photo_y + photo_size_h/2 - 3, "Verified Tree Photo")
             c.restoreState()
     else:
-        # Draw placeholder icon
         c.saveState()
-        c.setStrokeColor(HexColor("#b7cbbd"))
         c.setFillColor(HexColor("#53705f"))
-        c.setFont("Helvetica-Bold", 10)
-        c.drawCentredString(photo_box_x + photo_box_size/2, photo_box_y + photo_box_size/2 - 4, "Photo Pending")
+        c.setFont("Helvetica-Bold", 9)
+        c.drawCentredString(photo_x + photo_size_w/2, photo_y + photo_size_h/2 - 3, "Photo Pending Verification")
         c.restoreState()
 
+    # Polaroid Label
+    c.setFillColor(HexColor("#083e20"))
+    c.setFont("Helvetica-Bold", 8.5)
+    c.drawCentredString(card2_x + card2_w/2, middle_y + 18, "VERIFIED FIELD PHOTO")
 
-    # Card 2: Climate Contribution Snapshot
-    card2_y = 206
-    card2_h = 130
-    _draw_rounded_box(c, right_x, card2_y, content_w, card2_h, 20, fill_color=HexColor("#ffffff"), stroke_color=HexColor("#e3ebe4"))
 
-    c.setFillColor(HexColor("#53705f"))
-    c.setFont("Helvetica-Bold", 9.5)
-    c.drawString(right_x + 20, card2_y + card2_h - 26, "CLIMATE CONTRIBUTION SNAPSHOT")
-
-    # Three metric chips
-    chip_w = 156
-    chip_h = 72
-    chip_y = card2_y + 16
-    chip_gap = 13
+    # Card 3: Dedication & Verification (Right side)
+    card3_x = 595
+    card3_w = 202
+    _draw_rounded_box(c, card3_x, middle_y, card3_w, middle_h, 12, fill_color=HexColor("#ffffff"), stroke_color=HexColor("#dcdfdc"))
     
-    chip1_x = right_x + 20
-    chip2_x = chip1_x + chip_w + chip_gap
-    chip3_x = chip2_x + chip_w + chip_gap
-    
-    _draw_metric_chip(c, chip1_x, chip_y, chip_w, chip_h, f"{float(carbon_data.get('current_co2_kg') or 0):,.2f} kg", "Current stored CO2")
-    _draw_metric_chip(c, chip2_x, chip_y, chip_w, chip_h, f"{float(carbon_data.get('annual_co2_kg') or 0):,.2f} kg/yr", "Annual sequestration")
-    _draw_metric_chip(c, chip3_x, chip_y, chip_w, chip_h, f"{float(carbon_data.get('lifetime_co2_kg') or 0):,.2f} kg", "Projected 40-year stock")
+    # Title
+    c.setFillColor(HexColor("#f4faf5"))
+    c.roundRect(card3_x + 10, middle_y + middle_h - 26, card3_w - 20, 18, 4, stroke=0, fill=1)
+    c.setFillColor(HexColor("#083e20"))
+    c.setFont("Helvetica-Bold", 8.5)
+    c.drawString(card3_x + 18, middle_y + middle_h - 21, "DEDICATION & REGISTRY")
 
-
-    # Card 3: Dedication & Care Statement
-    card3_y = 36
-    card3_h = 150
+    # Dedication Info
+    dedication_y = middle_y + middle_h - 38
     has_dedication = bool(dedication_type or dedication_name or dedication_message)
-    
     if has_dedication:
-        box_w = (content_w - 20) / 2
-        
-        # Left Box: Why this certificate matters
-        _draw_rounded_box(c, right_x, card3_y, box_w, card3_h, 16, fill_color=HexColor("#ffffff"), stroke_color=HexColor("#e3ebe4"))
-        c.setFillColor(HexColor("#53705f"))
-        c.setFont("Helvetica-Bold", 8.5)
-        c.drawString(right_x + 16, card3_y + card3_h - 22, "WHY THIS CERTIFICATE MATTERS")
-        
-        _draw_wrapped_text(
-            c,
-            evidence_message,
-            right_x + 16,
-            card3_y + card3_h - 40,
-            box_w - 32,
-            line_height=12,
-            font_name="Helvetica",
-            font_size=8.2,
-            color=HexColor("#4f6c59"),
-            max_lines=7
-        )
-        
-        # Right Box: Dedication
-        dedication_x = right_x + box_w + 20
-        _draw_rounded_box(c, dedication_x, card3_y, box_w, card3_h, 16, fill_color=HexColor("#ffffff"), stroke_color=HexColor("#e3ebe4"))
-        c.setFillColor(HexColor("#53705f"))
-        c.setFont("Helvetica-Bold", 8.5)
-        c.drawString(dedication_x + 16, card3_y + card3_h - 22, "DEDICATION")
-        
-        c.setFillColor(HexColor("#163826"))
-        c.setFont("Helvetica-Bold", 10)
-        dedication_line = " | ".join(part for part in [dedication_type.replace("_", " ").title() if dedication_type else "", dedication_name] if part)
-        c.drawString(dedication_x + 16, card3_y + card3_h - 42, dedication_line[:40])
+        c.setFillColor(HexColor("#b8860b"))
+        c.setFont("Helvetica-Bold", 9)
+        ded_title = dedication_type.replace("_", " ").title() if dedication_type else "Dedication"
+        c.drawString(card3_x + 16, dedication_y - 8, f"{ded_title}: {dedication_name[:24]}")
         
         if dedication_message:
+            c.setFillColor(HexColor("#4f6c59"))
+            c.setFont("Helvetica-Oblique", 7.5)
             _draw_wrapped_text(
                 c,
-                dedication_message,
-                dedication_x + 16,
-                card3_y + card3_h - 60,
-                box_w - 32,
-                line_height=11,
+                f"\"{dedication_message}\"",
+                card3_x + 16,
+                dedication_y - 20,
+                card3_w - 32,
+                line_height=9,
                 font_name="Helvetica-Oblique",
-                font_size=8.0,
+                font_size=7.5,
                 color=HexColor("#4f6c59"),
-                max_lines=6
+                max_lines=3
             )
-            
     else:
-        # Single Wide Box: Why this certificate matters
-        _draw_rounded_box(c, right_x, card3_y, content_w, card3_h, 16, fill_color=HexColor("#ffffff"), stroke_color=HexColor("#e3ebe4"))
-        c.setFillColor(HexColor("#53705f"))
-        c.setFont("Helvetica-Bold", 9.5)
-        c.drawString(right_x + 20, card3_y + card3_h - 24, "WHY THIS CERTIFICATE MATTERS")
-        
+        # Standard registry message
+        c.setFillColor(HexColor("#4f6c59"))
         _draw_wrapped_text(
             c,
             evidence_message,
-            right_x + 20,
-            card3_y + card3_h - 46,
-            content_w - 40,
-            line_height=14,
+            card3_x + 16,
+            dedication_y - 12,
+            card3_w - 32,
+            line_height=10,
             font_name="Helvetica",
-            font_size=9.5,
+            font_size=7.5,
             color=HexColor("#4f6c59"),
-            max_lines=6
+            max_lines=4
         )
+
+    # QR Code at the bottom of Card 3
+    if verification_url:
+        qr_size = 65
+        qr_x = card3_x + (card3_w - qr_size) / 2
+        qr_y = middle_y + 12
+        _draw_qr_code(c, verification_url, qr_x, qr_y, qr_size)
+        c.setFillColor(HexColor("#53705f"))
+        c.setFont("Helvetica", 6.8)
+        c.drawCentredString(card3_x + card3_w/2, middle_y + 6, "Scan to verify live timeline")
+
+
+    # --- BOTTOM CLIMATE METRICS (y from 56 to 126) ---
+    metrics_y = 56
+    metrics_h = 70
+    
+    # Calculate widths
+    total_metrics_w = page_w - 90 # 751.89
+    metric_card_w = 238
+    gap = 18
+    
+    metric_x1 = 45
+    metric_x2 = metric_x1 + metric_card_w + gap
+    metric_x3 = metric_x2 + metric_card_w + gap
+    
+    # Render 3 Metric Cards
+    def draw_climate_metric_card(x, val, label):
+        _draw_rounded_box(c, x, metrics_y, metric_card_w, metrics_h, 10, fill_color=HexColor("#f4faf5"), stroke_color=HexColor("#cce2d1"))
+        
+        c.setFillColor(HexColor("#083e20"))
+        c.setFont("Helvetica-Bold", 16)
+        c.drawString(x + 14, metrics_y + metrics_h - 26, val)
+        
+        c.setFillColor(HexColor("#4f6c59"))
+        c.setFont("Helvetica-Bold", 8.5)
+        c.drawString(x + 14, metrics_y + 14, label)
+        
+        # Gold badge accent
+        c.setFillColor(HexColor("#c5a059"))
+        c.circle(x + metric_card_w - 18, metrics_y + metrics_h/2, 3, stroke=0, fill=1)
+
+    draw_climate_metric_card(metric_x1, f"{float(carbon_data.get('current_co2_kg') or 0):,.2f} kg", "CURRENT STORED CO2")
+    draw_climate_metric_card(metric_x2, f"{float(carbon_data.get('annual_co2_kg') or 0):,.2f} kg/yr", "ANNUAL CO2 SEQUESTRATION")
+    draw_climate_metric_card(metric_x3, f"{float(carbon_data.get('lifetime_co2_kg') or 0):,.2f} kg", "PROJECTED 40-YEAR CARBON STOCK")
+
+    # --- FOOTER MARGIN DETAILS ---
+    c.setFillColor(HexColor("#53705f"))
+    c.setFont("Helvetica-Bold", 7.5)
+    c.drawString(45, 34, f"Ref: {sponsorship.get('unit_uid') or sponsorship.get('tree_id') or '-'}")
+    
+    c.drawRightString(page_w - 45, 34, "LandCheck Green Verified Digital Document")
 
     c.save()
     buffer.seek(0)

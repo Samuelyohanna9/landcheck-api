@@ -10196,7 +10196,12 @@ def export_sponsor_tree_certificate(
     return Response(
         content=pdf_bytes,
         media_type="application/pdf",
-        headers={"Content-Disposition": f'inline; filename=\"sponsor_tree_certificate_{int(unit_id)}.pdf\"'},
+        headers={
+            "Content-Disposition": f'inline; filename=\"sponsor_tree_certificate_{int(unit_id)}.pdf\"',
+            "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+            "Pragma": "no-cache",
+            "Expires": "0",
+        },
     )
 
 
