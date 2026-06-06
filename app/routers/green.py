@@ -320,6 +320,19 @@ class MobilePushTokenDeactivatePayload(BaseModel):
     user_id: int | None = None
 
 
+class SponsorPushTokenPayload(BaseModel):
+    sponsor_id: int
+    token: str
+    platform: str | None = None
+    app_version: str | None = None
+    device_label: str | None = None
+
+
+class SponsorPushTokenDeactivatePayload(BaseModel):
+    token: str
+    sponsor_id: int | None = None
+
+
 class SponsorSignupPayload(BaseModel):
     account_type: str = "individual"
     full_name: str
@@ -996,6 +1009,86 @@ def _deactivate_green_push_tokens(db: Session, tokens: list[str], *, user_id: in
         )
 
 
+def _normalize_sponsor_push_token(value: str | None) -> str:
+    token = str(value or "").strip()
+    if not token:
+        raise HTTPException(status_code=400, detail="Push token required")
+    if not (token.startswith("ExponentPushToken[") or token.startswith("ExpoPushToken[")):
+        raise HTTPException(status_code=400, detail="Invalid Expo push token")
+    return token
+
+
+def _upsert_sponsor_push_token(
+    db: Session,
+    *,
+    sponsor_id: int,
+    token: str,
+    platform: str | None = None,
+    app_version: str | None = None,
+    device_label: str | None = None,
+):
+    normalized_token = _normalize_sponsor_push_token(token)
+    db.execute(
+        text(
+            """
+            INSERT INTO green_sponsor_push_tokens (
+                sponsor_account_id, expo_push_token, platform, app_version, device_label,
+                is_active, last_seen_at, created_at, updated_at
+            )
+            VALUES (
+                :sponsor_id, :expo_push_token, :platform, :app_version, :device_label,
+                TRUE, NOW(), NOW(), NOW()
+            )
+            ON CONFLICT (expo_push_token) DO UPDATE
+            SET sponsor_account_id = EXCLUDED.sponsor_account_id,
+                platform = EXCLUDED.platform,
+                app_version = EXCLUDED.app_version,
+                device_label = EXCLUDED.device_label,
+                is_active = TRUE,
+                last_seen_at = NOW(),
+                updated_at = NOW()
+            """
+        ),
+        {
+            "sponsor_id": int(sponsor_id),
+            "expo_push_token": normalized_token,
+            "platform": (platform or "").strip().lower() or None,
+            "app_version": (app_version or "").strip() or None,
+            "device_label": (device_label or "").strip() or None,
+        },
+    )
+    return normalized_token
+
+
+def _deactivate_green_sponsor_push_tokens(db: Session, tokens: list[str], *, sponsor_id: int | None = None):
+    normalized_tokens = list({str(item or "").strip() for item in tokens if str(item or "").strip()})
+    if not normalized_tokens:
+        return
+    statement = text(
+        """
+        UPDATE green_sponsor_push_tokens
+        SET is_active = FALSE, updated_at = NOW()
+        WHERE expo_push_token IN :tokens
+        """
+    ).bindparams(bindparam("tokens", expanding=True))
+    params: dict[str, object] = {"tokens": normalized_tokens}
+    if sponsor_id is None:
+        db.execute(statement, params)
+    else:
+        params["sponsor_id"] = int(sponsor_id)
+        db.execute(
+            text(
+                """
+                UPDATE green_sponsor_push_tokens
+                SET is_active = FALSE, updated_at = NOW()
+                WHERE expo_push_token IN :tokens
+                  AND sponsor_account_id = :sponsor_id
+                """
+            ).bindparams(bindparam("tokens", expanding=True)),
+            params,
+        )
+
+
 def _list_green_push_targets_for_assignee(db: Session, *, project_id: int, assignee_name: str | None) -> list[dict]:
     assignee_clean = (assignee_name or "").strip()
     if not assignee_clean:
@@ -1098,6 +1191,7 @@ def _send_expo_push_messages(messages: list[dict]):
         cleanup_db = SessionLocal()
         try:
             _deactivate_green_push_tokens(cleanup_db, invalid_tokens)
+            _deactivate_green_sponsor_push_tokens(cleanup_db, invalid_tokens)
             cleanup_db.commit()
         except Exception:
             cleanup_db.rollback()
@@ -4581,6 +4675,21 @@ def ensure_green_tables(db: Session):
         )
     """))
     db.execute(text("""
+        CREATE TABLE IF NOT EXISTS green_sponsor_push_tokens (
+            id SERIAL PRIMARY KEY,
+            sponsor_account_id INTEGER NOT NULL REFERENCES green_sponsor_accounts(id) ON DELETE CASCADE,
+            expo_push_token TEXT NOT NULL UNIQUE,
+            platform TEXT,
+            app_version TEXT,
+            expo_project_id TEXT,
+            device_label TEXT,
+            is_active BOOLEAN NOT NULL DEFAULT TRUE,
+            last_seen_at TIMESTAMP DEFAULT NOW(),
+            created_at TIMESTAMP DEFAULT NOW(),
+            updated_at TIMESTAMP DEFAULT NOW()
+        )
+    """))
+    db.execute(text("""
         CREATE TABLE IF NOT EXISTS green_roles (
             id SERIAL PRIMARY KEY,
             role_uid TEXT NOT NULL,
@@ -5280,6 +5389,8 @@ def ensure_green_tables(db: Session):
     db.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS idx_green_push_tokens_token ON green_push_tokens(expo_push_token)"))
     db.execute(text("CREATE INDEX IF NOT EXISTS idx_green_push_tokens_user ON green_push_tokens(user_id, is_active)"))
     db.execute(text("CREATE INDEX IF NOT EXISTS idx_green_push_tokens_org ON green_push_tokens(organization_id, is_active)"))
+    db.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS idx_green_sponsor_push_tokens_token ON green_sponsor_push_tokens(expo_push_token)"))
+    db.execute(text("CREATE INDEX IF NOT EXISTS idx_green_sponsor_push_tokens_sponsor ON green_sponsor_push_tokens(sponsor_account_id, is_active)"))
     db.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS idx_green_roles_uid ON green_roles(UPPER(role_uid))"))
     db.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS idx_green_roles_key ON green_roles(LOWER(role_key))"))
     db.execute(text("CREATE INDEX IF NOT EXISTS idx_green_roles_active ON green_roles(is_active)"))
@@ -7960,6 +8071,55 @@ def _link_tree_to_pending_sponsorship_unit(db: Session, project_id: int, tree_id
     ).mappings().first()
     if updated:
         _refresh_sponsorship_order_status(db, int(updated["order_id"]))
+        try:
+            info = db.execute(
+                text(
+                    """
+                    SELECT sa.id AS sponsor_id, u.unit_uid, p.name AS project_name, t.species, t.project_tree_no
+                    FROM green_sponsorship_units u
+                    JOIN green_sponsor_accounts sa ON sa.id = u.sponsor_account_id
+                    JOIN tree_projects p ON p.id = u.project_id
+                    JOIN trees t ON t.id = u.tree_id
+                    WHERE u.id = :unit_id
+                    """
+                ),
+                {"unit_id": int(updated["id"])},
+            ).mappings().first()
+            if info:
+                tree_num = f"Tree #{info['project_tree_no']}" if info['project_tree_no'] else f"Tree ID {tree_id}"
+                title = "New Tree Linked!"
+                body = f"Your sponsored {info['species']} ({tree_num}) in {info['project_name']} has been verified and linked to your account!"
+                tokens = db.execute(
+                    text(
+                        """
+                        SELECT expo_push_token
+                        FROM green_sponsor_push_tokens
+                        WHERE sponsor_account_id = :sponsor_id
+                          AND COALESCE(is_active, TRUE) = TRUE
+                        """
+                    ),
+                    {"sponsor_id": int(info["sponsor_id"])},
+                ).scalars().all()
+                if tokens:
+                    messages = [
+                        {
+                            "to": token,
+                            "title": title,
+                            "body": body,
+                            "sound": "default",
+                            "priority": "high",
+                            "channelId": "sponsor-alerts",
+                            "data": {
+                                "unit_uid": info["unit_uid"],
+                                "tree_id": tree_id,
+                                "project_name": info["project_name"],
+                            },
+                        }
+                        for token in tokens
+                    ]
+                    _send_expo_push_messages(messages)
+        except Exception:
+            pass
         return dict(updated)
     return None
 
@@ -15324,6 +15484,57 @@ def deactivate_mobile_push_token(
     return {"ok": True}
 
 
+@router.post("/sponsor/mobile/push-tokens/register")
+def register_sponsor_mobile_push_token(
+    payload: SponsorPushTokenPayload,
+    db: Session = Depends(get_db),
+):
+    sponsor_id = int(payload.sponsor_id or 0)
+    if sponsor_id <= 0:
+        raise HTTPException(status_code=400, detail="Valid sponsor_id required")
+    sponsor_row = db.execute(
+        text(
+            """
+            SELECT id, COALESCE(is_active, TRUE) AS is_active
+            FROM green_sponsor_accounts
+            WHERE id = :sponsor_id
+            LIMIT 1
+            """
+        ),
+        {"sponsor_id": sponsor_id},
+    ).mappings().first()
+    if not sponsor_row:
+        raise HTTPException(status_code=404, detail="Sponsor not found")
+    if not bool(sponsor_row.get("is_active", True)):
+        raise HTTPException(status_code=403, detail="Sponsor is not active")
+
+    token = _upsert_sponsor_push_token(
+        db,
+        sponsor_id=sponsor_id,
+        token=payload.token,
+        platform=payload.platform,
+        app_version=payload.app_version,
+        device_label=payload.device_label,
+    )
+    db.commit()
+    return {"ok": True, "token": token}
+
+
+@router.post("/sponsor/mobile/push-tokens/deactivate")
+def deactivate_sponsor_mobile_push_token(
+    payload: SponsorPushTokenDeactivatePayload,
+    db: Session = Depends(get_db),
+):
+    token = _normalize_sponsor_push_token(payload.token)
+    _deactivate_green_sponsor_push_tokens(
+        db,
+        [token],
+        sponsor_id=int(payload.sponsor_id) if payload.sponsor_id is not None else None,
+    )
+    db.commit()
+    return {"ok": True}
+
+
 @router.patch("/tasks/{task_id}")
 def update_task(
     task_id: int,
@@ -15768,9 +15979,60 @@ def review_submitted_task(
                 changed_by=reviewer_name or None,
                 notes=review_notes or None,
             )
-        # Auto-maintenance generation disabled: supervisors assign maintenance manually.
-        auto_generated_task_id = None
         _resolve_task_alerts(db, task_id)
+        try:
+            sponsors = db.execute(
+                text(
+                    """
+                    SELECT DISTINCT u.sponsor_account_id, u.unit_uid, p.name AS project_name, t.species, t.project_tree_no
+                    FROM green_sponsorship_units u
+                    JOIN tree_projects p ON p.id = u.project_id
+                    JOIN trees t ON t.id = u.tree_id
+                    WHERE u.tree_id = :tree_id
+                      AND LOWER(COALESCE(u.sponsorship_status, '')) IN ('linked', 'active', 'replaced')
+                    """
+                ),
+                {"tree_id": int(task["tree_id"])},
+            ).mappings().all()
+            
+            for sp in sponsors:
+                tree_num = f"Tree #{sp['project_tree_no']}" if sp['project_tree_no'] else f"Tree ID {int(task['tree_id'])}"
+                title = "Tree Activity Update"
+                activity_label = task_type.replace("_", " ").title() if task_type else "Maintenance"
+                body = f"A new activity ({activity_label}) was completed and verified for your sponsored {sp['species']} ({tree_num}) in {sp['project_name']}."
+                
+                tokens = db.execute(
+                    text(
+                        """
+                        SELECT expo_push_token
+                        FROM green_sponsor_push_tokens
+                        WHERE sponsor_account_id = :sponsor_id
+                          AND COALESCE(is_active, TRUE) = TRUE
+                        """
+                    ),
+                    {"sponsor_id": int(sp["sponsor_account_id"])},
+                ).scalars().all()
+                if tokens:
+                    messages = [
+                        {
+                            "to": token,
+                            "title": title,
+                            "body": body,
+                            "sound": "default",
+                            "priority": "high",
+                            "channelId": "sponsor-alerts",
+                            "data": {
+                                "unit_uid": sp["unit_uid"],
+                                "tree_id": int(task["tree_id"]),
+                                "task_type": task_type,
+                                "project_name": sp["project_name"],
+                            },
+                        }
+                        for token in tokens
+                    ]
+                    _send_expo_push_messages(messages)
+        except Exception:
+            pass
         action_name = "task_review_approved"
     elif decision_key == "reject":
         db.execute(
