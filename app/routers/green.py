@@ -123,6 +123,11 @@ SPONSOR_PAYMENT_STATUS_VALUES = {"pending", "proof_submitted", "verified", "reje
 SPONSOR_ORDER_STATUS_VALUES = {"pending_payment", "payment_review", "paid", "allocated", "completed", "cancelled"}
 SPONSOR_UNIT_STATUS_VALUES = {"awaiting_payment", "awaiting_tree", "linked", "active", "replaced", "cancelled"}
 SPONSOR_DEDICATION_TYPE_VALUES = {"self", "memorial", "birthday", "celebration", "honor", "organization", "other"}
+SPONSOR_AGENT_ACCOUNT_CURRENCY = "NGN"
+SPONSOR_AGENT_MIN_PAYOUT_NAIRA = 10000
+SPONSOR_AGENT_PAYOUT_STATUS_VALUES = {"requested", "approved", "processing", "paid", "rejected", "failed", "cancelled"}
+SPONSOR_AGENT_DEFAULT_PLANTING_RATIO = 0.30
+SPONSOR_AGENT_DEFAULT_MAINTENANCE_RATIO = 0.10
 FLUTTERWAVE_API_BASE_URL = str(os.getenv("FLUTTERWAVE_API_BASE_URL") or "https://api.flutterwave.com/v3").strip().rstrip("/")
 LANDCHECK_API_PUBLIC_URL = str(os.getenv("LANDCHECK_API_PUBLIC_URL") or "").strip().rstrip("/")
 LANDCHECK_MOBILE_SCHEME = str(os.getenv("LANDCHECK_MOBILE_SCHEME") or "landcheckmobile").strip() or "landcheckmobile"
@@ -349,6 +354,32 @@ class SponsorOrderReviewPayload(BaseModel):
     @property
     def resolved_reviewer(self) -> str | None:
         return (self.reviewed_by or self.reviewer_name or "").strip() or None
+
+
+class SponsorAgentBankAccountPayload(BaseModel):
+    user_id: int
+    organization_id: int | None = None
+    bank_code: str
+    bank_name: str | None = None
+    account_number: str
+    account_name: str | None = None
+
+
+class SponsorAgentBankResolvePayload(BaseModel):
+    bank_code: str
+    account_number: str
+
+
+class SponsorAgentPayoutRequestPayload(BaseModel):
+    user_id: int
+    organization_id: int | None = None
+
+
+class SponsorAgentPayoutReviewPayload(BaseModel):
+    action: str
+    reviewer_name: str | None = None
+    review_notes: str | None = None
+    auto_transfer: bool = False
 
 
 def _normalize_privacy_scope(value: str | None) -> str:
@@ -1746,6 +1777,36 @@ def _normalize_currency_code(value: str | None, default: str = "NGN") -> str:
     return default
 
 
+def _normalize_sponsor_agent_payout_status(value: str | None) -> str:
+    normalized = _normalize_name(value)
+    if normalized in SPONSOR_AGENT_PAYOUT_STATUS_VALUES:
+        return normalized
+    return "requested"
+
+
+def _normalize_account_number(value: object) -> str:
+    return "".join(ch for ch in str(value or "").strip() if ch.isdigit())
+
+
+def _mask_account_number(value: object) -> str | None:
+    digits = _normalize_account_number(value)
+    if not digits:
+        return None
+    if len(digits) <= 4:
+        return digits
+    return f"{'*' * max(len(digits) - 4, 0)}{digits[-4:]}"
+
+
+def _derive_default_sponsor_agent_fee(amount_per_tree: object, *, ratio: float) -> float:
+    try:
+        base_value = round(float(amount_per_tree or 0), 2)
+    except Exception:
+        base_value = 0.0
+    if base_value <= 0 or ratio <= 0:
+        return 0.0
+    return round(base_value * ratio, 2)
+
+
 def _flutterwave_secret_key() -> str | None:
     return str(os.getenv("FLW_SECRET_KEY") or os.getenv("FLUTTERWAVE_SECRET_KEY") or "").strip() or None
 
@@ -2075,6 +2136,16 @@ def _apply_project_access_fields(payload: dict) -> dict:
         payload["sponsor_price_per_tree"] = round(float(price_value), 2) if price_value is not None else None
     except Exception:
         payload["sponsor_price_per_tree"] = None
+    planting_fee_value = payload.get("sponsor_agent_planting_fee")
+    try:
+        payload["sponsor_agent_planting_fee"] = round(float(planting_fee_value), 2) if planting_fee_value is not None else None
+    except Exception:
+        payload["sponsor_agent_planting_fee"] = None
+    maintenance_fee_value = payload.get("sponsor_agent_maintenance_fee")
+    try:
+        payload["sponsor_agent_maintenance_fee"] = round(float(maintenance_fee_value), 2) if maintenance_fee_value is not None else None
+    except Exception:
+        payload["sponsor_agent_maintenance_fee"] = None
     capacity_value = payload.get("sponsor_capacity")
     try:
         payload["sponsor_capacity"] = int(capacity_value) if capacity_value is not None else None
@@ -2110,6 +2181,34 @@ def _normalize_positive_int_list(value: object) -> list[int]:
         seen.add(numeric)
         normalized.append(numeric)
     return normalized
+
+
+def _normalize_string_list(value: object) -> list[str]:
+    if value is None:
+        return []
+    items = value if isinstance(value, (list, tuple, set)) else []
+    seen: set[str] = set()
+    normalized: list[str] = []
+    for item in items:
+        text_value = str(item or "").strip()
+        if not text_value or text_value in seen:
+            continue
+        seen.add(text_value)
+        normalized.append(text_value)
+    return normalized
+
+
+def _json_value_or(value: object, fallback):
+    if value is None:
+        return fallback
+    if isinstance(value, (dict, list)):
+        return value
+    if isinstance(value, str):
+        try:
+            return json.loads(value)
+        except Exception:
+            return fallback
+    return fallback
 
 
 def _validate_public_sponsor_agent_user_ids(
@@ -3915,6 +4014,8 @@ def ensure_green_tables(db: Session):
             sponsor_dedication_enabled BOOLEAN NOT NULL DEFAULT TRUE,
             sponsor_payment_instructions TEXT,
             public_sponsor_agent_user_ids JSONB,
+            sponsor_agent_planting_fee NUMERIC,
+            sponsor_agent_maintenance_fee NUMERIC,
             agric_config JSONB,
             relief_config JSONB,
             planting_model TEXT NOT NULL DEFAULT 'direct',
@@ -4080,6 +4181,8 @@ def ensure_green_tables(db: Session):
         db.execute(text("ALTER TABLE tree_projects ADD COLUMN IF NOT EXISTS sponsor_max_per_order INTEGER NOT NULL DEFAULT 100"))
         db.execute(text("ALTER TABLE tree_projects ADD COLUMN IF NOT EXISTS sponsor_dedication_enabled BOOLEAN NOT NULL DEFAULT TRUE"))
         db.execute(text("ALTER TABLE tree_projects ADD COLUMN IF NOT EXISTS sponsor_payment_instructions TEXT"))
+        db.execute(text("ALTER TABLE tree_projects ADD COLUMN IF NOT EXISTS sponsor_agent_planting_fee NUMERIC"))
+        db.execute(text("ALTER TABLE tree_projects ADD COLUMN IF NOT EXISTS sponsor_agent_maintenance_fee NUMERIC"))
         db.execute(text("ALTER TABLE tree_projects ADD COLUMN IF NOT EXISTS agric_config JSONB"))
         db.execute(text("ALTER TABLE tree_projects ADD COLUMN IF NOT EXISTS relief_config JSONB"))
         db.execute(text("ALTER TABLE tree_projects ADD COLUMN IF NOT EXISTS planting_model TEXT NOT NULL DEFAULT 'direct'"))
@@ -4352,6 +4455,52 @@ def ensure_green_tables(db: Session):
             updated_at TIMESTAMP DEFAULT NOW()
         )
     """))
+    db.execute(text("""
+        CREATE TABLE IF NOT EXISTS green_sponsor_agent_bank_accounts (
+            id SERIAL PRIMARY KEY,
+            user_id INTEGER NOT NULL REFERENCES green_users(id) ON DELETE CASCADE,
+            organization_id INTEGER REFERENCES green_organizations(id) ON DELETE SET NULL,
+            currency TEXT NOT NULL DEFAULT 'NGN',
+            bank_code TEXT NOT NULL,
+            bank_name TEXT,
+            account_number TEXT NOT NULL,
+            account_name TEXT,
+            verification_payload JSONB,
+            verified_at TIMESTAMP,
+            created_at TIMESTAMP DEFAULT NOW(),
+            updated_at TIMESTAMP DEFAULT NOW()
+        )
+    """))
+    db.execute(text("""
+        CREATE TABLE IF NOT EXISTS green_sponsor_agent_payout_requests (
+            id SERIAL PRIMARY KEY,
+            request_uid TEXT NOT NULL,
+            user_id INTEGER NOT NULL REFERENCES green_users(id) ON DELETE CASCADE,
+            organization_id INTEGER REFERENCES green_organizations(id) ON DELETE SET NULL,
+            currency TEXT NOT NULL DEFAULT 'NGN',
+            amount_total NUMERIC NOT NULL DEFAULT 0,
+            payout_minimum NUMERIC NOT NULL DEFAULT 10000,
+            status TEXT NOT NULL DEFAULT 'requested',
+            bank_code TEXT,
+            bank_name TEXT,
+            account_number TEXT,
+            account_name TEXT,
+            earning_keys JSONB,
+            earning_rows JSONB,
+            project_ids JSONB,
+            review_notes TEXT,
+            reviewed_by TEXT,
+            reviewed_at TIMESTAMP,
+            transfer_reference TEXT,
+            transfer_id BIGINT,
+            transfer_status TEXT,
+            transfer_payload JSONB,
+            transfer_processed_at TIMESTAMP,
+            paid_at TIMESTAMP,
+            created_at TIMESTAMP DEFAULT NOW(),
+            updated_at TIMESTAMP DEFAULT NOW()
+        )
+    """))
     try:
         db.execute(text("ALTER TABLE green_sponsorship_orders ADD COLUMN IF NOT EXISTS order_uid TEXT"))
         db.execute(text("ALTER TABLE green_sponsorship_orders ADD COLUMN IF NOT EXISTS payment_provider TEXT"))
@@ -4378,6 +4527,38 @@ def ensure_green_tables(db: Session):
         db.execute(text("ALTER TABLE green_sponsorship_units ADD COLUMN IF NOT EXISTS linked_at TIMESTAMP"))
         db.execute(text("ALTER TABLE green_sponsorship_units ADD COLUMN IF NOT EXISTS last_certificate_at TIMESTAMP"))
         db.execute(text("ALTER TABLE green_sponsorship_units ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW()"))
+        db.execute(text("ALTER TABLE green_sponsor_agent_bank_accounts ADD COLUMN IF NOT EXISTS organization_id INTEGER"))
+        db.execute(text("ALTER TABLE green_sponsor_agent_bank_accounts ADD COLUMN IF NOT EXISTS currency TEXT NOT NULL DEFAULT 'NGN'"))
+        db.execute(text("ALTER TABLE green_sponsor_agent_bank_accounts ADD COLUMN IF NOT EXISTS bank_code TEXT"))
+        db.execute(text("ALTER TABLE green_sponsor_agent_bank_accounts ADD COLUMN IF NOT EXISTS bank_name TEXT"))
+        db.execute(text("ALTER TABLE green_sponsor_agent_bank_accounts ADD COLUMN IF NOT EXISTS account_number TEXT"))
+        db.execute(text("ALTER TABLE green_sponsor_agent_bank_accounts ADD COLUMN IF NOT EXISTS account_name TEXT"))
+        db.execute(text("ALTER TABLE green_sponsor_agent_bank_accounts ADD COLUMN IF NOT EXISTS verification_payload JSONB"))
+        db.execute(text("ALTER TABLE green_sponsor_agent_bank_accounts ADD COLUMN IF NOT EXISTS verified_at TIMESTAMP"))
+        db.execute(text("ALTER TABLE green_sponsor_agent_bank_accounts ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW()"))
+        db.execute(text("ALTER TABLE green_sponsor_agent_payout_requests ADD COLUMN IF NOT EXISTS request_uid TEXT"))
+        db.execute(text("ALTER TABLE green_sponsor_agent_payout_requests ADD COLUMN IF NOT EXISTS organization_id INTEGER"))
+        db.execute(text("ALTER TABLE green_sponsor_agent_payout_requests ADD COLUMN IF NOT EXISTS currency TEXT NOT NULL DEFAULT 'NGN'"))
+        db.execute(text("ALTER TABLE green_sponsor_agent_payout_requests ADD COLUMN IF NOT EXISTS amount_total NUMERIC NOT NULL DEFAULT 0"))
+        db.execute(text("ALTER TABLE green_sponsor_agent_payout_requests ADD COLUMN IF NOT EXISTS payout_minimum NUMERIC NOT NULL DEFAULT 10000"))
+        db.execute(text("ALTER TABLE green_sponsor_agent_payout_requests ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'requested'"))
+        db.execute(text("ALTER TABLE green_sponsor_agent_payout_requests ADD COLUMN IF NOT EXISTS bank_code TEXT"))
+        db.execute(text("ALTER TABLE green_sponsor_agent_payout_requests ADD COLUMN IF NOT EXISTS bank_name TEXT"))
+        db.execute(text("ALTER TABLE green_sponsor_agent_payout_requests ADD COLUMN IF NOT EXISTS account_number TEXT"))
+        db.execute(text("ALTER TABLE green_sponsor_agent_payout_requests ADD COLUMN IF NOT EXISTS account_name TEXT"))
+        db.execute(text("ALTER TABLE green_sponsor_agent_payout_requests ADD COLUMN IF NOT EXISTS earning_keys JSONB"))
+        db.execute(text("ALTER TABLE green_sponsor_agent_payout_requests ADD COLUMN IF NOT EXISTS earning_rows JSONB"))
+        db.execute(text("ALTER TABLE green_sponsor_agent_payout_requests ADD COLUMN IF NOT EXISTS project_ids JSONB"))
+        db.execute(text("ALTER TABLE green_sponsor_agent_payout_requests ADD COLUMN IF NOT EXISTS review_notes TEXT"))
+        db.execute(text("ALTER TABLE green_sponsor_agent_payout_requests ADD COLUMN IF NOT EXISTS reviewed_by TEXT"))
+        db.execute(text("ALTER TABLE green_sponsor_agent_payout_requests ADD COLUMN IF NOT EXISTS reviewed_at TIMESTAMP"))
+        db.execute(text("ALTER TABLE green_sponsor_agent_payout_requests ADD COLUMN IF NOT EXISTS transfer_reference TEXT"))
+        db.execute(text("ALTER TABLE green_sponsor_agent_payout_requests ADD COLUMN IF NOT EXISTS transfer_id BIGINT"))
+        db.execute(text("ALTER TABLE green_sponsor_agent_payout_requests ADD COLUMN IF NOT EXISTS transfer_status TEXT"))
+        db.execute(text("ALTER TABLE green_sponsor_agent_payout_requests ADD COLUMN IF NOT EXISTS transfer_payload JSONB"))
+        db.execute(text("ALTER TABLE green_sponsor_agent_payout_requests ADD COLUMN IF NOT EXISTS transfer_processed_at TIMESTAMP"))
+        db.execute(text("ALTER TABLE green_sponsor_agent_payout_requests ADD COLUMN IF NOT EXISTS paid_at TIMESTAMP"))
+        db.execute(text("ALTER TABLE green_sponsor_agent_payout_requests ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW()"))
     except Exception:
         db.rollback()
     db.execute(text("""
@@ -4662,6 +4843,10 @@ def ensure_green_tables(db: Session):
     db.execute(text("CREATE INDEX IF NOT EXISTS idx_sponsor_units_project_status ON green_sponsorship_units(project_id, sponsorship_status, created_at DESC)"))
     db.execute(text("CREATE INDEX IF NOT EXISTS idx_sponsor_units_sponsor_status ON green_sponsorship_units(sponsor_account_id, sponsorship_status, created_at DESC)"))
     db.execute(text("CREATE INDEX IF NOT EXISTS idx_sponsor_units_tree ON green_sponsorship_units(tree_id)"))
+    db.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS idx_sponsor_agent_bank_user ON green_sponsor_agent_bank_accounts(user_id)"))
+    db.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS idx_sponsor_agent_payout_uid ON green_sponsor_agent_payout_requests(UPPER(request_uid))"))
+    db.execute(text("CREATE INDEX IF NOT EXISTS idx_sponsor_agent_payout_user_created ON green_sponsor_agent_payout_requests(user_id, created_at DESC)"))
+    db.execute(text("CREATE INDEX IF NOT EXISTS idx_sponsor_agent_payout_org_status ON green_sponsor_agent_payout_requests(organization_id, status, created_at DESC)"))
     db.execute(text("CREATE INDEX IF NOT EXISTS idx_tree_project_links_target ON tree_project_links(target_project_id, created_at DESC)"))
     for role_key, role_name, is_system in [
         ("admin", "Admin", True),
@@ -5878,6 +6063,8 @@ def create_project(
     sponsor_dedication_enabled: bool = Body(default=True),
     sponsor_payment_instructions: str | None = Body(default=None),
     public_sponsor_agent_user_ids: list[int] | None = Body(default=None),
+    sponsor_agent_planting_fee: float | None = Body(default=None),
+    sponsor_agent_maintenance_fee: float | None = Body(default=None),
     agric_config: dict | None = Body(default=None),
     relief_config: dict | None = Body(default=None),
     planting_model: str = Body(default=DEFAULT_PLANTING_MODEL),
@@ -5897,6 +6084,16 @@ def create_project(
     normalized_capacity = int(sponsor_capacity) if sponsor_capacity is not None else None
     normalized_max_per_order = max(1, int(sponsor_max_per_order or 100))
     normalized_payment_instructions = _clean_text(sponsor_payment_instructions, 1200)
+    normalized_planting_fee = (
+        round(float(sponsor_agent_planting_fee), 2)
+        if sponsor_agent_planting_fee is not None
+        else _derive_default_sponsor_agent_fee(normalized_price, ratio=SPONSOR_AGENT_DEFAULT_PLANTING_RATIO)
+    )
+    normalized_maintenance_fee = (
+        round(float(sponsor_agent_maintenance_fee), 2)
+        if sponsor_agent_maintenance_fee is not None
+        else _derive_default_sponsor_agent_fee(normalized_price, ratio=SPONSOR_AGENT_DEFAULT_MAINTENANCE_RATIO)
+    )
     org_id_value = int(organization_id) if organization_id is not None else None
     if org_id_value is not None and org_id_value <= 0:
         org_id_value = None
@@ -5923,6 +6120,7 @@ def create_project(
                 public_sponsor_enabled, public_sponsor_title, public_sponsor_description,
                 sponsor_price_per_tree, sponsor_currency, sponsor_capacity, sponsor_max_per_order,
                 sponsor_dedication_enabled, sponsor_payment_instructions, public_sponsor_agent_user_ids,
+                sponsor_agent_planting_fee, sponsor_agent_maintenance_fee,
                 agric_config, relief_config,
                 planting_model, allow_existing_tree_link, default_existing_tree_scope
             )
@@ -5931,6 +6129,7 @@ def create_project(
                 :public_sponsor_enabled, :public_sponsor_title, :public_sponsor_description,
                 :sponsor_price_per_tree, :sponsor_currency, :sponsor_capacity, :sponsor_max_per_order,
                 :sponsor_dedication_enabled, :sponsor_payment_instructions, CAST(:public_sponsor_agent_user_ids AS JSONB),
+                :sponsor_agent_planting_fee, :sponsor_agent_maintenance_fee,
                 CAST(:agric_config AS JSONB), CAST(:relief_config AS JSONB),
                 :planting_model, :allow_existing_tree_link, :default_existing_tree_scope
             )
@@ -5938,6 +6137,7 @@ def create_project(
                       public_sponsor_enabled, public_sponsor_title, public_sponsor_description,
                       sponsor_price_per_tree, sponsor_currency, sponsor_capacity, sponsor_max_per_order,
                       sponsor_dedication_enabled, sponsor_payment_instructions, public_sponsor_agent_user_ids,
+                      sponsor_agent_planting_fee, sponsor_agent_maintenance_fee,
                       agric_config, relief_config,
                       planting_model, allow_existing_tree_link, default_existing_tree_scope, created_at
         """),
@@ -5958,6 +6158,8 @@ def create_project(
             "sponsor_dedication_enabled": bool(sponsor_dedication_enabled),
             "sponsor_payment_instructions": normalized_payment_instructions,
             "public_sponsor_agent_user_ids": _safe_json(normalized_public_sponsor_agent_user_ids),
+            "sponsor_agent_planting_fee": normalized_planting_fee,
+            "sponsor_agent_maintenance_fee": normalized_maintenance_fee,
             "agric_config": _safe_json(normalized_agric_config),
             "relief_config": _safe_json(normalized_relief_config),
             "planting_model": normalized_model,
@@ -5984,6 +6186,8 @@ def create_project(
             "access_model": project.get("access_model"),
             "public_sponsor_enabled": project.get("public_sponsor_enabled"),
             "sponsor_price_per_tree": project.get("sponsor_price_per_tree"),
+            "sponsor_agent_planting_fee": project.get("sponsor_agent_planting_fee"),
+            "sponsor_agent_maintenance_fee": project.get("sponsor_agent_maintenance_fee"),
             "agric_config": project.get("agric_config"),
             "relief_config": project.get("relief_config"),
             "planting_model": project.get("planting_model"),
@@ -6126,6 +6330,625 @@ def _build_sponsor_auth_payload(row: dict) -> dict:
             "sponsor_uid": account["sponsor_uid"],
         },
     }
+
+
+def _serialize_sponsor_agent_bank_account(row: dict | None) -> dict | None:
+    if not row:
+        return None
+    account_number = _normalize_account_number(row.get("account_number"))
+    return {
+        "id": int(row.get("id") or 0),
+        "user_id": int(row.get("user_id") or 0),
+        "organization_id": int(row.get("organization_id") or 0) or None,
+        "currency": _normalize_currency_code(row.get("currency"), SPONSOR_AGENT_ACCOUNT_CURRENCY),
+        "bank_code": str(row.get("bank_code") or "").strip() or None,
+        "bank_name": str(row.get("bank_name") or "").strip() or None,
+        "account_number": account_number or None,
+        "account_number_masked": _mask_account_number(account_number),
+        "account_name": str(row.get("account_name") or "").strip() or None,
+        "verified_at": row.get("verified_at"),
+        "verified": bool(row.get("verified_at")) and bool(account_number) and bool(str(row.get("bank_code") or "").strip()),
+    }
+
+
+def _serialize_sponsor_agent_payout_request(row: dict | None) -> dict | None:
+    if not row:
+        return None
+    earning_keys = _normalize_string_list(_json_value_or(row.get("earning_keys"), []))
+    project_ids = _normalize_positive_int_list(_json_value_or(row.get("project_ids"), []))
+    payout_status = _normalize_sponsor_agent_payout_status(row.get("status"))
+    return {
+        "id": int(row.get("id") or 0),
+        "request_uid": str(row.get("request_uid") or "").strip() or None,
+        "user_id": int(row.get("user_id") or 0),
+        "user_name": str(row.get("user_name") or "").strip() or None,
+        "user_uid": str(row.get("user_uid") or "").strip() or None,
+        "organization_id": int(row.get("organization_id") or 0) or None,
+        "currency": _normalize_currency_code(row.get("currency"), SPONSOR_AGENT_ACCOUNT_CURRENCY),
+        "amount_total": round(float(row.get("amount_total") or 0), 2),
+        "payout_minimum": round(float(row.get("payout_minimum") or SPONSOR_AGENT_MIN_PAYOUT_NAIRA), 2),
+        "status": payout_status,
+        "bank_code": str(row.get("bank_code") or "").strip() or None,
+        "bank_name": str(row.get("bank_name") or "").strip() or None,
+        "account_number": _normalize_account_number(row.get("account_number")) or None,
+        "account_number_masked": _mask_account_number(row.get("account_number")),
+        "account_name": str(row.get("account_name") or "").strip() or None,
+        "earning_keys": earning_keys,
+        "earning_count": len(earning_keys),
+        "project_ids": project_ids,
+        "review_notes": str(row.get("review_notes") or "").strip() or None,
+        "reviewed_by": str(row.get("reviewed_by") or "").strip() or None,
+        "reviewed_at": row.get("reviewed_at"),
+        "transfer_reference": str(row.get("transfer_reference") or "").strip() or None,
+        "transfer_id": int(row.get("transfer_id") or 0) or None,
+        "transfer_status": str(row.get("transfer_status") or "").strip() or None,
+        "paid_at": row.get("paid_at"),
+        "created_at": row.get("created_at"),
+        "updated_at": row.get("updated_at"),
+    }
+
+
+def _get_green_user_for_sponsor_agent(
+    db: Session,
+    *,
+    user_id: int,
+    organization_id: int | None = None,
+) -> dict:
+    row = db.execute(
+        text(
+            """
+            SELECT
+                u.id, u.user_uid, u.full_name, u.work_username, u.organization_id,
+                COALESCE(u.allow_green, TRUE) AS allow_green,
+                COALESCE(u.is_active, TRUE) AS is_active,
+                o.name AS organization_name,
+                COALESCE(o.is_active, TRUE) AS organization_is_active,
+                o.status AS organization_status
+            FROM green_users u
+            LEFT JOIN green_organizations o ON o.id = u.organization_id
+            WHERE u.id = :user_id
+              AND (:organization_id IS NULL OR u.organization_id = :organization_id)
+            LIMIT 1
+            """
+        ),
+        {"user_id": int(user_id), "organization_id": int(organization_id) if organization_id is not None else None},
+    ).mappings().first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Agent account not found")
+    payload = dict(row)
+    if not bool(payload.get("is_active", True)) or not bool(payload.get("allow_green", True)):
+        raise HTTPException(status_code=403, detail="This user is not enabled for sponsor-funded Green work")
+    if payload.get("organization_id") is None or not bool(payload.get("organization_is_active", True)):
+        raise HTTPException(status_code=403, detail="This user is not linked to an active organization")
+    if _normalize_name(payload.get("organization_status")) == "suspended":
+        raise HTTPException(status_code=403, detail="This organization is suspended")
+    return payload
+
+
+def _build_sponsor_agent_aliases(user_row: dict) -> list[str]:
+    aliases: list[str] = []
+    seen: set[str] = set()
+    for candidate in [user_row.get("full_name"), user_row.get("work_username"), user_row.get("user_uid")]:
+        value = str(candidate or "").strip().lower()
+        if not value or value in seen:
+            continue
+        seen.add(value)
+        aliases.append(value)
+    return aliases
+
+
+def _list_public_sponsor_projects_for_agent(
+    db: Session,
+    *,
+    user_id: int,
+    organization_id: int | None = None,
+) -> list[dict]:
+    rows = db.execute(
+        text(
+            """
+            SELECT
+                p.id, p.organization_id, p.name, p.location_text, p.sponsor,
+                p.access_model, p.public_sponsor_enabled, p.public_sponsor_title, p.public_sponsor_description,
+                p.sponsor_price_per_tree, p.sponsor_currency, p.sponsor_capacity, p.sponsor_max_per_order,
+                p.sponsor_dedication_enabled, p.sponsor_payment_instructions, p.public_sponsor_agent_user_ids,
+                p.sponsor_agent_planting_fee, p.sponsor_agent_maintenance_fee,
+                p.workflow_profile, p.created_at
+            FROM tree_projects p
+            WHERE LOWER(COALESCE(p.access_model, 'partner_org')) = 'public_sponsorship'
+              AND (:organization_id IS NULL OR p.organization_id = :organization_id)
+              AND EXISTS (
+                    SELECT 1
+                    FROM jsonb_array_elements_text(COALESCE(p.public_sponsor_agent_user_ids, '[]'::jsonb)) AS selected(user_id_text)
+                    WHERE CAST(selected.user_id_text AS INTEGER) = :user_id
+              )
+            ORDER BY p.created_at DESC
+            """
+        ),
+        {"user_id": int(user_id), "organization_id": int(organization_id) if organization_id is not None else None},
+    ).mappings().all()
+    items: list[dict] = []
+    for row in rows:
+        item = _apply_project_access_fields(dict(row))
+        if item.get("sponsor_agent_planting_fee") is None:
+            item["sponsor_agent_planting_fee"] = _derive_default_sponsor_agent_fee(
+                item.get("sponsor_price_per_tree"),
+                ratio=SPONSOR_AGENT_DEFAULT_PLANTING_RATIO,
+            )
+        if item.get("sponsor_agent_maintenance_fee") is None:
+            item["sponsor_agent_maintenance_fee"] = _derive_default_sponsor_agent_fee(
+                item.get("sponsor_price_per_tree"),
+                ratio=SPONSOR_AGENT_DEFAULT_MAINTENANCE_RATIO,
+            )
+        items.append(item)
+    return items
+
+
+def _load_sponsor_agent_bank_account(db: Session, *, user_id: int) -> dict | None:
+    return db.execute(
+        text(
+            """
+            SELECT id, user_id, organization_id, currency, bank_code, bank_name, account_number, account_name,
+                   verification_payload, verified_at, created_at, updated_at
+            FROM green_sponsor_agent_bank_accounts
+            WHERE user_id = :user_id
+            ORDER BY updated_at DESC NULLS LAST, id DESC
+            LIMIT 1
+            """
+        ),
+        {"user_id": int(user_id)},
+    ).mappings().first()
+
+
+def _load_sponsor_agent_payout_requests(
+    db: Session,
+    *,
+    organization_id: int,
+    user_id: int | None = None,
+) -> list[dict]:
+    rows = db.execute(
+        text(
+            """
+            SELECT
+                pr.id, pr.request_uid, pr.user_id, pr.organization_id, pr.currency, pr.amount_total, pr.payout_minimum,
+                pr.status, pr.bank_code, pr.bank_name, pr.account_number, pr.account_name,
+                pr.earning_keys, pr.earning_rows, pr.project_ids,
+                pr.review_notes, pr.reviewed_by, pr.reviewed_at,
+                pr.transfer_reference, pr.transfer_id, pr.transfer_status, pr.transfer_payload,
+                pr.transfer_processed_at, pr.paid_at, pr.created_at, pr.updated_at,
+                u.full_name AS user_name, u.user_uid
+            FROM green_sponsor_agent_payout_requests pr
+            JOIN green_users u ON u.id = pr.user_id
+            WHERE pr.organization_id = :organization_id
+              AND (:user_id IS NULL OR pr.user_id = :user_id)
+            ORDER BY pr.created_at DESC, pr.id DESC
+            """
+        ),
+        {"organization_id": int(organization_id), "user_id": int(user_id) if user_id is not None else None},
+    ).mappings().all()
+    return [dict(row) for row in rows]
+
+
+def _build_sponsor_agent_earning_rows(
+    db: Session,
+    *,
+    user_row: dict,
+    project_rows: list[dict],
+) -> list[dict]:
+    project_ids = [int(row.get("id") or 0) for row in project_rows if int(row.get("id") or 0) > 0]
+    aliases = _build_sponsor_agent_aliases(user_row)
+    if not project_ids or not aliases:
+        return []
+    project_meta = {
+        int(row["id"]): {
+            "project_name": str(row.get("name") or "").strip() or f"Project #{int(row['id'])}",
+            "currency": _normalize_currency_code(row.get("sponsor_currency"), SPONSOR_AGENT_ACCOUNT_CURRENCY),
+            "planting_fee": round(float(row.get("sponsor_agent_planting_fee") or 0), 2),
+            "maintenance_fee": round(float(row.get("sponsor_agent_maintenance_fee") or 0), 2),
+        }
+        for row in project_rows
+        if int(row.get("id") or 0) > 0
+    }
+    sponsor_link_cte = """
+        WITH sponsor_tree_links AS (
+            SELECT DISTINCT ON (u.tree_id)
+                u.tree_id,
+                u.id AS unit_id,
+                u.project_id,
+                o.id AS order_id,
+                o.order_uid,
+                sa.full_name AS sponsor_name,
+                sa.organization_name AS sponsor_organization_name
+            FROM green_sponsorship_units u
+            JOIN green_sponsorship_orders o ON o.id = u.order_id
+            LEFT JOIN green_sponsor_accounts sa ON sa.id = u.sponsor_account_id
+            WHERE u.project_id IN :project_ids
+              AND u.tree_id IS NOT NULL
+              AND LOWER(COALESCE(o.payment_status, '')) = 'verified'
+              AND LOWER(COALESCE(u.sponsorship_status, '')) IN ('linked', 'active', 'replaced')
+            ORDER BY u.tree_id, COALESCE(u.linked_at, u.updated_at, u.created_at) DESC, u.id DESC
+        )
+    """
+    planting_rows = db.execute(
+        text(
+            sponsor_link_cte
+            + """
+            SELECT
+                t.project_id,
+                t.id AS tree_id,
+                t.project_tree_no,
+                t.species,
+                t.created_by,
+                t.planting_date,
+                COALESCE(t.created_at, NOW()) AS earned_at,
+                link.unit_id,
+                link.order_id,
+                link.order_uid,
+                link.sponsor_name,
+                link.sponsor_organization_name
+            FROM trees t
+            JOIN sponsor_tree_links link ON link.tree_id = t.id
+            WHERE t.project_id IN :project_ids
+              AND LOWER(TRIM(COALESCE(t.created_by, ''))) IN :aliases
+            ORDER BY COALESCE(t.planting_date::timestamp, t.created_at, NOW()) DESC, t.id DESC
+            """
+        ).bindparams(bindparam("project_ids", expanding=True), bindparam("aliases", expanding=True)),
+        {"project_ids": project_ids, "aliases": aliases},
+    ).mappings().all()
+    maintenance_rows = db.execute(
+        text(
+            sponsor_link_cte
+            + """
+            SELECT
+                tt.project_id,
+                tt.id AS task_id,
+                tt.tree_id,
+                tt.task_type,
+                tt.assignee_name,
+                tt.status,
+                tt.review_state,
+                COALESCE(tt.reviewed_at, tt.completed_at, tt.updated_at, tt.created_at, NOW()) AS earned_at,
+                t.project_tree_no,
+                t.species,
+                link.unit_id,
+                link.order_id,
+                link.order_uid,
+                link.sponsor_name,
+                link.sponsor_organization_name
+            FROM tree_tasks tt
+            JOIN trees t ON t.id = tt.tree_id
+            JOIN sponsor_tree_links link ON link.tree_id = tt.tree_id
+            WHERE tt.project_id IN :project_ids
+              AND LOWER(TRIM(COALESCE(tt.assignee_name, ''))) IN :aliases
+              AND LOWER(REPLACE(REPLACE(COALESCE(tt.task_type, ''), '-', '_'), ' ', '_')) NOT IN ('planting', 'field_capture', 'existing_inventory_intake')
+              AND LOWER(REPLACE(REPLACE(COALESCE(tt.review_state, ''), '-', '_'), ' ', '_')) = 'approved'
+            ORDER BY COALESCE(tt.reviewed_at, tt.completed_at, tt.updated_at, tt.created_at, NOW()) DESC, tt.id DESC
+            """
+        ).bindparams(bindparam("project_ids", expanding=True), bindparam("aliases", expanding=True)),
+        {"project_ids": project_ids, "aliases": aliases},
+    ).mappings().all()
+    earnings: list[dict] = []
+    for row in planting_rows:
+        project_id = int(row.get("project_id") or 0)
+        project_info = project_meta.get(project_id, {})
+        earnings.append(
+            {
+                "earning_key": f"planting-tree-{int(row.get('tree_id') or 0)}",
+                "work_type": "planting",
+                "project_id": project_id,
+                "project_name": project_info.get("project_name") or f"Project #{project_id}",
+                "currency": project_info.get("currency") or SPONSOR_AGENT_ACCOUNT_CURRENCY,
+                "amount": round(float(project_info.get("planting_fee") or 0), 2),
+                "tree_id": int(row.get("tree_id") or 0),
+                "task_id": None,
+                "unit_id": int(row.get("unit_id") or 0) or None,
+                "order_id": int(row.get("order_id") or 0) or None,
+                "order_uid": str(row.get("order_uid") or "").strip() or None,
+                "project_tree_no": int(row.get("project_tree_no") or 0) or None,
+                "tree_label": (
+                    f"Tree {int(row.get('project_tree_no') or 0)}"
+                    if int(row.get("project_tree_no") or 0) > 0
+                    else f"Tree #{int(row.get('tree_id') or 0)}"
+                ),
+                "species": str(row.get("species") or "").strip() or None,
+                "actor_name": str(row.get("created_by") or "").strip() or None,
+                "task_label": "Sponsored tree planted",
+                "earned_at": row.get("earned_at"),
+                "sponsor_name": str(row.get("sponsor_name") or "").strip() or None,
+                "sponsor_organization_name": str(row.get("sponsor_organization_name") or "").strip() or None,
+            }
+        )
+    for row in maintenance_rows:
+        project_id = int(row.get("project_id") or 0)
+        project_info = project_meta.get(project_id, {})
+        task_type = _normalize_name(row.get("task_type")) or "maintenance"
+        earnings.append(
+            {
+                "earning_key": f"maintenance-task-{int(row.get('task_id') or 0)}",
+                "work_type": "maintenance",
+                "project_id": project_id,
+                "project_name": project_info.get("project_name") or f"Project #{project_id}",
+                "currency": project_info.get("currency") or SPONSOR_AGENT_ACCOUNT_CURRENCY,
+                "amount": round(float(project_info.get("maintenance_fee") or 0), 2),
+                "tree_id": int(row.get("tree_id") or 0) or None,
+                "task_id": int(row.get("task_id") or 0),
+                "unit_id": int(row.get("unit_id") or 0) or None,
+                "order_id": int(row.get("order_id") or 0) or None,
+                "order_uid": str(row.get("order_uid") or "").strip() or None,
+                "project_tree_no": int(row.get("project_tree_no") or 0) or None,
+                "tree_label": (
+                    f"Tree {int(row.get('project_tree_no') or 0)}"
+                    if int(row.get("project_tree_no") or 0) > 0
+                    else f"Tree #{int(row.get('tree_id') or 0)}"
+                ),
+                "species": str(row.get("species") or "").strip() or None,
+                "actor_name": str(row.get("assignee_name") or "").strip() or None,
+                "task_label": task_type.replace("_", " ").title(),
+                "earned_at": row.get("earned_at"),
+                "sponsor_name": str(row.get("sponsor_name") or "").strip() or None,
+                "sponsor_organization_name": str(row.get("sponsor_organization_name") or "").strip() or None,
+            }
+        )
+    earnings.sort(key=lambda item: str(item.get("earned_at") or ""), reverse=True)
+    return earnings
+
+
+def _build_sponsor_agent_dashboard(
+    db: Session,
+    *,
+    user_id: int,
+    organization_id: int | None = None,
+) -> dict:
+    user_row = _get_green_user_for_sponsor_agent(db, user_id=user_id, organization_id=organization_id)
+    project_rows = _list_public_sponsor_projects_for_agent(
+        db,
+        user_id=int(user_row["id"]),
+        organization_id=int(user_row["organization_id"]) if user_row.get("organization_id") is not None else None,
+    )
+    bank_row = _load_sponsor_agent_bank_account(db, user_id=int(user_row["id"]))
+    request_rows = _load_sponsor_agent_payout_requests(
+        db,
+        organization_id=int(user_row["organization_id"]),
+        user_id=int(user_row["id"]),
+    )
+    serialized_requests = [item for item in (_serialize_sponsor_agent_payout_request(row) for row in request_rows) if item]
+    earnings = _build_sponsor_agent_earning_rows(db, user_row=user_row, project_rows=project_rows)
+    request_by_key: dict[str, dict] = {}
+    for request in serialized_requests:
+        for earning_key in request.get("earning_keys") or []:
+            request_by_key.setdefault(earning_key, request)
+    project_summaries: dict[int, dict] = {}
+    available_amount = 0.0
+    requested_amount = 0.0
+    paid_amount = 0.0
+    planting_count = 0
+    maintenance_count = 0
+    earning_rows: list[dict] = []
+    for item in earnings:
+        amount = round(float(item.get("amount") or 0), 2)
+        payout_request = request_by_key.get(str(item.get("earning_key") or ""))
+        payout_status = payout_request.get("status") if payout_request else "available"
+        project_id = int(item.get("project_id") or 0)
+        if project_id not in project_summaries:
+            project_summaries[project_id] = {
+                "project_id": project_id,
+                "project_name": item.get("project_name") or f"Project #{project_id}",
+                "currency": item.get("currency") or SPONSOR_AGENT_ACCOUNT_CURRENCY,
+                "available_amount": 0.0,
+                "requested_amount": 0.0,
+                "paid_amount": 0.0,
+                "planting_count": 0,
+                "maintenance_count": 0,
+            }
+        summary = project_summaries[project_id]
+        if item.get("work_type") == "planting":
+            planting_count += 1
+            summary["planting_count"] += 1
+        else:
+            maintenance_count += 1
+            summary["maintenance_count"] += 1
+        if payout_status == "available":
+            available_amount += amount
+            summary["available_amount"] += amount
+        elif payout_status in {"requested", "approved", "processing"}:
+            requested_amount += amount
+            summary["requested_amount"] += amount
+        elif payout_status == "paid":
+            paid_amount += amount
+            summary["paid_amount"] += amount
+        enriched = dict(item)
+        enriched["payout_status"] = payout_status
+        enriched["payout_request_id"] = payout_request.get("id") if payout_request else None
+        enriched["payout_request_uid"] = payout_request.get("request_uid") if payout_request else None
+        enriched["payout_requested_at"] = payout_request.get("created_at") if payout_request else None
+        enriched["payout_paid_at"] = payout_request.get("paid_at") if payout_request else None
+        earning_rows.append(enriched)
+    minimum_amount = SPONSOR_AGENT_MIN_PAYOUT_NAIRA
+    bank_payload = _serialize_sponsor_agent_bank_account(bank_row)
+    return {
+        "eligible": len(project_rows) > 0,
+        "minimum_payout_amount": minimum_amount,
+        "currency": SPONSOR_AGENT_ACCOUNT_CURRENCY,
+        "auto_payout_available": bool(_flutterwave_secret_key()),
+        "user": {
+            "id": int(user_row["id"]),
+            "full_name": str(user_row.get("full_name") or "").strip(),
+            "user_uid": str(user_row.get("user_uid") or "").strip() or None,
+            "organization_id": int(user_row.get("organization_id") or 0) or None,
+            "organization_name": str(user_row.get("organization_name") or "").strip() or None,
+        },
+        "bank_account": bank_payload,
+        "projects": [
+            {
+                "project_id": int(row.get("id") or 0),
+                "project_name": str(row.get("name") or "").strip() or f"Project #{int(row.get('id') or 0)}",
+                "location_text": str(row.get("location_text") or "").strip() or None,
+                "currency": _normalize_currency_code(row.get("sponsor_currency"), SPONSOR_AGENT_ACCOUNT_CURRENCY),
+                "planting_fee": round(float(row.get("sponsor_agent_planting_fee") or 0), 2),
+                "maintenance_fee": round(float(row.get("sponsor_agent_maintenance_fee") or 0), 2),
+            }
+            for row in project_rows
+        ],
+        "summary": {
+            "eligible_project_count": len(project_rows),
+            "planting_count": planting_count,
+            "maintenance_count": maintenance_count,
+            "total_earnings_amount": round(available_amount + requested_amount + paid_amount, 2),
+            "available_amount": round(available_amount, 2),
+            "requested_amount": round(requested_amount, 2),
+            "paid_amount": round(paid_amount, 2),
+            "pending_request_count": sum(1 for row in serialized_requests if row.get("status") in {"requested", "approved", "processing"}),
+            "paid_request_count": sum(1 for row in serialized_requests if row.get("status") == "paid"),
+            "payout_eligible": round(available_amount, 2) >= float(minimum_amount),
+            "bank_verified": bool(bank_payload and bank_payload.get("verified")),
+        },
+        "project_summaries": sorted(project_summaries.values(), key=lambda item: str(item.get("project_name") or "").lower()),
+        "earnings": earning_rows,
+        "requests": serialized_requests,
+    }
+
+
+def _flutterwave_payout_callback_url(request: Request) -> str:
+    base_url = _build_public_api_base_url(request)
+    if not base_url:
+        raise HTTPException(status_code=500, detail="Could not determine the public API URL for payout callbacks")
+    return f"{base_url}/green/admin/sponsor-agent-payouts/flutterwave/callback"
+
+
+def _list_flutterwave_banks(country_code: str = "NG") -> list[dict]:
+    response = _call_flutterwave_api("GET", f"/banks/{str(country_code or 'NG').strip().upper()}")
+    rows = response.get("data")
+    if not isinstance(rows, list):
+        return []
+    payload: list[dict] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        code = str(row.get("code") or "").strip()
+        name = str(row.get("name") or row.get("bank_name") or "").strip()
+        if not code or not name:
+            continue
+        payload.append({"code": code, "name": name})
+    payload.sort(key=lambda item: item["name"].lower())
+    return payload
+
+
+def _resolve_flutterwave_account_name(bank_code: str, account_number: str) -> dict:
+    payload = _call_flutterwave_api(
+        "POST",
+        "/accounts/resolve",
+        json={
+            "account_bank": str(bank_code or "").strip(),
+            "account_number": _normalize_account_number(account_number),
+        },
+    )
+    data = payload.get("data") or {}
+    return {
+        "account_number": _normalize_account_number(data.get("account_number") or account_number),
+        "account_name": str(data.get("account_name") or "").strip() or None,
+    }
+
+
+def _map_transfer_status_to_payout_status(status_value: str | None) -> str:
+    normalized = _normalize_name(status_value)
+    if normalized in {"successful", "success", "completed"}:
+        return "paid"
+    if normalized in {"failed", "error", "rejected", "cancelled", "canceled", "reversed"}:
+        return "failed"
+    return "processing"
+
+
+def _create_flutterwave_transfer_for_payout(request: Request, db: Session, payout_row: dict) -> dict:
+    amount_total = round(float(payout_row.get("amount_total") or 0), 2)
+    if amount_total <= 0:
+        raise HTTPException(status_code=400, detail="Payout amount must be greater than zero")
+    account_number = _normalize_account_number(payout_row.get("account_number"))
+    bank_code = str(payout_row.get("bank_code") or "").strip()
+    if not account_number or not bank_code:
+        raise HTTPException(status_code=400, detail="Verified bank details are required before automatic payout")
+    response = _call_flutterwave_api(
+        "POST",
+        "/transfers",
+        json={
+            "account_bank": bank_code,
+            "account_number": account_number,
+            "amount": amount_total,
+            "currency": _normalize_currency_code(payout_row.get("currency"), SPONSOR_AGENT_ACCOUNT_CURRENCY),
+            "debit_currency": _normalize_currency_code(payout_row.get("currency"), SPONSOR_AGENT_ACCOUNT_CURRENCY),
+            "beneficiary_name": str(payout_row.get("account_name") or payout_row.get("user_name") or "").strip() or None,
+            "reference": str(payout_row.get("request_uid") or _generate_prefixed_uid("PAY")).strip(),
+            "callback_url": _flutterwave_payout_callback_url(request),
+            "narration": f"LandCheck sponsor agent payout {str(payout_row.get('request_uid') or '').strip()}",
+        },
+    )
+    data = response.get("data") or {}
+    transfer_status = str(data.get("status") or "").strip() or None
+    payout_status = _map_transfer_status_to_payout_status(transfer_status)
+    updated = db.execute(
+        text(
+            """
+            UPDATE green_sponsor_agent_payout_requests
+            SET status = :status,
+                transfer_reference = COALESCE(:transfer_reference, transfer_reference),
+                transfer_id = COALESCE(:transfer_id, transfer_id),
+                transfer_status = :transfer_status,
+                transfer_payload = CAST(:transfer_payload AS JSONB),
+                transfer_processed_at = NOW(),
+                paid_at = CASE WHEN :status = 'paid' THEN COALESCE(paid_at, NOW()) ELSE paid_at END,
+                updated_at = NOW()
+            WHERE id = :request_id
+            RETURNING *
+            """
+        ),
+        {
+            "request_id": int(payout_row["id"]),
+            "status": payout_status,
+            "transfer_reference": str(data.get("reference") or payout_row.get("request_uid") or "").strip() or None,
+            "transfer_id": int(data.get("id") or 0) or None,
+            "transfer_status": transfer_status,
+            "transfer_payload": _safe_json(data if isinstance(data, dict) else {}),
+        },
+    ).mappings().first()
+    return dict(updated) if updated else dict(payout_row)
+
+
+def _sync_sponsor_agent_payout_transfer(db: Session, payout_row: dict) -> dict:
+    transfer_id = int(payout_row.get("transfer_id") or 0)
+    if transfer_id <= 0:
+        return dict(payout_row)
+    try:
+        response = _call_flutterwave_api("GET", f"/transfers/{transfer_id}")
+    except HTTPException:
+        return dict(payout_row)
+    data = response.get("data") or {}
+    transfer_status = str(data.get("status") or payout_row.get("transfer_status") or "").strip() or None
+    payout_status = _map_transfer_status_to_payout_status(transfer_status)
+    updated = db.execute(
+        text(
+            """
+            UPDATE green_sponsor_agent_payout_requests
+            SET status = CASE
+                    WHEN status IN ('rejected', 'cancelled') THEN status
+                    ELSE :status
+                END,
+                transfer_reference = COALESCE(:transfer_reference, transfer_reference),
+                transfer_status = :transfer_status,
+                transfer_payload = CAST(:transfer_payload AS JSONB),
+                transfer_processed_at = NOW(),
+                paid_at = CASE WHEN :status = 'paid' THEN COALESCE(paid_at, NOW()) ELSE paid_at END,
+                updated_at = NOW()
+            WHERE id = :request_id
+            RETURNING *
+            """
+        ),
+        {
+            "request_id": int(payout_row["id"]),
+            "status": payout_status,
+            "transfer_reference": str(data.get("reference") or payout_row.get("transfer_reference") or "").strip() or None,
+            "transfer_status": transfer_status,
+            "transfer_payload": _safe_json(data if isinstance(data, dict) else {}),
+        },
+    ).mappings().first()
+    return dict(updated) if updated else dict(payout_row)
 
 
 def _refresh_sponsorship_order_status(db: Session, order_id: int):
@@ -6360,6 +7183,8 @@ def update_project_settings(
     sponsor_dedication_enabled: bool | None = Body(default=None),
     sponsor_payment_instructions: str | None = Body(default=None),
     public_sponsor_agent_user_ids: list[int] | None = Body(default=None),
+    sponsor_agent_planting_fee: float | None = Body(default=None),
+    sponsor_agent_maintenance_fee: float | None = Body(default=None),
     agric_config: dict | None = Body(default=None),
     relief_config: dict | None = Body(default=None),
     planting_model: str | None = Body(default=None),
@@ -6371,7 +7196,8 @@ def update_project_settings(
             """
             SELECT id, workflow_profile, access_model, public_sponsor_enabled, public_sponsor_title, public_sponsor_description,
                    sponsor_price_per_tree, sponsor_currency, sponsor_capacity, sponsor_max_per_order,
-                   sponsor_dedication_enabled, sponsor_payment_instructions, public_sponsor_agent_user_ids, organization_id,
+                   sponsor_dedication_enabled, sponsor_payment_instructions, public_sponsor_agent_user_ids,
+                   sponsor_agent_planting_fee, sponsor_agent_maintenance_fee, organization_id,
                    agric_config, relief_config, planting_model, allow_existing_tree_link, default_existing_tree_scope
             FROM tree_projects
             WHERE id = :project_id
@@ -6437,6 +7263,24 @@ def update_project_settings(
         if sponsor_payment_instructions is not None
         else _clean_text(existing.get("sponsor_payment_instructions"), 1200)
     )
+    next_sponsor_agent_planting_fee = (
+        round(float(sponsor_agent_planting_fee), 2)
+        if sponsor_agent_planting_fee is not None
+        else (
+            round(float(existing.get("sponsor_agent_planting_fee")), 2)
+            if existing.get("sponsor_agent_planting_fee") is not None
+            else _derive_default_sponsor_agent_fee(next_sponsor_price, ratio=SPONSOR_AGENT_DEFAULT_PLANTING_RATIO)
+        )
+    )
+    next_sponsor_agent_maintenance_fee = (
+        round(float(sponsor_agent_maintenance_fee), 2)
+        if sponsor_agent_maintenance_fee is not None
+        else (
+            round(float(existing.get("sponsor_agent_maintenance_fee")), 2)
+            if existing.get("sponsor_agent_maintenance_fee") is not None
+            else _derive_default_sponsor_agent_fee(next_sponsor_price, ratio=SPONSOR_AGENT_DEFAULT_MAINTENANCE_RATIO)
+        )
+    )
     next_public_sponsor_agent_user_ids = (
         _validate_public_sponsor_agent_user_ids(
             db,
@@ -6488,6 +7332,8 @@ def update_project_settings(
                 sponsor_dedication_enabled = :sponsor_dedication_enabled,
                 sponsor_payment_instructions = :sponsor_payment_instructions,
                 public_sponsor_agent_user_ids = CAST(:public_sponsor_agent_user_ids AS JSONB),
+                sponsor_agent_planting_fee = :sponsor_agent_planting_fee,
+                sponsor_agent_maintenance_fee = :sponsor_agent_maintenance_fee,
                 agric_config = CAST(:agric_config AS JSONB),
                 relief_config = CAST(:relief_config AS JSONB),
                 planting_model = :planting_model,
@@ -6498,6 +7344,7 @@ def update_project_settings(
                       public_sponsor_enabled, public_sponsor_title, public_sponsor_description,
                       sponsor_price_per_tree, sponsor_currency, sponsor_capacity, sponsor_max_per_order,
                       sponsor_dedication_enabled, sponsor_payment_instructions, public_sponsor_agent_user_ids,
+                      sponsor_agent_planting_fee, sponsor_agent_maintenance_fee,
                       agric_config, relief_config,
                       planting_model, allow_existing_tree_link, default_existing_tree_scope, created_at
             """
@@ -6516,6 +7363,8 @@ def update_project_settings(
             "sponsor_dedication_enabled": next_sponsor_dedication_enabled,
             "sponsor_payment_instructions": next_sponsor_payment_instructions,
             "public_sponsor_agent_user_ids": _safe_json(next_public_sponsor_agent_user_ids),
+            "sponsor_agent_planting_fee": next_sponsor_agent_planting_fee,
+            "sponsor_agent_maintenance_fee": next_sponsor_agent_maintenance_fee,
             "agric_config": _safe_json(next_agric_config),
             "relief_config": _safe_json(next_relief_config),
             "planting_model": next_model,
@@ -6542,6 +7391,8 @@ def update_project_settings(
                 "public_sponsor_enabled": next_public_sponsor_enabled,
                 "sponsor_price_per_tree": next_sponsor_price,
                 "public_sponsor_agent_user_ids": next_public_sponsor_agent_user_ids,
+                "sponsor_agent_planting_fee": next_sponsor_agent_planting_fee,
+                "sponsor_agent_maintenance_fee": next_sponsor_agent_maintenance_fee,
                 "agric_config": next_agric_config,
                 "relief_config": next_relief_config,
                 "planting_model": next_model,
@@ -7342,6 +8193,196 @@ def export_sponsor_tree_certificate(
     )
 
 
+@router.get("/agent-payouts/banks")
+def list_sponsor_agent_banks(country: str = Query(default="NG")):
+    return {
+        "country": str(country or "NG").strip().upper() or "NG",
+        "banks": _list_flutterwave_banks(country or "NG"),
+    }
+
+
+@router.post("/agent-payouts/account/resolve")
+def resolve_sponsor_agent_bank_account(payload: SponsorAgentBankResolvePayload):
+    account_number = _normalize_account_number(payload.account_number)
+    if len(account_number) < 10:
+        raise HTTPException(status_code=400, detail="Enter a valid bank account number")
+    bank_code = str(payload.bank_code or "").strip()
+    if not bank_code:
+        raise HTTPException(status_code=400, detail="Bank code is required")
+    resolved = _resolve_flutterwave_account_name(bank_code, account_number)
+    if not resolved.get("account_name"):
+        raise HTTPException(status_code=400, detail="Could not verify this bank account")
+    return {
+        "ok": True,
+        "bank_code": bank_code,
+        "account_number": resolved.get("account_number"),
+        "account_name": resolved.get("account_name"),
+    }
+
+
+@router.put("/agent-payouts/account")
+def save_sponsor_agent_bank_account(payload: SponsorAgentBankAccountPayload, db: Session = Depends(get_db)):
+    user_row = _get_green_user_for_sponsor_agent(
+        db,
+        user_id=int(payload.user_id),
+        organization_id=int(payload.organization_id) if payload.organization_id is not None else None,
+    )
+    bank_code = str(payload.bank_code or "").strip()
+    if not bank_code:
+        raise HTTPException(status_code=400, detail="Bank code is required")
+    account_number = _normalize_account_number(payload.account_number)
+    if len(account_number) < 10:
+        raise HTTPException(status_code=400, detail="Enter a valid bank account number")
+    resolved = _resolve_flutterwave_account_name(bank_code, account_number)
+    account_name = str(resolved.get("account_name") or payload.account_name or "").strip()
+    if not account_name:
+        raise HTTPException(status_code=400, detail="Could not verify this bank account")
+    bank_name = str(payload.bank_name or "").strip() or None
+    verification_payload = _safe_json(
+        {
+            "bank_code": bank_code,
+            "bank_name": bank_name,
+            "account_number": resolved.get("account_number"),
+            "account_name": account_name,
+        }
+    )
+    existing = _load_sponsor_agent_bank_account(db, user_id=int(user_row["id"]))
+    if existing:
+        row = db.execute(
+            text(
+                """
+                UPDATE green_sponsor_agent_bank_accounts
+                SET organization_id = :organization_id,
+                    currency = :currency,
+                    bank_code = :bank_code,
+                    bank_name = :bank_name,
+                    account_number = :account_number,
+                    account_name = :account_name,
+                    verification_payload = CAST(:verification_payload AS JSONB),
+                    verified_at = NOW(),
+                    updated_at = NOW()
+                WHERE id = :account_id
+                RETURNING *
+                """
+            ),
+            {
+                "account_id": int(existing["id"]),
+                "organization_id": int(user_row["organization_id"]),
+                "currency": SPONSOR_AGENT_ACCOUNT_CURRENCY,
+                "bank_code": bank_code,
+                "bank_name": bank_name,
+                "account_number": account_number,
+                "account_name": account_name,
+                "verification_payload": verification_payload,
+            },
+        ).mappings().first()
+    else:
+        row = db.execute(
+            text(
+                """
+                INSERT INTO green_sponsor_agent_bank_accounts (
+                    user_id, organization_id, currency, bank_code, bank_name, account_number, account_name,
+                    verification_payload, verified_at
+                )
+                VALUES (
+                    :user_id, :organization_id, :currency, :bank_code, :bank_name, :account_number, :account_name,
+                    CAST(:verification_payload AS JSONB), NOW()
+                )
+                RETURNING *
+                """
+            ),
+            {
+                "user_id": int(user_row["id"]),
+                "organization_id": int(user_row["organization_id"]),
+                "currency": SPONSOR_AGENT_ACCOUNT_CURRENCY,
+                "bank_code": bank_code,
+                "bank_name": bank_name,
+                "account_number": account_number,
+                "account_name": account_name,
+                "verification_payload": verification_payload,
+            },
+        ).mappings().first()
+    db.commit()
+    return {"ok": True, "bank_account": _serialize_sponsor_agent_bank_account(dict(row) if row else None)}
+
+
+@router.get("/agent-payouts/me")
+def get_sponsor_agent_payout_dashboard(
+    user_id: int = Query(...),
+    organization_id: int | None = Query(default=None),
+    db: Session = Depends(get_db),
+):
+    return _build_sponsor_agent_dashboard(
+        db,
+        user_id=int(user_id),
+        organization_id=int(organization_id) if organization_id is not None else None,
+    )
+
+
+@router.post("/agent-payouts/requests")
+def create_sponsor_agent_payout_request(payload: SponsorAgentPayoutRequestPayload, db: Session = Depends(get_db)):
+    dashboard = _build_sponsor_agent_dashboard(
+        db,
+        user_id=int(payload.user_id),
+        organization_id=int(payload.organization_id) if payload.organization_id is not None else None,
+    )
+    if not dashboard.get("eligible"):
+        raise HTTPException(status_code=403, detail="This user is not selected as a public sponsor agent")
+    bank_account_row = _load_sponsor_agent_bank_account(db, user_id=int(dashboard["user"]["id"]))
+    bank_account = _serialize_sponsor_agent_bank_account(bank_account_row)
+    if not bank_account or not bank_account.get("verified"):
+        raise HTTPException(status_code=409, detail="Verify and save your bank account before requesting payout")
+    available_rows = [
+        row for row in dashboard.get("earnings") or [] if row.get("payout_status") == "available" and float(row.get("amount") or 0) > 0
+    ]
+    available_amount = round(sum(float(row.get("amount") or 0) for row in available_rows), 2)
+    if available_amount < float(SPONSOR_AGENT_MIN_PAYOUT_NAIRA):
+        raise HTTPException(
+            status_code=409,
+            detail=f"Minimum payout request is {SPONSOR_AGENT_MIN_PAYOUT_NAIRA} {SPONSOR_AGENT_ACCOUNT_CURRENCY}",
+        )
+    if not available_rows:
+        raise HTTPException(status_code=409, detail="No sponsor-funded earnings are currently available for payout")
+    request_uid = _generate_prefixed_uid("PAY")
+    project_ids = sorted({int(row.get("project_id") or 0) for row in available_rows if int(row.get("project_id") or 0) > 0})
+    row = db.execute(
+        text(
+            """
+            INSERT INTO green_sponsor_agent_payout_requests (
+                request_uid, user_id, organization_id, currency, amount_total, payout_minimum, status,
+                bank_code, bank_name, account_number, account_name,
+                earning_keys, earning_rows, project_ids
+            )
+            VALUES (
+                :request_uid, :user_id, :organization_id, :currency, :amount_total, :payout_minimum, 'requested',
+                :bank_code, :bank_name, :account_number, :account_name,
+                CAST(:earning_keys AS JSONB), CAST(:earning_rows AS JSONB), CAST(:project_ids AS JSONB)
+            )
+            RETURNING *
+            """
+        ),
+        {
+            "request_uid": request_uid,
+            "user_id": int(dashboard["user"]["id"]),
+            "organization_id": int(dashboard["user"]["organization_id"] or 0) or None,
+            "currency": SPONSOR_AGENT_ACCOUNT_CURRENCY,
+            "amount_total": available_amount,
+            "payout_minimum": SPONSOR_AGENT_MIN_PAYOUT_NAIRA,
+            "bank_code": bank_account_row.get("bank_code") if bank_account_row else None,
+            "bank_name": bank_account_row.get("bank_name") if bank_account_row else None,
+            "account_number": _normalize_account_number((bank_account_row or {}).get("account_number")),
+            "account_name": (bank_account_row or {}).get("account_name"),
+            "earning_keys": _safe_json(
+                [str(item.get("earning_key") or "").strip() for item in available_rows if str(item.get("earning_key") or "").strip()]
+            ),
+            "earning_rows": _safe_json(available_rows),
+            "project_ids": _safe_json(project_ids),
+        },
+    ).mappings().first()
+    db.commit()
+    return {"ok": True, "request": _serialize_sponsor_agent_payout_request(dict(row) if row else None)}
+
+
 @router.get("/admin/sponsors")
 def list_admin_sponsors(db: Session = Depends(get_db)):
     rows = db.execute(
@@ -7642,6 +8683,286 @@ def review_admin_sponsorship_order_payment(
     )
     db.commit()
     return {"ok": True, "order_id": int(order_id), "payment_status": next_payment_status}
+
+
+@router.get("/admin/sponsor-agent-payouts")
+def list_admin_sponsor_agent_payouts(
+    project_id: int = Query(...),
+    sync: bool = Query(default=True),
+    db: Session = Depends(get_db),
+):
+    project_row = db.execute(
+        text(
+            """
+            SELECT id, organization_id, name
+            FROM tree_projects
+            WHERE id = :project_id
+            LIMIT 1
+            """
+        ),
+        {"project_id": int(project_id)},
+    ).mappings().first()
+    if not project_row:
+        raise HTTPException(status_code=404, detail="Project not found")
+    organization_id = int(project_row.get("organization_id") or 0)
+    if organization_id <= 0:
+        raise HTTPException(status_code=400, detail="This project is not linked to an organization")
+    if sync:
+        request_rows = _load_sponsor_agent_payout_requests(db, organization_id=organization_id)
+        for row in request_rows:
+            if int(row.get("transfer_id") or 0) > 0 and _normalize_sponsor_agent_payout_status(row.get("status")) in {"approved", "processing"}:
+                try:
+                    _sync_sponsor_agent_payout_transfer(db, row)
+                except Exception:
+                    continue
+        db.commit()
+    agent_ids = db.execute(
+        text(
+            """
+            SELECT DISTINCT CAST(selected.user_id_text AS INTEGER) AS user_id
+            FROM tree_projects p
+            CROSS JOIN LATERAL jsonb_array_elements_text(COALESCE(p.public_sponsor_agent_user_ids, '[]'::jsonb)) AS selected(user_id_text)
+            WHERE p.organization_id = :organization_id
+              AND LOWER(COALESCE(p.access_model, 'partner_org')) = 'public_sponsorship'
+            ORDER BY CAST(selected.user_id_text AS INTEGER)
+            """
+        ),
+        {"organization_id": organization_id},
+    ).scalars().all()
+    agents: list[dict] = []
+    total_available = 0.0
+    total_requested = 0.0
+    total_paid = 0.0
+    for agent_id in agent_ids:
+        try:
+            dashboard = _build_sponsor_agent_dashboard(db, user_id=int(agent_id), organization_id=organization_id)
+        except HTTPException:
+            continue
+        summary = dashboard.get("summary") or {}
+        total_available += float(summary.get("available_amount") or 0)
+        total_requested += float(summary.get("requested_amount") or 0)
+        total_paid += float(summary.get("paid_amount") or 0)
+        agents.append(dashboard)
+    request_rows = _load_sponsor_agent_payout_requests(db, organization_id=organization_id)
+    requests_payload = [
+        item
+        for item in (_serialize_sponsor_agent_payout_request(row) for row in request_rows)
+        if item
+    ]
+    return {
+        "project_id": int(project_id),
+        "project_name": str(project_row.get("name") or "").strip() or None,
+        "organization_id": organization_id,
+        "minimum_payout_amount": SPONSOR_AGENT_MIN_PAYOUT_NAIRA,
+        "currency": SPONSOR_AGENT_ACCOUNT_CURRENCY,
+        "auto_payout_available": bool(_flutterwave_secret_key()),
+        "agents": agents,
+        "requests": requests_payload,
+        "summary": {
+            "agent_count": len(agents),
+            "request_count": len(requests_payload),
+            "pending_request_count": sum(1 for row in requests_payload if row.get("status") in {"requested", "approved", "processing"}),
+            "available_amount": round(total_available, 2),
+            "requested_amount": round(total_requested, 2),
+            "paid_amount": round(total_paid, 2),
+        },
+    }
+
+
+@router.patch("/admin/sponsor-agent-payouts/{request_id}")
+def review_admin_sponsor_agent_payout_request(
+    request_id: int,
+    payload: SponsorAgentPayoutReviewPayload,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    row = db.execute(
+        text(
+            """
+            SELECT
+                pr.*,
+                u.full_name AS user_name,
+                u.user_uid
+            FROM green_sponsor_agent_payout_requests pr
+            JOIN green_users u ON u.id = pr.user_id
+            WHERE pr.id = :request_id
+            LIMIT 1
+            """
+        ),
+        {"request_id": int(request_id)},
+    ).mappings().first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Payout request not found")
+    action = _normalize_name(payload.action)
+    reviewer_name = _clean_text(payload.reviewer_name, 120) or "super_admin"
+    review_notes = _clean_text(payload.review_notes, 500)
+    transfer_error: str | None = None
+    current_status = _normalize_sponsor_agent_payout_status(row.get("status"))
+    if action in {"reject", "rejected"}:
+        updated = db.execute(
+            text(
+                """
+                UPDATE green_sponsor_agent_payout_requests
+                SET status = 'rejected',
+                    reviewed_by = :reviewed_by,
+                    reviewed_at = NOW(),
+                    review_notes = :review_notes,
+                    updated_at = NOW()
+                WHERE id = :request_id
+                RETURNING *
+                """
+            ),
+            {
+                "request_id": int(request_id),
+                "reviewed_by": reviewer_name,
+                "review_notes": review_notes,
+            },
+        ).mappings().first()
+    elif action in {"cancel", "cancelled"}:
+        updated = db.execute(
+            text(
+                """
+                UPDATE green_sponsor_agent_payout_requests
+                SET status = 'cancelled',
+                    reviewed_by = :reviewed_by,
+                    reviewed_at = NOW(),
+                    review_notes = :review_notes,
+                    updated_at = NOW()
+                WHERE id = :request_id
+                RETURNING *
+                """
+            ),
+            {
+                "request_id": int(request_id),
+                "reviewed_by": reviewer_name,
+                "review_notes": review_notes,
+            },
+        ).mappings().first()
+    elif action in {"mark_paid", "paid"}:
+        updated = db.execute(
+            text(
+                """
+                UPDATE green_sponsor_agent_payout_requests
+                SET status = 'paid',
+                    reviewed_by = :reviewed_by,
+                    reviewed_at = NOW(),
+                    review_notes = :review_notes,
+                    paid_at = COALESCE(paid_at, NOW()),
+                    updated_at = NOW()
+                WHERE id = :request_id
+                RETURNING *
+                """
+            ),
+            {
+                "request_id": int(request_id),
+                "reviewed_by": reviewer_name,
+                "review_notes": review_notes,
+            },
+        ).mappings().first()
+    else:
+        updated = db.execute(
+            text(
+                """
+                UPDATE green_sponsor_agent_payout_requests
+                SET status = 'approved',
+                    reviewed_by = :reviewed_by,
+                    reviewed_at = NOW(),
+                    review_notes = :review_notes,
+                    updated_at = NOW()
+                WHERE id = :request_id
+                RETURNING *
+                """
+            ),
+            {
+                "request_id": int(request_id),
+                "reviewed_by": reviewer_name,
+                "review_notes": review_notes,
+            },
+        ).mappings().first()
+        updated = dict(updated) if updated else dict(row)
+        should_transfer = bool(payload.auto_transfer) or action in {"approve_and_pay", "retry_transfer", "auto_transfer"}
+        if should_transfer:
+            try:
+                updated = _create_flutterwave_transfer_for_payout(request, db, updated)
+            except HTTPException as exc:
+                transfer_error = str(exc.detail or "Automatic payout failed")
+                updated = db.execute(
+                    text(
+                        """
+                        UPDATE green_sponsor_agent_payout_requests
+                        SET status = CASE WHEN :current_status = 'paid' THEN 'paid' ELSE 'failed' END,
+                            reviewed_by = :reviewed_by,
+                            reviewed_at = NOW(),
+                            review_notes = :review_notes,
+                            transfer_status = 'error',
+                            updated_at = NOW()
+                        WHERE id = :request_id
+                        RETURNING *
+                        """
+                    ),
+                    {
+                        "request_id": int(request_id),
+                        "current_status": current_status,
+                        "reviewed_by": reviewer_name,
+                        "review_notes": review_notes or transfer_error,
+                    },
+                ).mappings().first()
+    _log_audit_event(
+        db,
+        project_id=None,
+        entity_type="sponsor_agent_payout_request",
+        entity_id=int(request_id),
+        action="sponsor_agent_payout_reviewed",
+        actor=reviewer_name,
+        details={
+            "action": action or "approve",
+            "status": _normalize_sponsor_agent_payout_status((updated or row).get("status")),
+            "transfer_error": transfer_error,
+        },
+    )
+    db.commit()
+    serialized = _serialize_sponsor_agent_payout_request(dict(updated) if updated else dict(row))
+    return {"ok": True, "request": serialized, "transfer_error": transfer_error}
+
+
+@router.post("/admin/sponsor-agent-payouts/flutterwave/callback")
+async def sponsor_agent_payout_flutterwave_callback(request: Request, db: Session = Depends(get_db)):
+    raw_body = await request.body()
+    signature = request.headers.get("flutterwave-signature")
+    secret_hash_configured = bool(_flutterwave_secret_hash())
+    if secret_hash_configured and not _verify_flutterwave_webhook_signature(raw_body, signature):
+        raise HTTPException(status_code=401, detail="Invalid webhook signature")
+    try:
+        payload = json.loads(raw_body.decode("utf-8") or "{}")
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="Invalid webhook payload") from exc
+    data = payload.get("data") or {}
+    transfer_id = int(data.get("id") or 0) or None
+    transfer_reference = str(data.get("reference") or "").strip() or None
+    if transfer_id is None and not transfer_reference:
+        return {"ok": True, "ignored": True}
+    row = db.execute(
+        text(
+            """
+            SELECT
+                pr.*,
+                u.full_name AS user_name,
+                u.user_uid
+            FROM green_sponsor_agent_payout_requests pr
+            JOIN green_users u ON u.id = pr.user_id
+            WHERE (:transfer_id IS NOT NULL AND pr.transfer_id = :transfer_id)
+               OR (:transfer_reference IS NOT NULL AND UPPER(COALESCE(pr.transfer_reference, request_uid)) = UPPER(:transfer_reference))
+            ORDER BY pr.created_at DESC, pr.id DESC
+            LIMIT 1
+            """
+        ),
+        {"transfer_id": transfer_id, "transfer_reference": transfer_reference},
+    ).mappings().first()
+    if not row:
+        return {"ok": True, "ignored": True}
+    updated = _sync_sponsor_agent_payout_transfer(db, dict(row))
+    db.commit()
+    return {"ok": True, "request": _serialize_sponsor_agent_payout_request(updated)}
 
 
 @router.get("/admin/organizations")
@@ -8182,6 +9503,7 @@ def list_projects(
             p.access_model, p.public_sponsor_enabled, p.public_sponsor_title, p.public_sponsor_description,
             p.sponsor_price_per_tree, p.sponsor_currency, p.sponsor_capacity, p.sponsor_max_per_order,
             p.sponsor_dedication_enabled, p.sponsor_payment_instructions, p.public_sponsor_agent_user_ids,
+            p.sponsor_agent_planting_fee, p.sponsor_agent_maintenance_fee,
             p.workflow_profile, p.agric_config, p.relief_config,
             p.planting_model, p.allow_existing_tree_link, p.default_existing_tree_scope, p.created_at,
             o.name AS organization_name, o.slug AS organization_slug, o.status AS organization_status,
@@ -8239,6 +9561,7 @@ def get_project(
             p.access_model, p.public_sponsor_enabled, p.public_sponsor_title, p.public_sponsor_description,
             p.sponsor_price_per_tree, p.sponsor_currency, p.sponsor_capacity, p.sponsor_max_per_order,
             p.sponsor_dedication_enabled, p.sponsor_payment_instructions, p.public_sponsor_agent_user_ids,
+            p.sponsor_agent_planting_fee, p.sponsor_agent_maintenance_fee,
             p.workflow_profile, p.agric_config, p.relief_config,
             p.planting_model, p.allow_existing_tree_link, p.default_existing_tree_scope, p.created_at,
             o.name AS organization_name, o.slug AS organization_slug, o.status AS organization_status,
@@ -8402,6 +9725,8 @@ def get_project(
             "sponsor_dedication_enabled": bool(project.get("sponsor_dedication_enabled", True)),
             "sponsor_payment_instructions": project.get("sponsor_payment_instructions"),
             "public_sponsor_agent_user_ids": _normalize_positive_int_list(project.get("public_sponsor_agent_user_ids")),
+            "sponsor_agent_planting_fee": project.get("sponsor_agent_planting_fee"),
+            "sponsor_agent_maintenance_fee": project.get("sponsor_agent_maintenance_fee"),
         },
         "community": {
             "custodians_total": int(custodian_summary.get("total_custodians") or 0),
