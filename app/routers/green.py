@@ -6213,7 +6213,7 @@ def _is_public_sponsorship_project(project: dict | None) -> bool:
     if not project:
         return False
     access_model = _normalize_project_access_model(project.get("access_model"))
-    return access_model == "public_sponsorship"
+    return access_model == "public_sponsorship" or bool(project.get("public_sponsor_enabled"))
 
 
 def _is_sponsor_checkout_ready(project: dict | None, available_slots: int | None = None) -> bool:
@@ -6488,7 +6488,10 @@ def _list_public_sponsor_project_ids_for_user_ids(
             SELECT DISTINCT p.id
             FROM tree_projects p
             CROSS JOIN LATERAL jsonb_array_elements_text(COALESCE(p.public_sponsor_agent_user_ids, '[]'::jsonb)) AS selected(user_id_text)
-            WHERE LOWER(COALESCE(p.access_model, 'partner_org')) = 'public_sponsorship'
+            WHERE (
+                    LOWER(COALESCE(p.access_model, 'partner_org')) = 'public_sponsorship'
+                 OR COALESCE(p.public_sponsor_enabled, FALSE) = TRUE
+                  )
               AND CAST(selected.user_id_text AS INTEGER) IN :user_ids
               AND (
                     :organization_id IS NULL
@@ -6533,7 +6536,10 @@ def _list_public_sponsor_projects_for_agent(
                 p.sponsor_agent_planting_fee, p.sponsor_agent_maintenance_fee,
                 p.workflow_profile, p.created_at
             FROM tree_projects p
-            WHERE LOWER(COALESCE(p.access_model, 'partner_org')) = 'public_sponsorship'
+            WHERE (
+                    LOWER(COALESCE(p.access_model, 'partner_org')) = 'public_sponsorship'
+                 OR COALESCE(p.public_sponsor_enabled, FALSE) = TRUE
+                  )
               AND (
                     :organization_id IS NULL
                  OR p.organization_id = :organization_id
@@ -7564,7 +7570,10 @@ def list_public_sponsorship_projects(db: Session = Depends(get_db)):
                 o.logo_url AS organization_logo_url
             FROM tree_projects p
             LEFT JOIN green_organizations o ON o.id = p.organization_id
-            WHERE LOWER(COALESCE(p.access_model, 'partner_org')) = 'public_sponsorship'
+            WHERE (
+                    LOWER(COALESCE(p.access_model, 'partner_org')) = 'public_sponsorship'
+                 OR COALESCE(p.public_sponsor_enabled, FALSE) = TRUE
+                  )
               AND (o.id IS NULL OR COALESCE(o.is_active, TRUE) = TRUE)
             ORDER BY
                 CASE WHEN COALESCE(p.sponsor_price_per_tree, 0) > 0 THEN 0 ELSE 1 END,
@@ -8806,7 +8815,10 @@ def list_admin_sponsor_agent_payouts(
             FROM tree_projects p
             CROSS JOIN LATERAL jsonb_array_elements_text(COALESCE(p.public_sponsor_agent_user_ids, '[]'::jsonb)) AS selected(user_id_text)
             WHERE p.organization_id = :organization_id
-              AND LOWER(COALESCE(p.access_model, 'partner_org')) = 'public_sponsorship'
+              AND (
+                    LOWER(COALESCE(p.access_model, 'partner_org')) = 'public_sponsorship'
+                 OR COALESCE(p.public_sponsor_enabled, FALSE) = TRUE
+                  )
             ORDER BY CAST(selected.user_id_text AS INTEGER)
             """
         ),
