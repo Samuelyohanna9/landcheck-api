@@ -123,6 +123,9 @@ SPONSOR_PAYMENT_STATUS_VALUES = {"pending", "proof_submitted", "verified", "reje
 SPONSOR_ORDER_STATUS_VALUES = {"pending_payment", "payment_review", "paid", "allocated", "completed", "cancelled"}
 SPONSOR_UNIT_STATUS_VALUES = {"awaiting_payment", "awaiting_tree", "linked", "active", "replaced", "cancelled"}
 SPONSOR_DEDICATION_TYPE_VALUES = {"self", "memorial", "birthday", "celebration", "honor", "organization", "other"}
+SPONSOR_TERMS_VERSION = "2026-06-06-v1"
+SPONSOR_TERMS_EFFECTIVE_DATE = "2026-06-06"
+SPONSOR_RESET_TOKEN_TTL_HOURS = 2
 SPONSOR_AGENT_ACCOUNT_CURRENCY = "NGN"
 SPONSOR_AGENT_MIN_PAYOUT_NAIRA = 10000
 SPONSOR_AGENT_PAYOUT_STATUS_VALUES = {"requested", "approved", "processing", "paid", "rejected", "failed", "cancelled"}
@@ -331,6 +334,15 @@ class SponsorLoginPayload(BaseModel):
     password: str
 
 
+class SponsorForgotPasswordPayload(BaseModel):
+    email: str
+
+
+class SponsorResetPasswordPayload(BaseModel):
+    token: str
+    new_password: str
+
+
 class SponsorOrderPayload(BaseModel):
     sponsor_id: int | None = None
     project_id: int
@@ -343,6 +355,9 @@ class SponsorOrderPayload(BaseModel):
     payment_proof_url: str | None = None
     payment_proof_urls: list[str] | None = None
     purchaser_note: str | None = None
+    accepted_terms: bool = False
+    accepted_policy: bool = False
+    consent_version: str | None = None
 
 
 class SponsorOrderReviewPayload(BaseModel):
@@ -1367,6 +1382,387 @@ def _send_organization_welcome_email(
         server.send_message(msg)
 
 
+def _smtp_settings_or_raise() -> dict:
+    smtp_host = str(os.getenv("SMTP_HOST") or "").strip()
+    if not smtp_host:
+        raise RuntimeError("SMTP_HOST is not configured")
+    smtp_port = int(str(os.getenv("SMTP_PORT") or "587").strip() or "587")
+    smtp_user = str(os.getenv("SMTP_USERNAME") or "").strip()
+    smtp_pass = str(os.getenv("SMTP_PASSWORD") or "").strip()
+    smtp_from_email = str(os.getenv("SMTP_FROM_EMAIL") or smtp_user or "").strip()
+    smtp_from_name = str(os.getenv("SMTP_FROM_NAME") or "LandCheck").strip()
+    if not smtp_from_email:
+        raise RuntimeError("SMTP_FROM_EMAIL (or SMTP_USERNAME) is not configured")
+    return {
+        "host": smtp_host,
+        "port": smtp_port,
+        "user": smtp_user,
+        "password": smtp_pass,
+        "from_email": smtp_from_email,
+        "from_name": smtp_from_name,
+        "use_ssl": _env_bool("SMTP_USE_SSL", False),
+        "use_tls": _env_bool("SMTP_USE_TLS", True),
+    }
+
+
+def _deliver_email_message(msg: EmailMessage, settings: dict):
+    if bool(settings.get("use_ssl")):
+        with smtplib.SMTP_SSL(str(settings["host"]), int(settings["port"]), timeout=20) as server:
+            if settings.get("user"):
+                server.login(str(settings["user"]), str(settings.get("password") or ""))
+            server.send_message(msg)
+        return
+
+    with smtplib.SMTP(str(settings["host"]), int(settings["port"]), timeout=20) as server:
+        try:
+            server.ehlo()
+        except Exception:
+            pass
+        if bool(settings.get("use_tls")):
+            server.starttls()
+            try:
+                server.ehlo()
+            except Exception:
+                pass
+        if settings.get("user"):
+            server.login(str(settings["user"]), str(settings.get("password") or ""))
+        server.send_message(msg)
+
+
+def _send_html_email(*, to_email: str, subject: str, text_body: str, html_body: str):
+    settings = _smtp_settings_or_raise()
+    msg = EmailMessage()
+    msg["Subject"] = subject
+    msg["From"] = f'{settings["from_name"]} <{settings["from_email"]}>' if settings.get("from_name") else settings["from_email"]
+    msg["To"] = str(to_email or "").strip()
+    msg.set_content(text_body)
+    msg.add_alternative(html_body, subtype="html")
+    _deliver_email_message(msg, settings)
+
+
+def _load_sponsor_order_email_payload(db: Session, order_id: int):
+    return db.execute(
+        text(
+            """
+            SELECT
+                o.id,
+                o.order_uid,
+                o.project_id,
+                o.quantity,
+                o.amount_per_tree,
+                o.amount_total,
+                o.currency,
+                o.payment_method,
+                o.payment_status,
+                o.payment_link,
+                o.payment_verified_at,
+                o.dedication_type,
+                o.dedication_name,
+                o.dedication_message,
+                o.sponsor_confirmation_sent_at,
+                o.payment_confirmation_sent_at,
+                sa.id AS sponsor_id,
+                sa.full_name AS sponsor_name,
+                sa.email AS sponsor_email,
+                sa.account_type AS sponsor_account_type,
+                sa.organization_name AS sponsor_organization_name,
+                p.name AS project_name,
+                p.location_text AS project_location_text
+            FROM green_sponsorship_orders o
+            JOIN green_sponsor_accounts sa ON sa.id = o.sponsor_account_id
+            JOIN tree_projects p ON p.id = o.project_id
+            WHERE o.id = :order_id
+            LIMIT 1
+            """
+        ),
+        {"order_id": int(order_id)},
+    ).mappings().first()
+
+
+def _send_sponsor_welcome_email(*, to_email: str, full_name: str, account_type: str | None, organization_name: str | None, request: Request | None = None):
+    recipient_name = str(full_name or "").strip() or "Supporter"
+    terms_url = _build_sponsor_public_terms_url(request) or "https://api.landcheck.online/green/sponsor/public/terms"
+    privacy_url = _build_public_privacy_policy_url()
+    account_label = "Organization sponsor" if _normalize_name(account_type) == "organization" else "Individual sponsor"
+    org_line = f"Organization: {organization_name}\n" if str(organization_name or "").strip() else ""
+    body = (
+        f"Hello {recipient_name},\n\n"
+        "Welcome to LandCheck Green public sponsorship.\n\n"
+        "Your sponsor account is now active. You can sign in, choose any public sponsor project, pay securely online, and follow verified field updates for every tree linked to you.\n\n"
+        f"Account type: {account_label}\n"
+        f"{org_line}"
+        f"Privacy policy: {privacy_url}\n"
+        f"Sponsorship terms: {terms_url}\n\n"
+        "What to expect next:\n"
+        "- Select a public project that is open for sponsorship.\n"
+        "- Complete secure checkout.\n"
+        "- Receive verified map, photo, maintenance, and certificate updates as trees are linked to your order.\n\n"
+        "Regards,\n"
+        "LandCheck Green"
+    )
+    html_body = f"""
+    <html>
+      <body style="margin:0;padding:28px;background:#eef8ef;font-family:Arial,sans-serif;color:#173624;">
+        <div style="max-width:680px;margin:0 auto;background:#ffffff;border:1px solid #d8ebdd;border-radius:20px;overflow:hidden;box-shadow:0 18px 42px rgba(12,73,34,0.10);">
+          <div style="padding:28px 28px 22px;background:linear-gradient(140deg,#0c5f2e 0%,#1a8a4a 100%);color:#ffffff;">
+            <div style="font-size:12px;font-weight:800;letter-spacing:0.16em;text-transform:uppercase;color:#d8f7df;">LandCheck Green</div>
+            <div style="margin-top:10px;font-size:28px;font-weight:800;line-height:1.15;">Welcome to verified tree sponsorship</div>
+            <div style="margin-top:10px;font-size:15px;line-height:1.7;color:#eefcf0;">Your account is ready for secure project support, live field evidence, and premium tree stories.</div>
+          </div>
+          <div style="padding:26px 28px 30px;">
+            <p style="margin:0 0 14px;font-size:15px;line-height:1.7;">Hello {html.escape(recipient_name)},</p>
+            <p style="margin:0 0 16px;font-size:15px;line-height:1.7;">Your public sponsor account is now active. You can sign in, support approved projects, and track each verified tree with map, photo, care history, and certificate records.</p>
+            <div style="border:1px solid #dbece0;border-radius:16px;background:#f8fcf9;padding:18px 18px 14px;margin:0 0 18px;">
+              <div style="font-size:13px;font-weight:800;letter-spacing:0.08em;text-transform:uppercase;color:#4e6b58;">Account profile</div>
+              <div style="margin-top:10px;font-size:16px;font-weight:700;color:#143522;">{html.escape(account_label)}</div>
+              {f'<div style="margin-top:8px;font-size:14px;color:#486652;"><strong>Organization:</strong> {html.escape(str(organization_name or "").strip())}</div>' if str(organization_name or "").strip() else ''}
+            </div>
+            <div style="border:1px solid #dbece0;border-radius:16px;background:#ffffff;padding:18px;margin:0 0 18px;">
+              <div style="font-size:14px;font-weight:800;color:#143522;margin:0 0 10px;">Before your first sponsorship</div>
+              <ul style="margin:0;padding-left:18px;color:#315540;font-size:14px;line-height:1.65;">
+                <li>Choose any public sponsor project that matches your interest.</li>
+                <li>Complete secure checkout before trees are reserved for you.</li>
+                <li>Use the same email address whenever you sign back in.</li>
+              </ul>
+            </div>
+            <div style="display:flex;gap:12px;flex-wrap:wrap;margin:0 0 18px;">
+              <a href="{html.escape(privacy_url, quote=True)}" style="display:inline-block;padding:13px 18px;border-radius:999px;background:#eff8f1;color:#0e5f2f;font-weight:800;text-decoration:none;border:1px solid #cfe6d5;">Privacy policy</a>
+              <a href="{html.escape(terms_url, quote=True)}" style="display:inline-block;padding:13px 18px;border-radius:999px;background:#0f6f39;color:#ffffff;font-weight:800;text-decoration:none;">Sponsorship terms</a>
+            </div>
+            <p style="margin:0;font-size:14px;line-height:1.7;color:#486652;">Regards,<br/>LandCheck Green</p>
+          </div>
+        </div>
+      </body>
+    </html>
+    """
+    _send_html_email(
+        to_email=to_email,
+        subject="Welcome to LandCheck Green Sponsorship",
+        text_body=body,
+        html_body=html_body,
+    )
+
+
+def _send_sponsor_password_reset_email(*, to_email: str, full_name: str, reset_url: str, expires_at: datetime):
+    recipient_name = str(full_name or "").strip() or "Supporter"
+    expiry_label = expires_at.strftime("%d %b %Y %H:%M UTC")
+    body = (
+        f"Hello {recipient_name},\n\n"
+        "We received a request to reset your LandCheck Green sponsor password.\n\n"
+        f"Use this secure reset link before {expiry_label}:\n{reset_url}\n\n"
+        "If you did not request this change, you can ignore this message and your current password will remain active.\n\n"
+        "Regards,\n"
+        "LandCheck Green"
+    )
+    html_body = f"""
+    <html>
+      <body style="margin:0;padding:28px;background:#f3f9f4;font-family:Arial,sans-serif;color:#173624;">
+        <div style="max-width:660px;margin:0 auto;background:#ffffff;border:1px solid #d8ebdd;border-radius:20px;overflow:hidden;">
+          <div style="padding:26px 28px;background:linear-gradient(145deg,#0d5e2e 0%,#1f7f43 100%);color:#ffffff;">
+            <div style="font-size:26px;font-weight:800;line-height:1.18;">Reset your sponsor password</div>
+            <div style="margin-top:8px;font-size:14px;line-height:1.7;color:#eaf9ed;">Use the secure button below to choose a new password for your LandCheck Green sponsor account.</div>
+          </div>
+          <div style="padding:26px 28px 30px;">
+            <p style="margin:0 0 14px;font-size:15px;line-height:1.7;">Hello {html.escape(recipient_name)},</p>
+            <p style="margin:0 0 18px;font-size:15px;line-height:1.7;">A password reset was requested for your sponsor account. This secure link expires on <strong>{html.escape(expiry_label)}</strong>.</p>
+            <a href="{html.escape(reset_url, quote=True)}" style="display:inline-block;padding:14px 22px;border-radius:999px;background:#0f6f39;color:#ffffff;font-size:15px;font-weight:800;text-decoration:none;">Reset password</a>
+            <p style="margin:18px 0 0;font-size:13px;line-height:1.7;color:#4b6857;">If the button does not open, copy this link into your browser:<br/>{html.escape(reset_url)}</p>
+            <p style="margin:18px 0 0;font-size:13px;line-height:1.7;color:#4b6857;">If you did not request this, you can ignore this email.</p>
+          </div>
+        </div>
+      </body>
+    </html>
+    """
+    _send_html_email(
+        to_email=to_email,
+        subject="Reset your LandCheck Green sponsor password",
+        text_body=body,
+        html_body=html_body,
+    )
+
+
+def _send_sponsor_order_created_email(*, order_row: dict, request: Request | None = None):
+    sponsor_name = str(order_row.get("sponsor_name") or "").strip() or "Supporter"
+    sponsor_email = str(order_row.get("sponsor_email") or "").strip()
+    if not sponsor_email:
+        return
+    project_name = str(order_row.get("project_name") or "LandCheck Green project").strip()
+    location_text = str(order_row.get("project_location_text") or "").strip()
+    quantity = max(int(order_row.get("quantity") or 0), 1)
+    amount_total = round(float(order_row.get("amount_total") or 0), 2)
+    currency = _normalize_currency_code(order_row.get("currency"), "NGN")
+    payment_link = str(order_row.get("payment_link") or "").strip()
+    terms_url = _build_sponsor_public_terms_url(request) or "https://api.landcheck.online/green/sponsor/public/terms"
+    body = (
+        f"Hello {sponsor_name},\n\n"
+        "Your LandCheck Green sponsorship order has been created.\n\n"
+        f"Project: {project_name}\n"
+        f"Location: {location_text or '-'}\n"
+        f"Trees reserved: {quantity}\n"
+        f"Amount: {currency} {amount_total:,.2f}\n\n"
+        f"Complete secure checkout here: {payment_link}\n\n"
+        "Once payment is confirmed, your order moves into verified field allocation and you will receive a follow-up confirmation email.\n\n"
+        f"Sponsorship terms: {terms_url}\n\n"
+        "Regards,\n"
+        "LandCheck Green"
+    )
+    html_body = f"""
+    <html>
+      <body style="margin:0;padding:28px;background:#eef8ef;font-family:Arial,sans-serif;color:#173624;">
+        <div style="max-width:680px;margin:0 auto;background:#ffffff;border:1px solid #d8ebdd;border-radius:20px;overflow:hidden;">
+          <div style="padding:28px;background:linear-gradient(145deg,#0c5f2e 0%,#1d8a49 100%);color:#ffffff;">
+            <div style="font-size:12px;font-weight:800;letter-spacing:0.16em;text-transform:uppercase;color:#daf7df;">Checkout started</div>
+            <div style="margin-top:10px;font-size:28px;font-weight:800;line-height:1.15;">Your sponsorship is almost active</div>
+            <div style="margin-top:10px;font-size:15px;line-height:1.7;color:#effcf1;">Complete secure payment to move this order into verified field allocation and live project updates.</div>
+          </div>
+          <div style="padding:26px 28px 30px;">
+            <p style="margin:0 0 14px;font-size:15px;line-height:1.7;">Hello {html.escape(sponsor_name)},</p>
+            <div style="border:1px solid #dbece0;border-radius:16px;background:#f8fcf9;padding:18px;margin:0 0 18px;">
+              <div style="font-size:14px;font-weight:800;color:#163826;margin:0 0 10px;">Order summary</div>
+              <div style="font-size:15px;line-height:1.8;color:#345542;">
+                <div><strong>Project:</strong> {html.escape(project_name)}</div>
+                <div><strong>Location:</strong> {html.escape(location_text or "-")}</div>
+                <div><strong>Trees reserved:</strong> {quantity}</div>
+                <div><strong>Amount:</strong> {html.escape(currency)} {amount_total:,.2f}</div>
+                <div><strong>Reference:</strong> {html.escape(str(order_row.get("order_uid") or "-"))}</div>
+              </div>
+            </div>
+            {f'<a href="{html.escape(payment_link, quote=True)}" style="display:inline-block;padding:14px 22px;border-radius:999px;background:#0f6f39;color:#ffffff;font-size:15px;font-weight:800;text-decoration:none;">Complete secure payment</a>' if payment_link else ''}
+            <p style="margin:18px 0 0;font-size:14px;line-height:1.7;color:#4b6857;">After payment is confirmed, you will receive another email and your sponsor dashboard will start showing tree allocation and field evidence as records are approved.</p>
+            <p style="margin:18px 0 0;font-size:13px;line-height:1.7;color:#4b6857;">Review terms: <a href="{html.escape(terms_url, quote=True)}" style="color:#0f6f39;font-weight:700;">LandCheck sponsor terms</a></p>
+          </div>
+        </div>
+      </body>
+    </html>
+    """
+    _send_html_email(
+        to_email=sponsor_email,
+        subject="Complete your LandCheck Green sponsorship payment",
+        text_body=body,
+        html_body=html_body,
+    )
+
+
+def _send_sponsor_payment_confirmed_email(*, order_row: dict, request: Request | None = None):
+    sponsor_name = str(order_row.get("sponsor_name") or "").strip() or "Supporter"
+    sponsor_email = str(order_row.get("sponsor_email") or "").strip()
+    if not sponsor_email:
+        return
+    project_name = str(order_row.get("project_name") or "LandCheck Green project").strip()
+    location_text = str(order_row.get("project_location_text") or "").strip()
+    quantity = max(int(order_row.get("quantity") or 0), 1)
+    amount_total = round(float(order_row.get("amount_total") or 0), 2)
+    currency = _normalize_currency_code(order_row.get("currency"), "NGN")
+    payment_verified_at = str(order_row.get("payment_verified_at") or "").strip() or datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+    body = (
+        f"Hello {sponsor_name},\n\n"
+        "Your LandCheck Green sponsorship payment has been confirmed.\n\n"
+        f"Project: {project_name}\n"
+        f"Location: {location_text or '-'}\n"
+        f"Trees sponsored: {quantity}\n"
+        f"Confirmed amount: {currency} {amount_total:,.2f}\n"
+        f"Confirmed at: {payment_verified_at}\n\n"
+        "Your order is now ready for verified field allocation. As trees are linked and reviewed, your sponsor dashboard will start showing map records, photo evidence, maintenance updates, and certificate access.\n\n"
+        "Regards,\n"
+        "LandCheck Green"
+    )
+    html_body = f"""
+    <html>
+      <body style="margin:0;padding:28px;background:#eef8ef;font-family:Arial,sans-serif;color:#173624;">
+        <div style="max-width:680px;margin:0 auto;background:#ffffff;border:1px solid #d8ebdd;border-radius:20px;overflow:hidden;">
+          <div style="padding:28px;background:linear-gradient(145deg,#0b5d2d 0%,#16753d 55%,#3cb562 100%);color:#ffffff;">
+            <div style="font-size:12px;font-weight:800;letter-spacing:0.16em;text-transform:uppercase;color:#daf7df;">Payment confirmed</div>
+            <div style="margin-top:10px;font-size:28px;font-weight:800;line-height:1.15;">Your sponsorship is now active</div>
+            <div style="margin-top:10px;font-size:15px;line-height:1.7;color:#effcf1;">LandCheck Green has confirmed your payment and your order is ready for verified field allocation.</div>
+          </div>
+          <div style="padding:26px 28px 30px;">
+            <p style="margin:0 0 14px;font-size:15px;line-height:1.7;">Hello {html.escape(sponsor_name)},</p>
+            <div style="border:1px solid #dbece0;border-radius:16px;background:#f8fcf9;padding:18px;margin:0 0 18px;">
+              <div style="font-size:14px;font-weight:800;color:#163826;margin:0 0 10px;">Confirmed sponsorship</div>
+              <div style="font-size:15px;line-height:1.8;color:#345542;">
+                <div><strong>Project:</strong> {html.escape(project_name)}</div>
+                <div><strong>Location:</strong> {html.escape(location_text or "-")}</div>
+                <div><strong>Trees sponsored:</strong> {quantity}</div>
+                <div><strong>Confirmed amount:</strong> {html.escape(currency)} {amount_total:,.2f}</div>
+                <div><strong>Reference:</strong> {html.escape(str(order_row.get("order_uid") or "-"))}</div>
+              </div>
+            </div>
+            <div style="border:1px solid #d9ebdc;border-radius:16px;background:#ffffff;padding:18px;">
+              <div style="font-size:14px;font-weight:800;color:#163826;margin:0 0 8px;">What happens next</div>
+              <ul style="margin:0;padding-left:18px;color:#345542;font-size:14px;line-height:1.65;">
+                <li>Trees move into verified field allocation for this project.</li>
+                <li>Your dashboard will begin to show live map, photo, and maintenance evidence as records are approved.</li>
+                <li>Your digital certificate becomes available once trees are linked to your sponsorship units.</li>
+              </ul>
+            </div>
+            <p style="margin:18px 0 0;font-size:13px;line-height:1.7;color:#4b6857;">Confirmation time: {html.escape(payment_verified_at)}</p>
+          </div>
+        </div>
+      </body>
+    </html>
+    """
+    _send_html_email(
+        to_email=sponsor_email,
+        subject="Your LandCheck Green sponsorship payment is confirmed",
+        text_body=body,
+        html_body=html_body,
+    )
+
+
+def _notify_sponsor_welcome_email(db: Session, sponsor_id: int, request: Request | None = None):
+    sponsor_row = db.execute(
+        text(
+            """
+            SELECT id, full_name, account_type, organization_name, email, last_welcome_email_at
+            FROM green_sponsor_accounts
+            WHERE id = :sponsor_id
+            LIMIT 1
+            """
+        ),
+        {"sponsor_id": int(sponsor_id)},
+    ).mappings().first()
+    if not sponsor_row or not str(sponsor_row.get("email") or "").strip():
+        return
+    if sponsor_row.get("last_welcome_email_at"):
+        return
+    _send_sponsor_welcome_email(
+        to_email=str(sponsor_row.get("email") or "").strip(),
+        full_name=str(sponsor_row.get("full_name") or ""),
+        account_type=str(sponsor_row.get("account_type") or ""),
+        organization_name=str(sponsor_row.get("organization_name") or "").strip() or None,
+        request=request,
+    )
+    db.execute(
+        text("UPDATE green_sponsor_accounts SET last_welcome_email_at = NOW(), updated_at = NOW() WHERE id = :sponsor_id"),
+        {"sponsor_id": int(sponsor_id)},
+    )
+    db.commit()
+
+
+def _notify_sponsor_order_created_email(db: Session, order_id: int, request: Request | None = None):
+    row = _load_sponsor_order_email_payload(db, order_id)
+    if not row or row.get("sponsor_confirmation_sent_at"):
+        return
+    _send_sponsor_order_created_email(order_row=dict(row), request=request)
+    db.execute(
+        text("UPDATE green_sponsorship_orders SET sponsor_confirmation_sent_at = NOW(), updated_at = NOW() WHERE id = :order_id"),
+        {"order_id": int(order_id)},
+    )
+    db.commit()
+
+
+def _notify_sponsor_payment_confirmed_email(db: Session, order_id: int, request: Request | None = None):
+    row = _load_sponsor_order_email_payload(db, order_id)
+    if not row or row.get("payment_confirmation_sent_at"):
+        return
+    _send_sponsor_payment_confirmed_email(order_row=dict(row), request=request)
+    db.execute(
+        text("UPDATE green_sponsorship_orders SET payment_confirmation_sent_at = NOW(), updated_at = NOW() WHERE id = :order_id"),
+        {"order_id": int(order_id)},
+    )
+    db.commit()
+
+
 def _next_project_tree_no(db: Session, project_id: int) -> int:
     # Lock the project row so concurrent inserts don't issue the same local tree number.
     db.execute(text("SELECT id FROM tree_projects WHERE id = :project_id FOR UPDATE"), {"project_id": int(project_id)})
@@ -1839,6 +2235,34 @@ def _build_public_api_base_url(request: Request | None = None) -> str:
     return ""
 
 
+def _build_public_privacy_policy_url() -> str:
+    return str(os.getenv("LANDCHECK_PRIVACY_POLICY_URL") or "").strip() or "https://landcheck.online/privacy"
+
+
+def _build_sponsor_public_terms_url(request: Request | None = None) -> str | None:
+    base_url = _build_public_api_base_url(request)
+    return f"{base_url}/green/sponsor/public/terms" if base_url else None
+
+
+def _build_sponsor_public_reset_password_url(token: str, request: Request | None = None) -> str | None:
+    reset_token = str(token or "").strip()
+    if not reset_token:
+        return None
+    base_url = _build_public_api_base_url(request)
+    return f"{base_url}/green/sponsor/public/reset-password?token={quote(reset_token)}" if base_url else None
+
+
+def _build_tree_best_photo_url(tree_id: object, request: Request | None = None) -> str | None:
+    try:
+        numeric = int(tree_id or 0)
+    except Exception:
+        return None
+    if numeric <= 0:
+        return None
+    base_url = _build_public_api_base_url(request)
+    return f"{base_url}/green/trees/{numeric}/photo?w=1280&q=76&fm=jpeg" if base_url else None
+
+
 def _build_flutterwave_return_url(request: Request, order_uid: str) -> str:
     base_url = _build_public_api_base_url(request)
     if not base_url:
@@ -2070,6 +2494,7 @@ def _sync_sponsorship_order_flutterwave_payment(
     gateway_state = actual_status or "pending"
     flw_reference = str(data.get("flw_ref") or "").strip() or None
     note = _clean_text(review_notes, 500)
+    already_verified = _normalize_sponsor_payment_status(order_row.get("payment_status")) == "verified"
     matches_reference = not expected_tx_ref or actual_tx_ref == expected_tx_ref
     matches_currency = actual_currency == expected_currency
     matches_amount = charged_amount + 0.01 >= expected_amount
@@ -2123,6 +2548,7 @@ def _sync_sponsorship_order_flutterwave_payment(
             "transaction_id": gateway_transaction_id,
             "tx_ref": actual_tx_ref,
             "message": "Payment verified successfully.",
+            "should_send_payment_confirmation": not already_verified,
         }
     db.execute(
         text(
@@ -2155,6 +2581,7 @@ def _sync_sponsorship_order_flutterwave_payment(
         "transaction_id": gateway_transaction_id,
         "tx_ref": actual_tx_ref,
         "message": failure_message,
+        "should_send_payment_confirmation": False,
     }
 
 
@@ -4129,6 +4556,10 @@ def ensure_green_tables(db: Session):
             phone TEXT,
             password_hash TEXT NOT NULL,
             is_active BOOLEAN NOT NULL DEFAULT TRUE,
+            last_welcome_email_at TIMESTAMP,
+            password_reset_token_hash TEXT,
+            password_reset_token_expires_at TIMESTAMP,
+            password_reset_requested_at TIMESTAMP,
             created_at TIMESTAMP DEFAULT NOW(),
             updated_at TIMESTAMP DEFAULT NOW()
         )
@@ -4181,6 +4612,10 @@ def ensure_green_tables(db: Session):
         db.execute(text("ALTER TABLE green_sponsor_accounts ADD COLUMN IF NOT EXISTS organization_name TEXT"))
         db.execute(text("ALTER TABLE green_sponsor_accounts ADD COLUMN IF NOT EXISTS phone TEXT"))
         db.execute(text("ALTER TABLE green_sponsor_accounts ADD COLUMN IF NOT EXISTS is_active BOOLEAN NOT NULL DEFAULT TRUE"))
+        db.execute(text("ALTER TABLE green_sponsor_accounts ADD COLUMN IF NOT EXISTS last_welcome_email_at TIMESTAMP"))
+        db.execute(text("ALTER TABLE green_sponsor_accounts ADD COLUMN IF NOT EXISTS password_reset_token_hash TEXT"))
+        db.execute(text("ALTER TABLE green_sponsor_accounts ADD COLUMN IF NOT EXISTS password_reset_token_expires_at TIMESTAMP"))
+        db.execute(text("ALTER TABLE green_sponsor_accounts ADD COLUMN IF NOT EXISTS password_reset_requested_at TIMESTAMP"))
         db.execute(text("ALTER TABLE green_sponsor_accounts ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW()"))
         db.execute(text("ALTER TABLE green_push_tokens ADD COLUMN IF NOT EXISTS organization_id INTEGER"))
         db.execute(text("ALTER TABLE green_push_tokens ADD COLUMN IF NOT EXISTS platform TEXT"))
@@ -4460,9 +4895,15 @@ def ensure_green_tables(db: Session):
             dedication_name TEXT,
             dedication_message TEXT,
             purchaser_note TEXT,
+            accepted_terms BOOLEAN NOT NULL DEFAULT FALSE,
+            accepted_policy BOOLEAN NOT NULL DEFAULT FALSE,
+            consent_version TEXT,
+            consent_ip TEXT,
             reviewed_by TEXT,
             reviewed_at TIMESTAMP,
             review_notes TEXT,
+            sponsor_confirmation_sent_at TIMESTAMP,
+            payment_confirmation_sent_at TIMESTAMP,
             created_at TIMESTAMP DEFAULT NOW(),
             updated_at TIMESTAMP DEFAULT NOW()
         )
@@ -4548,9 +4989,15 @@ def ensure_green_tables(db: Session):
         db.execute(text("ALTER TABLE green_sponsorship_orders ADD COLUMN IF NOT EXISTS dedication_name TEXT"))
         db.execute(text("ALTER TABLE green_sponsorship_orders ADD COLUMN IF NOT EXISTS dedication_message TEXT"))
         db.execute(text("ALTER TABLE green_sponsorship_orders ADD COLUMN IF NOT EXISTS purchaser_note TEXT"))
+        db.execute(text("ALTER TABLE green_sponsorship_orders ADD COLUMN IF NOT EXISTS accepted_terms BOOLEAN NOT NULL DEFAULT FALSE"))
+        db.execute(text("ALTER TABLE green_sponsorship_orders ADD COLUMN IF NOT EXISTS accepted_policy BOOLEAN NOT NULL DEFAULT FALSE"))
+        db.execute(text("ALTER TABLE green_sponsorship_orders ADD COLUMN IF NOT EXISTS consent_version TEXT"))
+        db.execute(text("ALTER TABLE green_sponsorship_orders ADD COLUMN IF NOT EXISTS consent_ip TEXT"))
         db.execute(text("ALTER TABLE green_sponsorship_orders ADD COLUMN IF NOT EXISTS reviewed_by TEXT"))
         db.execute(text("ALTER TABLE green_sponsorship_orders ADD COLUMN IF NOT EXISTS reviewed_at TIMESTAMP"))
         db.execute(text("ALTER TABLE green_sponsorship_orders ADD COLUMN IF NOT EXISTS review_notes TEXT"))
+        db.execute(text("ALTER TABLE green_sponsorship_orders ADD COLUMN IF NOT EXISTS sponsor_confirmation_sent_at TIMESTAMP"))
+        db.execute(text("ALTER TABLE green_sponsorship_orders ADD COLUMN IF NOT EXISTS payment_confirmation_sent_at TIMESTAMP"))
         db.execute(text("ALTER TABLE green_sponsorship_orders ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW()"))
         db.execute(text("ALTER TABLE green_sponsorship_units ADD COLUMN IF NOT EXISTS unit_uid TEXT"))
         db.execute(text("ALTER TABLE green_sponsorship_units ADD COLUMN IF NOT EXISTS tree_project_no INTEGER"))
@@ -7981,7 +8428,7 @@ def get_public_sponsorship_project(project_id: int, db: Session = Depends(get_db
 
 
 @router.post("/sponsor-auth/signup")
-def sponsor_auth_signup(payload: SponsorSignupPayload, db: Session = Depends(get_db)):
+def sponsor_auth_signup(payload: SponsorSignupPayload, request: Request, db: Session = Depends(get_db)):
     full_name = str(payload.full_name or "").strip()
     if not full_name:
         raise HTTPException(status_code=400, detail="Full name is required")
@@ -8024,6 +8471,10 @@ def sponsor_auth_signup(payload: SponsorSignupPayload, db: Session = Depends(get
         details={"account_type": row.get("account_type"), "email": row.get("email")},
     )
     db.commit()
+    try:
+        _notify_sponsor_welcome_email(db, int(row["id"]), request=request)
+    except Exception:
+        db.rollback()
     return _build_sponsor_auth_payload(dict(row))
 
 
@@ -8048,6 +8499,121 @@ def sponsor_auth_login(payload: SponsorLoginPayload, db: Session = Depends(get_d
     return _build_sponsor_auth_payload(dict(row))
 
 
+@router.post("/sponsor-auth/forgot-password")
+def sponsor_auth_forgot_password(payload: SponsorForgotPasswordPayload, request: Request, db: Session = Depends(get_db)):
+    email = _normalize_email_address(payload.email)
+    row = db.execute(
+        text(
+            """
+            SELECT id, full_name, email
+            FROM green_sponsor_accounts
+            WHERE LOWER(email) = LOWER(:email)
+              AND COALESCE(is_active, TRUE) = TRUE
+            LIMIT 1
+            """
+        ),
+        {"email": email},
+    ).mappings().first()
+    if not row:
+        return {"ok": True, "message": "If that sponsor email exists, a reset link has been sent."}
+
+    token = secrets.token_urlsafe(32)
+    token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
+    expires_at = datetime.utcnow() + timedelta(hours=SPONSOR_RESET_TOKEN_TTL_HOURS)
+    db.execute(
+        text(
+            """
+            UPDATE green_sponsor_accounts
+            SET password_reset_token_hash = :token_hash,
+                password_reset_token_expires_at = :expires_at,
+                password_reset_requested_at = NOW(),
+                updated_at = NOW()
+            WHERE id = :sponsor_id
+            """
+        ),
+        {
+            "sponsor_id": int(row["id"]),
+            "token_hash": token_hash,
+            "expires_at": expires_at,
+        },
+    )
+    _log_audit_event(
+        db,
+        project_id=None,
+        entity_type="sponsor_account",
+        entity_id=int(row["id"]),
+        action="sponsor_password_reset_requested",
+        actor=str(row.get("email") or "").strip(),
+        details={"expires_at": expires_at.isoformat()},
+    )
+    db.commit()
+    reset_url = _build_sponsor_public_reset_password_url(token, request=request)
+    if reset_url:
+        try:
+            _send_sponsor_password_reset_email(
+                to_email=str(row.get("email") or "").strip(),
+                full_name=str(row.get("full_name") or ""),
+                reset_url=reset_url,
+                expires_at=expires_at,
+            )
+        except Exception:
+            pass
+    return {"ok": True, "message": "If that sponsor email exists, a reset link has been sent."}
+
+
+@router.post("/sponsor-auth/reset-password")
+def sponsor_auth_reset_password(payload: SponsorResetPasswordPayload, db: Session = Depends(get_db)):
+    token = str(payload.token or "").strip()
+    if len(token) < 20:
+        raise HTTPException(status_code=400, detail="Invalid reset token")
+    new_password = str(payload.new_password or "")
+    if len(new_password) < 8:
+        raise HTTPException(status_code=400, detail="Password must be at least 8 characters")
+    token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
+    row = db.execute(
+        text(
+            """
+            SELECT id, email
+            FROM green_sponsor_accounts
+            WHERE password_reset_token_hash = :token_hash
+              AND password_reset_token_expires_at IS NOT NULL
+              AND password_reset_token_expires_at >= NOW()
+            LIMIT 1
+            """
+        ),
+        {"token_hash": token_hash},
+    ).mappings().first()
+    if not row:
+        raise HTTPException(status_code=400, detail="This reset link is invalid or has expired")
+    db.execute(
+        text(
+            """
+            UPDATE green_sponsor_accounts
+            SET password_hash = :password_hash,
+                password_reset_token_hash = NULL,
+                password_reset_token_expires_at = NULL,
+                updated_at = NOW()
+            WHERE id = :sponsor_id
+            """
+        ),
+        {
+            "sponsor_id": int(row["id"]),
+            "password_hash": _hash_password_value(new_password),
+        },
+    )
+    _log_audit_event(
+        db,
+        project_id=None,
+        entity_type="sponsor_account",
+        entity_id=int(row["id"]),
+        action="sponsor_password_reset_completed",
+        actor=str(row.get("email") or "").strip(),
+        details={},
+    )
+    db.commit()
+    return {"ok": True, "message": "Password updated successfully. You can sign in now."}
+
+
 @router.post("/sponsor/orders")
 def create_sponsor_order(
     payload: SponsorOrderPayload,
@@ -8070,6 +8636,10 @@ def create_sponsor_order(
     max_per_order = max(1, int(project.get("sponsor_max_per_order") or 100))
     if quantity > max_per_order:
         raise HTTPException(status_code=400, detail=f"Maximum trees per order is {max_per_order}")
+    if not bool(payload.accepted_terms):
+        raise HTTPException(status_code=400, detail="You must accept the sponsor terms before checkout")
+    if not bool(payload.accepted_policy):
+        raise HTTPException(status_code=400, detail="You must accept the privacy policy before checkout")
     usage = _project_sponsorship_usage(db, int(project["id"]))
     capacity = project.get("sponsor_capacity")
     if capacity is not None and int(usage["reserved_slots"]) + quantity > int(capacity):
@@ -8095,6 +8665,8 @@ def create_sponsor_order(
     dedication_type = _normalize_sponsor_dedication_type(payload.dedication_type)
     dedication_name = _clean_text(payload.dedication_name, 160)
     dedication_message = _clean_text(payload.dedication_message, 500)
+    consent_version = _clean_text(payload.consent_version, 80) or SPONSOR_TERMS_VERSION
+    consent_ip = _request_ip_address(request)
     order_uid = _generate_prefixed_uid("ORD")
     amount_total = round(amount_per_tree * quantity, 2)
     payment_session: dict | None = None
@@ -8108,14 +8680,16 @@ def create_sponsor_order(
                     payment_method, payment_reference, payment_status, order_status,
                     payment_provider, payment_link, payment_gateway_reference, payment_gateway_status, payment_gateway_payload,
                     payment_proof_url, payment_proof_urls,
-                    dedication_type, dedication_name, dedication_message, purchaser_note
+                    dedication_type, dedication_name, dedication_message, purchaser_note,
+                    accepted_terms, accepted_policy, consent_version, consent_ip
                 )
                 VALUES (
                     :order_uid, :sponsor_account_id, :project_id, :quantity, :amount_per_tree, :amount_total, :currency,
                     :payment_method, :payment_reference, :payment_status, :order_status,
                     :payment_provider, :payment_link, :payment_gateway_reference, :payment_gateway_status, CAST(:payment_gateway_payload AS JSONB),
                     :payment_proof_url, CAST(:payment_proof_urls AS JSONB),
-                    :dedication_type, :dedication_name, :dedication_message, :purchaser_note
+                    :dedication_type, :dedication_name, :dedication_message, :purchaser_note,
+                    :accepted_terms, :accepted_policy, :consent_version, :consent_ip
                 )
                 RETURNING id, order_uid
                 """
@@ -8143,6 +8717,10 @@ def create_sponsor_order(
                 "dedication_name": dedication_name,
                 "dedication_message": dedication_message,
                 "purchaser_note": _clean_text(payload.purchaser_note, 500),
+                "accepted_terms": True,
+                "accepted_policy": True,
+                "consent_version": consent_version,
+                "consent_ip": consent_ip,
             },
         ).mappings().first()
         order_id = int(order_row["id"])
@@ -8218,6 +8796,7 @@ def create_sponsor_order(
                 "payment_status": payment_status,
                 "amount_total": amount_total,
                 "payment_method": payment_method,
+                "consent_version": consent_version,
             },
         )
         db.commit()
@@ -8227,6 +8806,10 @@ def create_sponsor_order(
     except Exception:
         db.rollback()
         raise
+    try:
+        _notify_sponsor_order_created_email(db, order_id, request=request)
+    except Exception:
+        db.rollback()
     return {
         "ok": True,
         "order_id": order_id,
@@ -8268,9 +8851,10 @@ def get_sponsor_order_payment_status(
     if not row:
         raise HTTPException(status_code=404, detail="Sponsorship order not found")
     item = dict(row)
+    sync_result: dict | None = None
     if refresh and _normalize_name(item.get("payment_method")) == "flutterwave_standard" and item.get("payment_status") != "verified":
         try:
-            _sync_sponsorship_order_flutterwave_payment(
+            sync_result = _sync_sponsorship_order_flutterwave_payment(
                 db,
                 item,
                 transaction_id=int(item.get("payment_gateway_transaction_id") or 0) or None,
@@ -8278,6 +8862,11 @@ def get_sponsor_order_payment_status(
                 actor="sponsor_app",
             )
             db.commit()
+            if bool((sync_result or {}).get("should_send_payment_confirmation")):
+                try:
+                    _notify_sponsor_payment_confirmed_email(db, int(item.get("id") or 0))
+                except Exception:
+                    db.rollback()
         except HTTPException:
             db.rollback()
         row = db.execute(
@@ -8370,6 +8959,11 @@ def sponsor_flutterwave_return(
                 review_notes="Verified after Flutterwave redirect",
             )
             db.commit()
+            if bool(result.get("should_send_payment_confirmation")):
+                try:
+                    _notify_sponsor_payment_confirmed_email(db, int(order.get("id") or 0))
+                except Exception:
+                    db.rollback()
             payment_state = "verified" if result.get("verified") else ("failed" if result.get("gateway_status") in {"failed", "cancelled", "canceled"} else "pending")
             message = str(result.get("message") or message)
         except HTTPException:
@@ -8439,6 +9033,11 @@ async def sponsor_flutterwave_webhook(request: Request, db: Session = Depends(ge
             details={"tx_ref": tx_ref, "verified": bool(result.get("verified")), "gateway_status": result.get("gateway_status")},
         )
         db.commit()
+        if bool(result.get("should_send_payment_confirmation")):
+            try:
+                _notify_sponsor_payment_confirmed_email(db, int(order.get("id") or 0), request=request)
+            except Exception:
+                db.rollback()
         return {"ok": True, "verified": bool(result.get("verified"))}
     except HTTPException as exc:
         db.rollback()
@@ -8655,6 +9254,10 @@ def _hydrate_sponsor_tree_story_item(item: dict, db: Session, request: Request |
     timeline = _load_sponsor_tree_story_timeline(db, int(item["tree_id"]), request=request) if item.get("tree_id") else []
     gallery_urls: list[str] = []
     seen: set[str] = set()
+    tree_photo_proxy_url = _build_tree_best_photo_url(item.get("tree_id"), request=request)
+    if tree_photo_proxy_url:
+        seen.add(tree_photo_proxy_url)
+        gallery_urls.append(tree_photo_proxy_url)
     for candidate in root_photo_urls:
         public_url = _build_public_asset_url(candidate, request=request)
         if public_url and public_url not in seen:
@@ -8668,7 +9271,7 @@ def _hydrate_sponsor_tree_story_item(item: dict, db: Session, request: Request |
                 gallery_urls.append(public_url)
 
     item["photo_urls"] = gallery_urls
-    item["photo_url"] = gallery_urls[0] if gallery_urls else _build_public_asset_url(primary_root_photo, request=request)
+    item["photo_url"] = tree_photo_proxy_url or (gallery_urls[0] if gallery_urls else _build_public_asset_url(primary_root_photo, request=request))
     item["timeline"] = timeline
     item["maps_url"] = _build_google_maps_direction_url(item.get("lat"), item.get("lng"))
     item["public_story_url"] = _build_sponsor_public_story_url(item.get("unit_uid"), request=request)
@@ -8689,6 +9292,7 @@ def _render_public_sponsor_tree_story_html(item: dict) -> str:
     status_label = html.escape(str(item.get("tree_status") or item.get("sponsorship_status") or "active").replace("_", " ").title())
     planting_date = html.escape(str(item.get("planting_date") or "-"))
     photo_url = str(item.get("photo_url") or "").strip()
+    safe_photo_url = html.escape(photo_url, quote=True)
     public_certificate_url = html.escape(str(item.get("public_certificate_url") or "").strip())
     public_story_url = html.escape(str(item.get("public_story_url") or "").strip())
     maps_url = html.escape(str(item.get("maps_url") or "").strip())
@@ -8757,7 +9361,7 @@ def _render_public_sponsor_tree_story_html(item: dict) -> str:
             <a class="ghost-button" href="{maps_url}" target="_blank" rel="noopener noreferrer">Find this tree in Google Maps</a>
           </div>
           <div id="story-map" class="map-box"></div>
-          <p class="coords">Latitude {lat:.6f} · Longitude {lng:.6f}</p>
+          <p class="coords">Latitude {lat:.6f} &middot; Longitude {lng:.6f}</p>
         </section>
         <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
         <script>
@@ -8790,8 +9394,8 @@ def _render_public_sponsor_tree_story_html(item: dict) -> str:
         </section>
         """
 
-    og_image = f'<meta property="og:image" content="{html.escape(photo_url)}" /><meta name="twitter:image" content="{html.escape(photo_url)}" />' if photo_url else ""
-    hero_style = f' style="background-image:url(\'{html.escape(photo_url)}\')"' if photo_url else ""
+    og_image = f'<meta property="og:image" content="{safe_photo_url}" /><meta name="twitter:image" content="{safe_photo_url}" />' if photo_url else ""
+    hero_style = f' style="background-image:url(\'{safe_photo_url}\')"' if photo_url else ""
     return f"""<!doctype html>
 <html lang="en">
   <head>
@@ -9072,9 +9676,9 @@ def _render_public_sponsor_tree_story_html(item: dict) -> str:
             <p>This page shows the real map location, approved field photos, care history, and certificate for the sponsored tree linked to {sponsor_name}.</p>
           </div>
           <div class="chip-row">
-            <div class="chip">Status · {status_label}</div>
-            <div class="chip">Species · {species}</div>
-            <div class="chip">Project · {project_name}</div>
+            <div class="chip">Status &middot; {status_label}</div>
+            <div class="chip">Species &middot; {species}</div>
+            <div class="chip">Project &middot; {project_name}</div>
           </div>
           <div class="action-row">
             <a class="action-button" href="{public_certificate_url}" target="_blank" rel="noopener noreferrer">Open digital certificate</a>
@@ -9153,6 +9757,369 @@ def _render_public_sponsor_tree_story_html(item: dict) -> str:
         </section>
       </div>
     </main>
+  </body>
+</html>"""
+
+
+def _render_sponsor_public_terms_html(request: Request | None = None) -> str:
+    privacy_url = html.escape(_build_public_privacy_policy_url(), quote=True)
+    support_email = html.escape(str(os.getenv("LANDCHECK_SUPPORT_EMAIL") or os.getenv("SMTP_FROM_EMAIL") or "support@landcheck.online").strip())
+    terms_version = html.escape(SPONSOR_TERMS_VERSION)
+    effective_date = html.escape(SPONSOR_TERMS_EFFECTIVE_DATE)
+    return f"""<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>LandCheck Green Sponsor Terms</title>
+    <meta name="description" content="LandCheck Green public sponsor terms, checkout conditions, privacy references, and supporter responsibilities." />
+    <style>
+      :root {{
+        --bg: #edf8ee;
+        --panel: rgba(255,255,255,0.96);
+        --border: rgba(13, 78, 35, 0.10);
+        --text: #163424;
+        --muted: #53705f;
+        --emerald: #0f6f39;
+        --emerald-dark: #0b4f28;
+        --shadow: 0 22px 48px rgba(12, 61, 31, 0.10);
+      }}
+      * {{ box-sizing: border-box; }}
+      body {{
+        margin: 0;
+        font-family: Inter, "Segoe UI", system-ui, sans-serif;
+        color: var(--text);
+        background:
+          radial-gradient(circle at top right, rgba(126,224,142,0.24), transparent 24rem),
+          linear-gradient(180deg, #f9fdf9 0%, var(--bg) 100%);
+      }}
+      .shell {{ max-width: 980px; margin: 0 auto; padding: 26px 18px 54px; }}
+      .hero {{
+        border-radius: 30px;
+        overflow: hidden;
+        background: linear-gradient(140deg, rgba(7,48,21,0.95), rgba(15,111,57,0.88));
+        box-shadow: var(--shadow);
+        color: #fff;
+        padding: 30px 26px;
+      }}
+      .hero p, .hero h1 {{ margin: 0; }}
+      .eyebrow {{
+        color: rgba(255,255,255,0.74);
+        font-size: 12px;
+        font-weight: 800;
+        letter-spacing: 0.14em;
+        text-transform: uppercase;
+      }}
+      .hero h1 {{
+        margin-top: 10px;
+        font-size: clamp(2rem, 4vw, 3.2rem);
+        line-height: 1.05;
+        letter-spacing: -0.04em;
+      }}
+      .hero .meta {{
+        margin-top: 12px;
+        color: rgba(255,255,255,0.88);
+        font-size: 0.98rem;
+        line-height: 1.7;
+      }}
+      .stack {{ display: grid; gap: 18px; margin-top: 18px; }}
+      .panel {{
+        background: var(--panel);
+        border: 1px solid var(--border);
+        border-radius: 24px;
+        box-shadow: var(--shadow);
+        padding: 22px;
+      }}
+      .panel h2 {{
+        margin: 0 0 8px;
+        font-size: 1.3rem;
+        letter-spacing: -0.03em;
+      }}
+      .panel p {{
+        margin: 0;
+        color: var(--muted);
+        line-height: 1.75;
+      }}
+      .panel ul {{
+        margin: 12px 0 0;
+        padding-left: 18px;
+        color: var(--muted);
+        line-height: 1.75;
+      }}
+      .meta-grid {{
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+        gap: 14px;
+      }}
+      .meta-card {{
+        border-radius: 18px;
+        border: 1px solid var(--border);
+        background: rgba(246,251,247,0.96);
+        padding: 16px 18px;
+      }}
+      .meta-card strong {{
+        display: block;
+        margin-top: 8px;
+        font-size: 1rem;
+        color: var(--emerald-dark);
+      }}
+      a {{ color: var(--emerald); font-weight: 700; text-decoration: none; }}
+      @media (max-width: 720px) {{
+        .shell {{ padding: 16px 14px 40px; }}
+        .hero {{ padding: 24px 20px; }}
+      }}
+    </style>
+  </head>
+  <body>
+    <main class="shell">
+      <section class="hero">
+        <p class="eyebrow">LandCheck Green public sponsor route</p>
+        <h1>Public Sponsor Terms and Checkout Conditions</h1>
+        <p class="meta">Version {terms_version} &middot; Effective {effective_date}. These terms apply when a sponsor account uses the public LandCheck Green route to reserve trees, pay online, and receive verified map, photo, certificate, and maintenance updates.</p>
+      </section>
+      <div class="stack">
+        <section class="panel">
+          <h2>1. What this service covers</h2>
+          <p>LandCheck Green provides a public sponsorship route where individuals and organizations can support approved tree projects, complete secure checkout, and later view verified field evidence linked to the sponsored trees. Tree allocation happens only inside projects that an administrator has opened for public sponsorship.</p>
+        </section>
+        <section class="panel">
+          <h2>2. Checkout, pricing, and tree allocation</h2>
+          <ul>
+            <li>Prices shown at checkout are project-specific and charged per tree or per reserved sponsorship unit.</li>
+            <li>A sponsorship becomes active only after payment is confirmed by the payment provider or by LandCheck review where manual verification is used.</li>
+            <li>Tree assignment may happen after payment confirmation. Until a verified tree is linked, the order remains a reserved sponsorship commitment for that project.</li>
+            <li>Public sponsor projects may have limited capacity. LandCheck may stop or limit checkout when a project reaches its published capacity.</li>
+          </ul>
+        </section>
+        <section class="panel">
+          <h2>3. Evidence, certificates, and impact records</h2>
+          <ul>
+            <li>Map points, photos, maintenance history, and certificates depend on reviewed field submissions and may update over time as teams work on the project.</li>
+            <li>Photos and coordinates are operational evidence. They are not a land title document, environmental credit instrument, or guarantee of future survival beyond the evidence shown.</li>
+            <li>Carbon and environmental impact values are indicative project-support metrics generated from LandCheck models and verified field records. They should not be treated as regulated carbon credits unless separately stated in writing.</li>
+          </ul>
+        </section>
+        <section class="panel">
+          <h2>4. Refunds, substitutions, and project changes</h2>
+          <ul>
+            <li>If a project cannot allocate all paid sponsorship units, LandCheck may re-link the units to eligible replacement trees within the same approved project context or offer an administrative remedy consistent with the payment status and project record.</li>
+            <li>Refund handling depends on whether payment has cleared, whether trees have already been allocated, and whether verified field work has started. The team may review each case before a final decision is issued.</li>
+            <li>LandCheck may correct obvious pricing, allocation, duplicate-order, or payment reconciliation errors where necessary for accounting accuracy.</li>
+          </ul>
+        </section>
+        <section class="panel">
+          <h2>5. Privacy, payments, and Nigerian compliance</h2>
+          <ul>
+            <li>LandCheck processes sponsor account and checkout information in line with its privacy policy and operational privacy controls. Review the privacy policy here: <a href="{privacy_url}" target="_blank" rel="noopener noreferrer">{privacy_url}</a>.</li>
+            <li>Public sponsor checkout records may include account details, project choices, payment status, IP address, and field evidence linked to funded trees for service delivery, audit, fraud prevention, and support handling.</li>
+            <li>These terms are designed to align with LandCheck operational data handling under the Nigeria Data Protection Act 2023 and fair information handling expectations for platform users.</li>
+            <li>Consumer-facing disclosures, price display, and complaint handling are intended to remain consistent with basic transparency and redress expectations under Nigeria’s consumer protection framework.</li>
+            <li>Online payments are processed through integrated third-party payment providers. LandCheck does not ask sponsors to bypass the secure payment flow for card payments inside the public route.</li>
+          </ul>
+        </section>
+        <section class="panel">
+          <h2>6. Sponsor responsibilities</h2>
+          <ul>
+            <li>Use accurate identity and contact details when creating a sponsor account or placing an order.</li>
+            <li>Do not upload unlawful, abusive, fraudulent, or misleading dedication text or payment information.</li>
+            <li>Keep your password private and notify LandCheck promptly if you suspect unauthorized use of your sponsor account.</li>
+          </ul>
+        </section>
+        <section class="panel">
+          <h2>7. Governing law and support</h2>
+          <p>These sponsor-route terms are governed by the laws of the Federal Republic of Nigeria. Questions, complaints, or support requests can be sent to <a href="mailto:{support_email}">{support_email}</a>. LandCheck may update these terms from time to time, and the version accepted at checkout is recorded with the order.</p>
+        </section>
+        <section class="panel">
+          <h2>Quick reference</h2>
+          <div class="meta-grid">
+            <article class="meta-card">
+              <span class="eyebrow" style="color:#53705f;">Terms version</span>
+              <strong>{terms_version}</strong>
+            </article>
+            <article class="meta-card">
+              <span class="eyebrow" style="color:#53705f;">Effective date</span>
+              <strong>{effective_date}</strong>
+            </article>
+            <article class="meta-card">
+              <span class="eyebrow" style="color:#53705f;">Privacy policy</span>
+              <strong><a href="{privacy_url}" target="_blank" rel="noopener noreferrer">Open privacy policy</a></strong>
+            </article>
+          </div>
+        </section>
+      </div>
+    </main>
+  </body>
+</html>"""
+
+
+def _render_sponsor_public_reset_password_html(token: str) -> str:
+    safe_token = html.escape(str(token or "").strip(), quote=True)
+    return f"""<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Reset Sponsor Password</title>
+    <style>
+      body {{
+        margin: 0;
+        font-family: Inter, "Segoe UI", system-ui, sans-serif;
+        background: linear-gradient(180deg, #f8fcf8 0%, #e9f6eb 100%);
+        color: #173624;
+      }}
+      .shell {{
+        min-height: 100vh;
+        display: grid;
+        place-items: center;
+        padding: 22px;
+      }}
+      .card {{
+        width: min(100%, 440px);
+        background: rgba(255,255,255,0.97);
+        border: 1px solid rgba(15,111,57,0.10);
+        border-radius: 24px;
+        box-shadow: 0 20px 48px rgba(10, 52, 28, 0.12);
+        overflow: hidden;
+      }}
+      .hero {{
+        padding: 24px 24px 20px;
+        background: linear-gradient(145deg,#0c5f2e 0%,#1b8245 100%);
+        color: #fff;
+      }}
+      .hero h1, .hero p {{ margin: 0; }}
+      .hero h1 {{
+        margin-top: 10px;
+        font-size: 1.9rem;
+        line-height: 1.1;
+      }}
+      .hero p {{
+        margin-top: 8px;
+        color: rgba(255,255,255,0.86);
+        line-height: 1.65;
+      }}
+      .body {{ padding: 22px 24px 26px; }}
+      label {{
+        display: block;
+        margin-bottom: 8px;
+        font-size: 0.92rem;
+        font-weight: 700;
+        color: #1a3d28;
+      }}
+      input {{
+        width: 100%;
+        min-height: 54px;
+        padding: 0 16px;
+        border-radius: 16px;
+        border: 1px solid rgba(15,111,57,0.16);
+        background: #fbfefb;
+        font: inherit;
+        color: #173624;
+        margin-bottom: 14px;
+      }}
+      button {{
+        width: 100%;
+        min-height: 54px;
+        border: 0;
+        border-radius: 16px;
+        background: #0f6f39;
+        color: #fff;
+        font: inherit;
+        font-weight: 800;
+        cursor: pointer;
+      }}
+      button:disabled {{ opacity: 0.6; cursor: wait; }}
+      .status {{
+        margin-top: 14px;
+        padding: 14px 16px;
+        border-radius: 14px;
+        background: #f4faf5;
+        border: 1px solid rgba(15,111,57,0.10);
+        color: #486652;
+        line-height: 1.65;
+        display: none;
+      }}
+      .status.error {{
+        background: #fff5f5;
+        border-color: rgba(185, 28, 28, 0.12);
+        color: #9f1d1d;
+      }}
+    </style>
+  </head>
+  <body>
+    <main class="shell">
+      <section class="card">
+        <div class="hero">
+          <div style="font-size:12px;font-weight:800;letter-spacing:0.14em;text-transform:uppercase;color:#d8f7df;">LandCheck Green sponsor route</div>
+          <h1>Reset your password</h1>
+          <p>Choose a new password for your sponsor account. After saving it, you can sign back in from the app.</p>
+        </div>
+        <div class="body">
+          <form id="reset-form">
+            <input id="token" type="hidden" value="{safe_token}" />
+            <label for="password">New password</label>
+            <input id="password" type="password" autocomplete="new-password" minlength="8" placeholder="Enter new password" required />
+            <label for="confirm-password">Confirm new password</label>
+            <input id="confirm-password" type="password" autocomplete="new-password" minlength="8" placeholder="Repeat new password" required />
+            <button id="submit-btn" type="submit">Save new password</button>
+            <div id="status" class="status"></div>
+          </form>
+        </div>
+      </section>
+    </main>
+    <script>
+      const form = document.getElementById('reset-form');
+      const statusEl = document.getElementById('status');
+      const submitBtn = document.getElementById('submit-btn');
+      form.addEventListener('submit', async (event) => {{
+        event.preventDefault();
+        const token = document.getElementById('token').value.trim();
+        const password = document.getElementById('password').value;
+        const confirmPassword = document.getElementById('confirm-password').value;
+        statusEl.style.display = 'none';
+        statusEl.className = 'status';
+        if (!token) {{
+          statusEl.textContent = 'This reset link is invalid or missing a token.';
+          statusEl.classList.add('error');
+          statusEl.style.display = 'block';
+          return;
+        }}
+        if (password.length < 8) {{
+          statusEl.textContent = 'Password must be at least 8 characters.';
+          statusEl.classList.add('error');
+          statusEl.style.display = 'block';
+          return;
+        }}
+        if (password !== confirmPassword) {{
+          statusEl.textContent = 'The two password entries do not match.';
+          statusEl.classList.add('error');
+          statusEl.style.display = 'block';
+          return;
+        }}
+        submitBtn.disabled = true;
+        submitBtn.textContent = 'Saving...';
+        try {{
+          const response = await fetch('/green/sponsor-auth/reset-password', {{
+            method: 'POST',
+            headers: {{ 'Content-Type': 'application/json' }},
+            body: JSON.stringify({{ token, new_password: password }}),
+          }});
+          const payload = await response.json().catch(() => ({{}}));
+          if (!response.ok) {{
+            throw new Error(payload.detail || 'Could not reset the password.');
+          }}
+          statusEl.textContent = payload.message || 'Password updated successfully. You can return to the app and sign in now.';
+          statusEl.style.display = 'block';
+          form.reset();
+        }} catch (error) {{
+          statusEl.textContent = error.message || 'Could not reset the password.';
+          statusEl.classList.add('error');
+          statusEl.style.display = 'block';
+        }} finally {{
+          submitBtn.disabled = false;
+          submitBtn.textContent = 'Save new password';
+        }}
+      }});
+    </script>
   </body>
 </html>"""
 
@@ -9298,6 +10265,16 @@ def public_sponsor_tree_certificate(unit_uid: str, request: Request, db: Session
         media_type="application/pdf",
         headers={"Content-Disposition": f'inline; filename=\"sponsor_tree_certificate_{safe_uid}.pdf\"'},
     )
+
+
+@router.get("/sponsor/public/terms", response_class=HTMLResponse)
+def sponsor_public_terms(request: Request):
+    return HTMLResponse(content=_render_sponsor_public_terms_html(request=request))
+
+
+@router.get("/sponsor/public/reset-password", response_class=HTMLResponse)
+def sponsor_public_reset_password(token: str = Query(default="")):
+    return HTMLResponse(content=_render_sponsor_public_reset_password_html(token))
 
 
 @router.get("/agent-payouts/banks")
@@ -9722,6 +10699,7 @@ def review_admin_sponsorship_order_payment(
     if not existing:
         raise HTTPException(status_code=404, detail="Sponsorship order not found")
     next_payment_status = _normalize_sponsor_payment_status(payload.payment_status)
+    send_payment_confirmation = next_payment_status == "verified" and _normalize_sponsor_payment_status(existing.get("payment_status")) != "verified"
     db.execute(
         text(
             """
@@ -9792,6 +10770,11 @@ def review_admin_sponsorship_order_payment(
         details={"payment_status": next_payment_status, "review_notes": _clean_text(payload.review_notes, 500)},
     )
     db.commit()
+    if send_payment_confirmation:
+        try:
+            _notify_sponsor_payment_confirmed_email(db, int(order_id))
+        except Exception:
+            db.rollback()
     return {"ok": True, "order_id": int(order_id), "payment_status": next_payment_status}
 
 
