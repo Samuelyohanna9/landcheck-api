@@ -1928,15 +1928,17 @@ def _call_flutterwave_api(
     method: str,
     path: str,
     payload: dict | None = None,
+    json: dict | None = None,
     params: dict | None = None,
     timeout: int = 30,
 ) -> dict:
+    request_payload = json if isinstance(json, dict) else payload
     try:
         response = requests.request(
             method.upper(),
             f"{FLUTTERWAVE_API_BASE_URL}{path}",
             headers=_flutterwave_headers(),
-            json=payload,
+            json=request_payload,
             params=params,
             timeout=timeout,
         )
