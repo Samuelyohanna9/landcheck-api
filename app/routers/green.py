@@ -9190,10 +9190,11 @@ def get_sponsor_tree_detail(unit_id: int, request: Request, sponsor_id: int = Qu
 @router.get("/sponsor/trees/{unit_id}/certificate/pdf")
 def export_sponsor_tree_certificate(
     unit_id: int,
+    request: Request,
     sponsor_id: int = Query(...),
-    request: Request | None = None,
     db: Session = Depends(get_db),
 ):
+    
     row = db.execute(
         text(
             """
