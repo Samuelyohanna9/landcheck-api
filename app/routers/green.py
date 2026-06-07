@@ -8006,57 +8006,290 @@ def _link_tree_to_pending_sponsorship_unit(db: Session, project_id: int, tree_id
     ).mappings().first()
     if updated:
         _refresh_sponsorship_order_status(db, int(updated["order_id"]))
-        try:
-            info = db.execute(
-                text(
-                    """
-                    SELECT sa.id AS sponsor_id, u.unit_uid, p.name AS project_name, t.species, t.project_tree_no
-                    FROM green_sponsorship_units u
-                    JOIN green_sponsor_accounts sa ON sa.id = u.sponsor_account_id
-                    JOIN tree_projects p ON p.id = u.project_id
-                    JOIN trees t ON t.id = u.tree_id
-                    WHERE u.id = :unit_id
-                    """
-                ),
-                {"unit_id": int(updated["id"])},
-            ).mappings().first()
-            if info:
-                tree_num = f"Tree #{info['project_tree_no']}" if info['project_tree_no'] else f"Tree ID {tree_id}"
-                title = "New Tree Linked!"
-                body = f"Your sponsored {info['species']} ({tree_num}) in {info['project_name']} has been verified and linked to your account!"
-                tokens = db.execute(
-                    text(
-                        """
-                        SELECT expo_push_token
-                        FROM green_sponsor_push_tokens
-                        WHERE sponsor_account_id = :sponsor_id
-                          AND COALESCE(is_active, TRUE) = TRUE
-                        """
-                    ),
-                    {"sponsor_id": int(info["sponsor_id"])},
-                ).scalars().all()
-                if tokens:
-                    messages = [
-                        {
-                            "to": token,
-                            "title": title,
-                            "body": body,
-                            "sound": "default",
-                            "priority": "high",
-                            "channelId": "sponsor-alerts",
-                            "data": {
-                                "unit_uid": info["unit_uid"],
-                                "tree_id": tree_id,
-                                "project_name": info["project_name"],
-                            },
-                        }
-                        for token in tokens
-                    ]
-                    _send_expo_push_messages(messages)
-        except Exception:
-            pass
+        _notify_sponsor_tree_planted(db, int(updated["id"]))
         return dict(updated)
     return None
+
+
+def _notify_sponsor_tree_planted(db: Session, unit_id: int, request: Request | None = None):
+    try:
+        row = db.execute(
+            text(
+                """
+                SELECT sa.id AS sponsor_id, sa.full_name AS sponsor_name, sa.email AS sponsor_email,
+                       u.unit_uid, p.name AS project_name, p.location_text AS project_location_text,
+                       t.species, t.project_tree_no, t.id AS tree_id
+                FROM green_sponsorship_units u
+                JOIN green_sponsor_accounts sa ON sa.id = u.sponsor_account_id
+                JOIN tree_projects p ON p.id = u.project_id
+                JOIN trees t ON t.id = u.tree_id
+                WHERE u.id = :unit_id
+                """
+            ),
+            {"unit_id": int(unit_id)},
+        ).mappings().first()
+        if not row:
+            return
+        
+        sponsor_id = int(row["sponsor_id"])
+        sponsor_name = str(row["sponsor_name"] or "").strip() or "Sponsor"
+        sponsor_email = str(row["sponsor_email"] or "").strip()
+        unit_uid = str(row["unit_uid"] or "").strip()
+        project_name = str(row["project_name"] or "LandCheck Green Project").strip()
+        location_text = str(row["project_location_text"] or "").strip()
+        species = str(row["species"] or "Verified Tree").strip()
+        tree_id = int(row["tree_id"])
+        tree_num = f"Tree #{row['project_tree_no']}" if row['project_tree_no'] else f"Tree ID {tree_id}"
+        
+        # 1. Send Push Notification
+        title = "New Tree Linked!"
+        body = f"Your sponsored {species} ({tree_num}) in {project_name} has been verified and linked to your account! You can view, download, and share your digital certificate under the 'My Trees' tab in the LC Green app."
+        
+        tokens = db.execute(
+            text(
+                """
+                SELECT expo_push_token
+                FROM green_sponsor_push_tokens
+                WHERE sponsor_account_id = :sponsor_id
+                AND COALESCE(is_active, TRUE) = TRUE
+                """
+            ),
+            {"sponsor_id": sponsor_id},
+        ).scalars().all()
+        
+        if tokens:
+            messages = [
+                {
+                    "to": token,
+                    "title": title,
+                    "body": body,
+                    "sound": "default",
+                    "priority": "high",
+                    "channelId": "sponsor-alerts",
+                    "data": {
+                        "unit_uid": unit_uid,
+                        "tree_id": tree_id,
+                        "project_name": project_name,
+                    },
+                }
+                for token in tokens
+            ]
+            _send_expo_push_messages(messages)
+            
+        # 2. Send Email
+        if sponsor_email:
+            base_url = _build_public_api_base_url(request) or "https://api.landcheck.online"
+            public_story_url = f"{base_url}/green/sponsor/public/trees/{quote(unit_uid)}"
+            
+            email_subject = "Your LandCheck Green tree is verified and linked!"
+            email_text = (
+                f"Hello {sponsor_name},\n\n"
+                "A new tree has been verified and linked to your sponsorship account!\n\n"
+                f"Project: {project_name}\n"
+                f"Location: {location_text or '-'}\n"
+                f"Tree species: {species}\n"
+                f"Tree number: {tree_num}\n\n"
+                "You can view, download, and share your digital certificate under the 'My Trees' tab in the LC Green mobile app. "
+                "Open the app, navigate to the 'My Trees' tab, and select this tree to view details.\n\n"
+                f"View your public tree story: {public_story_url}\n\n"
+                "Regards,\n"
+                "LandCheck Green"
+            )
+            
+            email_html = f"""
+            <html>
+            <body style="margin:0;padding:28px;background:#eef8ef;font-family:Arial,sans-serif;color:#173624;">
+            <div style="max-width:680px;margin:0 auto;background:#ffffff;border:1px solid #d8ebdd;border-radius:20px;overflow:hidden;">
+            <div style="padding:28px;background:linear-gradient(145deg,#0c5f2e 0%,#1d8a49 100%);color:#ffffff;">
+            <div style="font-size:12px;font-weight:800;letter-spacing:0.16em;text-transform:uppercase;color:#daf7df;">Planting Update</div>
+            <div style="margin-top:10px;font-size:28px;font-weight:800;line-height:1.15;">Your Tree is Planted & Linked!</div>
+            <div style="margin-top:10px;font-size:15px;line-height:1.7;color:#effcf1;">A verified tree has been successfully linked to your sponsorship account.</div>
+            </div>
+            <div style="padding:26px 28px 30px;">
+            <p style="margin:0 0 14px;font-size:15px;line-height:1.7;">Hello {html.escape(sponsor_name)},</p>
+            <div style="border:1px solid #dbece0;border-radius:16px;background:#f8fcf9;padding:18px;margin:0 0 18px;">
+            <div style="font-size:14px;font-weight:800;color:#163826;margin:0 0 10px;">Tree Details</div>
+            <div style="font-size:15px;line-height:1.8;color:#345542;">
+            <div><strong>Project:</strong> {html.escape(project_name)}</div>
+            <div><strong>Location:</strong> {html.escape(location_text or "-")}</div>
+            <div><strong>Tree Species:</strong> {html.escape(species)}</div>
+            <div><strong>Tree Identifier:</strong> {html.escape(tree_num)}</div>
+            </div>
+            </div>
+            <div style="border:1px solid #dbece0;border-radius:16px;background:#f8fcf9;padding:18px;margin:0 0 18px;">
+            <div style="font-size:14px;font-weight:800;color:#163826;margin:0 0 10px;">Your Digital Certificate</div>
+            <p style="margin:0;font-size:14px;line-height:1.7;color:#345542;">
+            You can view, download, and share your digital certificate inside the <strong>LC Green</strong> mobile app under the <strong>"My Trees"</strong> tab. Simply tap on the tree card to access your certificate.
+            </p>
+            </div>
+            <p style="margin:18px 0;font-size:14px;line-height:1.7;color:#4b6857;">You can also check and share the public story webpage of your tree using the button below:</p>
+            <a href="{html.escape(public_story_url, quote=True)}" style="display:inline-block;padding:14px 22px;border-radius:999px;background:#0f6f39;color:#ffffff;font-size:15px;font-weight:800;text-decoration:none;">View Public Tree Story</a>
+            <p style="margin:24px 0 0;font-size:13px;line-height:1.7;color:#4b6857;">Regards,<br><strong>LandCheck Green</strong></p>
+            </div>
+            </div>
+            </body>
+            </html>
+            """
+            
+            _send_html_email(
+                to_email=sponsor_email,
+                subject=email_subject,
+                text_body=email_text,
+                html_body=email_html
+            )
+    except Exception:
+        pass
+
+
+def _notify_sponsor_tree_maintenance(db: Session, tree_id: int, task_row: dict, request: Request | None = None):
+    try:
+        sponsors_info = db.execute(
+            text(
+                """
+                SELECT sa.id AS sponsor_id, sa.full_name AS sponsor_name, sa.email AS sponsor_email,
+                       u.unit_uid, p.name AS project_name, p.location_text AS project_location_text,
+                       t.species, t.project_tree_no
+                FROM green_sponsorship_units u
+                JOIN green_sponsor_accounts sa ON sa.id = u.sponsor_account_id
+                JOIN tree_projects p ON p.id = u.project_id
+                JOIN trees t ON t.id = u.tree_id
+                WHERE u.tree_id = :tree_id
+                """
+            ),
+            {"tree_id": int(tree_id)},
+        ).mappings().all()
+        
+        if not sponsors_info:
+            return
+            
+        task_type_raw = str(task_row.get("task_type") or "maintenance")
+        activity_name = task_type_raw.replace("_", " ").title()
+        review_notes = str(task_row.get("review_notes") or "").strip()
+        completed_at = str(task_row.get("completed_at") or "").strip() or datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+        
+        for row in sponsors_info:
+            sponsor_id = int(row["sponsor_id"])
+            sponsor_name = str(row["sponsor_name"] or "").strip() or "Sponsor"
+            sponsor_email = str(row["sponsor_email"] or "").strip()
+            unit_uid = str(row["unit_uid"] or "").strip()
+            project_name = str(row["project_name"] or "LandCheck Green Project").strip()
+            location_text = str(row["project_location_text"] or "").strip()
+            species = str(row["species"] or "Verified Tree").strip()
+            tree_num = f"Tree #{row['project_tree_no']}" if row['project_tree_no'] else f"Tree ID {tree_id}"
+            
+            # 1. Send Push Notification
+            title = "Tree Care Update!"
+            body = f"A new maintenance activity ({activity_name}) has been approved for your sponsored {species} ({tree_num}) in {project_name}. View the update and download your certificate under the 'My Trees' tab in the LC Green app."
+            
+            tokens = db.execute(
+                text(
+                    """
+                    SELECT expo_push_token
+                    FROM green_sponsor_push_tokens
+                    WHERE sponsor_account_id = :sponsor_id
+                    AND COALESCE(is_active, TRUE) = TRUE
+                    """
+                ),
+                {"sponsor_id": sponsor_id},
+            ).scalars().all()
+            
+            if tokens:
+                messages = [
+                    {
+                        "to": token,
+                        "title": title,
+                        "body": body,
+                        "sound": "default",
+                        "priority": "high",
+                        "channelId": "sponsor-alerts",
+                        "data": {
+                            "unit_uid": unit_uid,
+                            "tree_id": tree_id,
+                            "project_name": project_name,
+                        },
+                    }
+                    for token in tokens
+                ]
+                _send_expo_push_messages(messages)
+                
+            # 2. Send Email
+            if sponsor_email:
+                base_url = _build_public_api_base_url(request) or "https://api.landcheck.online"
+                public_story_url = f"{base_url}/green/sponsor/public/trees/{quote(unit_uid)}"
+                
+                email_subject = f"Care update for your sponsored LandCheck Green tree"
+                
+                notes_block = f"\nNotes: {review_notes}" if review_notes else ""
+                email_text = (
+                    f"Hello {sponsor_name},\n\n"
+                    "A care and maintenance activity has been completed and verified for your sponsored tree!\n\n"
+                    f"Project: {project_name}\n"
+                    f"Location: {location_text or '-'}\n"
+                    f"Tree species: {species}\n"
+                    f"Tree number: {tree_num}\n"
+                    f"Care Activity: {activity_name}\n"
+                    f"Completed on: {completed_at}"
+                    f"{notes_block}\n\n"
+                    "You can view, download, and share your digital certificate under the 'My Trees' tab in the LC Green mobile app. "
+                    "Open the app, navigate to the 'My Trees' tab, and select this tree to view details.\n\n"
+                    f"View your public tree story: {public_story_url}\n\n"
+                    "Regards,\n"
+                    "LandCheck Green"
+                )
+                
+                notes_html = f"""
+                <div style="border:1px solid #dbece0;border-radius:16px;background:#f8fcf9;padding:18px;margin:0 0 18px;">
+                <div style="font-size:14px;font-weight:800;color:#163826;margin:0 0 10px;">Supervisor Review Notes</div>
+                <p style="margin:0;font-size:14px;line-height:1.7;color:#345542;">{html.escape(review_notes)}</p>
+                </div>
+                """ if review_notes else ""
+                
+                email_html = f"""
+                <html>
+                <body style="margin:0;padding:28px;background:#eef8ef;font-family:Arial,sans-serif;color:#173624;">
+                <div style="max-width:680px;margin:0 auto;background:#ffffff;border:1px solid #d8ebdd;border-radius:20px;overflow:hidden;">
+                <div style="padding:28px;background:linear-gradient(145deg,#0c5f2e 0%,#1d8a49 100%);color:#ffffff;">
+                <div style="font-size:12px;font-weight:800;letter-spacing:0.16em;text-transform:uppercase;color:#daf7df;">Care & Maintenance Update</div>
+                <div style="margin-top:10px;font-size:28px;font-weight:800;line-height:1.15;">New Maintenance Verified</div>
+                <div style="margin-top:10px;font-size:15px;line-height:1.7;color:#effcf1;">A verified care activity has been performed on your sponsored tree.</div>
+                </div>
+                <div style="padding:26px 28px 30px;">
+                <p style="margin:0 0 14px;font-size:15px;line-height:1.7;">Hello {html.escape(sponsor_name)},</p>
+                <div style="border:1px solid #dbece0;border-radius:16px;background:#f8fcf9;padding:18px;margin:0 0 18px;">
+                <div style="font-size:14px;font-weight:800;color:#163826;margin:0 0 10px;">Tree & Activity Details</div>
+                <div style="font-size:15px;line-height:1.8;color:#345542;">
+                <div><strong>Project:</strong> {html.escape(project_name)}</div>
+                <div><strong>Location:</strong> {html.escape(location_text or "-")}</div>
+                <div><strong>Tree Species:</strong> {html.escape(species)}</div>
+                <div><strong>Tree Identifier:</strong> {html.escape(tree_num)}</div>
+                <div><strong>Care Activity:</strong> {html.escape(activity_name)}</div>
+                <div><strong>Completed at:</strong> {html.escape(completed_at)}</div>
+                </div>
+                </div>
+                {notes_html}
+                <div style="border:1px solid #dbece0;border-radius:16px;background:#f8fcf9;padding:18px;margin:0 0 18px;">
+                <div style="font-size:14px;font-weight:800;color:#163826;margin:0 0 10px;">Your Digital Certificate</div>
+                <p style="margin:0;font-size:14px;line-height:1.7;color:#345542;">
+                You can view, download, and share your digital certificate inside the <strong>LC Green</strong> mobile app under the <strong>"My Trees"</strong> tab. Simply tap on the tree card to access your certificate.
+                </p>
+                </div>
+                <p style="margin:18px 0;font-size:14px;line-height:1.7;color:#4b6857;">You can also check and share the public story webpage of your tree using the button below:</p>
+                <a href="{html.escape(public_story_url, quote=True)}" style="display:inline-block;padding:14px 22px;border-radius:999px;background:#0f6f39;color:#ffffff;font-size:15px;font-weight:800;text-decoration:none;">View Public Tree Story</a>
+                <p style="margin:24px 0 0;font-size:13px;line-height:1.7;color:#4b6857;">Regards,<br><strong>LandCheck Green</strong></p>
+                </div>
+                </div>
+                </body>
+                </html>
+                """
+                
+                _send_html_email(
+                    to_email=sponsor_email,
+                    subject=email_subject,
+                    text_body=email_text,
+                    html_body=email_html
+                )
+    except Exception:
+        pass
 
 
 def _build_tree_carbon_summary(tree_row: dict) -> dict:
@@ -9847,6 +10080,19 @@ def _render_public_sponsor_tree_story_html(item: dict) -> str:
           </div>
           <div class="timeline-grid">
             {''.join(timeline_cards)}
+          </div>
+        </section>
+
+        <section class="panel" style="background: linear-gradient(135deg, var(--emerald) 0%, var(--emerald-dark) 100%); color: #ffffff; padding: 32px; display: flex; align-items: center; justify-content: space-between; gap: 24px; flex-wrap: wrap; border: none;">
+          <div style="flex: 1; min-width: 280px;">
+            <p class="eyebrow" style="color: #a3f7ba; margin-bottom: 8px;">Sponsor a tree</p>
+            <h2 style="color: #ffffff; margin: 0 0 8px 0; font-size: 1.8rem; font-weight: 800; line-height: 1.2;">You also can sponsor a tree!</h2>
+            <p style="color: #d1f7dc; margin: 0; font-size: 1rem; line-height: 1.5;">Download the LC Green app in Play Store to contribute to climate action and track your own trees.</p>
+          </div>
+          <div>
+            <a href="https://play.google.com/store/apps/details?id=online.landcheck.mobile" target="_blank" rel="noopener noreferrer" style="display: inline-flex; align-items: center; gap: 10px; background: #ffffff; color: var(--emerald-dark); padding: 14px 28px; border-radius: 999px; font-weight: 800; font-size: 1rem; box-shadow: 0 8px 20px rgba(0,0,0,0.15); text-decoration: none;">
+              Download LC Green App in Play Store
+            </a>
           </div>
         </section>
       </div>
@@ -16006,6 +16252,17 @@ def review_submitted_task(
                 "tree_id": int(task["tree_id"]),
             },
         )
+        task_type_norm = _normalize_name(task.get("task_type"))
+        if task_type_norm != "planting":
+            _notify_sponsor_tree_maintenance(
+                db,
+                tree_id=int(task["tree_id"]),
+                task_row={
+                    "task_type": task.get("task_type"),
+                    "completed_at": datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC"),
+                    "review_notes": review_notes
+                }
+            )
     elif decision_key in {"reject", "metadata_edit"}:
         _queue_green_push_to_assignee(
             db,
