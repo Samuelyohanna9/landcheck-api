@@ -2,7 +2,7 @@ from sqlalchemy import text
 from app.db import SessionLocal
 
 db = SessionLocal()
-table = 'green_users'
+table = 'green_sponsorship_orders'
 print(f"--- Columns for {table} ---")
 res = db.execute(text(f"SELECT column_name, data_type FROM information_schema.columns WHERE table_name = '{table}'")).all()
 for r in res:

@@ -413,6 +413,11 @@ class SponsorAgentPayoutReviewPayload(BaseModel):
     settlement_reference: str | None = None
 
 
+class SponsorProfileSettingsPayload(BaseModel):
+    entity_category: str | None = None
+    leaderboard_visibility: str | None = None
+
+
 def _normalize_privacy_scope(value: str | None) -> str:
     scope = str(value or "").strip().lower()
     if scope not in PRIVACY_CONSENT_SCOPE_VALUES:
@@ -5085,6 +5090,8 @@ def ensure_green_tables(db: Session):
         )
     """))
     try:
+        db.execute(text("ALTER TABLE green_sponsor_accounts ADD COLUMN IF NOT EXISTS entity_category TEXT NOT NULL DEFAULT 'individual'"))
+        db.execute(text("ALTER TABLE green_sponsor_accounts ADD COLUMN IF NOT EXISTS leaderboard_visibility TEXT NOT NULL DEFAULT 'public'"))
         db.execute(text("ALTER TABLE green_sponsorship_orders ADD COLUMN IF NOT EXISTS order_uid TEXT"))
         db.execute(text("ALTER TABLE green_sponsorship_orders ADD COLUMN IF NOT EXISTS payment_provider TEXT"))
         db.execute(text("ALTER TABLE green_sponsorship_orders ADD COLUMN IF NOT EXISTS payment_link TEXT"))
@@ -6899,6 +6906,8 @@ def _serialize_sponsor_account(row: dict) -> dict:
         "email": str(row.get("email") or "").strip().lower(),
         "phone": str(row.get("phone") or "").strip() or None,
         "is_active": bool(row.get("is_active", True)),
+        "entity_category": str(row.get("entity_category") or "individual").strip().lower(),
+        "leaderboard_visibility": str(row.get("leaderboard_visibility") or "public").strip().lower(),
     }
 
 
@@ -6926,6 +6935,8 @@ def _build_sponsor_auth_payload(row: dict) -> dict:
             "phone": account["phone"],
             "account_type": account["account_type"],
             "sponsor_uid": account["sponsor_uid"],
+            "entity_category": account["entity_category"],
+            "leaderboard_visibility": account["leaderboard_visibility"],
         },
     }
 
@@ -8947,7 +8958,8 @@ def sponsor_auth_signup(payload: SponsorSignupPayload, request: Request, db: Ses
             VALUES (
                 :sponsor_uid, :account_type, :full_name, :organization_name, :email, :phone, :password_hash, TRUE
             )
-            RETURNING id, sponsor_uid, account_type, full_name, organization_name, email, phone, is_active
+            RETURNING id, sponsor_uid, account_type, full_name, organization_name, email, phone, is_active,
+                      entity_category, leaderboard_visibility
             """
         ),
         {
@@ -8983,7 +8995,8 @@ def sponsor_auth_login(payload: SponsorLoginPayload, db: Session = Depends(get_d
     row = db.execute(
         text(
             """
-            SELECT id, sponsor_uid, account_type, full_name, organization_name, email, phone, password_hash, is_active
+            SELECT id, sponsor_uid, account_type, full_name, organization_name, email, phone, password_hash, is_active,
+                   entity_category, leaderboard_visibility
             FROM green_sponsor_accounts
             WHERE LOWER(email) = LOWER(:email)
             LIMIT 1
@@ -9655,7 +9668,678 @@ def list_sponsor_trees(sponsor_id: int = Query(...), db: Session = Depends(get_d
         else:
             item["carbon"] = {"current_co2_kg": 0.0, "annual_co2_kg": 0.0, "lifetime_co2_kg": 0.0}
         payload.append(item)
-    return payload
+        return payload
+
+
+def _calculate_sponsor_achievement(db: Session, sponsor_id: int) -> dict:
+    total_trees = db.execute(
+        text(
+            """
+            SELECT COALESCE(SUM(quantity), 0)
+            FROM green_sponsorship_orders
+            WHERE sponsor_account_id = :sponsor_id
+            AND (
+                LOWER(payment_status) IN ('verified', 'paid')
+                OR LOWER(order_status) IN ('paid', 'allocated', 'completed')
+            )
+            """
+        ),
+        {"sponsor_id": int(sponsor_id)},
+    ).scalar() or 0
+    
+    level = "Seed Supporter"
+    badge_code = "seed_supporter"
+    badge_emoji = "🌱"
+    next_level = "Green Supporter"
+    next_level_threshold = 10
+    
+    if total_trees >= 500:
+        level = "Earth Guardian"
+        badge_code = "earth_guardian"
+        badge_emoji = "🌍"
+        next_level = None
+        next_level_threshold = None
+    elif total_trees >= 100:
+        level = "Climate Champion"
+        badge_code = "climate_champion"
+        badge_emoji = "🌲"
+        next_level = "Earth Guardian"
+        next_level_threshold = 500
+    elif total_trees >= 50:
+        level = "Forest Builder"
+        badge_code = "forest_builder"
+        badge_emoji = "🌳"
+        next_level = "Climate Champion"
+        next_level_threshold = 100
+    elif total_trees >= 10:
+        level = "Green Supporter"
+        badge_code = "green_supporter"
+        badge_emoji = "🌿"
+        next_level = "Forest Builder"
+        next_level_threshold = 50
+    elif total_trees >= 1:
+        level = "Seed Supporter"
+        badge_code = "seed_supporter"
+        badge_emoji = "🌱"
+        next_level = "Green Supporter"
+        next_level_threshold = 10
+    else:
+        level = "Climate Contributor"
+        badge_code = "climate_contributor"
+        badge_emoji = "🌱"
+        next_level = "Seed Supporter"
+        next_level_threshold = 1
+        
+    progress_percentage = 0.0
+    if next_level_threshold is not None:
+        prev_threshold = 0
+        if level == "Seed Supporter":
+            prev_threshold = 1
+        elif level == "Green Supporter":
+            prev_threshold = 10
+        elif level == "Forest Builder":
+            prev_threshold = 50
+        elif level == "Climate Champion":
+            prev_threshold = 100
+            
+        range_size = next_level_threshold - prev_threshold
+        if range_size > 0:
+            progress_percentage = min(100.0, max(0.0, ((total_trees - prev_threshold) / range_size) * 100.0))
+            
+    return {
+        "total_trees": int(total_trees),
+        "level": level,
+        "badge_code": badge_code,
+        "badge_emoji": badge_emoji,
+        "next_level": next_level,
+        "next_level_threshold": next_level_threshold,
+        "progress_percentage": round(progress_percentage, 1)
+    }
+
+
+def _get_leaderboard_data(db: Session) -> dict:
+    from datetime import datetime
+    start_of_month = datetime.utcnow().replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    
+    rows = db.execute(
+        text(
+            """
+            SELECT
+                sa.id,
+                COALESCE(sa.organization_name, sa.full_name) AS display_name,
+                sa.entity_category,
+                SUM(o.quantity) AS monthly_trees,
+                (
+                    SELECT COALESCE(SUM(q.quantity), 0)
+                    FROM green_sponsorship_orders q
+                    WHERE q.sponsor_account_id = sa.id
+                    AND (
+                        LOWER(q.payment_status) IN ('verified', 'paid')
+                        OR LOWER(q.order_status) IN ('paid', 'allocated', 'completed')
+                    )
+                ) AS all_time_trees
+            FROM green_sponsorship_orders o
+            JOIN green_sponsor_accounts sa ON sa.id = o.sponsor_account_id
+            WHERE o.created_at >= :start_of_month
+            AND (
+                LOWER(o.payment_status) IN ('verified', 'paid')
+                OR LOWER(o.order_status) IN ('paid', 'allocated', 'completed')
+            )
+            AND sa.leaderboard_visibility = 'public'
+            GROUP BY sa.id, sa.organization_name, sa.full_name, sa.entity_category
+            ORDER BY monthly_trees DESC, sa.id ASC
+            LIMIT 50
+            """
+        ),
+        {"start_of_month": start_of_month},
+    ).mappings().all()
+    
+    top_overall = []
+    top_schools = []
+    top_communities = []
+    top_companies = []
+    
+    for r in rows:
+        all_time = int(r["all_time_trees"] or 0)
+        
+        level = "Seed Supporter"
+        if all_time >= 500:
+            level = "Earth Guardian"
+        elif all_time >= 100:
+            level = "Climate Champion"
+        elif all_time >= 50:
+            level = "Forest Builder"
+        elif all_time >= 10:
+            level = "Green Supporter"
+        elif all_time >= 1:
+            level = "Seed Supporter"
+        else:
+            level = "Climate Contributor"
+            
+        entry = {
+            "sponsor_id": r["id"],
+            "display_name": str(r["display_name"]).strip(),
+            "entity_category": r["entity_category"],
+            "monthly_trees": int(r["monthly_trees"] or 0),
+            "all_time_trees": all_time,
+            "achievement_level": level
+        }
+        top_overall.append(entry)
+        
+        cat = r["entity_category"]
+        if cat == "school":
+            top_schools.append(entry)
+        elif cat == "community":
+            top_communities.append(entry)
+        elif cat == "company":
+            top_companies.append(entry)
+            
+    def add_ranks(lst):
+        ranked = []
+        for idx, item in enumerate(lst):
+            item_copy = dict(item)
+            item_copy["rank"] = idx + 1
+            ranked.append(item_copy)
+        return ranked
+        
+    return {
+        "top_overall": add_ranks(top_overall)[:20],
+        "top_schools": add_ranks(top_schools)[:20],
+        "top_communities": add_ranks(top_communities)[:20],
+        "top_companies": add_ranks(top_companies)[:20]
+    }
+
+
+def _render_sponsor_leaderboard_html(data: dict) -> str:
+    import json
+    from datetime import datetime
+    json_data = json.dumps(data)
+    
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>LandCheck Green Monthly Leaderboard</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&family=Outfit:wght@400;600;700;800;900&display=swap" rel="stylesheet" />
+  <style>
+    :root {{
+      --emerald-dark: #083e20;
+      --emerald-light: #16673a;
+      --gold: #c5a059;
+      --gold-dark: #b8860b;
+      --bg: #f9fbf9;
+      --panel: #ffffff;
+      --border: rgba(18, 92, 45, 0.08);
+      --shadow: 0 10px 30px rgba(10, 48, 24, 0.04);
+      --muted: #53705f;
+      --text: #0c2b1a;
+      --gold-light: #fbf7ee;
+    }}
+    * {{
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }}
+    body {{
+      font-family: 'Inter', sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.5;
+      padding: 0;
+    }}
+    header {{
+      background: linear-gradient(135deg, var(--emerald-dark) 0%, var(--emerald-light) 100%);
+      color: #fff;
+      padding: 60px 20px 40px;
+      text-align: center;
+      position: relative;
+      overflow: hidden;
+      border-bottom: 2px solid var(--gold);
+    }}
+    header::after {{
+      content: '';
+      position: absolute;
+      width: 300px;
+      height: 300px;
+      background: rgba(255,255,255,0.03);
+      border-radius: 50%;
+      top: -100px;
+      right: -100px;
+    }}
+    .header-content {{
+      position: relative;
+      z-index: 1;
+      max-width: 800px;
+      margin: 0 auto;
+    }}
+    .header-badge {{
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      background: rgba(255,255,255,0.12);
+      border: 1px solid rgba(255,255,255,0.16);
+      padding: 6px 14px;
+      border-radius: 999px;
+      font-size: 0.85rem;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      margin-bottom: 16px;
+    }}
+    header h1 {{
+      font-family: 'Outfit', sans-serif;
+      font-size: clamp(2.2rem, 5vw, 3.5rem);
+      line-height: 1.1;
+      font-weight: 900;
+      margin-bottom: 12px;
+      letter-spacing: -0.02em;
+    }}
+    header p {{
+      color: rgba(255,255,255,0.85);
+      font-size: 1.1rem;
+      max-width: 600px;
+      margin: 0 auto;
+    }}
+    .container {{
+      max-width: 900px;
+      margin: -20px auto 60px;
+      padding: 0 20px;
+      position: relative;
+      z-index: 2;
+    }}
+    .tabs {{
+      display: flex;
+      background: #fff;
+      border-radius: 20px;
+      padding: 6px;
+      box-shadow: 0 8px 24px rgba(10, 48, 24, 0.06);
+      border: 1px solid var(--border);
+      margin-bottom: 24px;
+      gap: 4px;
+      overflow-x: auto;
+    }}
+    .tab-button {{
+      flex: 1;
+      min-width: 120px;
+      background: none;
+      border: none;
+      padding: 12px 16px;
+      border-radius: 14px;
+      font-family: 'Outfit', sans-serif;
+      font-weight: 700;
+      font-size: 0.95rem;
+      color: var(--muted);
+      cursor: pointer;
+      transition: all 0.2s ease;
+      white-space: nowrap;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+    }}
+    .tab-button:hover {{
+      color: var(--emerald-dark);
+      background: rgba(22, 103, 58, 0.04);
+    }}
+    .tab-button.active {{
+      background: var(--emerald-dark);
+      color: #fff;
+    }}
+    .leaderboard-card {{
+      background: var(--panel);
+      border-radius: 28px;
+      border: 1px solid var(--border);
+      box-shadow: var(--shadow);
+      padding: 24px;
+      min-height: 300px;
+    }}
+    .empty-state {{
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      padding: 60px 20px;
+      text-align: center;
+      color: var(--muted);
+    }}
+    .empty-icon {{
+      font-size: 3rem;
+      margin-bottom: 12px;
+    }}
+    .leaderboard-list {{
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }}
+    .sponsor-row {{
+      display: flex;
+      align-items: center;
+      padding: 16px 20px;
+      background: #fff;
+      border-radius: 20px;
+      border: 1px solid var(--border);
+      transition: transform 0.2s ease, box-shadow 0.2s ease;
+    }}
+    .sponsor-row:hover {{
+      transform: translateY(-2px);
+      box-shadow: 0 8px 20px rgba(10, 48, 24, 0.05);
+      border-color: rgba(22, 103, 58, 0.16);
+    }}
+    .rank-col {{
+      width: 45px;
+      font-family: 'Outfit', sans-serif;
+      font-size: 1.35rem;
+      font-weight: 900;
+      color: var(--muted);
+      display: flex;
+      align-items: center;
+    }}
+    .rank-1 .rank-col {{ color: #ffd700; font-size: 1.8rem; }}
+    .rank-2 .rank-col {{ color: #c0c0c0; font-size: 1.6rem; }}
+    .rank-3 .rank-col {{ color: #cd7f32; font-size: 1.5rem; }}
+    
+    .info-col {{
+      flex: 1;
+      padding-right: 16px;
+    }}
+    .sponsor-name {{
+      font-size: 1.05rem;
+      font-weight: 800;
+      color: var(--text);
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 2px;
+    }}
+    .achievement-badge {{
+      display: inline-flex;
+      align-items: center;
+      background: var(--gold-light);
+      border: 1px solid rgba(197, 160, 89, 0.25);
+      color: var(--gold-dark);
+      padding: 2px 8px;
+      border-radius: 999px;
+      font-size: 0.72rem;
+      font-weight: 800;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+    }}
+    .meta-line {{
+      font-size: 0.82rem;
+      color: var(--muted);
+      font-weight: 500;
+    }}
+    .trees-col {{
+      text-align: right;
+    }}
+    .trees-count {{
+      font-family: 'Outfit', sans-serif;
+      font-size: 1.45rem;
+      font-weight: 900;
+      color: var(--emerald-dark);
+      line-height: 1;
+    }}
+    .trees-label {{
+      font-size: 0.75rem;
+      color: var(--muted);
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      margin-top: 2px;
+    }}
+    .promo-banner {{
+      margin-top: 40px;
+      background: linear-gradient(135deg, #f6fbf7 0%, #edf7ee 100%);
+      border: 1.5px solid var(--emerald-light);
+      border-radius: 24px;
+      padding: 24px 30px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 24px;
+      box-shadow: var(--shadow);
+    }}
+    .promo-content {{
+      flex: 1;
+    }}
+    .promo-title {{
+      font-family: 'Outfit', sans-serif;
+      font-size: 1.25rem;
+      font-weight: 800;
+      color: var(--emerald-dark);
+      margin-bottom: 4px;
+    }}
+    .promo-desc {{
+      color: var(--muted);
+      font-size: 0.92rem;
+      line-height: 1.45;
+    }}
+    .promo-btn {{
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      background: var(--emerald-dark);
+      color: #fff;
+      padding: 12px 24px;
+      border-radius: 14px;
+      font-weight: 700;
+      font-size: 0.95rem;
+      text-decoration: none;
+      transition: background 0.2s ease;
+      white-space: nowrap;
+      box-shadow: 0 4px 12px rgba(8, 62, 32, 0.15);
+    }}
+    .promo-btn:hover {{
+      background: var(--emerald-light);
+    }}
+    footer {{
+      text-align: center;
+      padding: 40px 20px;
+      color: var(--muted);
+      font-size: 0.85rem;
+      font-weight: 500;
+      border-top: 1px solid var(--border);
+    }}
+    @media (max-width: 600px) {{
+      .promo-banner {{
+        flex-direction: column;
+        align-items: stretch;
+        text-align: center;
+        padding: 20px;
+      }}
+      .promo-btn {{
+        justify-content: center;
+      }}
+    }}
+  </style>
+</head>
+<body>
+  <header>
+    <div class="header-content">
+      <div class="header-badge">🏆 Climate Action</div>
+      <h1>Monthly Leaderboard</h1>
+      <p>Top supporters sponsoring forest restoration and climate action under LandCheck Green restoration initiative this month.</p>
+    </div>
+  </header>
+  <div class="container">
+    <div class="tabs">
+      <button class="tab-button active" onclick="switchTab('top_overall')">🌍 Overall</button>
+      <button class="tab-button" onclick="switchTab('top_schools')">🏫 Schools</button>
+      <button class="tab-button" onclick="switchTab('top_communities')">👥 Communities</button>
+      <button class="tab-button" onclick="switchTab('top_companies')">🏢 Companies</button>
+    </div>
+    
+    <div class="leaderboard-card">
+      <div id="leaderboard-list" class="leaderboard-list">
+        <!-- Rendered dynamically by JS -->
+      </div>
+    </div>
+    
+    <div class="promo-banner">
+      <div class="promo-content">
+        <div class="promo-title">You also can sponsor a tree!</div>
+        <div class="promo-desc">Plant a tree in your name, celebrate an occasion, or gift a tree to a loved one. Download the LC Green mobile app from the Play Store and get certified GPS details.</div>
+      </div>
+      <a href="https://play.google.com/store/apps/details?id=online.landcheck.mobile" target="_blank" class="promo-btn">
+        Download LC Green
+      </a>
+    </div>
+  </div>
+  
+  <footer>
+    &copy; {datetime.utcnow().year} LandCheck Green Restoration Registry. All rights reserved.
+  </footer>
+  
+  <script>
+    const data = {json_data};
+    
+    function getBadgeEmoji(level) {{
+      const l = String(level || "").toLowerCase();
+      if (l.includes("guardian")) return "🌍";
+      if (l.includes("champion")) return "🌲";
+      if (l.includes("builder")) return "🌳";
+      if (l.includes("green")) return "🌿";
+      return "🌱";
+    }}
+    
+    function renderList(listKey) {{
+      const container = document.getElementById('leaderboard-list');
+      const items = data[listKey] || [];
+      
+      if (items.length === 0) {{
+        container.innerHTML = `
+          <div class="empty-state">
+            <div class="empty-icon">🌱</div>
+            <h3>No entries this month</h3>
+            <p>Be the first to sponsor a tree in this category this month!</p>
+          </div>
+        `;
+        return;
+      }}
+      
+      container.innerHTML = items.map((item, idx) => {{
+        const rank = item.rank || (idx + 1);
+        let rankClass = "";
+        if (rank === 1) rankClass = "rank-1";
+        else if (rank === 2) rankClass = "rank-2";
+        else if (rank === 3) rankClass = "rank-3";
+        
+        const emoji = getBadgeEmoji(item.achievement_level);
+        
+        return \\`
+          <div class="sponsor-row \\${{rankClass}}">
+            <div class="rank-col">#\\${{rank}}</div>
+            <div class="info-col">
+              <div class="sponsor-name">
+                \\${{item.display_name}}
+                <span class="achievement-badge">\\${{emoji}} \\${{item.achievement_level}}</span>
+              </div>
+              <div class="meta-line">Category: \\${{item.entity_category}} | All-time: \\${{item.all_time_trees}} trees</div>
+            </div>
+            <div class="trees-col">
+              <div class="trees-count">\\${{item.monthly_trees}}</div>
+              <div class="trees-label">Trees</div>
+            </div>
+          </div>
+        \\`;
+      }}).join('');
+    }}
+    
+    function switchTab(tabKey) {{
+      const buttons = document.querySelectorAll('.tab-button');
+      buttons.forEach(btn => {{
+        btn.classList.remove('active');
+        if (btn.getAttribute('onclick').includes(tabKey)) {{
+          btn.classList.add('active');
+        }}
+      }});
+      
+      renderList(tabKey);
+    }}
+    
+    renderList('top_overall');
+  </script>
+</body>
+</html>"""
+
+
+@router.patch("/sponsor/profile/settings")
+def update_sponsor_profile_settings(
+    payload: SponsorProfileSettingsPayload,
+    sponsor_id: int = Query(...),
+    db: Session = Depends(get_db),
+):
+    sponsor = db.execute(
+        text("SELECT id FROM green_sponsor_accounts WHERE id = :sponsor_id AND COALESCE(is_active, TRUE) = TRUE"),
+        {"sponsor_id": int(sponsor_id)},
+    ).scalar()
+    if not sponsor:
+        raise HTTPException(status_code=404, detail="Sponsor account not found")
+        
+    updates = {}
+    params = {"sponsor_id": int(sponsor_id)}
+    
+    if payload.entity_category is not None:
+        cat = str(payload.entity_category).strip().lower()
+        if cat not in {"individual", "school", "community", "company"}:
+            raise HTTPException(status_code=400, detail="Invalid entity category. Choose from: individual, school, community, company")
+        updates["entity_category"] = cat
+        params["entity_category"] = cat
+        
+    if payload.leaderboard_visibility is not None:
+        vis = str(payload.leaderboard_visibility).strip().lower()
+        if vis not in {"public", "anonymous"}:
+            raise HTTPException(status_code=400, detail="Invalid visibility. Choose from: public, anonymous")
+        updates["leaderboard_visibility"] = vis
+        params["leaderboard_visibility"] = vis
+        
+    if not updates:
+        raise HTTPException(status_code=400, detail="No updates provided")
+        
+    set_clause = ", ".join(f"{k} = :{k}" for k in updates.keys())
+    row = db.execute(
+        text(
+            f"""
+            UPDATE green_sponsor_accounts
+            SET {set_clause}, updated_at = NOW()
+            WHERE id = :sponsor_id
+            RETURNING id, sponsor_uid, account_type, full_name, organization_name, email, phone, is_active,
+                      entity_category, leaderboard_visibility
+            """
+        ),
+        params,
+    ).mappings().first()
+    db.commit()
+    return _serialize_sponsor_account(dict(row))
+
+
+@router.get("/sponsor/public/leaderboard")
+def get_public_leaderboard(db: Session = Depends(get_db)):
+    return _get_leaderboard_data(db)
+
+
+@router.get("/sponsor/public/leaderboard/view", response_class=HTMLResponse)
+def get_public_leaderboard_view(db: Session = Depends(get_db)):
+    data = _get_leaderboard_data(db)
+    return HTMLResponse(content=_render_sponsor_leaderboard_html(data))
+
+
+@router.get("/sponsor/profile/achievements")
+def get_sponsor_profile_achievements(
+    sponsor_id: int = Query(...),
+    db: Session = Depends(get_db),
+):
+    sponsor = db.execute(
+        text("SELECT id FROM green_sponsor_accounts WHERE id = :sponsor_id AND COALESCE(is_active, TRUE) = TRUE"),
+        {"sponsor_id": int(sponsor_id)},
+    ).scalar()
+    if not sponsor:
+        raise HTTPException(status_code=404, detail="Sponsor account not found")
+        
+    return _calculate_sponsor_achievement(db, sponsor_id)
 
 
 def _build_public_asset_url(raw_value: object, request: Request | None = None) -> str | None:
@@ -10699,7 +11383,13 @@ def export_sponsor_tree_certificate(
         raise HTTPException(status_code=404, detail="Sponsored tree certificate not found")
     item = _hydrate_sponsor_tree_story_item(dict(row), db, request=request)
     carbon = _build_tree_carbon_summary(item)
-    pdf_bytes = render_green_sponsor_certificate_pdf(item, carbon, verification_url=item.get("public_story_url"))
+    achievements = _calculate_sponsor_achievement(db, int(sponsor_id))
+    pdf_bytes = render_green_sponsor_certificate_pdf(
+        item,
+        carbon,
+        verification_url=item.get("public_story_url"),
+        level_name=achievements.get("level")
+    )
     db.execute(
         text("UPDATE green_sponsorship_units SET last_certificate_at = NOW(), updated_at = NOW() WHERE id = :unit_id"),
         {"unit_id": int(unit_id)},

@@ -104,7 +104,7 @@ def render_green_org_credentials_pdf(organization: dict, users: list[dict]) -> b
     return buffer.getvalue()
 
 
-def render_green_sponsor_certificate_pdf(sponsorship: dict, carbon: dict | None = None, verification_url: str | None = None) -> bytes:
+def render_green_sponsor_certificate_pdf(sponsorship: dict, carbon: dict | None = None, verification_url: str | None = None, level_name: str | None = None) -> bytes:
     from reportlab.lib.pagesizes import landscape
     buffer = io.BytesIO()
     page_w, page_h = landscape(A4) # 841.89 x 595.27
@@ -207,6 +207,12 @@ def render_green_sponsor_certificate_pdf(sponsorship: dict, carbon: dict | None 
         c.setFillColor(HexColor("#b8860b"))
         c.setFont("Helvetica-Bold", 11)
         c.drawCentredString(page_w / 2, curr_y, f"representing {sponsor_org}")
+        curr_y -= 15
+
+    if level_name:
+        c.setFillColor(HexColor("#c5a059"))
+        c.setFont("Helvetica-Bold", 9.5)
+        c.drawCentredString(page_w / 2, curr_y, f"ACHIEVEMENT LEVEL: {str(level_name).upper()}")
         curr_y -= 15
 
     # Decorative divider under Sponsor Name
