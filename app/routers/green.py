@@ -11407,6 +11407,17 @@ def export_sponsor_tree_certificate(
     )
 
 
+@router.get("/app/version-check")
+def app_version_check(db: Session = Depends(get_db)):
+    latest = os.getenv("LANDCHECK_LATEST_APP_VERSION", "1.0.17")
+    minimum = os.getenv("LANDCHECK_MIN_APP_VERSION", "1.0.0")
+    return {
+        "latest_version": latest.strip(),
+        "minimum_version": minimum.strip(),
+        "play_store_url": "https://play.google.com/store/apps/details?id=online.landcheck.mobile"
+    }
+
+
 def _load_public_sponsor_tree_story_row(db: Session, unit_uid: str):
     normalized_uid = str(unit_uid or "").strip()
     if not normalized_uid:
@@ -11665,17 +11676,21 @@ def create_sponsor_agent_payout_request(payload: SponsorAgentPayoutRequestPayloa
 
 @router.get("/admin/sponsors")
 def list_admin_sponsors(db: Session = Depends(get_db)):
+    from datetime import datetime
+    start_of_month = datetime.utcnow().replace(day=1, hour=0, minute=0, second=0, microsecond=0)
     rows = db.execute(
         text(
             """
             SELECT
                 sa.id, sa.sponsor_uid, sa.account_type, sa.full_name, sa.organization_name, sa.email, sa.phone,
-                sa.is_active, sa.created_at,
+                sa.is_active, sa.created_at, sa.entity_category, sa.leaderboard_visibility,
                 COALESCE(order_stats.orders_count, 0) AS orders_count,
                 COALESCE(order_stats.amount_total, 0) AS amount_total,
                 COALESCE(order_stats.verified_orders_count, 0) AS verified_orders_count,
                 COALESCE(order_stats.pending_orders_count, 0) AS pending_orders_count,
                 COALESCE(order_stats.issue_orders_count, 0) AS issue_orders_count,
+                COALESCE(order_stats.all_time_trees, 0) AS all_time_trees,
+                COALESCE(order_stats.monthly_trees, 0) AS monthly_trees,
                 COALESCE(unit_stats.linked_trees, 0) AS linked_trees,
                 COALESCE(unit_stats.awaiting_tree_units, 0) AS awaiting_tree_units
             FROM green_sponsor_accounts sa
@@ -11690,7 +11705,17 @@ def list_admin_sponsors(db: Session = Depends(get_db)):
                     ) AS pending_orders_count,
                     COUNT(*) FILTER (
                         WHERE LOWER(COALESCE(payment_status, '')) IN ('rejected', 'refunded')
-                    ) AS issue_orders_count
+                    ) AS issue_orders_count,
+                    COALESCE(SUM(quantity) FILTER (
+                        WHERE LOWER(payment_status) IN ('verified', 'paid')
+                        OR LOWER(order_status) IN ('paid', 'allocated', 'completed')
+                    ), 0) AS all_time_trees,
+                    COALESCE(SUM(quantity) FILTER (
+                        WHERE created_at >= :start_of_month AND (
+                            LOWER(payment_status) IN ('verified', 'paid')
+                            OR LOWER(order_status) IN ('paid', 'allocated', 'completed')
+                        )
+                    ), 0) AS monthly_trees
                 FROM green_sponsorship_orders
                 GROUP BY sponsor_account_id
             ) order_stats ON order_stats.sponsor_account_id = sa.id
@@ -11706,18 +11731,42 @@ def list_admin_sponsors(db: Session = Depends(get_db)):
             ) unit_stats ON unit_stats.sponsor_account_id = sa.id
             ORDER BY sa.created_at DESC, sa.id DESC
             """
-        )
+        ),
+        {"start_of_month": start_of_month},
     ).mappings().all()
-    return [_serialize_sponsor_account(dict(row)) | {
-        "orders_count": int(row.get("orders_count") or 0),
-        "amount_total": round(float(row.get("amount_total") or 0), 2),
-        "linked_trees": int(row.get("linked_trees") or 0),
-        "verified_orders_count": int(row.get("verified_orders_count") or 0),
-        "pending_orders_count": int(row.get("pending_orders_count") or 0),
-        "issue_orders_count": int(row.get("issue_orders_count") or 0),
-        "awaiting_tree_units": int(row.get("awaiting_tree_units") or 0),
-        "created_at": row.get("created_at"),
-    } for row in rows]
+    
+    payload = []
+    for row in rows:
+        all_time = int(row.get("all_time_trees") or 0)
+        level = "Seed Supporter"
+        if all_time >= 500:
+            level = "Earth Guardian"
+        elif all_time >= 100:
+            level = "Climate Champion"
+        elif all_time >= 50:
+            level = "Forest Builder"
+        elif all_time >= 10:
+            level = "Green Supporter"
+        elif all_time >= 1:
+            level = "Seed Supporter"
+        else:
+            level = "Climate Contributor"
+            
+        item = _serialize_sponsor_account(dict(row)) | {
+            "orders_count": int(row.get("orders_count") or 0),
+            "amount_total": round(float(row.get("amount_total") or 0), 2),
+            "linked_trees": int(row.get("linked_trees") or 0),
+            "verified_orders_count": int(row.get("verified_orders_count") or 0),
+            "pending_orders_count": int(row.get("pending_orders_count") or 0),
+            "issue_orders_count": int(row.get("issue_orders_count") or 0),
+            "awaiting_tree_units": int(row.get("awaiting_tree_units") or 0),
+            "all_time_trees": all_time,
+            "monthly_trees": int(row.get("monthly_trees") or 0),
+            "achievement_level": level,
+            "created_at": row.get("created_at"),
+        }
+        payload.append(item)
+    return payload
 
 
 def _list_admin_sponsorship_orders(db: Session, project_id: int | None = None, sync_gateway: bool = True) -> list[dict]:
