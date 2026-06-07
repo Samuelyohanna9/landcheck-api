@@ -6799,6 +6799,8 @@ def create_project(
             project["organization_status"] = org_meta.get("status")
             project["organization_logo_url"] = _normalize_logo_asset_path(org_meta.get("logo_url"))
     db.commit()
+    if normalized_public_sponsor_agent_user_ids:
+        _notify_agent_added_to_project(db, project["id"], normalized_public_sponsor_agent_user_ids)
     return project
 
 
@@ -8292,6 +8294,170 @@ def _notify_sponsor_tree_maintenance(db: Session, tree_id: int, task_row: dict, 
         pass
 
 
+def _notify_agent_added_to_project(db: Session, project_id: int, agent_user_ids: list[int], request: Request | None = None):
+    try:
+        project = db.execute(
+            text("SELECT id, name, location_text, sponsor FROM tree_projects WHERE id = :project_id"),
+            {"project_id": int(project_id)},
+        ).mappings().first()
+        if not project:
+            return
+        
+        project_name = str(project["name"] or "LandCheck Green Project").strip()
+        location_text = str(project["location_text"] or "").strip()
+        sponsor = str(project["sponsor"] or "").strip()
+        
+        for user_id in agent_user_ids:
+            user = db.execute(
+                text("SELECT full_name, email FROM green_users WHERE id = :user_id AND COALESCE(is_active, TRUE) = TRUE"),
+                {"user_id": int(user_id)},
+            ).mappings().first()
+            if not user or not user.get("email"):
+                continue
+            
+            agent_name = str(user["full_name"] or "").strip() or "Agent"
+            agent_email = str(user["email"]).strip()
+            
+            email_subject = f"Assigned as Agent: {project_name}"
+            email_text = (
+                f"Hello {agent_name},\n\n"
+                f"You have been assigned as an agent for the public sponsorship project: {project_name} in LandCheck Work.\n\n"
+                f"Project Details:\n"
+                f"Project: {project_name}\n"
+                f"Location: {location_text or '-'}\n"
+                f"Sponsor: {sponsor or '-'}\n\n"
+                "Please log into the LandCheck mobile app using your agent credentials, select this project name from the project dropdown menu, and you can begin performing tasks for this project.\n\n"
+                "Regards,\n"
+                "LandCheck Green"
+            )
+            
+            email_html = f"""
+            <html>
+            <body style="margin:0;padding:28px;background:#f3fbf5;font-family:Arial,sans-serif;color:#183523;">
+            <div style="max-width:680px;margin:0 auto;background:#ffffff;border:1px solid #d4ecd9;border-radius:20px;overflow:hidden;box-shadow:0 4px 12px rgba(0,0,0,0.03);">
+            <div style="padding:28px;background:linear-gradient(135deg,#165a30 0%,#278e4d 100%);color:#ffffff;">
+            <div style="font-size:12px;font-weight:800;letter-spacing:0.16em;text-transform:uppercase;color:#daf7df;">LandCheck Work</div>
+            <div style="margin-top:10px;font-size:26px;font-weight:800;line-height:1.2;">Project Agent Assignment</div>
+            <div style="margin-top:10px;font-size:15px;line-height:1.7;color:#f0fbf3;">You have been successfully added as an agent for a public sponsor project.</div>
+            </div>
+            <div style="padding:26px 28px 30px;">
+            <p style="margin:0 0 14px;font-size:15px;line-height:1.7;">Hello {html.escape(agent_name)},</p>
+            <p style="margin:0 0 18px;font-size:15px;line-height:1.7;color:#33523e;">
+            You have been assigned as an agent for the public sponsorship project <strong>{html.escape(project_name)}</strong> in LandCheck Work.
+            </p>
+            <div style="border:1px solid #dbece0;border-radius:16px;background:#f8fcf9;padding:18px;margin:0 0 18px;">
+            <div style="font-size:14px;font-weight:800;color:#163826;margin:0 0 10px;">Project Details</div>
+            <div style="font-size:15px;line-height:1.8;color:#345542;">
+            <div><strong>Project:</strong> {html.escape(project_name)}</div>
+            <div><strong>Location:</strong> {html.escape(location_text or "-")}</div>
+            <div><strong>Sponsor:</strong> {html.escape(sponsor or "-")}</div>
+            </div>
+            </div>
+            <div style="border:1px solid #dbece0;border-radius:16px;background:#f8fcf9;padding:18px;margin:0 0 18px;">
+            <div style="font-size:14px;font-weight:800;color:#163826;margin:0 0 10px;">Next Steps</div>
+            <p style="margin:0;font-size:14px;line-height:1.7;color:#345542;">
+            Please log into the <strong>LandCheck Mobile</strong> app, select the project name <strong>"{html.escape(project_name)}"</strong> from the project dropdown menu, and you can begin performing tasks for this project.
+            </p>
+            </div>
+            <p style="margin:24px 0 0;font-size:13px;line-height:1.7;color:#4b6857;">Regards,<br><strong>LandCheck Green Team</strong></p>
+            </div>
+            </div>
+            </body>
+            </html>
+            """
+            _send_html_email(
+                to_email=agent_email,
+                subject=email_subject,
+                text_body=email_text,
+                html_body=email_html
+            )
+    except Exception:
+        pass
+
+
+def _notify_agent_first_planting_assignment(db: Session, project_id: int, assignee_name: str, target_trees: int, request: Request | None = None):
+    try:
+        project = db.execute(
+            text("SELECT id, name, location_text, sponsor FROM tree_projects WHERE id = :project_id"),
+            {"project_id": int(project_id)},
+        ).mappings().first()
+        if not project:
+            return
+            
+        user = db.execute(
+            text("SELECT full_name, email FROM green_users WHERE LOWER(TRIM(work_username)) = LOWER(TRIM(:assignee_name)) AND COALESCE(is_active, TRUE) = TRUE"),
+            {"assignee_name": assignee_name},
+        ).mappings().first()
+        if not user or not user.get("email"):
+            return
+            
+        project_name = str(project["name"] or "LandCheck Green Project").strip()
+        location_text = str(project["location_text"] or "").strip()
+        agent_name = str(user["full_name"] or "").strip() or "Agent"
+        agent_email = str(user["email"]).strip()
+        
+        email_subject = f"First Planting Task Assignment: {project_name}"
+        email_text = (
+            f"Hello {agent_name},\n\n"
+            f"You have been assigned your first planting task for the project: {project_name} in LandCheck Work.\n\n"
+            f"Assignment Details:\n"
+            f"Project: {project_name}\n"
+            f"Location: {location_text or '-'}\n"
+            f"Trees Assigned: {target_trees}\n\n"
+            f"Please log into the LandCheck mobile app using your agent credentials, select the project name '{project_name}' from the project dropdown menu, and perform the task.\n\n"
+            "Regards,\n"
+            "LandCheck Green"
+        )
+        
+        email_html = f"""
+        <html>
+        <body style="margin:0;padding:28px;background:#f3fbf5;font-family:Arial,sans-serif;color:#183523;">
+        <div style="max-width:680px;margin:0 auto;background:#ffffff;border:1px solid #d4ecd9;border-radius:20px;overflow:hidden;box-shadow:0 4px 12px rgba(0,0,0,0.03);">
+        <div style="padding:28px;background:linear-gradient(135deg,#165a30 0%,#278e4d 100%);color:#ffffff;">
+        <div style="font-size:12px;font-weight:800;letter-spacing:0.16em;text-transform:uppercase;color:#daf7df;">LandCheck Work</div>
+        <div style="margin-top:10px;font-size:26px;font-weight:800;line-height:1.2;">First Planting Assignment</div>
+        <div style="margin-top:10px;font-size:15px;line-height:1.7;color:#f0fbf3;">You have been assigned your first planting task.</div>
+        </div>
+        <div style="padding:26px 28px 30px;">
+        <p style="margin:0 0 14px;font-size:15px;line-height:1.7;">Hello {html.escape(agent_name)},</p>
+        <p style="margin:0 0 18px;font-size:15px;line-height:1.7;color:#33523e;">
+        You have been assigned your first planting task for the project <strong>{html.escape(project_name)}</strong> in LandCheck Work.
+        </p>
+        <div style="border:1px solid #dbece0;border-radius:16px;background:#f8fcf9;padding:18px;margin:0 0 18px;">
+        <div style="font-size:14px;font-weight:800;color:#163826;margin:0 0 10px;">Assignment Details</div>
+        <div style="font-size:15px;line-height:1.8;color:#345542;">
+        <div><strong>Project:</strong> {html.escape(project_name)}</div>
+        <div><strong>Location:</strong> {html.escape(location_text or "-")}</div>
+        <div><strong>Trees Assigned:</strong> {target_trees}</div>
+        </div>
+        </div>
+        <div style="border:1px solid #dbece0;border-radius:16px;background:#f8fcf9;padding:18px;margin:0 0 18px;">
+        <div style="font-size:14px;font-weight:800;color:#163826;margin:0 0 10px;">Instructions</div>
+        <p style="margin:0;font-size:14px;line-height:1.7;color:#345542;">
+        To perform this task:
+        </p>
+        <ul style="margin:8px 0 0;padding-left:20px;color:#345542;font-size:14px;line-height:1.7;">
+          <li>Log into the <strong>LandCheck Mobile</strong> app using your agent credentials.</li>
+          <li>Select the project name <strong>"{html.escape(project_name)}"</strong> from the project dropdown menu.</li>
+          <li>Record and submit your planting records.</li>
+        </ul>
+        </div>
+        <p style="margin:24px 0 0;font-size:13px;line-height:1.7;color:#4b6857;">Regards,<br><strong>LandCheck Green Team</strong></p>
+        </div>
+        </div>
+        </body>
+        </html>
+        """
+        _send_html_email(
+            to_email=agent_email,
+            subject=email_subject,
+            text_body=email_text,
+            html_body=email_html
+        )
+    except Exception:
+        pass
+
+
 def _build_tree_carbon_summary(tree_row: dict) -> dict:
     if not bool(tree_row.get("count_in_carbon_scope", True)):
         return {"current_co2_kg": 0.0, "annual_co2_kg": 0.0, "lifetime_co2_kg": 0.0}
@@ -8649,6 +8815,11 @@ def update_project_settings(
         },
     )
     db.commit()
+    existing_agent_ids = _normalize_positive_int_list(existing.get("public_sponsor_agent_user_ids"))
+    new_agent_ids = next_public_sponsor_agent_user_ids or []
+    newly_added_ids = [uid for uid in new_agent_ids if uid not in existing_agent_ids]
+    if newly_added_ids:
+        _notify_agent_added_to_project(db, project_id, newly_added_ids)
     return payload
 
 
@@ -19484,6 +19655,22 @@ def create_work_order(
                     "target_trees": int(target_trees or 0),
                 },
             )
+            # Send first planting task assignment email notification
+            past_count = db.execute(
+                text(
+                    """
+                    SELECT COUNT(*)
+                    FROM green_work_orders
+                    WHERE project_id = :project_id
+                    AND LOWER(TRIM(assignee_name)) = LOWER(TRIM(:assignee_name))
+                    AND work_type = 'planting'
+                    AND id <> :current_id
+                    """
+                ),
+                {"project_id": project_id, "assignee_name": assignee_clean, "current_id": int(row)},
+            ).scalar() or 0
+            if past_count == 0:
+                _notify_agent_first_planting_assignment(db, project_id, assignee_clean, int(target_trees or 0))
     else:
         _queue_green_push_to_assignee(
             db,
