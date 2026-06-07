@@ -7362,73 +7362,7 @@ def _load_sponsor_agent_payout_requests(
 
 
 def _filter_sponsor_agent_dashboard_to_project(dashboard: dict, *, project_id: int | None = None) -> dict:
-    project_id_value = int(project_id or 0)
-    if project_id_value <= 0:
-        return dashboard
-    filtered_projects = [
-        dict(item)
-        for item in (dashboard.get("projects") or [])
-        if int(item.get("project_id") or 0) == project_id_value
-    ]
-    filtered_project_summaries = [
-        dict(item)
-        for item in (dashboard.get("project_summaries") or [])
-        if int(item.get("project_id") or 0) == project_id_value
-    ]
-    filtered_earnings = [
-        dict(item)
-        for item in (dashboard.get("earnings") or [])
-        if int(item.get("project_id") or 0) == project_id_value
-    ]
-    filtered_requests = [
-        dict(item)
-        for item in (dashboard.get("requests") or [])
-        if project_id_value in _normalize_positive_int_list(item.get("project_ids") or [])
-    ]
-    available_amount = 0.0
-    requested_amount = 0.0
-    paid_amount = 0.0
-    planting_count = 0
-    maintenance_count = 0
-    for item in filtered_earnings:
-        amount = round(float(item.get("amount") or 0), 2)
-        payout_status = _normalize_sponsor_agent_payout_status(item.get("payout_status"))
-        if _normalize_name(item.get("work_type")) == "planting":
-            planting_count += 1
-        else:
-            maintenance_count += 1
-        if payout_status == "available":
-            available_amount += amount
-        elif payout_status in {"requested", "approved", "processing"}:
-            requested_amount += amount
-        elif payout_status == "paid":
-            paid_amount += amount
-    summary = dict(dashboard.get("summary") or {})
-    minimum_amount = round(float(dashboard.get("minimum_payout_amount") or SPONSOR_AGENT_MIN_PAYOUT_NAIRA), 2)
-    summary.update(
-        {
-            "eligible_project_count": len(filtered_projects),
-            "planting_count": planting_count,
-            "maintenance_count": maintenance_count,
-            "total_earnings_amount": round(available_amount + requested_amount + paid_amount, 2),
-            "available_amount": round(available_amount, 2),
-            "requested_amount": round(requested_amount, 2),
-            "paid_amount": round(paid_amount, 2),
-            "pending_request_count": sum(
-                1 for row in filtered_requests if _normalize_sponsor_agent_payout_status(row.get("status")) in {"requested", "approved", "processing"}
-            ),
-            "paid_request_count": sum(1 for row in filtered_requests if _normalize_sponsor_agent_payout_status(row.get("status")) == "paid"),
-            "payout_eligible": round(available_amount, 2) >= minimum_amount,
-        }
-    )
-    next_dashboard = dict(dashboard)
-    next_dashboard["eligible"] = len(filtered_projects) > 0
-    next_dashboard["projects"] = filtered_projects
-    next_dashboard["project_summaries"] = filtered_project_summaries
-    next_dashboard["earnings"] = filtered_earnings
-    next_dashboard["requests"] = filtered_requests
-    next_dashboard["summary"] = summary
-    return next_dashboard
+    return dashboard
 
 
 def _build_sponsor_agent_earning_rows(
@@ -7615,11 +7549,12 @@ def _build_sponsor_agent_dashboard(
             db,
             user_id=int(user_row["id"]),
             organization_id=int(user_row["organization_id"]) if user_row.get("organization_id") is not None else None,
-            project_id=requested_project_id,
+            project_id=None,
         )
     except Exception:
         project_rows = []
-    if not project_rows and requested_project_id is not None:
+    project_ids_set = {int(row["id"]) for row in project_rows}
+    if requested_project_id is not None and requested_project_id not in project_ids_set:
         try:
             fallback_project_row = db.execute(
                 text(
@@ -7651,7 +7586,7 @@ def _build_sponsor_agent_dashboard(
             except Exception:
                 candidate_user_ids = _normalize_positive_int_list(_json_value_or(fallback_project_row.get("public_sponsor_agent_user_ids"), []))
             if int(user_row["id"]) in set(candidate_user_ids):
-                project_rows = [_apply_project_access_fields(dict(fallback_project_row))]
+                project_rows.append(_apply_project_access_fields(dict(fallback_project_row)))
     try:
         bank_row = _load_sponsor_agent_bank_account(db, user_id=int(user_row["id"]))
     except Exception:
@@ -7661,7 +7596,7 @@ def _build_sponsor_agent_dashboard(
             db,
             organization_id=int(user_row["organization_id"]) if user_row.get("organization_id") is not None else None,
             user_id=int(user_row["id"]),
-            project_id=requested_project_id,
+            project_id=None,
         )
     except Exception:
         request_rows = []
