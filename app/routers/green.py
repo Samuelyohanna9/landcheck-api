@@ -340,6 +340,7 @@ class SponsorSignupPayload(BaseModel):
     email: str
     phone: str | None = None
     password: str
+    referral_code: str | None = None
 
 
 class SponsorLoginPayload(BaseModel):
@@ -5647,6 +5648,42 @@ def ensure_green_tables(db: Session):
             """
         )
     )
+    db.execute(text("""
+        CREATE TABLE IF NOT EXISTS green_sponsor_complaints (
+            id SERIAL PRIMARY KEY,
+            sponsor_id INTEGER NOT NULL REFERENCES green_sponsor_accounts(id) ON DELETE CASCADE,
+            tree_id INTEGER REFERENCES trees(id) ON DELETE SET NULL,
+            complaint_type TEXT NOT NULL,
+            message TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'open',
+            created_at TIMESTAMP DEFAULT NOW()
+        )
+    """))
+    try:
+        db.execute(text("ALTER TABLE green_school_nominations ADD COLUMN IF NOT EXISTS points_spent INTEGER NOT NULL DEFAULT 100"))
+    except Exception:
+        db.rollback()
+
+    # Backfill GP for sponsors who already have tree sponsorships but 0 points
+    try:
+        db.execute(text("""
+            UPDATE green_sponsor_accounts sa
+            SET green_points = sa.green_points + (COALESCE(orders.total_trees, 0) * 25),
+                lifetime_points = sa.lifetime_points + (COALESCE(orders.total_trees, 0) * 25)
+            FROM (
+                SELECT sponsor_account_id, SUM(quantity) AS total_trees
+                FROM green_sponsorship_orders
+                WHERE LOWER(COALESCE(payment_status, '')) IN ('paid', 'verified')
+                   OR LOWER(COALESCE(order_status, '')) IN ('paid', 'allocated', 'completed')
+                GROUP BY sponsor_account_id
+            ) AS orders
+            WHERE orders.sponsor_account_id = sa.id
+              AND sa.green_points = 0
+              AND sa.lifetime_points = 0
+        """))
+    except Exception:
+        db.rollback()
+
     db.commit()
 
 
@@ -7998,8 +8035,8 @@ def _award_points_for_order(db: Session, order_id: int):
     if not sponsor:
         return
         
-    # Calculate base points (100 points per tree)
-    base_points = quantity * 100
+    # Calculate base points (25 points per tree)
+    base_points = quantity * 25
     multiplier = float(sponsor.get("point_booster_multiplier") or 1.0)
     uses = int(sponsor.get("point_booster_remaining_uses") or 0)
     
@@ -9093,14 +9130,25 @@ def sponsor_auth_signup(payload: SponsorSignupPayload, request: Request, db: Ses
     ).scalar()
     if existing:
         raise HTTPException(status_code=409, detail="Email already registered")
+    referred_by_id = None
+    if payload.referral_code:
+        ref_code = str(payload.referral_code).strip()
+        if ref_code:
+            referrer = db.execute(
+                text("SELECT id FROM green_sponsor_accounts WHERE UPPER(referral_code) = UPPER(:ref_code) LIMIT 1"),
+                {"ref_code": ref_code}
+            ).scalar()
+            if referrer:
+                referred_by_id = int(referrer)
+
     row = db.execute(
         text(
             """
             INSERT INTO green_sponsor_accounts (
-                sponsor_uid, account_type, full_name, organization_name, email, phone, password_hash, is_active
+                sponsor_uid, account_type, full_name, organization_name, email, phone, password_hash, referred_by_id, is_active
             )
             VALUES (
-                :sponsor_uid, :account_type, :full_name, :organization_name, :email, :phone, :password_hash, TRUE
+                :sponsor_uid, :account_type, :full_name, :organization_name, :email, :phone, :password_hash, :referred_by_id, TRUE
             )
             RETURNING id, sponsor_uid, account_type, full_name, organization_name, email, phone, is_active,
                       entity_category, leaderboard_visibility
@@ -9114,6 +9162,7 @@ def sponsor_auth_signup(payload: SponsorSignupPayload, request: Request, db: Ses
             "email": email,
             "phone": _clean_text(payload.phone, 80),
             "password_hash": _hash_password_value(payload.password),
+            "referred_by_id": referred_by_id,
         },
     ).mappings().first()
     _log_audit_event(
@@ -10520,6 +10569,17 @@ class SponsorApplyReferralPayload(BaseModel):
     referral_code: str
 
 
+class SponsorShareEarnPayload(BaseModel):
+    sponsor_id: int
+
+
+class SponsorComplaintPayload(BaseModel):
+    sponsor_id: int
+    complaint_type: str
+    tree_id: int | None = None
+    message: str
+
+
 @router.get("/sponsor/points")
 def get_sponsor_points(sponsor_id: int = Query(...), db: Session = Depends(get_db)):
     import uuid
@@ -10679,10 +10739,29 @@ def redeem_sponsor_reward(payload: SponsorRedeemPayload, db: Session = Depends(g
 
 @router.post("/sponsor/nominate-school")
 def nominate_school(payload: SponsorNominateSchoolPayload, db: Session = Depends(get_db)):
+    sponsor_id = payload.sponsor_id
+    cost = 100
+    
+    row = db.execute(
+        text("SELECT green_points FROM green_sponsor_accounts WHERE id = :sponsor_id AND COALESCE(is_active, TRUE) = TRUE"),
+        {"sponsor_id": sponsor_id}
+    ).mappings().first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Sponsor account not found")
+        
+    current_points = int(row.get("green_points") or 0)
+    if current_points < cost:
+        raise HTTPException(status_code=400, detail=f"Insufficient points. School nomination requires {cost} GP.")
+        
+    db.execute(
+        text("UPDATE green_sponsor_accounts SET green_points = green_points - :cost, updated_at = NOW() WHERE id = :sponsor_id"),
+        {"cost": cost, "sponsor_id": sponsor_id}
+    )
+    
     db.execute(
         text("""
-            INSERT INTO green_school_nominations (sponsor_id, school_name, school_address, contact_person, contact_phone, reason)
-            VALUES (:sponsor_id, :school_name, :school_address, :contact_person, :contact_phone, :reason)
+            INSERT INTO green_school_nominations (sponsor_id, school_name, school_address, contact_person, contact_phone, reason, points_spent)
+            VALUES (:sponsor_id, :school_name, :school_address, :contact_person, :contact_phone, :reason, :cost)
         """),
         {
             "sponsor_id": payload.sponsor_id,
@@ -10690,11 +10769,117 @@ def nominate_school(payload: SponsorNominateSchoolPayload, db: Session = Depends
             "school_address": payload.school_address,
             "contact_person": payload.contact_person,
             "contact_phone": payload.contact_phone,
-            "reason": payload.reason
+            "reason": payload.reason,
+            "cost": cost
         }
     )
     db.commit()
-    return {"ok": True, "message": "Nomination submitted successfully!"}
+    return {"ok": True, "message": f"Nomination submitted! Spent {cost} GP."}
+
+
+@router.post("/sponsor/points/share-earn")
+def sponsor_share_earn(payload: SponsorShareEarnPayload, db: Session = Depends(get_db)):
+    sponsor_id = payload.sponsor_id
+    
+    row = db.execute(
+        text("SELECT id FROM green_sponsor_accounts WHERE id = :sponsor_id AND COALESCE(is_active, TRUE) = TRUE"),
+        {"sponsor_id": sponsor_id}
+    ).scalar()
+    if not row:
+        raise HTTPException(status_code=404, detail="Sponsor account not found")
+        
+    gp_earn = 25
+    db.execute(
+        text("""
+            UPDATE green_sponsor_accounts 
+            SET green_points = green_points + :gp_earn, 
+                lifetime_points = lifetime_points + :gp_earn,
+                updated_at = NOW() 
+            WHERE id = :sponsor_id
+        """),
+        {"gp_earn": gp_earn, "sponsor_id": sponsor_id}
+    )
+    db.commit()
+    return {"ok": True, "earned": gp_earn}
+
+
+@router.post("/sponsor/complaints")
+def sponsor_create_complaint(payload: SponsorComplaintPayload, db: Session = Depends(get_db)):
+    sponsor_id = payload.sponsor_id
+    
+    row = db.execute(
+        text("SELECT id FROM green_sponsor_accounts WHERE id = :sponsor_id AND COALESCE(is_active, TRUE) = TRUE"),
+        {"sponsor_id": sponsor_id}
+    ).scalar()
+    if not row:
+        raise HTTPException(status_code=404, detail="Sponsor account not found")
+        
+    db.execute(
+        text("""
+            INSERT INTO green_sponsor_complaints (sponsor_id, tree_id, complaint_type, message, status)
+            VALUES (:sponsor_id, :tree_id, :complaint_type, :message, 'open')
+        """),
+        {
+            "sponsor_id": payload.sponsor_id,
+            "tree_id": payload.tree_id,
+            "complaint_type": payload.complaint_type,
+            "message": payload.message
+        }
+    )
+    db.commit()
+    return {"ok": True, "message": "Complaint submitted successfully. Our support team is reviewing it."}
+
+
+@router.get("/admin/complaints")
+def list_admin_complaints(db: Session = Depends(get_db)):
+    rows = db.execute(
+        text("""
+            SELECT c.id, c.sponsor_id, c.tree_id, c.complaint_type, c.message, c.status, c.created_at,
+                   sa.full_name AS sponsor_name, sa.email AS sponsor_email
+            FROM green_sponsor_complaints c
+            JOIN green_sponsor_accounts sa ON sa.id = c.sponsor_id
+            ORDER BY c.created_at DESC
+        """)
+    ).mappings().all()
+    return [dict(row) for row in rows]
+
+
+@router.patch("/admin/complaints/{complaint_id}")
+def update_admin_complaint_status(complaint_id: int, status: str = Query(...), db: Session = Depends(get_db)):
+    db.execute(
+        text("UPDATE green_sponsor_complaints SET status = :status WHERE id = :id"),
+        {"status": status, "id": complaint_id}
+    )
+    db.commit()
+    return {"ok": True}
+
+
+@router.get("/admin/school-nominations")
+def list_admin_school_nominations(db: Session = Depends(get_db)):
+    rows = db.execute(
+        text("""
+            SELECT n.id, n.sponsor_id, n.school_name, n.school_address, n.contact_person, n.contact_phone, n.reason, n.points_spent, n.created_at,
+                   sa.full_name AS sponsor_name, sa.email AS sponsor_email
+            FROM green_school_nominations n
+            JOIN green_sponsor_accounts sa ON sa.id = n.sponsor_id
+            ORDER BY n.created_at DESC
+        """)
+    ).mappings().all()
+    return [dict(row) for row in rows]
+
+
+@router.get("/admin/community-projects")
+def list_admin_community_projects(db: Session = Depends(get_db)):
+    rows = db.execute(
+        text("""
+            SELECT p.id, p.sponsor_id, p.project_name, p.proposed_location, p.description, p.points_contributed, p.created_at,
+                   sa.full_name AS sponsor_name, sa.email AS sponsor_email
+            FROM green_community_projects p
+            JOIN green_sponsor_accounts sa ON sa.id = p.sponsor_id
+            ORDER BY p.created_at DESC
+        """)
+    ).mappings().all()
+    return [dict(row) for row in rows]
 
 
 @router.post("/sponsor/community-project")
