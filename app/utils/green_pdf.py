@@ -3964,3 +3964,115 @@ def render_green_relief_programme_pdf(
         finish_page(final=True)
 
     c.save()
+
+
+def render_green_tree_qr_tag_pdf(tree: dict, verification_url: str) -> bytes:
+    import io
+    from datetime import datetime
+    buffer = io.BytesIO()
+    page_w = 250
+    page_h = 380
+    c = canvas.Canvas(buffer, pagesize=(page_w, page_h))
+    
+    # Background
+    c.setFillColor(HexColor("#fafaf7"))
+    c.rect(0, 0, page_w, page_h, stroke=0, fill=1)
+    
+    # Outer border
+    c.setStrokeColor(HexColor("#083e20")) # Forest Green
+    c.setLineWidth(1.5)
+    c.rect(8, 8, page_w - 16, page_h - 16, stroke=1, fill=0)
+    
+    # Inner thin gold border
+    c.setStrokeColor(HexColor("#c5a059")) # Gold
+    c.setLineWidth(0.6)
+    c.rect(12, 12, page_w - 24, page_h - 24, stroke=1, fill=0)
+    
+    # Top Header Bar
+    c.setFillColor(HexColor("#083e20"))
+    c.rect(12, page_h - 52, page_w - 24, 40, stroke=0, fill=1)
+    
+    # Header Text
+    c.setFillColor(HexColor("#ffffff"))
+    c.setFont("Helvetica-Bold", 10)
+    c.drawCentredString(page_w / 2, page_h - 30, "LANDCHECK GREEN")
+    c.setFont("Helvetica", 7.5)
+    c.setFillColor(HexColor("#c5a059"))
+    c.drawCentredString(page_w / 2, page_h - 43, "VERIFIED TREE RECORD")
+    
+    # Tree Identification
+    tree_no = tree.get("project_tree_no") or tree.get("tree_id") or 0
+    tree_id_str = f"Tree ID: LC-{tree.get('tree_id')}"
+    tree_no_str = f"Tree #{tree_no}" if tree.get("project_tree_no") else f"Tree ID {tree.get('tree_id')}"
+    
+    c.setFillColor(HexColor("#083e20"))
+    c.setFont("Helvetica-Bold", 12)
+    c.drawCentredString(page_w / 2, page_h - 72, tree_no_str)
+    
+    # QR Code in center
+    qr_size = 110
+    qr_x = (page_w - qr_size) / 2
+    qr_y = page_h - 192
+    _draw_qr_code(c, verification_url, qr_x, qr_y, qr_size)
+    
+    # Scan text below QR
+    c.setFillColor(HexColor("#53705f"))
+    c.setFont("Helvetica", 6.5)
+    c.drawCentredString(page_w / 2, qr_y - 10, "Scan QR to verify live story & growth history")
+    
+    # Sponsor Recognition Section
+    sponsor_name = tree.get("sponsor_name")
+    c.setStrokeColor(HexColor("#dcdfdc"))
+    c.setLineWidth(0.5)
+    c.line(16, qr_y - 18, page_w - 16, qr_y - 18)
+    
+    box_y = qr_y - 68
+    box_h = 44
+    _draw_rounded_box(c, 16, box_y, page_w - 32, box_h, 6, fill_color=HexColor("#ffffff"), stroke_color=HexColor("#dcdfdc"))
+    
+    if sponsor_name:
+        c.setFillColor(HexColor("#083e20"))
+        c.setFont("Helvetica-Bold", 8.5)
+        c.drawCentredString(page_w / 2, box_y + box_h - 14, "SPONSORED BY")
+        c.setFillColor(HexColor("#c5a059"))
+        c.setFont("Times-BoldItalic", 11)
+        c.drawCentredString(page_w / 2, box_y + 12, str(sponsor_name))
+    else:
+        c.setFillColor(HexColor("#53705f"))
+        c.setFont("Helvetica-Bold", 8)
+        c.drawCentredString(page_w / 2, box_y + box_h - 14, "SPONSORSHIP AVAILABLE")
+        c.setFillColor(HexColor("#083e20"))
+        c.setFont("Helvetica", 7.5)
+        c.drawCentredString(page_w / 2, box_y + 12, "Scan QR code to sponsor this tree")
+        
+    # Metadata Table details
+    meta_y = box_y - 14
+    
+    def draw_meta_line(label, val, y):
+        c.setFillColor(HexColor("#53705f"))
+        c.setFont("Helvetica-Bold", 7.5)
+        c.drawString(20, y, label)
+        c.setFillColor(HexColor("#163826"))
+        c.setFont("Helvetica", 7.5)
+        c.drawRightString(page_w - 20, y, str(val))
+        
+    species = tree.get("species") or "Unknown species"
+    project = tree.get("project_name") or "LandCheck Restoration"
+    planted_date = str(tree.get("planting_date") or "Pending")
+    status = str(tree.get("tree_status") or tree.get("status") or "alive").replace("_", " ").title()
+    impact = f"{float(tree.get('annual_co2_kg') or 21.0):.1f} kg CO2/yr"
+    
+    draw_meta_line("Species:", species[:28], meta_y)
+    draw_meta_line("Project:", project[:28], meta_y - 12)
+    draw_meta_line("Date Planted:", planted_date, meta_y - 24)
+    draw_meta_line("Status:", status, meta_y - 36)
+    draw_meta_line("Carbon Impact:", impact, meta_y - 48)
+    
+    # Tag footer
+    c.setFillColor(HexColor("#8a9a8f"))
+    c.setFont("Helvetica", 6)
+    c.drawCentredString(page_w / 2, 16, f"Ref ID: {tree_id_str} | registry.landcheck.org")
+    
+    c.save()
+    buffer.seek(0)
+    return buffer.getvalue()

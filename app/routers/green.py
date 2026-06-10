@@ -4708,6 +4708,40 @@ def ensure_green_tables(db: Session):
             updated_at TIMESTAMP DEFAULT NOW()
         )
     """))
+    db.execute(text("""
+        CREATE TABLE IF NOT EXISTS green_school_nominations (
+            id SERIAL PRIMARY KEY,
+            sponsor_id INTEGER NOT NULL REFERENCES green_sponsor_accounts(id) ON DELETE CASCADE,
+            school_name TEXT NOT NULL,
+            school_address TEXT NOT NULL,
+            contact_person TEXT,
+            contact_phone TEXT,
+            reason TEXT,
+            created_at TIMESTAMP DEFAULT NOW()
+        )
+    """))
+    db.execute(text("""
+        CREATE TABLE IF NOT EXISTS green_community_projects (
+            id SERIAL PRIMARY KEY,
+            sponsor_id INTEGER NOT NULL REFERENCES green_sponsor_accounts(id) ON DELETE CASCADE,
+            project_name TEXT NOT NULL,
+            proposed_location TEXT NOT NULL,
+            description TEXT,
+            points_contributed INTEGER NOT NULL DEFAULT 0,
+            created_at TIMESTAMP DEFAULT NOW()
+        )
+    """))
+    db.execute(text("""
+        CREATE TABLE IF NOT EXISTS green_sponsor_point_redemptions (
+            id SERIAL PRIMARY KEY,
+            sponsor_id INTEGER NOT NULL REFERENCES green_sponsor_accounts(id) ON DELETE CASCADE,
+            reward_type TEXT NOT NULL,
+            points_spent INTEGER NOT NULL,
+            shipping_details JSONB,
+            status TEXT NOT NULL DEFAULT 'pending',
+            created_at TIMESTAMP DEFAULT NOW()
+        )
+    """))
     try:
         db.execute(text("ALTER TABLE green_users ADD COLUMN IF NOT EXISTS user_uid TEXT"))
         db.execute(text("ALTER TABLE green_users ADD COLUMN IF NOT EXISTS email TEXT"))
@@ -4731,6 +4765,19 @@ def ensure_green_tables(db: Session):
         db.execute(text("ALTER TABLE green_sponsor_accounts ADD COLUMN IF NOT EXISTS password_reset_token_expires_at TIMESTAMP"))
         db.execute(text("ALTER TABLE green_sponsor_accounts ADD COLUMN IF NOT EXISTS password_reset_requested_at TIMESTAMP"))
         db.execute(text("ALTER TABLE green_sponsor_accounts ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW()"))
+        db.execute(text("ALTER TABLE green_sponsor_accounts ADD COLUMN IF NOT EXISTS green_points INTEGER NOT NULL DEFAULT 0"))
+        db.execute(text("ALTER TABLE green_sponsor_accounts ADD COLUMN IF NOT EXISTS lifetime_points INTEGER NOT NULL DEFAULT 0"))
+        db.execute(text("ALTER TABLE green_sponsor_accounts ADD COLUMN IF NOT EXISTS referral_code TEXT"))
+        db.execute(text("ALTER TABLE green_sponsor_accounts ADD COLUMN IF NOT EXISTS referred_by_id INTEGER REFERENCES green_sponsor_accounts(id)"))
+        db.execute(text("ALTER TABLE green_sponsor_accounts ADD COLUMN IF NOT EXISTS point_booster_multiplier NUMERIC NOT NULL DEFAULT 1.0"))
+        db.execute(text("ALTER TABLE green_sponsor_accounts ADD COLUMN IF NOT EXISTS point_booster_remaining_uses INTEGER NOT NULL DEFAULT 0"))
+        db.execute(text("ALTER TABLE green_sponsor_accounts ADD COLUMN IF NOT EXISTS profile_photo_url TEXT"))
+        db.execute(text("ALTER TABLE green_sponsor_accounts ADD COLUMN IF NOT EXISTS unlocked_species JSONB NOT NULL DEFAULT '[]'"))
+        db.execute(text("ALTER TABLE green_sponsor_accounts ADD COLUMN IF NOT EXISTS unlocked_avatars JSONB NOT NULL DEFAULT '[]'"))
+        db.execute(text("ALTER TABLE green_sponsor_accounts ADD COLUMN IF NOT EXISTS unlocked_map_icons JSONB NOT NULL DEFAULT '[]'"))
+        db.execute(text("ALTER TABLE green_sponsor_accounts ADD COLUMN IF NOT EXISTS current_avatar_border TEXT"))
+        db.execute(text("ALTER TABLE green_sponsor_accounts ADD COLUMN IF NOT EXISTS current_map_icon TEXT"))
+        db.execute(text("ALTER TABLE green_sponsorship_orders ADD COLUMN IF NOT EXISTS points_awarded BOOLEAN NOT NULL DEFAULT FALSE"))
         db.execute(text("ALTER TABLE green_push_tokens ADD COLUMN IF NOT EXISTS organization_id INTEGER"))
         db.execute(text("ALTER TABLE green_push_tokens ADD COLUMN IF NOT EXISTS platform TEXT"))
         db.execute(text("ALTER TABLE green_push_tokens ADD COLUMN IF NOT EXISTS app_version TEXT"))
@@ -7929,6 +7976,101 @@ def _sync_sponsor_agent_payout_transfer(db: Session, payout_row: dict) -> dict:
     return dict(updated) if updated else dict(payout_row)
 
 
+def _award_points_for_order(db: Session, order_id: int):
+    # Load order details
+    order_row = db.execute(
+        text("SELECT id, sponsor_account_id, quantity, points_awarded FROM green_sponsorship_orders WHERE id = :order_id"),
+        {"order_id": int(order_id)}
+    ).mappings().first()
+    if not order_row or order_row.get("points_awarded"):
+        return
+        
+    sponsor_id = order_row.get("sponsor_account_id")
+    quantity = int(order_row.get("quantity") or 0)
+    if quantity <= 0:
+        return
+        
+    # Load sponsor details
+    sponsor = db.execute(
+        text("SELECT id, referred_by_id, point_booster_multiplier, point_booster_remaining_uses FROM green_sponsor_accounts WHERE id = :sponsor_id"),
+        {"sponsor_id": sponsor_id}
+    ).mappings().first()
+    if not sponsor:
+        return
+        
+    # Calculate base points (100 points per tree)
+    base_points = quantity * 100
+    multiplier = float(sponsor.get("point_booster_multiplier") or 1.0)
+    uses = int(sponsor.get("point_booster_remaining_uses") or 0)
+    
+    earned_points = base_points
+    if uses > 0:
+        earned_points = int(base_points * multiplier)
+        # Decrement booster uses
+        new_uses = uses - 1
+        new_multiplier = multiplier if new_uses > 0 else 1.0
+        db.execute(
+            text("""
+                UPDATE green_sponsor_accounts 
+                SET point_booster_remaining_uses = :new_uses,
+                    point_booster_multiplier = :new_multiplier,
+                    updated_at = NOW()
+                WHERE id = :sponsor_id
+            """),
+            {"new_uses": new_uses, "new_multiplier": new_multiplier, "sponsor_id": sponsor_id}
+        )
+        
+    # Award points to sponsor
+    db.execute(
+        text("""
+            UPDATE green_sponsor_accounts
+            SET green_points = green_points + :points,
+                lifetime_points = lifetime_points + :points,
+                updated_at = NOW()
+            WHERE id = :sponsor_id
+        """),
+        {"points": earned_points, "sponsor_id": sponsor_id}
+    )
+    
+    # Mark order as points awarded
+    db.execute(
+        text("UPDATE green_sponsorship_orders SET points_awarded = TRUE, updated_at = NOW() WHERE id = :order_id"),
+        {"order_id": order_id}
+    )
+    
+    # Check if this is the sponsor's first points-awarded order
+    orders_count = db.execute(
+        text("SELECT COUNT(*) FROM green_sponsorship_orders WHERE sponsor_account_id = :sponsor_id AND points_awarded = TRUE"),
+        {"sponsor_id": sponsor_id}
+    ).scalar() or 0
+    
+    # If this was their first order, and they were referred by someone
+    if orders_count == 1 and sponsor.get("referred_by_id"):
+        referrer_id = sponsor.get("referred_by_id")
+        # Referrer gets 150 points
+        db.execute(
+            text("""
+                UPDATE green_sponsor_accounts
+                SET green_points = green_points + 150,
+                    lifetime_points = lifetime_points + 150,
+                    updated_at = NOW()
+                WHERE id = :referrer_id
+            """),
+            {"referrer_id": referrer_id}
+        )
+        # Referred gets 50 points bonus
+        db.execute(
+            text("""
+                UPDATE green_sponsor_accounts
+                SET green_points = green_points + 50,
+                    lifetime_points = lifetime_points + 50,
+                    updated_at = NOW()
+                WHERE id = :sponsor_id
+            """),
+            {"sponsor_id": sponsor_id}
+        )
+
+
 def _refresh_sponsorship_order_status(db: Session, order_id: int):
     counts = db.execute(
         text(
@@ -7973,6 +8115,8 @@ def _refresh_sponsorship_order_status(db: Session, order_id: int):
         ),
         {"order_id": int(order_id), "order_status": next_status},
     )
+    if next_status in {"paid", "allocated", "completed"}:
+        _award_points_for_order(db, order_id)
 
 
 def _link_tree_to_pending_sponsorship_unit(db: Session, project_id: int, tree_id: int) -> dict | None:
@@ -10342,6 +10486,342 @@ def get_sponsor_profile_achievements(
     return _calculate_sponsor_achievement(db, sponsor_id)
 
 
+class SponsorRedeemPayload(BaseModel):
+    sponsor_id: int
+    reward_type: str
+    shipping_details: dict | None = None
+
+class SponsorNominateSchoolPayload(BaseModel):
+    sponsor_id: int
+    school_name: str
+    school_address: str
+    contact_person: str | None = None
+    contact_phone: str | None = None
+    reason: str
+
+class SponsorCommunityProjectPayload(BaseModel):
+    sponsor_id: int
+    project_name: str
+    proposed_location: str
+    description: str | None = None
+    points: int
+
+class SponsorUpdateProfilePhotoPayload(BaseModel):
+    sponsor_id: int
+    profile_photo_url: str
+
+class SponsorUpdateAppearancePayload(BaseModel):
+    sponsor_id: int
+    avatar_border: str | None = None
+    map_icon: str | None = None
+
+class SponsorApplyReferralPayload(BaseModel):
+    sponsor_id: int
+    referral_code: str
+
+
+@router.get("/sponsor/points")
+def get_sponsor_points(sponsor_id: int = Query(...), db: Session = Depends(get_db)):
+    import uuid
+    import json
+    row = db.execute(
+        text("""
+            SELECT id, green_points, lifetime_points, referral_code, referred_by_id,
+                   point_booster_multiplier, point_booster_remaining_uses, profile_photo_url,
+                   unlocked_species, unlocked_avatars, unlocked_map_icons,
+                   current_avatar_border, current_map_icon
+            FROM green_sponsor_accounts
+            WHERE id = :sponsor_id AND COALESCE(is_active, TRUE) = TRUE
+        """),
+        {"sponsor_id": int(sponsor_id)}
+    ).mappings().first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Sponsor account not found")
+    
+    item = dict(row)
+    
+    # Generate referral code if not exists
+    if not item.get("referral_code"):
+        ref = f"LC-REF-{sponsor_id}-{uuid.uuid4().hex[:4].upper()}"
+        db.execute(text("UPDATE green_sponsor_accounts SET referral_code = :ref WHERE id = :sponsor_id"), {"ref": ref, "sponsor_id": sponsor_id})
+        db.commit()
+        item["referral_code"] = ref
+
+    # Normalize JSON arrays
+    for key in ["unlocked_species", "unlocked_avatars", "unlocked_map_icons"]:
+        val = item.get(key)
+        if val is None:
+            item[key] = []
+        elif isinstance(val, str):
+            try:
+                item[key] = json.loads(val)
+            except Exception:
+                item[key] = []
+        elif not isinstance(val, list):
+            item[key] = []
+            
+    # Cast point booster multiplier to float for frontend compatibility
+    if item.get("point_booster_multiplier") is not None:
+        item["point_booster_multiplier"] = float(item["point_booster_multiplier"])
+            
+    return item
+
+
+@router.post("/sponsor/redeem")
+def redeem_sponsor_reward(payload: SponsorRedeemPayload, db: Session = Depends(get_db)):
+    import json
+    sponsor_id = payload.sponsor_id
+    reward_type = payload.reward_type.strip()
+    
+    row = db.execute(
+        text("""
+            SELECT id, green_points, unlocked_species, unlocked_avatars, unlocked_map_icons
+            FROM green_sponsor_accounts
+            WHERE id = :sponsor_id AND COALESCE(is_active, TRUE) = TRUE
+        """),
+        {"sponsor_id": sponsor_id}
+    ).mappings().first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Sponsor account not found")
+        
+    current_points = int(row.get("green_points") or 0)
+    
+    # Determine cost and apply changes
+    cost = 0
+    if reward_type == "multiplier":  # Sunshine Elixir point booster
+        cost = 50
+    elif reward_type.startswith("avatar_"):
+        cost = 200
+    elif reward_type.startswith("map_icon_"):
+        cost = 150
+    elif reward_type.startswith("unlock_species_"):
+        cost = 500
+    elif reward_type.startswith("merch_"):
+        cost = 800 if reward_type == "merch_tote" else (1000 if reward_type == "merch_cap" else 1500)
+    else:
+        raise HTTPException(status_code=400, detail="Invalid reward type")
+        
+    if current_points < cost:
+        raise HTTPException(status_code=400, detail="Insufficient points balance")
+        
+    # Process redemption
+    db.execute(
+        text("UPDATE green_sponsor_accounts SET green_points = green_points - :cost, updated_at = NOW() WHERE id = :sponsor_id"),
+        {"cost": cost, "sponsor_id": sponsor_id}
+    )
+    
+    # Log redemption
+    db.execute(
+        text("""
+            INSERT INTO green_sponsor_point_redemptions (sponsor_id, reward_type, points_spent, shipping_details)
+            VALUES (:sponsor_id, :reward_type, :cost, CAST(:shipping_details AS JSONB))
+        """),
+        {
+            "sponsor_id": sponsor_id,
+            "reward_type": reward_type,
+            "cost": cost,
+            "shipping_details": json.dumps(payload.shipping_details) if payload.shipping_details else None
+        }
+    )
+    
+    # Unlock digital assets/boosters
+    if reward_type == "multiplier":
+        db.execute(
+            text("""
+                UPDATE green_sponsor_accounts
+                SET point_booster_multiplier = 2.0,
+                    point_booster_remaining_uses = point_booster_remaining_uses + 1,
+                    updated_at = NOW()
+                WHERE id = :sponsor_id
+            """),
+            {"sponsor_id": sponsor_id}
+        )
+    elif reward_type.startswith("avatar_"):
+        avatar_name = reward_type.replace("avatar_", "")
+        unlocked = row.get("unlocked_avatars") or []
+        if isinstance(unlocked, str):
+            try: unlocked = json.loads(unlocked)
+            except Exception: unlocked = []
+        if avatar_name not in unlocked:
+            unlocked.append(avatar_name)
+        db.execute(
+            text("UPDATE green_sponsor_accounts SET unlocked_avatars = CAST(:val AS JSONB), updated_at = NOW() WHERE id = :sponsor_id"),
+            {"val": json.dumps(unlocked), "sponsor_id": sponsor_id}
+        )
+    elif reward_type.startswith("map_icon_"):
+        icon_name = reward_type.replace("map_icon_", "")
+        unlocked = row.get("unlocked_map_icons") or []
+        if isinstance(unlocked, str):
+            try: unlocked = json.loads(unlocked)
+            except Exception: unlocked = []
+        if icon_name not in unlocked:
+            unlocked.append(icon_name)
+        db.execute(
+            text("UPDATE green_sponsor_accounts SET unlocked_map_icons = CAST(:val AS JSONB), updated_at = NOW() WHERE id = :sponsor_id"),
+            {"val": json.dumps(unlocked), "sponsor_id": sponsor_id}
+        )
+    elif reward_type.startswith("unlock_species_"):
+        species_name = reward_type.replace("unlock_species_", "")
+        unlocked = row.get("unlocked_species") or []
+        if isinstance(unlocked, str):
+            try: unlocked = json.loads(unlocked)
+            except Exception: unlocked = []
+        if species_name not in unlocked:
+            unlocked.append(species_name)
+        db.execute(
+            text("UPDATE green_sponsor_accounts SET unlocked_species = CAST(:val AS JSONB), updated_at = NOW() WHERE id = :sponsor_id"),
+            {"val": json.dumps(unlocked), "sponsor_id": sponsor_id}
+        )
+        
+    db.commit()
+    return {"ok": True, "spent": cost, "reward_type": reward_type}
+
+
+@router.post("/sponsor/nominate-school")
+def nominate_school(payload: SponsorNominateSchoolPayload, db: Session = Depends(get_db)):
+    db.execute(
+        text("""
+            INSERT INTO green_school_nominations (sponsor_id, school_name, school_address, contact_person, contact_phone, reason)
+            VALUES (:sponsor_id, :school_name, :school_address, :contact_person, :contact_phone, :reason)
+        """),
+        {
+            "sponsor_id": payload.sponsor_id,
+            "school_name": payload.school_name,
+            "school_address": payload.school_address,
+            "contact_person": payload.contact_person,
+            "contact_phone": payload.contact_phone,
+            "reason": payload.reason
+        }
+    )
+    db.commit()
+    return {"ok": True, "message": "Nomination submitted successfully!"}
+
+
+@router.post("/sponsor/community-project")
+def create_community_project(payload: SponsorCommunityProjectPayload, db: Session = Depends(get_db)):
+    sponsor_id = payload.sponsor_id
+    points = payload.points
+    if points <= 0:
+        raise HTTPException(status_code=400, detail="Points contributed must be greater than zero")
+        
+    row = db.execute(
+        text("SELECT green_points FROM green_sponsor_accounts WHERE id = :sponsor_id AND COALESCE(is_active, TRUE) = TRUE"),
+        {"sponsor_id": sponsor_id}
+    ).mappings().first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Sponsor account not found")
+        
+    current_points = int(row.get("green_points") or 0)
+    if current_points < points:
+        raise HTTPException(status_code=400, detail="Insufficient points balance")
+        
+    db.execute(
+        text("UPDATE green_sponsor_accounts SET green_points = green_points - :points, updated_at = NOW() WHERE id = :sponsor_id"),
+        {"points": points, "sponsor_id": sponsor_id}
+    )
+    
+    db.execute(
+        text("""
+            INSERT INTO green_community_projects (sponsor_id, project_name, proposed_location, description, points_contributed)
+            VALUES (:sponsor_id, :project_name, :proposed_location, :description, :points)
+        """),
+        {
+            "sponsor_id": sponsor_id,
+            "project_name": payload.project_name,
+            "proposed_location": payload.proposed_location,
+            "description": payload.description,
+            "points": points
+        }
+    )
+    db.commit()
+    return {"ok": True, "spent": points}
+
+
+@router.post("/sponsor/update-profile-photo")
+def update_sponsor_profile_photo(payload: SponsorUpdateProfilePhotoPayload, db: Session = Depends(get_db)):
+    db.execute(
+        text("UPDATE green_sponsor_accounts SET profile_photo_url = :photo_url, updated_at = NOW() WHERE id = :sponsor_id"),
+        {"photo_url": payload.profile_photo_url.strip(), "sponsor_id": payload.sponsor_id}
+    )
+    db.commit()
+    return {"ok": True}
+
+
+@router.post("/sponsor/update-appearance")
+def update_sponsor_appearance(payload: SponsorUpdateAppearancePayload, db: Session = Depends(get_db)):
+    import json
+    sponsor_id = payload.sponsor_id
+    avatar_border = payload.avatar_border
+    map_icon = payload.map_icon
+    
+    row = db.execute(
+        text("SELECT unlocked_avatars, unlocked_map_icons FROM green_sponsor_accounts WHERE id = :sponsor_id"),
+        {"sponsor_id": sponsor_id}
+    ).mappings().first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Sponsor account not found")
+        
+    # Check if border is unlocked
+    if avatar_border and avatar_border != "none":
+        unlocked = row.get("unlocked_avatars") or []
+        if isinstance(unlocked, str): unlocked = json.loads(unlocked)
+        if avatar_border not in unlocked:
+            raise HTTPException(status_code=400, detail="Avatar border not unlocked")
+            
+    # Check if map icon is unlocked
+    if map_icon and map_icon != "default":
+        unlocked = row.get("unlocked_map_icons") or []
+        if isinstance(unlocked, str): unlocked = json.loads(unlocked)
+        if map_icon not in unlocked:
+            raise HTTPException(status_code=400, detail="Map icon not unlocked")
+            
+    db.execute(
+        text("""
+            UPDATE green_sponsor_accounts
+            SET current_avatar_border = :avatar_border,
+                current_map_icon = :map_icon,
+                updated_at = NOW()
+            WHERE id = :sponsor_id
+        """),
+        {"avatar_border": avatar_border, "map_icon": map_icon, "sponsor_id": sponsor_id}
+    )
+    db.commit()
+    return {"ok": True}
+
+
+@router.post("/sponsor/apply-referral")
+def apply_referral_code(payload: SponsorApplyReferralPayload, db: Session = Depends(get_db)):
+    sponsor_id = payload.sponsor_id
+    ref_code = payload.referral_code.strip()
+    
+    sponsor = db.execute(
+        text("SELECT referred_by_id, referral_code FROM green_sponsor_accounts WHERE id = :sponsor_id"),
+        {"sponsor_id": sponsor_id}
+    ).mappings().first()
+    if not sponsor:
+        raise HTTPException(status_code=404, detail="Sponsor account not found")
+        
+    if sponsor.get("referred_by_id"):
+        raise HTTPException(status_code=400, detail="Referral already applied to this account")
+        
+    if ref_code == sponsor.get("referral_code"):
+        raise HTTPException(status_code=400, detail="Cannot refer yourself")
+        
+    referrer = db.execute(
+        text("SELECT id FROM green_sponsor_accounts WHERE UPPER(referral_code) = UPPER(:ref_code)"),
+        {"ref_code": ref_code}
+    ).mappings().first()
+    if not referrer:
+        raise HTTPException(status_code=404, detail="Invalid referral code")
+        
+    db.execute(
+        text("UPDATE green_sponsor_accounts SET referred_by_id = :referrer_id, updated_at = NOW() WHERE id = :sponsor_id"),
+        {"referrer_id": referrer.get("id"), "sponsor_id": sponsor_id}
+    )
+    db.commit()
+    return {"ok": True, "message": "Referral code applied!"}
+
+
 def _build_public_asset_url(raw_value: object, request: Request | None = None) -> str | None:
     raw = str(raw_value or "").strip()
     if not raw:
@@ -10463,8 +10943,27 @@ def _hydrate_sponsor_tree_story_item(item: dict, db: Session, request: Request |
 
 
 def _render_public_sponsor_tree_story_html(item: dict) -> str:
-    sponsor_name = html.escape(str(item.get("sponsor_name") or "Climate sponsor").strip() or "Climate sponsor")
+    sponsor_name_raw = str(item.get("sponsor_name") or "").strip()
     sponsor_org = html.escape(str(item.get("sponsor_organization_name") or "").strip())
+    
+    is_sponsored = bool(sponsor_name_raw)
+    if is_sponsored:
+        sponsor_name = html.escape(sponsor_name_raw)
+        sponsor_desc = f"This page shows the real map location, approved field photos, care history, and certificate for the sponsored tree linked to {sponsor_name}."
+        sponsor_box_html = f"""
+            <article class="detail-card"><label>Sponsor</label><strong>{sponsor_name}</strong></article>
+            <article class="detail-card"><label>Organization</label><strong>{sponsor_org or 'Individual sponsor'}</strong></article>
+        """
+    else:
+        sponsor_name = "Climate Sponsor"
+        sponsor_desc = "This page shows the real map location, approved field photos, and care history for this tree. This tree is currently available for sponsorship!"
+        sponsor_box_html = """
+            <article class="detail-card" style="grid-column: span 2; background: #fffcf4; border: 1px dashed #c5a059;">
+                <label style="color: #b8860b;">Sponsorship Available</label>
+                <strong style="color: #083e20; font-size: 1.1rem; margin-top: 4px;">Sponsor this tree & receive live updates!</strong>
+                <p style="margin: 6px 0 0; font-size: 0.8rem; color: #53705f;">Use the LandCheck Green mobile app to sponsor this tree, link your name, and receive a digital certificate.</p>
+            </article>
+        """
     project_name = html.escape(str(item.get("project_name") or "LandCheck Green project").strip() or "LandCheck Green project")
     species = html.escape(str(item.get("species") or "Verified tree").strip() or "Verified tree")
     tree_label = html.escape(
@@ -10856,7 +11355,7 @@ def _render_public_sponsor_tree_story_html(item: dict) -> str:
           <div>
             <p class="eyebrow">LandCheck Green verified tree story</p>
             <h1>{tree_label} is a live, field-verified climate action record.</h1>
-            <p>This page shows the real map location, approved field photos, care history, and certificate for the sponsored tree linked to {sponsor_name}.</p>
+            <p>{sponsor_desc}</p>
           </div>
           <div class="chip-row">
             <div class="chip">Status &middot; {status_label}</div>
@@ -10901,8 +11400,7 @@ def _render_public_sponsor_tree_story_html(item: dict) -> str:
             </div>
           </div>
           <div class="detail-grid">
-            <article class="detail-card"><label>Sponsor</label><strong>{sponsor_name}</strong></article>
-            <article class="detail-card"><label>Organization</label><strong>{sponsor_org or 'Individual sponsor'}</strong></article>
+            {sponsor_box_html}
             <article class="detail-card"><label>Project</label><strong>{project_name}</strong></article>
             <article class="detail-card"><label>Location</label><strong>{location_text}</strong></article>
             <article class="detail-card"><label>Planting date</label><strong>{planting_date}</strong></article>
@@ -11407,6 +11905,68 @@ def export_sponsor_tree_certificate(
     )
 
 
+@router.get("/trees/{tree_id}/qr-tag/pdf")
+def export_tree_qr_tag_pdf(
+    tree_id: int,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    from app.utils.green_pdf import render_green_tree_qr_tag_pdf
+    
+    # Load tree and project info, and optional sponsor info via LEFT JOINs
+    tree = db.execute(
+        text(
+            """
+            SELECT
+                t.id AS tree_id, t.project_tree_no, t.species, t.status, t.planting_date,
+                t.photo_url, t.photo_urls, t.tree_height_m, t.tree_age_months, t.inventory_tree_count,
+                t.count_in_carbon_scope, t.created_by, t.created_at AS tree_created_at,
+                p.id AS project_id, p.name AS project_name, p.location_text,
+                sa.full_name AS sponsor_name, sa.organization_name AS sponsor_organization_name,
+                u.unit_uid
+            FROM trees t
+            JOIN tree_projects p ON p.id = t.project_id
+            LEFT JOIN green_sponsorship_units u ON u.tree_id = t.id AND LOWER(COALESCE(u.sponsorship_status, '')) IN ('linked', 'active', 'replaced')
+            LEFT JOIN green_sponsor_accounts sa ON sa.id = u.sponsor_account_id
+            WHERE t.id = :tree_id
+            LIMIT 1
+            """
+        ),
+        {"tree_id": int(tree_id)},
+    ).mappings().first()
+    
+    if not tree:
+        raise HTTPException(status_code=404, detail="Tree not found")
+        
+    tree_dict = dict(tree)
+    
+    # Calculate carbon impact
+    carbon = _build_tree_carbon_summary(tree_dict)
+    tree_dict["annual_co2_kg"] = carbon.get("annual_co2_kg", 21.0)
+    
+    # Determine the public story URL for the QR code
+    unit_uid = tree_dict.get("unit_uid")
+    if unit_uid:
+        verification_url = _build_sponsor_public_story_url(unit_uid, request)
+    else:
+        # If not sponsored, QR links to the public tree story using tree_id!
+        base_url = _build_public_api_base_url(request)
+        verification_url = f"{base_url}/green/sponsor/public/trees/{tree_id}"
+        
+    pdf_bytes = render_green_tree_qr_tag_pdf(tree_dict, verification_url)
+    
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={
+            "Content-Disposition": f'inline; filename=\"tree_qr_tag_{int(tree_id)}.pdf\"',
+            "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+            "Pragma": "no-cache",
+            "Expires": "0",
+        },
+    )
+
+
 @router.get("/app/version-check")
 def app_version_check(db: Session = Depends(get_db)):
     latest = os.getenv("LANDCHECK_LATEST_APP_VERSION", "1.0.17")
@@ -11418,13 +11978,44 @@ def app_version_check(db: Session = Depends(get_db)):
     }
 
 
-def _load_public_sponsor_tree_story_row(db: Session, unit_uid: str):
-    normalized_uid = str(unit_uid or "").strip()
-    if not normalized_uid:
+def _load_public_sponsor_tree_story_row(db: Session, identifier: str):
+    normalized_id = str(identifier or "").strip()
+    if not normalized_id:
         return None
-    return db.execute(
-        text(
-            """
+        
+    is_numeric = False
+    try:
+        int(normalized_id)
+        is_numeric = True
+    except ValueError:
+        pass
+        
+    if is_numeric:
+        # Load by tree_id with LEFT JOINs
+        sql = """
+            SELECT
+                sa.full_name AS sponsor_name,
+                sa.organization_name AS sponsor_organization_name,
+                u.id AS unit_id, u.unit_uid, u.sponsorship_status, u.linked_at,
+                u.dedication_type, u.dedication_name, u.dedication_message,
+                o.id AS order_id, o.order_uid, o.payment_status, o.order_status, o.created_at AS order_created_at,
+                p.id AS project_id, p.name AS project_name, p.location_text, p.organization_id,
+                t.id AS tree_id, t.project_tree_no, t.species, t.status AS tree_status, t.notes AS tree_notes,
+                t.planting_date, t.photo_url, t.photo_urls, t.tree_height_m, t.tree_age_months, t.inventory_tree_count,
+                t.count_in_carbon_scope, t.created_by, t.created_at AS tree_created_at,
+                ST_X(t.geom) AS lng, ST_Y(t.geom) AS lat
+            FROM trees t
+            JOIN tree_projects p ON p.id = t.project_id
+            LEFT JOIN green_sponsorship_units u ON u.tree_id = t.id AND LOWER(COALESCE(u.sponsorship_status, '')) IN ('linked', 'active', 'replaced')
+            LEFT JOIN green_sponsor_accounts sa ON sa.id = u.sponsor_account_id
+            LEFT JOIN green_sponsorship_orders o ON o.id = u.order_id
+            WHERE t.id = :tree_id
+            LIMIT 1
+        """
+        return db.execute(text(sql), {"tree_id": int(normalized_id)}).mappings().first()
+    else:
+        # Load by unit_uid (original logic)
+        sql = """
             SELECT
                 sa.full_name AS sponsor_name,
                 sa.organization_name AS sponsor_organization_name,
@@ -11442,16 +12033,9 @@ def _load_public_sponsor_tree_story_row(db: Session, unit_uid: str):
             JOIN tree_projects p ON p.id = u.project_id
             JOIN trees t ON t.id = u.tree_id
             WHERE UPPER(u.unit_uid) = UPPER(:unit_uid)
-              AND (
-                COALESCE(p.public_sponsor_enabled, FALSE) = TRUE
-                OR LOWER(COALESCE(p.access_model, 'partner_org')) = 'public_sponsorship'
-              )
-              AND LOWER(COALESCE(u.sponsorship_status, 'awaiting_tree')) IN ('linked', 'active', 'replaced')
             LIMIT 1
-            """
-        ),
-        {"unit_uid": normalized_uid},
-    ).mappings().first()
+        """
+        return db.execute(text(sql), {"unit_uid": normalized_id}).mappings().first()
 
 
 @router.get("/sponsor/public/trees/{unit_uid}", response_class=HTMLResponse)
