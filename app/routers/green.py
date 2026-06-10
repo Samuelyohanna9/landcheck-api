@@ -1205,6 +1205,35 @@ def _send_expo_push_messages(messages: list[dict]):
             cleanup_db.close()
 
 
+def _send_sponsor_push_notification(db: Session, sponsor_id: int, title: str, body: str, data: dict = None):
+    tokens = db.execute(
+        text(
+            """
+            SELECT expo_push_token
+            FROM green_sponsor_push_tokens
+            WHERE sponsor_account_id = :sponsor_id
+            AND COALESCE(is_active, TRUE) = TRUE
+            """
+        ),
+        {"sponsor_id": sponsor_id},
+    ).scalars().all()
+    
+    if tokens:
+        messages = [
+            {
+                "to": token,
+                "title": title,
+                "body": body,
+                "sound": "default",
+                "priority": "high",
+                "channelId": "sponsor-alerts",
+                "data": data or {},
+            }
+            for token in tokens
+        ]
+        _send_expo_push_messages(messages)
+
+
 def _queue_green_push_to_assignee(
     db: Session,
     *,
@@ -5663,6 +5692,14 @@ def ensure_green_tables(db: Session):
         db.execute(text("ALTER TABLE green_school_nominations ADD COLUMN IF NOT EXISTS points_spent INTEGER NOT NULL DEFAULT 100"))
     except Exception:
         db.rollback()
+    try:
+        db.execute(text("ALTER TABLE green_school_nominations ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'pending'"))
+    except Exception:
+        db.rollback()
+    try:
+        db.execute(text("ALTER TABLE green_community_projects ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'pending'"))
+    except Exception:
+        db.rollback()
 
     # Backfill GP for sponsors who already have tree sponsorships but 0 points
     try:
@@ -6992,6 +7029,10 @@ def _serialize_sponsor_account(row: dict) -> dict:
         "is_active": bool(row.get("is_active", True)),
         "entity_category": str(row.get("entity_category") or "individual").strip().lower(),
         "leaderboard_visibility": str(row.get("leaderboard_visibility") or "public").strip().lower(),
+        "green_points": int(row.get("green_points") or 0),
+        "lifetime_points": int(row.get("lifetime_points") or 0),
+        "referral_code": str(row.get("referral_code") or "").strip() or None,
+        "referred_by_id": int(row.get("referred_by_id")) if row.get("referred_by_id") is not None else None,
     }
 
 
@@ -8074,38 +8115,6 @@ def _award_points_for_order(db: Session, order_id: int):
         text("UPDATE green_sponsorship_orders SET points_awarded = TRUE, updated_at = NOW() WHERE id = :order_id"),
         {"order_id": order_id}
     )
-    
-    # Check if this is the sponsor's first points-awarded order
-    orders_count = db.execute(
-        text("SELECT COUNT(*) FROM green_sponsorship_orders WHERE sponsor_account_id = :sponsor_id AND points_awarded = TRUE"),
-        {"sponsor_id": sponsor_id}
-    ).scalar() or 0
-    
-    # If this was their first order, and they were referred by someone
-    if orders_count == 1 and sponsor.get("referred_by_id"):
-        referrer_id = sponsor.get("referred_by_id")
-        # Referrer gets 150 points
-        db.execute(
-            text("""
-                UPDATE green_sponsor_accounts
-                SET green_points = green_points + 150,
-                    lifetime_points = lifetime_points + 150,
-                    updated_at = NOW()
-                WHERE id = :referrer_id
-            """),
-            {"referrer_id": referrer_id}
-        )
-        # Referred gets 50 points bonus
-        db.execute(
-            text("""
-                UPDATE green_sponsor_accounts
-                SET green_points = green_points + 50,
-                    lifetime_points = lifetime_points + 50,
-                    updated_at = NOW()
-                WHERE id = :sponsor_id
-            """),
-            {"sponsor_id": sponsor_id}
-        )
 
 
 def _refresh_sponsorship_order_status(db: Session, order_id: int):
@@ -9140,18 +9149,30 @@ def sponsor_auth_signup(payload: SponsorSignupPayload, request: Request, db: Ses
             ).scalar()
             if referrer:
                 referred_by_id = int(referrer)
+                db.execute(
+                    text("""
+                        UPDATE green_sponsor_accounts
+                        SET green_points = green_points + 25,
+                            lifetime_points = lifetime_points + 25,
+                            updated_at = NOW()
+                        WHERE id = :referrer_id
+                    """),
+                    {"referrer_id": referred_by_id}
+                )
 
     row = db.execute(
         text(
             """
             INSERT INTO green_sponsor_accounts (
-                sponsor_uid, account_type, full_name, organization_name, email, phone, password_hash, referred_by_id, is_active
+                sponsor_uid, account_type, full_name, organization_name, email, phone, password_hash, referred_by_id, is_active,
+                green_points, lifetime_points
             )
             VALUES (
-                :sponsor_uid, :account_type, :full_name, :organization_name, :email, :phone, :password_hash, :referred_by_id, TRUE
+                :sponsor_uid, :account_type, :full_name, :organization_name, :email, :phone, :password_hash, :referred_by_id, TRUE,
+                :green_points, :lifetime_points
             )
             RETURNING id, sponsor_uid, account_type, full_name, organization_name, email, phone, is_active,
-                      entity_category, leaderboard_visibility
+                      entity_category, leaderboard_visibility, green_points, lifetime_points
             """
         ),
         {
@@ -9163,6 +9184,8 @@ def sponsor_auth_signup(payload: SponsorSignupPayload, request: Request, db: Ses
             "phone": _clean_text(payload.phone, 80),
             "password_hash": _hash_password_value(payload.password),
             "referred_by_id": referred_by_id,
+            "green_points": 10 if referred_by_id else 0,
+            "lifetime_points": 10 if referred_by_id else 0,
         },
     ).mappings().first()
     _log_audit_event(
@@ -10580,6 +10603,68 @@ class SponsorComplaintPayload(BaseModel):
     message: str
 
 
+class SchoolNominationReviewPayload(BaseModel):
+    status: str
+
+
+class CommunityProjectStatusPayload(BaseModel):
+    status: str
+
+
+def _compute_active_referrer_rules(db: Session, sponsor_id: int) -> dict:
+    personal_trees_sponsored = db.execute(
+        text("""
+            SELECT COALESCE(SUM(quantity), 0)
+            FROM green_sponsorship_orders
+            WHERE sponsor_account_id = :sponsor_id
+              AND (
+                  LOWER(COALESCE(payment_status, '')) IN ('paid', 'verified')
+                  OR LOWER(COALESCE(order_status, '')) IN ('paid', 'allocated', 'completed')
+              )
+        """),
+        {"sponsor_id": sponsor_id}
+    ).scalar() or 0
+    
+    total_referred_users = db.execute(
+        text("""
+            SELECT COUNT(*)
+            FROM green_sponsor_accounts
+            WHERE referred_by_id = :sponsor_id
+        """),
+        {"sponsor_id": sponsor_id}
+    ).scalar() or 0
+    
+    converted_referred_users = db.execute(
+        text("""
+            SELECT COUNT(DISTINCT sa.id)
+            FROM green_sponsor_accounts sa
+            JOIN green_sponsorship_orders o ON o.sponsor_account_id = sa.id
+            WHERE sa.referred_by_id = :sponsor_id
+              AND (
+                  LOWER(COALESCE(o.payment_status, '')) IN ('paid', 'verified')
+                  OR LOWER(COALESCE(o.order_status, '')) IN ('paid', 'allocated', 'completed')
+              )
+        """),
+        {"sponsor_id": sponsor_id}
+    ).scalar() or 0
+
+    personal_sponsor_met = personal_trees_sponsored >= 1
+    conversion_rate_met = True
+    if total_referred_users > 0:
+        conversion_rate_met = (converted_referred_users / total_referred_users) >= 0.2
+        
+    referral_rules_met = personal_sponsor_met and conversion_rate_met
+    
+    return {
+        "personal_trees_sponsored": int(personal_trees_sponsored),
+        "total_referred_users": int(total_referred_users),
+        "converted_referred_users": int(converted_referred_users),
+        "personal_sponsor_met": bool(personal_sponsor_met),
+        "conversion_rate_met": bool(conversion_rate_met),
+        "referral_rules_met": bool(referral_rules_met)
+    }
+
+
 @router.get("/sponsor/points")
 def get_sponsor_points(sponsor_id: int = Query(...), db: Session = Depends(get_db)):
     import uuid
@@ -10623,6 +10708,10 @@ def get_sponsor_points(sponsor_id: int = Query(...), db: Session = Depends(get_d
     # Cast point booster multiplier to float for frontend compatibility
     if item.get("point_booster_multiplier") is not None:
         item["point_booster_multiplier"] = float(item["point_booster_multiplier"])
+        
+    # Inject referral rules metrics
+    rules = _compute_active_referrer_rules(db, int(sponsor_id))
+    item.update(rules)
             
     return item
 
@@ -10643,6 +10732,13 @@ def redeem_sponsor_reward(payload: SponsorRedeemPayload, db: Session = Depends(g
     ).mappings().first()
     if not row:
         raise HTTPException(status_code=404, detail="Sponsor account not found")
+        
+    rules = _compute_active_referrer_rules(db, sponsor_id)
+    if not rules["referral_rules_met"]:
+        raise HTTPException(
+            status_code=400,
+            detail="Referral rules not met. You must sponsor at least 1 tree yourself and maintain at least 20% conversion rate on referred signups to spend points."
+        )
         
     current_points = int(row.get("green_points") or 0)
     
@@ -10749,6 +10845,13 @@ def nominate_school(payload: SponsorNominateSchoolPayload, db: Session = Depends
     if not row:
         raise HTTPException(status_code=404, detail="Sponsor account not found")
         
+    rules = _compute_active_referrer_rules(db, sponsor_id)
+    if not rules["referral_rules_met"]:
+        raise HTTPException(
+            status_code=400,
+            detail="Referral rules not met. You must sponsor at least 1 tree yourself and maintain at least 20% conversion rate on referred signups to spend points."
+        )
+        
     current_points = int(row.get("green_points") or 0)
     if current_points < cost:
         raise HTTPException(status_code=400, detail=f"Insufficient points. School nomination requires {cost} GP.")
@@ -10850,6 +10953,62 @@ def update_admin_complaint_status(complaint_id: int, status: str = Query(...), d
         text("UPDATE green_sponsor_complaints SET status = :status WHERE id = :id"),
         {"status": status, "id": complaint_id}
     )
+    
+    if status == "resolved":
+        row = db.execute(
+            text("""
+                SELECT c.sponsor_id, c.tree_id, c.complaint_type
+                FROM green_sponsor_complaints c
+                WHERE c.id = :id
+            """),
+            {"id": complaint_id}
+        ).mappings().first()
+        if row:
+            sponsor_id = row["sponsor_id"]
+            complaint_type = row["complaint_type"] or "sponsorship concern"
+            tree_id = row["tree_id"]
+            title = "Complaint Resolved"
+            tree_info = f" for Tree ID {tree_id}" if tree_id else ""
+            body = f"Your complaint regarding your {complaint_type}{tree_info} has been marked as resolved by our supervisor team. Thank you for your support!"
+            _send_sponsor_push_notification(db, sponsor_id, title, body, {
+                "complaint_id": complaint_id,
+                "tree_id": tree_id,
+                "status": "resolved"
+            })
+            
+    db.commit()
+    return {"ok": True}
+
+
+@router.post("/admin/complaints/{complaint_id}/resolve")
+def resolve_admin_complaint(complaint_id: int, db: Session = Depends(get_db)):
+    db.execute(
+        text("UPDATE green_sponsor_complaints SET status = 'resolved' WHERE id = :id"),
+        {"id": complaint_id}
+    )
+    
+    row = db.execute(
+        text("""
+            SELECT c.sponsor_id, c.tree_id, c.complaint_type
+            FROM green_sponsor_complaints c
+            WHERE c.id = :id
+        """),
+        {"id": complaint_id}
+    ).mappings().first()
+    
+    if row:
+        sponsor_id = row["sponsor_id"]
+        complaint_type = row["complaint_type"] or "sponsorship concern"
+        tree_id = row["tree_id"]
+        title = "Complaint Resolved"
+        tree_info = f" for Tree ID {tree_id}" if tree_id else ""
+        body = f"Your complaint regarding your {complaint_type}{tree_info} has been marked as resolved by our supervisor team. Thank you for your support!"
+        _send_sponsor_push_notification(db, sponsor_id, title, body, {
+            "complaint_id": complaint_id,
+            "tree_id": tree_id,
+            "status": "resolved"
+        })
+        
     db.commit()
     return {"ok": True}
 
@@ -10858,7 +11017,7 @@ def update_admin_complaint_status(complaint_id: int, status: str = Query(...), d
 def list_admin_school_nominations(db: Session = Depends(get_db)):
     rows = db.execute(
         text("""
-            SELECT n.id, n.sponsor_id, n.school_name, n.school_address, n.contact_person, n.contact_phone, n.reason, n.points_spent, n.created_at,
+            SELECT n.id, n.sponsor_id, n.school_name, n.school_address, n.contact_person, n.contact_phone, n.reason, n.points_spent, COALESCE(n.status, 'pending') AS status, n.created_at,
                    sa.full_name AS sponsor_name, sa.email AS sponsor_email
             FROM green_school_nominations n
             JOIN green_sponsor_accounts sa ON sa.id = n.sponsor_id
@@ -10868,11 +11027,53 @@ def list_admin_school_nominations(db: Session = Depends(get_db)):
     return [dict(row) for row in rows]
 
 
+@router.post("/admin/school-nominations/{nomination_id}/review")
+def review_school_nomination(nomination_id: int, payload: SchoolNominationReviewPayload, db: Session = Depends(get_db)):
+    status = payload.status
+    if status not in ("approved", "rejected"):
+        raise HTTPException(status_code=400, detail="Invalid nomination status. Must be approved or rejected.")
+        
+    db.execute(
+        text("UPDATE green_school_nominations SET status = :status WHERE id = :id"),
+        {"status": status, "id": nomination_id}
+    )
+    
+    row = db.execute(
+        text("""
+            SELECT n.sponsor_id, n.school_name
+            FROM green_school_nominations n
+            WHERE n.id = :id
+        """),
+        {"id": nomination_id}
+    ).mappings().first()
+    
+    if row:
+        sponsor_id = row["sponsor_id"]
+        school_name = row["school_name"]
+        
+        # Send Push Notification
+        if status == "approved":
+            title = "School Nomination Approved!"
+            body = f"Your nomination of '{school_name}' has been approved! We will review the site and notify you of upcoming planting activities."
+        else:
+            title = "School Nomination Update"
+            body = f"Your nomination of '{school_name}' has been reviewed by our supervisors, but was not approved at this time."
+            
+        _send_sponsor_push_notification(db, sponsor_id, title, body, {
+            "nomination_id": nomination_id,
+            "school_name": school_name,
+            "status": status
+        })
+        
+    db.commit()
+    return {"ok": True}
+
+
 @router.get("/admin/community-projects")
 def list_admin_community_projects(db: Session = Depends(get_db)):
     rows = db.execute(
         text("""
-            SELECT p.id, p.sponsor_id, p.project_name, p.proposed_location, p.description, p.points_contributed, p.created_at,
+            SELECT p.id, p.sponsor_id, p.project_name, p.proposed_location, p.description, p.points_contributed, COALESCE(p.status, 'pending') AS status, p.created_at,
                    sa.full_name AS sponsor_name, sa.email AS sponsor_email
             FROM green_community_projects p
             JOIN green_sponsor_accounts sa ON sa.id = p.sponsor_id
@@ -10880,6 +11081,48 @@ def list_admin_community_projects(db: Session = Depends(get_db)):
         """)
     ).mappings().all()
     return [dict(row) for row in rows]
+
+
+@router.post("/admin/community-projects/{project_id}/status")
+def review_community_project(project_id: int, payload: CommunityProjectStatusPayload, db: Session = Depends(get_db)):
+    status = payload.status
+    if status not in ("approved", "rejected"):
+        raise HTTPException(status_code=400, detail="Invalid project status. Must be approved or rejected.")
+        
+    db.execute(
+        text("UPDATE green_community_projects SET status = :status WHERE id = :id"),
+        {"status": status, "id": project_id}
+    )
+    
+    row = db.execute(
+        text("""
+            SELECT p.sponsor_id, p.project_name
+            FROM green_community_projects p
+            WHERE p.id = :id
+        """),
+        {"id": project_id}
+    ).mappings().first()
+    
+    if row:
+        sponsor_id = row["sponsor_id"]
+        project_name = row["project_name"]
+        
+        # Send Push Notification
+        if status == "approved":
+            title = "Community Project Approved!"
+            body = f"Your proposed community forest project '{project_name}' has been approved! Thank you for your support."
+        else:
+            title = "Community Project Update"
+            body = f"Your proposed community forest project '{project_name}' was reviewed but not approved at this time."
+            
+        _send_sponsor_push_notification(db, sponsor_id, title, body, {
+            "project_id": project_id,
+            "project_name": project_name,
+            "status": status
+        })
+        
+    db.commit()
+    return {"ok": True}
 
 
 @router.post("/sponsor/community-project")
@@ -10895,6 +11138,13 @@ def create_community_project(payload: SponsorCommunityProjectPayload, db: Sessio
     ).mappings().first()
     if not row:
         raise HTTPException(status_code=404, detail="Sponsor account not found")
+        
+    rules = _compute_active_referrer_rules(db, sponsor_id)
+    if not rules["referral_rules_met"]:
+        raise HTTPException(
+            status_code=400,
+            detail="Referral rules not met. You must sponsor at least 1 tree yourself and maintain at least 20% conversion rate on referred signups to spend points."
+        )
         
     current_points = int(row.get("green_points") or 0)
     if current_points < points:
@@ -12453,6 +12703,7 @@ def list_admin_sponsors(db: Session = Depends(get_db)):
             SELECT
                 sa.id, sa.sponsor_uid, sa.account_type, sa.full_name, sa.organization_name, sa.email, sa.phone,
                 sa.is_active, sa.created_at, sa.entity_category, sa.leaderboard_visibility,
+                sa.green_points, sa.lifetime_points, sa.referral_code, sa.referred_by_id,
                 COALESCE(order_stats.orders_count, 0) AS orders_count,
                 COALESCE(order_stats.amount_total, 0) AS amount_total,
                 COALESCE(order_stats.verified_orders_count, 0) AS verified_orders_count,
