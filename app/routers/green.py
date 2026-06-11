@@ -930,6 +930,37 @@ def _safe_push_date_label(value: str | date | datetime | None) -> str | None:
         return str(base)
 
 
+def _log_activity(
+    db: Session,
+    source: str,
+    event_type: str,
+    message: str,
+    actor: str | None = None,
+    details: dict | None = None,
+):
+    try:
+        from sqlalchemy import text
+        import json
+        db.execute(
+            text(
+                """
+                INSERT INTO green_activity_logs (source, event_type, actor, message, details, created_at)
+                VALUES (:source, :event_type, :actor, :message, CAST(:details AS JSONB), NOW())
+                """
+            ),
+            {
+                "source": source,
+                "event_type": event_type,
+                "actor": actor,
+                "message": message,
+                "details": json.dumps(details) if details is not None else None,
+            },
+        )
+        db.commit()
+    except Exception:
+        db.rollback()
+
+
 def _project_organization_id(db: Session, project_id: int) -> int | None:
     value = db.execute(
         text("SELECT organization_id FROM tree_projects WHERE id = :project_id"),
@@ -5700,6 +5731,46 @@ def ensure_green_tables(db: Session):
         db.execute(text("ALTER TABLE green_community_projects ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'pending'"))
     except Exception:
         db.rollback()
+    try:
+        db.execute(text("ALTER TABLE tree_projects ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'ongoing'"))
+    except Exception:
+        db.rollback()
+    try:
+        db.execute(text("ALTER TABLE green_sponsor_complaints ADD COLUMN IF NOT EXISTS supervisor_note TEXT"))
+    except Exception:
+        db.rollback()
+    try:
+        db.execute(text("ALTER TABLE green_school_nominations ADD COLUMN IF NOT EXISTS supervisor_note TEXT"))
+    except Exception:
+        db.rollback()
+    try:
+        db.execute(text("ALTER TABLE green_community_projects ADD COLUMN IF NOT EXISTS supervisor_note TEXT"))
+    except Exception:
+        db.rollback()
+    try:
+        db.execute(text("ALTER TABLE green_sponsor_point_redemptions ADD COLUMN IF NOT EXISTS supervisor_note TEXT"))
+    except Exception:
+        db.rollback()
+
+    db.execute(text("""
+        CREATE TABLE IF NOT EXISTS green_activity_logs (
+            id SERIAL PRIMARY KEY,
+            source TEXT NOT NULL,
+            event_type TEXT NOT NULL,
+            actor TEXT,
+            message TEXT NOT NULL,
+            details JSONB,
+            created_at TIMESTAMP DEFAULT NOW()
+        )
+    """))
+
+    db.execute(text("""
+        CREATE TABLE IF NOT EXISTS green_tree_qr_prints (
+            id SERIAL PRIMARY KEY,
+            tree_id INTEGER NOT NULL REFERENCES trees(id) ON DELETE CASCADE,
+            printed_at TIMESTAMP DEFAULT NOW()
+        )
+    """))
 
     # Backfill GP for sponsors who already have tree sponsorships but 0 points
     try:
@@ -8804,11 +8875,12 @@ def update_project_settings(
     planting_model: str | None = Body(default=None),
     allow_existing_tree_link: bool | None = Body(default=None),
     default_existing_tree_scope: str | None = Body(default=None),
+    status: str | None = Body(default=None),
 ):
     existing = db.execute(
         text(
             """
-            SELECT id, workflow_profile, access_model, public_sponsor_enabled, public_sponsor_title, public_sponsor_description,
+            SELECT id, status, name, workflow_profile, access_model, public_sponsor_enabled, public_sponsor_title, public_sponsor_description,
                    sponsor_price_per_tree, sponsor_currency, sponsor_capacity, sponsor_max_per_order,
                    sponsor_dedication_enabled, sponsor_payment_instructions, public_sponsor_agent_user_ids,
                    sponsor_agent_planting_fee, sponsor_agent_maintenance_fee, organization_id,
@@ -8821,6 +8893,14 @@ def update_project_settings(
     ).mappings().first()
     if not existing:
         raise HTTPException(status_code=404, detail="Project not found")
+
+    next_status = (
+        status.strip().lower()
+        if status is not None
+        else (existing.get("status") or "ongoing")
+    )
+    if next_status not in ("ongoing", "paused", "closed"):
+        next_status = "ongoing"
 
     next_workflow_profile = (
         _normalize_workflow_profile(workflow_profile)
@@ -8934,7 +9014,8 @@ def update_project_settings(
         text(
             """
             UPDATE tree_projects
-            SET workflow_profile = :workflow_profile,
+            SET status = :status,
+                workflow_profile = :workflow_profile,
                 access_model = :access_model,
                 public_sponsor_enabled = :public_sponsor_enabled,
                 public_sponsor_title = :public_sponsor_title,
@@ -8954,7 +9035,7 @@ def update_project_settings(
                 allow_existing_tree_link = :allow_existing_tree_link,
                 default_existing_tree_scope = :default_existing_tree_scope
             WHERE id = :project_id
-            RETURNING id, name, location_text, sponsor, workflow_profile, access_model,
+            RETURNING id, status, name, location_text, sponsor, workflow_profile, access_model,
                       public_sponsor_enabled, public_sponsor_title, public_sponsor_description,
                       sponsor_price_per_tree, sponsor_currency, sponsor_capacity, sponsor_max_per_order,
                       sponsor_dedication_enabled, sponsor_payment_instructions, public_sponsor_agent_user_ids,
@@ -8965,6 +9046,7 @@ def update_project_settings(
         ),
         {
             "project_id": project_id,
+            "status": next_status,
             "workflow_profile": next_workflow_profile,
             "access_model": next_access_model,
             "public_sponsor_enabled": next_public_sponsor_enabled,
@@ -8991,6 +9073,16 @@ def update_project_settings(
     payload["agric_config"] = _normalize_agric_config(payload.get("agric_config"))
     payload["relief_config"] = _normalize_relief_config(payload.get("relief_config"))
     payload = _apply_project_access_fields(payload)
+    
+    _log_activity(
+        db,
+        "backend_api",
+        "project_settings_updated",
+        f"Project settings for '{existing.get('name')}' updated to status '{next_status}'",
+        "admin",
+        {"project_id": project_id, "status": next_status}
+    )
+
     _log_audit_event(
         db,
         project_id=project_id,
@@ -9094,7 +9186,7 @@ def list_public_sponsorship_projects(db: Session = Depends(get_db)):
                 p.access_model, p.public_sponsor_enabled, p.public_sponsor_title, p.public_sponsor_description,
                 p.sponsor_price_per_tree, p.sponsor_currency, p.sponsor_capacity, p.sponsor_max_per_order,
                 p.sponsor_dedication_enabled, p.sponsor_payment_instructions,
-                p.workflow_profile, p.created_at,
+                p.workflow_profile, p.status, p.created_at,
                 o.name AS organization_name, o.slug AS organization_slug, o.status AS organization_status,
                 COALESCE(o.is_active, TRUE) AS organization_is_active,
                 o.logo_url AS organization_logo_url
@@ -9197,6 +9289,14 @@ def sponsor_auth_signup(payload: SponsorSignupPayload, request: Request, db: Ses
         actor=full_name,
         details={"account_type": row.get("account_type"), "email": row.get("email")},
     )
+    _log_activity(
+        db,
+        "sponsor_app",
+        "sponsor_signup",
+        f"Sponsor {row.get('full_name')} ({row.get('email')}) signed up successfully",
+        row.get('full_name'),
+        {"sponsor_id": int(row["id"]), "account_type": row.get("account_type")}
+    )
     db.commit()
     try:
         _notify_sponsor_welcome_email(db, int(row["id"]), request=request)
@@ -9224,6 +9324,14 @@ def sponsor_auth_login(payload: SponsorLoginPayload, db: Session = Depends(get_d
         raise HTTPException(status_code=401, detail="Invalid email or password")
     if not bool(row.get("is_active", True)):
         raise HTTPException(status_code=403, detail="Sponsor account is inactive")
+    _log_activity(
+        db,
+        "sponsor_app",
+        "sponsor_login",
+        f"Sponsor {row.get('full_name')} logged in successfully",
+        row.get('full_name'),
+        {"sponsor_id": int(row["id"])}
+    )
     return _build_sponsor_auth_payload(dict(row))
 
 
@@ -10605,10 +10713,12 @@ class SponsorComplaintPayload(BaseModel):
 
 class SchoolNominationReviewPayload(BaseModel):
     status: str
+    supervisor_note: str | None = None
 
 
 class CommunityProjectStatusPayload(BaseModel):
     status: str
+    supervisor_note: str | None = None
 
 
 def _compute_active_referrer_rules(db: Session, sponsor_id: int) -> dict:
@@ -10779,6 +10889,14 @@ def redeem_sponsor_reward(payload: SponsorRedeemPayload, db: Session = Depends(g
             "shipping_details": json.dumps(payload.shipping_details) if payload.shipping_details else None
         }
     )
+    _log_activity(
+        db,
+        "sponsor_app",
+        "sponsor_redeem",
+        f"Sponsor with ID {sponsor_id} redeemed reward '{reward_type}' for {cost} GP",
+        str(sponsor_id),
+        {"sponsor_id": sponsor_id, "reward_type": reward_type, "points_spent": cost}
+    )
     
     # Unlock digital assets/boosters
     if reward_type == "multiplier":
@@ -10948,10 +11066,15 @@ def list_admin_complaints(db: Session = Depends(get_db)):
 
 
 @router.patch("/admin/complaints/{complaint_id}")
-def update_admin_complaint_status(complaint_id: int, status: str = Query(...), db: Session = Depends(get_db)):
+def update_admin_complaint_status(
+    complaint_id: int,
+    status: str = Query(...),
+    supervisor_note: str | None = Query(default=None),
+    db: Session = Depends(get_db)
+):
     db.execute(
-        text("UPDATE green_sponsor_complaints SET status = :status WHERE id = :id"),
-        {"status": status, "id": complaint_id}
+        text("UPDATE green_sponsor_complaints SET status = :status, supervisor_note = :supervisor_note WHERE id = :id"),
+        {"status": status, "supervisor_note": supervisor_note, "id": complaint_id}
     )
     
     if status == "resolved":
@@ -10970,6 +11093,8 @@ def update_admin_complaint_status(complaint_id: int, status: str = Query(...), d
             title = "Complaint Resolved"
             tree_info = f" for Tree ID {tree_id}" if tree_id else ""
             body = f"Your complaint regarding your {complaint_type}{tree_info} has been marked as resolved by our supervisor team. Thank you for your support!"
+            if supervisor_note:
+                body += f" Note: {supervisor_note}"
             _send_sponsor_push_notification(db, sponsor_id, title, body, {
                 "complaint_id": complaint_id,
                 "tree_id": tree_id,
@@ -10980,11 +11105,20 @@ def update_admin_complaint_status(complaint_id: int, status: str = Query(...), d
     return {"ok": True}
 
 
+class ResolveComplaintPayload(BaseModel):
+    supervisor_note: str | None = None
+
+
 @router.post("/admin/complaints/{complaint_id}/resolve")
-def resolve_admin_complaint(complaint_id: int, db: Session = Depends(get_db)):
+def resolve_admin_complaint(
+    complaint_id: int,
+    payload: ResolveComplaintPayload = Body(default=None),
+    db: Session = Depends(get_db),
+):
+    note = payload.supervisor_note if payload else None
     db.execute(
-        text("UPDATE green_sponsor_complaints SET status = 'resolved' WHERE id = :id"),
-        {"id": complaint_id}
+        text("UPDATE green_sponsor_complaints SET status = 'resolved', supervisor_note = :supervisor_note WHERE id = :id"),
+        {"id": complaint_id, "supervisor_note": note}
     )
     
     row = db.execute(
@@ -11003,6 +11137,8 @@ def resolve_admin_complaint(complaint_id: int, db: Session = Depends(get_db)):
         title = "Complaint Resolved"
         tree_info = f" for Tree ID {tree_id}" if tree_id else ""
         body = f"Your complaint regarding your {complaint_type}{tree_info} has been marked as resolved by our supervisor team. Thank you for your support!"
+        if note:
+            body += f" Note: {note}"
         _send_sponsor_push_notification(db, sponsor_id, title, body, {
             "complaint_id": complaint_id,
             "tree_id": tree_id,
@@ -11017,7 +11153,7 @@ def resolve_admin_complaint(complaint_id: int, db: Session = Depends(get_db)):
 def list_admin_school_nominations(db: Session = Depends(get_db)):
     rows = db.execute(
         text("""
-            SELECT n.id, n.sponsor_id, n.school_name, n.school_address, n.contact_person, n.contact_phone, n.reason, n.points_spent, COALESCE(n.status, 'pending') AS status, n.created_at,
+            SELECT n.id, n.sponsor_id, n.school_name, n.school_address, n.contact_person, n.contact_phone, n.reason, n.points_spent, COALESCE(n.status, 'pending') AS status, n.supervisor_note, n.created_at,
                    sa.full_name AS sponsor_name, sa.email AS sponsor_email
             FROM green_school_nominations n
             JOIN green_sponsor_accounts sa ON sa.id = n.sponsor_id
@@ -11034,8 +11170,8 @@ def review_school_nomination(nomination_id: int, payload: SchoolNominationReview
         raise HTTPException(status_code=400, detail="Invalid nomination status. Must be approved or rejected.")
         
     db.execute(
-        text("UPDATE green_school_nominations SET status = :status WHERE id = :id"),
-        {"status": status, "id": nomination_id}
+        text("UPDATE green_school_nominations SET status = :status, supervisor_note = :supervisor_note WHERE id = :id"),
+        {"status": status, "supervisor_note": payload.supervisor_note, "id": nomination_id}
     )
     
     row = db.execute(
@@ -11059,6 +11195,9 @@ def review_school_nomination(nomination_id: int, payload: SchoolNominationReview
             title = "School Nomination Update"
             body = f"Your nomination of '{school_name}' has been reviewed by our supervisors, but was not approved at this time."
             
+        if payload.supervisor_note:
+            body += f" Note: {payload.supervisor_note}"
+            
         _send_sponsor_push_notification(db, sponsor_id, title, body, {
             "nomination_id": nomination_id,
             "school_name": school_name,
@@ -11073,7 +11212,7 @@ def review_school_nomination(nomination_id: int, payload: SchoolNominationReview
 def list_admin_community_projects(db: Session = Depends(get_db)):
     rows = db.execute(
         text("""
-            SELECT p.id, p.sponsor_id, p.project_name, p.proposed_location, p.description, p.points_contributed, COALESCE(p.status, 'pending') AS status, p.created_at,
+            SELECT p.id, p.sponsor_id, p.project_name, p.proposed_location, p.description, p.points_contributed, COALESCE(p.status, 'pending') AS status, p.supervisor_note, p.created_at,
                    sa.full_name AS sponsor_name, sa.email AS sponsor_email
             FROM green_community_projects p
             JOIN green_sponsor_accounts sa ON sa.id = p.sponsor_id
@@ -11090,8 +11229,8 @@ def review_community_project(project_id: int, payload: CommunityProjectStatusPay
         raise HTTPException(status_code=400, detail="Invalid project status. Must be approved or rejected.")
         
     db.execute(
-        text("UPDATE green_community_projects SET status = :status WHERE id = :id"),
-        {"status": status, "id": project_id}
+        text("UPDATE green_community_projects SET status = :status, supervisor_note = :supervisor_note WHERE id = :id"),
+        {"status": status, "supervisor_note": payload.supervisor_note, "id": project_id}
     )
     
     row = db.execute(
@@ -11114,6 +11253,9 @@ def review_community_project(project_id: int, payload: CommunityProjectStatusPay
         else:
             title = "Community Project Update"
             body = f"Your proposed community forest project '{project_name}' was reviewed but not approved at this time."
+            
+        if payload.supervisor_note:
+            body += f" Note: {payload.supervisor_note}"
             
         _send_sponsor_push_notification(db, sponsor_id, title, body, {
             "project_id": project_id,
@@ -11170,6 +11312,211 @@ def create_community_project(payload: SponsorCommunityProjectPayload, db: Sessio
     )
     db.commit()
     return {"ok": True, "spent": points}
+
+
+class PointRedemptionReviewPayload(BaseModel):
+    status: str
+    supervisor_note: str | None = None
+
+
+@router.get("/admin/point-redemptions")
+def list_admin_point_redemptions(db: Session = Depends(get_db)):
+    rows = db.execute(
+        text(
+            """
+            SELECT r.id, r.sponsor_id, r.reward_type, r.points_spent, r.shipping_details, r.status, r.supervisor_note, r.created_at,
+                   sa.full_name AS sponsor_name, sa.email AS sponsor_email
+            FROM green_sponsor_point_redemptions r
+            JOIN green_sponsor_accounts sa ON sa.id = r.sponsor_id
+            ORDER BY r.created_at DESC
+            """
+        )
+    ).mappings().all()
+    
+    items = []
+    for row in rows:
+        item = dict(row)
+        if isinstance(item.get("shipping_details"), str):
+            try:
+                item["shipping_details"] = json.loads(item["shipping_details"])
+            except Exception:
+                item["shipping_details"] = {}
+        items.append(item)
+    return items
+
+
+@router.post("/admin/point-redemptions/{redemption_id}/review")
+def review_point_redemption(
+    redemption_id: int,
+    payload: PointRedemptionReviewPayload,
+    db: Session = Depends(get_db),
+):
+    status_clean = payload.status.strip().lower()
+    if status_clean not in ("approved", "rejected"):
+        raise HTTPException(status_code=400, detail="Invalid status. Must be 'approved' or 'rejected'.")
+        
+    redemption = db.execute(
+        text(
+            """
+            SELECT id, sponsor_id, reward_type, points_spent, status
+            FROM green_sponsor_point_redemptions
+            WHERE id = :redemption_id
+            """
+        ),
+        {"redemption_id": redemption_id},
+    ).mappings().first()
+    
+    if not redemption:
+        raise HTTPException(status_code=404, detail="Redemption not found.")
+        
+    if redemption["status"] != "pending":
+        raise HTTPException(status_code=400, detail="Redemption has already been reviewed.")
+        
+    db.execute(
+        text(
+            """
+            UPDATE green_sponsor_point_redemptions
+            SET status = :status,
+                supervisor_note = :supervisor_note
+            WHERE id = :redemption_id
+            """
+        ),
+        {
+            "redemption_id": redemption_id,
+            "status": status_clean,
+            "supervisor_note": payload.supervisor_note,
+        },
+    )
+    
+    # Refund points if rejected
+    if status_clean == "rejected":
+        db.execute(
+            text(
+                """
+                UPDATE green_sponsor_accounts
+                SET green_points = green_points + :refund
+                WHERE id = :sponsor_id
+                """
+            ),
+            {
+                "refund": redemption["points_spent"],
+                "sponsor_id": redemption["sponsor_id"],
+            },
+        )
+        
+    db.commit()
+    
+    # Send push notification
+    try:
+        title = "Reward Redemption Update"
+        reward_label = redemption["reward_type"].replace("merch_", "").replace("_", " ").title()
+        if status_clean == "approved":
+            body = f"Your request for {reward_label} has been approved."
+        else:
+            body = f"Your request for {reward_label} was rejected. Points refunded."
+            
+        if payload.supervisor_note:
+            body += f" Note: {payload.supervisor_note}"
+            
+        _send_sponsor_push_notification(
+            db,
+            sponsor_id=redemption["sponsor_id"],
+            title=title,
+            body=body,
+            data={"type": "redemption_review", "redemption_id": redemption_id},
+        )
+    except Exception:
+        pass
+        
+    # Log activity
+    _log_activity(
+        db,
+        "backend_api",
+        "redemption_reviewed",
+        f"Redemption #{redemption_id} for reward '{redemption['reward_type']}' reviewed to status '{status_clean}'",
+        "admin",
+        {"redemption_id": redemption_id, "status": status_clean, "supervisor_note": payload.supervisor_note},
+    )
+    
+    return {"status": "success"}
+
+
+class PublicLogPayload(BaseModel):
+    source: str
+    event_type: str
+    actor: str | None = None
+    message: str
+    details: dict | None = None
+
+
+@router.post("/public/logs")
+def create_public_log(payload: PublicLogPayload, db: Session = Depends(get_db)):
+    _log_activity(
+        db,
+        source=payload.source,
+        event_type=payload.event_type,
+        message=payload.message,
+        actor=payload.actor,
+        details=payload.details,
+    )
+    return {"status": "success"}
+
+
+@router.get("/admin/logs")
+def get_admin_logs(db: Session = Depends(get_db)):
+    rows = db.execute(
+        text(
+            """
+            SELECT id, source, event_type, actor, message, details, created_at
+            FROM green_activity_logs
+            ORDER BY created_at DESC, id DESC
+            LIMIT 10000
+            """
+        )
+    ).mappings().all()
+    
+    items = []
+    for row in rows:
+        item = dict(row)
+        if isinstance(item.get("details"), str):
+            try:
+                item["details"] = json.loads(item["details"])
+            except Exception:
+                item["details"] = {}
+        items.append(item)
+    return items
+
+
+@router.post("/admin/logs/reset")
+def reset_admin_logs(db: Session = Depends(get_db)):
+    db.execute(text("TRUNCATE TABLE green_activity_logs"))
+    db.commit()
+    _log_activity(
+        db,
+        "backend_api",
+        "logs_reset",
+        "Activity logs table reset/truncated by admin",
+        "admin",
+    )
+    return {"status": "success"}
+
+
+@router.get("/admin/qr-prints")
+def get_admin_qr_prints(db: Session = Depends(get_db)):
+    rows = db.execute(
+        text(
+            """
+            SELECT p.tree_id, COUNT(p.id) AS print_count, MAX(p.printed_at) AS last_printed_at,
+                   t.project_tree_no, t.species, t.project_id, proj.name AS project_name
+            FROM green_tree_qr_prints p
+            JOIN trees t ON t.id = p.tree_id
+            JOIN tree_projects proj ON proj.id = t.project_id
+            GROUP BY p.tree_id, t.project_tree_no, t.species, t.project_id, proj.name
+            ORDER BY print_count DESC, last_printed_at DESC
+            """
+        )
+    ).mappings().all()
+    return [dict(row) for row in rows]
 
 
 @router.post("/sponsor/update-profile-photo")
@@ -12390,6 +12737,12 @@ def export_tree_qr_tag_pdf(
         
     pdf_bytes = render_green_tree_qr_tag_pdf(tree_dict, verification_url)
     
+    db.execute(
+        text("INSERT INTO green_tree_qr_prints (tree_id, printed_at) VALUES (:tree_id, NOW())"),
+        {"tree_id": int(tree_id)},
+    )
+    db.commit()
+    
     return Response(
         content=pdf_bytes,
         media_type="application/pdf",
@@ -12772,6 +13125,7 @@ def list_admin_sponsors(db: Session = Depends(get_db)):
         else:
             level = "Climate Contributor"
             
+        rules = _compute_active_referrer_rules(db, int(row["id"]))
         item = _serialize_sponsor_account(dict(row)) | {
             "orders_count": int(row.get("orders_count") or 0),
             "amount_total": round(float(row.get("amount_total") or 0), 2),
@@ -12784,6 +13138,12 @@ def list_admin_sponsors(db: Session = Depends(get_db)):
             "monthly_trees": int(row.get("monthly_trees") or 0),
             "achievement_level": level,
             "created_at": row.get("created_at"),
+            "personal_trees_sponsored": rules.get("personal_trees_sponsored", 0),
+            "total_referred_users": rules.get("total_referred_users", 0),
+            "converted_referred_users": rules.get("converted_referred_users", 0),
+            "referral_rules_met": rules.get("referral_rules_met", False),
+            "conversion_rate_met": rules.get("conversion_rate_met", False),
+            "referral_conversion_rate": rules.get("referral_conversion_rate", 0),
         }
         payload.append(item)
     return payload
@@ -13899,7 +14259,7 @@ def list_projects(
             p.sponsor_dedication_enabled, p.sponsor_payment_instructions, p.public_sponsor_agent_user_ids,
             p.sponsor_agent_planting_fee, p.sponsor_agent_maintenance_fee,
             p.workflow_profile, p.agric_config, p.relief_config,
-            p.planting_model, p.allow_existing_tree_link, p.default_existing_tree_scope, p.created_at,
+            p.planting_model, p.allow_existing_tree_link, p.default_existing_tree_scope, p.status, p.created_at,
             o.name AS organization_name, o.slug AS organization_slug, o.status AS organization_status,
             o.logo_url AS organization_logo_url
         FROM tree_projects p
@@ -13998,7 +14358,7 @@ def get_project(
             p.sponsor_dedication_enabled, p.sponsor_payment_instructions, p.public_sponsor_agent_user_ids,
             p.sponsor_agent_planting_fee, p.sponsor_agent_maintenance_fee,
             p.workflow_profile, p.agric_config, p.relief_config,
-            p.planting_model, p.allow_existing_tree_link, p.default_existing_tree_scope, p.created_at,
+            p.planting_model, p.allow_existing_tree_link, p.default_existing_tree_scope, p.status, p.created_at,
             o.name AS organization_name, o.slug AS organization_slug, o.status AS organization_status,
             o.logo_url AS organization_logo_url
         FROM tree_projects p
