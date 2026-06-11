@@ -4838,6 +4838,7 @@ def ensure_green_tables(db: Session):
         db.execute(text("ALTER TABLE green_sponsor_accounts ADD COLUMN IF NOT EXISTS unlocked_map_icons JSONB NOT NULL DEFAULT '[]'"))
         db.execute(text("ALTER TABLE green_sponsor_accounts ADD COLUMN IF NOT EXISTS current_avatar_border TEXT"))
         db.execute(text("ALTER TABLE green_sponsor_accounts ADD COLUMN IF NOT EXISTS current_map_icon TEXT"))
+        db.execute(text("ALTER TABLE green_sponsor_accounts ADD COLUMN IF NOT EXISTS legacy_order_points_reconciled_at TIMESTAMP"))
         db.execute(text("ALTER TABLE green_sponsorship_orders ADD COLUMN IF NOT EXISTS points_awarded BOOLEAN NOT NULL DEFAULT FALSE"))
         db.execute(text("ALTER TABLE green_push_tokens ADD COLUMN IF NOT EXISTS organization_id INTEGER"))
         db.execute(text("ALTER TABLE green_push_tokens ADD COLUMN IF NOT EXISTS platform TEXT"))
@@ -5230,6 +5231,13 @@ def ensure_green_tables(db: Session):
         db.execute(text("ALTER TABLE green_sponsorship_units ADD COLUMN IF NOT EXISTS dedication_message TEXT"))
         db.execute(text("ALTER TABLE green_sponsorship_units ADD COLUMN IF NOT EXISTS linked_at TIMESTAMP"))
         db.execute(text("ALTER TABLE green_sponsorship_units ADD COLUMN IF NOT EXISTS last_certificate_at TIMESTAMP"))
+        db.execute(text("ALTER TABLE green_sponsorship_units ADD COLUMN IF NOT EXISTS assigned_user_id INTEGER REFERENCES green_users(id)"))
+        db.execute(text("ALTER TABLE green_sponsorship_units ADD COLUMN IF NOT EXISTS assigned_assignee_name TEXT"))
+        db.execute(text("ALTER TABLE green_sponsorship_units ADD COLUMN IF NOT EXISTS assigned_at TIMESTAMP"))
+        db.execute(text("ALTER TABLE green_sponsorship_units ADD COLUMN IF NOT EXISTS qr_download_count INTEGER NOT NULL DEFAULT 0"))
+        db.execute(text("ALTER TABLE green_sponsorship_units ADD COLUMN IF NOT EXISTS first_qr_downloaded_at TIMESTAMP"))
+        db.execute(text("ALTER TABLE green_sponsorship_units ADD COLUMN IF NOT EXISTS last_qr_downloaded_at TIMESTAMP"))
+        db.execute(text("ALTER TABLE green_sponsorship_units ADD COLUMN IF NOT EXISTS last_qr_downloaded_by TEXT"))
         db.execute(text("ALTER TABLE green_sponsorship_units ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW()"))
         db.execute(text("ALTER TABLE green_sponsor_agent_bank_accounts ADD COLUMN IF NOT EXISTS organization_id INTEGER"))
         db.execute(text("ALTER TABLE green_sponsor_agent_bank_accounts ADD COLUMN IF NOT EXISTS currency TEXT NOT NULL DEFAULT 'NGN'"))
@@ -5551,6 +5559,7 @@ def ensure_green_tables(db: Session):
     db.execute(text("CREATE INDEX IF NOT EXISTS idx_sponsor_units_project_status ON green_sponsorship_units(project_id, sponsorship_status, created_at DESC)"))
     db.execute(text("CREATE INDEX IF NOT EXISTS idx_sponsor_units_sponsor_status ON green_sponsorship_units(sponsor_account_id, sponsorship_status, created_at DESC)"))
     db.execute(text("CREATE INDEX IF NOT EXISTS idx_sponsor_units_tree ON green_sponsorship_units(tree_id)"))
+    db.execute(text("CREATE INDEX IF NOT EXISTS idx_sponsor_units_project_assigned_user ON green_sponsorship_units(project_id, assigned_user_id, sponsorship_status, created_at DESC)"))
     db.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS idx_sponsor_agent_bank_user ON green_sponsor_agent_bank_accounts(user_id)"))
     db.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS idx_sponsor_agent_payout_uid ON green_sponsor_agent_payout_requests(UPPER(request_uid))"))
     db.execute(text("CREATE INDEX IF NOT EXISTS idx_sponsor_agent_payout_user_created ON green_sponsor_agent_payout_requests(user_id, created_at DESC)"))
@@ -5772,22 +5781,101 @@ def ensure_green_tables(db: Session):
         )
     """))
 
-    # Backfill GP for sponsors who already have tree sponsorships but 0 points
+    # Backfill GP for legacy sponsors who already had paid orders before points_awarded existed.
+    # Mark those orders as awarded in the same pass so live checkout cannot award them twice.
     try:
         db.execute(text("""
-            UPDATE green_sponsor_accounts sa
-            SET green_points = sa.green_points + (COALESCE(orders.total_trees, 0) * 25),
-                lifetime_points = sa.lifetime_points + (COALESCE(orders.total_trees, 0) * 25)
-            FROM (
+            WITH target_orders AS (
+                SELECT id, sponsor_account_id, quantity
+                FROM green_sponsorship_orders
+                WHERE COALESCE(points_awarded, FALSE) = FALSE
+                  AND (
+                        LOWER(COALESCE(payment_status, '')) IN ('paid', 'verified')
+                     OR LOWER(COALESCE(order_status, '')) IN ('paid', 'allocated', 'completed')
+                  )
+            ),
+            target_sponsors AS (
                 SELECT sponsor_account_id, SUM(quantity) AS total_trees
+                FROM target_orders
+                GROUP BY sponsor_account_id
+            ),
+            updated_accounts AS (
+                UPDATE green_sponsor_accounts sa
+                SET green_points = sa.green_points + (COALESCE(ts.total_trees, 0) * 25),
+                    lifetime_points = sa.lifetime_points + (COALESCE(ts.total_trees, 0) * 25)
+                FROM target_sponsors ts
+                WHERE ts.sponsor_account_id = sa.id
+                  AND sa.green_points = 0
+                  AND sa.lifetime_points = 0
+                RETURNING sa.id
+            )
+            UPDATE green_sponsorship_orders o
+            SET points_awarded = TRUE,
+                updated_at = NOW()
+            FROM updated_accounts ua
+            WHERE o.sponsor_account_id = ua.id
+              AND COALESCE(o.points_awarded, FALSE) = FALSE
+              AND (
+                    LOWER(COALESCE(o.payment_status, '')) IN ('paid', 'verified')
+                 OR LOWER(COALESCE(o.order_status, '')) IN ('paid', 'allocated', 'completed')
+              )
+        """))
+    except Exception:
+        db.rollback()
+
+    # Correct the simple legacy double-award pattern where the bootstrap backfill and live checkout
+    # both granted the same base sponsor-tree points.
+    try:
+        db.execute(text("""
+            WITH paid_points AS (
+                SELECT sponsor_account_id, SUM(quantity * 25) AS base_points
                 FROM green_sponsorship_orders
                 WHERE LOWER(COALESCE(payment_status, '')) IN ('paid', 'verified')
                    OR LOWER(COALESCE(order_status, '')) IN ('paid', 'allocated', 'completed')
                 GROUP BY sponsor_account_id
-            ) AS orders
-            WHERE orders.sponsor_account_id = sa.id
-              AND sa.green_points = 0
-              AND sa.lifetime_points = 0
+            ),
+            referral_points AS (
+                SELECT referred_by_id AS sponsor_id, COUNT(*) * 25 AS referral_points
+                FROM green_sponsor_accounts
+                WHERE referred_by_id IS NOT NULL
+                GROUP BY referred_by_id
+            )
+            UPDATE green_sponsor_accounts sa
+            SET green_points = GREATEST(
+                    0,
+                    sa.green_points - COALESCE(pp.base_points, 0)
+                ),
+                lifetime_points = GREATEST(
+                    0,
+                    sa.lifetime_points - COALESCE(pp.base_points, 0)
+                ),
+                legacy_order_points_reconciled_at = NOW(),
+                updated_at = NOW()
+            FROM paid_points pp
+            LEFT JOIN referral_points rp ON rp.sponsor_id = pp.sponsor_account_id
+            WHERE sa.id = pp.sponsor_account_id
+              AND sa.legacy_order_points_reconciled_at IS NULL
+              AND COALESCE(sa.green_points, 0) = COALESCE(sa.lifetime_points, 0)
+              AND COALESCE(sa.green_points, 0) = (
+                    (COALESCE(pp.base_points, 0) * 2)
+                    + CASE WHEN sa.referred_by_id IS NOT NULL THEN 10 ELSE 0 END
+                    + COALESCE(rp.referral_points, 0)
+              )
+              AND NOT EXISTS (
+                    SELECT 1
+                    FROM green_sponsor_point_redemptions r
+                    WHERE r.sponsor_id = sa.id
+              )
+              AND NOT EXISTS (
+                    SELECT 1
+                    FROM green_school_nominations n
+                    WHERE n.sponsor_id = sa.id
+              )
+              AND NOT EXISTS (
+                    SELECT 1
+                    FROM green_community_projects c
+                    WHERE c.sponsor_id = sa.id
+              )
         """))
     except Exception:
         db.rollback()
@@ -7373,6 +7461,311 @@ def _collect_public_sponsor_agent_user_ids_for_project(
     return collected
 
 
+def _load_public_sponsorship_project_row(db: Session, *, project_id: int) -> dict:
+    row = db.execute(
+        text(
+            """
+            SELECT id, organization_id, name, access_model, public_sponsor_enabled, public_sponsor_agent_user_ids
+            FROM tree_projects
+            WHERE id = :project_id
+            LIMIT 1
+            """
+        ),
+        {"project_id": int(project_id)},
+    ).mappings().first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Project not found")
+    payload = dict(row)
+    if not _is_public_sponsorship_project(payload):
+        raise HTTPException(status_code=400, detail="Project is not open for public sponsorship")
+    return payload
+
+
+def _list_assignee_aliases_for_lookup(
+    db: Session,
+    *,
+    assignee_name: str | None,
+    organization_id: int | None = None,
+) -> list[str]:
+    aliases: list[str] = []
+    seen: set[str] = set()
+
+    def add_alias(value: object):
+        alias = str(value or "").strip().lower()
+        if not alias or alias in seen:
+            return
+        seen.add(alias)
+        aliases.append(alias)
+
+    add_alias(assignee_name)
+    matched_rows = _list_green_users_for_assignee_name(
+        db,
+        assignee_name=assignee_name,
+        organization_id=int(organization_id) if organization_id is not None else None,
+    )
+    if not matched_rows and organization_id is not None:
+        matched_rows = _list_green_users_for_assignee_name(
+            db,
+            assignee_name=assignee_name,
+            organization_id=None,
+        )
+    for row in matched_rows:
+        for alias in _build_sponsor_agent_aliases(row):
+            add_alias(alias)
+    return aliases
+
+
+def _match_selected_public_sponsor_user_for_assignee(
+    db: Session,
+    *,
+    assignee_name: str | None,
+    organization_id: int | None,
+    selected_user_ids: list[int],
+) -> dict | None:
+    matched_rows = _list_green_users_for_assignee_name(
+        db,
+        assignee_name=assignee_name,
+        organization_id=int(organization_id) if organization_id is not None else None,
+    )
+    if not matched_rows and organization_id is not None:
+        matched_rows = _list_green_users_for_assignee_name(
+            db,
+            assignee_name=assignee_name,
+            organization_id=None,
+        )
+    allowed_ids = set(_normalize_positive_int_list(selected_user_ids))
+    for row in matched_rows:
+        user_id = int(row.get("id") or 0)
+        if allowed_ids and user_id not in allowed_ids:
+            continue
+        return dict(row)
+    return None
+
+
+def _count_planted_trees_for_aliases(db: Session, *, project_id: int, aliases: list[str]) -> int:
+    normalized_aliases = [str(item or "").strip().lower() for item in aliases if str(item or "").strip()]
+    if not normalized_aliases:
+        return 0
+    count = db.execute(
+        text(
+            """
+            SELECT COUNT(*)
+            FROM trees
+            WHERE project_id = :project_id
+              AND LOWER(COALESCE(tree_origin, 'new_planting')) = 'new_planting'
+              AND COALESCE(count_in_planting_kpis, TRUE) = TRUE
+              AND LOWER(REPLACE(REPLACE(COALESCE(status, ''), '-', '_'), ' ', '_')) <> 'pending_planting'
+              AND LOWER(TRIM(COALESCE(created_by, ''))) IN :aliases
+            """
+        ).bindparams(bindparam("aliases", expanding=True)),
+        {"project_id": int(project_id), "aliases": normalized_aliases},
+    ).scalar()
+    return int(count or 0)
+
+
+def _count_reserved_sponsor_units_for_assignee(
+    db: Session,
+    *,
+    project_id: int,
+    user_id: int | None,
+    aliases: list[str],
+) -> int:
+    normalized_aliases = [str(item or "").strip().lower() for item in aliases if str(item or "").strip()]
+    if user_id is None and not normalized_aliases:
+        return 0
+    count = db.execute(
+        text(
+            """
+            SELECT COUNT(*)
+            FROM green_sponsorship_units
+            WHERE project_id = :project_id
+              AND tree_id IS NULL
+              AND LOWER(COALESCE(sponsorship_status, '')) = 'awaiting_tree'
+              AND (
+                    (:user_id IS NOT NULL AND assigned_user_id = :user_id)
+                 OR LOWER(TRIM(COALESCE(assigned_assignee_name, ''))) IN :aliases
+              )
+            """
+        ).bindparams(bindparam("aliases", expanding=True)),
+        {
+            "project_id": int(project_id),
+            "user_id": int(user_id) if user_id is not None else None,
+            "aliases": normalized_aliases or [""],
+        },
+    ).scalar()
+    return int(count or 0)
+
+
+def _assign_available_sponsor_units_for_project(db: Session, *, project_id: int) -> int:
+    project_row = _load_public_sponsorship_project_row(db, project_id=int(project_id))
+    organization_id = int(project_row.get("organization_id") or 0) or None
+    explicit_agent_ids = _normalize_positive_int_list(_json_value_or(project_row.get("public_sponsor_agent_user_ids"), []))
+    try:
+        selected_agent_ids = _collect_public_sponsor_agent_user_ids_for_project(
+            db,
+            project_id=int(project_id),
+            organization_id=organization_id,
+            explicit_user_ids=explicit_agent_ids,
+        )
+    except Exception:
+        selected_agent_ids = explicit_agent_ids
+    selected_agent_ids = _normalize_positive_int_list(selected_agent_ids)
+    if not selected_agent_ids:
+        return 0
+
+    order_rows = db.execute(
+        text(
+            """
+            SELECT id, assignee_name, target_trees, created_at
+            FROM green_work_orders
+            WHERE project_id = :project_id
+              AND LOWER(REPLACE(REPLACE(COALESCE(work_type, ''), '-', '_'), ' ', '_')) = 'planting'
+              AND LOWER(COALESCE(status, 'assigned')) NOT IN ('done', 'completed', 'closed', 'cancelled')
+            ORDER BY created_at ASC, id ASC
+            """
+        ),
+        {"project_id": int(project_id)},
+    ).mappings().all()
+    if not order_rows:
+        return 0
+
+    assignee_entries: list[dict] = []
+    assignee_index: dict[str, dict] = {}
+    for order_row in order_rows:
+        assignee_name = str(order_row.get("assignee_name") or "").strip()
+        target_trees = int(order_row.get("target_trees") or 0)
+        if not assignee_name or target_trees <= 0:
+            continue
+        matched_user = _match_selected_public_sponsor_user_for_assignee(
+            db,
+            assignee_name=assignee_name,
+            organization_id=organization_id,
+            selected_user_ids=selected_agent_ids,
+        )
+        user_id = int(matched_user.get("id") or 0) if matched_user else 0
+        if user_id <= 0:
+            continue
+        key = f"user:{user_id}"
+        entry = assignee_index.get(key)
+        if entry is None:
+            entry = {
+                "user_id": user_id,
+                "assignee_name": assignee_name,
+                "aliases": _build_sponsor_agent_aliases(matched_user),
+                "target_trees": 0,
+            }
+            assignee_index[key] = entry
+            assignee_entries.append(entry)
+        entry["target_trees"] = int(entry.get("target_trees") or 0) + target_trees
+
+    assigned_total = 0
+    for entry in assignee_entries:
+        aliases = [str(item or "").strip().lower() for item in entry.get("aliases") or [] if str(item or "").strip()]
+        user_id = int(entry.get("user_id") or 0)
+        target_trees = int(entry.get("target_trees") or 0)
+        planted_count = _count_planted_trees_for_aliases(
+            db,
+            project_id=int(project_id),
+            aliases=aliases,
+        )
+        reserved_count = _count_reserved_sponsor_units_for_assignee(
+            db,
+            project_id=int(project_id),
+            user_id=user_id,
+            aliases=aliases,
+        )
+        missing_count = max(target_trees - planted_count - reserved_count, 0)
+        if missing_count <= 0:
+            continue
+        rows = db.execute(
+            text(
+                """
+                WITH next_units AS (
+                    SELECT id
+                    FROM green_sponsorship_units
+                    WHERE project_id = :project_id
+                      AND tree_id IS NULL
+                      AND LOWER(COALESCE(sponsorship_status, '')) = 'awaiting_tree'
+                      AND assigned_user_id IS NULL
+                      AND NULLIF(BTRIM(COALESCE(assigned_assignee_name, '')), '') IS NULL
+                    ORDER BY created_at ASC, id ASC
+                    LIMIT :limit_count
+                )
+                UPDATE green_sponsorship_units u
+                SET assigned_user_id = :user_id,
+                    assigned_assignee_name = :assignee_name,
+                    assigned_at = NOW(),
+                    updated_at = NOW()
+                FROM next_units nu
+                WHERE u.id = nu.id
+                RETURNING u.id
+                """
+            ),
+            {
+                "project_id": int(project_id),
+                "limit_count": int(missing_count),
+                "user_id": user_id,
+                "assignee_name": str(entry.get("assignee_name") or "").strip(),
+            },
+        ).mappings().all()
+        assigned_total += len(rows)
+    return assigned_total
+
+
+def _ensure_public_sponsor_agent_project_access(
+    db: Session,
+    *,
+    project_id: int,
+    user_id: int,
+    organization_id: int | None = None,
+) -> tuple[dict, dict, list[int]]:
+    project_row = _load_public_sponsorship_project_row(db, project_id=int(project_id))
+    user_row = _get_green_user_for_sponsor_agent(
+        db,
+        user_id=int(user_id),
+        organization_id=int(organization_id) if organization_id is not None else None,
+    )
+    explicit_agent_ids = _normalize_positive_int_list(_json_value_or(project_row.get("public_sponsor_agent_user_ids"), []))
+    try:
+        selected_agent_ids = _collect_public_sponsor_agent_user_ids_for_project(
+            db,
+            project_id=int(project_id),
+            organization_id=int(project_row.get("organization_id") or 0) or None,
+            explicit_user_ids=explicit_agent_ids,
+        )
+    except Exception:
+        selected_agent_ids = explicit_agent_ids
+    selected_agent_ids = _normalize_positive_int_list(selected_agent_ids)
+    if int(user_row.get("id") or 0) not in set(selected_agent_ids):
+        raise HTTPException(status_code=403, detail="This user is not selected as a public sponsor agent")
+    return project_row, user_row, selected_agent_ids
+
+
+def _mark_sponsor_unit_qr_download(
+    db: Session,
+    *,
+    unit_id: int,
+    downloader_name: str | None = None,
+):
+    db.execute(
+        text(
+            """
+            UPDATE green_sponsorship_units
+            SET qr_download_count = COALESCE(qr_download_count, 0) + 1,
+                first_qr_downloaded_at = COALESCE(first_qr_downloaded_at, NOW()),
+                last_qr_downloaded_at = NOW(),
+                last_qr_downloaded_by = COALESCE(:downloader_name, last_qr_downloaded_by),
+                updated_at = NOW()
+            WHERE id = :unit_id
+            """
+        ),
+        {
+            "unit_id": int(unit_id),
+            "downloader_name": str(downloader_name or "").strip() or None,
+        },
+    )
+
+
 def _list_public_sponsor_project_ids_for_user_ids(
     db: Session,
     *,
@@ -8237,27 +8630,80 @@ def _refresh_sponsorship_order_status(db: Session, order_id: int):
 
 
 def _link_tree_to_pending_sponsorship_unit(db: Session, project_id: int, tree_id: int) -> dict | None:
-    unit = db.execute(
-        text(
-            """
-            SELECT id, order_id
-            FROM green_sponsorship_units
-            WHERE project_id = :project_id
-              AND tree_id IS NULL
-              AND LOWER(COALESCE(sponsorship_status, '')) = 'awaiting_tree'
-            ORDER BY created_at ASC, id ASC
-            LIMIT 1
-            """
-        ),
-        {"project_id": int(project_id)},
-    ).mappings().first()
-    if not unit:
-        return None
     tree_row = db.execute(
-        text("SELECT id, project_tree_no FROM trees WHERE id = :tree_id AND project_id = :project_id"),
+        text("SELECT id, project_tree_no, created_by FROM trees WHERE id = :tree_id AND project_id = :project_id"),
         {"tree_id": int(tree_id), "project_id": int(project_id)},
     ).mappings().first()
     if not tree_row:
+        return None
+    project_row = db.execute(
+        text("SELECT organization_id FROM tree_projects WHERE id = :project_id LIMIT 1"),
+        {"project_id": int(project_id)},
+    ).mappings().first() or {}
+    organization_id = int(project_row.get("organization_id") or 0) or None
+
+    assignee_name = str(tree_row.get("created_by") or "").strip()
+    assignee_aliases = _list_assignee_aliases_for_lookup(
+        db,
+        assignee_name=assignee_name,
+        organization_id=organization_id,
+    )
+    matched_users = _list_green_users_for_assignee_name(
+        db,
+        assignee_name=assignee_name,
+        organization_id=organization_id,
+    )
+    if not matched_users and organization_id is not None:
+        matched_users = _list_green_users_for_assignee_name(
+            db,
+            assignee_name=assignee_name,
+            organization_id=None,
+        )
+    matched_user_ids = [int(row.get("id") or 0) for row in matched_users if int(row.get("id") or 0) > 0]
+
+    unit = None
+    if matched_user_ids or assignee_aliases:
+        unit = db.execute(
+            text(
+                """
+                SELECT id, order_id
+                FROM green_sponsorship_units
+                WHERE project_id = :project_id
+                  AND tree_id IS NULL
+                  AND LOWER(COALESCE(sponsorship_status, '')) = 'awaiting_tree'
+                  AND (
+                        assigned_user_id IN :user_ids
+                     OR LOWER(TRIM(COALESCE(assigned_assignee_name, ''))) IN :aliases
+                  )
+                ORDER BY COALESCE(assigned_at, created_at) ASC, created_at ASC, id ASC
+                LIMIT 1
+                """
+            ).bindparams(
+                bindparam("user_ids", expanding=True),
+                bindparam("aliases", expanding=True),
+            ),
+            {
+                "project_id": int(project_id),
+                "user_ids": matched_user_ids or [0],
+                "aliases": assignee_aliases or [""],
+            },
+        ).mappings().first()
+    if not unit:
+        unit = db.execute(
+            text(
+                """
+                SELECT id, order_id
+                FROM green_sponsorship_units
+                WHERE project_id = :project_id
+                  AND tree_id IS NULL
+                  AND LOWER(COALESCE(sponsorship_status, '')) = 'awaiting_tree'
+                ORDER BY created_at ASC, id ASC
+                LIMIT 1
+                """
+            ),
+            {"project_id": int(project_id)},
+        ).mappings().first()
+    if not unit:
         return None
     updated = db.execute(
         text(
@@ -8267,6 +8713,8 @@ def _link_tree_to_pending_sponsorship_unit(db: Session, project_id: int, tree_id
                 tree_project_no = :tree_project_no,
                 sponsorship_status = 'linked',
                 linked_at = NOW(),
+                assigned_user_id = COALESCE(assigned_user_id, :assigned_user_id),
+                assigned_assignee_name = COALESCE(NULLIF(BTRIM(COALESCE(assigned_assignee_name, '')), ''), :assigned_assignee_name),
                 updated_at = NOW()
             WHERE id = :unit_id
             RETURNING id, order_id
@@ -8276,6 +8724,8 @@ def _link_tree_to_pending_sponsorship_unit(db: Session, project_id: int, tree_id
             "unit_id": int(unit["id"]),
             "tree_id": int(tree_id),
             "tree_project_no": int(tree_row.get("project_tree_no") or 0) or None,
+            "assigned_user_id": matched_user_ids[0] if matched_user_ids else None,
+            "assigned_assignee_name": assignee_name or None,
         },
     ).mappings().first()
     if updated:
@@ -12687,10 +13137,129 @@ def export_sponsor_tree_certificate(
     )
 
 
+@router.get("/sponsorship-units/{unit_id}/qr-tag/pdf")
+def export_sponsorship_unit_qr_tag_pdf(
+    unit_id: int,
+    request: Request,
+    user_id: int = Query(...),
+    organization_id: int | None = Query(default=None),
+    db: Session = Depends(get_db),
+):
+    unit_project = db.execute(
+        text(
+            """
+            SELECT id, project_id
+            FROM green_sponsorship_units
+            WHERE id = :unit_id
+            LIMIT 1
+            """
+        ),
+        {"unit_id": int(unit_id)},
+    ).mappings().first()
+    if not unit_project:
+        raise HTTPException(status_code=404, detail="Sponsor QR tag not found")
+
+    project_row, user_row, _selected_agent_ids = _ensure_public_sponsor_agent_project_access(
+        db,
+        project_id=int(unit_project["project_id"]),
+        user_id=int(user_id),
+        organization_id=int(organization_id) if organization_id is not None else None,
+    )
+    _assign_available_sponsor_units_for_project(db, project_id=int(project_row["id"]))
+
+    aliases = _build_sponsor_agent_aliases(user_row)
+    row = db.execute(
+        text(
+            """
+            SELECT
+                u.id AS unit_id,
+                u.unit_uid,
+                u.project_id,
+                u.tree_id,
+                u.tree_project_no,
+                u.sponsorship_status,
+                u.dedication_type,
+                u.dedication_name,
+                u.dedication_message,
+                u.qr_download_count,
+                sa.full_name AS sponsor_name,
+                sa.organization_name AS sponsor_organization_name,
+                p.name AS project_name,
+                p.location_text,
+                t.id AS linked_tree_id,
+                t.species,
+                t.status AS tree_status,
+                t.planting_date,
+                t.photo_url,
+                t.photo_urls,
+                t.tree_height_m,
+                t.tree_age_months,
+                t.inventory_tree_count,
+                t.count_in_carbon_scope,
+                t.created_at AS tree_created_at
+            FROM green_sponsorship_units u
+            JOIN green_sponsor_accounts sa ON sa.id = u.sponsor_account_id
+            JOIN tree_projects p ON p.id = u.project_id
+            LEFT JOIN trees t ON t.id = u.tree_id
+            WHERE u.id = :unit_id
+              AND u.project_id = :project_id
+              AND LOWER(COALESCE(u.sponsorship_status, '')) IN ('awaiting_tree', 'linked', 'active', 'replaced')
+              AND (
+                    u.assigned_user_id = :user_id
+                 OR LOWER(TRIM(COALESCE(u.assigned_assignee_name, ''))) IN :aliases
+              )
+            LIMIT 1
+            """
+        ).bindparams(bindparam("aliases", expanding=True)),
+        {
+            "unit_id": int(unit_id),
+            "project_id": int(project_row["id"]),
+            "user_id": int(user_id),
+            "aliases": aliases or [""],
+        },
+    ).mappings().first()
+    if not row:
+        raise HTTPException(status_code=404, detail="No sponsor QR tag is currently reserved for this agent")
+
+    item = dict(row)
+    if item.get("linked_tree_id") and not item.get("tree_id"):
+        item["tree_id"] = item.get("linked_tree_id")
+    if item.get("tree_id"):
+        carbon = _build_tree_carbon_summary(item)
+        item["annual_co2_kg"] = carbon.get("annual_co2_kg", 21.0)
+    else:
+        item["annual_co2_kg"] = 21.0
+    verification_url = _build_sponsor_public_story_url(item.get("unit_uid"), request)
+    if not verification_url:
+        base_url = _build_public_api_base_url(request)
+        verification_url = f"{base_url}/green/sponsor/public/trees/{quote(str(item.get('unit_uid') or unit_id))}"
+
+    pdf_bytes = render_green_tree_qr_tag_pdf(item, verification_url)
+    downloader_name = str(user_row.get("full_name") or user_row.get("work_username") or "").strip() or None
+    _mark_sponsor_unit_qr_download(
+        db,
+        unit_id=int(item["unit_id"]),
+        downloader_name=downloader_name,
+    )
+    db.commit()
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={
+            "Content-Disposition": f'inline; filename=\"sponsor_qr_tag_{str(item.get("unit_uid") or unit_id)}.pdf\"',
+            "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+            "Pragma": "no-cache",
+            "Expires": "0",
+        },
+    )
+
+
 @router.get("/trees/{tree_id}/qr-tag/pdf")
 def export_tree_qr_tag_pdf(
     tree_id: int,
     request: Request,
+    user_id: int | None = Query(default=None),
+    organization_id: int | None = Query(default=None),
     db: Session = Depends(get_db),
 ):
     from app.utils.green_pdf import render_green_tree_qr_tag_pdf
@@ -12705,7 +13274,7 @@ def export_tree_qr_tag_pdf(
                 t.count_in_carbon_scope, t.created_by, t.created_at AS tree_created_at,
                 p.id AS project_id, p.name AS project_name, p.location_text,
                 sa.full_name AS sponsor_name, sa.organization_name AS sponsor_organization_name,
-                u.unit_uid
+                u.id AS unit_id, u.unit_uid
             FROM trees t
             JOIN tree_projects p ON p.id = t.project_id
             LEFT JOIN green_sponsorship_units u ON u.tree_id = t.id AND LOWER(COALESCE(u.sponsorship_status, '')) IN ('linked', 'active', 'replaced')
@@ -12736,6 +13305,23 @@ def export_tree_qr_tag_pdf(
         verification_url = f"{base_url}/green/sponsor/public/trees/{tree_id}"
         
     pdf_bytes = render_green_tree_qr_tag_pdf(tree_dict, verification_url)
+    downloader_name = None
+    if user_id is not None and int(user_id) > 0:
+        try:
+            downloader_user = _get_green_user_for_sponsor_agent(
+                db,
+                user_id=int(user_id),
+                organization_id=int(organization_id) if organization_id is not None else None,
+            )
+            downloader_name = str(downloader_user.get("full_name") or downloader_user.get("work_username") or "").strip() or None
+        except Exception:
+            downloader_name = None
+    if tree_dict.get("unit_id"):
+        _mark_sponsor_unit_qr_download(
+            db,
+            unit_id=int(tree_dict["unit_id"]),
+            downloader_name=downloader_name,
+        )
     
     db.execute(
         text("INSERT INTO green_tree_qr_prints (tree_id, printed_at) VALUES (:tree_id, NOW())"),
@@ -13046,6 +13632,77 @@ def create_sponsor_agent_payout_request(payload: SponsorAgentPayoutRequestPayloa
     return {"ok": True, "request": _serialize_sponsor_agent_payout_request(dict(row) if row else None)}
 
 
+@router.get("/agent/sponsor-qr-tags")
+def list_agent_sponsor_qr_tags(
+    project_id: int = Query(...),
+    user_id: int = Query(...),
+    organization_id: int | None = Query(default=None),
+    sync: bool = Query(default=True),
+    db: Session = Depends(get_db),
+):
+    project_row, user_row, _selected_agent_ids = _ensure_public_sponsor_agent_project_access(
+        db,
+        project_id=int(project_id),
+        user_id=int(user_id),
+        organization_id=int(organization_id) if organization_id is not None else None,
+    )
+    if sync:
+        _assign_available_sponsor_units_for_project(db, project_id=int(project_row["id"]))
+        db.commit()
+    aliases = _build_sponsor_agent_aliases(user_row)
+    rows = db.execute(
+        text(
+            """
+            SELECT
+                u.id AS unit_id,
+                u.unit_uid,
+                u.project_id,
+                u.tree_id,
+                u.tree_project_no,
+                u.sponsorship_status,
+                u.dedication_type,
+                u.dedication_name,
+                u.dedication_message,
+                u.assigned_at,
+                u.qr_download_count,
+                u.first_qr_downloaded_at,
+                u.last_qr_downloaded_at,
+                u.last_qr_downloaded_by,
+                sa.id AS sponsor_account_id,
+                sa.full_name AS sponsor_name,
+                sa.organization_name AS sponsor_organization_name,
+                p.name AS project_name,
+                p.location_text,
+                t.species,
+                t.status AS tree_status
+            FROM green_sponsorship_units u
+            JOIN green_sponsor_accounts sa ON sa.id = u.sponsor_account_id
+            JOIN tree_projects p ON p.id = u.project_id
+            LEFT JOIN trees t ON t.id = u.tree_id
+            WHERE u.project_id = :project_id
+              AND u.tree_id IS NULL
+              AND LOWER(COALESCE(u.sponsorship_status, '')) = 'awaiting_tree'
+              AND (
+                    u.assigned_user_id = :user_id
+                 OR LOWER(TRIM(COALESCE(u.assigned_assignee_name, ''))) IN :aliases
+              )
+            ORDER BY COALESCE(u.assigned_at, u.created_at) ASC, u.id ASC
+            """
+        ).bindparams(bindparam("aliases", expanding=True)),
+        {
+            "project_id": int(project_id),
+            "user_id": int(user_id),
+            "aliases": aliases or [""],
+        },
+    ).mappings().all()
+    payload: list[dict] = []
+    for row in rows:
+        item = dict(row)
+        item["download_status"] = "downloaded" if int(item.get("qr_download_count") or 0) > 0 else "pending_download"
+        payload.append(item)
+    return payload
+
+
 @router.get("/admin/sponsors")
 def list_admin_sponsors(db: Session = Depends(get_db)):
     from datetime import datetime
@@ -13145,6 +13802,62 @@ def list_admin_sponsors(db: Session = Depends(get_db)):
             "conversion_rate_met": rules.get("conversion_rate_met", False),
             "referral_conversion_rate": rules.get("referral_conversion_rate", 0),
         }
+        payload.append(item)
+    return payload
+
+
+@router.get("/admin/sponsor-qr-status")
+def list_admin_sponsor_qr_status(
+    project_id: int = Query(...),
+    sync: bool = Query(default=True),
+    db: Session = Depends(get_db),
+):
+    project_row = _load_public_sponsorship_project_row(db, project_id=int(project_id))
+    if sync:
+        _assign_available_sponsor_units_for_project(db, project_id=int(project_row["id"]))
+        db.commit()
+    rows = db.execute(
+        text(
+            """
+            SELECT
+                u.id AS unit_id,
+                u.unit_uid,
+                u.project_id,
+                u.tree_id,
+                u.tree_project_no,
+                u.sponsorship_status,
+                u.dedication_type,
+                u.dedication_name,
+                u.dedication_message,
+                u.assigned_at,
+                u.qr_download_count,
+                u.first_qr_downloaded_at,
+                u.last_qr_downloaded_at,
+                u.last_qr_downloaded_by,
+                sa.id AS sponsor_account_id,
+                sa.full_name AS sponsor_name,
+                sa.organization_name AS sponsor_organization_name,
+                COALESCE(gu.full_name, u.assigned_assignee_name) AS assigned_agent_name,
+                gu.work_username AS assigned_agent_username,
+                p.name AS project_name,
+                t.species,
+                t.status AS tree_status
+            FROM green_sponsorship_units u
+            JOIN green_sponsor_accounts sa ON sa.id = u.sponsor_account_id
+            JOIN tree_projects p ON p.id = u.project_id
+            LEFT JOIN green_users gu ON gu.id = u.assigned_user_id
+            LEFT JOIN trees t ON t.id = u.tree_id
+            WHERE u.project_id = :project_id
+              AND LOWER(COALESCE(u.sponsorship_status, '')) IN ('awaiting_tree', 'linked', 'active', 'replaced')
+            ORDER BY COALESCE(sa.full_name, ''), COALESCE(u.assigned_at, u.created_at), u.id ASC
+            """
+        ),
+        {"project_id": int(project_id)},
+    ).mappings().all()
+    payload: list[dict] = []
+    for row in rows:
+        item = dict(row)
+        item["download_status"] = "downloaded" if int(item.get("qr_download_count") or 0) > 0 else "pending_download"
         payload.append(item)
     return payload
 
@@ -13354,6 +14067,10 @@ def review_admin_sponsorship_order_payment(
                 """
             ),
             {"order_id": int(order_id)},
+        )
+        _assign_available_sponsor_units_for_project(
+            db,
+            project_id=int(existing.get("project_id") or 0),
         )
     elif next_payment_status == "refunded":
         db.execute(
@@ -21735,6 +22452,13 @@ def create_work_order(
             "allow_existing_tree_area_reuse": bool(allow_existing_tree_area_reuse),
         },
     )
+    if work_type == "planting":
+        project_access_row = db.execute(
+            text("SELECT access_model, public_sponsor_enabled FROM tree_projects WHERE id = :project_id LIMIT 1"),
+            {"project_id": int(project_id)},
+        ).mappings().first()
+        if project_access_row and _is_public_sponsorship_project(dict(project_access_row)):
+            _assign_available_sponsor_units_for_project(db, project_id=int(project_id))
     db.commit()
     due_label = _safe_push_date_label(due_date)
     if work_type == "planting":

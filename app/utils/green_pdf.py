@@ -4001,9 +4001,20 @@ def render_green_tree_qr_tag_pdf(tree: dict, verification_url: str) -> bytes:
     c.drawCentredString(page_w / 2, page_h - 43, "VERIFIED TREE RECORD")
     
     # Tree Identification
-    tree_no = tree.get("project_tree_no") or tree.get("tree_id") or 0
-    tree_id_str = f"Tree ID: LC-{tree.get('tree_id')}"
-    tree_no_str = f"Tree #{tree_no}" if tree.get("project_tree_no") else f"Tree ID {tree.get('tree_id')}"
+    unit_uid = str(tree.get("unit_uid") or "").strip() or None
+    tree_id_value = tree.get("tree_id")
+    tree_id = int(tree_id_value) if tree_id_value not in {None, ""} else None
+    tree_no = tree.get("project_tree_no") or tree_id or unit_uid or 0
+    reference_label = unit_uid or (f"LC-{tree_id}" if tree_id is not None else "-")
+    tree_id_str = f"Unit ID: {unit_uid}" if unit_uid and tree_id is None else f"Tree ID: LC-{tree_id or '-'}"
+    if tree.get("project_tree_no"):
+        tree_no_str = f"Tree #{tree_no}"
+    elif tree_id is not None:
+        tree_no_str = f"Tree ID {tree_id}"
+    elif unit_uid:
+        tree_no_str = f"Sponsor Unit {unit_uid}"
+    else:
+        tree_no_str = "Reserved tree"
     
     c.setFillColor(HexColor("#083e20"))
     c.setFont("Helvetica-Bold", 12)
@@ -4058,8 +4069,8 @@ def render_green_tree_qr_tag_pdf(tree: dict, verification_url: str) -> bytes:
         
     species = tree.get("species") or "Unknown species"
     project = tree.get("project_name") or "LandCheck Restoration"
-    planted_date = str(tree.get("planting_date") or "Pending")
-    status = str(tree.get("tree_status") or tree.get("status") or "alive").replace("_", " ").title()
+    planted_date = str(tree.get("planting_date") or ("Pending field planting" if unit_uid and tree_id is None else "Pending"))
+    status = str(tree.get("tree_status") or tree.get("status") or ("reserved" if unit_uid and tree_id is None else "alive")).replace("_", " ").title()
     impact = f"{float(tree.get('annual_co2_kg') or 21.0):.1f} kg CO2/yr"
     
     draw_meta_line("Species:", species[:28], meta_y)
@@ -4071,7 +4082,7 @@ def render_green_tree_qr_tag_pdf(tree: dict, verification_url: str) -> bytes:
     # Tag footer
     c.setFillColor(HexColor("#8a9a8f"))
     c.setFont("Helvetica", 6)
-    c.drawCentredString(page_w / 2, 16, f"Ref ID: {tree_id_str} | registry.landcheck.org")
+    c.drawCentredString(page_w / 2, 16, f"Ref ID: {reference_label} | registry.landcheck.org")
     
     c.save()
     buffer.seek(0)
