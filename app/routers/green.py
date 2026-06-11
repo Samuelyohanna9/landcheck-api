@@ -13274,7 +13274,7 @@ def export_tree_qr_tag_pdf(
                 t.count_in_carbon_scope, t.created_by, t.created_at AS tree_created_at,
                 p.id AS project_id, p.name AS project_name, p.location_text,
                 sa.full_name AS sponsor_name, sa.organization_name AS sponsor_organization_name,
-                u.id AS unit_id, u.unit_uid
+                u.id AS unit_id, u.unit_uid, u.assigned_user_id, u.assigned_assignee_name
             FROM trees t
             JOIN tree_projects p ON p.id = t.project_id
             LEFT JOIN green_sponsorship_units u ON u.tree_id = t.id AND LOWER(COALESCE(u.sponsorship_status, '')) IN ('linked', 'active', 'replaced')
@@ -13290,6 +13290,30 @@ def export_tree_qr_tag_pdf(
         raise HTTPException(status_code=404, detail="Tree not found")
         
     tree_dict = dict(tree)
+    downloader_user = None
+    if tree_dict.get("unit_id") and user_id is not None and int(user_id) > 0:
+        _project_row, downloader_user, _selected_agent_ids = _ensure_public_sponsor_agent_project_access(
+            db,
+            project_id=int(tree_dict.get("project_id") or 0),
+            user_id=int(user_id),
+            organization_id=int(organization_id) if organization_id is not None else None,
+        )
+        agent_aliases = set(_build_sponsor_agent_aliases(downloader_user))
+        assigned_user_id = int(tree_dict.get("assigned_user_id") or 0)
+        assigned_assignee_name = str(tree_dict.get("assigned_assignee_name") or "").strip().lower()
+        tree_creator_name = str(tree_dict.get("created_by") or "").strip().lower()
+        assignment_confirmed = (
+            (assigned_user_id > 0 and assigned_user_id == int(user_id))
+            or (assigned_assignee_name and assigned_assignee_name in agent_aliases)
+            or (
+                assigned_user_id <= 0
+                and not assigned_assignee_name
+                and tree_creator_name
+                and tree_creator_name in agent_aliases
+            )
+        )
+        if not assignment_confirmed:
+            raise HTTPException(status_code=403, detail="This sponsor QR tag is not assigned to this agent")
     
     # Calculate carbon impact
     carbon = _build_tree_carbon_summary(tree_dict)
@@ -13307,15 +13331,18 @@ def export_tree_qr_tag_pdf(
     pdf_bytes = render_green_tree_qr_tag_pdf(tree_dict, verification_url)
     downloader_name = None
     if user_id is not None and int(user_id) > 0:
-        try:
-            downloader_user = _get_green_user_for_sponsor_agent(
-                db,
-                user_id=int(user_id),
-                organization_id=int(organization_id) if organization_id is not None else None,
-            )
-            downloader_name = str(downloader_user.get("full_name") or downloader_user.get("work_username") or "").strip() or None
-        except Exception:
-            downloader_name = None
+        if downloader_user is None:
+            try:
+                downloader_user = _get_green_user_for_sponsor_agent(
+                    db,
+                    user_id=int(user_id),
+                    organization_id=int(organization_id) if organization_id is not None else None,
+                )
+            except Exception:
+                downloader_user = None
+        downloader_name = (
+            str((downloader_user or {}).get("full_name") or (downloader_user or {}).get("work_username") or "").strip() or None
+        )
     if tree_dict.get("unit_id"):
         _mark_sponsor_unit_qr_download(
             db,
