@@ -3,6 +3,7 @@ from fastapi.responses import FileResponse, HTMLResponse, Response, StreamingRes
 from sqlalchemy.orm import Session
 from sqlalchemy import bindparam, text
 from datetime import datetime, date, timedelta, timezone
+import logging
 import json
 import base64
 import os
@@ -60,6 +61,7 @@ from app.utils.carbon import (
 )
 
 router = APIRouter(prefix="/green", tags=["green"])
+logger = logging.getLogger(__name__)
 
 _GREEN_SCHEMA_BOOTSTRAP_LOCK = Lock()
 _GREEN_SCHEMA_READY = False
@@ -7736,6 +7738,28 @@ def _assign_available_sponsor_units_for_project(db: Session, *, project_id: int)
     return assigned_total
 
 
+def _try_assign_available_sponsor_units_for_project(
+    db: Session,
+    *,
+    project_id: int,
+    context: str,
+) -> int:
+    try:
+        assigned_total = _assign_available_sponsor_units_for_project(db, project_id=int(project_id))
+        db.commit()
+        return int(assigned_total or 0)
+    except HTTPException:
+        raise
+    except Exception:
+        db.rollback()
+        logger.exception(
+            "Sponsor QR auto-assignment sync failed for project_id=%s context=%s",
+            int(project_id),
+            str(context or "").strip() or "unknown",
+        )
+        return 0
+
+
 def _ensure_public_sponsor_agent_project_access(
     db: Session,
     *,
@@ -13192,7 +13216,11 @@ def export_sponsorship_unit_qr_tag_pdf(
         user_id=int(user_id),
         organization_id=int(organization_id) if organization_id is not None else None,
     )
-    _assign_available_sponsor_units_for_project(db, project_id=int(project_row["id"]))
+    _try_assign_available_sponsor_units_for_project(
+        db,
+        project_id=int(project_row["id"]),
+        context="export_sponsorship_unit_qr_tag_pdf",
+    )
 
     aliases = _build_sponsor_agent_aliases(user_row)
     row = db.execute(
@@ -13703,8 +13731,11 @@ def list_agent_sponsor_qr_tags(
         organization_id=int(organization_id) if organization_id is not None else None,
     )
     if sync:
-        _assign_available_sponsor_units_for_project(db, project_id=int(project_row["id"]))
-        db.commit()
+        _try_assign_available_sponsor_units_for_project(
+            db,
+            project_id=int(project_row["id"]),
+            context="list_agent_sponsor_qr_tags",
+        )
     aliases = _build_sponsor_agent_aliases(user_row)
     rows = db.execute(
         text(
@@ -13871,8 +13902,11 @@ def list_admin_sponsor_qr_status(
     _ensure_sponsor_qr_unit_columns(db)
     project_row = _load_public_sponsorship_project_row(db, project_id=int(project_id))
     if sync:
-        _assign_available_sponsor_units_for_project(db, project_id=int(project_row["id"]))
-        db.commit()
+        _try_assign_available_sponsor_units_for_project(
+            db,
+            project_id=int(project_row["id"]),
+            context="list_admin_sponsor_qr_status",
+        )
     rows = db.execute(
         text(
             """
