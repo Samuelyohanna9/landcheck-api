@@ -11204,6 +11204,13 @@ class SponsorShareEarnPayload(BaseModel):
     sponsor_id: int
 
 
+class SponsorGameActionPayload(BaseModel):
+    sponsor_id: int
+    game_id: str
+    action: str
+    gp_delta: int
+
+
 class SponsorComplaintPayload(BaseModel):
     sponsor_id: int
     complaint_type: str
@@ -11522,6 +11529,46 @@ def sponsor_share_earn(payload: SponsorShareEarnPayload, db: Session = Depends(g
     )
     db.commit()
     return {"ok": True, "earned": gp_earn}
+
+
+@router.post("/sponsor/game/action")
+def sponsor_game_action(payload: SponsorGameActionPayload, db: Session = Depends(get_db)):
+    row = db.execute(
+        text("SELECT id, green_points FROM green_sponsor_accounts WHERE id = :sid AND COALESCE(is_active, TRUE) = TRUE"),
+        {"sid": payload.sponsor_id}
+    ).mappings().first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Sponsor account not found")
+
+    current_points = int(row["green_points"] or 0)
+    gp_delta = int(payload.gp_delta)
+
+    # Cap per-action earn amounts so games can't be exploited
+    MAX_EARN = {
+        "save_forest": 50, "rainmaker": 25, "climate_defender": 30,
+        "fruit_harvest": 25, "daily_spin": 200, "forest_quest": 500,
+    }
+    if gp_delta > 0:
+        cap = MAX_EARN.get(payload.game_id, 100)
+        gp_delta = min(gp_delta, cap)
+
+    if gp_delta < 0 and current_points + gp_delta < 0:
+        raise HTTPException(status_code=400, detail="Insufficient green points")
+
+    if gp_delta != 0:
+        if gp_delta > 0:
+            db.execute(
+                text("UPDATE green_sponsor_accounts SET green_points = green_points + :d, lifetime_points = lifetime_points + :d, updated_at = NOW() WHERE id = :sid"),
+                {"d": gp_delta, "sid": payload.sponsor_id}
+            )
+        else:
+            db.execute(
+                text("UPDATE green_sponsor_accounts SET green_points = green_points + :d, updated_at = NOW() WHERE id = :sid"),
+                {"d": gp_delta, "sid": payload.sponsor_id}
+            )
+        db.commit()
+
+    return {"ok": True, "gp_delta": gp_delta, "new_balance": current_points + gp_delta}
 
 
 @router.post("/sponsor/complaints")
@@ -13916,6 +13963,7 @@ def list_admin_sponsor_qr_status(
                 u.project_id,
                 u.tree_id,
                 u.tree_project_no,
+                u.assigned_user_id,
                 u.sponsorship_status,
                 u.dedication_type,
                 u.dedication_name,
@@ -13951,6 +13999,105 @@ def list_admin_sponsor_qr_status(
         item["download_status"] = "downloaded" if int(item.get("qr_download_count") or 0) > 0 else "pending_download"
         payload.append(item)
     return payload
+
+
+@router.post("/admin/sponsor-qr-status/{unit_id}/reissue")
+def reissue_admin_sponsor_qr_status(
+    unit_id: int,
+    agent_user_id: int = Body(..., embed=True),
+    reviewer_name: str | None = Body(default=None, embed=True),
+    db: Session = Depends(get_db),
+):
+    _ensure_sponsor_qr_unit_columns(db)
+    unit_row = db.execute(
+        text(
+            """
+            SELECT id, project_id, tree_id, sponsorship_status
+            FROM green_sponsorship_units
+            WHERE id = :unit_id
+            LIMIT 1
+            """
+        ),
+        {"unit_id": int(unit_id)},
+    ).mappings().first()
+    if not unit_row:
+        raise HTTPException(status_code=404, detail="Sponsor QR tag not found")
+    if unit_row.get("tree_id") is not None:
+        raise HTTPException(status_code=409, detail="This sponsor QR tag is already linked to a planted tree")
+    if _normalize_name(unit_row.get("sponsorship_status")) != "awaiting_tree":
+        raise HTTPException(status_code=409, detail="Only sponsor units awaiting planting can be reissued")
+
+    project_row = _load_public_sponsorship_project_row(db, project_id=int(unit_row.get("project_id") or 0))
+    organization_id = int(project_row.get("organization_id") or 0) or None
+    explicit_agent_ids = _normalize_positive_int_list(_json_value_or(project_row.get("public_sponsor_agent_user_ids"), []))
+    try:
+        selected_agent_ids = _collect_public_sponsor_agent_user_ids_for_project(
+            db,
+            project_id=int(project_row["id"]),
+            organization_id=organization_id,
+            explicit_user_ids=explicit_agent_ids,
+        )
+    except Exception:
+        selected_agent_ids = explicit_agent_ids
+    normalized_agent_id = int(agent_user_id or 0)
+    if normalized_agent_id <= 0:
+        raise HTTPException(status_code=400, detail="Select a sponsor agent to receive this QR tag")
+    if normalized_agent_id not in set(_normalize_positive_int_list(selected_agent_ids)):
+        raise HTTPException(status_code=403, detail="Selected user is not saved as a sponsor agent for this project")
+
+    agent_row = _get_green_user_for_sponsor_agent(
+        db,
+        user_id=normalized_agent_id,
+        organization_id=organization_id,
+    )
+    assigned_assignee_name = (
+        str(agent_row.get("full_name") or agent_row.get("work_username") or "").strip() or None
+    )
+    updated_row = db.execute(
+        text(
+            """
+            UPDATE green_sponsorship_units
+            SET assigned_user_id = :agent_user_id,
+                assigned_assignee_name = :assigned_assignee_name,
+                assigned_at = NOW(),
+                updated_at = NOW()
+            WHERE id = :unit_id
+            RETURNING id, project_id, assigned_user_id, assigned_assignee_name, assigned_at
+            """
+        ),
+        {
+            "unit_id": int(unit_id),
+            "agent_user_id": normalized_agent_id,
+            "assigned_assignee_name": assigned_assignee_name,
+        },
+    ).mappings().first()
+    db.commit()
+
+    assignee_name = str(agent_row.get("full_name") or agent_row.get("work_username") or "").strip() or None
+    if assignee_name:
+        project_name = str(project_row.get("name") or "this project").strip() or "this project"
+        _queue_green_push_to_assignee(
+            db,
+            project_id=int(project_row["id"]),
+            assignee_name=assignee_name,
+            title="Sponsor QR tag reissued",
+            body=f"A sponsor-funded QR tag was reissued to you in {project_name}. Open Map & Add Tree to download it before planting.",
+            data={
+                "type": "sponsor_qr_reissued",
+                "project_id": int(project_row["id"]),
+                "unit_id": int(unit_id),
+                "reviewer_name": str(reviewer_name or "").strip() or None,
+            },
+        )
+
+    return {
+        "ok": True,
+        "unit_id": int(unit_id),
+        "project_id": int(project_row["id"]),
+        "assigned_user_id": int((updated_row or {}).get("assigned_user_id") or normalized_agent_id),
+        "assigned_assignee_name": str((updated_row or {}).get("assigned_assignee_name") or assigned_assignee_name or "").strip() or None,
+        "assigned_at": (updated_row or {}).get("assigned_at"),
+    }
 
 
 def _list_admin_sponsorship_orders(db: Session, project_id: int | None = None, sync_gateway: bool = True) -> list[dict]:
