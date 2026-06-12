@@ -42,6 +42,7 @@ from app.utils.green_pdf import (
     render_green_existing_trees_report_pdf,
     render_green_org_credentials_pdf,
     render_green_sponsor_certificate_pdf,
+    render_green_tree_qr_tag_pdf,
 )
 from app.utils.green_remote_monitoring import compute_remote_monitoring_report
 from app.utils.r2_exports import upload_export_file_best_effort, _build_export_r2_settings
@@ -11547,6 +11548,8 @@ def sponsor_game_action(payload: SponsorGameActionPayload, db: Session = Depends
     MAX_EARN = {
         "save_forest": 50, "rainmaker": 25, "climate_defender": 30,
         "fruit_harvest": 25, "daily_spin": 200, "forest_quest": 500,
+        "grow_tree": 0, "wildlife_collector": 0,
+        "forest_builder": 60,
     }
     if gp_delta > 0:
         cap = MAX_EARN.get(payload.game_id, 100)
