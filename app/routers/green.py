@@ -14076,19 +14076,27 @@ def reissue_admin_sponsor_qr_status(
     assignee_name = str(agent_row.get("full_name") or agent_row.get("work_username") or "").strip() or None
     if assignee_name:
         project_name = str(project_row.get("name") or "this project").strip() or "this project"
-        _queue_green_push_to_assignee(
-            db,
-            project_id=int(project_row["id"]),
-            assignee_name=assignee_name,
-            title="Sponsor QR tag reissued",
-            body=f"A sponsor-funded QR tag was reissued to you in {project_name}. Open Map & Add Tree to download it before planting.",
-            data={
-                "type": "sponsor_qr_reissued",
-                "project_id": int(project_row["id"]),
-                "unit_id": int(unit_id),
-                "reviewer_name": str(reviewer_name or "").strip() or None,
-            },
-        )
+        try:
+            _queue_green_push_to_assignee(
+                db,
+                project_id=int(project_row["id"]),
+                assignee_name=assignee_name,
+                title="Sponsor QR tag reissued",
+                body=f"A sponsor-funded QR tag was reissued to you in {project_name}. Open Map & Add Tree to download it before planting.",
+                data={
+                    "type": "sponsor_qr_reissued",
+                    "project_id": int(project_row["id"]),
+                    "unit_id": int(unit_id),
+                    "reviewer_name": str(reviewer_name or "").strip() or None,
+                },
+            )
+        except Exception:
+            logger.exception(
+                "Sponsor QR reissue push notification failed for unit_id=%s project_id=%s agent_user_id=%s",
+                int(unit_id),
+                int(project_row["id"]),
+                int(normalized_agent_id),
+            )
 
     return {
         "ok": True,
