@@ -7481,6 +7481,29 @@ def _load_public_sponsorship_project_row(db: Session, *, project_id: int) -> dic
     return payload
 
 
+_sponsor_qr_unit_columns_ready = False
+
+
+def _ensure_sponsor_qr_unit_columns(db: Session):
+    global _sponsor_qr_unit_columns_ready
+    if _sponsor_qr_unit_columns_ready:
+        return
+    try:
+        db.execute(text("ALTER TABLE green_sponsorship_units ADD COLUMN IF NOT EXISTS assigned_user_id INTEGER REFERENCES green_users(id)"))
+        db.execute(text("ALTER TABLE green_sponsorship_units ADD COLUMN IF NOT EXISTS assigned_assignee_name TEXT"))
+        db.execute(text("ALTER TABLE green_sponsorship_units ADD COLUMN IF NOT EXISTS assigned_at TIMESTAMP"))
+        db.execute(text("ALTER TABLE green_sponsorship_units ADD COLUMN IF NOT EXISTS qr_download_count INTEGER NOT NULL DEFAULT 0"))
+        db.execute(text("ALTER TABLE green_sponsorship_units ADD COLUMN IF NOT EXISTS first_qr_downloaded_at TIMESTAMP"))
+        db.execute(text("ALTER TABLE green_sponsorship_units ADD COLUMN IF NOT EXISTS last_qr_downloaded_at TIMESTAMP"))
+        db.execute(text("ALTER TABLE green_sponsorship_units ADD COLUMN IF NOT EXISTS last_qr_downloaded_by TEXT"))
+        db.execute(text("CREATE INDEX IF NOT EXISTS idx_sponsor_units_project_assigned_user ON green_sponsorship_units(project_id, assigned_user_id, sponsorship_status, created_at DESC)"))
+        db.commit()
+        _sponsor_qr_unit_columns_ready = True
+    except Exception:
+        db.rollback()
+        raise
+
+
 def _list_assignee_aliases_for_lookup(
     db: Session,
     *,
@@ -7597,6 +7620,7 @@ def _count_reserved_sponsor_units_for_assignee(
 
 
 def _assign_available_sponsor_units_for_project(db: Session, *, project_id: int) -> int:
+    _ensure_sponsor_qr_unit_columns(db)
     project_row = _load_public_sponsorship_project_row(db, project_id=int(project_id))
     organization_id = int(project_row.get("organization_id") or 0) or None
     explicit_agent_ids = _normalize_positive_int_list(_json_value_or(project_row.get("public_sponsor_agent_user_ids"), []))
@@ -7719,6 +7743,7 @@ def _ensure_public_sponsor_agent_project_access(
     user_id: int,
     organization_id: int | None = None,
 ) -> tuple[dict, dict, list[int]]:
+    _ensure_sponsor_qr_unit_columns(db)
     project_row = _load_public_sponsorship_project_row(db, project_id=int(project_id))
     user_row = _get_green_user_for_sponsor_agent(
         db,
@@ -7747,6 +7772,7 @@ def _mark_sponsor_unit_qr_download(
     unit_id: int,
     downloader_name: str | None = None,
 ):
+    _ensure_sponsor_qr_unit_columns(db)
     db.execute(
         text(
             """
@@ -13145,6 +13171,7 @@ def export_sponsorship_unit_qr_tag_pdf(
     organization_id: int | None = Query(default=None),
     db: Session = Depends(get_db),
 ):
+    _ensure_sponsor_qr_unit_columns(db)
     unit_project = db.execute(
         text(
             """
@@ -13263,6 +13290,7 @@ def export_tree_qr_tag_pdf(
     db: Session = Depends(get_db),
 ):
     from app.utils.green_pdf import render_green_tree_qr_tag_pdf
+    _ensure_sponsor_qr_unit_columns(db)
     
     # Load tree and project info, and optional sponsor info via LEFT JOINs
     tree = db.execute(
@@ -13667,6 +13695,7 @@ def list_agent_sponsor_qr_tags(
     sync: bool = Query(default=True),
     db: Session = Depends(get_db),
 ):
+    _ensure_sponsor_qr_unit_columns(db)
     project_row, user_row, _selected_agent_ids = _ensure_public_sponsor_agent_project_access(
         db,
         project_id=int(project_id),
@@ -13839,6 +13868,7 @@ def list_admin_sponsor_qr_status(
     sync: bool = Query(default=True),
     db: Session = Depends(get_db),
 ):
+    _ensure_sponsor_qr_unit_columns(db)
     project_row = _load_public_sponsorship_project_row(db, project_id=int(project_id))
     if sync:
         _assign_available_sponsor_units_for_project(db, project_id=int(project_row["id"]))
