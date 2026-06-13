@@ -46,6 +46,7 @@ from app.utils.green_pdf import (
 )
 from app.utils.green_remote_monitoring import compute_remote_monitoring_report
 from app.utils.r2_exports import upload_export_file_best_effort, _build_export_r2_settings
+from app.utils.activity_logger import ensure_activity_log_table, require_super_admin_request, safe_log_activity
 from app.utils.carbon import (
     compute_project_carbon,
     generate_co2_projection_table,
@@ -941,27 +942,14 @@ def _log_activity(
     actor: str | None = None,
     details: dict | None = None,
 ):
-    try:
-        from sqlalchemy import text
-        import json
-        db.execute(
-            text(
-                """
-                INSERT INTO green_activity_logs (source, event_type, actor, message, details, created_at)
-                VALUES (:source, :event_type, :actor, :message, CAST(:details AS JSONB), NOW())
-                """
-            ),
-            {
-                "source": source,
-                "event_type": event_type,
-                "actor": actor,
-                "message": message,
-                "details": json.dumps(details) if details is not None else None,
-            },
-        )
-        db.commit()
-    except Exception:
-        db.rollback()
+    safe_log_activity(
+        db,
+        source=source,
+        event_type=event_type,
+        actor=actor,
+        message=message,
+        details=details,
+    )
 
 
 def _project_organization_id(db: Session, project_id: int) -> int | None:
@@ -12037,7 +12025,9 @@ def create_public_log(payload: PublicLogPayload, db: Session = Depends(get_db)):
 
 
 @router.get("/admin/logs")
-def get_admin_logs(db: Session = Depends(get_db)):
+def get_admin_logs(request: Request, db: Session = Depends(get_db)):
+    require_super_admin_request(request)
+    ensure_activity_log_table()
     rows = db.execute(
         text(
             """
@@ -12062,7 +12052,9 @@ def get_admin_logs(db: Session = Depends(get_db)):
 
 
 @router.post("/admin/logs/reset")
-def reset_admin_logs(db: Session = Depends(get_db)):
+def reset_admin_logs(request: Request, db: Session = Depends(get_db)):
+    require_super_admin_request(request)
+    ensure_activity_log_table()
     db.execute(text("TRUNCATE TABLE green_activity_logs"))
     db.commit()
     _log_activity(
@@ -12076,7 +12068,8 @@ def reset_admin_logs(db: Session = Depends(get_db)):
 
 
 @router.get("/admin/qr-prints")
-def get_admin_qr_prints(db: Session = Depends(get_db)):
+def get_admin_qr_prints(request: Request, db: Session = Depends(get_db)):
+    require_super_admin_request(request)
     rows = db.execute(
         text(
             """
