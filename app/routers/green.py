@@ -9712,6 +9712,30 @@ def list_public_sponsorship_projects(db: Session = Depends(get_db)):
     return items
 
 
+@router.get("/public/partner-organizations")
+def list_public_partner_organizations(db: Session = Depends(get_db)):
+    rows = db.execute(
+        text(
+            """
+            SELECT id, name, logo_url
+            FROM green_organizations
+            WHERE COALESCE(is_active, TRUE) = TRUE
+              AND logo_url IS NOT NULL
+              AND logo_url != ''
+            ORDER BY name
+            """
+        )
+    ).mappings().all()
+    return [
+        {
+            "id": row["id"],
+            "name": row["name"],
+            "logo_url": _normalize_logo_asset_path(row["logo_url"]),
+        }
+        for row in rows
+    ]
+
+
 @router.get("/public-projects/{project_id}")
 def get_public_sponsorship_project(project_id: int, db: Session = Depends(get_db)):
     project = get_project(project_id=project_id, db=db, assignee_name=None)
