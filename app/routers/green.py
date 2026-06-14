@@ -5719,6 +5719,22 @@ def ensure_green_tables(db: Session):
             created_at TIMESTAMP DEFAULT NOW()
         )
     """))
+    db.execute(text("""
+        CREATE TABLE IF NOT EXISTS green_sponsor_social_follow_claims (
+            id SERIAL PRIMARY KEY,
+            sponsor_id INTEGER NOT NULL REFERENCES green_sponsor_accounts(id) ON DELETE CASCADE,
+            facebook_screenshot_url TEXT,
+            instagram_screenshot_url TEXT,
+            facebook_opened BOOLEAN NOT NULL DEFAULT FALSE,
+            instagram_opened BOOLEAN NOT NULL DEFAULT FALSE,
+            status TEXT NOT NULL DEFAULT 'pending',
+            supervisor_note TEXT,
+            points_awarded BOOLEAN NOT NULL DEFAULT FALSE,
+            created_at TIMESTAMP DEFAULT NOW(),
+            updated_at TIMESTAMP DEFAULT NOW(),
+            reviewed_at TIMESTAMP
+        )
+    """))
     try:
         db.execute(text("ALTER TABLE green_school_nominations ADD COLUMN IF NOT EXISTS points_spent INTEGER NOT NULL DEFAULT 100"))
     except Exception:
@@ -5737,6 +5753,46 @@ def ensure_green_tables(db: Session):
         db.rollback()
     try:
         db.execute(text("ALTER TABLE green_sponsor_complaints ADD COLUMN IF NOT EXISTS supervisor_note TEXT"))
+    except Exception:
+        db.rollback()
+    try:
+        db.execute(text("ALTER TABLE green_sponsor_social_follow_claims ADD COLUMN IF NOT EXISTS facebook_screenshot_url TEXT"))
+    except Exception:
+        db.rollback()
+    try:
+        db.execute(text("ALTER TABLE green_sponsor_social_follow_claims ADD COLUMN IF NOT EXISTS instagram_screenshot_url TEXT"))
+    except Exception:
+        db.rollback()
+    try:
+        db.execute(text("ALTER TABLE green_sponsor_social_follow_claims ADD COLUMN IF NOT EXISTS facebook_opened BOOLEAN NOT NULL DEFAULT FALSE"))
+    except Exception:
+        db.rollback()
+    try:
+        db.execute(text("ALTER TABLE green_sponsor_social_follow_claims ADD COLUMN IF NOT EXISTS instagram_opened BOOLEAN NOT NULL DEFAULT FALSE"))
+    except Exception:
+        db.rollback()
+    try:
+        db.execute(text("ALTER TABLE green_sponsor_social_follow_claims ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'pending'"))
+    except Exception:
+        db.rollback()
+    try:
+        db.execute(text("ALTER TABLE green_sponsor_social_follow_claims ADD COLUMN IF NOT EXISTS supervisor_note TEXT"))
+    except Exception:
+        db.rollback()
+    try:
+        db.execute(text("ALTER TABLE green_sponsor_social_follow_claims ADD COLUMN IF NOT EXISTS points_awarded BOOLEAN NOT NULL DEFAULT FALSE"))
+    except Exception:
+        db.rollback()
+    try:
+        db.execute(text("ALTER TABLE green_sponsor_social_follow_claims ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT NOW()"))
+    except Exception:
+        db.rollback()
+    try:
+        db.execute(text("ALTER TABLE green_sponsor_social_follow_claims ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW()"))
+    except Exception:
+        db.rollback()
+    try:
+        db.execute(text("ALTER TABLE green_sponsor_social_follow_claims ADD COLUMN IF NOT EXISTS reviewed_at TIMESTAMP"))
     except Exception:
         db.rollback()
     try:
@@ -11224,11 +11280,25 @@ class SponsorGameActionPayload(BaseModel):
     gp_delta: int
 
 
+class SponsorSocialFollowClaimPayload(BaseModel):
+    sponsor_id: int
+    facebook_screenshot_url: str | None = None
+    instagram_screenshot_url: str | None = None
+    facebook_opened: bool = False
+    instagram_opened: bool = False
+
+
 class SponsorComplaintPayload(BaseModel):
     sponsor_id: int
     complaint_type: str
     tree_id: int | None = None
     message: str
+
+
+class SponsorSocialFollowReviewPayload(BaseModel):
+    status: str
+    supervisor_note: str | None = None
+    reviewer_name: str | None = None
 
 
 class SchoolNominationReviewPayload(BaseModel):
@@ -11239,6 +11309,96 @@ class SchoolNominationReviewPayload(BaseModel):
 class CommunityProjectStatusPayload(BaseModel):
     status: str
     supervisor_note: str | None = None
+
+
+SOCIAL_FOLLOW_REWARD_GP = 20
+
+
+def _normalize_optional_text(value: str | None) -> str | None:
+    if value is None:
+        return None
+    cleaned = str(value).strip()
+    return cleaned or None
+
+
+def _social_follow_reward_already_awarded(db: Session, sponsor_id: int) -> bool:
+    approved_claim = db.execute(
+        text(
+            """
+            SELECT 1
+            FROM green_sponsor_social_follow_claims
+            WHERE sponsor_id = :sponsor_id
+              AND COALESCE(points_awarded, FALSE) = TRUE
+            LIMIT 1
+            """
+        ),
+        {"sponsor_id": sponsor_id},
+    ).scalar()
+    if approved_claim:
+        return True
+
+    legacy_award = db.execute(
+        text(
+            """
+            SELECT 1
+            FROM green_activity_logs
+            WHERE actor = :actor
+              AND event_type = 'follow_landcheck_social_reward'
+            LIMIT 1
+            """
+        ),
+        {"actor": str(sponsor_id)},
+    ).scalar()
+    return bool(legacy_award)
+
+
+def _serialize_sponsor_social_follow_claim(row) -> dict | None:
+    if not row:
+        return None
+    item = dict(row)
+    item["id"] = int(item.get("id") or 0)
+    item["sponsor_id"] = int(item.get("sponsor_id") or 0)
+    item["facebook_opened"] = bool(item.get("facebook_opened"))
+    item["instagram_opened"] = bool(item.get("instagram_opened"))
+    item["points_awarded"] = bool(item.get("points_awarded"))
+    item["status"] = str(item.get("status") or "pending")
+    item["facebook_screenshot_url"] = _normalize_optional_text(item.get("facebook_screenshot_url"))
+    item["instagram_screenshot_url"] = _normalize_optional_text(item.get("instagram_screenshot_url"))
+    item["supervisor_note"] = _normalize_optional_text(item.get("supervisor_note"))
+    item["sponsor_name"] = _normalize_optional_text(item.get("sponsor_name"))
+    item["sponsor_email"] = _normalize_optional_text(item.get("sponsor_email"))
+    return item
+
+
+def _get_latest_sponsor_social_follow_claim(db: Session, sponsor_id: int) -> dict | None:
+    row = db.execute(
+        text(
+            """
+            SELECT c.id,
+                   c.sponsor_id,
+                   c.facebook_screenshot_url,
+                   c.instagram_screenshot_url,
+                   c.facebook_opened,
+                   c.instagram_opened,
+                   c.status,
+                   c.supervisor_note,
+                   c.points_awarded,
+                   c.created_at,
+                   c.updated_at,
+                   COALESCE(c.updated_at, c.created_at) AS submitted_at,
+                   c.reviewed_at,
+                   sa.full_name AS sponsor_name,
+                   sa.email AS sponsor_email
+            FROM green_sponsor_social_follow_claims c
+            JOIN green_sponsor_accounts sa ON sa.id = c.sponsor_id
+            WHERE c.sponsor_id = :sponsor_id
+            ORDER BY COALESCE(c.updated_at, c.created_at) DESC, c.id DESC
+            LIMIT 1
+            """
+        ),
+        {"sponsor_id": sponsor_id},
+    ).mappings().first()
+    return _serialize_sponsor_social_follow_claim(row)
 
 
 def _compute_active_referrer_rules(db: Session, sponsor_id: int) -> dict:
@@ -11611,21 +11771,7 @@ def sponsor_game_action(payload: SponsorGameActionPayload, db: Session = Depends
     gp_delta = int(payload.gp_delta)
 
     if payload.game_id == "forest_quest" and payload.action == "follow_landcheck_social" and gp_delta > 0:
-        already_claimed = db.execute(
-            text(
-                """
-                SELECT 1
-                FROM green_activity_logs
-                WHERE source = 'sponsor_game'
-                  AND event_type = 'follow_landcheck_social_reward'
-                  AND actor = :actor
-                LIMIT 1
-                """
-            ),
-            {"actor": str(payload.sponsor_id)},
-        ).scalar()
-        if already_claimed:
-            return {"ok": True, "gp_delta": 0, "new_balance": current_points}
+        return {"ok": True, "gp_delta": 0, "new_balance": current_points}
 
     # Cap per-action earn amounts so games can't be exploited
     MAX_EARN = {
@@ -11652,19 +11798,193 @@ def sponsor_game_action(payload: SponsorGameActionPayload, db: Session = Depends
                 text("UPDATE green_sponsor_accounts SET green_points = green_points + :d, updated_at = NOW() WHERE id = :sid"),
                 {"d": gp_delta, "sid": payload.sponsor_id}
             )
-
-        if payload.game_id == "forest_quest" and payload.action == "follow_landcheck_social" and gp_delta > 0:
-            _log_activity(
-                db,
-                "sponsor_game",
-                "follow_landcheck_social_reward",
-                f"Sponsor {payload.sponsor_id} claimed the LandCheck social follow reward",
-                str(payload.sponsor_id),
-                {"sponsor_id": payload.sponsor_id, "game_id": payload.game_id, "action": payload.action, "gp_delta": gp_delta},
-            )
         db.commit()
 
     return {"ok": True, "gp_delta": gp_delta, "new_balance": current_points + gp_delta}
+
+
+@router.get("/sponsor/social-follow-claim")
+def get_sponsor_social_follow_claim(
+    sponsor_id: int = Query(...),
+    db: Session = Depends(get_db),
+):
+    sponsor = db.execute(
+        text(
+            """
+            SELECT id, full_name, email
+            FROM green_sponsor_accounts
+            WHERE id = :sponsor_id
+              AND COALESCE(is_active, TRUE) = TRUE
+            """
+        ),
+        {"sponsor_id": sponsor_id},
+    ).mappings().first()
+    if not sponsor:
+        raise HTTPException(status_code=404, detail="Sponsor account not found")
+
+    claim = _get_latest_sponsor_social_follow_claim(db, sponsor_id)
+    if claim:
+        return claim
+
+    if _social_follow_reward_already_awarded(db, sponsor_id):
+        return {
+            "id": 0,
+            "sponsor_id": sponsor_id,
+            "facebook_screenshot_url": None,
+            "instagram_screenshot_url": None,
+            "facebook_opened": True,
+            "instagram_opened": True,
+            "status": "approved",
+            "supervisor_note": "Follow reward was already credited before the proof-review workflow was introduced.",
+            "points_awarded": True,
+            "created_at": None,
+            "updated_at": None,
+            "submitted_at": None,
+            "reviewed_at": None,
+            "sponsor_name": sponsor["full_name"],
+            "sponsor_email": sponsor["email"],
+        }
+
+    return None
+
+
+@router.post("/sponsor/social-follow-claim")
+def submit_sponsor_social_follow_claim(
+    payload: SponsorSocialFollowClaimPayload,
+    db: Session = Depends(get_db),
+):
+    sponsor = db.execute(
+        text(
+            """
+            SELECT id, full_name, email
+            FROM green_sponsor_accounts
+            WHERE id = :sponsor_id
+              AND COALESCE(is_active, TRUE) = TRUE
+            """
+        ),
+        {"sponsor_id": payload.sponsor_id},
+    ).mappings().first()
+    if not sponsor:
+        raise HTTPException(status_code=404, detail="Sponsor account not found")
+
+    if not payload.facebook_opened or not payload.instagram_opened:
+        raise HTTPException(status_code=400, detail="Open both Facebook and Instagram before submitting proof.")
+
+    facebook_screenshot_url = _normalize_optional_text(payload.facebook_screenshot_url)
+    instagram_screenshot_url = _normalize_optional_text(payload.instagram_screenshot_url)
+    if not facebook_screenshot_url or not instagram_screenshot_url:
+        raise HTTPException(status_code=400, detail="Upload both follow screenshots before submitting proof.")
+
+    if _social_follow_reward_already_awarded(db, payload.sponsor_id):
+        raise HTTPException(status_code=400, detail="This sponsor account has already received the social follow reward.")
+
+    latest = db.execute(
+        text(
+            """
+            SELECT id, status, points_awarded
+            FROM green_sponsor_social_follow_claims
+            WHERE sponsor_id = :sponsor_id
+            ORDER BY COALESCE(updated_at, created_at) DESC, id DESC
+            LIMIT 1
+            """
+        ),
+        {"sponsor_id": payload.sponsor_id},
+    ).mappings().first()
+
+    if latest and str(latest.get("status") or "").strip().lower() == "approved":
+        raise HTTPException(status_code=400, detail="This sponsor account has already completed the social follow reward review.")
+    if latest and bool(latest.get("points_awarded")):
+        raise HTTPException(status_code=400, detail="This sponsor account has already received the social follow reward.")
+
+    if latest:
+        db.execute(
+            text(
+                """
+                UPDATE green_sponsor_social_follow_claims
+                SET facebook_screenshot_url = :facebook_screenshot_url,
+                    instagram_screenshot_url = :instagram_screenshot_url,
+                    facebook_opened = TRUE,
+                    instagram_opened = TRUE,
+                    status = 'pending',
+                    supervisor_note = NULL,
+                    points_awarded = FALSE,
+                    updated_at = NOW(),
+                    reviewed_at = NULL
+                WHERE id = :claim_id
+                """
+            ),
+            {
+                "claim_id": latest["id"],
+                "facebook_screenshot_url": facebook_screenshot_url,
+                "instagram_screenshot_url": instagram_screenshot_url,
+            },
+        )
+        claim_id = int(latest["id"])
+    else:
+        claim_id = int(
+            db.execute(
+                text(
+                    """
+                    INSERT INTO green_sponsor_social_follow_claims (
+                        sponsor_id,
+                        facebook_screenshot_url,
+                        instagram_screenshot_url,
+                        facebook_opened,
+                        instagram_opened,
+                        status,
+                        points_awarded
+                    )
+                    VALUES (
+                        :sponsor_id,
+                        :facebook_screenshot_url,
+                        :instagram_screenshot_url,
+                        TRUE,
+                        TRUE,
+                        'pending',
+                        FALSE
+                    )
+                    RETURNING id
+                    """
+                ),
+                {
+                    "sponsor_id": payload.sponsor_id,
+                    "facebook_screenshot_url": facebook_screenshot_url,
+                    "instagram_screenshot_url": instagram_screenshot_url,
+                },
+            ).scalar()
+            or 0
+        )
+
+    claim = _get_latest_sponsor_social_follow_claim(db, payload.sponsor_id)
+    _log_activity(
+        db,
+        "sponsor_game",
+        "social_follow_claim_submitted",
+        f"Sponsor {payload.sponsor_id} submitted LandCheck social follow proof for review",
+        str(payload.sponsor_id),
+        {
+            "claim_id": claim_id,
+            "sponsor_id": payload.sponsor_id,
+            "facebook_opened": True,
+            "instagram_opened": True,
+            "facebook_screenshot_url": facebook_screenshot_url,
+            "instagram_screenshot_url": instagram_screenshot_url,
+        },
+    )
+    db.commit()
+
+    try:
+        _send_sponsor_push_notification(
+            db,
+            payload.sponsor_id,
+            "Follow Proof Submitted",
+            "Your LandCheck social follow proof is now waiting for super admin review in LandCheck Work.",
+            {"claim_id": claim_id, "status": "pending", "type": "social_follow_claim"},
+        )
+    except Exception:
+        pass
+
+    return {"ok": True, "claim": claim}
 
 
 @router.post("/sponsor/complaints")
@@ -11706,6 +12026,155 @@ def list_admin_complaints(db: Session = Depends(get_db)):
         """)
     ).mappings().all()
     return [dict(row) for row in rows]
+
+
+@router.get("/admin/social-follow-claims")
+def list_admin_social_follow_claims(db: Session = Depends(get_db)):
+    rows = db.execute(
+        text(
+            """
+            SELECT c.id,
+                   c.sponsor_id,
+                   c.facebook_screenshot_url,
+                   c.instagram_screenshot_url,
+                   c.facebook_opened,
+                   c.instagram_opened,
+                   c.status,
+                   c.supervisor_note,
+                   c.points_awarded,
+                   c.created_at,
+                   c.updated_at,
+                   COALESCE(c.updated_at, c.created_at) AS submitted_at,
+                   c.reviewed_at,
+                   sa.full_name AS sponsor_name,
+                   sa.email AS sponsor_email
+            FROM green_sponsor_social_follow_claims c
+            JOIN green_sponsor_accounts sa ON sa.id = c.sponsor_id
+            ORDER BY
+                CASE
+                    WHEN LOWER(COALESCE(c.status, 'pending')) = 'pending' THEN 0
+                    WHEN LOWER(COALESCE(c.status, 'pending')) = 'rejected' THEN 1
+                    ELSE 2
+                END,
+                COALESCE(c.updated_at, c.created_at) DESC,
+                c.id DESC
+            """
+        )
+    ).mappings().all()
+    return [_serialize_sponsor_social_follow_claim(row) for row in rows]
+
+
+@router.post("/admin/social-follow-claims/{claim_id}/review")
+def review_social_follow_claim(
+    claim_id: int,
+    payload: SponsorSocialFollowReviewPayload,
+    db: Session = Depends(get_db),
+):
+    status_clean = str(payload.status or "").strip().lower()
+    if status_clean not in ("approved", "rejected"):
+        raise HTTPException(status_code=400, detail="Invalid status. Must be 'approved' or 'rejected'.")
+
+    claim = db.execute(
+        text(
+            """
+            SELECT id, sponsor_id, status, points_awarded, facebook_screenshot_url, instagram_screenshot_url
+            FROM green_sponsor_social_follow_claims
+            WHERE id = :claim_id
+            """
+        ),
+        {"claim_id": claim_id},
+    ).mappings().first()
+    if not claim:
+        raise HTTPException(status_code=404, detail="Social follow claim not found.")
+
+    current_status = str(claim.get("status") or "").strip().lower()
+    if current_status != "pending":
+        raise HTTPException(status_code=400, detail="This social follow claim has already been reviewed.")
+
+    sponsor_id = int(claim["sponsor_id"])
+    already_awarded = bool(claim.get("points_awarded")) or _social_follow_reward_already_awarded(db, sponsor_id)
+    gp_awarded = False
+    if status_clean == "approved" and not already_awarded:
+        db.execute(
+            text(
+                """
+                UPDATE green_sponsor_accounts
+                SET green_points = green_points + :gp_delta,
+                    lifetime_points = lifetime_points + :gp_delta,
+                    updated_at = NOW()
+                WHERE id = :sponsor_id
+                """
+            ),
+            {"gp_delta": SOCIAL_FOLLOW_REWARD_GP, "sponsor_id": sponsor_id},
+        )
+        gp_awarded = True
+
+    db.execute(
+        text(
+            """
+            UPDATE green_sponsor_social_follow_claims
+            SET status = :status,
+                supervisor_note = :supervisor_note,
+                points_awarded = :points_awarded,
+                reviewed_at = NOW(),
+                updated_at = NOW()
+            WHERE id = :claim_id
+            """
+        ),
+        {
+            "claim_id": claim_id,
+            "status": status_clean,
+            "supervisor_note": _normalize_optional_text(payload.supervisor_note),
+            "points_awarded": bool(status_clean == "approved"),
+        },
+    )
+
+    reviewer_name = _normalize_optional_text(payload.reviewer_name) or "super_admin"
+    event_type = "social_follow_claim_rewarded" if status_clean == "approved" else "social_follow_claim_rejected"
+    _log_activity(
+        db,
+        "backend_api",
+        event_type,
+        (
+            f"Social follow proof claim #{claim_id} {status_clean} for sponsor {sponsor_id}"
+            + (f"; {SOCIAL_FOLLOW_REWARD_GP} GP awarded" if gp_awarded else "")
+        ),
+        reviewer_name,
+        {
+            "claim_id": claim_id,
+            "sponsor_id": sponsor_id,
+            "status": status_clean,
+            "supervisor_note": _normalize_optional_text(payload.supervisor_note),
+            "reviewer_name": reviewer_name,
+            "gp_awarded": gp_awarded,
+        },
+    )
+    db.commit()
+
+    try:
+        if status_clean == "approved":
+            body = (
+                f"Your LandCheck social follow proof was approved. {SOCIAL_FOLLOW_REWARD_GP} GP has been added to your account."
+                if gp_awarded
+                else "Your LandCheck social follow proof was approved. This reward had already been credited on your account."
+            )
+            title = "Follow Reward Approved"
+        else:
+            body = "Your LandCheck social follow proof was reviewed and needs another submission."
+            if payload.supervisor_note and str(payload.supervisor_note).strip():
+                body += f" Note: {str(payload.supervisor_note).strip()}"
+            title = "Follow Proof Needs Update"
+        _send_sponsor_push_notification(
+            db,
+            sponsor_id,
+            title,
+            body,
+            {"claim_id": claim_id, "status": status_clean, "type": "social_follow_claim_review"},
+        )
+    except Exception:
+        pass
+
+    return {"ok": True, "status": status_clean, "gp_awarded": gp_awarded}
 
 
 @router.patch("/admin/complaints/{complaint_id}")
