@@ -10561,7 +10561,7 @@ def list_sponsor_trees(sponsor_id: int = Query(...), db: Session = Depends(get_d
         else:
             item["carbon"] = {"current_co2_kg": 0.0, "annual_co2_kg": 0.0, "lifetime_co2_kg": 0.0}
         payload.append(item)
-        return payload
+    return payload
 
 
 def _calculate_sponsor_achievement(db: Session, sponsor_id: int) -> dict:
