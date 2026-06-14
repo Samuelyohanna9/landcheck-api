@@ -76,6 +76,7 @@ def safe_log_activity(
     details: dict[str, Any] | None = None,
 ) -> None:
     ensure_activity_log_table()
+    resolved_actor = resolve_actor_label(actor, details)
     try:
         db.execute(
             text(
@@ -87,7 +88,7 @@ def safe_log_activity(
             {
                 "source": _normalize_text(source, 120) or "backend-api",
                 "event_type": _normalize_text(event_type, 120) or "activity",
-                "actor": _normalize_text(actor, 255),
+                "actor": resolved_actor,
                 "message": _normalize_text(message, 4000) or "Activity recorded",
                 "details": json.dumps(details or {}, default=str),
             },
@@ -99,6 +100,41 @@ def safe_log_activity(
 
 def _request_client_label(request: Request) -> str | None:
     return _normalize_text(request.headers.get("X-LC-Client"), 120)
+
+
+def _resolve_actor_from_details(details: Any) -> str | None:
+    if not isinstance(details, dict):
+        return None
+    preferred_keys = (
+        "actor_name",
+        "user_name",
+        "full_name",
+        "resolved_reviewer",
+        "reviewer_name",
+        "created_by",
+        "updated_by",
+        "submitted_by",
+        "requested_by",
+        "assigned_by",
+        "assignee_name",
+        "sponsor_name",
+        "actor",
+    )
+    for key in preferred_keys:
+        value = _normalize_text(details.get(key), 255)
+        if value:
+            return value
+    fallback_email = _normalize_text(details.get("email"), 255)
+    if fallback_email:
+        return fallback_email
+    return None
+
+
+def resolve_actor_label(actor: str | None, details: Any = None) -> str | None:
+    direct_actor = _normalize_text(actor, 255)
+    if direct_actor:
+        return direct_actor
+    return _resolve_actor_from_details(details)
 
 
 def classify_request_source(request: Request) -> str:
@@ -207,18 +243,19 @@ def log_request_activity(
     try:
         path = str(request.url.path or "").strip()
         method = str(request.method or "").upper()
+        details = build_request_log_details(
+            request,
+            status_code=status_code,
+            duration_ms=duration_ms,
+            error_message=error_message,
+        )
         safe_log_activity(
             db,
             source=classify_request_source(request),
             event_type="request_completed" if int(status_code) < 400 else "request_failed",
-            actor=_normalize_text(request.headers.get("X-LC-User-Name"), 255),
+            actor=resolve_actor_label(_normalize_text(request.headers.get("X-LC-User-Name"), 255), details),
             message=f"{method} {path} -> {int(status_code)}",
-            details=build_request_log_details(
-                request,
-                status_code=status_code,
-                duration_ms=duration_ms,
-                error_message=error_message,
-            ),
+            details=details,
         )
     finally:
         db.close()
