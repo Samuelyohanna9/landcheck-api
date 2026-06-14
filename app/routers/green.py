@@ -11295,6 +11295,47 @@ def _compute_active_referrer_rules(db: Session, sponsor_id: int) -> dict:
     }
 
 
+def _compute_sponsor_merch_points(db: Session, sponsor_id: int, current_points: int) -> dict:
+    sponsor_tree_points_earned = db.execute(
+        text(
+            """
+            SELECT COALESCE(SUM(quantity * 25), 0)
+            FROM green_sponsorship_orders
+            WHERE sponsor_account_id = :sponsor_id
+              AND (
+                    LOWER(COALESCE(payment_status, '')) IN ('paid', 'verified')
+                 OR LOWER(COALESCE(order_status, '')) IN ('paid', 'allocated', 'completed')
+              )
+            """
+        ),
+        {"sponsor_id": int(sponsor_id)},
+    ).scalar() or 0
+
+    merch_points_spent = db.execute(
+        text(
+            """
+            SELECT COALESCE(SUM(points_spent), 0)
+            FROM green_sponsor_point_redemptions
+            WHERE sponsor_id = :sponsor_id
+              AND reward_type LIKE 'merch_%'
+              AND LOWER(COALESCE(status, 'pending')) <> 'rejected'
+            """
+        ),
+        {"sponsor_id": int(sponsor_id)},
+    ).scalar() or 0
+
+    sponsor_tree_points_earned = int(sponsor_tree_points_earned or 0)
+    merch_points_spent = int(merch_points_spent or 0)
+    merch_source_balance = max(sponsor_tree_points_earned - merch_points_spent, 0)
+    merch_eligible_points = max(min(int(current_points or 0), merch_source_balance), 0)
+
+    return {
+        "sponsor_tree_points_earned": sponsor_tree_points_earned,
+        "merch_points_spent": merch_points_spent,
+        "merch_eligible_points": merch_eligible_points,
+    }
+
+
 @router.get("/sponsor/points")
 def get_sponsor_points(sponsor_id: int = Query(...), db: Session = Depends(get_db)):
     import uuid
@@ -11342,6 +11383,7 @@ def get_sponsor_points(sponsor_id: int = Query(...), db: Session = Depends(get_d
     # Inject referral rules metrics
     rules = _compute_active_referrer_rules(db, int(sponsor_id))
     item.update(rules)
+    item.update(_compute_sponsor_merch_points(db, int(sponsor_id), int(item.get("green_points") or 0)))
             
     return item
 
@@ -11387,6 +11429,18 @@ def redeem_sponsor_reward(payload: SponsorRedeemPayload, db: Session = Depends(g
     else:
         raise HTTPException(status_code=400, detail="Invalid reward type")
         
+    if reward_type.startswith("merch_"):
+        merch_points = _compute_sponsor_merch_points(db, sponsor_id, current_points)
+        if int(merch_points.get("merch_eligible_points") or 0) < cost:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"This merchandise item requires {cost} sponsor tree GP. "
+                    f"Only GP earned from paid tree sponsorship qualifies for merch redemption. "
+                    f"Current merch-eligible balance: {int(merch_points.get('merch_eligible_points') or 0)} GP."
+                ),
+            )
+
     if current_points < cost:
         raise HTTPException(status_code=400, detail="Insufficient points balance")
         
@@ -11556,6 +11610,23 @@ def sponsor_game_action(payload: SponsorGameActionPayload, db: Session = Depends
     current_points = int(row["green_points"] or 0)
     gp_delta = int(payload.gp_delta)
 
+    if payload.game_id == "forest_quest" and payload.action == "follow_landcheck_social" and gp_delta > 0:
+        already_claimed = db.execute(
+            text(
+                """
+                SELECT 1
+                FROM green_activity_logs
+                WHERE source = 'sponsor_game'
+                  AND event_type = 'follow_landcheck_social_reward'
+                  AND actor = :actor
+                LIMIT 1
+                """
+            ),
+            {"actor": str(payload.sponsor_id)},
+        ).scalar()
+        if already_claimed:
+            return {"ok": True, "gp_delta": 0, "new_balance": current_points}
+
     # Cap per-action earn amounts so games can't be exploited
     MAX_EARN = {
         "save_forest": 50, "rainmaker": 25, "climate_defender": 30,
@@ -11580,6 +11651,16 @@ def sponsor_game_action(payload: SponsorGameActionPayload, db: Session = Depends
             db.execute(
                 text("UPDATE green_sponsor_accounts SET green_points = green_points + :d, updated_at = NOW() WHERE id = :sid"),
                 {"d": gp_delta, "sid": payload.sponsor_id}
+            )
+
+        if payload.game_id == "forest_quest" and payload.action == "follow_landcheck_social" and gp_delta > 0:
+            _log_activity(
+                db,
+                "sponsor_game",
+                "follow_landcheck_social_reward",
+                f"Sponsor {payload.sponsor_id} claimed the LandCheck social follow reward",
+                str(payload.sponsor_id),
+                {"sponsor_id": payload.sponsor_id, "game_id": payload.game_id, "action": payload.action, "gp_delta": gp_delta},
             )
         db.commit()
 
