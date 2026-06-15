@@ -7380,14 +7380,33 @@ def _build_sponsor_agent_aliases(user_row: dict) -> list[str]:
     return aliases
 
 
+def _build_assignee_name_variants(value: str | None) -> list[str]:
+    raw_value = str(value or "").strip()
+    if not raw_value:
+        return []
+    variants: list[str] = []
+    seen: set[str] = set()
+
+    def add_variant(candidate: str | None):
+        normalized = " ".join(str(candidate or "").strip().split()).lower()
+        if not normalized or normalized in seen:
+            return
+        seen.add(normalized)
+        variants.append(normalized)
+
+    add_variant(raw_value)
+    add_variant(re.sub(r"\s*\([^)]*\)\s*$", "", raw_value))
+    return variants
+
+
 def _list_green_users_for_assignee_name(
     db: Session,
     *,
     assignee_name: str | None,
     organization_id: int | None = None,
 ) -> list[dict]:
-    assignee_clean = str(assignee_name or "").strip()
-    if not assignee_clean:
+    candidate_names = _build_assignee_name_variants(assignee_name)
+    if not candidate_names:
         return []
     rows = db.execute(
         text(
@@ -7399,16 +7418,16 @@ def _list_green_users_for_assignee_name(
               AND COALESCE(u.allow_green, TRUE) = TRUE
               AND (:organization_id IS NULL OR u.organization_id = :organization_id)
               AND (
-                    LOWER(TRIM(COALESCE(u.full_name, ''))) = LOWER(TRIM(:assignee_name))
-                 OR LOWER(TRIM(COALESCE(u.work_username, ''))) = LOWER(TRIM(:assignee_name))
-                 OR LOWER(TRIM(COALESCE(u.user_uid, ''))) = LOWER(TRIM(:assignee_name))
-                 OR LOWER(TRIM(COALESCE(u.email, ''))) = LOWER(TRIM(:assignee_name))
+                    LOWER(REGEXP_REPLACE(TRIM(COALESCE(u.full_name, '')), '\\s+', ' ', 'g')) IN :candidate_names
+                 OR LOWER(REGEXP_REPLACE(TRIM(COALESCE(u.work_username, '')), '\\s+', ' ', 'g')) IN :candidate_names
+                 OR LOWER(REGEXP_REPLACE(TRIM(COALESCE(u.user_uid, '')), '\\s+', ' ', 'g')) IN :candidate_names
+                 OR LOWER(REGEXP_REPLACE(TRIM(COALESCE(u.email, '')), '\\s+', ' ', 'g')) IN :candidate_names
               )
             ORDER BY u.id DESC
             """
-        ),
+        ).bindparams(bindparam("candidate_names", expanding=True)),
         {
-            "assignee_name": assignee_clean,
+            "candidate_names": candidate_names,
             "organization_id": int(organization_id) if organization_id is not None else None,
         },
     ).mappings().all()
@@ -7613,23 +7632,37 @@ def _match_selected_public_sponsor_user_for_assignee(
     return None
 
 
-def _count_planted_trees_for_aliases(db: Session, *, project_id: int, aliases: list[str]) -> int:
+def _count_linked_sponsor_units_for_assignee(
+    db: Session,
+    *,
+    project_id: int,
+    user_id: int | None,
+    aliases: list[str],
+) -> int:
     normalized_aliases = [str(item or "").strip().lower() for item in aliases if str(item or "").strip()]
-    if not normalized_aliases:
+    if user_id is None and not normalized_aliases:
         return 0
     count = db.execute(
         text(
             """
             SELECT COUNT(*)
-            FROM trees
-            WHERE project_id = :project_id
-              AND LOWER(COALESCE(tree_origin, 'new_planting')) = 'new_planting'
-              AND COALESCE(count_in_planting_kpis, TRUE) = TRUE
-              AND LOWER(REPLACE(REPLACE(COALESCE(status, ''), '-', '_'), ' ', '_')) <> 'pending_planting'
-              AND LOWER(TRIM(COALESCE(created_by, ''))) IN :aliases
+            FROM green_sponsorship_units u
+            LEFT JOIN trees t ON t.id = u.tree_id
+            WHERE u.project_id = :project_id
+              AND u.tree_id IS NOT NULL
+              AND LOWER(COALESCE(u.sponsorship_status, '')) IN ('linked', 'active', 'replaced')
+              AND (
+                    (:user_id IS NOT NULL AND u.assigned_user_id = :user_id)
+                 OR LOWER(REGEXP_REPLACE(TRIM(COALESCE(u.assigned_assignee_name, '')), '\\s+', ' ', 'g')) IN :aliases
+                 OR LOWER(REGEXP_REPLACE(TRIM(COALESCE(t.created_by, '')), '\\s+', ' ', 'g')) IN :aliases
+              )
             """
         ).bindparams(bindparam("aliases", expanding=True)),
-        {"project_id": int(project_id), "aliases": normalized_aliases},
+        {
+            "project_id": int(project_id),
+            "user_id": int(user_id) if user_id is not None else None,
+            "aliases": normalized_aliases or [""],
+        },
     ).scalar()
     return int(count or 0)
 
@@ -7735,9 +7768,11 @@ def _assign_available_sponsor_units_for_project(db: Session, *, project_id: int)
         aliases = [str(item or "").strip().lower() for item in entry.get("aliases") or [] if str(item or "").strip()]
         user_id = int(entry.get("user_id") or 0)
         target_trees = int(entry.get("target_trees") or 0)
-        planted_count = _count_planted_trees_for_aliases(
+        # Only sponsor-linked trees should fulfill sponsor-funded planting demand.
+        linked_count = _count_linked_sponsor_units_for_assignee(
             db,
             project_id=int(project_id),
+            user_id=user_id,
             aliases=aliases,
         )
         reserved_count = _count_reserved_sponsor_units_for_assignee(
@@ -7746,7 +7781,7 @@ def _assign_available_sponsor_units_for_project(db: Session, *, project_id: int)
             user_id=user_id,
             aliases=aliases,
         )
-        missing_count = max(target_trees - planted_count - reserved_count, 0)
+        missing_count = max(target_trees - linked_count - reserved_count, 0)
         if missing_count <= 0:
             continue
         rows = db.execute(
