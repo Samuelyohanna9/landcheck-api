@@ -4807,6 +4807,7 @@ def ensure_green_tables(db: Session):
         db.execute(text("ALTER TABLE green_users ADD COLUMN IF NOT EXISTS notes TEXT"))
         db.execute(text("ALTER TABLE green_users ADD COLUMN IF NOT EXISTS is_active BOOLEAN NOT NULL DEFAULT TRUE"))
         db.execute(text("ALTER TABLE green_users ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW()"))
+        db.execute(text("ALTER TABLE green_users ADD COLUMN IF NOT EXISTS profile_photo_url TEXT"))
         db.execute(text("ALTER TABLE green_sponsor_accounts ADD COLUMN IF NOT EXISTS sponsor_uid TEXT"))
         db.execute(text("ALTER TABLE green_sponsor_accounts ADD COLUMN IF NOT EXISTS account_type TEXT NOT NULL DEFAULT 'individual'"))
         db.execute(text("ALTER TABLE green_sponsor_accounts ADD COLUMN IF NOT EXISTS organization_name TEXT"))
@@ -11257,6 +11258,11 @@ class SponsorCommunityProjectPayload(BaseModel):
 
 class SponsorUpdateProfilePhotoPayload(BaseModel):
     sponsor_id: int
+    profile_photo_url: str
+
+class GreenUserUpdateProfilePhotoPayload(BaseModel):
+    user_id: int
+    organization_id: int | None = None
     profile_photo_url: str
 
 class SponsorUpdateAppearancePayload(BaseModel):
@@ -19217,6 +19223,51 @@ def change_own_password(
     return {"ok": True}
 
 
+@router.post("/auth/update-profile-photo")
+def update_green_user_profile_photo(
+    payload: GreenUserUpdateProfilePhotoPayload,
+    db: Session = Depends(get_db),
+):
+    photo_url = str(payload.profile_photo_url or "").strip()
+    if not photo_url:
+        raise HTTPException(status_code=400, detail="Profile photo URL is required")
+
+    user_row = db.execute(
+        text(
+            """
+            SELECT
+                u.id,
+                u.organization_id,
+                COALESCE(u.allow_green, TRUE) AS allow_green,
+                COALESCE(u.allow_work, FALSE) AS allow_work,
+                COALESCE(u.is_active, TRUE) AS is_active
+            FROM green_users u
+            WHERE u.id = :user_id
+            LIMIT 1
+            """
+        ),
+        {"user_id": int(payload.user_id)},
+    ).mappings().first()
+    if not user_row:
+        raise HTTPException(status_code=404, detail="User not found")
+    if not bool(user_row.get("is_active", True)):
+        raise HTTPException(status_code=403, detail="User account is inactive")
+    if not (bool(user_row.get("allow_green", True)) or bool(user_row.get("allow_work", False))):
+        raise HTTPException(status_code=403, detail="This user is not enabled for LandCheck access")
+
+    request_org_id = int(payload.organization_id) if payload.organization_id is not None else None
+    user_org_id = int(user_row.get("organization_id") or 0) or None
+    if request_org_id is not None and user_org_id is not None and request_org_id != user_org_id:
+        raise HTTPException(status_code=403, detail="This user is not linked to the requested organization")
+
+    db.execute(
+        text("UPDATE green_users SET profile_photo_url = :photo_url, updated_at = NOW() WHERE id = :user_id"),
+        {"photo_url": photo_url, "user_id": int(user_row["id"])},
+    )
+    db.commit()
+    return {"ok": True, "profile_photo_url": _normalize_logo_asset_path(photo_url)}
+
+
 @router.post("/work-auth/login")
 def work_auth_login(
     db: Session = Depends(get_db),
@@ -19261,7 +19312,7 @@ def work_auth_login(
                 COALESCE(u.allow_green, TRUE) AS allow_green,
                 COALESCE(u.allow_work, FALSE) AS allow_work,
                 COALESCE(u.is_active, TRUE) AS is_active,
-                u.work_username, u.work_password_hash,
+                u.work_username, u.work_password_hash, u.profile_photo_url,
                 u.organization_id,
                 o.name AS organization_name, o.slug AS organization_slug, o.status AS organization_status,
                 COALESCE(o.is_active, TRUE) AS organization_is_active,
@@ -19317,6 +19368,7 @@ def work_auth_login(
             "organization_status": user_row.get("organization_status"),
             "organization_is_active": bool(user_row.get("organization_is_active", True)),
             "organization_logo_url": _normalize_logo_asset_path(user_row.get("organization_logo_url")),
+            "profile_photo_url": _normalize_logo_asset_path(user_row.get("profile_photo_url")),
         },
     }
 
@@ -19365,7 +19417,7 @@ def green_auth_login(
                 COALESCE(u.allow_green, TRUE) AS allow_green,
                 COALESCE(u.allow_work, FALSE) AS allow_work,
                 COALESCE(u.is_active, TRUE) AS is_active,
-                u.work_username, u.work_password_hash,
+                u.work_username, u.work_password_hash, u.profile_photo_url,
                 u.organization_id,
                 o.name AS organization_name, o.slug AS organization_slug, o.status AS organization_status,
                 COALESCE(o.is_active, TRUE) AS organization_is_active,
@@ -19420,6 +19472,7 @@ def green_auth_login(
             "organization_status": user_row.get("organization_status"),
             "organization_is_active": bool(user_row.get("organization_is_active", True)),
             "organization_logo_url": _normalize_logo_asset_path(user_row.get("organization_logo_url")),
+            "profile_photo_url": _normalize_logo_asset_path(user_row.get("profile_photo_url")),
         },
     }
 
