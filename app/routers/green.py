@@ -23319,52 +23319,83 @@ def create_work_order(
             "allow_existing_tree_area_reuse": bool(allow_existing_tree_area_reuse),
         },
     )
+    should_sync_public_sponsor_units = False
     if work_type == "planting":
         project_access_row = db.execute(
             text("SELECT access_model, public_sponsor_enabled FROM tree_projects WHERE id = :project_id LIMIT 1"),
             {"project_id": int(project_id)},
         ).mappings().first()
-        if project_access_row and _is_public_sponsorship_project(dict(project_access_row)):
-            _assign_available_sponsor_units_for_project(db, project_id=int(project_id))
+        should_sync_public_sponsor_units = bool(
+            project_access_row and _is_public_sponsorship_project(dict(project_access_row))
+        )
     db.commit()
+    if should_sync_public_sponsor_units:
+        try:
+            _try_assign_available_sponsor_units_for_project(
+                db,
+                project_id=int(project_id),
+                context="create_work_order",
+            )
+        except Exception:
+            logger.exception(
+                "Sponsor QR auto-assignment failed after work order commit for project_id=%s work_order_id=%s",
+                int(project_id),
+                int(row),
+            )
     due_label = _safe_push_date_label(due_date)
     if work_type == "planting":
         if action_name == "work_order_accumulated":
-            _queue_green_push_to_assignee(
-                db,
-                project_id=project_id,
-                assignee_name=assignee_clean,
-                title="Planting target increased",
-                body=(
-                    f"Your planting target increased by {int(target_trees or 0)} tree{'s' if int(target_trees or 0) != 1 else ''}."
-                    + (f" Due {due_label}." if due_label else "")
-                ),
-                data={
-                    "type": "work_order_target_increase",
-                    "project_id": int(project_id),
-                    "work_order_id": int(row),
-                    "work_type": work_type,
-                    "target_trees_delta": int(target_trees or 0),
-                },
-            )
+            try:
+                _queue_green_push_to_assignee(
+                    db,
+                    project_id=project_id,
+                    assignee_name=assignee_clean,
+                    title="Planting target increased",
+                    body=(
+                        f"Your planting target increased by {int(target_trees or 0)} tree{'s' if int(target_trees or 0) != 1 else ''}."
+                        + (f" Due {due_label}." if due_label else "")
+                    ),
+                    data={
+                        "type": "work_order_target_increase",
+                        "project_id": int(project_id),
+                        "work_order_id": int(row),
+                        "work_type": work_type,
+                        "target_trees_delta": int(target_trees or 0),
+                    },
+                )
+            except Exception:
+                logger.exception(
+                    "Failed to queue planting target increase push for project_id=%s work_order_id=%s assignee=%s",
+                    int(project_id),
+                    int(row),
+                    assignee_clean,
+                )
         else:
-            _queue_green_push_to_assignee(
-                db,
-                project_id=project_id,
-                assignee_name=assignee_clean,
-                title="New planting order assigned",
-                body=(
-                    f"You have been assigned {int(target_trees or 0)} tree{'s' if int(target_trees or 0) != 1 else ''} for planting."
-                    + (f" Due {due_label}." if due_label else "")
-                ),
-                data={
-                    "type": "work_order_assigned",
-                    "project_id": int(project_id),
-                    "work_order_id": int(row),
-                    "work_type": work_type,
-                    "target_trees": int(target_trees or 0),
-                },
-            )
+            try:
+                _queue_green_push_to_assignee(
+                    db,
+                    project_id=project_id,
+                    assignee_name=assignee_clean,
+                    title="New planting order assigned",
+                    body=(
+                        f"You have been assigned {int(target_trees or 0)} tree{'s' if int(target_trees or 0) != 1 else ''} for planting."
+                        + (f" Due {due_label}." if due_label else "")
+                    ),
+                    data={
+                        "type": "work_order_assigned",
+                        "project_id": int(project_id),
+                        "work_order_id": int(row),
+                        "work_type": work_type,
+                        "target_trees": int(target_trees or 0),
+                    },
+                )
+            except Exception:
+                logger.exception(
+                    "Failed to queue planting assignment push for project_id=%s work_order_id=%s assignee=%s",
+                    int(project_id),
+                    int(row),
+                    assignee_clean,
+                )
             # Send first planting task assignment email notification
             past_count = db.execute(
                 text(
@@ -23380,21 +23411,37 @@ def create_work_order(
                 {"project_id": project_id, "assignee_name": assignee_clean, "current_id": int(row)},
             ).scalar() or 0
             if past_count == 0:
-                _notify_agent_first_planting_assignment(db, project_id, assignee_clean, int(target_trees or 0))
+                try:
+                    _notify_agent_first_planting_assignment(db, project_id, assignee_clean, int(target_trees or 0))
+                except Exception:
+                    logger.exception(
+                        "Failed to send first planting assignment email for project_id=%s work_order_id=%s assignee=%s",
+                        int(project_id),
+                        int(row),
+                        assignee_clean,
+                    )
     else:
-        _queue_green_push_to_assignee(
-            db,
-            project_id=project_id,
-            assignee_name=assignee_clean,
-            title="New maintenance order assigned",
-            body="A new maintenance order has been assigned to you." + (f" Due {due_label}." if due_label else ""),
-            data={
-                "type": "work_order_assigned",
-                "project_id": int(project_id),
-                "work_order_id": int(row),
-                "work_type": work_type,
-            },
-        )
+        try:
+            _queue_green_push_to_assignee(
+                db,
+                project_id=project_id,
+                assignee_name=assignee_clean,
+                title="New maintenance order assigned",
+                body="A new maintenance order has been assigned to you." + (f" Due {due_label}." if due_label else ""),
+                data={
+                    "type": "work_order_assigned",
+                    "project_id": int(project_id),
+                    "work_order_id": int(row),
+                    "work_type": work_type,
+                },
+            )
+        except Exception:
+            logger.exception(
+                "Failed to queue maintenance assignment push for project_id=%s work_order_id=%s assignee=%s",
+                int(project_id),
+                int(row),
+                assignee_clean,
+            )
     return {"id": row}
 
 
