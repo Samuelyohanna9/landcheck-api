@@ -7372,11 +7372,11 @@ def _build_sponsor_agent_aliases(user_row: dict) -> list[str]:
     aliases: list[str] = []
     seen: set[str] = set()
     for candidate in [user_row.get("full_name"), user_row.get("work_username"), user_row.get("user_uid")]:
-        value = str(candidate or "").strip().lower()
-        if not value or value in seen:
-            continue
-        seen.add(value)
-        aliases.append(value)
+        for value in _build_assignee_name_variants(str(candidate or "")):
+            if not value or value in seen:
+                continue
+            seen.add(value)
+            aliases.append(value)
     return aliases
 
 
@@ -7687,7 +7687,7 @@ def _count_reserved_sponsor_units_for_assignee(
               AND LOWER(COALESCE(sponsorship_status, '')) = 'awaiting_tree'
               AND (
                     (:user_id IS NOT NULL AND assigned_user_id = :user_id)
-                 OR LOWER(TRIM(COALESCE(assigned_assignee_name, ''))) IN :aliases
+                 OR LOWER(REGEXP_REPLACE(TRIM(COALESCE(assigned_assignee_name, '')), '\\s+', ' ', 'g')) IN :aliases
               )
             """
         ).bindparams(bindparam("aliases", expanding=True)),
@@ -7698,6 +7698,93 @@ def _count_reserved_sponsor_units_for_assignee(
         },
     ).scalar()
     return int(count or 0)
+
+
+def _assign_available_sponsor_units_for_agent(
+    db: Session,
+    *,
+    project_id: int,
+    user_id: int,
+    organization_id: int | None = None,
+) -> int:
+    _ensure_sponsor_qr_unit_columns(db)
+    _project_row, user_row, _selected_agent_ids = _ensure_public_sponsor_agent_project_access(
+        db,
+        project_id=int(project_id),
+        user_id=int(user_id),
+        organization_id=int(organization_id) if organization_id is not None else None,
+    )
+    aliases = _build_sponsor_agent_aliases(user_row)
+    if not aliases:
+        return 0
+    target_trees = db.execute(
+        text(
+            """
+            SELECT COALESCE(SUM(COALESCE(target_trees, 0)), 0)
+            FROM green_work_orders
+            WHERE project_id = :project_id
+              AND LOWER(REPLACE(REPLACE(COALESCE(work_type, ''), '-', '_'), ' ', '_')) = 'planting'
+              AND LOWER(COALESCE(status, 'assigned')) NOT IN ('done', 'completed', 'closed', 'cancelled')
+              AND LOWER(REGEXP_REPLACE(TRIM(COALESCE(assignee_name, '')), '\\s+', ' ', 'g')) IN :aliases
+            """
+        ).bindparams(bindparam("aliases", expanding=True)),
+        {
+            "project_id": int(project_id),
+            "aliases": aliases,
+        },
+    ).scalar()
+    target_trees = int(target_trees or 0)
+    if target_trees <= 0:
+        return 0
+
+    linked_count = _count_linked_sponsor_units_for_assignee(
+        db,
+        project_id=int(project_id),
+        user_id=int(user_id),
+        aliases=aliases,
+    )
+    reserved_count = _count_reserved_sponsor_units_for_assignee(
+        db,
+        project_id=int(project_id),
+        user_id=int(user_id),
+        aliases=aliases,
+    )
+    missing_count = max(target_trees - linked_count - reserved_count, 0)
+    if missing_count <= 0:
+        return 0
+
+    rows = db.execute(
+        text(
+            """
+            WITH next_units AS (
+                SELECT id
+                FROM green_sponsorship_units
+                WHERE project_id = :project_id
+                  AND tree_id IS NULL
+                  AND LOWER(COALESCE(sponsorship_status, '')) = 'awaiting_tree'
+                  AND assigned_user_id IS NULL
+                  AND NULLIF(BTRIM(COALESCE(assigned_assignee_name, '')), '') IS NULL
+                ORDER BY created_at ASC, id ASC
+                LIMIT :limit_count
+            )
+            UPDATE green_sponsorship_units u
+            SET assigned_user_id = :user_id,
+                assigned_assignee_name = :assigned_assignee_name,
+                assigned_at = NOW(),
+                updated_at = NOW()
+            FROM next_units nu
+            WHERE u.id = nu.id
+            RETURNING u.id
+            """
+        ),
+        {
+            "project_id": int(project_id),
+            "limit_count": int(missing_count),
+            "user_id": int(user_id),
+            "assigned_assignee_name": str(user_row.get("full_name") or user_row.get("work_username") or "").strip() or None,
+        },
+    ).mappings().all()
+    return len(rows)
 
 
 def _assign_available_sponsor_units_for_project(db: Session, *, project_id: int) -> int:
@@ -7836,6 +7923,36 @@ def _try_assign_available_sponsor_units_for_project(
         logger.exception(
             "Sponsor QR auto-assignment sync failed for project_id=%s context=%s",
             int(project_id),
+            str(context or "").strip() or "unknown",
+        )
+        return 0
+
+
+def _try_assign_available_sponsor_units_for_agent(
+    db: Session,
+    *,
+    project_id: int,
+    user_id: int,
+    organization_id: int | None,
+    context: str,
+) -> int:
+    try:
+        assigned_total = _assign_available_sponsor_units_for_agent(
+            db,
+            project_id=int(project_id),
+            user_id=int(user_id),
+            organization_id=int(organization_id) if organization_id is not None else None,
+        )
+        db.commit()
+        return int(assigned_total or 0)
+    except HTTPException:
+        raise
+    except Exception:
+        db.rollback()
+        logger.exception(
+            "Sponsor QR agent sync failed for project_id=%s user_id=%s context=%s",
+            int(project_id),
+            int(user_id),
             str(context or "").strip() or "unknown",
         )
         return 0
@@ -8804,7 +8921,7 @@ def _link_tree_to_pending_sponsorship_unit(db: Session, project_id: int, tree_id
                   AND LOWER(COALESCE(sponsorship_status, '')) = 'awaiting_tree'
                   AND (
                         assigned_user_id IN :user_ids
-                     OR LOWER(TRIM(COALESCE(assigned_assignee_name, ''))) IN :aliases
+                     OR LOWER(REGEXP_REPLACE(TRIM(COALESCE(assigned_assignee_name, '')), '\\s+', ' ', 'g')) IN :aliases
                   )
                 ORDER BY COALESCE(assigned_at, created_at) ASC, created_at ASC, id ASC
                 LIMIT 1
@@ -13879,6 +13996,13 @@ def export_sponsorship_unit_qr_tag_pdf(
         project_id=int(project_row["id"]),
         context="export_sponsorship_unit_qr_tag_pdf",
     )
+    _try_assign_available_sponsor_units_for_agent(
+        db,
+        project_id=int(project_row["id"]),
+        user_id=int(user_id),
+        organization_id=int(organization_id) if organization_id is not None else None,
+        context="export_sponsorship_unit_qr_tag_pdf",
+    )
 
     aliases = _build_sponsor_agent_aliases(user_row)
     row = db.execute(
@@ -13919,7 +14043,7 @@ def export_sponsorship_unit_qr_tag_pdf(
               AND LOWER(COALESCE(u.sponsorship_status, '')) IN ('awaiting_tree', 'linked', 'active', 'replaced')
               AND (
                     u.assigned_user_id = :user_id
-                 OR LOWER(TRIM(COALESCE(u.assigned_assignee_name, ''))) IN :aliases
+                 OR LOWER(REGEXP_REPLACE(TRIM(COALESCE(u.assigned_assignee_name, '')), '\\s+', ' ', 'g')) IN :aliases
               )
             LIMIT 1
             """
@@ -14394,6 +14518,13 @@ def list_agent_sponsor_qr_tags(
             project_id=int(project_row["id"]),
             context="list_agent_sponsor_qr_tags",
         )
+        _try_assign_available_sponsor_units_for_agent(
+            db,
+            project_id=int(project_row["id"]),
+            user_id=int(user_id),
+            organization_id=int(organization_id) if organization_id is not None else None,
+            context="list_agent_sponsor_qr_tags",
+        )
     aliases = _build_sponsor_agent_aliases(user_row)
     rows = db.execute(
         text(
@@ -14429,7 +14560,7 @@ def list_agent_sponsor_qr_tags(
               AND LOWER(COALESCE(u.sponsorship_status, '')) = 'awaiting_tree'
               AND (
                     u.assigned_user_id = :user_id
-                 OR LOWER(TRIM(COALESCE(u.assigned_assignee_name, ''))) IN :aliases
+                 OR LOWER(REGEXP_REPLACE(TRIM(COALESCE(u.assigned_assignee_name, '')), '\\s+', ' ', 'g')) IN :aliases
               )
             ORDER BY COALESCE(u.assigned_at, u.created_at) ASC, u.id ASC
             """
@@ -14715,6 +14846,115 @@ def reissue_admin_sponsor_qr_status(
         db.rollback()
         logger.exception("Sponsor QR reissue failed for unit_id=%s", int(unit_id))
         raise HTTPException(status_code=500, detail=f"Sponsor QR reissue failed: {str(exc)}")
+
+
+@router.post("/admin/sponsorship-orders/{order_id}/assign-agent")
+def assign_admin_sponsorship_order_agent(
+    order_id: int,
+    agent_user_id: int = Body(..., embed=True),
+    reviewer_name: str | None = Body(default=None, embed=True),
+    db: Session = Depends(get_db),
+):
+    try:
+        order_row = db.execute(
+            text(
+                """
+                SELECT id, project_id
+                FROM green_sponsorship_orders
+                WHERE id = :order_id
+                LIMIT 1
+                """
+            ),
+            {"order_id": int(order_id)},
+        ).mappings().first()
+        if not order_row:
+            raise HTTPException(status_code=404, detail="Sponsorship order not found")
+
+        project_row = _load_public_sponsorship_project_row(db, project_id=int(order_row.get("project_id") or 0))
+        organization_id = int(project_row.get("organization_id") or 0) or None
+        selected_agent_ids = _normalize_positive_int_list(_json_value_or(project_row.get("public_sponsor_agent_user_ids"), []))
+        normalized_agent_id = int(agent_user_id or 0)
+        if normalized_agent_id <= 0:
+            raise HTTPException(status_code=400, detail="Select a sponsor agent to receive these QR tags")
+        if normalized_agent_id not in set(selected_agent_ids):
+            raise HTTPException(status_code=403, detail="Selected user is not saved as a sponsor agent for this project")
+
+        agent_row = _get_green_user_for_sponsor_agent(
+            db,
+            user_id=normalized_agent_id,
+            organization_id=organization_id,
+        )
+        assigned_assignee_name = str(agent_row.get("full_name") or agent_row.get("work_username") or "").strip() or None
+        updated_rows = db.execute(
+            text(
+                """
+                UPDATE green_sponsorship_units
+                SET assigned_user_id = :agent_user_id,
+                    assigned_assignee_name = :assigned_assignee_name,
+                    assigned_at = NOW(),
+                    updated_at = NOW()
+                WHERE order_id = :order_id
+                  AND tree_id IS NULL
+                  AND LOWER(COALESCE(sponsorship_status, '')) = 'awaiting_tree'
+                RETURNING id
+                """
+            ),
+            {
+                "order_id": int(order_id),
+                "agent_user_id": normalized_agent_id,
+                "assigned_assignee_name": assigned_assignee_name,
+            },
+        ).mappings().all()
+        if not updated_rows:
+            raise HTTPException(status_code=409, detail="No awaiting sponsor QR tags are available for this order")
+
+        db.commit()
+
+        assignee_name = str(agent_row.get("full_name") or agent_row.get("work_username") or "").strip() or None
+        if assignee_name:
+            project_name = str(project_row.get("name") or "this project").strip() or "this project"
+            try:
+                _queue_green_push_to_assignee(
+                    db,
+                    project_id=int(project_row["id"]),
+                    assignee_name=assignee_name,
+                    title="Sponsor QR tags assigned",
+                    body=(
+                        f"{len(updated_rows)} sponsor-funded QR tag"
+                        f"{'s were' if len(updated_rows) != 1 else ' was'} assigned to you in {project_name}. "
+                        "Open Map & Add Tree to download them before planting."
+                    ),
+                    data={
+                        "type": "sponsor_qr_bulk_assigned",
+                        "project_id": int(project_row["id"]),
+                        "order_id": int(order_id),
+                        "assigned_count": len(updated_rows),
+                        "reviewer_name": str(reviewer_name or "").strip() or None,
+                    },
+                )
+            except Exception:
+                logger.exception(
+                    "Sponsor QR bulk assignment push notification failed for order_id=%s project_id=%s agent_user_id=%s",
+                    int(order_id),
+                    int(project_row["id"]),
+                    int(normalized_agent_id),
+                )
+
+        return {
+            "ok": True,
+            "order_id": int(order_id),
+            "project_id": int(project_row["id"]),
+            "assigned_user_id": normalized_agent_id,
+            "assigned_assignee_name": assigned_assignee_name,
+            "assigned_count": len(updated_rows),
+            "unit_ids": [int(row.get("id") or 0) for row in updated_rows if int(row.get("id") or 0) > 0],
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        db.rollback()
+        logger.exception("Sponsor QR bulk assignment failed for order_id=%s", int(order_id))
+        raise HTTPException(status_code=500, detail=f"Sponsor QR bulk assignment failed: {str(exc)}")
 
 
 def _list_admin_sponsorship_orders(db: Session, project_id: int | None = None, sync_gateway: bool = True) -> list[dict]:
