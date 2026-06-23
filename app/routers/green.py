@@ -7491,6 +7491,7 @@ def _collect_public_sponsor_agent_user_ids_for_project(
             {"project_id": int(project_id)},
         ).scalars().all()
     except Exception:
+        _rollback_quietly(db)
         try:
             name_rows = db.execute(
                 text(
@@ -7511,6 +7512,7 @@ def _collect_public_sponsor_agent_user_ids_for_project(
                 {"project_id": int(project_id)},
             ).scalars().all()
         except Exception:
+            _rollback_quietly(db)
             name_rows = []
     for assignee_name in name_rows:
         assignee_name_value = str(assignee_name or "").strip()
@@ -7521,6 +7523,7 @@ def _collect_public_sponsor_agent_user_ids_for_project(
                 organization_id=int(organization_id) if organization_id is not None else None,
             )
         except Exception:
+            _rollback_quietly(db)
             matched_rows = []
         if not matched_rows and organization_id is not None:
             try:
@@ -7530,6 +7533,7 @@ def _collect_public_sponsor_agent_user_ids_for_project(
                     organization_id=None,
                 )
             except Exception:
+                _rollback_quietly(db)
                 matched_rows = []
         for row in matched_rows:
             user_id = int(row.get("id") or 0)
@@ -7563,6 +7567,13 @@ def _load_public_sponsorship_project_row(db: Session, *, project_id: int) -> dic
 _sponsor_qr_unit_columns_ready = False
 _work_order_assignee_columns_ready = False
 _work_order_assignee_columns_available: bool | None = None
+
+
+def _rollback_quietly(db: Session):
+    try:
+        db.rollback()
+    except Exception:
+        pass
 
 
 def _ensure_sponsor_qr_unit_columns(db: Session):
@@ -8090,6 +8101,7 @@ def _assign_available_sponsor_units_for_project(db: Session, *, project_id: int)
             explicit_user_ids=explicit_agent_ids,
         )
     except Exception:
+        _rollback_quietly(db)
         selected_agent_ids = explicit_agent_ids
     selected_agent_ids = _normalize_positive_int_list(selected_agent_ids)
     if not selected_agent_ids:
@@ -8353,6 +8365,7 @@ def _ensure_public_sponsor_agent_project_access(
             explicit_user_ids=explicit_agent_ids,
         )
     except Exception:
+        _rollback_quietly(db)
         selected_agent_ids = explicit_agent_ids
     selected_agent_ids = _normalize_positive_int_list(selected_agent_ids)
     resolved_user_id = int(user_row.get("id") or 0)
@@ -8393,6 +8406,7 @@ def _ensure_public_sponsor_agent_project_access(
                     {"project_id": int(project_id), "aliases": aliases or [""]},
                 ).scalar())
         except Exception:
+            _rollback_quietly(db)
             logger.exception("Fallback work-order check failed for user_id=%s project_id=%s", resolved_user_id, int(project_id))
         if has_active_planting_order:
             selected_agent_ids.append(resolved_user_id)
@@ -15221,6 +15235,7 @@ def reissue_admin_sponsor_qr_status(
                 explicit_user_ids=explicit_agent_ids,
             )
         except Exception:
+            _rollback_quietly(db)
             selected_agent_ids = explicit_agent_ids
         normalized_agent_id = int(agent_user_id or 0)
         if normalized_agent_id <= 0:
@@ -23986,6 +24001,7 @@ def create_work_order(
                 explicit_user_ids=explicit_agent_ids,
             )
         except Exception:
+            _rollback_quietly(db)
             selected_agent_ids = explicit_agent_ids
         sponsor_agent_row = _match_selected_public_sponsor_user_for_assignee(
             db,
@@ -24004,6 +24020,7 @@ def create_work_order(
                     {"project_id": int(project_id), "ids": _safe_json(updated_ids)},
                 )
             except Exception:
+                _rollback_quietly(db)
                 logger.warning("Could not auto-register agent %s in project %s sponsor agent list", sponsor_agent_user_id, project_id)
         awaiting_tree_backlog = db.execute(
             text(
@@ -24237,6 +24254,29 @@ def create_work_order(
     db.commit()
     work_order_id = int(row)
     if should_sync_public_sponsor_units:
+        try:
+            _promote_project_paid_units_to_awaiting_tree(db, int(project_id))
+            _try_assign_available_sponsor_units_for_project(
+                db,
+                project_id=int(project_id),
+                context="create_work_order_immediate",
+            )
+            if sponsor_agent_user_id is not None:
+                _try_assign_available_sponsor_units_for_agent(
+                    db,
+                    project_id=int(project_id),
+                    user_id=int(sponsor_agent_user_id),
+                    organization_id=int(project_organization_id) if project_organization_id is not None else None,
+                    context="create_work_order_immediate",
+                )
+        except Exception:
+            _rollback_quietly(db)
+            logger.exception(
+                "Immediate sponsor QR sync failed for project_id=%s work_order_id=%s assignee_user_id=%s",
+                int(project_id),
+                work_order_id,
+                int(sponsor_agent_user_id) if sponsor_agent_user_id is not None else None,
+            )
         _bg_project_id = int(project_id)
         _bg_agent_user_id = int(sponsor_agent_user_id) if sponsor_agent_user_id is not None else None
         _bg_org_id = int(project_organization_id) if project_organization_id is not None else None
