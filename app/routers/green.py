@@ -9251,6 +9251,80 @@ def _refresh_sponsorship_order_status(db: Session, order_id: int):
         _award_points_for_order(db, order_id)
 
 
+def _is_paid_like_sponsorship_order(order_row: dict | None) -> bool:
+    row = dict(order_row or {})
+    payment_status = _normalize_sponsor_payment_status(row.get("payment_status"))
+    order_status = _normalize_sponsor_order_status(row.get("order_status"))
+    return payment_status in {"verified", "paid"} or order_status in {"paid", "allocated", "completed"}
+
+
+def _promote_order_units_to_awaiting_tree_if_paid(db: Session, order_id: int) -> int:
+    order_row = db.execute(
+        text(
+            """
+            SELECT id, project_id, payment_status, order_status
+            FROM green_sponsorship_orders
+            WHERE id = :order_id
+            LIMIT 1
+            """
+        ),
+        {"order_id": int(order_id)},
+    ).mappings().first()
+    if not order_row or not _is_paid_like_sponsorship_order(dict(order_row)):
+        return 0
+    updated_rows = db.execute(
+        text(
+            """
+            UPDATE green_sponsorship_units
+            SET sponsorship_status = 'awaiting_tree',
+                updated_at = NOW()
+            WHERE order_id = :order_id
+              AND tree_id IS NULL
+              AND LOWER(COALESCE(sponsorship_status, '')) = 'awaiting_payment'
+            RETURNING id
+            """
+        ),
+        {"order_id": int(order_id)},
+    ).mappings().all()
+    if updated_rows:
+        _refresh_sponsorship_order_status(db, int(order_id))
+    return len(updated_rows)
+
+
+def _promote_project_paid_units_to_awaiting_tree(db: Session, project_id: int) -> int:
+    updated_rows = db.execute(
+        text(
+            """
+            UPDATE green_sponsorship_units u
+            SET sponsorship_status = 'awaiting_tree',
+                updated_at = NOW()
+            FROM green_sponsorship_orders o
+            WHERE u.order_id = o.id
+              AND u.project_id = :project_id
+              AND o.project_id = :project_id
+              AND u.tree_id IS NULL
+              AND LOWER(COALESCE(u.sponsorship_status, '')) = 'awaiting_payment'
+              AND (
+                    LOWER(COALESCE(o.payment_status, '')) IN ('verified', 'paid')
+                 OR LOWER(COALESCE(o.order_status, '')) IN ('paid', 'allocated', 'completed')
+              )
+            RETURNING u.order_id
+            """
+        ),
+        {"project_id": int(project_id)},
+    ).mappings().all()
+    if not updated_rows:
+        return 0
+    refreshed_order_ids = {
+        int(row.get("order_id") or 0)
+        for row in updated_rows
+        if int(row.get("order_id") or 0) > 0
+    }
+    for order_id in refreshed_order_ids:
+        _refresh_sponsorship_order_status(db, order_id)
+    return len(updated_rows)
+
+
 def _link_tree_to_pending_sponsorship_unit(db: Session, project_id: int, tree_id: int) -> dict | None:
     tree_row = db.execute(
         text("SELECT id, project_tree_no, created_by FROM trees WHERE id = :tree_id AND project_id = :project_id"),
@@ -14825,6 +14899,7 @@ def list_agent_sponsor_qr_tags(
         user_id=int(user_id),
         organization_id=int(organization_id) if organization_id is not None else None,
     )
+    _promote_project_paid_units_to_awaiting_tree(db, int(project_row["id"]))
     if sync:
         _try_assign_available_sponsor_units_for_project(
             db,
@@ -15003,6 +15078,7 @@ def list_admin_sponsor_qr_status(
 ):
     _ensure_sponsor_qr_unit_columns(db)
     project_row = _load_public_sponsorship_project_row(db, project_id=int(project_id))
+    _promote_project_paid_units_to_awaiting_tree(db, int(project_row["id"]))
     if sync:
         _try_assign_available_sponsor_units_for_project(
             db,
@@ -15085,7 +15161,16 @@ def reissue_admin_sponsor_qr_status(
 
         project_row = _load_public_sponsorship_project_row(db, project_id=int(unit_row.get("project_id") or 0))
         organization_id = int(project_row.get("organization_id") or 0) or None
-        selected_agent_ids = _normalize_positive_int_list(_json_value_or(project_row.get("public_sponsor_agent_user_ids"), []))
+        explicit_agent_ids = _normalize_positive_int_list(_json_value_or(project_row.get("public_sponsor_agent_user_ids"), []))
+        try:
+            selected_agent_ids = _collect_public_sponsor_agent_user_ids_for_project(
+                db,
+                project_id=int(project_row.get("id") or 0),
+                organization_id=organization_id,
+                explicit_user_ids=explicit_agent_ids,
+            )
+        except Exception:
+            selected_agent_ids = explicit_agent_ids
         normalized_agent_id = int(agent_user_id or 0)
         if normalized_agent_id <= 0:
             raise HTTPException(status_code=400, detail="Select a sponsor agent to receive this QR tag")
@@ -15169,10 +15254,11 @@ def assign_admin_sponsorship_order_agent(
     db: Session = Depends(get_db),
 ):
     try:
+        _ensure_sponsor_qr_unit_columns(db)
         order_row = db.execute(
             text(
                 """
-                SELECT id, project_id
+                SELECT id, project_id, payment_status, order_status
                 FROM green_sponsorship_orders
                 WHERE id = :order_id
                 LIMIT 1
@@ -15182,10 +15268,20 @@ def assign_admin_sponsorship_order_agent(
         ).mappings().first()
         if not order_row:
             raise HTTPException(status_code=404, detail="Sponsorship order not found")
+        _promote_order_units_to_awaiting_tree_if_paid(db, int(order_id))
 
         project_row = _load_public_sponsorship_project_row(db, project_id=int(order_row.get("project_id") or 0))
         organization_id = int(project_row.get("organization_id") or 0) or None
-        selected_agent_ids = _normalize_positive_int_list(_json_value_or(project_row.get("public_sponsor_agent_user_ids"), []))
+        explicit_agent_ids = _normalize_positive_int_list(_json_value_or(project_row.get("public_sponsor_agent_user_ids"), []))
+        try:
+            selected_agent_ids = _collect_public_sponsor_agent_user_ids_for_project(
+                db,
+                project_id=int(project_row.get("id") or 0),
+                organization_id=organization_id,
+                explicit_user_ids=explicit_agent_ids,
+            )
+        except Exception:
+            selected_agent_ids = explicit_agent_ids
         normalized_agent_id = int(agent_user_id or 0)
         if normalized_agent_id <= 0:
             raise HTTPException(status_code=400, detail="Select a sponsor agent to receive these QR tags")
@@ -23828,6 +23924,7 @@ def create_work_order(
     if work_type == "planting" and int(target_trees or 0) <= 0:
         raise HTTPException(status_code=400, detail="Target trees must be greater than 0 for planting orders")
     if work_type == "planting" and public_sponsor_project:
+        _promote_project_paid_units_to_awaiting_tree(db, int(project_id))
         explicit_agent_ids = _normalize_positive_int_list(_json_value_or(project_access_row.get("public_sponsor_agent_user_ids"), []))
         try:
             selected_agent_ids = _collect_public_sponsor_agent_user_ids_for_project(
