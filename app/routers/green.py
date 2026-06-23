@@ -7850,6 +7850,7 @@ def _assign_available_sponsor_units_for_agent(
     ).mappings().all()
     target_trees = 0
     project_organization_id = int(project_row.get("organization_id") or 0) or None
+    active_target_by_user_id: dict[int, int] = {}
     for order_row in order_rows:
         assignee_name = str(order_row.get("assignee_name") or "").strip()
         order_target_trees = int(order_row.get("target_trees") or 0)
@@ -7859,33 +7860,108 @@ def _assign_available_sponsor_units_for_agent(
             db,
             assignee_name=assignee_name,
             organization_id=project_organization_id,
-            selected_user_ids=[int(user_id)],
+            selected_user_ids=selected_agent_ids,
         )
-        if matched_user and int(matched_user.get("id") or 0) == int(user_id):
+        matched_user_id = int(matched_user.get("id") or 0) if matched_user else 0
+        if matched_user_id > 0:
+            active_target_by_user_id[matched_user_id] = int(active_target_by_user_id.get(matched_user_id, 0) or 0) + order_target_trees
+        if matched_user_id == int(user_id):
             target_trees += order_target_trees
             continue
         if any(alias in aliases for alias in _build_assignee_name_variants(assignee_name)):
             target_trees += order_target_trees
+            active_target_by_user_id[int(user_id)] = int(active_target_by_user_id.get(int(user_id), 0) or 0) + order_target_trees
     if target_trees <= 0:
         return 0
 
-    linked_count = _count_linked_sponsor_units_for_assignee(
-        db,
-        project_id=int(project_id),
-        user_id=int(user_id),
-        aliases=aliases,
-    )
-    reserved_count = _count_reserved_sponsor_units_for_assignee(
-        db,
-        project_id=int(project_id),
-        user_id=int(user_id),
-        aliases=aliases,
-    )
+    selected_agent_ids = _normalize_positive_int_list(selected_agent_ids)
+    awaiting_unit_rows = db.execute(
+        text(
+            """
+            SELECT
+                id,
+                assigned_user_id,
+                assigned_assignee_name,
+                assigned_at,
+                created_at
+            FROM green_sponsorship_units
+            WHERE project_id = :project_id
+              AND tree_id IS NULL
+              AND LOWER(COALESCE(sponsorship_status, '')) = 'awaiting_tree'
+            ORDER BY COALESCE(assigned_at, created_at) ASC, created_at ASC, id ASC
+            """
+        ),
+        {"project_id": int(project_id)},
+    ).mappings().all()
+    reserved_rows_by_user_id: dict[int, list[dict]] = {uid: [] for uid in active_target_by_user_id if uid > 0}
+    reassignable_unit_ids: list[int] = []
+    seen_reassignable_ids: set[int] = set()
+
+    def add_reassignable(unit_id: int | None):
+        normalized_unit_id = int(unit_id or 0)
+        if normalized_unit_id <= 0 or normalized_unit_id in seen_reassignable_ids:
+            return
+        seen_reassignable_ids.add(normalized_unit_id)
+        reassignable_unit_ids.append(normalized_unit_id)
+
+    for unit_row in awaiting_unit_rows:
+        row_payload = dict(unit_row)
+        unit_id = int(row_payload.get("id") or 0)
+        assigned_user_id = int(row_payload.get("assigned_user_id") or 0) or None
+        assigned_assignee_name = str(row_payload.get("assigned_assignee_name") or "").strip()
+
+        owner_user_id = assigned_user_id if assigned_user_id is not None else None
+        if owner_user_id is None and assigned_assignee_name:
+            matched_owner = _match_selected_public_sponsor_user_for_assignee(
+                db,
+                assignee_name=assigned_assignee_name,
+                organization_id=project_organization_id,
+                selected_user_ids=selected_agent_ids,
+            )
+            owner_user_id = int(matched_owner.get("id") or 0) if matched_owner else 0
+            owner_user_id = owner_user_id or None
+
+        if owner_user_id in active_target_by_user_id:
+            reserved_rows_by_user_id.setdefault(int(owner_user_id), []).append(row_payload)
+            continue
+
+        if owner_user_id is None and not assigned_assignee_name:
+            add_reassignable(unit_id)
+            continue
+
+        add_reassignable(unit_id)
+
+    linked_count_by_user_id: dict[int, int] = {}
+    for active_user_id, active_target in active_target_by_user_id.items():
+        if active_user_id <= 0 or active_target <= 0:
+            continue
+        active_user_row = user_row if int(active_user_id) == int(user_id) else _get_green_user_for_sponsor_agent(
+            db,
+            user_id=int(active_user_id),
+            organization_id=project_organization_id,
+        )
+        active_aliases = _build_sponsor_agent_aliases(active_user_row)
+        linked_count = _count_linked_sponsor_units_for_assignee(
+            db,
+            project_id=int(project_id),
+            user_id=int(active_user_id),
+            aliases=active_aliases,
+        )
+        linked_count_by_user_id[int(active_user_id)] = linked_count
+        allowed_reserved = max(int(active_target) - linked_count, 0)
+        reserved_rows = list(reserved_rows_by_user_id.get(int(active_user_id), []))
+        if len(reserved_rows) > allowed_reserved:
+            for surplus_row in reserved_rows[allowed_reserved:]:
+                add_reassignable(int(surplus_row.get("id") or 0))
+            reserved_rows = reserved_rows[:allowed_reserved]
+            reserved_rows_by_user_id[int(active_user_id)] = reserved_rows
+
+    linked_count = int(linked_count_by_user_id.get(int(user_id), 0))
+    reserved_count = len(reserved_rows_by_user_id.get(int(user_id), []))
     missing_count = max(target_trees - linked_count - reserved_count, 0)
     if missing_count <= 0:
         return 0
 
-    selected_agent_ids = _normalize_positive_int_list(selected_agent_ids)
     rows = db.execute(
         text(
             """
