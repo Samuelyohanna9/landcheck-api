@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Body, Depends, HTTPException, Query, UploadFile, File, Form, Request
+from fastapi import APIRouter, BackgroundTasks, Body, Depends, HTTPException, Query, UploadFile, File, Form, Request
 from fastapi.responses import FileResponse, HTMLResponse, Response, StreamingResponse
 from sqlalchemy.orm import Session
 from sqlalchemy import bindparam, text
@@ -8355,8 +8355,49 @@ def _ensure_public_sponsor_agent_project_access(
     except Exception:
         selected_agent_ids = explicit_agent_ids
     selected_agent_ids = _normalize_positive_int_list(selected_agent_ids)
-    if int(user_row.get("id") or 0) not in set(selected_agent_ids):
-        raise HTTPException(status_code=403, detail="This user is not selected as a public sponsor agent")
+    resolved_user_id = int(user_row.get("id") or 0)
+    if resolved_user_id not in set(selected_agent_ids):
+        work_order_assignee_user_available = _ensure_work_order_assignee_columns(db)
+        has_active_planting_order = False
+        try:
+            aliases = _build_sponsor_agent_aliases(user_row)
+            if work_order_assignee_user_available:
+                has_active_planting_order = bool(db.execute(
+                    text(
+                        """
+                        SELECT 1 FROM green_work_orders
+                        WHERE project_id = :project_id
+                          AND LOWER(REPLACE(REPLACE(COALESCE(work_type, ''), '-', '_'), ' ', '_')) = 'planting'
+                          AND LOWER(COALESCE(status, 'assigned')) NOT IN ('done', 'completed', 'closed', 'cancelled')
+                          AND (
+                                assignee_user_id = :user_id
+                             OR LOWER(REGEXP_REPLACE(TRIM(COALESCE(assignee_name, '')), '\\s+', ' ', 'g')) IN :aliases
+                          )
+                        LIMIT 1
+                        """
+                    ).bindparams(bindparam("aliases", expanding=True)),
+                    {"project_id": int(project_id), "user_id": resolved_user_id, "aliases": aliases or [""]},
+                ).scalar())
+            elif aliases:
+                has_active_planting_order = bool(db.execute(
+                    text(
+                        """
+                        SELECT 1 FROM green_work_orders
+                        WHERE project_id = :project_id
+                          AND LOWER(REPLACE(REPLACE(COALESCE(work_type, ''), '-', '_'), ' ', '_')) = 'planting'
+                          AND LOWER(COALESCE(status, 'assigned')) NOT IN ('done', 'completed', 'closed', 'cancelled')
+                          AND LOWER(REGEXP_REPLACE(TRIM(COALESCE(assignee_name, '')), '\\s+', ' ', 'g')) IN :aliases
+                        LIMIT 1
+                        """
+                    ).bindparams(bindparam("aliases", expanding=True)),
+                    {"project_id": int(project_id), "aliases": aliases or [""]},
+                ).scalar())
+        except Exception:
+            logger.exception("Fallback work-order check failed for user_id=%s project_id=%s", resolved_user_id, int(project_id))
+        if has_active_planting_order:
+            selected_agent_ids.append(resolved_user_id)
+        else:
+            raise HTTPException(status_code=403, detail="This user is not selected as a public sponsor agent")
     return project_row, user_row, selected_agent_ids
 
 
@@ -23888,6 +23929,7 @@ def task_stats(project_id: int, db: Session = Depends(get_db)):
 
 @router.post("/work-orders")
 def create_work_order(
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
     project_id: int = Body(...),
     assignee_name: str = Body(...),
@@ -23954,6 +23996,15 @@ def create_work_order(
         if not sponsor_agent_row:
             raise HTTPException(status_code=403, detail="Only saved public sponsor agents can receive sponsor-funded planting work")
         sponsor_agent_user_id = int(sponsor_agent_row.get("id") or 0) or None
+        if sponsor_agent_user_id and sponsor_agent_user_id not in set(explicit_agent_ids):
+            try:
+                updated_ids = list(set(explicit_agent_ids + [sponsor_agent_user_id]))
+                db.execute(
+                    text("UPDATE tree_projects SET public_sponsor_agent_user_ids = CAST(:ids AS JSONB) WHERE id = :project_id"),
+                    {"project_id": int(project_id), "ids": _safe_json(updated_ids)},
+                )
+            except Exception:
+                logger.warning("Could not auto-register agent %s in project %s sponsor agent list", sponsor_agent_user_id, project_id)
         awaiting_tree_backlog = db.execute(
             text(
                 """
@@ -24186,33 +24237,27 @@ def create_work_order(
     db.commit()
     work_order_id = int(row)
     if should_sync_public_sponsor_units:
-        try:
-            _try_assign_available_sponsor_units_for_project(
-                db,
-                project_id=int(project_id),
-                context="create_work_order",
-            )
-        except Exception:
-            logger.exception(
-                "Sponsor QR project-level auto-assignment failed after work order commit for project_id=%s work_order_id=%s",
-                int(project_id),
-                work_order_id,
-            )
-        if sponsor_agent_user_id is not None:
+        _bg_project_id = int(project_id)
+        _bg_agent_user_id = int(sponsor_agent_user_id) if sponsor_agent_user_id is not None else None
+        _bg_org_id = int(project_organization_id) if project_organization_id is not None else None
+        def _bg_sync_sponsor_units():
+            bg_db = SessionLocal()
             try:
-                _try_assign_available_sponsor_units_for_agent(
-                    db,
-                    project_id=int(project_id),
-                    user_id=int(sponsor_agent_user_id),
-                    organization_id=project_organization_id,
-                    context="create_work_order",
-                )
+                _ensure_green_schema_ready(bg_db)
+                _try_assign_available_sponsor_units_for_project(bg_db, project_id=_bg_project_id, context="create_work_order_bg")
+                if _bg_agent_user_id is not None:
+                    _try_assign_available_sponsor_units_for_agent(
+                        bg_db, project_id=_bg_project_id, user_id=_bg_agent_user_id,
+                        organization_id=_bg_org_id, context="create_work_order_bg",
+                    )
             except Exception:
-                logger.exception(
-                    "Sponsor QR agent-level auto-assignment failed after work order commit for project_id=%s work_order_id=%s",
-                    int(project_id),
-                    work_order_id,
-                )
+                logger.exception("Background sponsor QR sync failed for project_id=%s work_order_id=%s", _bg_project_id, work_order_id)
+            finally:
+                try:
+                    bg_db.close()
+                except Exception:
+                    pass
+        background_tasks.add_task(_bg_sync_sponsor_units)
     due_label = _safe_push_date_label(due_date)
     if work_type == "planting":
         if action_name == "work_order_accumulated":
