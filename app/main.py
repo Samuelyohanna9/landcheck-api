@@ -1,5 +1,5 @@
 # app/main.py
-
+import os
 from time import perf_counter
 
 from fastapi import FastAPI, Request
@@ -11,6 +11,18 @@ from app.db_init import init_db
 from app.utils.activity_logger import ensure_activity_log_table, log_request_activity, should_skip_request_logging
 
 app = FastAPI(title="LandCheck API")
+
+
+def _parse_csv_env(name: str) -> list[str]:
+    raw_value = str(os.getenv(name, "") or "").strip()
+    if not raw_value:
+        return []
+    values: list[str] = []
+    for item in raw_value.split(","):
+        clean = item.strip().rstrip("/")
+        if clean and clean not in values:
+            values.append(clean)
+    return values
 
 # ✅ Create tables on startup
 @app.on_event("startup")
@@ -26,16 +38,30 @@ app.add_middleware(GZipMiddleware, minimum_size=1000)
 # ✅ SECURITY OPTIMIZATION: Custom Domain CORS
 # Replacing "*" with specific origins allows you to set allow_credentials=True
 # which is required if you ever add logins or cookies.
-origins = [
+default_origins = [
     "https://landcheck.online",
     "https://www.landcheck.online",
     "https://landcheck-web.pages.dev",  # Keep for testing
     "http://localhost:3000",             # Keep for local dev if needed
+    "http://127.0.0.1:3000",
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+    "http://localhost:4173",
+    "http://127.0.0.1:4173",
 ]
+
+origins: list[str] = []
+for origin in [*default_origins, *_parse_csv_env("CORS_ALLOW_ORIGINS")]:
+    clean = origin.strip().rstrip("/")
+    if clean and clean not in origins:
+        origins.append(clean)
+
+local_origin_regex = str(os.getenv("CORS_ALLOW_ORIGIN_REGEX", "") or "").strip()
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,
+    allow_origin_regex=local_origin_regex or None,
     allow_credentials=True,  # Now allowed because we specified origins
     allow_methods=["*"],
     allow_headers=["*"],

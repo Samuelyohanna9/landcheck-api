@@ -1,0 +1,22 @@
+services:
+  postgis:
+    image: postgis/postgis:16-3.4
+    container_name: landcheck-postgis-local
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: landcheck_local
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      - landcheck-postgis-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d landcheck_local"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  landcheck-postgis-data:
+
