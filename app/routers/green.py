@@ -7561,6 +7561,8 @@ def _load_public_sponsorship_project_row(db: Session, *, project_id: int) -> dic
 
 
 _sponsor_qr_unit_columns_ready = False
+_work_order_assignee_columns_ready = False
+_work_order_assignee_columns_available: bool | None = None
 
 
 def _ensure_sponsor_qr_unit_columns(db: Session):
@@ -7581,6 +7583,47 @@ def _ensure_sponsor_qr_unit_columns(db: Session):
     except Exception:
         db.rollback()
         raise
+
+
+def _has_work_order_assignee_column(db: Session) -> bool:
+    result = db.execute(
+        text(
+            """
+            SELECT EXISTS (
+                SELECT 1
+                FROM information_schema.columns
+                WHERE table_name = 'green_work_orders'
+                  AND column_name = 'assignee_user_id'
+            )
+            """
+        )
+    ).scalar()
+    return bool(result)
+
+
+def _ensure_work_order_assignee_columns(db: Session) -> bool:
+    global _work_order_assignee_columns_ready, _work_order_assignee_columns_available
+    if _work_order_assignee_columns_ready and _work_order_assignee_columns_available is not None:
+        return bool(_work_order_assignee_columns_available)
+    try:
+        db.execute(text("ALTER TABLE green_work_orders ADD COLUMN IF NOT EXISTS assignee_user_id INTEGER REFERENCES green_users(id)"))
+        db.execute(text("CREATE INDEX IF NOT EXISTS idx_work_orders_project_assignee_user ON green_work_orders(project_id, assignee_user_id, created_at DESC)"))
+        db.commit()
+        _work_order_assignee_columns_ready = True
+        _work_order_assignee_columns_available = True
+        return True
+    except Exception:
+        db.rollback()
+        try:
+            _work_order_assignee_columns_available = _has_work_order_assignee_column(db)
+        except Exception:
+            _work_order_assignee_columns_available = False
+        _work_order_assignee_columns_ready = True
+        if not _work_order_assignee_columns_available:
+            logger.warning(
+                "green_work_orders.assignee_user_id is unavailable; falling back to name-based sponsor assignment routing"
+            )
+        return bool(_work_order_assignee_columns_available)
 
 
 def _list_assignee_aliases_for_lookup(
@@ -7825,6 +7868,7 @@ def _assign_available_sponsor_units_for_agent(
     organization_id: int | None = None,
 ) -> int:
     _ensure_sponsor_qr_unit_columns(db)
+    work_order_assignee_user_available = _ensure_work_order_assignee_columns(db)
     project_row, user_row, selected_agent_ids = _ensure_public_sponsor_agent_project_access(
         db,
         project_id=int(project_id),
@@ -7836,8 +7880,8 @@ def _assign_available_sponsor_units_for_agent(
         return 0
     order_rows = db.execute(
         text(
-            """
-            SELECT assignee_name, target_trees
+            f"""
+            SELECT assignee_name, {"assignee_user_id" if work_order_assignee_user_available else "NULL::INTEGER AS assignee_user_id"}, target_trees
             FROM green_work_orders
             WHERE project_id = :project_id
               AND LOWER(REPLACE(REPLACE(COALESCE(work_type, ''), '-', '_'), ' ', '_')) = 'planting'
@@ -7852,9 +7896,17 @@ def _assign_available_sponsor_units_for_agent(
     project_organization_id = int(project_row.get("organization_id") or 0) or None
     active_target_by_user_id: dict[int, int] = {}
     for order_row in order_rows:
+        order_assignee_user_id = int(order_row.get("assignee_user_id") or 0) or None
         assignee_name = str(order_row.get("assignee_name") or "").strip()
         order_target_trees = int(order_row.get("target_trees") or 0)
-        if not assignee_name or order_target_trees <= 0:
+        if order_target_trees <= 0:
+            continue
+        if order_assignee_user_id is not None:
+            active_target_by_user_id[int(order_assignee_user_id)] = int(active_target_by_user_id.get(int(order_assignee_user_id), 0) or 0) + order_target_trees
+            if int(order_assignee_user_id) == int(user_id):
+                target_trees += order_target_trees
+            continue
+        if not assignee_name:
             continue
         matched_user = _match_selected_public_sponsor_user_for_assignee(
             db,
@@ -8025,6 +8077,7 @@ def _assign_available_sponsor_units_for_agent(
 
 def _assign_available_sponsor_units_for_project(db: Session, *, project_id: int) -> int:
     _ensure_sponsor_qr_unit_columns(db)
+    work_order_assignee_user_available = _ensure_work_order_assignee_columns(db)
     project_row = _load_public_sponsorship_project_row(db, project_id=int(project_id))
     organization_id = int(project_row.get("organization_id") or 0) or None
     explicit_agent_ids = _normalize_positive_int_list(_json_value_or(project_row.get("public_sponsor_agent_user_ids"), []))
@@ -8043,8 +8096,8 @@ def _assign_available_sponsor_units_for_project(db: Session, *, project_id: int)
 
     order_rows = db.execute(
         text(
-            """
-            SELECT id, assignee_name, target_trees, created_at
+            f"""
+            SELECT id, assignee_name, {"assignee_user_id" if work_order_assignee_user_available else "NULL::INTEGER AS assignee_user_id"}, target_trees, created_at
             FROM green_work_orders
             WHERE project_id = :project_id
               AND LOWER(REPLACE(REPLACE(COALESCE(work_type, ''), '-', '_'), ' ', '_')) = 'planting'
@@ -8060,16 +8113,28 @@ def _assign_available_sponsor_units_for_project(db: Session, *, project_id: int)
     assignee_entries: list[dict] = []
     assignee_index: dict[str, dict] = {}
     for order_row in order_rows:
+        order_assignee_user_id = int(order_row.get("assignee_user_id") or 0) or None
         assignee_name = str(order_row.get("assignee_name") or "").strip()
         target_trees = int(order_row.get("target_trees") or 0)
-        if not assignee_name or target_trees <= 0:
+        if target_trees <= 0:
             continue
-        matched_user = _match_selected_public_sponsor_user_for_assignee(
-            db,
-            assignee_name=assignee_name,
-            organization_id=organization_id,
-            selected_user_ids=selected_agent_ids,
-        )
+        matched_user = None
+        if order_assignee_user_id is not None and int(order_assignee_user_id) in set(selected_agent_ids):
+            try:
+                matched_user = _get_green_user_for_sponsor_agent(
+                    db,
+                    user_id=int(order_assignee_user_id),
+                    organization_id=organization_id,
+                )
+            except HTTPException:
+                matched_user = None
+        if matched_user is None and assignee_name:
+            matched_user = _match_selected_public_sponsor_user_for_assignee(
+                db,
+                assignee_name=assignee_name,
+                organization_id=organization_id,
+                selected_user_ids=selected_agent_ids,
+            )
         user_id = int(matched_user.get("id") or 0) if matched_user else 0
         if user_id <= 0:
             continue
@@ -23731,6 +23796,7 @@ def create_work_order(
     area_geojson: dict | str | None = Body(default=None),
     allow_existing_tree_area_reuse: bool = Body(default=False),
 ):
+    work_order_assignee_user_available = _ensure_work_order_assignee_columns(db)
     if work_type not in {"planting", "maintenance"}:
         raise HTTPException(status_code=400, detail="Invalid work_type")
     assignee_clean = (assignee_name or "").strip()
@@ -23831,73 +23897,161 @@ def create_work_order(
     )
     existing_id = None
     if can_accumulate:
-        existing_id = db.execute(
-            text(
-                """
-                SELECT id
-                FROM green_work_orders
-                WHERE project_id = :project_id
-                  AND LOWER(TRIM(assignee_name)) = LOWER(TRIM(:assignee_name))
-                  AND work_type = :work_type
-                  AND COALESCE(area_enabled, FALSE) = FALSE
-                  AND area_geojson IS NULL
-                  AND COALESCE(species_allocations, '[]'::jsonb) = '[]'::jsonb
-                  AND COALESCE(auto_assign_first_cycle_maintenance, FALSE) = :auto_assign_first_cycle_maintenance
-                  AND LOWER(COALESCE(status, 'assigned')) NOT IN ('done', 'completed', 'closed', 'cancelled')
-                ORDER BY created_at DESC, id DESC
-                LIMIT 1
-                """
-            ),
-            {
+        if work_order_assignee_user_available:
+            existing_id = db.execute(
+                text(
+                    """
+                    SELECT id
+                    FROM green_work_orders
+                    WHERE project_id = :project_id
+                      AND (
+                            (:assignee_user_id IS NOT NULL AND COALESCE(assignee_user_id, 0) = :assignee_user_id)
+                         OR (:assignee_user_id IS NULL AND LOWER(TRIM(assignee_name)) = LOWER(TRIM(:assignee_name)))
+                      )
+                      AND work_type = :work_type
+                      AND COALESCE(area_enabled, FALSE) = FALSE
+                      AND area_geojson IS NULL
+                      AND COALESCE(species_allocations, '[]'::jsonb) = '[]'::jsonb
+                      AND COALESCE(auto_assign_first_cycle_maintenance, FALSE) = :auto_assign_first_cycle_maintenance
+                      AND LOWER(COALESCE(status, 'assigned')) NOT IN ('done', 'completed', 'closed', 'cancelled')
+                    ORDER BY created_at DESC, id DESC
+                    LIMIT 1
+                    """
+                ),
+                {
+                    "project_id": project_id,
+                    "assignee_name": assignee_clean,
+                    "assignee_user_id": int(sponsor_agent_user_id) if sponsor_agent_user_id is not None else None,
+                    "work_type": work_type,
+                    "auto_assign_first_cycle_maintenance": auto_assign_first_cycle_maintenance,
+                },
+            ).scalar()
+        else:
+            existing_id = db.execute(
+                text(
+                    """
+                    SELECT id
+                    FROM green_work_orders
+                    WHERE project_id = :project_id
+                      AND LOWER(TRIM(assignee_name)) = LOWER(TRIM(:assignee_name))
+                      AND work_type = :work_type
+                      AND COALESCE(area_enabled, FALSE) = FALSE
+                      AND area_geojson IS NULL
+                      AND COALESCE(species_allocations, '[]'::jsonb) = '[]'::jsonb
+                      AND COALESCE(auto_assign_first_cycle_maintenance, FALSE) = :auto_assign_first_cycle_maintenance
+                      AND LOWER(COALESCE(status, 'assigned')) NOT IN ('done', 'completed', 'closed', 'cancelled')
+                    ORDER BY created_at DESC, id DESC
+                    LIMIT 1
+                    """
+                ),
+                {
+                    "project_id": project_id,
+                    "assignee_name": assignee_clean,
+                    "work_type": work_type,
+                    "auto_assign_first_cycle_maintenance": auto_assign_first_cycle_maintenance,
+                },
+            ).scalar()
+
+    if existing_id and work_type == "planting":
+        if work_order_assignee_user_available:
+            row = db.execute(
+                text(
+                    """
+                    UPDATE green_work_orders
+                    SET target_trees = COALESCE(target_trees, 0) + :target_trees,
+                        assignee_name = COALESCE(:assignee_name, assignee_name),
+                        assignee_user_id = COALESCE(:assignee_user_id, assignee_user_id),
+                        due_date = COALESCE(:due_date, due_date),
+                        last_update = NOW()
+                    WHERE id = :id
+                    RETURNING id
+                    """
+                ),
+                {
+                    "id": int(existing_id),
+                    "target_trees": int(target_trees or 0),
+                    "assignee_name": assignee_clean,
+                    "assignee_user_id": int(sponsor_agent_user_id) if sponsor_agent_user_id is not None else None,
+                    "due_date": due_date,
+                },
+            ).scalar()
+        else:
+            row = db.execute(
+                text(
+                    """
+                    UPDATE green_work_orders
+                    SET target_trees = COALESCE(target_trees, 0) + :target_trees,
+                        assignee_name = COALESCE(:assignee_name, assignee_name),
+                        due_date = COALESCE(:due_date, due_date),
+                        last_update = NOW()
+                    WHERE id = :id
+                    RETURNING id
+                    """
+                ),
+                {
+                    "id": int(existing_id),
+                    "target_trees": int(target_trees or 0),
+                    "assignee_name": assignee_clean,
+                    "due_date": due_date,
+                },
+            ).scalar()
+        action_name = "work_order_accumulated"
+    else:
+        if work_order_assignee_user_available:
+            row = db.execute(text("""
+                INSERT INTO green_work_orders (
+                    project_id, assignee_name, assignee_user_id, work_type, target_trees, species_allocations, maintenance_schedule,
+                    auto_assign_first_cycle_maintenance, due_date,
+                    area_enabled, area_label, area_geojson, allow_existing_tree_area_reuse
+                )
+                VALUES (
+                    :project_id, :assignee_name, :assignee_user_id, :work_type, :target_trees, CAST(:species_allocations AS JSONB), :maintenance_schedule,
+                    :auto_assign_first_cycle_maintenance, :due_date,
+                    :area_enabled, :area_label, CAST(:area_geojson AS JSONB), :allow_existing_tree_area_reuse
+                )
+                RETURNING id
+            """), {
+                "project_id": project_id,
+                "assignee_name": assignee_clean,
+                "assignee_user_id": int(sponsor_agent_user_id) if sponsor_agent_user_id is not None else None,
+                "work_type": work_type,
+                "target_trees": target_trees,
+                "species_allocations": _safe_json(normalized_species_allocations) if normalized_species_allocations else None,
+                "maintenance_schedule": maintenance_schedule or None,
+                "auto_assign_first_cycle_maintenance": auto_assign_first_cycle_maintenance,
+                "due_date": due_date,
+                "area_enabled": bool(area_enabled),
+                "area_label": area_label_clean,
+                "area_geojson": _safe_json(normalized_area_geojson) if normalized_area_geojson else None,
+                "allow_existing_tree_area_reuse": bool(allow_existing_tree_area_reuse),
+            }).scalar()
+        else:
+            row = db.execute(text("""
+                INSERT INTO green_work_orders (
+                    project_id, assignee_name, work_type, target_trees, species_allocations, maintenance_schedule,
+                    auto_assign_first_cycle_maintenance, due_date,
+                    area_enabled, area_label, area_geojson, allow_existing_tree_area_reuse
+                )
+                VALUES (
+                    :project_id, :assignee_name, :work_type, :target_trees, CAST(:species_allocations AS JSONB), :maintenance_schedule,
+                    :auto_assign_first_cycle_maintenance, :due_date,
+                    :area_enabled, :area_label, CAST(:area_geojson AS JSONB), :allow_existing_tree_area_reuse
+                )
+                RETURNING id
+            """), {
                 "project_id": project_id,
                 "assignee_name": assignee_clean,
                 "work_type": work_type,
+                "target_trees": target_trees,
+                "species_allocations": _safe_json(normalized_species_allocations) if normalized_species_allocations else None,
+                "maintenance_schedule": maintenance_schedule or None,
                 "auto_assign_first_cycle_maintenance": auto_assign_first_cycle_maintenance,
-            },
-        ).scalar()
-
-    if existing_id and work_type == "planting":
-        row = db.execute(
-            text(
-                """
-                UPDATE green_work_orders
-                SET target_trees = COALESCE(target_trees, 0) + :target_trees,
-                    due_date = COALESCE(:due_date, due_date),
-                    last_update = NOW()
-                WHERE id = :id
-                RETURNING id
-                """
-            ),
-            {"id": int(existing_id), "target_trees": int(target_trees or 0), "due_date": due_date},
-        ).scalar()
-        action_name = "work_order_accumulated"
-    else:
-        row = db.execute(text("""
-            INSERT INTO green_work_orders (
-                project_id, assignee_name, work_type, target_trees, species_allocations, maintenance_schedule,
-                auto_assign_first_cycle_maintenance, due_date,
-                area_enabled, area_label, area_geojson, allow_existing_tree_area_reuse
-            )
-            VALUES (
-                :project_id, :assignee_name, :work_type, :target_trees, CAST(:species_allocations AS JSONB), :maintenance_schedule,
-                :auto_assign_first_cycle_maintenance, :due_date,
-                :area_enabled, :area_label, CAST(:area_geojson AS JSONB), :allow_existing_tree_area_reuse
-            )
-            RETURNING id
-        """), {
-            "project_id": project_id,
-            "assignee_name": assignee_clean,
-            "work_type": work_type,
-            "target_trees": target_trees,
-            "species_allocations": _safe_json(normalized_species_allocations) if normalized_species_allocations else None,
-            "maintenance_schedule": maintenance_schedule or None,
-            "auto_assign_first_cycle_maintenance": auto_assign_first_cycle_maintenance,
-            "due_date": due_date,
-            "area_enabled": bool(area_enabled),
-            "area_label": area_label_clean,
-            "area_geojson": _safe_json(normalized_area_geojson) if normalized_area_geojson else None,
-            "allow_existing_tree_area_reuse": bool(allow_existing_tree_area_reuse),
-        }).scalar()
+                "due_date": due_date,
+                "area_enabled": bool(area_enabled),
+                "area_label": area_label_clean,
+                "area_geojson": _safe_json(normalized_area_geojson) if normalized_area_geojson else None,
+                "allow_existing_tree_area_reuse": bool(allow_existing_tree_area_reuse),
+            }).scalar()
         action_name = "work_order_created"
     _log_audit_event(
         db,
@@ -24053,45 +24207,94 @@ def list_work_orders(
     assignee_name: str | None = None,
     db: Session = Depends(get_db),
 ):
+    work_order_assignee_user_available = _ensure_work_order_assignee_columns(db)
     assignee_aliases = _list_assignee_aliases_for_lookup(db, assignee_name=assignee_name)
     if assignee_name and not assignee_aliases:
         assignee_aliases = _build_assignee_name_variants(assignee_name)
-    rows = db.execute(text("""
-        WITH tree_counts AS (
-            SELECT LOWER(TRIM(created_by)) AS assignee_key, COUNT(*) AS planted
-            FROM trees
-            WHERE project_id = :project_id
-              AND LOWER(COALESCE(tree_origin, 'new_planting')) = 'new_planting'
-              AND COALESCE(count_in_planting_kpis, TRUE) = TRUE
-              AND LOWER(REPLACE(REPLACE(COALESCE(status, ''), '-', '_'), ' ', '_')) <> 'pending_planting'
-            GROUP BY created_by
-        )
-        SELECT o.id, o.project_id, o.assignee_name, o.work_type, o.target_trees,
-               o.species_allocations,
-               o.maintenance_schedule,
-               COALESCE(o.auto_assign_first_cycle_maintenance, FALSE) AS auto_assign_first_cycle_maintenance,
-               o.due_date, o.status,
-               COALESCE(o.area_enabled, FALSE) AS area_enabled,
-               o.area_label, o.area_geojson,
-               COALESCE(o.allow_existing_tree_area_reuse, FALSE) AS allow_existing_tree_area_reuse,
-               CASE
-                   WHEN o.work_type = 'planting' THEN COALESCE(t.planted, 0)
-                   ELSE o.planted_count
-               END AS planted_count,
-               o.last_update, o.created_at
-        FROM green_work_orders o
-        LEFT JOIN tree_counts t ON t.assignee_key = LOWER(TRIM(o.assignee_name))
-        WHERE o.project_id = :project_id
-          AND (
-                :assignee_filter_off = TRUE
-             OR LOWER(REGEXP_REPLACE(TRIM(COALESCE(o.assignee_name, '')), '\\s+', ' ', 'g')) IN :assignee_aliases
-          )
-        ORDER BY o.created_at DESC
-    """).bindparams(bindparam("assignee_aliases", expanding=True)), {
-        "project_id": int(project_id),
-        "assignee_filter_off": not bool(str(assignee_name or "").strip()),
-        "assignee_aliases": assignee_aliases or [""],
-    }).mappings().all()
+    matched_assignee_rows = _list_green_users_for_assignee_name(db, assignee_name=assignee_name, organization_id=None) if assignee_name else []
+    assignee_user_ids = _normalize_positive_int_list([int(row.get("id") or 0) for row in matched_assignee_rows])
+    if work_order_assignee_user_available:
+        rows = db.execute(text("""
+            WITH tree_counts AS (
+                SELECT LOWER(TRIM(created_by)) AS assignee_key, COUNT(*) AS planted
+                FROM trees
+                WHERE project_id = :project_id
+                  AND LOWER(COALESCE(tree_origin, 'new_planting')) = 'new_planting'
+                  AND COALESCE(count_in_planting_kpis, TRUE) = TRUE
+                  AND LOWER(REPLACE(REPLACE(COALESCE(status, ''), '-', '_'), ' ', '_')) <> 'pending_planting'
+                GROUP BY created_by
+            )
+            SELECT o.id, o.project_id, o.assignee_name, o.work_type, o.target_trees,
+                   o.species_allocations,
+                   o.maintenance_schedule,
+                   COALESCE(o.auto_assign_first_cycle_maintenance, FALSE) AS auto_assign_first_cycle_maintenance,
+                   o.due_date, o.status,
+                   COALESCE(o.area_enabled, FALSE) AS area_enabled,
+                   o.area_label, o.area_geojson,
+                   COALESCE(o.allow_existing_tree_area_reuse, FALSE) AS allow_existing_tree_area_reuse,
+                   CASE
+                       WHEN o.work_type = 'planting' THEN COALESCE(t.planted, 0)
+                       ELSE o.planted_count
+                   END AS planted_count,
+                   o.last_update, o.created_at
+            FROM green_work_orders o
+            LEFT JOIN tree_counts t ON t.assignee_key = LOWER(TRIM(o.assignee_name))
+            WHERE o.project_id = :project_id
+              AND (
+                    :assignee_filter_off = TRUE
+                 OR LOWER(REGEXP_REPLACE(TRIM(COALESCE(o.assignee_name, '')), '\\s+', ' ', 'g')) IN :assignee_aliases
+                 OR (:assignee_user_filter_off = FALSE AND COALESCE(o.assignee_user_id, 0) IN :assignee_user_ids)
+              )
+            ORDER BY o.created_at DESC
+        """).bindparams(
+            bindparam("assignee_aliases", expanding=True),
+            bindparam("assignee_user_ids", expanding=True),
+        ), {
+            "project_id": int(project_id),
+            "assignee_filter_off": not bool(str(assignee_name or "").strip()),
+            "assignee_aliases": assignee_aliases or [""],
+            "assignee_user_filter_off": not bool(assignee_user_ids),
+            "assignee_user_ids": assignee_user_ids or [0],
+        }).mappings().all()
+    else:
+        rows = db.execute(text("""
+            WITH tree_counts AS (
+                SELECT LOWER(TRIM(created_by)) AS assignee_key, COUNT(*) AS planted
+                FROM trees
+                WHERE project_id = :project_id
+                  AND LOWER(COALESCE(tree_origin, 'new_planting')) = 'new_planting'
+                  AND COALESCE(count_in_planting_kpis, TRUE) = TRUE
+                  AND LOWER(REPLACE(REPLACE(COALESCE(status, ''), '-', '_'), ' ', '_')) <> 'pending_planting'
+                GROUP BY created_by
+            )
+            SELECT o.id, o.project_id, o.assignee_name, o.work_type, o.target_trees,
+                   o.species_allocations,
+                   o.maintenance_schedule,
+                   COALESCE(o.auto_assign_first_cycle_maintenance, FALSE) AS auto_assign_first_cycle_maintenance,
+                   o.due_date, o.status,
+                   COALESCE(o.area_enabled, FALSE) AS area_enabled,
+                   o.area_label, o.area_geojson,
+                   COALESCE(o.allow_existing_tree_area_reuse, FALSE) AS allow_existing_tree_area_reuse,
+                   CASE
+                       WHEN o.work_type = 'planting' THEN COALESCE(t.planted, 0)
+                       ELSE o.planted_count
+                   END AS planted_count,
+                   o.last_update, o.created_at
+            FROM green_work_orders o
+            LEFT JOIN tree_counts t ON t.assignee_key = LOWER(TRIM(o.assignee_name))
+            WHERE o.project_id = :project_id
+              AND (
+                    :assignee_filter_off = TRUE
+                 OR LOWER(REGEXP_REPLACE(TRIM(COALESCE(o.assignee_name, '')), '\\s+', ' ', 'g')) IN :assignee_aliases
+              )
+            ORDER BY o.created_at DESC
+        """).bindparams(
+            bindparam("assignee_aliases", expanding=True),
+        ), {
+            "project_id": int(project_id),
+            "assignee_filter_off": not bool(str(assignee_name or "").strip()),
+            "assignee_aliases": assignee_aliases or [""],
+        }).mappings().all()
     payload: list[dict] = []
     for row in rows:
         item = dict(row)
