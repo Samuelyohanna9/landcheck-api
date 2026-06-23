@@ -23632,6 +23632,22 @@ def create_work_order(
     assignee_clean = (assignee_name or "").strip()
     if not assignee_clean:
         raise HTTPException(status_code=400, detail="Assignee name required")
+    project_access_row = db.execute(
+        text(
+            """
+            SELECT id, organization_id, access_model, public_sponsor_enabled, public_sponsor_agent_user_ids
+            FROM tree_projects
+            WHERE id = :project_id
+            LIMIT 1
+            """
+        ),
+        {"project_id": int(project_id)},
+    ).mappings().first()
+    if not project_access_row:
+        raise HTTPException(status_code=404, detail="Project not found")
+    sponsor_agent_user_id: int | None = None
+    project_organization_id = int(project_access_row.get("organization_id") or 0) or None
+    public_sponsor_project = _is_public_sponsorship_project(dict(project_access_row))
     if area_enabled and work_type != "planting":
         raise HTTPException(status_code=400, detail="Area assignment is only available for planting orders")
     normalized_species_allocations = _normalize_species_allocations(species_allocations)
@@ -23641,6 +23657,52 @@ def create_work_order(
         target_trees = int(sum(int(item.get("count") or 0) for item in normalized_species_allocations))
     if work_type == "planting" and int(target_trees or 0) <= 0:
         raise HTTPException(status_code=400, detail="Target trees must be greater than 0 for planting orders")
+    if work_type == "planting" and public_sponsor_project:
+        explicit_agent_ids = _normalize_positive_int_list(_json_value_or(project_access_row.get("public_sponsor_agent_user_ids"), []))
+        try:
+            selected_agent_ids = _collect_public_sponsor_agent_user_ids_for_project(
+                db,
+                project_id=int(project_id),
+                organization_id=project_organization_id,
+                explicit_user_ids=explicit_agent_ids,
+            )
+        except Exception:
+            selected_agent_ids = explicit_agent_ids
+        sponsor_agent_row = _match_selected_public_sponsor_user_for_assignee(
+            db,
+            assignee_name=assignee_clean,
+            organization_id=project_organization_id,
+            selected_user_ids=_normalize_positive_int_list(selected_agent_ids),
+        )
+        if not sponsor_agent_row:
+            raise HTTPException(status_code=403, detail="Only saved public sponsor agents can receive sponsor-funded planting work")
+        sponsor_agent_user_id = int(sponsor_agent_row.get("id") or 0) or None
+        awaiting_tree_backlog = db.execute(
+            text(
+                """
+                SELECT COUNT(*)
+                FROM green_sponsorship_units
+                WHERE project_id = :project_id
+                  AND tree_id IS NULL
+                  AND LOWER(COALESCE(sponsorship_status, '')) = 'awaiting_tree'
+                """
+            ),
+            {"project_id": int(project_id)},
+        ).scalar()
+        awaiting_tree_backlog_value = int(awaiting_tree_backlog or 0)
+        if awaiting_tree_backlog_value <= 0:
+            raise HTTPException(
+                status_code=409,
+                detail="No paid sponsor trees are currently awaiting planting in this project. Capture payment-backed sponsor trees first, then assign planting work.",
+            )
+        if int(target_trees or 0) > awaiting_tree_backlog_value:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"Only {awaiting_tree_backlog_value} paid sponsor tree"
+                    f"{'' if awaiting_tree_backlog_value == 1 else 's'} are currently awaiting planting in this project."
+                ),
+            )
     auto_assign_first_cycle_maintenance = bool(auto_assign_first_cycle_maintenance) and work_type == "planting"
 
     normalized_area_geojson = _normalize_polygon_area_geojson(area_geojson)
@@ -23755,13 +23817,7 @@ def create_work_order(
     )
     should_sync_public_sponsor_units = False
     if work_type == "planting":
-        project_access_row = db.execute(
-            text("SELECT access_model, public_sponsor_enabled FROM tree_projects WHERE id = :project_id LIMIT 1"),
-            {"project_id": int(project_id)},
-        ).mappings().first()
-        should_sync_public_sponsor_units = bool(
-            project_access_row and _is_public_sponsorship_project(dict(project_access_row))
-        )
+        should_sync_public_sponsor_units = bool(public_sponsor_project)
     db.commit()
     if should_sync_public_sponsor_units:
         try:
@@ -23770,6 +23826,14 @@ def create_work_order(
                 project_id=int(project_id),
                 context="create_work_order",
             )
+            if sponsor_agent_user_id is not None:
+                _try_assign_available_sponsor_units_for_agent(
+                    db,
+                    project_id=int(project_id),
+                    user_id=int(sponsor_agent_user_id),
+                    organization_id=project_organization_id,
+                    context="create_work_order",
+                )
         except Exception:
             logger.exception(
                 "Sponsor QR auto-assignment failed after work order commit for project_id=%s work_order_id=%s",
