@@ -7825,7 +7825,7 @@ def _assign_available_sponsor_units_for_agent(
     organization_id: int | None = None,
 ) -> int:
     _ensure_sponsor_qr_unit_columns(db)
-    project_row, user_row, _selected_agent_ids = _ensure_public_sponsor_agent_project_access(
+    project_row, user_row, selected_agent_ids = _ensure_public_sponsor_agent_project_access(
         db,
         project_id=int(project_id),
         user_id=int(user_id),
@@ -7885,6 +7885,7 @@ def _assign_available_sponsor_units_for_agent(
     if missing_count <= 0:
         return 0
 
+    selected_agent_ids = _normalize_positive_int_list(selected_agent_ids)
     rows = db.execute(
         text(
             """
@@ -7894,9 +7895,31 @@ def _assign_available_sponsor_units_for_agent(
                 WHERE project_id = :project_id
                   AND tree_id IS NULL
                   AND LOWER(COALESCE(sponsorship_status, '')) = 'awaiting_tree'
-                  AND assigned_user_id IS NULL
-                  AND NULLIF(BTRIM(COALESCE(assigned_assignee_name, '')), '') IS NULL
-                ORDER BY created_at ASC, id ASC
+                  AND (
+                        (
+                            assigned_user_id IS NULL
+                            AND (
+                                    NULLIF(BTRIM(COALESCE(assigned_assignee_name, '')), '') IS NULL
+                                 OR LOWER(REGEXP_REPLACE(TRIM(COALESCE(assigned_assignee_name, '')), '\\s+', ' ', 'g')) IN :aliases
+                                )
+                        )
+                     OR assigned_user_id NOT IN :selected_agent_ids
+                  )
+                ORDER BY
+                    CASE
+                        WHEN assigned_user_id IS NULL
+                             AND LOWER(REGEXP_REPLACE(TRIM(COALESCE(assigned_assignee_name, '')), '\\s+', ' ', 'g')) IN :aliases
+                            THEN 0
+                        WHEN assigned_user_id IS NULL
+                             AND NULLIF(BTRIM(COALESCE(assigned_assignee_name, '')), '') IS NULL
+                            THEN 1
+                        WHEN assigned_user_id IS NULL
+                            THEN 2
+                        ELSE 3
+                    END,
+                    COALESCE(assigned_at, created_at) ASC,
+                    created_at ASC,
+                    id ASC
                 LIMIT :limit_count
             )
             UPDATE green_sponsorship_units u
@@ -7908,12 +7931,17 @@ def _assign_available_sponsor_units_for_agent(
             WHERE u.id = nu.id
             RETURNING u.id
             """
+        ).bindparams(
+            bindparam("aliases", expanding=True),
+            bindparam("selected_agent_ids", expanding=True),
         ),
         {
             "project_id": int(project_id),
             "limit_count": int(missing_count),
             "user_id": int(user_id),
             "assigned_assignee_name": str(user_row.get("full_name") or user_row.get("work_username") or "").strip() or None,
+            "aliases": aliases or [""],
+            "selected_agent_ids": selected_agent_ids or [0],
         },
     ).mappings().all()
     return len(rows)
