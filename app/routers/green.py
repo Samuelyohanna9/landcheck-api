@@ -7982,54 +7982,124 @@ def _assign_available_sponsor_units_for_project(db: Session, *, project_id: int)
             assignee_entries.append(entry)
         entry["target_trees"] = int(entry.get("target_trees") or 0) + target_trees
 
-    assigned_total = 0
+    if not assignee_entries:
+        return 0
+
+    awaiting_unit_rows = db.execute(
+        text(
+            """
+            SELECT
+                id,
+                assigned_user_id,
+                assigned_assignee_name,
+                assigned_at,
+                created_at
+            FROM green_sponsorship_units
+            WHERE project_id = :project_id
+              AND tree_id IS NULL
+              AND LOWER(COALESCE(sponsorship_status, '')) = 'awaiting_tree'
+            ORDER BY COALESCE(assigned_at, created_at) ASC, created_at ASC, id ASC
+            """
+        ),
+        {"project_id": int(project_id)},
+    ).mappings().all()
+
+    selected_agent_id_set = set(selected_agent_ids)
+    active_target_by_user_id = {
+        int(entry.get("user_id") or 0): int(entry.get("target_trees") or 0)
+        for entry in assignee_entries
+        if int(entry.get("user_id") or 0) > 0
+    }
+    reserved_rows_by_user_id: dict[int, list[dict]] = {user_id: [] for user_id in active_target_by_user_id}
+    reassignable_unit_ids: list[int] = []
+    seen_reassignable_ids: set[int] = set()
+
+    def add_reassignable(unit_id: int | None):
+        normalized_unit_id = int(unit_id or 0)
+        if normalized_unit_id <= 0 or normalized_unit_id in seen_reassignable_ids:
+            return
+        seen_reassignable_ids.add(normalized_unit_id)
+        reassignable_unit_ids.append(normalized_unit_id)
+
+    for unit_row in awaiting_unit_rows:
+        row_payload = dict(unit_row)
+        unit_id = int(row_payload.get("id") or 0)
+        assigned_user_id = int(row_payload.get("assigned_user_id") or 0) or None
+        assigned_assignee_name = str(row_payload.get("assigned_assignee_name") or "").strip()
+
+        owner_user_id = assigned_user_id if assigned_user_id is not None else None
+        if owner_user_id is None and assigned_assignee_name:
+            matched_owner = _match_selected_public_sponsor_user_for_assignee(
+                db,
+                assignee_name=assigned_assignee_name,
+                organization_id=organization_id,
+                selected_user_ids=selected_agent_ids,
+            )
+            owner_user_id = int(matched_owner.get("id") or 0) if matched_owner else None
+            owner_user_id = owner_user_id or None
+
+        if owner_user_id in active_target_by_user_id:
+            reserved_rows_by_user_id.setdefault(int(owner_user_id), []).append(row_payload)
+            continue
+
+        if owner_user_id is None and not assigned_assignee_name:
+            add_reassignable(unit_id)
+            continue
+
+        if owner_user_id is None or owner_user_id not in selected_agent_id_set or owner_user_id not in active_target_by_user_id:
+            add_reassignable(unit_id)
+
     for entry in assignee_entries:
-        aliases = [str(item or "").strip().lower() for item in entry.get("aliases") or [] if str(item or "").strip()]
         user_id = int(entry.get("user_id") or 0)
+        aliases = [str(item or "").strip().lower() for item in entry.get("aliases") or [] if str(item or "").strip()]
         target_trees = int(entry.get("target_trees") or 0)
-        # Only sponsor-linked trees should fulfill sponsor-funded planting demand.
         linked_count = _count_linked_sponsor_units_for_assignee(
             db,
             project_id=int(project_id),
             user_id=user_id,
             aliases=aliases,
         )
-        reserved_count = _count_reserved_sponsor_units_for_assignee(
-            db,
-            project_id=int(project_id),
-            user_id=user_id,
-            aliases=aliases,
-        )
+        reserved_rows = list(reserved_rows_by_user_id.get(user_id, []))
+        allowed_reserved = max(target_trees - linked_count, 0)
+        if len(reserved_rows) > allowed_reserved:
+            for surplus_row in reserved_rows[allowed_reserved:]:
+                add_reassignable(int(surplus_row.get("id") or 0))
+            reserved_rows = reserved_rows[:allowed_reserved]
+            reserved_rows_by_user_id[user_id] = reserved_rows
+        entry["linked_count"] = linked_count
+        entry["reserved_count"] = len(reserved_rows)
+
+    assigned_total = 0
+    for entry in assignee_entries:
+        user_id = int(entry.get("user_id") or 0)
+        target_trees = int(entry.get("target_trees") or 0)
+        linked_count = int(entry.get("linked_count") or 0)
+        reserved_count = int(entry.get("reserved_count") or 0)
         missing_count = max(target_trees - linked_count - reserved_count, 0)
         if missing_count <= 0:
             continue
+        unit_ids_to_assign = reassignable_unit_ids[:missing_count]
+        if not unit_ids_to_assign:
+            continue
+        reassignable_unit_ids = reassignable_unit_ids[len(unit_ids_to_assign):]
         rows = db.execute(
             text(
                 """
-                WITH next_units AS (
-                    SELECT id
-                    FROM green_sponsorship_units
-                    WHERE project_id = :project_id
-                      AND tree_id IS NULL
-                      AND LOWER(COALESCE(sponsorship_status, '')) = 'awaiting_tree'
-                      AND assigned_user_id IS NULL
-                      AND NULLIF(BTRIM(COALESCE(assigned_assignee_name, '')), '') IS NULL
-                    ORDER BY created_at ASC, id ASC
-                    LIMIT :limit_count
-                )
-                UPDATE green_sponsorship_units u
+                UPDATE green_sponsorship_units
                 SET assigned_user_id = :user_id,
                     assigned_assignee_name = :assignee_name,
                     assigned_at = NOW(),
                     updated_at = NOW()
-                FROM next_units nu
-                WHERE u.id = nu.id
-                RETURNING u.id
+                WHERE id IN :unit_ids
+                  AND project_id = :project_id
+                  AND tree_id IS NULL
+                  AND LOWER(COALESCE(sponsorship_status, '')) = 'awaiting_tree'
+                RETURNING id
                 """
-            ),
+            ).bindparams(bindparam("unit_ids", expanding=True)),
             {
                 "project_id": int(project_id),
-                "limit_count": int(missing_count),
+                "unit_ids": unit_ids_to_assign,
                 "user_id": user_id,
                 "assignee_name": str(entry.get("assignee_name") or "").strip(),
             },
