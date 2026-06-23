@@ -7582,7 +7582,8 @@ def _ensure_sponsor_qr_unit_columns(db: Session):
         _sponsor_qr_unit_columns_ready = True
     except Exception:
         db.rollback()
-        raise
+        _sponsor_qr_unit_columns_ready = True
+        logger.warning("_ensure_sponsor_qr_unit_columns migration failed; columns may already exist")
 
 
 def _has_work_order_assignee_column(db: Session) -> bool:
@@ -9307,6 +9308,7 @@ def _promote_project_paid_units_to_awaiting_tree(db: Session, project_id: int) -
               AND (
                     LOWER(COALESCE(o.payment_status, '')) IN ('verified', 'paid')
                  OR LOWER(COALESCE(o.order_status, '')) IN ('paid', 'allocated', 'completed')
+                 OR o.payment_verified_at IS NOT NULL
               )
             RETURNING u.order_id
             """
@@ -9322,6 +9324,10 @@ def _promote_project_paid_units_to_awaiting_tree(db: Session, project_id: int) -
     }
     for order_id in refreshed_order_ids:
         _refresh_sponsorship_order_status(db, order_id)
+    try:
+        db.commit()
+    except Exception:
+        db.rollback()
     return len(updated_rows)
 
 
@@ -14458,7 +14464,11 @@ def export_sponsorship_unit_qr_tag_pdf(
         base_url = _build_public_api_base_url(request)
         verification_url = f"{base_url}/green/sponsor/public/trees/{quote(str(item.get('unit_uid') or unit_id))}"
 
-    pdf_bytes = render_green_tree_qr_tag_pdf(item, verification_url)
+    try:
+        pdf_bytes = render_green_tree_qr_tag_pdf(item, verification_url)
+    except Exception:
+        logger.exception("QR tag PDF render failed for unit_id=%s", int(unit_id))
+        raise HTTPException(status_code=500, detail="Failed to generate QR tag PDF — please retry or contact support.")
     downloader_name = str(user_row.get("full_name") or user_row.get("work_username") or "").strip() or None
     _mark_sponsor_unit_qr_download(
         db,
@@ -24174,6 +24184,7 @@ def create_work_order(
     if work_type == "planting":
         should_sync_public_sponsor_units = bool(public_sponsor_project)
     db.commit()
+    work_order_id = int(row)
     if should_sync_public_sponsor_units:
         try:
             _try_assign_available_sponsor_units_for_project(
@@ -24181,7 +24192,14 @@ def create_work_order(
                 project_id=int(project_id),
                 context="create_work_order",
             )
-            if sponsor_agent_user_id is not None:
+        except Exception:
+            logger.exception(
+                "Sponsor QR project-level auto-assignment failed after work order commit for project_id=%s work_order_id=%s",
+                int(project_id),
+                work_order_id,
+            )
+        if sponsor_agent_user_id is not None:
+            try:
                 _try_assign_available_sponsor_units_for_agent(
                     db,
                     project_id=int(project_id),
@@ -24189,12 +24207,12 @@ def create_work_order(
                     organization_id=project_organization_id,
                     context="create_work_order",
                 )
-        except Exception:
-            logger.exception(
-                "Sponsor QR auto-assignment failed after work order commit for project_id=%s work_order_id=%s",
-                int(project_id),
-                int(row),
-            )
+            except Exception:
+                logger.exception(
+                    "Sponsor QR agent-level auto-assignment failed after work order commit for project_id=%s work_order_id=%s",
+                    int(project_id),
+                    work_order_id,
+                )
     due_label = _safe_push_date_label(due_date)
     if work_type == "planting":
         if action_name == "work_order_accumulated":
