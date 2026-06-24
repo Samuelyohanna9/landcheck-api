@@ -15111,7 +15111,11 @@ def list_admin_sponsors(db: Session = Depends(get_db)):
         else:
             level = "Climate Contributor"
             
-        rules = _compute_active_referrer_rules(db, int(row["id"]))
+        try:
+            rules = _compute_active_referrer_rules(db, int(row["id"]))
+        except Exception:
+            logger.exception("Failed to compute referral rules for sponsor_id=%s", int(row["id"]))
+            rules = {}
         item = _serialize_sponsor_account(dict(row)) | {
             "orders_count": int(row.get("orders_count") or 0),
             "amount_total": round(float(row.get("amount_total") or 0), 2),
