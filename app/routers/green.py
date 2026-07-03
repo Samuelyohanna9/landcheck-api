@@ -130,6 +130,7 @@ SPONSOR_DEDICATION_TYPE_VALUES = {"self", "memorial", "birthday", "celebration",
 SPONSOR_TERMS_VERSION = "2026-06-06-v1"
 SPONSOR_TERMS_EFFECTIVE_DATE = "2026-06-06"
 SPONSOR_RESET_TOKEN_TTL_HOURS = 2
+FIELD_RESET_TOKEN_TTL_HOURS = 2
 SPONSOR_AGENT_ACCOUNT_CURRENCY = "NGN"
 SPONSOR_AGENT_MIN_PAYOUT_NAIRA = 10000
 SPONSOR_AGENT_PAYOUT_STATUS_VALUES = {"requested", "approved", "processing", "paid", "rejected", "failed", "cancelled"}
@@ -357,6 +358,15 @@ class SponsorForgotPasswordPayload(BaseModel):
 
 
 class SponsorResetPasswordPayload(BaseModel):
+    token: str
+    new_password: str
+
+
+class FieldForgotPasswordPayload(BaseModel):
+    email: str
+
+
+class FieldResetPasswordPayload(BaseModel):
     token: str
     new_password: str
 
@@ -1692,6 +1702,225 @@ def _send_sponsor_welcome_email(*, to_email: str, full_name: str, account_type: 
         text_body=body,
         html_body=html_body,
     )
+
+
+def _build_field_public_reset_password_url(token: str, request: Request | None = None) -> str | None:
+    reset_token = str(token or "").strip()
+    if not reset_token:
+        return None
+    base_url = _build_public_api_base_url(request)
+    return f"{base_url}/green/public/reset-password?token={quote(reset_token)}" if base_url else None
+
+
+def _send_field_password_reset_email(*, to_email: str, full_name: str, reset_url: str, expires_at: datetime):
+    recipient_name = str(full_name or "").strip() or "Field Officer"
+    expiry_label = expires_at.strftime("%d %b %Y %H:%M UTC")
+    body = (
+        f"Hello {recipient_name},\n\n"
+        "We received a request to reset your LandCheck Green field account password.\n\n"
+        f"Use this secure reset link before {expiry_label}:\n{reset_url}\n\n"
+        "If you did not request this change, you can ignore this message and your current password will remain active.\n\n"
+        "Regards,\n"
+        "LandCheck Green"
+    )
+    html_body = f"""
+    <html>
+      <body style="margin:0;padding:28px;background:#f3f9f4;font-family:Arial,sans-serif;color:#173624;">
+        <div style="max-width:660px;margin:0 auto;background:#ffffff;border:1px solid #d8ebdd;border-radius:20px;overflow:hidden;">
+          <div style="padding:26px 28px;background:linear-gradient(145deg,#0d5e2e 0%,#1f7f43 100%);color:#ffffff;">
+            <div style="font-size:26px;font-weight:800;line-height:1.18;">Reset your field password</div>
+            <div style="margin-top:8px;font-size:14px;line-height:1.7;color:#eaf9ed;">Use the secure button below to choose a new password for your LandCheck Green field account.</div>
+          </div>
+          <div style="padding:26px 28px 30px;">
+            <p style="margin:0 0 14px;font-size:15px;line-height:1.7;">Hello {html.escape(recipient_name)},</p>
+            <p style="margin:0 0 18px;font-size:15px;line-height:1.7;">A password reset was requested for your field account. This secure link expires on <strong>{html.escape(expiry_label)}</strong>.</p>
+            <a href="{html.escape(reset_url, quote=True)}" style="display:inline-block;padding:14px 22px;border-radius:999px;background:#0f6f39;color:#ffffff;font-size:15px;font-weight:800;text-decoration:none;">Reset password</a>
+            <p style="margin:18px 0 0;font-size:13px;line-height:1.7;color:#4b6857;">If the button does not open, copy this link into your browser:<br/>{html.escape(reset_url)}</p>
+            <p style="margin:18px 0 0;font-size:13px;line-height:1.7;color:#4b6857;">If you did not request this, you can ignore this email.</p>
+          </div>
+        </div>
+      </body>
+    </html>
+    """
+    _send_html_email(
+        to_email=to_email,
+        subject="Reset your LandCheck Green field password",
+        text_body=body,
+        html_body=html_body,
+    )
+
+
+def _render_field_public_reset_password_html(token: str) -> str:
+    safe_token = html.escape(str(token or "").strip(), quote=True)
+    return f"""<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Reset Field Password</title>
+    <style>
+      body {{
+        margin: 0;
+        font-family: Inter, "Segoe UI", system-ui, sans-serif;
+        background: linear-gradient(180deg, #f8fcf8 0%, #e9f6eb 100%);
+        color: #173624;
+      }}
+      .shell {{
+        min-height: 100vh;
+        display: grid;
+        place-items: center;
+        padding: 22px;
+      }}
+      .card {{
+        width: min(100%, 440px);
+        background: rgba(255,255,255,0.97);
+        border: 1px solid rgba(15,111,57,0.10);
+        border-radius: 24px;
+        box-shadow: 0 20px 48px rgba(10, 52, 28, 0.12);
+        overflow: hidden;
+      }}
+      .hero {{
+        padding: 24px 24px 20px;
+        background: linear-gradient(145deg,#0c5f2e 0%,#1b8245 100%);
+        color: #fff;
+      }}
+      .hero h1, .hero p {{ margin: 0; }}
+      .hero h1 {{
+        margin-top: 10px;
+        font-size: 1.9rem;
+        line-height: 1.1;
+      }}
+      .hero p {{
+        margin-top: 8px;
+        color: rgba(255,255,255,0.86);
+        line-height: 1.65;
+      }}
+      .body {{ padding: 22px 24px 26px; }}
+      label {{
+        display: block;
+        margin-bottom: 8px;
+        font-size: 0.92rem;
+        font-weight: 700;
+        color: #1a3d28;
+      }}
+      input {{
+        width: 100%;
+        min-height: 54px;
+        padding: 0 16px;
+        border-radius: 16px;
+        border: 1px solid rgba(15,111,57,0.16);
+        background: #fbfefb;
+        font: inherit;
+        color: #173624;
+        margin-bottom: 14px;
+        box-sizing: border-box;
+      }}
+      button {{
+        width: 100%;
+        min-height: 54px;
+        border: 0;
+        border-radius: 16px;
+        background: #0f6f39;
+        color: #fff;
+        font: inherit;
+        font-weight: 800;
+        cursor: pointer;
+      }}
+      button:disabled {{ opacity: 0.6; cursor: wait; }}
+      .status {{
+        margin-top: 14px;
+        padding: 14px 16px;
+        border-radius: 14px;
+        background: #f4faf5;
+        border: 1px solid rgba(15,111,57,0.10);
+        color: #486652;
+        line-height: 1.65;
+        display: none;
+      }}
+      .status.error {{
+        background: #fff5f5;
+        border-color: rgba(185, 28, 28, 0.12);
+        color: #9f1d1d;
+      }}
+    </style>
+  </head>
+  <body>
+    <main class="shell">
+      <section class="card">
+        <div class="hero">
+          <div style="font-size:12px;font-weight:800;letter-spacing:0.14em;text-transform:uppercase;color:#d8f7df;">LandCheck Green field route</div>
+          <h1>Reset your password</h1>
+          <p>Choose a new password for your field account. After saving, sign back in from the app.</p>
+        </div>
+        <div class="body">
+          <form id="reset-form">
+            <input id="token" type="hidden" value="{safe_token}" />
+            <label for="password">New password</label>
+            <input id="password" type="password" autocomplete="new-password" minlength="6" placeholder="Enter new password" required />
+            <label for="confirm-password">Confirm new password</label>
+            <input id="confirm-password" type="password" autocomplete="new-password" minlength="6" placeholder="Repeat new password" required />
+            <button id="submit-btn" type="submit">Save new password</button>
+            <div id="status" class="status"></div>
+          </form>
+        </div>
+      </section>
+    </main>
+    <script>
+      const form = document.getElementById('reset-form');
+      const statusEl = document.getElementById('status');
+      const submitBtn = document.getElementById('submit-btn');
+      form.addEventListener('submit', async (event) => {{
+        event.preventDefault();
+        const token = document.getElementById('token').value.trim();
+        const password = document.getElementById('password').value;
+        const confirmPassword = document.getElementById('confirm-password').value;
+        statusEl.style.display = 'none';
+        statusEl.className = 'status';
+        if (!token) {{
+          statusEl.textContent = 'This reset link is invalid or missing a token.';
+          statusEl.classList.add('error');
+          statusEl.style.display = 'block';
+          return;
+        }}
+        if (password.length < 6) {{
+          statusEl.textContent = 'Password must be at least 6 characters.';
+          statusEl.classList.add('error');
+          statusEl.style.display = 'block';
+          return;
+        }}
+        if (password !== confirmPassword) {{
+          statusEl.textContent = 'The two password entries do not match.';
+          statusEl.classList.add('error');
+          statusEl.style.display = 'block';
+          return;
+        }}
+        submitBtn.disabled = true;
+        submitBtn.textContent = 'Saving...';
+        try {{
+          const response = await fetch('/green/green-auth/reset-password', {{
+            method: 'POST',
+            headers: {{ 'Content-Type': 'application/json' }},
+            body: JSON.stringify({{ token, new_password: password }}),
+          }});
+          const payload = await response.json().catch(() => ({{}}));
+          if (!response.ok) {{
+            throw new Error(payload.detail || 'Could not reset the password.');
+          }}
+          statusEl.textContent = payload.message || 'Password updated successfully. You can return to the app and sign in now.';
+          statusEl.style.display = 'block';
+          form.reset();
+        }} catch (error) {{
+          statusEl.textContent = error.message || 'Could not reset the password.';
+          statusEl.classList.add('error');
+          statusEl.style.display = 'block';
+        }} finally {{
+          submitBtn.disabled = false;
+          submitBtn.textContent = 'Save new password';
+        }}
+      }});
+    </script>
+  </body>
+</html>"""
 
 
 def _send_sponsor_password_reset_email(*, to_email: str, full_name: str, reset_url: str, expires_at: datetime):
@@ -4888,6 +5117,10 @@ def ensure_green_tables(db: Session):
         db.execute(text("ALTER TABLE trees ADD COLUMN IF NOT EXISTS existing_area_geojson JSONB"))
         db.execute(text("ALTER TABLE trees ADD COLUMN IF NOT EXISTS existing_area_sqm NUMERIC"))
         db.execute(text("ALTER TABLE trees ADD COLUMN IF NOT EXISTS record_profile_data JSONB"))
+        db.execute(text("ALTER TABLE green_users ADD COLUMN IF NOT EXISTS email TEXT"))
+        db.execute(text("ALTER TABLE green_users ADD COLUMN IF NOT EXISTS password_reset_token_hash TEXT"))
+        db.execute(text("ALTER TABLE green_users ADD COLUMN IF NOT EXISTS password_reset_token_expires_at TIMESTAMP"))
+        db.execute(text("ALTER TABLE green_users ADD COLUMN IF NOT EXISTS password_reset_requested_at TIMESTAMP"))
     except Exception:
         db.rollback()
     try:
@@ -20244,6 +20477,124 @@ def green_auth_login(
             "profile_photo_url": _normalize_logo_asset_path(user_row.get("profile_photo_url")),
         },
     }
+
+
+@router.post("/green-auth/forgot-password")
+def green_auth_forgot_password(payload: FieldForgotPasswordPayload, request: Request, db: Session = Depends(get_db)):
+    email = _normalize_email_address(payload.email)
+    row = db.execute(
+        text(
+            """
+            SELECT id, full_name, email
+            FROM green_users
+            WHERE LOWER(COALESCE(email, '')) = LOWER(:email)
+              AND COALESCE(is_active, TRUE) = TRUE
+            LIMIT 1
+            """
+        ),
+        {"email": email},
+    ).mappings().first()
+    if not row:
+        return {"ok": True, "message": "If that email exists on a field account, a reset link has been sent."}
+
+    token = secrets.token_urlsafe(32)
+    token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
+    expires_at = datetime.utcnow() + timedelta(hours=FIELD_RESET_TOKEN_TTL_HOURS)
+    db.execute(
+        text(
+            """
+            UPDATE green_users
+            SET password_reset_token_hash = :token_hash,
+                password_reset_token_expires_at = :expires_at,
+                password_reset_requested_at = NOW()
+            WHERE id = :user_id
+            """
+        ),
+        {
+            "user_id": int(row["id"]),
+            "token_hash": token_hash,
+            "expires_at": expires_at,
+        },
+    )
+    _log_audit_event(
+        db,
+        project_id=None,
+        entity_type="green_user",
+        entity_id=int(row["id"]),
+        action="field_password_reset_requested",
+        actor=str(row.get("email") or "").strip(),
+        details={"expires_at": expires_at.isoformat()},
+    )
+    db.commit()
+    reset_url = _build_field_public_reset_password_url(token, request=request)
+    if reset_url:
+        try:
+            _send_field_password_reset_email(
+                to_email=str(row.get("email") or "").strip(),
+                full_name=str(row.get("full_name") or ""),
+                reset_url=reset_url,
+                expires_at=expires_at,
+            )
+        except Exception:
+            pass
+    return {"ok": True, "message": "If that email exists on a field account, a reset link has been sent."}
+
+
+@router.post("/green-auth/reset-password")
+def green_auth_reset_password(payload: FieldResetPasswordPayload, db: Session = Depends(get_db)):
+    token = str(payload.token or "").strip()
+    if len(token) < 20:
+        raise HTTPException(status_code=400, detail="Invalid reset token")
+    new_password = str(payload.new_password or "")
+    if len(new_password) < 6:
+        raise HTTPException(status_code=400, detail="Password must be at least 6 characters")
+    token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
+    row = db.execute(
+        text(
+            """
+            SELECT id, email
+            FROM green_users
+            WHERE password_reset_token_hash = :token_hash
+              AND password_reset_token_expires_at IS NOT NULL
+              AND password_reset_token_expires_at >= NOW()
+            LIMIT 1
+            """
+        ),
+        {"token_hash": token_hash},
+    ).mappings().first()
+    if not row:
+        raise HTTPException(status_code=400, detail="This reset link is invalid or has expired")
+    db.execute(
+        text(
+            """
+            UPDATE green_users
+            SET work_password_hash = :password_hash,
+                password_reset_token_hash = NULL,
+                password_reset_token_expires_at = NULL
+            WHERE id = :user_id
+            """
+        ),
+        {
+            "user_id": int(row["id"]),
+            "password_hash": _hash_password_value(new_password),
+        },
+    )
+    _log_audit_event(
+        db,
+        project_id=None,
+        entity_type="green_user",
+        entity_id=int(row["id"]),
+        action="field_password_reset_completed",
+        actor=str(row.get("email") or "").strip(),
+        details={},
+    )
+    db.commit()
+    return {"ok": True, "message": "Password updated successfully. You can sign in now."}
+
+
+@router.get("/public/reset-password", response_class=HTMLResponse)
+def field_public_reset_password(token: str = Query(default="")):
+    return HTMLResponse(content=_render_field_public_reset_password_html(token))
 
 
 @router.post("/mobile/push-tokens/register")
