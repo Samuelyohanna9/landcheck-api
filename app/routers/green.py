@@ -5121,6 +5121,20 @@ def ensure_green_tables(db: Session):
         db.execute(text("ALTER TABLE green_users ADD COLUMN IF NOT EXISTS password_reset_token_hash TEXT"))
         db.execute(text("ALTER TABLE green_users ADD COLUMN IF NOT EXISTS password_reset_token_expires_at TIMESTAMP"))
         db.execute(text("ALTER TABLE green_users ADD COLUMN IF NOT EXISTS password_reset_requested_at TIMESTAMP"))
+        db.execute(text("""
+            CREATE TABLE IF NOT EXISTS green_impact_comments (
+                id          SERIAL PRIMARY KEY,
+                org_slug    TEXT NOT NULL,
+                commenter_name TEXT NOT NULL,
+                commenter_rank TEXT,
+                commenter_org  TEXT,
+                comment_body   TEXT NOT NULL,
+                created_at     TIMESTAMP DEFAULT NOW()
+            )
+        """))
+        db.execute(text(
+            "CREATE INDEX IF NOT EXISTS idx_green_impact_comments_slug ON green_impact_comments(org_slug)"
+        ))
     except Exception:
         db.rollback()
     try:
@@ -10775,21 +10789,59 @@ def get_public_org_impact(org_slug: str, db: Session = Depends(get_db)):
             if len(recent_photos) >= 16:
                 break
 
-        # Map GPS points
+        # Map points / polygon features
         map_rows = db.execute(
             text(
                 """
-                SELECT ST_X(geom) AS lng, ST_Y(geom) AS lat
-                FROM trees
-                WHERE project_id = :pid
-                  AND geom IS NOT NULL
-                  AND LOWER(COALESCE(record_profile_data->>'placeholder_reason', '')) != 'pending_field_capture'
-                LIMIT 600
+                SELECT
+                    ST_X(ST_Centroid(t.geom))  AS lng,
+                    ST_Y(ST_Centroid(t.geom))  AS lat,
+                    CASE WHEN ST_GeometryType(t.geom) NOT IN ('ST_Point','ST_MultiPoint')
+                         THEN ST_AsGeoJSON(t.geom, 6) ELSE NULL END        AS geojson,
+                    t.existing_area_geojson::text                           AS fallback_geojson,
+                    c.name                                                  AS custodian_name,
+                    t.species                                               AS commodity,
+                    CASE WHEN ST_GeometryType(t.geom) NOT IN ('ST_Point','ST_MultiPoint')
+                         THEN ROUND(CAST(ST_Area(t.geom::geography)/10000.0 AS numeric),2)
+                         WHEN t.existing_area_sqm IS NOT NULL
+                         THEN ROUND(CAST(t.existing_area_sqm/10000.0 AS numeric),2)
+                         ELSE NULL END                                      AS area_ha,
+                    t.project_tree_no                                       AS ref_no
+                FROM trees t
+                LEFT JOIN green_custodians c ON c.id = t.custodian_id AND c.project_id = t.project_id
+                WHERE t.project_id = :pid
+                  AND t.geom IS NOT NULL
+                  AND LOWER(COALESCE(t.record_profile_data->>'placeholder_reason', '')) != 'pending_field_capture'
+                LIMIT 300
                 """
             ),
             {"pid": proj_id},
         ).mappings().all()
-        map_points = [{"lng": float(r["lng"]), "lat": float(r["lat"])} for r in map_rows]
+
+        map_points: list[dict] = []
+        map_features: list[dict] = []
+        for r in map_rows:
+            lng_val = r.get("lng")
+            lat_val = r.get("lat")
+            if lng_val is None or lat_val is None:
+                continue
+            props = {
+                "custodian_name": str(r.get("custodian_name") or ""),
+                "commodity": str(r.get("commodity") or ""),
+                "area_ha": float(r["area_ha"]) if r.get("area_ha") is not None else None,
+                "ref_no": str(r.get("ref_no") or ""),
+            }
+            map_points.append({"lng": float(lng_val), "lat": float(lat_val), **props})
+            raw_geojson = r.get("geojson") or r.get("fallback_geojson")
+            if raw_geojson:
+                try:
+                    map_features.append({
+                        "type": "Feature",
+                        "geometry": json.loads(str(raw_geojson)),
+                        "properties": props,
+                    })
+                except Exception:
+                    pass
 
         # Recent approved activity timeline
         activity_rows = db.execute(
@@ -10846,6 +10898,7 @@ def get_public_org_impact(org_slug: str, db: Session = Depends(get_db)):
             },
             "recent_photos": recent_photos,
             "map_points": map_points,
+            "map_features": map_features,
             "recent_activities": recent_activities,
         })
 
@@ -10858,6 +10911,57 @@ def get_public_org_impact(org_slug: str, db: Session = Depends(get_db)):
             "last_updated_at": str(last_updated_at) if last_updated_at else None,
         },
         "generated_at": datetime.utcnow().isoformat() + "Z",
+    }
+
+
+@router.get("/public/impact/{org_slug}/comments")
+def get_org_impact_comments(org_slug: str, db: Session = Depends(get_db)):
+    clean_slug = str(org_slug or "").strip().lower()
+    rows = db.execute(text("""
+        SELECT id, commenter_name, commenter_rank, commenter_org, comment_body, created_at
+        FROM green_impact_comments
+        WHERE LOWER(org_slug) = :slug
+        ORDER BY created_at DESC
+        LIMIT 100
+    """), {"slug": clean_slug}).mappings().all()
+    return [
+        {
+            "id": r["id"],
+            "commenter_name": r["commenter_name"],
+            "commenter_rank": r.get("commenter_rank") or None,
+            "commenter_org": r.get("commenter_org") or None,
+            "comment_body": r["comment_body"],
+            "created_at": str(r["created_at"]) if r.get("created_at") else None,
+        }
+        for r in rows
+    ]
+
+
+@router.post("/public/impact/{org_slug}/comment")
+def post_org_impact_comment(org_slug: str, payload: dict = Body(...), db: Session = Depends(get_db)):
+    clean_slug = str(org_slug or "").strip().lower()
+    commenter_name = str(payload.get("commenter_name") or "").strip()
+    if not commenter_name:
+        raise HTTPException(status_code=422, detail="commenter_name is required")
+    comment_body = str(payload.get("comment_body") or "").strip()
+    if not comment_body:
+        raise HTTPException(status_code=422, detail="comment_body is required")
+    commenter_rank = str(payload.get("commenter_rank") or "").strip() or None
+    commenter_org = str(payload.get("commenter_org") or "").strip() or None
+    result = db.execute(text("""
+        INSERT INTO green_impact_comments (org_slug, commenter_name, commenter_rank, commenter_org, comment_body)
+        VALUES (:slug, :name, :rank, :org, :body)
+        RETURNING id, created_at
+    """), {"slug": clean_slug, "name": commenter_name, "rank": commenter_rank, "org": commenter_org, "body": comment_body})
+    row = result.mappings().first()
+    db.commit()
+    return {
+        "id": row["id"],
+        "commenter_name": commenter_name,
+        "commenter_rank": commenter_rank,
+        "commenter_org": commenter_org,
+        "comment_body": comment_body,
+        "created_at": str(row["created_at"]) if row.get("created_at") else None,
     }
 
 
