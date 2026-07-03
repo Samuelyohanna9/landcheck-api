@@ -10614,6 +10614,268 @@ def list_public_partner_organizations(db: Session = Depends(get_db)):
     ]
 
 
+@router.get("/public/impact/{org_slug}")
+def get_public_org_impact(org_slug: str, db: Session = Depends(get_db)):
+    clean_slug = str(org_slug or "").strip().lower()
+    if not clean_slug:
+        raise HTTPException(status_code=404, detail="Organisation not found")
+
+    org_row = db.execute(
+        text(
+            """
+            SELECT id, name, slug, short_name, logo_url, status,
+                   contact_email, website_url, country, state_region, city
+            FROM green_organizations
+            WHERE LOWER(slug) = :slug
+              AND COALESCE(is_active, TRUE) = TRUE
+            LIMIT 1
+            """
+        ),
+        {"slug": clean_slug},
+    ).mappings().first()
+    if not org_row:
+        raise HTTPException(status_code=404, detail="Organisation not found")
+
+    org = dict(org_row)
+    org_id = int(org["id"])
+    org["logo_url"] = _normalize_logo_asset_path(org.get("logo_url"))
+
+    project_rows = db.execute(
+        text(
+            """
+            SELECT id, name, location_text, workflow_profile, agric_config, relief_config, created_at
+            FROM tree_projects
+            WHERE organization_id = :org_id
+            ORDER BY created_at
+            """
+        ),
+        {"org_id": org_id},
+    ).mappings().all()
+
+    projects = []
+    total_records_all = 0
+    total_approved_tasks_all = 0
+    last_updated_at = None
+
+    for proj_row in project_rows:
+        proj_id = int(proj_row["id"])
+        workflow = _normalize_workflow_profile(proj_row.get("workflow_profile"))
+        labels = _get_workflow_labels(workflow)
+
+        stats_row = db.execute(
+            text(
+                """
+                SELECT
+                    COUNT(*)                                                                                   AS total_records,
+                    COUNT(*) FILTER (WHERE LOWER(COALESCE(status, '')) NOT IN ('dead', 'replaced'))           AS active_records,
+                    COUNT(*) FILTER (WHERE LOWER(COALESCE(status, '')) = 'dead')                              AS dead_records,
+                    COUNT(*) FILTER (WHERE LOWER(COALESCE(status, '')) = 'replaced')                         AS replaced_records,
+                    COUNT(DISTINCT custodian_id) FILTER (WHERE custodian_id IS NOT NULL)                      AS total_custodians,
+                    COUNT(DISTINCT created_by) FILTER (WHERE created_by IS NOT NULL AND created_by != '')    AS total_field_officers
+                FROM trees
+                WHERE project_id = :pid
+                  AND LOWER(COALESCE(record_profile_data->>'placeholder_reason', '')) != 'pending_field_capture'
+                """
+            ),
+            {"pid": proj_id},
+        ).mappings().first()
+
+        stats = dict(stats_row) if stats_row else {}
+        total_rec = int(stats.get("total_records") or 0)
+        active_rec = int(stats.get("active_records") or 0)
+        dead_rec = int(stats.get("dead_records") or 0)
+        replaced_rec = int(stats.get("replaced_records") or 0)
+        total_custodians = int(stats.get("total_custodians") or 0)
+        total_field_officers = int(stats.get("total_field_officers") or 0)
+        survival_rate = round(active_rec / total_rec * 100, 1) if total_rec > 0 else 0.0
+
+        task_row = db.execute(
+            text(
+                """
+                SELECT
+                    COUNT(*)              AS approved_count,
+                    MAX(tt.reviewed_at)  AS last_activity
+                FROM tree_tasks tt
+                JOIN trees t ON t.id = tt.tree_id
+                WHERE t.project_id = :pid
+                  AND LOWER(COALESCE(tt.review_state, 'none')) = 'approved'
+                """
+            ),
+            {"pid": proj_id},
+        ).mappings().first()
+
+        approved_tasks = int((task_row or {}).get("approved_count") or 0)
+        last_activity = (task_row or {}).get("last_activity")
+
+        total_records_all += total_rec
+        total_approved_tasks_all += approved_tasks
+        if last_activity:
+            if last_updated_at is None or last_activity > last_updated_at:
+                last_updated_at = last_activity
+
+        # Species / commodity breakdown
+        breakdown_rows = db.execute(
+            text(
+                """
+                SELECT COALESCE(NULLIF(TRIM(species), ''), 'Unspecified') AS label, COUNT(*) AS count
+                FROM trees
+                WHERE project_id = :pid
+                  AND LOWER(COALESCE(record_profile_data->>'placeholder_reason', '')) != 'pending_field_capture'
+                GROUP BY label
+                ORDER BY count DESC
+                LIMIT 8
+                """
+            ),
+            {"pid": proj_id},
+        ).mappings().all()
+        species_breakdown = [{"label": row["label"], "count": int(row["count"])} for row in breakdown_rows]
+
+        # Recent approved photos
+        photo_rows = db.execute(
+            text(
+                """
+                SELECT tt.photo_url, tt.photo_urls, tt.reviewed_at, tt.assignee_name,
+                       t.id AS tree_id, t.species, t.project_tree_no
+                FROM tree_tasks tt
+                JOIN trees t ON t.id = tt.tree_id
+                WHERE t.project_id = :pid
+                  AND LOWER(COALESCE(tt.review_state, 'none')) = 'approved'
+                  AND (tt.photo_url IS NOT NULL OR tt.photo_urls IS NOT NULL)
+                ORDER BY tt.reviewed_at DESC
+                LIMIT 30
+                """
+            ),
+            {"pid": proj_id},
+        ).mappings().all()
+
+        recent_photos: list[dict] = []
+        for ph in photo_rows:
+            urls: list[str] = []
+            raw_urls = ph.get("photo_urls")
+            if raw_urls:
+                try:
+                    parsed = raw_urls if isinstance(raw_urls, list) else json.loads(str(raw_urls))
+                    urls.extend([str(u) for u in parsed if u])
+                except Exception:
+                    pass
+            if ph.get("photo_url") and ph["photo_url"] not in urls:
+                urls.insert(0, str(ph["photo_url"]))
+            for url in urls[:2]:
+                if not url:
+                    continue
+                recent_photos.append({
+                    "url": url,
+                    "tree_id": int(ph["tree_id"]),
+                    "captured_at": str(ph.get("reviewed_at") or ""),
+                    "created_by": str(ph.get("assignee_name") or ""),
+                    "entity_label": f"{labels['entity_singular']} #{ph.get('project_tree_no') or ph['tree_id']}",
+                })
+                if len(recent_photos) >= 16:
+                    break
+            if len(recent_photos) >= 16:
+                break
+
+        # Map GPS points
+        map_rows = db.execute(
+            text(
+                """
+                SELECT ST_X(geom) AS lng, ST_Y(geom) AS lat
+                FROM trees
+                WHERE project_id = :pid
+                  AND geom IS NOT NULL
+                  AND LOWER(COALESCE(record_profile_data->>'placeholder_reason', '')) != 'pending_field_capture'
+                LIMIT 600
+                """
+            ),
+            {"pid": proj_id},
+        ).mappings().all()
+        map_points = [{"lng": float(r["lng"]), "lat": float(r["lat"])} for r in map_rows]
+
+        # Recent approved activity timeline
+        activity_rows = db.execute(
+            text(
+                """
+                SELECT tt.id, tt.task_type, tt.assignee_name, tt.review_notes, tt.reviewed_at,
+                       t.species, t.project_tree_no, t.id AS tree_id,
+                       c.name AS custodian_name
+                FROM tree_tasks tt
+                JOIN trees t ON t.id = tt.tree_id
+                LEFT JOIN green_custodians c ON c.id = t.custodian_id AND c.project_id = t.project_id
+                WHERE t.project_id = :pid
+                  AND LOWER(COALESCE(tt.review_state, 'none')) = 'approved'
+                ORDER BY tt.reviewed_at DESC
+                LIMIT 20
+                """
+            ),
+            {"pid": proj_id},
+        ).mappings().all()
+
+        recent_activities = [
+            {
+                "id": int(row["id"]),
+                "task_type": str(row.get("task_type") or ""),
+                "assignee_name": str(row.get("assignee_name") or ""),
+                "custodian_name": str(row.get("custodian_name") or ""),
+                "review_notes": str(row.get("review_notes") or ""),
+                "reviewed_at": str(row.get("reviewed_at") or ""),
+                "entity_ref": f"{labels['entity_singular']} #{row.get('project_tree_no') or row.get('tree_id')}",
+                "species": str(row.get("species") or ""),
+            }
+            for row in activity_rows
+        ]
+
+        projects.append({
+            "id": proj_id,
+            "name": str(proj_row.get("name") or ""),
+            "location_text": str(proj_row.get("location_text") or ""),
+            "workflow_profile": workflow,
+            "labels": labels,
+            "agric_config": _normalize_agric_config(proj_row.get("agric_config")),
+            "relief_config": _normalize_relief_config(proj_row.get("relief_config")),
+            "stats": {
+                "total_records": total_rec,
+                "active_records": active_rec,
+                "dead_records": dead_rec,
+                "replaced_records": replaced_rec,
+                "survival_rate": survival_rate,
+                "total_custodians": total_custodians,
+                "total_field_officers": total_field_officers,
+                "approved_tasks": approved_tasks,
+                "species_breakdown": species_breakdown,
+                "last_activity_at": str(last_activity) if last_activity else None,
+            },
+            "recent_photos": recent_photos,
+            "map_points": map_points,
+            "recent_activities": recent_activities,
+        })
+
+    return {
+        "org": org,
+        "projects": projects,
+        "summary": {
+            "total_records": total_records_all,
+            "total_approved_activities": total_approved_tasks_all,
+            "last_updated_at": str(last_updated_at) if last_updated_at else None,
+        },
+        "generated_at": datetime.utcnow().isoformat() + "Z",
+    }
+
+
+@router.get("/public/impact/{org_slug}/pdf")
+def download_org_impact_pdf(org_slug: str, request: Request, db: Session = Depends(get_db)):
+    from app.utils.green_pdf import render_green_donor_impact_pdf
+    data = get_public_org_impact(org_slug=org_slug, db=db)
+    base_url = _build_public_api_base_url(request)
+    pdf_bytes = render_green_donor_impact_pdf(data, base_url=base_url)
+    org_name_safe = re.sub(r"[^a-zA-Z0-9]+", "-", str(data["org"].get("name") or org_slug)).strip("-").lower()
+    filename = f"LandCheck-Impact-{org_name_safe}-{datetime.utcnow().strftime('%Y%m%d')}.pdf"
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
 @router.get("/public-projects/{project_id}")
 def get_public_sponsorship_project(project_id: int, db: Session = Depends(get_db)):
     project = get_project(project_id=project_id, db=db, assignee_name=None)

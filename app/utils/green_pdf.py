@@ -104,6 +104,380 @@ def render_green_org_credentials_pdf(organization: dict, users: list[dict]) -> b
     return buffer.getvalue()
 
 
+def _fetch_image_bytes(url: str, timeout: int = 8) -> bytes | None:
+    if not url:
+        return None
+    try:
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        req = Request(url, headers={"User-Agent": "LandCheckPDF/1.0"})
+        with urlopen(req, timeout=timeout, context=ctx) as resp:
+            return resp.read()
+    except Exception:
+        return None
+
+
+def _draw_logo_image(c: canvas.Canvas, logo_url: str | None, x: float, y: float, size: float = 44):
+    if not logo_url:
+        return
+    raw = _fetch_image_bytes(logo_url)
+    if not raw:
+        return
+    try:
+        img = Image.open(io.BytesIO(raw)).convert("RGBA")
+        img = ImageOps.fit(img, (128, 128), method=Image.LANCZOS)
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        buf.seek(0)
+        c.drawImage(ImageReader(buf), x, y, width=size, height=size, preserveAspectRatio=True, mask="auto")
+    except Exception:
+        pass
+
+
+def _draw_evidence_photo(c: canvas.Canvas, url: str, x: float, y: float, w: float, h: float):
+    raw = _fetch_image_bytes(url)
+    if not raw:
+        return False
+    try:
+        img = Image.open(io.BytesIO(raw)).convert("RGB")
+        img = ImageOps.fit(img, (int(w * 2.5), int(h * 2.5)), method=Image.LANCZOS)
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=78)
+        buf.seek(0)
+        c.drawImage(ImageReader(buf), x, y, width=w, height=h, preserveAspectRatio=False)
+        return True
+    except Exception:
+        return False
+
+
+def render_green_donor_impact_pdf(data: dict, base_url: str = "") -> bytes:
+    buffer = io.BytesIO()
+    c = canvas.Canvas(buffer, pagesize=A4)
+    page_w, page_h = A4
+    MARGIN = 36
+    CONTENT_W = page_w - MARGIN * 2
+    GREEN_DARK = HexColor("#0f2b1a")
+    GREEN_MID = HexColor("#1a6e37")
+    GREEN_ACCENT = HexColor("#2aa852")
+    GREEN_LIGHT = HexColor("#e7f5e7")
+    AMBER = HexColor("#b45309")
+    BLUE_MID = HexColor("#1d4ed8")
+    TEXT_DARK = HexColor("#111827")
+    TEXT_MID = HexColor("#374151")
+    TEXT_SOFT = HexColor("#6b7280")
+    SURFACE = HexColor("#f9fafb")
+    BORDER = HexColor("#d1fae5")
+    GOLD = HexColor("#c5a059")
+
+    org = data.get("org") or {}
+    projects: list[dict] = data.get("projects") or []
+    summary = data.get("summary") or {}
+    generated_at = str(data.get("generated_at") or "")[:16].replace("T", " ")
+
+    org_name = str(org.get("name") or "Organisation")
+    org_short = str(org.get("short_name") or org_name)
+    org_logo_url = str(org.get("logo_url") or "")
+    org_location = ", ".join(filter(None, [org.get("city"), org.get("state_region"), org.get("country")]))
+    org_website = str(org.get("website_url") or "")
+
+    total_records = int(summary.get("total_records") or 0)
+    total_activities = int(summary.get("total_approved_activities") or 0)
+    last_updated = str(summary.get("last_updated_at") or "")[:10]
+
+    page_no = [1]
+
+    def new_page():
+        c.showPage()
+        page_no[0] += 1
+        # Minimal header on continuation pages
+        c.setFillColor(GREEN_DARK)
+        c.rect(0, page_h - 28, page_w, 28, stroke=0, fill=1)
+        c.setFillColorRGB(1, 1, 1)
+        c.setFont("Helvetica-Bold", 8)
+        c.drawString(MARGIN, page_h - 18, f"{org_short} — Impact Report  |  LandCheck")
+        c.setFont("Helvetica", 7)
+        c.drawRightString(page_w - MARGIN, page_h - 18, f"Page {page_no[0]}")
+        return page_h - 44
+
+    # ── Cover header ──────────────────────────────────────────────────────────
+    # Deep green banner
+    c.setFillColor(GREEN_DARK)
+    c.rect(0, page_h - 110, page_w, 110, stroke=0, fill=1)
+
+    # Subtle right decorative blob
+    c.saveState()
+    c.setFillColor(HexColor("#163c26"))
+    c.circle(page_w - 30, page_h - 30, 100, stroke=0, fill=1)
+    c.setFillColor(HexColor("#1a4d2e"))
+    c.circle(page_w - 30, page_h - 30, 60, stroke=0, fill=1)
+    c.restoreState()
+
+    # Logo
+    _draw_logo_image(c, org_logo_url, MARGIN, page_h - 92, size=64)
+
+    logo_right = MARGIN + (72 if org_logo_url else 0)
+    c.setFillColorRGB(1, 1, 1)
+    c.setFont("Helvetica-Bold", 19)
+    c.drawString(logo_right, page_h - 52, org_name)
+    c.setFont("Helvetica", 9)
+    c.setFillColor(HexColor("#86efac"))
+    c.drawString(logo_right, page_h - 68, "Programme Impact Report")
+    if org_location:
+        c.setFont("Helvetica", 8)
+        c.setFillColor(HexColor("#bbf7d0"))
+        c.drawString(logo_right, page_h - 82, org_location)
+
+    # "Verified by LandCheck" badge — top right
+    badge_x = page_w - MARGIN - 130
+    c.setFillColor(GREEN_ACCENT)
+    c.roundRect(badge_x, page_h - 78, 130, 22, 11, stroke=0, fill=1)
+    c.setFillColorRGB(1, 1, 1)
+    c.setFont("Helvetica-Bold", 7.5)
+    c.drawCentredString(badge_x + 65, page_h - 64, "✓  VERIFIED BY LANDCHECK")
+
+    # Generated date
+    c.setFont("Helvetica", 7)
+    c.setFillColor(HexColor("#bbf7d0"))
+    c.drawRightString(page_w - MARGIN, page_h - 100, f"Generated: {generated_at} UTC")
+
+    # ── Summary metric strip ──────────────────────────────────────────────────
+    strip_y = page_h - 162
+    c.setFillColor(GREEN_LIGHT)
+    c.roundRect(MARGIN, strip_y, CONTENT_W, 46, 8, stroke=0, fill=1)
+    c.setStrokeColor(BORDER)
+    c.setLineWidth(0.8)
+    c.roundRect(MARGIN, strip_y, CONTENT_W, 46, 8, stroke=1, fill=0)
+
+    metrics = [
+        (str(total_records), "Total Records"),
+        (str(total_activities), "Approved Activities"),
+        (str(len(projects)), "Active Projects"),
+        (last_updated or "—", "Last Updated"),
+    ]
+    col_w = CONTENT_W / len(metrics)
+    for i, (val, label) in enumerate(metrics):
+        mx = MARGIN + i * col_w + col_w / 2
+        c.setFillColor(GREEN_DARK)
+        c.setFont("Helvetica-Bold", 14)
+        c.drawCentredString(mx, strip_y + 28, val)
+        c.setFont("Helvetica", 7.5)
+        c.setFillColor(TEXT_SOFT)
+        c.drawCentredString(mx, strip_y + 15, label)
+        if i < len(metrics) - 1:
+            c.setStrokeColor(BORDER)
+            c.setLineWidth(0.6)
+            c.line(MARGIN + (i + 1) * col_w, strip_y + 8, MARGIN + (i + 1) * col_w, strip_y + 40)
+
+    y = strip_y - 18
+
+    # ── Project sections ──────────────────────────────────────────────────────
+    def section_header(title: str, subtitle: str, mode: str, cur_y: float) -> float:
+        if cur_y < 120:
+            cur_y = new_page()
+        c.setFillColor(GREEN_MID if mode == "green" else AMBER if mode == "agric" else BLUE_MID)
+        c.roundRect(MARGIN, cur_y - 24, CONTENT_W, 26, 6, stroke=0, fill=1)
+        c.setFillColorRGB(1, 1, 1)
+        c.setFont("Helvetica-Bold", 10)
+        c.drawString(MARGIN + 8, cur_y - 13, title)
+        c.setFont("Helvetica", 8)
+        c.setFillColor(HexColor("#d1fae5"))
+        c.drawRightString(MARGIN + CONTENT_W - 8, cur_y - 13, subtitle)
+        return cur_y - 34
+
+    def stat_row(items: list[tuple[str, str]], cur_y: float) -> float:
+        if cur_y < 80:
+            cur_y = new_page()
+        box_w = (CONTENT_W - (len(items) - 1) * 6) / len(items)
+        for i, (val, lbl) in enumerate(items):
+            bx = MARGIN + i * (box_w + 6)
+            c.setFillColor(SURFACE)
+            c.roundRect(bx, cur_y - 36, box_w, 38, 6, stroke=0, fill=1)
+            c.setStrokeColor(HexColor("#e5e7eb"))
+            c.setLineWidth(0.5)
+            c.roundRect(bx, cur_y - 36, box_w, 38, 6, stroke=1, fill=0)
+            c.setFillColor(GREEN_DARK)
+            c.setFont("Helvetica-Bold", 13)
+            c.drawCentredString(bx + box_w / 2, cur_y - 16, str(val))
+            c.setFont("Helvetica", 7)
+            c.setFillColor(TEXT_SOFT)
+            c.drawCentredString(bx + box_w / 2, cur_y - 28, lbl)
+        return cur_y - 46
+
+    for proj in projects:
+        workflow = str(proj.get("workflow_profile") or "green")
+        lbl = proj.get("labels") or {}
+        entity_pl = str(lbl.get("entity_plural") or "Records")
+        owner_pl = str(lbl.get("owner_plural") or "Custodians")
+        mode_label = str(lbl.get("mode_label") or workflow.title())
+        stats = proj.get("stats") or {}
+        proj_name = str(proj.get("name") or "")
+        location = str(proj.get("location_text") or "")
+        subtitle_text = f"Mode: {mode_label}  |  {location}"
+
+        y = section_header(proj_name, subtitle_text, workflow, y)
+
+        # Stat row
+        sr = int(stats.get("total_records") or 0)
+        sa = int(stats.get("active_records") or 0)
+        sc = int(stats.get("total_custodians") or 0)
+        srate = f"{stats.get('survival_rate') or 0:.0f}%"
+        sapp = int(stats.get("approved_tasks") or 0)
+        sfo = int(stats.get("total_field_officers") or 0)
+        y = stat_row([
+            (str(sr), f"Total {entity_pl}"),
+            (str(sa), f"Active"),
+            (srate, "Activity Rate"),
+            (str(sc), owner_pl),
+            (str(sapp), "Approved Activities"),
+            (str(sfo), "Field Officers"),
+        ], y)
+        y -= 6
+
+        # Species breakdown bar
+        breakdown = proj.get("stats", {}).get("species_breakdown") or []
+        if breakdown:
+            if y < 100:
+                y = new_page()
+            c.setFillColor(TEXT_MID)
+            c.setFont("Helvetica-Bold", 8)
+            c.drawString(MARGIN, y, f"{entity_pl} Breakdown:")
+            y -= 12
+            max_count = max((row["count"] for row in breakdown), default=1)
+            bar_h = 9
+            bar_max_w = CONTENT_W * 0.55
+            for row in breakdown[:6]:
+                if y < 60:
+                    y = new_page()
+                bar_fill = (row["count"] / max_count) * bar_max_w
+                c.setFillColor(HexColor("#d1fae5"))
+                c.roundRect(MARGIN, y - bar_h, bar_max_w, bar_h, 3, stroke=0, fill=1)
+                c.setFillColor(GREEN_ACCENT)
+                c.roundRect(MARGIN, y - bar_h, max(bar_fill, 4), bar_h, 3, stroke=0, fill=1)
+                c.setFillColor(TEXT_DARK)
+                c.setFont("Helvetica", 7.5)
+                c.drawString(MARGIN + bar_max_w + 8, y - bar_h + 2, f"{row['label']} — {row['count']:,}")
+                y -= bar_h + 4
+            y -= 6
+
+        # Evidence photos (up to 6 per project)
+        photos = proj.get("recent_photos") or []
+        if photos:
+            if y < 100:
+                y = new_page()
+            c.setFillColor(TEXT_MID)
+            c.setFont("Helvetica-Bold", 8)
+            c.drawString(MARGIN, y, "Evidence Photos (Approved):")
+            y -= 10
+
+            photo_w = (CONTENT_W - 12) / 3
+            photo_h = photo_w * 0.68
+            col_count = 0
+            px = MARGIN
+
+            def fetch_photos_parallel(urls: list[str]) -> dict[str, bytes | None]:
+                with ThreadPoolExecutor(max_workers=4) as executor:
+                    futures = {executor.submit(_fetch_image_bytes, u): u for u in urls}
+                    return {url: fut.result() for fut, url in {v: k for k, v in futures.items()}.items()}
+
+            photo_urls = [ph["url"] for ph in photos[:6] if ph.get("url")]
+            photo_cache = fetch_photos_parallel(photo_urls) if photo_urls else {}
+
+            for ph in photos[:6]:
+                url = ph.get("url") or ""
+                raw = photo_cache.get(url)
+                if not raw:
+                    continue
+                if y - photo_h < 60:
+                    y = new_page()
+                    px = MARGIN
+                    col_count = 0
+                try:
+                    img = Image.open(io.BytesIO(raw)).convert("RGB")
+                    img = ImageOps.fit(img, (int(photo_w * 2.5), int(photo_h * 2.5)), method=Image.LANCZOS)
+                    buf = io.BytesIO()
+                    img.save(buf, format="JPEG", quality=78)
+                    buf.seek(0)
+                    c.setFillColor(HexColor("#e5e7eb"))
+                    c.roundRect(px, y - photo_h, photo_w, photo_h, 5, stroke=0, fill=1)
+                    c.drawImage(ImageReader(buf), px, y - photo_h, width=photo_w, height=photo_h, preserveAspectRatio=False)
+                except Exception:
+                    pass
+                col_count += 1
+                if col_count >= 3:
+                    col_count = 0
+                    y -= photo_h + 6
+                    px = MARGIN
+                else:
+                    px += photo_w + 6
+            if col_count > 0:
+                y -= photo_h + 6
+            y -= 8
+
+        # Activity timeline
+        activities = proj.get("recent_activities") or []
+        if activities:
+            if y < 100:
+                y = new_page()
+            c.setFillColor(TEXT_MID)
+            c.setFont("Helvetica-Bold", 8)
+            c.drawString(MARGIN, y, "Recent Approved Activities:")
+            y -= 4
+
+            def humanize_task(t: str) -> str:
+                return t.replace("_", " ").title() if t else "Activity"
+
+            for i, act in enumerate(activities[:12]):
+                if y < 60:
+                    y = new_page()
+                row_h = 14
+                bg = HexColor("#f9fafb") if i % 2 == 0 else HexColor("#ffffff")
+                c.setFillColor(bg)
+                c.rect(MARGIN, y - row_h, CONTENT_W, row_h, stroke=0, fill=1)
+                ts = str(act.get("reviewed_at") or "")[:10]
+                task_name = humanize_task(str(act.get("task_type") or ""))
+                entity_ref = str(act.get("entity_ref") or "")
+                custodian = str(act.get("custodian_name") or act.get("assignee_name") or "")
+                notes = str(act.get("review_notes") or "")
+                summary_line = f"{entity_ref}  ·  {custodian}" if custodian else entity_ref
+                c.setFillColor(GREEN_ACCENT)
+                c.circle(MARGIN + 5, y - row_h / 2, 2.5, stroke=0, fill=1)
+                c.setFillColor(TEXT_DARK)
+                c.setFont("Helvetica-Bold", 7.5)
+                c.drawString(MARGIN + 12, y - row_h + 4, task_name)
+                c.setFillColor(TEXT_SOFT)
+                c.setFont("Helvetica", 7)
+                c.drawString(MARGIN + 85, y - row_h + 4, summary_line[:45])
+                c.drawRightString(MARGIN + CONTENT_W, y - row_h + 4, ts)
+                if notes:
+                    c.setFont("Helvetica-Oblique", 6.5)
+                    c.drawString(MARGIN + 85, y - row_h - 1, notes[:70])
+                y -= row_h + (4 if notes else 0)
+            y -= 12
+
+        y -= 8
+
+    # ── Footer on last page ───────────────────────────────────────────────────
+    if y < 70:
+        y = new_page()
+    c.setStrokeColor(HexColor("#d1fae5"))
+    c.setLineWidth(0.8)
+    c.line(MARGIN, 56, page_w - MARGIN, 56)
+    c.setFillColor(TEXT_SOFT)
+    c.setFont("Helvetica", 7)
+    c.drawString(MARGIN, 44, f"Report generated by LandCheck Geospatial Technologies Limited  ·  landcheck.online  ·  {generated_at} UTC")
+    c.setFont("Helvetica", 7)
+    c.drawRightString(page_w - MARGIN, 44, "Data shown reflects supervisor-approved field records only.")
+    c.setFillColor(GREEN_DARK)
+    c.setFont("Helvetica-Bold", 7)
+    c.drawCentredString(page_w / 2, 30, "LANDCHECK VERIFIED IMPACT REPORT")
+
+    c.showPage()
+    c.save()
+    buffer.seek(0)
+    return buffer.getvalue()
+
+
 def render_green_sponsor_certificate_pdf(sponsorship: dict, carbon: dict | None = None, verification_url: str | None = None, level_name: str | None = None) -> bytes:
     from reportlab.lib.pagesizes import landscape
     buffer = io.BytesIO()
