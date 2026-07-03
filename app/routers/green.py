@@ -5135,6 +5135,7 @@ def ensure_green_tables(db: Session):
         db.execute(text(
             "CREATE INDEX IF NOT EXISTS idx_green_impact_comments_slug ON green_impact_comments(org_slug)"
         ))
+        db.execute(text("ALTER TABLE green_impact_comments ADD COLUMN IF NOT EXISTS project_name TEXT"))
     except Exception:
         db.rollback()
     try:
@@ -10918,7 +10919,7 @@ def get_public_org_impact(org_slug: str, db: Session = Depends(get_db)):
 def get_org_impact_comments(org_slug: str, db: Session = Depends(get_db)):
     clean_slug = str(org_slug or "").strip().lower()
     rows = db.execute(text("""
-        SELECT id, commenter_name, commenter_rank, commenter_org, comment_body, created_at
+        SELECT id, commenter_name, commenter_rank, commenter_org, project_name, comment_body, created_at
         FROM green_impact_comments
         WHERE LOWER(org_slug) = :slug
         ORDER BY created_at DESC
@@ -10930,6 +10931,7 @@ def get_org_impact_comments(org_slug: str, db: Session = Depends(get_db)):
             "commenter_name": r["commenter_name"],
             "commenter_rank": r.get("commenter_rank") or None,
             "commenter_org": r.get("commenter_org") or None,
+            "project_name": r.get("project_name") or None,
             "comment_body": r["comment_body"],
             "created_at": str(r["created_at"]) if r.get("created_at") else None,
         }
@@ -10948,11 +10950,12 @@ def post_org_impact_comment(org_slug: str, payload: dict = Body(...), db: Sessio
         raise HTTPException(status_code=422, detail="comment_body is required")
     commenter_rank = str(payload.get("commenter_rank") or "").strip() or None
     commenter_org = str(payload.get("commenter_org") or "").strip() or None
+    project_name = str(payload.get("project_name") or "").strip() or None
     result = db.execute(text("""
-        INSERT INTO green_impact_comments (org_slug, commenter_name, commenter_rank, commenter_org, comment_body)
-        VALUES (:slug, :name, :rank, :org, :body)
+        INSERT INTO green_impact_comments (org_slug, commenter_name, commenter_rank, commenter_org, project_name, comment_body)
+        VALUES (:slug, :name, :rank, :org, :project_name, :body)
         RETURNING id, created_at
-    """), {"slug": clean_slug, "name": commenter_name, "rank": commenter_rank, "org": commenter_org, "body": comment_body})
+    """), {"slug": clean_slug, "name": commenter_name, "rank": commenter_rank, "org": commenter_org, "project_name": project_name, "body": comment_body})
     row = result.mappings().first()
     db.commit()
     return {
@@ -10960,6 +10963,7 @@ def post_org_impact_comment(org_slug: str, payload: dict = Body(...), db: Sessio
         "commenter_name": commenter_name,
         "commenter_rank": commenter_rank,
         "commenter_org": commenter_org,
+        "project_name": project_name,
         "comment_body": comment_body,
         "created_at": str(row["created_at"]) if row.get("created_at") else None,
     }
