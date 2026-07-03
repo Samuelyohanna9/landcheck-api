@@ -10627,14 +10627,14 @@ def get_public_org_impact(org_slug: str, db: Session = Depends(get_db)):
                    contact_email, website_url, country, state_region, city
             FROM green_organizations
             WHERE LOWER(slug) = :slug
-              AND COALESCE(is_active, TRUE) = TRUE
+              AND slug IS NOT NULL AND slug != ''
             LIMIT 1
             """
         ),
         {"slug": clean_slug},
     ).mappings().first()
     if not org_row:
-        raise HTTPException(status_code=404, detail="Organisation not found")
+        raise HTTPException(status_code=404, detail=f"No organisation found with slug '{clean_slug}'. Check the link or contact the organisation.")
 
     org = dict(org_row)
     org_id = int(org["id"])
