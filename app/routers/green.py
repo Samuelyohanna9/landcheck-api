@@ -10831,6 +10831,43 @@ def get_public_impact_stats(db: Session = Depends(get_db)):
     }
 
 
+@router.get("/public/recent-sponsorships")
+def get_public_recent_sponsorships(limit: int = Query(default=12, ge=1, le=30), db: Session = Depends(get_db)):
+    """Recent verified sponsorships for a public social-proof feed.
+
+    Only exposes a sponsor's first name (never email/phone/full surname) plus the
+    project and quantity, so this is safe to show to anonymous visitors.
+    """
+    rows = db.execute(
+        text(
+            """
+            SELECT
+                sa.full_name AS sponsor_full_name,
+                p.name AS project_name,
+                o.quantity,
+                COALESCE(o.payment_verified_at, o.updated_at, o.created_at) AS sponsored_at
+            FROM green_sponsorship_orders o
+            JOIN green_sponsor_accounts sa ON sa.id = o.sponsor_account_id
+            JOIN tree_projects p ON p.id = o.project_id
+            WHERE LOWER(COALESCE(o.payment_status, '')) IN ('verified', 'paid')
+            ORDER BY COALESCE(o.payment_verified_at, o.updated_at, o.created_at) DESC
+            LIMIT :limit
+            """
+        ),
+        {"limit": int(limit)},
+    ).mappings().all()
+    items = []
+    for row in rows:
+        first_name = str(row.get("sponsor_full_name") or "A supporter").strip().split(" ")[0] or "A supporter"
+        items.append({
+            "sponsor_first_name": first_name,
+            "project_name": row.get("project_name"),
+            "quantity": int(row.get("quantity") or 0),
+            "sponsored_at": row.get("sponsored_at"),
+        })
+    return items
+
+
 @router.get("/public/impact/{org_slug}")
 def get_public_org_impact(org_slug: str, db: Session = Depends(get_db)):
     clean_slug = str(org_slug or "").strip().lower()
@@ -11860,6 +11897,83 @@ def get_sponsor_order_payment_status(
     item["awaiting_tree_units"] = int(counts.get("awaiting_tree_units") or 0)
     item["awaiting_payment_units"] = int(counts.get("awaiting_payment_units") or 0)
     return item
+
+
+@router.get("/sponsor/public/order-lookup")
+def public_sponsor_order_lookup(
+    order_uid: str = Query(...),
+    email: str = Query(...),
+    db: Session = Depends(get_db),
+):
+    """Let a guest (or any sponsor) see their full order history without logging in.
+
+    Requires the exact order_uid + the email on that order's account — this pairing
+    can't be guessed/enumerated the way a bare email lookup could.
+    """
+    clean_email = _normalize_email_address(email)
+    anchor = db.execute(
+        text(
+            """
+            SELECT o.sponsor_account_id, sa.email AS sponsor_email, sa.full_name AS sponsor_name
+            FROM green_sponsorship_orders o
+            JOIN green_sponsor_accounts sa ON sa.id = o.sponsor_account_id
+            WHERE UPPER(o.order_uid) = UPPER(:order_uid)
+            LIMIT 1
+            """
+        ),
+        {"order_uid": str(order_uid or "").strip()},
+    ).mappings().first()
+    if not anchor or str(anchor.get("sponsor_email") or "").strip().lower() != clean_email:
+        raise HTTPException(status_code=404, detail="We could not find an order matching that order ID and email.")
+    sponsor_account_id = int(anchor["sponsor_account_id"])
+    rows = db.execute(
+        text(
+            """
+            SELECT
+                o.id, o.order_uid, o.project_id, o.quantity, o.amount_per_tree, o.amount_total, o.currency,
+                o.payment_method, o.payment_status, o.order_status, o.payment_verified_at,
+                o.dedication_type, o.dedication_name, o.created_at, o.updated_at,
+                p.name AS project_name, p.location_text
+            FROM green_sponsorship_orders o
+            JOIN tree_projects p ON p.id = o.project_id
+            WHERE o.sponsor_account_id = :sponsor_account_id
+            ORDER BY o.created_at DESC
+            """
+        ),
+        {"sponsor_account_id": sponsor_account_id},
+    ).mappings().all()
+    order_ids = [int(r["id"]) for r in rows]
+    unit_counts_by_order: dict[int, dict] = {}
+    if order_ids:
+        unit_rows = db.execute(
+            text(
+                """
+                SELECT
+                    order_id,
+                    COUNT(*) AS total_units,
+                    COUNT(*) FILTER (WHERE tree_id IS NOT NULL) AS linked_units,
+                    COUNT(*) FILTER (WHERE LOWER(COALESCE(sponsorship_status, '')) = 'awaiting_tree') AS awaiting_tree_units
+                FROM green_sponsorship_units
+                WHERE order_id = ANY(:order_ids)
+                GROUP BY order_id
+                """
+            ),
+            {"order_ids": order_ids},
+        ).mappings().all()
+        unit_counts_by_order = {int(r["order_id"]): dict(r) for r in unit_rows}
+    orders = []
+    for row in rows:
+        item = dict(row)
+        counts = unit_counts_by_order.get(int(item["id"]), {})
+        orders.append({
+            **item,
+            "payment_status": _normalize_sponsor_payment_status(item.get("payment_status")),
+            "order_status": _normalize_sponsor_order_status(item.get("order_status")),
+            "total_units": int(counts.get("total_units") or 0),
+            "linked_units": int(counts.get("linked_units") or 0),
+            "awaiting_tree_units": int(counts.get("awaiting_tree_units") or 0),
+        })
+    return {"sponsor_name": anchor.get("sponsor_name"), "orders": orders}
 
 
 @router.get("/sponsor/payments/flutterwave/return")
