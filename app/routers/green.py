@@ -375,6 +375,7 @@ class SponsorOrderPayload(BaseModel):
     sponsor_id: int | None = None
     project_id: int
     quantity: int
+    checkout_currency: str | None = None
     dedication_type: str | None = None
     dedication_name: str | None = None
     dedication_message: str | None = None
@@ -2556,6 +2557,86 @@ def _normalize_currency_code(value: str | None, default: str = "NGN") -> str:
     return default
 
 
+def _normalize_optional_project_money(value: object) -> float | None:
+    try:
+        amount = round(float(value), 2)
+    except Exception:
+        return None
+    return amount if amount > 0 else None
+
+
+def _get_project_available_sponsor_currencies(project: dict | None) -> list[str]:
+    if not project:
+        return []
+    available: list[str] = []
+    if _normalize_optional_project_money(project.get("sponsor_price_per_tree_ngn")) is not None:
+        available.append("NGN")
+    if _normalize_optional_project_money(project.get("sponsor_price_per_tree_usd")) is not None:
+        available.append("USD")
+    if available:
+        return available
+    legacy_price = _normalize_optional_project_money(project.get("sponsor_price_per_tree"))
+    if legacy_price is None:
+        return []
+    return [_normalize_currency_code(project.get("sponsor_currency"), "NGN")]
+
+
+def _get_project_sponsor_price(
+    project: dict | None,
+    currency: str | None,
+    *,
+    fallback_to_any: bool = False,
+) -> float | None:
+    if not project:
+        return None
+    normalized_currency = _normalize_currency_code(currency, "NGN")
+    direct_field = f"sponsor_price_per_tree_{normalized_currency.lower()}"
+    direct_price = _normalize_optional_project_money(project.get(direct_field))
+    if direct_price is not None:
+        return direct_price
+    legacy_currency = _normalize_currency_code(project.get("sponsor_currency"), "NGN")
+    legacy_price = _normalize_optional_project_money(project.get("sponsor_price_per_tree"))
+    if legacy_price is not None and legacy_currency == normalized_currency:
+        return legacy_price
+    if fallback_to_any:
+        for next_currency in _get_project_available_sponsor_currencies(project):
+            next_price = _get_project_sponsor_price(project, next_currency, fallback_to_any=False)
+            if next_price is not None:
+                return next_price
+    return None
+
+
+def _apply_project_sponsor_price_fields(payload: dict) -> dict:
+    legacy_price = _normalize_optional_project_money(payload.get("sponsor_price_per_tree"))
+    legacy_currency = _normalize_currency_code(payload.get("sponsor_currency"), "NGN")
+    price_ngn = _normalize_optional_project_money(payload.get("sponsor_price_per_tree_ngn"))
+    price_usd = _normalize_optional_project_money(payload.get("sponsor_price_per_tree_usd"))
+    if price_ngn is None and price_usd is None and legacy_price is not None:
+        if legacy_currency == "USD":
+            price_usd = legacy_price
+        else:
+            price_ngn = legacy_price
+    payload["sponsor_price_per_tree_ngn"] = price_ngn
+    payload["sponsor_price_per_tree_usd"] = price_usd
+    if price_ngn is not None:
+        payload["sponsor_price_per_tree"] = price_ngn
+        payload["sponsor_currency"] = "NGN"
+    elif price_usd is not None:
+        payload["sponsor_price_per_tree"] = price_usd
+        payload["sponsor_currency"] = "USD"
+    else:
+        payload["sponsor_price_per_tree"] = None
+        payload["sponsor_currency"] = legacy_currency
+    available_currencies = _get_project_available_sponsor_currencies(payload)
+    payload["available_sponsor_currencies"] = available_currencies
+    payload["sponsor_price_options"] = {}
+    for currency_code in available_currencies:
+        price_value = _get_project_sponsor_price(payload, currency_code, fallback_to_any=False)
+        if price_value is not None:
+            payload["sponsor_price_options"][currency_code] = price_value
+    return payload
+
+
 def _normalize_sponsor_agent_payout_status(value: str | None) -> str:
     normalized = _normalize_name(value)
     if normalized in SPONSOR_AGENT_PAYOUT_STATUS_VALUES:
@@ -2968,11 +3049,7 @@ def _sync_sponsorship_order_flutterwave_payment(
 def _apply_project_access_fields(payload: dict) -> dict:
     payload["access_model"] = _normalize_project_access_model(payload.get("access_model"))
     payload["public_sponsor_enabled"] = bool(payload.get("public_sponsor_enabled"))
-    price_value = payload.get("sponsor_price_per_tree")
-    try:
-        payload["sponsor_price_per_tree"] = round(float(price_value), 2) if price_value is not None else None
-    except Exception:
-        payload["sponsor_price_per_tree"] = None
+    payload = _apply_project_sponsor_price_fields(payload)
     planting_fee_value = payload.get("sponsor_agent_planting_fee")
     try:
         payload["sponsor_agent_planting_fee"] = round(float(planting_fee_value), 2) if planting_fee_value is not None else None
@@ -2993,7 +3070,6 @@ def _apply_project_access_fields(payload: dict) -> dict:
         payload["sponsor_max_per_order"] = max(1, int(max_per_order or 100))
     except Exception:
         payload["sponsor_max_per_order"] = 100
-    payload["sponsor_currency"] = _normalize_currency_code(payload.get("sponsor_currency"), "NGN")
     payload["sponsor_dedication_enabled"] = bool(payload.get("sponsor_dedication_enabled", True))
     payload["public_sponsor_title"] = _clean_text(payload.get("public_sponsor_title"), 160)
     payload["public_sponsor_description"] = _clean_text(payload.get("public_sponsor_description"), 1200)
@@ -4845,6 +4921,8 @@ def ensure_green_tables(db: Session):
             public_sponsor_enabled BOOLEAN NOT NULL DEFAULT FALSE,
             public_sponsor_title TEXT,
             public_sponsor_description TEXT,
+            sponsor_price_per_tree_ngn NUMERIC,
+            sponsor_price_per_tree_usd NUMERIC,
             sponsor_price_per_tree NUMERIC,
             sponsor_currency TEXT NOT NULL DEFAULT 'NGN',
             sponsor_capacity INTEGER,
@@ -5085,6 +5163,8 @@ def ensure_green_tables(db: Session):
         db.execute(text("ALTER TABLE tree_projects ADD COLUMN IF NOT EXISTS public_sponsor_title TEXT"))
         db.execute(text("ALTER TABLE tree_projects ADD COLUMN IF NOT EXISTS public_sponsor_description TEXT"))
         db.execute(text("ALTER TABLE tree_projects ADD COLUMN IF NOT EXISTS public_sponsor_agent_user_ids JSONB"))
+        db.execute(text("ALTER TABLE tree_projects ADD COLUMN IF NOT EXISTS sponsor_price_per_tree_ngn NUMERIC"))
+        db.execute(text("ALTER TABLE tree_projects ADD COLUMN IF NOT EXISTS sponsor_price_per_tree_usd NUMERIC"))
         db.execute(text("ALTER TABLE tree_projects ADD COLUMN IF NOT EXISTS sponsor_price_per_tree NUMERIC"))
         db.execute(text("ALTER TABLE tree_projects ADD COLUMN IF NOT EXISTS sponsor_currency TEXT NOT NULL DEFAULT 'NGN'"))
         db.execute(text("ALTER TABLE tree_projects ADD COLUMN IF NOT EXISTS sponsor_capacity INTEGER"))
@@ -7232,6 +7312,8 @@ def create_project(
     public_sponsor_enabled: bool = Body(default=False),
     public_sponsor_title: str | None = Body(default=None),
     public_sponsor_description: str | None = Body(default=None),
+    sponsor_price_per_tree_ngn: float | None = Body(default=None),
+    sponsor_price_per_tree_usd: float | None = Body(default=None),
     sponsor_price_per_tree: float | None = Body(default=None),
     sponsor_currency: str = Body(default="NGN"),
     sponsor_capacity: int | None = Body(default=None),
@@ -7255,20 +7337,29 @@ def create_project(
     normalized_existing_scope = _normalize_existing_tree_scope(default_existing_tree_scope)
     normalized_public_title = _clean_text(public_sponsor_title, 160)
     normalized_public_description = _clean_text(public_sponsor_description, 1200)
-    normalized_price = round(float(sponsor_price_per_tree), 2) if sponsor_price_per_tree is not None else None
     normalized_currency = _normalize_currency_code(sponsor_currency, "NGN")
+    normalized_price_ngn = _normalize_optional_project_money(sponsor_price_per_tree_ngn)
+    normalized_price_usd = _normalize_optional_project_money(sponsor_price_per_tree_usd)
+    normalized_legacy_price = _normalize_optional_project_money(sponsor_price_per_tree)
+    if normalized_price_ngn is None and normalized_price_usd is None and normalized_legacy_price is not None:
+        if normalized_currency == "USD":
+            normalized_price_usd = normalized_legacy_price
+        else:
+            normalized_price_ngn = normalized_legacy_price
+    normalized_price = normalized_price_ngn if normalized_price_ngn is not None else normalized_price_usd
+    normalized_currency = "NGN" if normalized_price_ngn is not None else ("USD" if normalized_price_usd is not None else normalized_currency)
     normalized_capacity = int(sponsor_capacity) if sponsor_capacity is not None else None
     normalized_max_per_order = max(1, int(sponsor_max_per_order or 100))
     normalized_payment_instructions = _clean_text(sponsor_payment_instructions, 1200)
     normalized_planting_fee = (
         round(float(sponsor_agent_planting_fee), 2)
         if sponsor_agent_planting_fee is not None
-        else _derive_default_sponsor_agent_fee(normalized_price, ratio=SPONSOR_AGENT_DEFAULT_PLANTING_RATIO)
+        else _derive_default_sponsor_agent_fee(normalized_price_ngn, ratio=SPONSOR_AGENT_DEFAULT_PLANTING_RATIO)
     )
     normalized_maintenance_fee = (
         round(float(sponsor_agent_maintenance_fee), 2)
         if sponsor_agent_maintenance_fee is not None
-        else _derive_default_sponsor_agent_fee(normalized_price, ratio=SPONSOR_AGENT_DEFAULT_MAINTENANCE_RATIO)
+        else _derive_default_sponsor_agent_fee(normalized_price_ngn, ratio=SPONSOR_AGENT_DEFAULT_MAINTENANCE_RATIO)
     )
     org_id_value = int(organization_id) if organization_id is not None else None
     if org_id_value is not None and org_id_value <= 0:
@@ -7294,6 +7385,7 @@ def create_project(
             INSERT INTO tree_projects (
                 organization_id, name, location_text, sponsor, workflow_profile, access_model,
                 public_sponsor_enabled, public_sponsor_title, public_sponsor_description,
+                sponsor_price_per_tree_ngn, sponsor_price_per_tree_usd,
                 sponsor_price_per_tree, sponsor_currency, sponsor_capacity, sponsor_max_per_order,
                 sponsor_dedication_enabled, sponsor_payment_instructions, public_sponsor_agent_user_ids,
                 sponsor_agent_planting_fee, sponsor_agent_maintenance_fee,
@@ -7303,6 +7395,7 @@ def create_project(
             VALUES (
                 :organization_id, :name, :location_text, :sponsor, :workflow_profile, :access_model,
                 :public_sponsor_enabled, :public_sponsor_title, :public_sponsor_description,
+                :sponsor_price_per_tree_ngn, :sponsor_price_per_tree_usd,
                 :sponsor_price_per_tree, :sponsor_currency, :sponsor_capacity, :sponsor_max_per_order,
                 :sponsor_dedication_enabled, :sponsor_payment_instructions, CAST(:public_sponsor_agent_user_ids AS JSONB),
                 :sponsor_agent_planting_fee, :sponsor_agent_maintenance_fee,
@@ -7311,6 +7404,7 @@ def create_project(
             )
             RETURNING id, organization_id, name, location_text, sponsor, workflow_profile, access_model,
                       public_sponsor_enabled, public_sponsor_title, public_sponsor_description,
+                      sponsor_price_per_tree_ngn, sponsor_price_per_tree_usd,
                       sponsor_price_per_tree, sponsor_currency, sponsor_capacity, sponsor_max_per_order,
                       sponsor_dedication_enabled, sponsor_payment_instructions, public_sponsor_agent_user_ids,
                       sponsor_agent_planting_fee, sponsor_agent_maintenance_fee,
@@ -7327,6 +7421,8 @@ def create_project(
             "public_sponsor_enabled": bool(public_sponsor_enabled),
             "public_sponsor_title": normalized_public_title,
             "public_sponsor_description": normalized_public_description,
+            "sponsor_price_per_tree_ngn": normalized_price_ngn,
+            "sponsor_price_per_tree_usd": normalized_price_usd,
             "sponsor_price_per_tree": normalized_price,
             "sponsor_currency": normalized_currency,
             "sponsor_capacity": normalized_capacity,
@@ -7361,6 +7457,8 @@ def create_project(
             "workflow_profile": project.get("workflow_profile"),
             "access_model": project.get("access_model"),
             "public_sponsor_enabled": project.get("public_sponsor_enabled"),
+            "sponsor_price_per_tree_ngn": project.get("sponsor_price_per_tree_ngn"),
+            "sponsor_price_per_tree_usd": project.get("sponsor_price_per_tree_usd"),
             "sponsor_price_per_tree": project.get("sponsor_price_per_tree"),
             "sponsor_agent_planting_fee": project.get("sponsor_agent_planting_fee"),
             "sponsor_agent_maintenance_fee": project.get("sponsor_agent_maintenance_fee"),
@@ -7400,10 +7498,7 @@ def _is_public_sponsorship_project(project: dict | None) -> bool:
 def _is_sponsor_checkout_ready(project: dict | None, available_slots: int | None = None) -> bool:
     if not _is_public_sponsorship_project(project):
         return False
-    try:
-        if float(project.get("sponsor_price_per_tree") or 0) <= 0:
-            return False
-    except Exception:
+    if not _get_project_available_sponsor_currencies(project):
         return False
     capacity = project.get("sponsor_capacity")
     if capacity is not None and available_slots is not None and int(available_slots) <= 0:
@@ -7414,10 +7509,7 @@ def _is_sponsor_checkout_ready(project: dict | None, available_slots: int | None
 def _build_sponsor_launch_note(project: dict | None, available_slots: int | None = None) -> str:
     if not _is_public_sponsorship_project(project):
         return "This project is not open for public sponsorship."
-    try:
-        price_ready = float(project.get("sponsor_price_per_tree") or 0) > 0
-    except Exception:
-        price_ready = False
+    price_ready = len(_get_project_available_sponsor_currencies(project)) > 0
     if not price_ready:
         return "This project is being prepared for sponsorship. Pricing and payment instructions will appear here shortly."
     capacity = project.get("sponsor_capacity")
@@ -8755,7 +8847,8 @@ def _list_public_sponsor_projects_for_agent(
             SELECT
                 p.id, p.organization_id, p.name, p.location_text, p.sponsor,
                 p.access_model, p.public_sponsor_enabled, p.public_sponsor_title, p.public_sponsor_description,
-                p.sponsor_price_per_tree, p.sponsor_currency, p.sponsor_capacity, p.sponsor_max_per_order,
+                p.sponsor_price_per_tree, p.sponsor_currency, p.sponsor_price_per_tree_ngn, p.sponsor_price_per_tree_usd,
+                p.sponsor_capacity, p.sponsor_max_per_order,
                 p.sponsor_dedication_enabled, p.sponsor_payment_instructions, p.public_sponsor_agent_user_ids,
                 p.sponsor_agent_planting_fee, p.sponsor_agent_maintenance_fee,
                 p.workflow_profile, p.created_at
@@ -8795,12 +8888,12 @@ def _list_public_sponsor_projects_for_agent(
         item = _apply_project_access_fields(dict(row))
         if item.get("sponsor_agent_planting_fee") is None:
             item["sponsor_agent_planting_fee"] = _derive_default_sponsor_agent_fee(
-                item.get("sponsor_price_per_tree"),
+                item.get("sponsor_price_per_tree_ngn"),
                 ratio=SPONSOR_AGENT_DEFAULT_PLANTING_RATIO,
             )
         if item.get("sponsor_agent_maintenance_fee") is None:
             item["sponsor_agent_maintenance_fee"] = _derive_default_sponsor_agent_fee(
-                item.get("sponsor_price_per_tree"),
+                item.get("sponsor_price_per_tree_ngn"),
                 ratio=SPONSOR_AGENT_DEFAULT_MAINTENANCE_RATIO,
             )
         items.append(item)
@@ -9087,7 +9180,8 @@ def _build_sponsor_agent_dashboard(
                     SELECT
                         p.id, p.organization_id, p.name, p.location_text, p.sponsor,
                         p.access_model, p.public_sponsor_enabled, p.public_sponsor_title, p.public_sponsor_description,
-                        p.sponsor_price_per_tree, p.sponsor_currency, p.sponsor_capacity, p.sponsor_max_per_order,
+                        p.sponsor_price_per_tree, p.sponsor_currency, p.sponsor_price_per_tree_ngn, p.sponsor_price_per_tree_usd,
+                        p.sponsor_capacity, p.sponsor_max_per_order,
                         p.sponsor_dedication_enabled, p.sponsor_payment_instructions, p.public_sponsor_agent_user_ids,
                         p.sponsor_agent_planting_fee, p.sponsor_agent_maintenance_fee,
                         p.workflow_profile, p.created_at
@@ -10255,6 +10349,8 @@ def update_project_settings(
     public_sponsor_enabled: bool | None = Body(default=None),
     public_sponsor_title: str | None = Body(default=None),
     public_sponsor_description: str | None = Body(default=None),
+    sponsor_price_per_tree_ngn: float | None = Body(default=None),
+    sponsor_price_per_tree_usd: float | None = Body(default=None),
     sponsor_price_per_tree: float | None = Body(default=None),
     sponsor_currency: str | None = Body(default=None),
     sponsor_capacity: int | None = Body(default=None),
@@ -10275,6 +10371,7 @@ def update_project_settings(
         text(
             """
             SELECT id, status, name, workflow_profile, access_model, public_sponsor_enabled, public_sponsor_title, public_sponsor_description,
+                   sponsor_price_per_tree_ngn, sponsor_price_per_tree_usd,
                    sponsor_price_per_tree, sponsor_currency, sponsor_capacity, sponsor_max_per_order,
                    sponsor_dedication_enabled, sponsor_payment_instructions, public_sponsor_agent_user_ids,
                    sponsor_agent_planting_fee, sponsor_agent_maintenance_fee, organization_id,
@@ -10321,15 +10418,40 @@ def update_project_settings(
         if public_sponsor_description is not None
         else _clean_text(existing.get("public_sponsor_description"), 1200)
     )
-    next_sponsor_price = (
-        round(float(sponsor_price_per_tree), 2)
-        if sponsor_price_per_tree is not None
-        else (round(float(existing.get("sponsor_price_per_tree")), 2) if existing.get("sponsor_price_per_tree") is not None else None)
-    )
-    next_sponsor_currency = (
+    next_sponsor_currency_input = (
         _normalize_currency_code(sponsor_currency, "NGN")
         if sponsor_currency is not None
         else _normalize_currency_code(existing.get("sponsor_currency"), "NGN")
+    )
+    next_sponsor_price_ngn = (
+        _normalize_optional_project_money(sponsor_price_per_tree_ngn)
+        if sponsor_price_per_tree_ngn is not None
+        else _normalize_optional_project_money(existing.get("sponsor_price_per_tree_ngn"))
+    )
+    next_sponsor_price_usd = (
+        _normalize_optional_project_money(sponsor_price_per_tree_usd)
+        if sponsor_price_per_tree_usd is not None
+        else _normalize_optional_project_money(existing.get("sponsor_price_per_tree_usd"))
+    )
+    if sponsor_price_per_tree is not None:
+        next_legacy_price = _normalize_optional_project_money(sponsor_price_per_tree)
+        if sponsor_price_per_tree_ngn is None and sponsor_price_per_tree_usd is None:
+            if next_sponsor_currency_input == "USD":
+                next_sponsor_price_usd = next_legacy_price
+            else:
+                next_sponsor_price_ngn = next_legacy_price
+    elif next_sponsor_price_ngn is None and next_sponsor_price_usd is None:
+        next_legacy_price = _normalize_optional_project_money(existing.get("sponsor_price_per_tree"))
+        if next_legacy_price is not None:
+            if next_sponsor_currency_input == "USD":
+                next_sponsor_price_usd = next_legacy_price
+            else:
+                next_sponsor_price_ngn = next_legacy_price
+    next_sponsor_price = next_sponsor_price_ngn if next_sponsor_price_ngn is not None else next_sponsor_price_usd
+    next_sponsor_currency = (
+        "NGN"
+        if next_sponsor_price_ngn is not None
+        else ("USD" if next_sponsor_price_usd is not None else next_sponsor_currency_input)
     )
     next_sponsor_capacity = (
         int(sponsor_capacity)
@@ -10357,7 +10479,7 @@ def update_project_settings(
         else (
             round(float(existing.get("sponsor_agent_planting_fee")), 2)
             if existing.get("sponsor_agent_planting_fee") is not None
-            else _derive_default_sponsor_agent_fee(next_sponsor_price, ratio=SPONSOR_AGENT_DEFAULT_PLANTING_RATIO)
+            else _derive_default_sponsor_agent_fee(next_sponsor_price_ngn, ratio=SPONSOR_AGENT_DEFAULT_PLANTING_RATIO)
         )
     )
     next_sponsor_agent_maintenance_fee = (
@@ -10366,7 +10488,7 @@ def update_project_settings(
         else (
             round(float(existing.get("sponsor_agent_maintenance_fee")), 2)
             if existing.get("sponsor_agent_maintenance_fee") is not None
-            else _derive_default_sponsor_agent_fee(next_sponsor_price, ratio=SPONSOR_AGENT_DEFAULT_MAINTENANCE_RATIO)
+            else _derive_default_sponsor_agent_fee(next_sponsor_price_ngn, ratio=SPONSOR_AGENT_DEFAULT_MAINTENANCE_RATIO)
         )
     )
     next_public_sponsor_agent_user_ids = (
@@ -10414,6 +10536,8 @@ def update_project_settings(
                 public_sponsor_enabled = :public_sponsor_enabled,
                 public_sponsor_title = :public_sponsor_title,
                 public_sponsor_description = :public_sponsor_description,
+                sponsor_price_per_tree_ngn = :sponsor_price_per_tree_ngn,
+                sponsor_price_per_tree_usd = :sponsor_price_per_tree_usd,
                 sponsor_price_per_tree = :sponsor_price_per_tree,
                 sponsor_currency = :sponsor_currency,
                 sponsor_capacity = :sponsor_capacity,
@@ -10431,6 +10555,7 @@ def update_project_settings(
             WHERE id = :project_id
             RETURNING id, status, name, location_text, sponsor, workflow_profile, access_model,
                       public_sponsor_enabled, public_sponsor_title, public_sponsor_description,
+                      sponsor_price_per_tree_ngn, sponsor_price_per_tree_usd,
                       sponsor_price_per_tree, sponsor_currency, sponsor_capacity, sponsor_max_per_order,
                       sponsor_dedication_enabled, sponsor_payment_instructions, public_sponsor_agent_user_ids,
                       sponsor_agent_planting_fee, sponsor_agent_maintenance_fee,
@@ -10446,6 +10571,8 @@ def update_project_settings(
             "public_sponsor_enabled": next_public_sponsor_enabled,
             "public_sponsor_title": next_public_title,
             "public_sponsor_description": next_public_description,
+            "sponsor_price_per_tree_ngn": next_sponsor_price_ngn,
+            "sponsor_price_per_tree_usd": next_sponsor_price_usd,
             "sponsor_price_per_tree": next_sponsor_price,
             "sponsor_currency": next_sponsor_currency,
             "sponsor_capacity": next_sponsor_capacity,
@@ -10489,6 +10616,8 @@ def update_project_settings(
                 "workflow_profile": next_workflow_profile,
                 "access_model": next_access_model,
                 "public_sponsor_enabled": next_public_sponsor_enabled,
+                "sponsor_price_per_tree_ngn": next_sponsor_price_ngn,
+                "sponsor_price_per_tree_usd": next_sponsor_price_usd,
                 "sponsor_price_per_tree": next_sponsor_price,
                 "public_sponsor_agent_user_ids": next_public_sponsor_agent_user_ids,
                 "sponsor_agent_planting_fee": next_sponsor_agent_planting_fee,
@@ -10578,7 +10707,8 @@ def list_public_sponsorship_projects(db: Session = Depends(get_db)):
             SELECT
                 p.id, p.organization_id, p.name, p.location_text, p.sponsor,
                 p.access_model, p.public_sponsor_enabled, p.public_sponsor_title, p.public_sponsor_description,
-                p.sponsor_price_per_tree, p.sponsor_currency, p.sponsor_capacity, p.sponsor_max_per_order,
+                p.sponsor_price_per_tree, p.sponsor_currency, p.sponsor_price_per_tree_ngn, p.sponsor_price_per_tree_usd,
+                p.sponsor_capacity, p.sponsor_max_per_order,
                 p.sponsor_dedication_enabled, p.sponsor_payment_instructions,
                 p.workflow_profile, p.status, p.created_at,
                 o.name AS organization_name, o.slug AS organization_slug, o.status AS organization_status,
@@ -10592,7 +10722,10 @@ def list_public_sponsorship_projects(db: Session = Depends(get_db)):
                   )
               AND (o.id IS NULL OR COALESCE(o.is_active, TRUE) = TRUE)
             ORDER BY
-                CASE WHEN COALESCE(p.sponsor_price_per_tree, 0) > 0 THEN 0 ELSE 1 END,
+                CASE
+                    WHEN COALESCE(p.sponsor_price_per_tree_ngn, p.sponsor_price_per_tree_usd, p.sponsor_price_per_tree, 0) > 0 THEN 0
+                    ELSE 1
+                END,
                 p.created_at DESC
             """
         )
@@ -10627,6 +10760,32 @@ def list_public_partner_organizations(db: Session = Depends(get_db)):
         }
         for row in rows
     ]
+
+
+@router.get("/public/impact-stats")
+def get_public_impact_stats(db: Session = Depends(get_db)):
+    """Platform-wide tree count across every organisation and public sponsorship
+    project. Counts every real tree record (excludes not-yet-captured
+    placeholders) so it grows automatically as orgs and trees are added."""
+    row = db.execute(
+        text(
+            """
+            SELECT
+                COUNT(t.id) AS total_trees,
+                COUNT(DISTINCT p.organization_id) FILTER (WHERE p.organization_id IS NOT NULL) AS total_organizations
+            FROM trees t
+            JOIN tree_projects p ON p.id = t.project_id
+            LEFT JOIN green_organizations o ON o.id = p.organization_id
+            WHERE (o.id IS NULL OR COALESCE(o.is_active, TRUE) = TRUE)
+              AND LOWER(COALESCE(t.record_profile_data->>'placeholder_reason', '')) != 'pending_field_capture'
+            """
+        )
+    ).mappings().first()
+    return {
+        "total_trees": int((row or {}).get("total_trees") or 0),
+        "total_organizations": int((row or {}).get("total_organizations") or 0),
+        "generated_at": datetime.utcnow().isoformat() + "Z",
+    }
 
 
 @router.get("/public/impact/{org_slug}")
@@ -11253,7 +11412,24 @@ def create_sponsor_order(
     capacity = project.get("sponsor_capacity")
     if capacity is not None and int(usage["reserved_slots"]) + quantity > int(capacity):
         raise HTTPException(status_code=409, detail="Not enough sponsorship slots remaining in this project")
-    amount_per_tree = round(float(project.get("sponsor_price_per_tree") or 0), 2)
+    requested_checkout_currency = _normalize_currency_code(payload.checkout_currency, "NGN")
+    available_checkout_currencies = _get_project_available_sponsor_currencies(project)
+    if not available_checkout_currencies:
+        raise HTTPException(
+            status_code=400,
+            detail="This sponsor project is visible, but pricing is still being finalized. Please try again after the project team updates payment details.",
+        )
+    if payload.checkout_currency and requested_checkout_currency not in available_checkout_currencies:
+        raise HTTPException(
+            status_code=400,
+            detail="The selected checkout currency is not available for this sponsor project.",
+        )
+    checkout_currency = (
+        requested_checkout_currency
+        if requested_checkout_currency in available_checkout_currencies
+        else available_checkout_currencies[0]
+    )
+    amount_per_tree = round(float(_get_project_sponsor_price(project, checkout_currency, fallback_to_any=False) or 0), 2)
     if amount_per_tree <= 0:
         raise HTTPException(
             status_code=400,
@@ -11310,7 +11486,7 @@ def create_sponsor_order(
                 "quantity": quantity,
                 "amount_per_tree": amount_per_tree,
                 "amount_total": amount_total,
-                "currency": str(project.get("sponsor_currency") or "NGN"),
+                "currency": checkout_currency,
                 "payment_method": payment_method,
                 "payment_reference": payment_reference,
                 "payment_status": payment_status,
@@ -11367,7 +11543,7 @@ def create_sponsor_order(
                     "project_id": int(project["id"]),
                     "sponsor_account_id": int(sponsor_id),
                     "amount_total": amount_total,
-                    "currency": str(project.get("sponsor_currency") or "NGN"),
+                    "currency": checkout_currency,
                     "payment_gateway_reference": order_uid,
                 },
                 sponsor_row=dict(sponsor_row),
@@ -17149,7 +17325,8 @@ def list_projects(
         SELECT
             p.id, p.organization_id, p.name, p.location_text, p.sponsor,
             p.access_model, p.public_sponsor_enabled, p.public_sponsor_title, p.public_sponsor_description,
-            p.sponsor_price_per_tree, p.sponsor_currency, p.sponsor_capacity, p.sponsor_max_per_order,
+            p.sponsor_price_per_tree, p.sponsor_currency, p.sponsor_price_per_tree_ngn, p.sponsor_price_per_tree_usd,
+            p.sponsor_capacity, p.sponsor_max_per_order,
             p.sponsor_dedication_enabled, p.sponsor_payment_instructions, p.public_sponsor_agent_user_ids,
             p.sponsor_agent_planting_fee, p.sponsor_agent_maintenance_fee,
             p.workflow_profile, p.agric_config, p.relief_config,
@@ -17211,7 +17388,8 @@ def list_projects(
                     SELECT
                         p.id, p.organization_id, p.name, p.location_text, p.sponsor,
                         p.access_model, p.public_sponsor_enabled, p.public_sponsor_title, p.public_sponsor_description,
-                        p.sponsor_price_per_tree, p.sponsor_currency, p.sponsor_capacity, p.sponsor_max_per_order,
+                        p.sponsor_price_per_tree, p.sponsor_currency, p.sponsor_price_per_tree_ngn, p.sponsor_price_per_tree_usd,
+                        p.sponsor_capacity, p.sponsor_max_per_order,
                         p.sponsor_dedication_enabled, p.sponsor_payment_instructions, p.public_sponsor_agent_user_ids,
                         p.sponsor_agent_planting_fee, p.sponsor_agent_maintenance_fee,
                         p.workflow_profile, p.agric_config, p.relief_config,
@@ -17248,7 +17426,8 @@ def get_project(
         SELECT
             p.id, p.organization_id, p.name, p.location_text, p.sponsor,
             p.access_model, p.public_sponsor_enabled, p.public_sponsor_title, p.public_sponsor_description,
-            p.sponsor_price_per_tree, p.sponsor_currency, p.sponsor_capacity, p.sponsor_max_per_order,
+            p.sponsor_price_per_tree, p.sponsor_currency, p.sponsor_price_per_tree_ngn, p.sponsor_price_per_tree_usd,
+            p.sponsor_capacity, p.sponsor_max_per_order,
             p.sponsor_dedication_enabled, p.sponsor_payment_instructions, p.public_sponsor_agent_user_ids,
             p.sponsor_agent_planting_fee, p.sponsor_agent_maintenance_fee,
             p.workflow_profile, p.agric_config, p.relief_config,
@@ -17421,8 +17600,12 @@ def get_project(
             "allow_existing_tree_link": bool(project.get("allow_existing_tree_link")),
             "default_existing_tree_scope": _normalize_existing_tree_scope(project.get("default_existing_tree_scope")),
             "public_sponsor_enabled": bool(project.get("public_sponsor_enabled")),
+            "sponsor_price_per_tree_ngn": project.get("sponsor_price_per_tree_ngn"),
+            "sponsor_price_per_tree_usd": project.get("sponsor_price_per_tree_usd"),
             "sponsor_price_per_tree": project.get("sponsor_price_per_tree"),
             "sponsor_currency": project.get("sponsor_currency"),
+            "available_sponsor_currencies": _get_project_available_sponsor_currencies(project),
+            "sponsor_price_options": dict(project.get("sponsor_price_options") or {}),
             "sponsor_capacity": project.get("sponsor_capacity"),
             "sponsor_max_per_order": project.get("sponsor_max_per_order"),
             "sponsor_dedication_enabled": bool(project.get("sponsor_dedication_enabled", True)),
