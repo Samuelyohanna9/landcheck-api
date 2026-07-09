@@ -1,5 +1,5 @@
 from fastapi import APIRouter, BackgroundTasks, Body, Depends, HTTPException, Query, UploadFile, File, Form, Request
-from fastapi.responses import FileResponse, HTMLResponse, Response, StreamingResponse
+from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse, Response, StreamingResponse
 from sqlalchemy.orm import Session
 from sqlalchemy import bindparam, text
 from datetime import datetime, date, timedelta, timezone
@@ -373,6 +373,9 @@ class FieldResetPasswordPayload(BaseModel):
 
 class SponsorOrderPayload(BaseModel):
     sponsor_id: int | None = None
+    guest_full_name: str | None = None
+    guest_email: str | None = None
+    guest_phone: str | None = None
     project_id: int
     quantity: int
     checkout_currency: str | None = None
@@ -387,6 +390,13 @@ class SponsorOrderPayload(BaseModel):
     accepted_terms: bool = False
     accepted_policy: bool = False
     consent_version: str | None = None
+    payment_return_url: str | None = None
+
+
+class SponsorGuestClaimPayload(BaseModel):
+    sponsor_id: int
+    email: str
+    password: str
 
 
 class SponsorOrderReviewPayload(BaseModel):
@@ -2724,11 +2734,38 @@ def _build_tree_best_photo_url(tree_id: object, request: Request | None = None) 
     return f"{base_url}/green/trees/{numeric}/photo?w=1280&q=76&fm=jpeg" if base_url else None
 
 
-def _build_flutterwave_return_url(request: Request, order_uid: str) -> str:
+ALLOWED_SPONSOR_WEB_RETURN_HOSTS = {"landcheck.online", "www.landcheck.online", "localhost", "127.0.0.1"}
+
+
+def _sanitize_sponsor_web_return_url(value: str | None) -> str | None:
+    """Only trust a browser-supplied return URL if it points at our own web hosts.
+
+    Prevents this endpoint being used as an open redirect for arbitrary URLs.
+    """
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    try:
+        parsed = urlparse(raw)
+    except Exception:
+        return None
+    if parsed.scheme not in {"http", "https"}:
+        return None
+    hostname = (parsed.hostname or "").lower()
+    if hostname not in ALLOWED_SPONSOR_WEB_RETURN_HOSTS:
+        return None
+    return raw
+
+
+def _build_flutterwave_return_url(request: Request, order_uid: str, web_return_url: str | None = None) -> str:
     base_url = _build_public_api_base_url(request)
     if not base_url:
         raise HTTPException(status_code=500, detail="Could not determine the public API URL for payment callbacks")
-    return f"{base_url}/green/sponsor/payments/flutterwave/return?order_uid={quote(str(order_uid or '').strip())}"
+    url = f"{base_url}/green/sponsor/payments/flutterwave/return?order_uid={quote(str(order_uid or '').strip())}"
+    safe_web_return = _sanitize_sponsor_web_return_url(web_return_url)
+    if safe_web_return:
+        url += f"&web_return={quote(safe_web_return, safe='')}"
+    return url
 
 
 def _build_sponsor_payment_app_url(order_uid: str, status: str, message: str | None = None) -> str:
@@ -2868,7 +2905,7 @@ def _call_flutterwave_api(
     return body
 
 
-def _create_flutterwave_payment_link(request: Request, order_row: dict, sponsor_row: dict, project: dict) -> dict:
+def _create_flutterwave_payment_link(request: Request, order_row: dict, sponsor_row: dict, project: dict, web_return_url: str | None = None) -> dict:
     tx_ref = str(order_row.get("payment_gateway_reference") or order_row.get("order_uid") or "").strip()
     if not tx_ref:
         raise HTTPException(status_code=500, detail="Sponsorship order is missing a transaction reference")
@@ -2881,7 +2918,7 @@ def _create_flutterwave_payment_link(request: Request, order_row: dict, sponsor_
             "tx_ref": tx_ref,
             "amount": f"{amount_total:.2f}",
             "currency": currency,
-            "redirect_url": _build_flutterwave_return_url(request, str(order_row.get("order_uid") or tx_ref)),
+            "redirect_url": _build_flutterwave_return_url(request, str(order_row.get("order_uid") or tx_ref), web_return_url=web_return_url),
             "customer": {
                 "email": str(sponsor_row.get("email") or "").strip(),
                 "name": str(sponsor_row.get("full_name") or "").strip(),
@@ -5014,6 +5051,8 @@ def ensure_green_tables(db: Session):
             phone TEXT,
             password_hash TEXT NOT NULL,
             is_active BOOLEAN NOT NULL DEFAULT TRUE,
+            is_guest BOOLEAN NOT NULL DEFAULT FALSE,
+            claimed_at TIMESTAMP,
             last_welcome_email_at TIMESTAMP,
             password_reset_token_hash TEXT,
             password_reset_token_expires_at TIMESTAMP,
@@ -5138,6 +5177,8 @@ def ensure_green_tables(db: Session):
         db.execute(text("ALTER TABLE green_sponsor_accounts ADD COLUMN IF NOT EXISTS current_avatar_border TEXT"))
         db.execute(text("ALTER TABLE green_sponsor_accounts ADD COLUMN IF NOT EXISTS current_map_icon TEXT"))
         db.execute(text("ALTER TABLE green_sponsor_accounts ADD COLUMN IF NOT EXISTS legacy_order_points_reconciled_at TIMESTAMP"))
+        db.execute(text("ALTER TABLE green_sponsor_accounts ADD COLUMN IF NOT EXISTS is_guest BOOLEAN NOT NULL DEFAULT FALSE"))
+        db.execute(text("ALTER TABLE green_sponsor_accounts ADD COLUMN IF NOT EXISTS claimed_at TIMESTAMP"))
         db.execute(text("ALTER TABLE green_sponsorship_orders ADD COLUMN IF NOT EXISTS points_awarded BOOLEAN NOT NULL DEFAULT FALSE"))
         db.execute(text("ALTER TABLE green_push_tokens ADD COLUMN IF NOT EXISTS organization_id INTEGER"))
         db.execute(text("ALTER TABLE green_push_tokens ADD COLUMN IF NOT EXISTS platform TEXT"))
@@ -7580,6 +7621,8 @@ def _serialize_sponsor_account(row: dict) -> dict:
         "lifetime_points": int(row.get("lifetime_points") or 0),
         "referral_code": str(row.get("referral_code") or "").strip() or None,
         "referred_by_id": int(row.get("referred_by_id")) if row.get("referred_by_id") is not None else None,
+        "is_guest": bool(row.get("is_guest", False)),
+        "claimed_at": row.get("claimed_at"),
     }
 
 
@@ -11382,6 +11425,55 @@ def sponsor_auth_reset_password(payload: SponsorResetPasswordPayload, db: Sessio
     return {"ok": True, "message": "Password updated successfully. You can sign in now."}
 
 
+def _ensure_guest_sponsor_account(db: Session, *, full_name: str, email: str, phone: str | None) -> dict:
+    """Find or transparently create an unclaimed sponsor account for guest checkout.
+
+    Guests never see or set a password at this step — a random one is hashed and
+    stored so the row satisfies the NOT NULL password_hash constraint but cannot be
+    logged into until the sponsor claims the account (see /sponsor/guest/claim).
+    """
+    clean_name = str(full_name or "").strip()
+    if not clean_name:
+        raise HTTPException(status_code=400, detail="Full name is required")
+    clean_email = _normalize_email_address(email)
+    existing = db.execute(
+        text("SELECT id, full_name, email, phone, is_active, is_guest FROM green_sponsor_accounts WHERE LOWER(email) = LOWER(:email) LIMIT 1"),
+        {"email": clean_email},
+    ).mappings().first()
+    if existing:
+        return dict(existing)
+    row = db.execute(
+        text(
+            """
+            INSERT INTO green_sponsor_accounts (
+                sponsor_uid, account_type, full_name, email, phone, password_hash, is_active, is_guest
+            )
+            VALUES (
+                :sponsor_uid, 'individual', :full_name, :email, :phone, :password_hash, TRUE, TRUE
+            )
+            RETURNING id, full_name, email, phone, is_active, is_guest
+            """
+        ),
+        {
+            "sponsor_uid": _ensure_unique_sponsor_uid(db, None),
+            "full_name": clean_name,
+            "email": clean_email,
+            "phone": _clean_text(phone, 80),
+            "password_hash": _hash_password_value(_generate_temporary_login_password()),
+        },
+    ).mappings().first()
+    _log_audit_event(
+        db,
+        project_id=None,
+        entity_type="sponsor_account",
+        entity_id=int(row["id"]),
+        action="sponsor_guest_account_created",
+        actor=clean_name,
+        details={"email": clean_email},
+    )
+    return dict(row)
+
+
 @router.post("/sponsor/orders")
 def create_sponsor_order(
     payload: SponsorOrderPayload,
@@ -11389,14 +11481,26 @@ def create_sponsor_order(
     db: Session = Depends(get_db),
 ):
     sponsor_id = int(payload.sponsor_id or 0)
-    if sponsor_id <= 0:
-        raise HTTPException(status_code=400, detail="Sponsor account is required")
-    sponsor_row = db.execute(
-        text("SELECT id, full_name, email, phone, is_active FROM green_sponsor_accounts WHERE id = :sponsor_id"),
-        {"sponsor_id": int(sponsor_id)},
-    ).mappings().first()
-    if not sponsor_row or not bool(sponsor_row.get("is_active", True)):
-        raise HTTPException(status_code=404, detail="Sponsor account not found")
+    if sponsor_id > 0:
+        sponsor_row = db.execute(
+            text("SELECT id, full_name, email, phone, is_active, is_guest FROM green_sponsor_accounts WHERE id = :sponsor_id"),
+            {"sponsor_id": int(sponsor_id)},
+        ).mappings().first()
+        if not sponsor_row or not bool(sponsor_row.get("is_active", True)):
+            raise HTTPException(status_code=404, detail="Sponsor account not found")
+    else:
+        if not str(payload.guest_email or "").strip() or not str(payload.guest_full_name or "").strip():
+            raise HTTPException(status_code=400, detail="Name and email are required to sponsor as a guest")
+        sponsor_row = _ensure_guest_sponsor_account(
+            db,
+            full_name=payload.guest_full_name or "",
+            email=payload.guest_email or "",
+            phone=payload.guest_phone,
+        )
+        db.commit()
+        if not bool(sponsor_row.get("is_active", True)):
+            raise HTTPException(status_code=404, detail="This sponsor account is not active. Please contact support.")
+        sponsor_id = int(sponsor_row["id"])
     project = get_project(project_id=int(payload.project_id), db=db, assignee_name=None)
     if not _is_public_sponsorship_project(project):
         raise HTTPException(status_code=400, detail="Project is not open for public sponsorship")
@@ -11548,6 +11652,7 @@ def create_sponsor_order(
                 },
                 sponsor_row=dict(sponsor_row),
                 project=project,
+                web_return_url=payload.payment_return_url,
             )
             db.execute(
                 text(
@@ -11602,7 +11707,64 @@ def create_sponsor_order(
         "payment_method": payment_method,
         "payment_status": payment_status,
         "payment_link": payment_session.get("link") if payment_session else None,
+        "sponsor_id": sponsor_id,
+        "is_guest": bool(sponsor_row.get("is_guest", False)),
     }
+
+
+@router.post("/sponsor/guest/claim")
+def claim_guest_sponsor_account(payload: SponsorGuestClaimPayload, db: Session = Depends(get_db)):
+    """Turn a guest checkout account into a fully login-capable sponsor account.
+
+    Requires the sponsor_id + the email on file to match, so an order confirmation
+    (which carries the sponsor_id) can't be used alone to hijack a stranger's guest order.
+    """
+    row = db.execute(
+        text("SELECT id, sponsor_uid, account_type, full_name, organization_name, email, phone, is_active, is_guest FROM green_sponsor_accounts WHERE id = :sponsor_id"),
+        {"sponsor_id": int(payload.sponsor_id)},
+    ).mappings().first()
+    if not row or not bool(row.get("is_active", True)):
+        raise HTTPException(status_code=404, detail="Sponsor account not found")
+    if _normalize_email_address(payload.email) != str(row.get("email") or "").strip().lower():
+        raise HTTPException(status_code=400, detail="Email does not match this sponsor account")
+    if not bool(row.get("is_guest", False)):
+        raise HTTPException(status_code=409, detail="This account already has a password. Please sign in instead.")
+    db.execute(
+        text(
+            """
+            UPDATE green_sponsor_accounts
+            SET password_hash = :password_hash,
+                is_guest = FALSE,
+                claimed_at = NOW(),
+                updated_at = NOW()
+            WHERE id = :sponsor_id
+            """
+        ),
+        {"sponsor_id": int(row["id"]), "password_hash": _hash_password_value(payload.password)},
+    )
+    _log_audit_event(
+        db,
+        project_id=None,
+        entity_type="sponsor_account",
+        entity_id=int(row["id"]),
+        action="sponsor_guest_account_claimed",
+        actor=str(row.get("full_name") or "").strip(),
+        details={"email": str(row.get("email") or "")},
+    )
+    db.commit()
+    claimed_row = db.execute(
+        text(
+            """
+            SELECT id, sponsor_uid, account_type, full_name, organization_name, email, phone, is_active,
+                   entity_category, leaderboard_visibility, green_points, lifetime_points, referral_code,
+                   referred_by_id, is_guest, claimed_at
+            FROM green_sponsor_accounts
+            WHERE id = :sponsor_id
+            """
+        ),
+        {"sponsor_id": int(row["id"])},
+    ).mappings().first()
+    return _build_sponsor_auth_payload(dict(claimed_row))
 
 
 @router.get("/sponsor/orders/{order_uid}/payment-status")
@@ -11706,8 +11868,10 @@ def sponsor_flutterwave_return(
     status: str | None = Query(default=None),
     tx_ref: str | None = Query(default=None),
     transaction_id: int | None = Query(default=None),
+    web_return: str | None = Query(default=None),
     db: Session = Depends(get_db),
 ):
+    safe_web_return = _sanitize_sponsor_web_return_url(web_return)
     order = db.execute(
         text(
             """
@@ -11722,9 +11886,14 @@ def sponsor_flutterwave_return(
         {"order_uid": str(order_uid or "").strip()},
     ).mappings().first()
     if not order:
-        deep_link = _build_sponsor_payment_app_url(str(order_uid or "").strip(), "failed", "We could not find that sponsorship order.")
+        not_found_message = "We could not find that sponsorship order. Return to the app and try again."
+        if safe_web_return:
+            return RedirectResponse(
+                f"{safe_web_return}?order_uid={quote(str(order_uid or '').strip())}&status=failed&message={quote(not_found_message)}"
+            )
+        deep_link = _build_sponsor_payment_app_url(str(order_uid or "").strip(), "failed", not_found_message)
         return Response(
-            content=_render_sponsor_payment_return_page("Order not found", "We could not find that sponsorship order. Return to the app and try again.", deep_link),
+            content=_render_sponsor_payment_return_page("Order not found", not_found_message, deep_link),
             media_type="text/html",
         )
     payment_state = "pending"
@@ -11755,6 +11924,15 @@ def sponsor_flutterwave_return(
             db.rollback()
             payment_state = "pending"
             message = "We could not confirm the payment automatically yet. Return to the app and refresh the order status."
+    if safe_web_return:
+        sponsor_account_id = int(order.get("sponsor_account_id") or 0)
+        redirect_qs = (
+            f"order_uid={quote(str(order.get('order_uid') or order_uid))}"
+            f"&status={quote(payment_state)}"
+            f"&message={quote(message)}"
+            f"&sponsor_id={sponsor_account_id}"
+        )
+        return RedirectResponse(f"{safe_web_return}?{redirect_qs}")
     deep_link = _build_sponsor_payment_app_url(str(order.get("order_uid") or order_uid), payment_state, message)
     title = "Payment pending"
     if payment_state == "verified":
@@ -15822,6 +16000,7 @@ def list_admin_sponsors(db: Session = Depends(get_db)):
                 sa.id, sa.sponsor_uid, sa.account_type, sa.full_name, sa.organization_name, sa.email, sa.phone,
                 sa.is_active, sa.created_at, sa.entity_category, sa.leaderboard_visibility,
                 sa.green_points, sa.lifetime_points, sa.referral_code, sa.referred_by_id,
+                sa.is_guest, sa.claimed_at,
                 COALESCE(order_stats.orders_count, 0) AS orders_count,
                 COALESCE(order_stats.amount_total, 0) AS amount_total,
                 COALESCE(order_stats.verified_orders_count, 0) AS verified_orders_count,
