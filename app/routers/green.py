@@ -14033,91 +14033,109 @@ def resolve_admin_complaint(
 ASSISTANT_FAQ_INTENTS: list[dict] = [
     {
         "key": "pricing",
+        "sample_question": "How much does it cost to sponsor a tree?",
         "keywords": ["price", "cost", "how much", "fee", "charge", "expensive", "cheap"],
         "answer": "Sponsorship pricing varies by project and is shown in Naira (NGN) or US Dollars (USD) on each project card before you check out — you pick whichever currency works best for you at checkout.",
     },
     {
         "key": "guest_checkout",
+        "sample_question": "Do I need to create an account?",
         "keywords": ["account", "sign up", "signup", "register", "login", "log in", "create an account"],
         "answer": "No account is needed! You can sponsor a tree as a guest with just your name, email, and phone number. After payment, you'll get the option to set up a free account if you'd like to track your trees over time.",
     },
     {
         "key": "tracking",
+        "sample_question": "How do I track my sponsored tree?",
         "keywords": ["track", "order status", "where is my tree", "find my order", "order id"],
         "answer": "You can track your sponsorship any time using \"Track Order\" at the top of this page — just enter the order ID from your confirmation email and the email address you sponsored with.",
     },
     {
         "key": "certificate",
+        "sample_question": "Do I get a certificate?",
         "keywords": ["certificate", "proof", "receipt"],
         "answer": "The moment your payment is confirmed, we email you a digital sponsorship certificate. You'll also get GPS map location and photo evidence as your tree is planted and cared for.",
     },
     {
         "key": "payment_methods",
+        "sample_question": "What payment methods can I use?",
         "keywords": ["pay with", "payment method", "card", "bank transfer", "ussd", "apple pay", "google pay"],
         "answer": "You can pay securely by card, bank transfer, or USSD through our payment partner Flutterwave. Apple Pay isn't currently available for Naira payments, but card payments work smoothly on any device.",
     },
     {
         "key": "currency_international",
+        "sample_question": "Can I sponsor from outside Nigeria?",
         "keywords": ["dollar", "usd", "naira", "ngn", "outside nigeria", "abroad", "diaspora", "another country", "foreign", "overseas"],
         "answer": "Yes — you can sponsor a tree from anywhere in the world. Just choose USD as your checkout currency if you're paying from outside Nigeria (NGN is also available).",
     },
     {
         "key": "climate_impact",
+        "sample_question": "What's the climate impact of one tree?",
         "keywords": ["co2", "carbon", "climate impact", "environment", "footprint", "offset"],
         "answer": "Each sponsored tree absorbs roughly 21kg of CO2 per year and helps retain around 120L of water. Not sure how many trees you need? Try our free CO2 footprint calculator, linked just above the project list!",
     },
     {
         "key": "project_verification",
+        "sample_question": "Are these projects verified and legit?",
         "keywords": ["verified", "legit", "real", "scam", "trust", "genuine"],
         "answer": "Every project is GPS-mapped and field-monitored by LandCheck officers, with photo evidence and location data recorded at every stage — from planting through maturity.",
     },
     {
         "key": "land_rights",
+        "sample_question": "Do you have permission to plant on this land?",
         "keywords": ["land rights", "approval", "permission", "legal", "owns the land"],
         "answer": "Every project has full land-rights and planting approval on record before it opens for sponsorship, and LandCheck field agents are already on the ground ready to plant.",
     },
     {
         "key": "refund_cancel",
+        "sample_question": "Can I get a refund or cancel my order?",
         "keywords": ["refund", "cancel", "money back"],
         "answer": "If you have an issue with your order, our support team can help — please share your order ID and we'll look into it personally.",
     },
     {
         "key": "payment_pending",
+        "sample_question": "My payment is stuck pending, what do I do?",
         "keywords": ["payment failed", "still pending", "stuck", "not confirmed", "didn't go through", "did not go through"],
         "answer": "If your payment is still pending, give it a few minutes and use \"Check Again\" on the payment status screen. If it's been longer than 30 minutes, let us know your order ID and we'll check on it for you.",
     },
     {
         "key": "dedication_gift",
+        "sample_question": "Can I gift or dedicate a tree to someone?",
         "keywords": ["gift", "dedicate", "memory of", "birthday", "anniversary", "honour", "honor"],
         "answer": "Yes! At checkout you can dedicate your tree to someone — for a birthday, anniversary, memorial, or just to celebrate them — and add a personal message.",
     },
     {
         "key": "bulk_organization",
+        "sample_question": "Can my company or school sponsor in bulk?",
         "keywords": ["company", "organization", "organisation", "bulk", "csr", "school", "corporate"],
         "answer": "For companies, schools, or organizations looking to sponsor in bulk, visit our Organizations page (\"For Organizations\" in the menu above) for partnership options and dedicated reporting.",
     },
     {
         "key": "updates_frequency",
+        "sample_question": "How often will I get updates on my tree?",
         "keywords": ["how often", "updates", "photos", "hear from you"],
         "answer": "You'll receive email updates with GPS location and photo evidence as your tree is planted and maintained — no account required to check on it.",
     },
     {
         "key": "planting_timeline",
+        "sample_question": "When will my tree actually be planted?",
         "keywords": ["when will", "planting date", "how long", "timeline"],
         "answer": "Planting typically begins soon after a project reaches its funding target, and our field agents are already on the ground for active projects. You'll be notified by email once your tree is planted.",
     },
     {
         "key": "data_privacy",
+        "sample_question": "Is my personal data kept private?",
         "keywords": ["privacy", "data", "information safe", "share my email"],
         "answer": "Your information is only used to process your sponsorship and send you updates. You can read our full privacy policy for details on how we handle your data.",
     },
     {
         "key": "app_download",
+        "sample_question": "Is there a mobile app?",
         "keywords": ["app", "download", "android", "mobile app", "play store"],
         "answer": "Yes — LandCheck Green has a free Android app where you can track your sponsored trees, see your certificate, and view your impact. The download link is available after your first sponsorship.",
     },
     {
         "key": "multiple_trees",
+        "sample_question": "How many trees should I sponsor?",
         "keywords": ["more than one", "multiple trees", "several trees", "how many can i", "how many should"],
         "answer": "You can sponsor as many trees as you'd like in a single order — just adjust the quantity before checkout. If you want a personalized recommendation, try the CO2 footprint calculator linked above the project list.",
     },
@@ -14138,9 +14156,80 @@ def _match_assistant_intent(message: str) -> dict | None:
     return best_intent if best_score > 0 else None
 
 
+# ─── Gemini free-tier fallback ─────────────────────────────────────────────
+# When the keyword matcher above misses, we optionally ask Gemini's free tier
+# to answer using ONLY the FAQ knowledge base as context (grounded, not open
+# web knowledge), so it can't confidently invent pricing/impact claims. If
+# GEMINI_API_KEY isn't set, or the call fails or times out, this returns None
+# and the caller falls back to human escalation exactly as before — the
+# feature is fully optional and the bot works without it.
+
+GEMINI_API_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
+GEMINI_ESCALATE_SENTINEL = "ESCALATE"
+
+
+def _gemini_api_key() -> str | None:
+    return str(os.getenv("GEMINI_API_KEY") or "").strip() or None
+
+
+def _gemini_model() -> str:
+    return str(os.getenv("GEMINI_MODEL") or "gemini-2.0-flash").strip() or "gemini-2.0-flash"
+
+
+def _build_assistant_faq_context() -> str:
+    return "\n\n".join(
+        f"Q: {intent.get('sample_question', intent['key'])}\nA: {intent['answer']}"
+        for intent in ASSISTANT_FAQ_INTENTS
+    )
+
+
+def _ask_gemini_assistant(message: str) -> str | None:
+    api_key = _gemini_api_key()
+    if not api_key:
+        return None
+    prompt = (
+        "You are Planty, a friendly assistant on LandCheck Green's public tree-sponsorship page. "
+        "Answer the visitor's question using ONLY the information in the FAQ knowledge base below — "
+        "never invent prices, policies, or claims that aren't there. Keep the answer short (2-3 sentences) and warm. "
+        f"If the knowledge base does not clearly cover the question, reply with exactly the single word {GEMINI_ESCALATE_SENTINEL} and nothing else.\n\n"
+        f"FAQ knowledge base:\n{_build_assistant_faq_context()}\n\n"
+        f"Visitor question: {message}"
+    )
+    try:
+        response = requests.post(
+            f"{GEMINI_API_BASE_URL}/models/{_gemini_model()}:generateContent",
+            params={"key": api_key},
+            json={
+                "contents": [{"parts": [{"text": prompt}]}],
+                "generationConfig": {"temperature": 0.2, "maxOutputTokens": 220},
+            },
+            timeout=10,
+        )
+        response.raise_for_status()
+        data = response.json()
+    except Exception:
+        return None
+    candidates = data.get("candidates") or []
+    if not candidates:
+        return None
+    parts = ((candidates[0].get("content") or {}).get("parts")) or []
+    answer_text = "".join(str(part.get("text") or "") for part in parts).strip()
+    if not answer_text or answer_text.strip().upper() == GEMINI_ESCALATE_SENTINEL:
+        return None
+    return answer_text
+
+
 class AssistantAskPayload(BaseModel):
     message: str
     session_id: str | None = None
+
+
+@router.get("/sponsor/assistant/suggested-questions")
+def sponsor_assistant_suggested_questions():
+    return [
+        {"key": intent["key"], "question": intent.get("sample_question") or intent["key"]}
+        for intent in ASSISTANT_FAQ_INTENTS
+    ]
 
 
 @router.post("/sponsor/assistant/ask")
@@ -14148,11 +14237,17 @@ def sponsor_assistant_ask(payload: AssistantAskPayload):
     message = _clean_text(payload.message, 500) or ""
     intent = _match_assistant_intent(message)
     if intent:
-        return {"matched": True, "answer": intent["answer"], "intent_key": intent["key"]}
+        return {"matched": True, "answer": intent["answer"], "intent_key": intent["key"], "source": "faq"}
+
+    llm_answer = _ask_gemini_assistant(message)
+    if llm_answer:
+        return {"matched": True, "answer": llm_answer, "intent_key": None, "source": "llm"}
+
     return {
         "matched": False,
         "answer": "I'm not confident about that one. Want me to pass your question to our support team? They'll follow up by email.",
         "intent_key": None,
+        "source": None,
     }
 
 
