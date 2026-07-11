@@ -1460,6 +1460,76 @@ def _send_new_user_credentials_email(
         server.send_message(msg)
 
 
+def _send_assistant_escalation_reply_email(*, to_email: str, visitor_name: str, question: str, reply: str):
+    smtp_host = str(os.getenv("SMTP_HOST") or "").strip()
+    if not smtp_host:
+        raise RuntimeError("SMTP_HOST is not configured")
+    smtp_port = int(str(os.getenv("SMTP_PORT") or "587").strip() or "587")
+    smtp_user = str(os.getenv("SMTP_USERNAME") or "").strip()
+    smtp_pass = str(os.getenv("SMTP_PASSWORD") or "").strip()
+    smtp_from_email = str(os.getenv("SMTP_FROM_EMAIL") or smtp_user or "").strip()
+    smtp_from_name = str(os.getenv("SMTP_FROM_NAME") or "LandCheck Green").strip()
+    if not smtp_from_email:
+        raise RuntimeError("SMTP_FROM_EMAIL (or SMTP_USERNAME) is not configured")
+    use_ssl = _env_bool("SMTP_USE_SSL", False)
+    use_tls = _env_bool("SMTP_USE_TLS", not use_ssl)
+
+    body = (
+        f"Hi {visitor_name},\n\n"
+        f"You asked our Planty assistant:\n\"{question}\"\n\n"
+        f"Here's the answer from our support team:\n{reply}\n\n"
+        "Thanks for sponsoring with LandCheck Green!\n"
+    )
+    html_body = f"""
+    <html>
+      <body style="margin:0;padding:24px;background:#f4f8f2;font-family:Arial,sans-serif;color:#13271d;">
+        <div style="max-width:560px;margin:0 auto;background:#ffffff;border:1px solid #d4e2d2;border-radius:16px;overflow:hidden;">
+          <div style="background:#0a3d20;padding:20px 24px;">
+            <div style="font-size:20px;font-weight:800;color:#ffffff;">LandCheck Green Support</div>
+          </div>
+          <div style="padding:24px;">
+            <p style="margin:0 0 14px;font-size:15px;">Hi {html.escape(visitor_name)},</p>
+            <p style="margin:0 0 8px;font-size:13px;color:#5a6f63;">You asked:</p>
+            <p style="margin:0 0 16px;font-size:14px;font-style:italic;color:#13271d;background:#f4f8f2;border-radius:10px;padding:10px 14px;">{html.escape(question)}</p>
+            <p style="margin:0 0 8px;font-size:13px;color:#5a6f63;">Our team's answer:</p>
+            <p style="margin:0 0 20px;font-size:15px;line-height:1.6;">{html.escape(reply)}</p>
+            <p style="margin:0;font-size:14px;color:#5a6f63;">Thanks for sponsoring with LandCheck Green!</p>
+          </div>
+        </div>
+      </body>
+    </html>
+    """
+
+    msg = EmailMessage()
+    msg["Subject"] = "An answer from LandCheck Green support"
+    msg["From"] = f"{smtp_from_name} <{smtp_from_email}>" if smtp_from_name else smtp_from_email
+    msg["To"] = to_email
+    msg.set_content(body)
+    msg.add_alternative(html_body, subtype="html")
+
+    if use_ssl:
+        with smtplib.SMTP_SSL(smtp_host, smtp_port, timeout=20) as server:
+            if smtp_user:
+                server.login(smtp_user, smtp_pass)
+            server.send_message(msg)
+        return
+
+    with smtplib.SMTP(smtp_host, smtp_port, timeout=20) as server:
+        try:
+            server.ehlo()
+        except Exception:
+            pass
+        if use_tls:
+            server.starttls()
+            try:
+                server.ehlo()
+            except Exception:
+                pass
+        if smtp_user:
+            server.login(smtp_user, smtp_pass)
+        server.send_message(msg)
+
+
 def _send_organization_welcome_email(
     *,
     to_email: str,
@@ -6087,6 +6157,22 @@ def ensure_green_tables(db: Session):
             message TEXT NOT NULL,
             status TEXT NOT NULL DEFAULT 'open',
             created_at TIMESTAMP DEFAULT NOW()
+        )
+    """))
+    db.execute(text("""
+        CREATE TABLE IF NOT EXISTS green_assistant_escalations (
+            id SERIAL PRIMARY KEY,
+            session_id TEXT,
+            visitor_name TEXT,
+            visitor_email TEXT,
+            question TEXT NOT NULL,
+            transcript TEXT,
+            status TEXT NOT NULL DEFAULT 'open',
+            supervisor_note TEXT,
+            admin_reply TEXT,
+            created_at TIMESTAMP DEFAULT NOW(),
+            resolved_at TIMESTAMP,
+            seen_at TIMESTAMP
         )
     """))
     db.execute(text("""
@@ -13933,8 +14019,243 @@ def resolve_admin_complaint(
             "tree_id": tree_id,
             "status": "resolved"
         })
-        
+
     db.commit()
+    return {"ok": True}
+
+
+# ─── "Planty" sponsor assistant — FAQ matching + escalation to a human ────────
+# Rule-based, not an LLM: a fixed keyword-scored knowledge base covering the
+# questions guest sponsors actually ask. Anything it can't confidently answer
+# is escalated into green_assistant_escalations, which surfaces in the
+# Feedback & Nominations tab in LandCheck Work with an unread badge.
+
+ASSISTANT_FAQ_INTENTS: list[dict] = [
+    {
+        "key": "pricing",
+        "keywords": ["price", "cost", "how much", "fee", "charge", "expensive", "cheap"],
+        "answer": "Sponsorship pricing varies by project and is shown in Naira (NGN) or US Dollars (USD) on each project card before you check out — you pick whichever currency works best for you at checkout.",
+    },
+    {
+        "key": "guest_checkout",
+        "keywords": ["account", "sign up", "signup", "register", "login", "log in", "create an account"],
+        "answer": "No account is needed! You can sponsor a tree as a guest with just your name, email, and phone number. After payment, you'll get the option to set up a free account if you'd like to track your trees over time.",
+    },
+    {
+        "key": "tracking",
+        "keywords": ["track", "order status", "where is my tree", "find my order", "order id"],
+        "answer": "You can track your sponsorship any time using \"Track Order\" at the top of this page — just enter the order ID from your confirmation email and the email address you sponsored with.",
+    },
+    {
+        "key": "certificate",
+        "keywords": ["certificate", "proof", "receipt"],
+        "answer": "The moment your payment is confirmed, we email you a digital sponsorship certificate. You'll also get GPS map location and photo evidence as your tree is planted and cared for.",
+    },
+    {
+        "key": "payment_methods",
+        "keywords": ["pay with", "payment method", "card", "bank transfer", "ussd", "apple pay", "google pay"],
+        "answer": "You can pay securely by card, bank transfer, or USSD through our payment partner Flutterwave. Apple Pay isn't currently available for Naira payments, but card payments work smoothly on any device.",
+    },
+    {
+        "key": "currency_international",
+        "keywords": ["dollar", "usd", "naira", "ngn", "outside nigeria", "abroad", "diaspora", "another country", "foreign", "overseas"],
+        "answer": "Yes — you can sponsor a tree from anywhere in the world. Just choose USD as your checkout currency if you're paying from outside Nigeria (NGN is also available).",
+    },
+    {
+        "key": "climate_impact",
+        "keywords": ["co2", "carbon", "climate impact", "environment", "footprint", "offset"],
+        "answer": "Each sponsored tree absorbs roughly 21kg of CO2 per year and helps retain around 120L of water. Not sure how many trees you need? Try our free CO2 footprint calculator, linked just above the project list!",
+    },
+    {
+        "key": "project_verification",
+        "keywords": ["verified", "legit", "real", "scam", "trust", "genuine"],
+        "answer": "Every project is GPS-mapped and field-monitored by LandCheck officers, with photo evidence and location data recorded at every stage — from planting through maturity.",
+    },
+    {
+        "key": "land_rights",
+        "keywords": ["land rights", "approval", "permission", "legal", "owns the land"],
+        "answer": "Every project has full land-rights and planting approval on record before it opens for sponsorship, and LandCheck field agents are already on the ground ready to plant.",
+    },
+    {
+        "key": "refund_cancel",
+        "keywords": ["refund", "cancel", "money back"],
+        "answer": "If you have an issue with your order, our support team can help — please share your order ID and we'll look into it personally.",
+    },
+    {
+        "key": "payment_pending",
+        "keywords": ["payment failed", "still pending", "stuck", "not confirmed", "didn't go through", "did not go through"],
+        "answer": "If your payment is still pending, give it a few minutes and use \"Check Again\" on the payment status screen. If it's been longer than 30 minutes, let us know your order ID and we'll check on it for you.",
+    },
+    {
+        "key": "dedication_gift",
+        "keywords": ["gift", "dedicate", "memory of", "birthday", "anniversary", "honour", "honor"],
+        "answer": "Yes! At checkout you can dedicate your tree to someone — for a birthday, anniversary, memorial, or just to celebrate them — and add a personal message.",
+    },
+    {
+        "key": "bulk_organization",
+        "keywords": ["company", "organization", "organisation", "bulk", "csr", "school", "corporate"],
+        "answer": "For companies, schools, or organizations looking to sponsor in bulk, visit our Organizations page (\"For Organizations\" in the menu above) for partnership options and dedicated reporting.",
+    },
+    {
+        "key": "updates_frequency",
+        "keywords": ["how often", "updates", "photos", "hear from you"],
+        "answer": "You'll receive email updates with GPS location and photo evidence as your tree is planted and maintained — no account required to check on it.",
+    },
+    {
+        "key": "planting_timeline",
+        "keywords": ["when will", "planting date", "how long", "timeline"],
+        "answer": "Planting typically begins soon after a project reaches its funding target, and our field agents are already on the ground for active projects. You'll be notified by email once your tree is planted.",
+    },
+    {
+        "key": "data_privacy",
+        "keywords": ["privacy", "data", "information safe", "share my email"],
+        "answer": "Your information is only used to process your sponsorship and send you updates. You can read our full privacy policy for details on how we handle your data.",
+    },
+    {
+        "key": "app_download",
+        "keywords": ["app", "download", "android", "mobile app", "play store"],
+        "answer": "Yes — LandCheck Green has a free Android app where you can track your sponsored trees, see your certificate, and view your impact. The download link is available after your first sponsorship.",
+    },
+    {
+        "key": "multiple_trees",
+        "keywords": ["more than one", "multiple trees", "several trees", "how many can i", "how many should"],
+        "answer": "You can sponsor as many trees as you'd like in a single order — just adjust the quantity before checkout. If you want a personalized recommendation, try the CO2 footprint calculator linked above the project list.",
+    },
+]
+
+
+def _match_assistant_intent(message: str) -> dict | None:
+    text_lower = str(message or "").strip().lower()
+    if not text_lower:
+        return None
+    best_intent: dict | None = None
+    best_score = 0
+    for intent in ASSISTANT_FAQ_INTENTS:
+        score = sum(1 for keyword in intent["keywords"] if keyword in text_lower)
+        if score > best_score:
+            best_score = score
+            best_intent = intent
+    return best_intent if best_score > 0 else None
+
+
+class AssistantAskPayload(BaseModel):
+    message: str
+    session_id: str | None = None
+
+
+@router.post("/sponsor/assistant/ask")
+def sponsor_assistant_ask(payload: AssistantAskPayload):
+    message = _clean_text(payload.message, 500) or ""
+    intent = _match_assistant_intent(message)
+    if intent:
+        return {"matched": True, "answer": intent["answer"], "intent_key": intent["key"]}
+    return {
+        "matched": False,
+        "answer": "I'm not confident about that one. Want me to pass your question to our support team? They'll follow up by email.",
+        "intent_key": None,
+    }
+
+
+class AssistantEscalatePayload(BaseModel):
+    session_id: str | None = None
+    name: str
+    email: str
+    question: str
+    transcript: str | None = None
+
+
+@router.post("/sponsor/assistant/escalate")
+def sponsor_assistant_escalate(payload: AssistantEscalatePayload, db: Session = Depends(get_db)):
+    name = _clean_text(payload.name, 200)
+    email = _clean_text(payload.email, 200)
+    question = _clean_text(payload.question, 2000)
+    if not email or not question:
+        raise HTTPException(status_code=400, detail="Name, email, and question are required.")
+    db.execute(
+        text("""
+            INSERT INTO green_assistant_escalations (session_id, visitor_name, visitor_email, question, transcript, status)
+            VALUES (:session_id, :visitor_name, :visitor_email, :question, :transcript, 'open')
+        """),
+        {
+            "session_id": _clean_text(payload.session_id, 100),
+            "visitor_name": name,
+            "visitor_email": email,
+            "question": question,
+            "transcript": _clean_text(payload.transcript, 8000),
+        },
+    )
+    db.commit()
+    return {"ok": True, "message": "Thanks — our team will review this and email you back soon."}
+
+
+@router.get("/admin/assistant-escalations")
+def list_admin_assistant_escalations(db: Session = Depends(get_db)):
+    rows = db.execute(
+        text("""
+            SELECT id, session_id, visitor_name, visitor_email, question, transcript, status,
+                   supervisor_note, admin_reply, created_at, resolved_at, seen_at
+            FROM green_assistant_escalations
+            ORDER BY created_at DESC
+        """)
+    ).mappings().all()
+    return [dict(row) for row in rows]
+
+
+@router.get("/admin/assistant-escalations/unread-count")
+def count_admin_assistant_escalations_unread(db: Session = Depends(get_db)):
+    count = db.execute(
+        text("SELECT COUNT(*) FROM green_assistant_escalations WHERE seen_at IS NULL")
+    ).scalar()
+    return {"count": int(count or 0)}
+
+
+@router.post("/admin/assistant-escalations/mark-seen")
+def mark_admin_assistant_escalations_seen(db: Session = Depends(get_db)):
+    db.execute(text("UPDATE green_assistant_escalations SET seen_at = NOW() WHERE seen_at IS NULL"))
+    db.commit()
+    return {"ok": True}
+
+
+class ResolveAssistantEscalationPayload(BaseModel):
+    supervisor_note: str | None = None
+    admin_reply: str | None = None
+
+
+@router.post("/admin/assistant-escalations/{escalation_id}/resolve")
+def resolve_admin_assistant_escalation(
+    escalation_id: int,
+    payload: ResolveAssistantEscalationPayload = Body(default=None),
+    db: Session = Depends(get_db),
+):
+    note = _normalize_optional_text(payload.supervisor_note if payload else None)
+    reply = _normalize_optional_text(payload.admin_reply if payload else None)
+    row = db.execute(
+        text("SELECT visitor_email, visitor_name, question FROM green_assistant_escalations WHERE id = :id"),
+        {"id": escalation_id},
+    ).mappings().first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Escalation not found.")
+    db.execute(
+        text("""
+            UPDATE green_assistant_escalations
+            SET status = 'resolved', supervisor_note = :note, admin_reply = :reply, resolved_at = NOW()
+            WHERE id = :id
+        """),
+        {"id": escalation_id, "note": note, "reply": reply},
+    )
+    db.commit()
+
+    if reply and row.get("visitor_email"):
+        try:
+            _send_assistant_escalation_reply_email(
+                to_email=row["visitor_email"],
+                visitor_name=row.get("visitor_name") or "there",
+                question=row.get("question") or "",
+                reply=reply,
+            )
+        except Exception:
+            pass
+
     return {"ok": True}
 
 
