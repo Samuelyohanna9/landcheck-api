@@ -14136,7 +14136,7 @@ ASSISTANT_FAQ_INTENTS: list[dict] = [
     {
         "key": "multiple_trees",
         "sample_question": "How many trees should I sponsor?",
-        "keywords": ["more than one", "multiple trees", "several trees", "how many can i", "how many should"],
+        "keywords": ["more than one", "multiple trees", "several trees", "how many can i", "how many should", "how many trees", "how many can", "sponsor more than"],
         "answer": "You can sponsor as many trees as you'd like in a single order — just adjust the quantity before checkout. If you want a personalized recommendation, try the CO2 footprint calculator linked above the project list.",
     },
 ]
