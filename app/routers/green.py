@@ -19,6 +19,7 @@ import hashlib
 import hmac
 import secrets
 import smtplib
+import time
 from pathlib import Path
 from threading import Lock
 import threading
@@ -14195,19 +14196,39 @@ def _ask_gemini_assistant(message: str) -> str | None:
         f"FAQ knowledge base:\n{_build_assistant_faq_context()}\n\n"
         f"Visitor question: {message}"
     )
-    try:
-        response = requests.post(
-            f"{GEMINI_API_BASE_URL}/models/{_gemini_model()}:generateContent",
-            params={"key": api_key},
-            json={
-                "contents": [{"parts": [{"text": prompt}]}],
-                "generationConfig": {"temperature": 0.2, "maxOutputTokens": 220},
-            },
-            timeout=10,
-        )
-        response.raise_for_status()
-        data = response.json()
-    except Exception:
+    request_body = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {"temperature": 0.2, "maxOutputTokens": 220},
+    }
+    url = f"{GEMINI_API_BASE_URL}/models/{_gemini_model()}:generateContent"
+    data: dict | None = None
+    max_attempts = 2
+    for attempt in range(1, max_attempts + 1):
+        try:
+            response = requests.post(url, params={"key": api_key}, json=request_body, timeout=10)
+        except requests.RequestException:
+            logger.warning("Gemini assistant call failed to reach the API (attempt %s)", attempt)
+            return None
+        if response.status_code == 429:
+            retry_after_header = str(response.headers.get("Retry-After") or "").strip()
+            wait_seconds = float(retry_after_header) if retry_after_header.replace(".", "", 1).isdigit() else 1.5
+            logger.warning(
+                "Gemini assistant hit 429 rate limit (attempt %s/%s) — check quota at aistudio.google.com",
+                attempt, max_attempts,
+            )
+            if attempt < max_attempts:
+                time.sleep(min(wait_seconds, 3.0))
+                continue
+            return None
+        if not response.ok:
+            logger.warning("Gemini assistant call failed with status %s: %s", response.status_code, response.text[:300])
+            return None
+        try:
+            data = response.json()
+        except ValueError:
+            return None
+        break
+    if data is None:
         return None
     candidates = data.get("candidates") or []
     if not candidates:
