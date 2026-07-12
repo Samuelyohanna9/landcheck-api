@@ -14033,6 +14033,12 @@ def resolve_admin_complaint(
 
 ASSISTANT_FAQ_INTENTS: list[dict] = [
     {
+        "key": "greeting",
+        "sample_question": "Hi",
+        "keywords": ["hi", "hello", "hey", "greetings", "good morning", "good afternoon", "good evening", "howdy"],
+        "answer": "Hi! I'm Planty, your tree sponsorship assistant. How can I help you today?",
+    },
+    {
         "key": "pricing",
         "sample_question": "How much does it cost to sponsor a tree?",
         "keywords": ["price", "cost", "how much", "fee", "charge", "expensive", "cheap"],
@@ -14150,7 +14156,7 @@ def _match_assistant_intent(message: str) -> dict | None:
     best_intent: dict | None = None
     best_score = 0
     for intent in ASSISTANT_FAQ_INTENTS:
-        score = sum(1 for keyword in intent["keywords"] if keyword in text_lower)
+        score = sum(1 for keyword in intent["keywords"] if re.search(r"\b" + re.escape(keyword) + r"\b", text_lower))
         if score > best_score:
             best_score = score
             best_intent = intent
