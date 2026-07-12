@@ -478,7 +478,13 @@ def render_green_donor_impact_pdf(data: dict, base_url: str = "") -> bytes:
     return buffer.getvalue()
 
 
-def render_green_sponsor_certificate_pdf(sponsorship: dict, carbon: dict | None = None, verification_url: str | None = None, level_name: str | None = None) -> bytes:
+def render_green_sponsor_certificate_pdf(
+    sponsorship: dict,
+    carbon: dict | None = None,
+    verification_url: str | None = None,
+    level_name: str | None = None,
+    sponsor_total_trees: int | None = None,
+) -> bytes:
     from reportlab.lib.pagesizes import landscape
     buffer = io.BytesIO()
     page_w, page_h = landscape(A4) # 841.89 x 595.27
@@ -496,6 +502,7 @@ def render_green_sponsor_certificate_pdf(sponsorship: dict, carbon: dict | None 
     dedication_name = str(sponsorship.get("dedication_name") or "").strip()
     dedication_message = str(sponsorship.get("dedication_message") or "").strip()
     evidence_message = "Each sponsored tree is linked to map-verified coordinates, approved field photos, reviewed care history, and a live digital reference."
+    total_trees_sponsored = max(int(sponsor_total_trees or 0), 1)
 
     # Background
     c.setFillColor(HexColor("#fafaf7"))
@@ -791,7 +798,7 @@ def render_green_sponsor_certificate_pdf(sponsorship: dict, carbon: dict | None 
         c.setFillColor(HexColor("#c5a059"))
         c.circle(x + metric_card_w - 18, metrics_y + metrics_h/2, 3, stroke=0, fill=1)
 
-    draw_climate_metric_card(metric_x1, f"{float(carbon_data.get('current_co2_kg') or 0):,.2f} kg", "CURRENT STORED CO2")
+    draw_climate_metric_card(metric_x1, f"{int(total_trees_sponsored):,}", "TREES SPONSORED")
     draw_climate_metric_card(metric_x2, f"{float(carbon_data.get('annual_co2_kg') or 0):,.2f} kg/yr", "ANNUAL CO2 SEQUESTRATION")
     draw_climate_metric_card(metric_x3, f"{float(carbon_data.get('lifetime_co2_kg') or 0):,.2f} kg", "PROJECTED 40-YEAR CARBON STOCK")
 
@@ -801,6 +808,386 @@ def render_green_sponsor_certificate_pdf(sponsorship: dict, carbon: dict | None 
     c.drawString(45, 34, f"Ref: {sponsorship.get('unit_uid') or sponsorship.get('tree_id') or '-'}")
     
     c.drawRightString(page_w - 45, 34, "LandCheck Green Verified Digital Document")
+
+    _draw_sponsor_certificate_evidence_page(
+        c,
+        page_w,
+        page_h,
+        sponsorship=sponsorship,
+        carbon_data=carbon_data,
+        verification_url=verification_url,
+        sponsor_name=sponsor_name,
+        project_name=project_name,
+        tree_label=tree_label,
+        species_label=species_label,
+        planting_date=planting_date,
+        location_text=location_text,
+        dedication_type=dedication_type,
+        dedication_name=dedication_name,
+        dedication_message=dedication_message,
+        total_trees_sponsored=total_trees_sponsored,
+    )
+
+    c.save()
+    buffer.seek(0)
+    return buffer.getvalue()
+
+
+def _collect_sponsor_certificate_gallery_entries(sponsorship: dict) -> list[dict]:
+    rows: list[dict] = []
+    seen: set[str] = set()
+
+    def add(url_value: object, *, title: str, meta: str | None = None):
+        raw = str(url_value or "").strip()
+        if not raw or raw in seen:
+            return
+        seen.add(raw)
+        rows.append(
+            {
+                "url": raw,
+                "title": str(title or "").strip() or "Verified field evidence",
+                "meta": str(meta or "").strip() or None,
+            }
+        )
+
+    primary_photo = str(sponsorship.get("photo_url") or "").strip()
+    if primary_photo:
+        add(primary_photo, title="Primary verified tree photo", meta=str(sponsorship.get("project_name") or "").strip() or None)
+    for index, candidate in enumerate(sponsorship.get("photo_urls") or []):
+        add(
+            candidate,
+            title="Primary verified tree photo" if index == 0 and not primary_photo else f"Verified field photo {index + 1}",
+            meta=str(sponsorship.get("location_text") or sponsorship.get("project_name") or "").strip() or None,
+        )
+    for event in sponsorship.get("timeline") or []:
+        event_title = str(event.get("task_type") or "Field update").replace("_", " ").title()
+        event_meta = str(event.get("reviewed_at") or event.get("completed_at") or event.get("submitted_at") or "").strip() or None
+        add(event.get("photo_url"), title=f"{event_title} evidence", meta=event_meta)
+        for photo in event.get("photo_urls") or []:
+            add(photo, title=f"{event_title} evidence", meta=event_meta)
+    return rows[:4]
+
+
+def _draw_sponsor_certificate_evidence_page(
+    c,
+    page_w: float,
+    page_h: float,
+    *,
+    sponsorship: dict,
+    carbon_data: dict,
+    verification_url: str | None,
+    sponsor_name: str,
+    project_name: str,
+    tree_label: str,
+    species_label: str,
+    planting_date: str,
+    location_text: str,
+    dedication_type: str,
+    dedication_name: str,
+    dedication_message: str,
+    total_trees_sponsored: int,
+):
+    gallery = _collect_sponsor_certificate_gallery_entries(sponsorship)
+    c.showPage()
+
+    c.setFillColor(HexColor("#f7fbf8"))
+    c.rect(0, 0, page_w, page_h, stroke=0, fill=1)
+
+    c.setStrokeColor(HexColor("#083e20"))
+    c.setLineWidth(1.1)
+    c.rect(22, 22, page_w - 44, page_h - 44, stroke=1, fill=0)
+    c.setStrokeColor(HexColor("#d7b57a"))
+    c.setLineWidth(0.6)
+    c.rect(28, 28, page_w - 56, page_h - 56, stroke=1, fill=0)
+
+    c.setFillColor(HexColor("#083e20"))
+    c.roundRect(42, page_h - 92, page_w - 84, 44, 16, stroke=0, fill=1)
+    c.setFillColor(HexColor("#ffffff"))
+    c.setFont("Helvetica-Bold", 19)
+    c.drawString(58, page_h - 66, "Verification & Evidence Pack")
+    c.setFont("Helvetica", 9.5)
+    c.setFillColor(HexColor("#dff6e5"))
+    c.drawString(58, page_h - 82, "A premium second-page summary of the sponsored tree, field proof, and live verification record.")
+
+    summary_x = 42
+    summary_y = 90
+    summary_w = 248
+    summary_h = page_h - 208
+    _draw_rounded_box(c, summary_x, summary_y, summary_w, summary_h, 18, fill_color=HexColor("#ffffff"), stroke_color=HexColor("#dbe9dd"))
+
+    c.setFillColor(HexColor("#c5a059"))
+    c.setFont("Helvetica-Bold", 9)
+    c.drawString(summary_x + 18, summary_y + summary_h - 26, "SPONSOR SUMMARY")
+    c.setFillColor(HexColor("#083e20"))
+    c.setFont("Helvetica-Bold", 18)
+    c.drawString(summary_x + 18, summary_y + summary_h - 50, sponsor_name[:28])
+    c.setFillColor(HexColor("#53705f"))
+    c.setFont("Helvetica", 9.5)
+    c.drawString(summary_x + 18, summary_y + summary_h - 66, f"{int(total_trees_sponsored):,} tree{'s' if int(total_trees_sponsored) != 1 else ''} sponsored in LandCheck Green")
+
+    chip_y = summary_y + summary_h - 106
+    _draw_rounded_box(c, summary_x + 18, chip_y, 104, 40, 12, fill_color=HexColor("#f4faf5"), stroke_color=HexColor("#cce2d1"))
+    c.setFillColor(HexColor("#083e20"))
+    c.setFont("Helvetica-Bold", 16)
+    c.drawString(summary_x + 30, chip_y + 16, f"{float(carbon_data.get('current_co2_kg') or 0):,.2f} kg")
+    c.setFillColor(HexColor("#53705f"))
+    c.setFont("Helvetica-Bold", 7.5)
+    c.drawString(summary_x + 30, chip_y + 6, "CURRENT STORED CO2")
+
+    _draw_rounded_box(c, summary_x + 132, chip_y, 98, 40, 12, fill_color=HexColor("#fff9ef"), stroke_color=HexColor("#ead7ad"))
+    c.setFillColor(HexColor("#083e20"))
+    c.setFont("Helvetica-Bold", 15)
+    c.drawString(summary_x + 144, chip_y + 16, tree_label[:16])
+    c.setFillColor(HexColor("#8a6c32"))
+    c.setFont("Helvetica-Bold", 7.5)
+    c.drawString(summary_x + 144, chip_y + 6, "CERTIFIED TREE")
+
+    details_y = chip_y - 22
+    detail_rows = [
+        ("Project", project_name[:34]),
+        ("Species", species_label[:34]),
+        ("Planting date", planting_date[:34]),
+        ("Location", location_text[:34]),
+    ]
+    for index, (label, value) in enumerate(detail_rows):
+        y = details_y - index * 18
+        c.setFillColor(HexColor("#53705f"))
+        c.setFont("Helvetica-Bold", 8.5)
+        c.drawString(summary_x + 18, y, label)
+        c.setFillColor(HexColor("#163826"))
+        c.setFont("Helvetica", 8.5)
+        c.drawRightString(summary_x + summary_w - 18, y, value)
+
+    if dedication_type or dedication_name or dedication_message:
+        dedication_title = str(dedication_type or "Dedication").replace("_", " ").title()
+        dedication_text = " | ".join(
+            [part for part in [dedication_title, dedication_name, dedication_message] if str(part or "").strip()]
+        )
+        text_y = details_y - len(detail_rows) * 18 - 8
+        c.setFillColor(HexColor("#c5a059"))
+        c.setFont("Helvetica-Bold", 8.5)
+        c.drawString(summary_x + 18, text_y, "Dedication")
+        _draw_wrapped_text(
+            c,
+            dedication_text,
+            summary_x + 18,
+            text_y - 12,
+            summary_w - 36,
+            line_height=11,
+            font_name="Helvetica",
+            font_size=8.4,
+            color=HexColor("#163826"),
+            max_lines=4,
+        )
+
+    qr_box_y = summary_y + 28
+    qr_box_h = 148
+    _draw_rounded_box(c, summary_x + 18, qr_box_y, summary_w - 36, qr_box_h, 14, fill_color=HexColor("#f8fbf8"), stroke_color=HexColor("#dbe9dd"))
+    if verification_url:
+        qr_size = 78
+        qr_x = summary_x + (summary_w - qr_size) / 2
+        qr_y = qr_box_y + 44
+        _draw_qr_code(c, verification_url, qr_x, qr_y, qr_size)
+        c.setFillColor(HexColor("#083e20"))
+        c.setFont("Helvetica-Bold", 8.5)
+        c.drawCentredString(summary_x + summary_w / 2, qr_box_y + 28, "Scan for live tree story, map, and directions")
+        c.setFillColor(HexColor("#53705f"))
+        c.setFont("Helvetica", 7.2)
+        c.drawCentredString(summary_x + summary_w / 2, qr_box_y + 16, "The QR opens the public mini site with approved evidence and route guidance.")
+    else:
+        c.setFillColor(HexColor("#53705f"))
+        c.setFont("Helvetica-Bold", 9)
+        c.drawCentredString(summary_x + summary_w / 2, qr_box_y + 74, "Live verification link pending")
+
+    gallery_x = summary_x + summary_w + 20
+    gallery_y = summary_y
+    gallery_w = page_w - gallery_x - 42
+    gallery_h = summary_h
+    _draw_rounded_box(c, gallery_x, gallery_y, gallery_w, gallery_h, 18, fill_color=HexColor("#ffffff"), stroke_color=HexColor("#dbe9dd"))
+    c.setFillColor(HexColor("#083e20"))
+    c.setFont("Helvetica-Bold", 15)
+    c.drawString(gallery_x + 18, gallery_y + gallery_h - 28, "Approved Field Evidence")
+    c.setFillColor(HexColor("#53705f"))
+    c.setFont("Helvetica", 8.5)
+    c.drawString(gallery_x + 18, gallery_y + gallery_h - 42, "Verified planting and care imagery currently linked to this sponsored tree.")
+
+    grid_top = gallery_y + gallery_h - 62
+    gap = 14
+    card_w = (gallery_w - 18 * 2 - gap) / 2
+    card_h = (gallery_h - 92 - gap) / 2
+    slots = [
+        (gallery_x + 18, grid_top - card_h),
+        (gallery_x + 18 + card_w + gap, grid_top - card_h),
+        (gallery_x + 18, grid_top - card_h * 2 - gap),
+        (gallery_x + 18 + card_w + gap, grid_top - card_h * 2 - gap),
+    ]
+
+    for idx, (slot_x, slot_y) in enumerate(slots):
+        entry = gallery[idx] if idx < len(gallery) else None
+        _draw_rounded_box(c, slot_x, slot_y, card_w, card_h, 14, fill_color=HexColor("#f8fbf8"), stroke_color=HexColor("#e1ece3"))
+        image_y = slot_y + 54
+        image_h = card_h - 68
+        if entry:
+            reader = _load_photo_reader(entry.get("url"), {})
+            if reader is not None:
+                try:
+                    c.drawImage(
+                        reader,
+                        slot_x + 8,
+                        image_y,
+                        card_w - 16,
+                        image_h,
+                        preserveAspectRatio=True,
+                        anchor="c",
+                        mask="auto",
+                    )
+                except Exception:
+                    reader = None
+            if reader is None:
+                c.setFillColor(HexColor("#dfe9e1"))
+                c.roundRect(slot_x + 8, image_y, card_w - 16, image_h, 10, stroke=0, fill=1)
+                c.setFillColor(HexColor("#53705f"))
+                c.setFont("Helvetica-Bold", 9)
+                c.drawCentredString(slot_x + card_w / 2, image_y + image_h / 2, "Photo preview unavailable")
+            c.setFillColor(HexColor("#083e20"))
+            c.setFont("Helvetica-Bold", 8.6)
+            c.drawString(slot_x + 10, slot_y + 36, str(entry.get("title") or "Verified field evidence")[:34])
+            c.setFillColor(HexColor("#53705f"))
+            c.setFont("Helvetica", 7.5)
+            meta_text = str(entry.get("meta") or project_name)[:42]
+            c.drawString(slot_x + 10, slot_y + 22, meta_text)
+        else:
+            c.setFillColor(HexColor("#eef4ef"))
+            c.roundRect(slot_x + 8, image_y, card_w - 16, image_h, 10, stroke=0, fill=1)
+            c.setFillColor(HexColor("#53705f"))
+            c.setFont("Helvetica-Bold", 9)
+            c.drawCentredString(slot_x + card_w / 2, image_y + image_h / 2 + 6, "More evidence will appear")
+            c.setFont("Helvetica", 7.5)
+            c.drawCentredString(slot_x + card_w / 2, image_y + image_h / 2 - 8, "after new planting and maintenance reviews")
+
+    c.setFillColor(HexColor("#53705f"))
+    c.setFont("Helvetica-Bold", 7.5)
+    c.drawString(42, 30, f"Reference: {sponsorship.get('unit_uid') or sponsorship.get('tree_id') or '-'}")
+    c.drawRightString(page_w - 42, 30, "LandCheck Green sponsor certificate evidence page")
+
+
+def _draw_sponsor_qr_sheet_card(c, unit: dict, verification_url: str, x: float, y: float, width: float, height: float):
+    c.setFillColor(HexColor("#ffffff"))
+    c.setStrokeColor(HexColor("#083e20"))
+    c.setLineWidth(1)
+    c.roundRect(x, y, width, height, 14, stroke=1, fill=1)
+
+    c.setFillColor(HexColor("#083e20"))
+    c.roundRect(x + 10, y + height - 40, width - 20, 28, 9, stroke=0, fill=1)
+    c.setFillColor(HexColor("#ffffff"))
+    c.setFont("Helvetica-Bold", 10)
+    c.drawString(x + 18, y + height - 22, "LANDCHECK GREEN")
+    c.setFillColor(HexColor("#d7b57a"))
+    c.setFont("Helvetica-Bold", 7.2)
+    c.drawRightString(x + width - 18, y + height - 22, "SPONSOR QR TAG")
+
+    sponsor_name = str(unit.get("sponsor_name") or unit.get("sponsor_organization_name") or "Sponsor tree").strip()
+    unit_ref = str(unit.get("unit_uid") or f"Unit #{int(unit.get('unit_id') or 0)}").strip()
+    species_label = str(unit.get("species") or "").strip() or "Species pending allocation"
+    project_name = str(unit.get("project_name") or "LandCheck sponsor project").strip()
+    dedication_bits = [
+        str(unit.get("dedication_type") or "").replace("_", " ").title().strip(),
+        str(unit.get("dedication_name") or "").strip(),
+    ]
+    dedication_line = " | ".join([item for item in dedication_bits if item])
+
+    c.setFillColor(HexColor("#083e20"))
+    c.setFont("Helvetica-Bold", 9.5)
+    c.drawString(x + 16, y + height - 58, sponsor_name[:34])
+    c.setFillColor(HexColor("#53705f"))
+    c.setFont("Helvetica", 7.6)
+    c.drawString(x + 16, y + height - 72, unit_ref[:36])
+
+    qr_size = min(92, width - 44)
+    qr_x = x + 16
+    qr_y = y + height - 176
+    _draw_qr_code(c, verification_url, qr_x, qr_y, qr_size)
+
+    c.setFillColor(HexColor("#083e20"))
+    c.setFont("Helvetica-Bold", 8)
+    c.drawString(x + 122, y + height - 96, "Species")
+    c.setFillColor(HexColor("#163826"))
+    c.setFont("Helvetica", 8.2)
+    c.drawString(x + 122, y + height - 108, species_label[:20])
+
+    c.setFillColor(HexColor("#083e20"))
+    c.setFont("Helvetica-Bold", 8)
+    c.drawString(x + 122, y + height - 128, "Project")
+    c.setFillColor(HexColor("#163826"))
+    c.setFont("Helvetica", 8.2)
+    c.drawString(x + 122, y + height - 140, project_name[:22])
+
+    c.setFillColor(HexColor("#083e20"))
+    c.setFont("Helvetica-Bold", 8)
+    c.drawString(x + 122, y + height - 160, "Status")
+    c.setFillColor(HexColor("#163826"))
+    c.setFont("Helvetica", 8.2)
+    c.drawString(
+        x + 122,
+        y + height - 172,
+        str(unit.get("tree_status") or unit.get("sponsorship_status") or "awaiting_tree").replace("_", " ").title()[:22],
+    )
+
+    if dedication_line:
+        c.setFillColor(HexColor("#8a6c32"))
+        c.setFont("Helvetica-Bold", 7.5)
+        c.drawString(x + 16, y + 48, "Dedication")
+        c.setFillColor(HexColor("#53705f"))
+        _draw_wrapped_text(
+            c,
+            dedication_line,
+            x + 16,
+            y + 36,
+            width - 32,
+            line_height=9,
+            font_name="Helvetica",
+            font_size=7.3,
+            color=HexColor("#53705f"),
+            max_lines=2,
+        )
+
+    c.setStrokeColor(HexColor("#dce7de"))
+    c.setLineWidth(0.5)
+    c.line(x + 14, y + 24, x + width - 14, y + 24)
+    c.setFillColor(HexColor("#53705f"))
+    c.setFont("Helvetica", 6.4)
+    c.drawString(x + 16, y + 12, "Scan to open the live tree story")
+    c.drawRightString(x + width - 16, y + 12, "landcheck.online")
+
+
+def render_green_sponsor_qr_sheet_pdf(units: list[dict]) -> bytes:
+    buffer = io.BytesIO()
+    page_w, page_h = A4
+    c = canvas.Canvas(buffer, pagesize=A4)
+
+    margin_x = 22
+    margin_top = 26
+    margin_bottom = 24
+    gap_x = 14
+    gap_y = 14
+    cols = 2
+    rows = 3
+    card_w = (page_w - margin_x * 2 - gap_x) / cols
+    card_h = (page_h - margin_top - margin_bottom - gap_y * (rows - 1)) / rows
+
+    for index, unit in enumerate(units):
+        if index and index % (cols * rows) == 0:
+            c.showPage()
+        page_index = index % (cols * rows)
+        row = page_index // cols
+        col = page_index % cols
+        x = margin_x + col * (card_w + gap_x)
+        y = page_h - margin_top - (row + 1) * card_h - row * gap_y
+        unit_uid = str(unit.get("unit_uid") or unit.get("unit_id") or "").strip()
+        verification_url = str(unit.get("verification_url") or "").strip()
+        if not verification_url:
+            verification_url = f"https://landcheck.online/green/sponsor/public/trees/{unit_uid}"
+        _draw_sponsor_qr_sheet_card(c, unit, verification_url, x, y, card_w, card_h)
 
     c.save()
     buffer.seek(0)
