@@ -17500,6 +17500,7 @@ def assign_public_sponsor_donor_trees(payload: AssignSponsorDonorTreesPayload, d
         ).mappings().all()
 
     updated_rows: list[dict] = []
+    new_species_entries: list[dict] = []
     if normalized_allocations:
         # Each allocation entry links its own batch of the next-available units, in order,
         # so different sub-counts of this assignment can carry different species.
@@ -17509,9 +17510,31 @@ def assign_public_sponsor_donor_trees(payload: AssignSponsorDonorTreesPayload, d
                 continue
             batch_species = str(allocation.get("species") or "").strip() or None
             updated_rows.extend(_link_next_units(batch_count, batch_species))
+            if batch_species:
+                new_species_entries.append({"species": batch_species, "count": batch_count})
     else:
         species_clean = str(payload.species or "").strip() or None
         updated_rows = _link_next_units(requested_count, species_clean)
+        if species_clean:
+            new_species_entries.append({"species": species_clean, "count": requested_count})
+
+    if new_species_entries:
+        # QR exports re-derive each unit's allocated_species from this work order's own
+        # species_allocations column (_sync_sponsor_unit_allocations_for_agent) — without
+        # persisting the species here too, that sync overwrites what we just wrote above
+        # back to NULL ("Unknown species") on the next tag download.
+        existing_species_row = db.execute(
+            text("SELECT species_allocations FROM green_work_orders WHERE id = :id"),
+            {"id": work_order_id},
+        ).mappings().first()
+        existing_allocations = _normalize_species_allocations(
+            _json_value_or((existing_species_row or {}).get("species_allocations"), [])
+        )
+        merged_allocations = _normalize_species_allocations(existing_allocations + new_species_entries)
+        db.execute(
+            text("UPDATE green_work_orders SET species_allocations = CAST(:species_allocations AS JSONB) WHERE id = :id"),
+            {"species_allocations": _safe_json(merged_allocations), "id": work_order_id},
+        )
 
     db.commit()
 
