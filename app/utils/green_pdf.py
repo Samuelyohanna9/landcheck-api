@@ -1074,26 +1074,34 @@ def _draw_sponsor_certificate_evidence_page(
 def render_green_sponsor_qr_sheet_pdf(units: list[dict]) -> bytes:
     """Multi-up sheet using the exact same tag design as the standalone QR tag
     (see _draw_tree_qr_card) — just scaled down to fit several per A4 page.
-    2x2 (4/page) rather than a denser grid, to keep the card's native ~0.658
-    width:height ratio intact instead of squashing it into a squarer cell."""
+    2x3 (6/page), sized to keep the card's native ~0.658 width:height ratio
+    intact instead of squashing it into a squarer cell."""
     buffer = io.BytesIO()
     page_w, page_h = A4
     c = canvas.Canvas(buffer, pagesize=A4)
 
-    margin_x = 28
-    margin_top = 28
-    margin_bottom = 28
-    gap_x = 18
-    gap_y = 18
+    margin_x = 24
+    margin_top = 24
+    margin_bottom = 24
+    gap_x = 14
+    gap_y = 14
     cols = 2
-    rows = 2
-    card_w = (page_w - margin_x * 2 - gap_x) / cols
+    rows = 3
+
+    available_w = page_w - margin_x * 2 - gap_x * (cols - 1)
+    available_h = page_h - margin_top - margin_bottom - gap_y * (rows - 1)
+
+    card_w = available_w / cols
     card_h = card_w * (_TREE_QR_CARD_NATIVE_H / _TREE_QR_CARD_NATIVE_W)
-    # If the native ratio makes cards taller than the page allows, fall back to
-    # filling the available height instead (still uniform width/height per card).
-    max_card_h = (page_h - margin_top - margin_bottom - gap_y * (rows - 1)) / rows
+    # Keep the card's native aspect ratio — if that height would overflow the
+    # page at this width, shrink both dimensions together (not just squash height).
+    max_card_h = available_h / rows
     if card_h > max_card_h:
         card_h = max_card_h
+        card_w = card_h * (_TREE_QR_CARD_NATIVE_W / _TREE_QR_CARD_NATIVE_H)
+
+    grid_w = card_w * cols + gap_x * (cols - 1)
+    start_x = margin_x + (available_w - grid_w) / 2
 
     for index, unit in enumerate(units):
         if index and index % (cols * rows) == 0:
@@ -1101,7 +1109,7 @@ def render_green_sponsor_qr_sheet_pdf(units: list[dict]) -> bytes:
         page_index = index % (cols * rows)
         row = page_index // cols
         col = page_index % cols
-        x = margin_x + col * (card_w + gap_x)
+        x = start_x + col * (card_w + gap_x)
         y = page_h - margin_top - (row + 1) * card_h - row * gap_y
         unit_uid = str(unit.get("unit_uid") or unit.get("unit_id") or "").strip()
         verification_url = str(unit.get("verification_url") or "").strip()
