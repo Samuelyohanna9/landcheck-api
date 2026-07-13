@@ -17067,6 +17067,125 @@ def list_admin_sponsor_qr_status(
     return payload
 
 
+def _reissue_sponsor_qr_unit_core(
+    db: Session,
+    *,
+    unit_id: int,
+    agent_user_id: int,
+    reviewer_name: str | None,
+) -> dict:
+    """Shared by the single and bulk reissue endpoints. Raises HTTPException on
+    validation failure and commits on success. Callers looping over multiple
+    units should catch HTTPException per-unit (and roll back just that attempt)
+    so one bad unit_id doesn't abort tags already reissued earlier in the batch."""
+    _ensure_sponsor_qr_unit_columns(db)
+    unit_row = db.execute(
+        text(
+            """
+            SELECT id, project_id, tree_id, sponsorship_status
+            FROM green_sponsorship_units
+            WHERE id = :unit_id
+            LIMIT 1
+            """
+        ),
+        {"unit_id": int(unit_id)},
+    ).mappings().first()
+    if not unit_row:
+        raise HTTPException(status_code=404, detail="Sponsor QR tag not found")
+    if unit_row.get("tree_id") is not None:
+        raise HTTPException(status_code=409, detail="This sponsor QR tag is already linked to a planted tree")
+    if _normalize_name(unit_row.get("sponsorship_status")) != "awaiting_tree":
+        raise HTTPException(status_code=409, detail="Only sponsor units awaiting planting can be reissued")
+
+    project_row = _load_public_sponsorship_project_row(db, project_id=int(unit_row.get("project_id") or 0))
+    organization_id = int(project_row.get("organization_id") or 0) or None
+    explicit_agent_ids = _normalize_positive_int_list(_json_value_or(project_row.get("public_sponsor_agent_user_ids"), []))
+    try:
+        selected_agent_ids = _collect_public_sponsor_agent_user_ids_for_project(
+            db,
+            project_id=int(project_row.get("id") or 0),
+            organization_id=organization_id,
+            explicit_user_ids=explicit_agent_ids,
+        )
+    except Exception:
+        _rollback_quietly(db)
+        selected_agent_ids = explicit_agent_ids
+    normalized_agent_id = int(agent_user_id or 0)
+    if normalized_agent_id <= 0:
+        raise HTTPException(status_code=400, detail="Select a sponsor agent to receive this QR tag")
+    if normalized_agent_id not in set(selected_agent_ids):
+        raise HTTPException(status_code=403, detail="Selected user is not saved as a sponsor agent for this project")
+
+    agent_row = _get_green_user_for_sponsor_agent(
+        db,
+        user_id=normalized_agent_id,
+        organization_id=organization_id,
+    )
+    assigned_assignee_name = (
+        str(agent_row.get("full_name") or agent_row.get("work_username") or "").strip() or None
+    )
+    updated_row = db.execute(
+        text(
+            """
+            UPDATE green_sponsorship_units
+            SET assigned_user_id = :agent_user_id,
+                assigned_assignee_name = :assigned_assignee_name,
+                assigned_at = NOW(),
+                assigned_work_order_id = NULL,
+                updated_at = NOW()
+            WHERE id = :unit_id
+            RETURNING id, project_id, assigned_user_id, assigned_assignee_name, assigned_at
+            """
+        ),
+        {
+            "unit_id": int(unit_id),
+            "agent_user_id": normalized_agent_id,
+            "assigned_assignee_name": assigned_assignee_name,
+        },
+    ).mappings().first()
+    _sync_sponsor_unit_allocations_for_agent(
+        db,
+        project_id=int(project_row["id"]),
+        user_id=int(normalized_agent_id),
+        organization_id=organization_id,
+    )
+    db.commit()
+
+    assignee_name = str(agent_row.get("full_name") or agent_row.get("work_username") or "").strip() or None
+    if assignee_name:
+        project_name = str(project_row.get("name") or "this project").strip() or "this project"
+        try:
+            _queue_green_push_to_assignee(
+                db,
+                project_id=int(project_row["id"]),
+                assignee_name=assignee_name,
+                title="Sponsor QR tag reissued",
+                body=f"A sponsor-funded QR tag was reissued to you in {project_name}. Open Map & Add Tree to download it before planting.",
+                data={
+                    "type": "sponsor_qr_reissued",
+                    "project_id": int(project_row["id"]),
+                    "unit_id": int(unit_id),
+                    "reviewer_name": str(reviewer_name or "").strip() or None,
+                },
+            )
+        except Exception:
+            logger.exception(
+                "Sponsor QR reissue push notification failed for unit_id=%s project_id=%s agent_user_id=%s",
+                int(unit_id),
+                int(project_row["id"]),
+                int(normalized_agent_id),
+            )
+
+    return {
+        "ok": True,
+        "unit_id": int(unit_id),
+        "project_id": int(project_row["id"]),
+        "assigned_user_id": int((updated_row or {}).get("assigned_user_id") or normalized_agent_id),
+        "assigned_assignee_name": str((updated_row or {}).get("assigned_assignee_name") or assigned_assignee_name or "").strip() or None,
+        "assigned_at": (updated_row or {}).get("assigned_at"),
+    }
+
+
 @router.post("/admin/sponsor-qr-status/{unit_id}/reissue")
 def reissue_admin_sponsor_qr_status(
     unit_id: int,
@@ -17075,118 +17194,394 @@ def reissue_admin_sponsor_qr_status(
     db: Session = Depends(get_db),
 ):
     try:
-        _ensure_sponsor_qr_unit_columns(db)
-        unit_row = db.execute(
-            text(
-                """
-                SELECT id, project_id, tree_id, sponsorship_status
-                FROM green_sponsorship_units
-                WHERE id = :unit_id
-                LIMIT 1
-                """
-            ),
-            {"unit_id": int(unit_id)},
-        ).mappings().first()
-        if not unit_row:
-            raise HTTPException(status_code=404, detail="Sponsor QR tag not found")
-        if unit_row.get("tree_id") is not None:
-            raise HTTPException(status_code=409, detail="This sponsor QR tag is already linked to a planted tree")
-        if _normalize_name(unit_row.get("sponsorship_status")) != "awaiting_tree":
-            raise HTTPException(status_code=409, detail="Only sponsor units awaiting planting can be reissued")
-
-        project_row = _load_public_sponsorship_project_row(db, project_id=int(unit_row.get("project_id") or 0))
-        organization_id = int(project_row.get("organization_id") or 0) or None
-        explicit_agent_ids = _normalize_positive_int_list(_json_value_or(project_row.get("public_sponsor_agent_user_ids"), []))
-        try:
-            selected_agent_ids = _collect_public_sponsor_agent_user_ids_for_project(
-                db,
-                project_id=int(project_row.get("id") or 0),
-                organization_id=organization_id,
-                explicit_user_ids=explicit_agent_ids,
-            )
-        except Exception:
-            _rollback_quietly(db)
-            selected_agent_ids = explicit_agent_ids
-        normalized_agent_id = int(agent_user_id or 0)
-        if normalized_agent_id <= 0:
-            raise HTTPException(status_code=400, detail="Select a sponsor agent to receive this QR tag")
-        if normalized_agent_id not in set(selected_agent_ids):
-            raise HTTPException(status_code=403, detail="Selected user is not saved as a sponsor agent for this project")
-
-        agent_row = _get_green_user_for_sponsor_agent(
-            db,
-            user_id=normalized_agent_id,
-            organization_id=organization_id,
+        return _reissue_sponsor_qr_unit_core(
+            db, unit_id=unit_id, agent_user_id=agent_user_id, reviewer_name=reviewer_name
         )
-        assigned_assignee_name = (
-            str(agent_row.get("full_name") or agent_row.get("work_username") or "").strip() or None
-        )
-        updated_row = db.execute(
-            text(
-                """
-                UPDATE green_sponsorship_units
-                SET assigned_user_id = :agent_user_id,
-                    assigned_assignee_name = :assigned_assignee_name,
-                    assigned_at = NOW(),
-                    assigned_work_order_id = NULL,
-                    updated_at = NOW()
-                WHERE id = :unit_id
-                RETURNING id, project_id, assigned_user_id, assigned_assignee_name, assigned_at
-                """
-            ),
-            {
-                "unit_id": int(unit_id),
-                "agent_user_id": normalized_agent_id,
-                "assigned_assignee_name": assigned_assignee_name,
-            },
-        ).mappings().first()
-        _sync_sponsor_unit_allocations_for_agent(
-            db,
-            project_id=int(project_row["id"]),
-            user_id=int(normalized_agent_id),
-            organization_id=organization_id,
-        )
-        db.commit()
-
-        assignee_name = str(agent_row.get("full_name") or agent_row.get("work_username") or "").strip() or None
-        if assignee_name:
-            project_name = str(project_row.get("name") or "this project").strip() or "this project"
-            try:
-                _queue_green_push_to_assignee(
-                    db,
-                    project_id=int(project_row["id"]),
-                    assignee_name=assignee_name,
-                    title="Sponsor QR tag reissued",
-                    body=f"A sponsor-funded QR tag was reissued to you in {project_name}. Open Map & Add Tree to download it before planting.",
-                    data={
-                        "type": "sponsor_qr_reissued",
-                        "project_id": int(project_row["id"]),
-                        "unit_id": int(unit_id),
-                        "reviewer_name": str(reviewer_name or "").strip() or None,
-                    },
-                )
-            except Exception:
-                logger.exception(
-                    "Sponsor QR reissue push notification failed for unit_id=%s project_id=%s agent_user_id=%s",
-                    int(unit_id),
-                    int(project_row["id"]),
-                    int(normalized_agent_id),
-                )
-
-        return {
-            "ok": True,
-            "unit_id": int(unit_id),
-            "project_id": int(project_row["id"]),
-            "assigned_user_id": int((updated_row or {}).get("assigned_user_id") or normalized_agent_id),
-            "assigned_assignee_name": str((updated_row or {}).get("assigned_assignee_name") or assigned_assignee_name or "").strip() or None,
-            "assigned_at": (updated_row or {}).get("assigned_at"),
-        }
     except HTTPException:
         raise
     except Exception as exc:
         db.rollback()
         logger.exception("Sponsor QR reissue failed for unit_id=%s", int(unit_id))
         raise HTTPException(status_code=500, detail=f"Sponsor QR reissue failed: {str(exc)}")
+
+
+class BulkReissueSponsorQrPayload(BaseModel):
+    unit_ids: list[int]
+    agent_user_id: int
+    reviewer_name: str | None = None
+
+
+@router.post("/admin/sponsor-qr-status/reissue-bulk")
+def reissue_admin_sponsor_qr_status_bulk(
+    payload: BulkReissueSponsorQrPayload,
+    db: Session = Depends(get_db),
+):
+    unit_ids = _normalize_positive_int_list(payload.unit_ids)
+    if not unit_ids:
+        raise HTTPException(status_code=400, detail="Select at least one sponsor QR tag to reissue")
+    if len(unit_ids) > 200:
+        raise HTTPException(status_code=400, detail="Reissue at most 200 sponsor QR tags at a time")
+
+    results: list[dict] = []
+    succeeded = 0
+    for unit_id in unit_ids:
+        try:
+            result = _reissue_sponsor_qr_unit_core(
+                db, unit_id=unit_id, agent_user_id=payload.agent_user_id, reviewer_name=payload.reviewer_name
+            )
+            results.append({"unit_id": int(unit_id), "ok": True, **result})
+            succeeded += 1
+        except HTTPException as exc:
+            db.rollback()
+            results.append({"unit_id": int(unit_id), "ok": False, "error": exc.detail})
+        except Exception as exc:
+            db.rollback()
+            logger.exception("Bulk sponsor QR reissue failed for unit_id=%s", int(unit_id))
+            results.append({"unit_id": int(unit_id), "ok": False, "error": str(exc)})
+
+    return {
+        "ok": succeeded > 0,
+        "succeeded": succeeded,
+        "failed": len(unit_ids) - succeeded,
+        "results": results,
+    }
+
+
+# ─── Per-sponsor planting assignment (public-sponsor-route projects only) ──
+# Lets a super admin pick a specific PAID sponsor, see how many of that
+# sponsor's trees are already assigned (and to whom), and assign some/all of
+# the remaining unassigned ones to an agent — or cancel an assignment that
+# hasn't been planted yet. This is the donor-scoped alternative to typing a
+# flat target_trees number into a work order.
+
+@router.get("/admin/public-sponsor-donors")
+def list_admin_public_sponsor_donors(project_id: int = Query(...), db: Session = Depends(get_db)):
+    _ensure_sponsor_qr_unit_columns(db)
+    project_row = _load_public_sponsorship_project_row(db, project_id=int(project_id))
+    if not _is_public_sponsorship_project(dict(project_row)):
+        raise HTTPException(status_code=400, detail="This view is only available for public-sponsor-route projects")
+    _promote_project_paid_units_to_awaiting_tree(db, int(project_row["id"]))
+
+    rows = db.execute(
+        text(
+            """
+            SELECT
+                u.id AS unit_id,
+                u.sponsor_account_id,
+                sa.full_name AS sponsor_name,
+                sa.organization_name AS sponsor_organization_name,
+                u.tree_id,
+                u.sponsorship_status,
+                u.assigned_user_id,
+                u.assigned_assignee_name,
+                gu.full_name AS assigned_agent_full_name,
+                gu.work_username AS assigned_agent_username
+            FROM green_sponsorship_units u
+            JOIN green_sponsor_accounts sa ON sa.id = u.sponsor_account_id
+            LEFT JOIN green_users gu ON gu.id = u.assigned_user_id
+            WHERE u.project_id = :project_id
+              AND LOWER(COALESCE(u.sponsorship_status, '')) <> 'awaiting_payment'
+            ORDER BY sa.full_name ASC, u.created_at ASC
+            """
+        ),
+        {"project_id": int(project_row["id"])},
+    ).mappings().all()
+
+    donors: dict[int, dict] = {}
+    for row in rows:
+        sponsor_id = int(row["sponsor_account_id"] or 0)
+        if sponsor_id <= 0:
+            continue
+        donor = donors.setdefault(
+            sponsor_id,
+            {
+                "sponsor_account_id": sponsor_id,
+                "sponsor_name": row.get("sponsor_name"),
+                "sponsor_organization_name": row.get("sponsor_organization_name"),
+                "total_paid_trees": 0,
+                "planted": 0,
+                "assigned_unplanted": 0,
+                "unassigned_remaining": 0,
+                "assignments": {},
+            },
+        )
+        donor["total_paid_trees"] += 1
+        is_planted = row.get("tree_id") is not None
+        assigned_assignee_name_clean = str(row.get("assigned_assignee_name") or "").strip()
+        is_assigned = row.get("assigned_user_id") is not None or bool(assigned_assignee_name_clean)
+        if is_planted:
+            donor["planted"] += 1
+        elif is_assigned:
+            donor["assigned_unplanted"] += 1
+            agent_key = int(row["assigned_user_id"]) if row.get("assigned_user_id") else 0
+            agent_name = (
+                row.get("assigned_agent_full_name")
+                or row.get("assigned_agent_username")
+                or assigned_assignee_name_clean
+                or "Unknown agent"
+            )
+            bucket = donor["assignments"].setdefault(
+                agent_key, {"agent_user_id": agent_key or None, "agent_name": agent_name, "count": 0, "unit_ids": []}
+            )
+            bucket["count"] += 1
+            bucket["unit_ids"].append(int(row["unit_id"]))
+        else:
+            donor["unassigned_remaining"] += 1
+
+    result = []
+    for donor in donors.values():
+        donor["assignments"] = list(donor["assignments"].values())
+        result.append(donor)
+    result.sort(key=lambda d: str(d.get("sponsor_name") or "").lower())
+    return result
+
+
+class AssignSponsorDonorTreesPayload(BaseModel):
+    project_id: int
+    sponsor_account_id: int
+    agent_user_id: int
+    count: int | None = None  # omit or <=0 to mean "all remaining"
+    species: str | None = None
+
+
+@router.post("/admin/public-sponsor-donors/assign")
+def assign_public_sponsor_donor_trees(payload: AssignSponsorDonorTreesPayload, db: Session = Depends(get_db)):
+    _ensure_sponsor_qr_unit_columns(db)
+    work_order_assignee_user_available = _ensure_work_order_assignee_columns(db)
+    project_row = _load_public_sponsorship_project_row(db, project_id=int(payload.project_id))
+    if not _is_public_sponsorship_project(dict(project_row)):
+        raise HTTPException(status_code=400, detail="This assignment flow is only available for public-sponsor-route projects")
+
+    organization_id = int(project_row.get("organization_id") or 0) or None
+    explicit_agent_ids = _normalize_positive_int_list(_json_value_or(project_row.get("public_sponsor_agent_user_ids"), []))
+    try:
+        selected_agent_ids = _collect_public_sponsor_agent_user_ids_for_project(
+            db,
+            project_id=int(project_row["id"]),
+            organization_id=organization_id,
+            explicit_user_ids=explicit_agent_ids,
+        )
+    except Exception:
+        _rollback_quietly(db)
+        selected_agent_ids = explicit_agent_ids
+    normalized_agent_id = int(payload.agent_user_id or 0)
+    if normalized_agent_id <= 0:
+        raise HTTPException(status_code=400, detail="Select a sponsor agent")
+    if normalized_agent_id not in set(_normalize_positive_int_list(selected_agent_ids)):
+        raise HTTPException(status_code=403, detail="Selected user is not saved as a sponsor agent for this project")
+
+    agent_row = _get_green_user_for_sponsor_agent(db, user_id=normalized_agent_id, organization_id=organization_id)
+    agent_name = str(agent_row.get("full_name") or agent_row.get("work_username") or "").strip() or None
+    if not agent_name:
+        raise HTTPException(status_code=400, detail="Could not resolve the selected agent's name")
+
+    sponsor_id = int(payload.sponsor_account_id or 0)
+    if sponsor_id <= 0:
+        raise HTTPException(status_code=400, detail="Select a sponsor")
+
+    remaining_count = db.execute(
+        text(
+            """
+            SELECT COUNT(*) FROM green_sponsorship_units
+            WHERE project_id = :project_id AND sponsor_account_id = :sponsor_id
+              AND tree_id IS NULL
+              AND LOWER(COALESCE(sponsorship_status, '')) = 'awaiting_tree'
+              AND assigned_user_id IS NULL
+              AND NULLIF(BTRIM(COALESCE(assigned_assignee_name, '')), '') IS NULL
+            """
+        ),
+        {"project_id": int(project_row["id"]), "sponsor_id": sponsor_id},
+    ).scalar()
+    remaining_count_value = int(remaining_count or 0)
+    if remaining_count_value <= 0:
+        raise HTTPException(status_code=409, detail="This sponsor has no remaining unassigned trees in this project")
+
+    requested_count = int(payload.count) if payload.count and int(payload.count) > 0 else remaining_count_value
+    if requested_count > remaining_count_value:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Only {remaining_count_value} unassigned tree{'' if remaining_count_value == 1 else 's'} remain for this sponsor.",
+        )
+
+    # Reuse an open planting work order for this agent if one exists, so the mobile
+    # Map "Remaining" counter and KPI system stay in lockstep with real assignments.
+    work_order_row = db.execute(
+        text(
+            f"""
+            SELECT id FROM green_work_orders
+            WHERE project_id = :project_id
+              AND LOWER(REPLACE(REPLACE(COALESCE(work_type, ''), '-', '_'), ' ', '_')) = 'planting'
+              AND LOWER(COALESCE(status, 'assigned')) NOT IN ('done', 'completed', 'closed', 'cancelled')
+              AND ({"assignee_user_id = :agent_user_id OR " if work_order_assignee_user_available else ""}LOWER(REGEXP_REPLACE(TRIM(COALESCE(assignee_name, '')), '\\s+', ' ', 'g')) = LOWER(REGEXP_REPLACE(TRIM(:agent_name), '\\s+', ' ', 'g')))
+            ORDER BY created_at DESC
+            LIMIT 1
+            """
+        ),
+        {"project_id": int(project_row["id"]), "agent_user_id": normalized_agent_id, "agent_name": agent_name},
+    ).mappings().first()
+
+    if work_order_row:
+        work_order_id = int(work_order_row["id"])
+        db.execute(
+            text("UPDATE green_work_orders SET target_trees = COALESCE(target_trees, 0) + :count, last_update = NOW() WHERE id = :id"),
+            {"count": requested_count, "id": work_order_id},
+        )
+    else:
+        insert_cols = "project_id, assignee_name, work_type, target_trees, status"
+        insert_vals = ":project_id, :assignee_name, 'planting', :target_trees, 'assigned'"
+        insert_params = {
+            "project_id": int(project_row["id"]),
+            "assignee_name": agent_name,
+            "target_trees": requested_count,
+        }
+        if work_order_assignee_user_available:
+            insert_cols += ", assignee_user_id"
+            insert_vals += ", :assignee_user_id"
+            insert_params["assignee_user_id"] = normalized_agent_id
+        work_order_id = db.execute(
+            text(f"INSERT INTO green_work_orders ({insert_cols}) VALUES ({insert_vals}) RETURNING id"),
+            insert_params,
+        ).scalar()
+
+    species_clean = str(payload.species or "").strip() or None
+
+    updated_rows = db.execute(
+        text(
+            """
+            WITH next_units AS (
+                SELECT id FROM green_sponsorship_units
+                WHERE project_id = :project_id AND sponsor_account_id = :sponsor_id
+                  AND tree_id IS NULL
+                  AND LOWER(COALESCE(sponsorship_status, '')) = 'awaiting_tree'
+                  AND assigned_user_id IS NULL
+                  AND NULLIF(BTRIM(COALESCE(assigned_assignee_name, '')), '') IS NULL
+                ORDER BY created_at ASC, id ASC
+                LIMIT :count
+            )
+            UPDATE green_sponsorship_units u
+            SET assigned_user_id = :agent_user_id,
+                assigned_assignee_name = :agent_name,
+                assigned_work_order_id = :work_order_id,
+                assigned_at = NOW(),
+                allocated_species = COALESCE(:species, allocated_species),
+                updated_at = NOW()
+            FROM next_units nu
+            WHERE u.id = nu.id
+            RETURNING u.id
+            """
+        ),
+        {
+            "project_id": int(project_row["id"]),
+            "sponsor_id": sponsor_id,
+            "count": requested_count,
+            "agent_user_id": normalized_agent_id,
+            "agent_name": agent_name,
+            "work_order_id": work_order_id,
+            "species": species_clean,
+        },
+    ).mappings().all()
+
+    db.commit()
+
+    try:
+        project_name = str(project_row.get("name") or "this project").strip() or "this project"
+        _queue_green_push_to_assignee(
+            db,
+            project_id=int(project_row["id"]),
+            assignee_name=agent_name,
+            title="New sponsor trees assigned",
+            body=(
+                f"{len(updated_rows)} sponsor-funded tree{'' if len(updated_rows) == 1 else 's'} assigned to you in "
+                f"{project_name}. Open Map & Add Tree to download the QR sheet."
+            ),
+            data={
+                "type": "sponsor_trees_assigned",
+                "project_id": int(project_row["id"]),
+                "work_order_id": int(work_order_id),
+            },
+        )
+    except Exception:
+        logger.exception(
+            "Sponsor donor assignment push notification failed for project_id=%s agent_user_id=%s",
+            int(project_row["id"]),
+            normalized_agent_id,
+        )
+
+    return {
+        "ok": True,
+        "assigned_count": len(updated_rows),
+        "work_order_id": int(work_order_id),
+        "unit_ids": [int(r["id"]) for r in updated_rows],
+    }
+
+
+class UnassignSponsorDonorUnitsPayload(BaseModel):
+    unit_ids: list[int]
+
+
+@router.post("/admin/public-sponsor-donors/unassign")
+def unassign_public_sponsor_donor_units(payload: UnassignSponsorDonorUnitsPayload, db: Session = Depends(get_db)):
+    unit_ids = _normalize_positive_int_list(payload.unit_ids)
+    if not unit_ids:
+        raise HTTPException(status_code=400, detail="Select at least one assigned tree to cancel")
+    if len(unit_ids) > 200:
+        raise HTTPException(status_code=400, detail="Cancel at most 200 assignments at a time")
+
+    results: list[dict] = []
+    succeeded = 0
+    for unit_id in unit_ids:
+        try:
+            unit_row = db.execute(
+                text("SELECT id, tree_id, assigned_work_order_id FROM green_sponsorship_units WHERE id = :id"),
+                {"id": int(unit_id)},
+            ).mappings().first()
+            if not unit_row:
+                raise HTTPException(status_code=404, detail="Sponsor unit not found")
+            if unit_row.get("tree_id") is not None:
+                raise HTTPException(status_code=409, detail="This tree has already been planted and cannot be unassigned")
+            work_order_id = unit_row.get("assigned_work_order_id")
+            db.execute(
+                text(
+                    """
+                    UPDATE green_sponsorship_units
+                    SET assigned_user_id = NULL,
+                        assigned_assignee_name = NULL,
+                        assigned_work_order_id = NULL,
+                        assigned_at = NULL,
+                        updated_at = NOW()
+                    WHERE id = :id
+                    """
+                ),
+                {"id": int(unit_id)},
+            )
+            if work_order_id:
+                db.execute(
+                    text(
+                        """
+                        UPDATE green_work_orders
+                        SET target_trees = GREATEST(COALESCE(target_trees, 0) - 1, 0), last_update = NOW()
+                        WHERE id = :work_order_id
+                        """
+                    ),
+                    {"work_order_id": int(work_order_id)},
+                )
+            db.commit()
+            results.append({"unit_id": int(unit_id), "ok": True})
+            succeeded += 1
+        except HTTPException as exc:
+            db.rollback()
+            results.append({"unit_id": int(unit_id), "ok": False, "error": exc.detail})
+        except Exception as exc:
+            db.rollback()
+            logger.exception("Unassign sponsor donor unit failed for unit_id=%s", int(unit_id))
+            results.append({"unit_id": int(unit_id), "ok": False, "error": str(exc)})
+
+    return {
+        "ok": succeeded > 0,
+        "succeeded": succeeded,
+        "failed": len(unit_ids) - succeeded,
+        "results": results,
+    }
 
 
 @router.post("/admin/sponsorship-orders/{order_id}/assign-agent")
@@ -26042,12 +26437,38 @@ def create_work_order(
                 status_code=409,
                 detail="No paid sponsor trees are currently awaiting planting in this project. Capture payment-backed sponsor trees first, then assign planting work.",
             )
-        if int(target_trees or 0) > awaiting_tree_backlog_value:
+        # The backlog above is shared across every agent's active planting order on this
+        # project — a brand-new assignment must not promise trees that are already spoken
+        # for by another agent's still-outstanding (unplanted) quota, or two agents can each
+        # pass this check individually while jointly over-committing the same backlog.
+        committed_to_other_orders = db.execute(
+            text(
+                """
+                SELECT COALESCE(SUM(GREATEST(target_trees - COALESCE(planted_count, 0), 0)), 0)
+                FROM green_work_orders
+                WHERE project_id = :project_id
+                  AND LOWER(REPLACE(REPLACE(COALESCE(work_type, ''), '-', '_'), ' ', '_')) = 'planting'
+                  AND LOWER(COALESCE(status, 'assigned')) NOT IN ('done', 'completed', 'closed', 'cancelled')
+                """
+            ),
+            {"project_id": int(project_id)},
+        ).scalar()
+        committed_to_other_orders_value = int(committed_to_other_orders or 0)
+        available_for_new_order = max(awaiting_tree_backlog_value - committed_to_other_orders_value, 0)
+        if available_for_new_order <= 0:
             raise HTTPException(
                 status_code=409,
                 detail=(
-                    f"Only {awaiting_tree_backlog_value} paid sponsor tree"
-                    f"{'' if awaiting_tree_backlog_value == 1 else 's'} are currently awaiting planting in this project."
+                    f"All {awaiting_tree_backlog_value} paid sponsor tree{'' if awaiting_tree_backlog_value == 1 else 's'} awaiting "
+                    "planting in this project are already committed to other agents' active planting orders."
+                ),
+            )
+        if int(target_trees or 0) > available_for_new_order:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"Only {available_for_new_order} paid sponsor tree{'' if available_for_new_order == 1 else 's'} are available for a "
+                    f"new assignment in this project ({committed_to_other_orders_value} already committed to other agents' active orders)."
                 ),
             )
     auto_assign_first_cycle_maintenance = bool(auto_assign_first_cycle_maintenance) and work_type == "planting"
