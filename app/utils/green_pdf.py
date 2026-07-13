@@ -1071,109 +1071,29 @@ def _draw_sponsor_certificate_evidence_page(
     c.drawRightString(page_w - 42, 30, "LandCheck Green sponsor certificate evidence page")
 
 
-def _draw_sponsor_qr_sheet_card(c, unit: dict, verification_url: str, x: float, y: float, width: float, height: float):
-    c.setFillColor(HexColor("#ffffff"))
-    c.setStrokeColor(HexColor("#083e20"))
-    c.setLineWidth(1)
-    c.roundRect(x, y, width, height, 14, stroke=1, fill=1)
-
-    c.setFillColor(HexColor("#083e20"))
-    c.roundRect(x + 10, y + height - 40, width - 20, 28, 9, stroke=0, fill=1)
-    c.setFillColor(HexColor("#ffffff"))
-    c.setFont("Helvetica-Bold", 10)
-    c.drawString(x + 18, y + height - 22, "LANDCHECK GREEN")
-    c.setFillColor(HexColor("#d7b57a"))
-    c.setFont("Helvetica-Bold", 7.2)
-    c.drawRightString(x + width - 18, y + height - 22, "SPONSOR QR TAG")
-
-    sponsor_name = str(unit.get("sponsor_name") or unit.get("sponsor_organization_name") or "Sponsor tree").strip()
-    unit_ref = str(unit.get("unit_uid") or f"Unit #{int(unit.get('unit_id') or 0)}").strip()
-    species_label = str(unit.get("species") or "").strip() or "Species pending allocation"
-    project_name = str(unit.get("project_name") or "LandCheck sponsor project").strip()
-    dedication_bits = [
-        str(unit.get("dedication_type") or "").replace("_", " ").title().strip(),
-        str(unit.get("dedication_name") or "").strip(),
-    ]
-    dedication_line = " | ".join([item for item in dedication_bits if item])
-
-    c.setFillColor(HexColor("#083e20"))
-    c.setFont("Helvetica-Bold", 9.5)
-    c.drawString(x + 16, y + height - 58, sponsor_name[:34])
-    c.setFillColor(HexColor("#53705f"))
-    c.setFont("Helvetica", 7.6)
-    c.drawString(x + 16, y + height - 72, unit_ref[:36])
-
-    qr_size = min(92, width - 44)
-    qr_x = x + 16
-    qr_y = y + height - 176
-    _draw_qr_code(c, verification_url, qr_x, qr_y, qr_size)
-
-    c.setFillColor(HexColor("#083e20"))
-    c.setFont("Helvetica-Bold", 8)
-    c.drawString(x + 122, y + height - 96, "Species")
-    c.setFillColor(HexColor("#163826"))
-    c.setFont("Helvetica", 8.2)
-    c.drawString(x + 122, y + height - 108, species_label[:20])
-
-    c.setFillColor(HexColor("#083e20"))
-    c.setFont("Helvetica-Bold", 8)
-    c.drawString(x + 122, y + height - 128, "Project")
-    c.setFillColor(HexColor("#163826"))
-    c.setFont("Helvetica", 8.2)
-    c.drawString(x + 122, y + height - 140, project_name[:22])
-
-    c.setFillColor(HexColor("#083e20"))
-    c.setFont("Helvetica-Bold", 8)
-    c.drawString(x + 122, y + height - 160, "Status")
-    c.setFillColor(HexColor("#163826"))
-    c.setFont("Helvetica", 8.2)
-    c.drawString(
-        x + 122,
-        y + height - 172,
-        str(unit.get("tree_status") or unit.get("sponsorship_status") or "awaiting_tree").replace("_", " ").title()[:22],
-    )
-
-    if dedication_line:
-        c.setFillColor(HexColor("#8a6c32"))
-        c.setFont("Helvetica-Bold", 7.5)
-        c.drawString(x + 16, y + 48, "Dedication")
-        c.setFillColor(HexColor("#53705f"))
-        _draw_wrapped_text(
-            c,
-            dedication_line,
-            x + 16,
-            y + 36,
-            width - 32,
-            line_height=9,
-            font_name="Helvetica",
-            font_size=7.3,
-            color=HexColor("#53705f"),
-            max_lines=2,
-        )
-
-    c.setStrokeColor(HexColor("#dce7de"))
-    c.setLineWidth(0.5)
-    c.line(x + 14, y + 24, x + width - 14, y + 24)
-    c.setFillColor(HexColor("#53705f"))
-    c.setFont("Helvetica", 6.4)
-    c.drawString(x + 16, y + 12, "Scan to open the live tree story")
-    c.drawRightString(x + width - 16, y + 12, "landcheck.online")
-
-
 def render_green_sponsor_qr_sheet_pdf(units: list[dict]) -> bytes:
+    """Multi-up sheet using the exact same tag design as the standalone QR tag
+    (see _draw_tree_qr_card) — just scaled down to fit several per A4 page.
+    2x2 (4/page) rather than a denser grid, to keep the card's native ~0.658
+    width:height ratio intact instead of squashing it into a squarer cell."""
     buffer = io.BytesIO()
     page_w, page_h = A4
     c = canvas.Canvas(buffer, pagesize=A4)
 
-    margin_x = 22
-    margin_top = 26
-    margin_bottom = 24
-    gap_x = 14
-    gap_y = 14
+    margin_x = 28
+    margin_top = 28
+    margin_bottom = 28
+    gap_x = 18
+    gap_y = 18
     cols = 2
-    rows = 3
+    rows = 2
     card_w = (page_w - margin_x * 2 - gap_x) / cols
-    card_h = (page_h - margin_top - margin_bottom - gap_y * (rows - 1)) / rows
+    card_h = card_w * (_TREE_QR_CARD_NATIVE_H / _TREE_QR_CARD_NATIVE_W)
+    # If the native ratio makes cards taller than the page allows, fall back to
+    # filling the available height instead (still uniform width/height per card).
+    max_card_h = (page_h - margin_top - margin_bottom - gap_y * (rows - 1)) / rows
+    if card_h > max_card_h:
+        card_h = max_card_h
 
     for index, unit in enumerate(units):
         if index and index % (cols * rows) == 0:
@@ -1187,7 +1107,7 @@ def render_green_sponsor_qr_sheet_pdf(units: list[dict]) -> bytes:
         verification_url = str(unit.get("verification_url") or "").strip()
         if not verification_url:
             verification_url = f"https://landcheck.online/green/sponsor/public/trees/{unit_uid}"
-        _draw_sponsor_qr_sheet_card(c, unit, verification_url, x, y, card_w, card_h)
+        _draw_tree_qr_card(c, x, y, card_w, card_h, unit, verification_url)
 
     c.save()
     buffer.seek(0)
@@ -4727,32 +4647,39 @@ def render_green_relief_programme_pdf(
     c.save()
 
 
-def render_green_tree_qr_tag_pdf(tree: dict, verification_url: str) -> bytes:
-    import io
-    from datetime import datetime
-    buffer = io.BytesIO()
-    page_w = 250
-    page_h = 380
-    c = canvas.Canvas(buffer, pagesize=(page_w, page_h))
-    
+# Native design size. _draw_tree_qr_card scales to this ratio (≈0.658) via a
+# canvas transform so the standalone tag and every card in a multi-up sheet
+# render the pixel-identical design, just at a different size.
+_TREE_QR_CARD_NATIVE_W = 250
+_TREE_QR_CARD_NATIVE_H = 380
+
+
+def _draw_tree_qr_card(c, x: float, y: float, w: float, h: float, tree: dict, verification_url: str):
+    page_w = _TREE_QR_CARD_NATIVE_W
+    page_h = _TREE_QR_CARD_NATIVE_H
+    scale = w / page_w
+    c.saveState()
+    c.translate(x, y)
+    c.scale(scale, scale)
+
     # Background
     c.setFillColor(HexColor("#fafaf7"))
     c.rect(0, 0, page_w, page_h, stroke=0, fill=1)
-    
+
     # Outer border
     c.setStrokeColor(HexColor("#083e20")) # Forest Green
     c.setLineWidth(1.5)
     c.rect(8, 8, page_w - 16, page_h - 16, stroke=1, fill=0)
-    
+
     # Inner thin gold border
     c.setStrokeColor(HexColor("#c5a059")) # Gold
     c.setLineWidth(0.6)
     c.rect(12, 12, page_w - 24, page_h - 24, stroke=1, fill=0)
-    
+
     # Top Header Bar
     c.setFillColor(HexColor("#083e20"))
     c.rect(12, page_h - 52, page_w - 24, 40, stroke=0, fill=1)
-    
+
     # Header Text
     c.setFillColor(HexColor("#ffffff"))
     c.setFont("Helvetica-Bold", 10)
@@ -4760,7 +4687,7 @@ def render_green_tree_qr_tag_pdf(tree: dict, verification_url: str) -> bytes:
     c.setFont("Helvetica", 7.5)
     c.setFillColor(HexColor("#c5a059"))
     c.drawCentredString(page_w / 2, page_h - 43, "VERIFIED TREE RECORD")
-    
+
     # Tree Identification
     unit_uid = str(tree.get("unit_uid") or "").strip() or None
     tree_id_value = tree.get("tree_id")
@@ -4787,22 +4714,22 @@ def render_green_tree_qr_tag_pdf(tree: dict, verification_url: str) -> bytes:
     qr_x = (page_w - qr_size) / 2
     qr_y = page_h - (184 if is_sponsor_unit_qr else 192)
     _draw_qr_code(c, verification_url, qr_x, qr_y, qr_size)
-    
+
     # Scan text below QR
     c.setFillColor(HexColor("#53705f"))
     c.setFont("Helvetica", 6.5)
     c.drawCentredString(page_w / 2, qr_y - 10, "Scan QR to verify live story & growth history")
-    
+
     # Sponsor Recognition Section
     sponsor_name = tree.get("sponsor_name")
     c.setStrokeColor(HexColor("#dcdfdc"))
     c.setLineWidth(0.5)
     c.line(16, qr_y - 18, page_w - 16, qr_y - 18)
-    
+
     box_y = qr_y - 68
     box_h = 44
     _draw_rounded_box(c, 16, box_y, page_w - 32, box_h, 6, fill_color=HexColor("#ffffff"), stroke_color=HexColor("#dcdfdc"))
-    
+
     if sponsor_name:
         c.setFillColor(HexColor("#083e20"))
         c.setFont("Helvetica-Bold", 8.5)
@@ -4817,10 +4744,10 @@ def render_green_tree_qr_tag_pdf(tree: dict, verification_url: str) -> bytes:
         c.setFillColor(HexColor("#083e20"))
         c.setFont("Helvetica", 7.5)
         c.drawCentredString(page_w / 2, box_y + 12, "Scan QR code to sponsor this tree")
-        
+
     # Metadata Table details
     meta_y = box_y - 14
-    
+
     def draw_meta_line(label, val, y):
         c.setFillColor(HexColor("#53705f"))
         c.setFont("Helvetica-Bold", 7.5)
@@ -4828,24 +4755,36 @@ def render_green_tree_qr_tag_pdf(tree: dict, verification_url: str) -> bytes:
         c.setFillColor(HexColor("#163826"))
         c.setFont("Helvetica", 7.5)
         c.drawRightString(page_w - 20, y, str(val))
-        
+
     species = tree.get("species") or "Unknown species"
     project = tree.get("project_name") or "LandCheck Restoration"
     planted_date = str(tree.get("planting_date") or ("Pending field planting" if unit_uid and tree_id is None else "Pending"))
     status = str(tree.get("tree_status") or tree.get("status") or ("reserved" if unit_uid and tree_id is None else "alive")).replace("_", " ").title()
-    impact = f"{float(tree.get('annual_co2_kg') or 21.0):.1f} kg CO2/yr"
-    
+    # Grams keep a single tree's annual CO2 absorption (roughly 50-25,000 g/yr in
+    # practice) as a whole, legible number at any scale — tons/kg both risk
+    # rounding a young tree's small value down to an uninformative "0".
+    impact = f"{float(tree.get('annual_co2_kg') or 21.0) * 1000:,.0f} g CO2/yr"
+
     draw_meta_line("Species:", species[:28], meta_y)
     draw_meta_line("Project:", project[:28], meta_y - 12)
     draw_meta_line("Date Planted:", planted_date, meta_y - 24)
     draw_meta_line("Status:", status, meta_y - 36)
     draw_meta_line("Carbon Impact:", impact, meta_y - 48)
-    
+
     # Tag footer
     c.setFillColor(HexColor("#8a9a8f"))
     c.setFont("Helvetica", 6)
     c.drawCentredString(page_w / 2, 16, f"Ref ID: {reference_label} | landcheck.online")
-    
+
+    c.restoreState()
+
+
+def render_green_tree_qr_tag_pdf(tree: dict, verification_url: str) -> bytes:
+    buffer = io.BytesIO()
+    page_w = _TREE_QR_CARD_NATIVE_W
+    page_h = _TREE_QR_CARD_NATIVE_H
+    c = canvas.Canvas(buffer, pagesize=(page_w, page_h))
+    _draw_tree_qr_card(c, 0, 0, page_w, page_h, tree, verification_url)
     c.save()
     buffer.seek(0)
     return buffer.getvalue()

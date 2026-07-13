@@ -16241,7 +16241,13 @@ def export_sponsorship_unit_qr_tag_pdf(
         carbon = _build_tree_carbon_summary(item)
         item["annual_co2_kg"] = carbon.get("annual_co2_kg", 21.0)
     else:
+        # Not planted yet — the tag is printed ahead of fieldwork, so a real
+        # planting_date/status don't exist. Show the print date and "Alive"
+        # (the tree is expected to be planted and alive by the time this tag
+        # is actually attached) rather than a blank or stale placeholder.
         item["annual_co2_kg"] = 21.0
+        item["planting_date"] = date.today().isoformat()
+        item["tree_status"] = "alive"
     verification_url = _build_sponsor_public_story_url(item.get("unit_uid"), request)
     if not verification_url:
         base_url = _build_public_api_base_url(request)
@@ -16352,6 +16358,12 @@ def export_agent_sponsor_qr_sheet_pdf(
     for row in rows:
         item = dict(row)
         item["verification_url"] = _build_sponsor_public_story_url(item.get("unit_uid"), request)
+        # Every unit here is pre-plant by definition (query filters tree_id IS NULL) — show
+        # the print date and "Alive" rather than a blank/stale placeholder, same as the
+        # single pre-plant tag endpoint.
+        item["planting_date"] = date.today().isoformat()
+        item["tree_status"] = "alive"
+        item["annual_co2_kg"] = 21.0
         units.append(item)
 
     try:
@@ -17340,8 +17352,9 @@ class AssignSponsorDonorTreesPayload(BaseModel):
     project_id: int
     sponsor_account_id: int
     agent_user_id: int
-    count: int | None = None  # omit or <=0 to mean "all remaining"
-    species: str | None = None
+    count: int | None = None  # omit or <=0 to mean "all remaining"; ignored if species_allocations is set
+    species: str | None = None  # single species applied to the whole batch — optional
+    species_allocations: list[dict] | None = None  # e.g. [{"species": "Mahogany", "count": 10}] — optional, overrides count/species
 
 
 @router.post("/admin/public-sponsor-donors/assign")
@@ -17396,7 +17409,13 @@ def assign_public_sponsor_donor_trees(payload: AssignSponsorDonorTreesPayload, d
     if remaining_count_value <= 0:
         raise HTTPException(status_code=409, detail="This sponsor has no remaining unassigned trees in this project")
 
-    requested_count = int(payload.count) if payload.count and int(payload.count) > 0 else remaining_count_value
+    normalized_allocations = _normalize_species_allocations(payload.species_allocations) if payload.species_allocations else []
+    if normalized_allocations:
+        requested_count = int(sum(int(item.get("count") or 0) for item in normalized_allocations))
+        if requested_count <= 0:
+            raise HTTPException(status_code=400, detail="Species allocation counts must add up to more than 0")
+    else:
+        requested_count = int(payload.count) if payload.count and int(payload.count) > 0 else remaining_count_value
     if requested_count > remaining_count_value:
         raise HTTPException(
             status_code=409,
@@ -17443,43 +17462,56 @@ def assign_public_sponsor_donor_trees(payload: AssignSponsorDonorTreesPayload, d
             insert_params,
         ).scalar()
 
-    species_clean = str(payload.species or "").strip() or None
+    def _link_next_units(count: int, species_for_batch: str | None) -> list[dict]:
+        return db.execute(
+            text(
+                """
+                WITH next_units AS (
+                    SELECT id FROM green_sponsorship_units
+                    WHERE project_id = :project_id AND sponsor_account_id = :sponsor_id
+                      AND tree_id IS NULL
+                      AND LOWER(COALESCE(sponsorship_status, '')) = 'awaiting_tree'
+                      AND assigned_user_id IS NULL
+                      AND NULLIF(BTRIM(COALESCE(assigned_assignee_name, '')), '') IS NULL
+                    ORDER BY created_at ASC, id ASC
+                    LIMIT :count
+                )
+                UPDATE green_sponsorship_units u
+                SET assigned_user_id = :agent_user_id,
+                    assigned_assignee_name = :agent_name,
+                    assigned_work_order_id = :work_order_id,
+                    assigned_at = NOW(),
+                    allocated_species = COALESCE(:species, allocated_species),
+                    updated_at = NOW()
+                FROM next_units nu
+                WHERE u.id = nu.id
+                RETURNING u.id
+                """
+            ),
+            {
+                "project_id": int(project_row["id"]),
+                "sponsor_id": sponsor_id,
+                "count": int(count),
+                "agent_user_id": normalized_agent_id,
+                "agent_name": agent_name,
+                "work_order_id": work_order_id,
+                "species": species_for_batch,
+            },
+        ).mappings().all()
 
-    updated_rows = db.execute(
-        text(
-            """
-            WITH next_units AS (
-                SELECT id FROM green_sponsorship_units
-                WHERE project_id = :project_id AND sponsor_account_id = :sponsor_id
-                  AND tree_id IS NULL
-                  AND LOWER(COALESCE(sponsorship_status, '')) = 'awaiting_tree'
-                  AND assigned_user_id IS NULL
-                  AND NULLIF(BTRIM(COALESCE(assigned_assignee_name, '')), '') IS NULL
-                ORDER BY created_at ASC, id ASC
-                LIMIT :count
-            )
-            UPDATE green_sponsorship_units u
-            SET assigned_user_id = :agent_user_id,
-                assigned_assignee_name = :agent_name,
-                assigned_work_order_id = :work_order_id,
-                assigned_at = NOW(),
-                allocated_species = COALESCE(:species, allocated_species),
-                updated_at = NOW()
-            FROM next_units nu
-            WHERE u.id = nu.id
-            RETURNING u.id
-            """
-        ),
-        {
-            "project_id": int(project_row["id"]),
-            "sponsor_id": sponsor_id,
-            "count": requested_count,
-            "agent_user_id": normalized_agent_id,
-            "agent_name": agent_name,
-            "work_order_id": work_order_id,
-            "species": species_clean,
-        },
-    ).mappings().all()
+    updated_rows: list[dict] = []
+    if normalized_allocations:
+        # Each allocation entry links its own batch of the next-available units, in order,
+        # so different sub-counts of this assignment can carry different species.
+        for allocation in normalized_allocations:
+            batch_count = int(allocation.get("count") or 0)
+            if batch_count <= 0:
+                continue
+            batch_species = str(allocation.get("species") or "").strip() or None
+            updated_rows.extend(_link_next_units(batch_count, batch_species))
+    else:
+        species_clean = str(payload.species or "").strip() or None
+        updated_rows = _link_next_units(requested_count, species_clean)
 
     db.commit()
 
