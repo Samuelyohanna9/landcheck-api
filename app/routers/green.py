@@ -7926,6 +7926,34 @@ def _collect_public_sponsor_agent_user_ids_for_project(
 ) -> list[int]:
     collected = _normalize_positive_int_list(explicit_user_ids or [])
     seen = set(collected)
+    # Prefer the direct assignee/assigned foreign-key columns over name matching wherever
+    # they're already populated (e.g. agents assigned via the sponsor-donor flow, which sets
+    # assignee_user_id/assigned_user_id directly) — assignee_name text matching below is
+    # fragile (casing/whitespace/duplicate-name mismatches) and could silently drop a real
+    # agent from this roster even though they were assigned correctly.
+    try:
+        direct_id_rows = db.execute(
+            text(
+                """
+                SELECT DISTINCT assignee_user_id AS user_id
+                FROM green_work_orders
+                WHERE project_id = :project_id AND assignee_user_id IS NOT NULL
+                UNION
+                SELECT DISTINCT assigned_user_id AS user_id
+                FROM green_sponsorship_units
+                WHERE project_id = :project_id AND assigned_user_id IS NOT NULL
+                """
+            ),
+            {"project_id": int(project_id)},
+        ).scalars().all()
+    except Exception:
+        _rollback_quietly(db)
+        direct_id_rows = []
+    for direct_user_id in direct_id_rows:
+        direct_user_id_value = int(direct_user_id or 0)
+        if direct_user_id_value > 0 and direct_user_id_value not in seen:
+            seen.add(direct_user_id_value)
+            collected.append(direct_user_id_value)
     try:
         name_rows = db.execute(
             text(
@@ -18053,10 +18081,24 @@ def list_admin_sponsor_agent_payouts(
             ),
             {"organization_id": organization_id},
         ).mappings().all()
-        if int(project_id) not in {int(row["id"]) for row in org_project_rows}:
-            org_project_rows = list(org_project_rows) + [project_row]
     else:
-        org_project_rows = [project_row]
+        # No organization set on this project — treat every other org-less public-sponsor
+        # project as part of the same shared pool instead of falling back to just this one
+        # project (which would silently reproduce the single-project bug for any deployment
+        # that doesn't populate organization_id).
+        org_project_rows = db.execute(
+            text(
+                """
+                SELECT id, public_sponsor_agent_user_ids
+                FROM tree_projects
+                WHERE organization_id IS NULL
+                  AND (LOWER(COALESCE(access_model, '')) = 'public_sponsorship' OR COALESCE(public_sponsor_enabled, FALSE) = TRUE)
+                """
+            ),
+            {},
+        ).mappings().all()
+    if int(project_id) not in {int(row["id"]) for row in org_project_rows}:
+        org_project_rows = list(org_project_rows) + [project_row]
 
     agent_id_set: set[int] = set()
     for proj_row in org_project_rows:
@@ -18071,6 +18113,28 @@ def list_admin_sponsor_agent_payouts(
         except Exception:
             proj_agent_ids = proj_explicit_ids
         agent_id_set.update(_normalize_positive_int_list(proj_agent_ids))
+
+    # Safety net: an agent who already has a payout request row must always show up here
+    # regardless of whether the roster-matching above (name/assignment based) found them —
+    # otherwise a submitted request can silently vanish from this tab even though it exists.
+    try:
+        existing_requester_ids = db.execute(
+            text(
+                """
+                SELECT DISTINCT user_id
+                FROM green_sponsor_agent_payout_requests
+                WHERE (
+                    (:organization_id IS NOT NULL AND organization_id = :organization_id)
+                 OR (:organization_id IS NULL AND organization_id IS NULL)
+                )
+                """
+            ),
+            {"organization_id": organization_id if organization_id > 0 else None},
+        ).scalars().all()
+    except Exception:
+        _rollback_quietly(db)
+        existing_requester_ids = []
+    agent_id_set.update(_normalize_positive_int_list(existing_requester_ids))
     selected_agent_ids = sorted(agent_id_set)
 
     if sync:
@@ -18106,17 +18170,26 @@ def list_admin_sponsor_agent_payouts(
         except HTTPException:
             continue
         except Exception:
+            logger.exception(
+                "Sponsor agent payout dashboard build failed for agent_id=%s project_id=%s",
+                int(agent_id),
+                int(project_id),
+            )
             continue
+        # Always surface this agent's payout requests for admin review/action, even if they
+        # are no longer considered a currently "eligible" agent (e.g. removed from the
+        # project's agent roster after applying) — a submitted request still needs a decision
+        # and must never silently disappear from this tab.
+        for request_item in dashboard.get("requests") or []:
+            request_id = int(request_item.get("id") or 0)
+            if request_id > 0:
+                requests_by_id[request_id] = dict(request_item)
         if not dashboard.get("eligible"):
             continue
         summary = dashboard.get("summary") or {}
         total_available += float(summary.get("available_amount") or 0)
         total_requested += float(summary.get("requested_amount") or 0)
         total_paid += float(summary.get("paid_amount") or 0)
-        for request_item in dashboard.get("requests") or []:
-            request_id = int(request_item.get("id") or 0)
-            if request_id > 0:
-                requests_by_id[request_id] = dict(request_item)
         agents.append(dashboard)
     requests_payload = sorted(
         requests_by_id.values(),
