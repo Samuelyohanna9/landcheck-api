@@ -134,7 +134,7 @@ SPONSOR_TERMS_EFFECTIVE_DATE = "2026-06-06"
 SPONSOR_RESET_TOKEN_TTL_HOURS = 2
 FIELD_RESET_TOKEN_TTL_HOURS = 2
 SPONSOR_AGENT_ACCOUNT_CURRENCY = "NGN"
-SPONSOR_AGENT_MIN_PAYOUT_NAIRA = 10000
+SPONSOR_AGENT_MIN_PAYOUT_NAIRA = 8000
 SPONSOR_AGENT_PAYOUT_STATUS_VALUES = {"requested", "approved", "processing", "paid", "rejected", "failed", "cancelled"}
 SPONSOR_AGENT_DEFAULT_PLANTING_RATIO = 0.30
 SPONSOR_AGENT_DEFAULT_MAINTENANCE_RATIO = 0.10
@@ -18034,23 +18034,51 @@ def list_admin_sponsor_agent_payouts(
     if not project_row:
         raise HTTPException(status_code=404, detail="Project not found")
     organization_id = int(project_row.get("organization_id") or 0)
-    explicit_agent_ids = _normalize_positive_int_list(_json_value_or(project_row.get("public_sponsor_agent_user_ids"), []))
-    try:
-        selected_agent_ids = _collect_public_sponsor_agent_user_ids_for_project(
-            db,
-            project_id=int(project_id),
-            organization_id=organization_id if organization_id > 0 else None,
-            explicit_user_ids=explicit_agent_ids,
-        )
-    except Exception:
-        selected_agent_ids = explicit_agent_ids
+
+    # Sponsor agents commonly work across several public-sponsor projects, and a payout
+    # request aggregates ALL of an agent's earnings org-wide (see _build_sponsor_agent_dashboard)
+    # regardless of which project is currently selected here. Scoping the agent roster to just
+    # the one selected project meant agents who only earned on a different project in this same
+    # organization never appeared in this tab — so collect the roster across every public-sponsor
+    # project in the organization instead of just this one.
+    if organization_id > 0:
+        org_project_rows = db.execute(
+            text(
+                """
+                SELECT id, public_sponsor_agent_user_ids
+                FROM tree_projects
+                WHERE organization_id = :organization_id
+                  AND (LOWER(COALESCE(access_model, '')) = 'public_sponsorship' OR COALESCE(public_sponsor_enabled, FALSE) = TRUE)
+                """
+            ),
+            {"organization_id": organization_id},
+        ).mappings().all()
+        if int(project_id) not in {int(row["id"]) for row in org_project_rows}:
+            org_project_rows = list(org_project_rows) + [project_row]
+    else:
+        org_project_rows = [project_row]
+
+    agent_id_set: set[int] = set()
+    for proj_row in org_project_rows:
+        proj_explicit_ids = _normalize_positive_int_list(_json_value_or(proj_row.get("public_sponsor_agent_user_ids"), []))
+        try:
+            proj_agent_ids = _collect_public_sponsor_agent_user_ids_for_project(
+                db,
+                project_id=int(proj_row["id"]),
+                organization_id=organization_id if organization_id > 0 else None,
+                explicit_user_ids=proj_explicit_ids,
+            )
+        except Exception:
+            proj_agent_ids = proj_explicit_ids
+        agent_id_set.update(_normalize_positive_int_list(proj_agent_ids))
+    selected_agent_ids = sorted(agent_id_set)
+
     if sync:
         try:
             request_rows = _load_sponsor_agent_payout_requests(
                 db,
                 organization_id=organization_id if organization_id > 0 else None,
                 user_ids=selected_agent_ids,
-                project_id=int(project_id),
             )
         except Exception:
             request_rows = []
