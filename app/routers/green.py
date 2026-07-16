@@ -18046,8 +18046,10 @@ def review_admin_sponsorship_order_payment(
 def list_admin_sponsor_agent_payouts(
     project_id: int = Query(...),
     sync: bool = Query(default=True),
+    debug: bool = Query(default=False),
     db: Session = Depends(get_db),
 ):
+    diagnostics: dict = {"projects": []}
     project_row = db.execute(
         text(
             """
@@ -18103,6 +18105,7 @@ def list_admin_sponsor_agent_payouts(
     agent_id_set: set[int] = set()
     for proj_row in org_project_rows:
         proj_explicit_ids = _normalize_positive_int_list(_json_value_or(proj_row.get("public_sponsor_agent_user_ids"), []))
+        proj_diag = {"project_id": int(proj_row["id"]), "explicit_ids": proj_explicit_ids}
         try:
             proj_agent_ids = _collect_public_sponsor_agent_user_ids_for_project(
                 db,
@@ -18110,8 +18113,16 @@ def list_admin_sponsor_agent_payouts(
                 organization_id=organization_id if organization_id > 0 else None,
                 explicit_user_ids=proj_explicit_ids,
             )
-        except Exception:
+            proj_diag["collected_ids"] = proj_agent_ids
+        except Exception as exc:
+            logger.exception(
+                "Sponsor agent roster collection failed for project_id=%s (payouts project_id=%s)",
+                int(proj_row["id"]),
+                int(project_id),
+            )
+            proj_diag["error"] = str(exc)
             proj_agent_ids = proj_explicit_ids
+        diagnostics["projects"].append(proj_diag)
         agent_id_set.update(_normalize_positive_int_list(proj_agent_ids))
 
     # Safety net: an agent who already has a payout request row must always show up here
@@ -18136,6 +18147,9 @@ def list_admin_sponsor_agent_payouts(
         existing_requester_ids = []
     agent_id_set.update(_normalize_positive_int_list(existing_requester_ids))
     selected_agent_ids = sorted(agent_id_set)
+    diagnostics["existing_requester_ids"] = _normalize_positive_int_list(existing_requester_ids)
+    diagnostics["selected_agent_ids"] = selected_agent_ids
+    diagnostics["agent_errors"] = []
 
     if sync:
         try:
@@ -18181,6 +18195,7 @@ def list_admin_sponsor_agent_payouts(
                 int(project_id),
                 str(exc.detail or exc),
             )
+            diagnostics["agent_errors"].append({"agent_id": int(agent_id), "error": str(exc.detail or exc)})
             # Fall back to the agent's raw payout requests directly — an account-state issue
             # (inactive account, suspended org, etc.) shouldn't make an already-submitted
             # payout request invisible to the admin; it still needs a decision.
@@ -18192,12 +18207,13 @@ def list_admin_sponsor_agent_payouts(
             except Exception:
                 pass
             continue
-        except Exception:
+        except Exception as exc:
             logger.exception(
                 "Sponsor agent payout dashboard build failed for agent_id=%s project_id=%s",
                 int(agent_id),
                 int(project_id),
             )
+            diagnostics["agent_errors"].append({"agent_id": int(agent_id), "error": str(exc)})
             continue
         # Always surface this agent's payout requests for admin review/action, even if they
         # are no longer considered a currently "eligible" agent (e.g. removed from the
@@ -18224,7 +18240,7 @@ def list_admin_sponsor_agent_payouts(
         key=lambda item: (str(item.get("created_at") or ""), int(item.get("id") or 0)),
         reverse=True,
     )
-    return {
+    payload_out = {
         "project_id": int(project_id),
         "project_name": str(project_row.get("name") or "").strip() or None,
         "organization_id": organization_id or None,
@@ -18242,6 +18258,9 @@ def list_admin_sponsor_agent_payouts(
             "paid_amount": round(total_paid, 2),
         },
     }
+    if debug:
+        payload_out["_diagnostics"] = diagnostics
+    return payload_out
 
 
 @router.patch("/admin/sponsor-agent-payouts/{request_id}")
