@@ -9396,6 +9396,10 @@ def _build_sponsor_agent_earning_rows(
             {"project_ids": project_ids, "aliases": aliases},
         ).mappings().all()
     except Exception:
+        # A failed query leaves the whole session's transaction "aborted" in Postgres —
+        # every later query on this same db session (e.g. the next agent processed in the
+        # admin payout roster loop) would then fail too unless we roll back right here.
+        _rollback_quietly(db)
         planting_rows = []
     try:
         maintenance_rows = db.execute(
@@ -9431,6 +9435,7 @@ def _build_sponsor_agent_earning_rows(
             {"project_ids": project_ids, "aliases": aliases},
         ).mappings().all()
     except Exception:
+        _rollback_quietly(db)
         maintenance_rows = []
     earnings: list[dict] = []
     for row in planting_rows:
@@ -9515,6 +9520,7 @@ def _build_sponsor_agent_dashboard(
             project_id=None,
         )
     except Exception:
+        _rollback_quietly(db)
         project_rows = []
     project_ids_set = {int(row["id"]) for row in project_rows}
     if requested_project_id is not None and requested_project_id not in project_ids_set:
@@ -9538,6 +9544,7 @@ def _build_sponsor_agent_dashboard(
                 {"project_id": requested_project_id},
             ).mappings().first()
         except Exception:
+            _rollback_quietly(db)
             fallback_project_row = None
         if fallback_project_row and _is_public_sponsorship_project(dict(fallback_project_row)):
             try:
@@ -9548,12 +9555,14 @@ def _build_sponsor_agent_dashboard(
                     explicit_user_ids=_normalize_positive_int_list(_json_value_or(fallback_project_row.get("public_sponsor_agent_user_ids"), [])),
                 )
             except Exception:
+                _rollback_quietly(db)
                 candidate_user_ids = _normalize_positive_int_list(_json_value_or(fallback_project_row.get("public_sponsor_agent_user_ids"), []))
             if int(user_row["id"]) in set(candidate_user_ids):
                 project_rows.append(_apply_project_access_fields(dict(fallback_project_row)))
     try:
         bank_row = _load_sponsor_agent_bank_account(db, user_id=int(user_row["id"]))
     except Exception:
+        _rollback_quietly(db)
         bank_row = None
     try:
         request_rows = _load_sponsor_agent_payout_requests(
@@ -9563,6 +9572,7 @@ def _build_sponsor_agent_dashboard(
             project_id=None,
         )
     except Exception:
+        _rollback_quietly(db)
         request_rows = []
     serialized_requests: list[dict] = []
     for row in request_rows:
@@ -9575,6 +9585,7 @@ def _build_sponsor_agent_dashboard(
     try:
         earnings = _build_sponsor_agent_earning_rows(db, user_row=user_row, project_rows=project_rows)
     except Exception:
+        _rollback_quietly(db)
         earnings = []
     request_by_key: dict[str, dict] = {}
     for request in serialized_requests:
@@ -18120,6 +18131,7 @@ def list_admin_sponsor_agent_payouts(
                 int(proj_row["id"]),
                 int(project_id),
             )
+            _rollback_quietly(db)
             proj_diag["error"] = str(exc)
             proj_agent_ids = proj_explicit_ids
         diagnostics["projects"].append(proj_diag)
@@ -18159,12 +18171,14 @@ def list_admin_sponsor_agent_payouts(
                 user_ids=selected_agent_ids,
             )
         except Exception:
+            _rollback_quietly(db)
             request_rows = []
         for row in request_rows:
             if int(row.get("transfer_id") or 0) > 0 and _normalize_sponsor_agent_payout_status(row.get("status")) in {"approved", "processing"}:
                 try:
                     _sync_sponsor_agent_payout_transfer(db, row)
                 except Exception:
+                    _rollback_quietly(db)
                     continue
         db.commit()
     agent_ids = selected_agent_ids
