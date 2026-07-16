@@ -18181,6 +18181,16 @@ def list_admin_sponsor_agent_payouts(
                 int(project_id),
                 str(exc.detail or exc),
             )
+            # Fall back to the agent's raw payout requests directly — an account-state issue
+            # (inactive account, suspended org, etc.) shouldn't make an already-submitted
+            # payout request invisible to the admin; it still needs a decision.
+            try:
+                for row in _load_sponsor_agent_payout_requests(db, user_id=int(agent_id)) or []:
+                    item = _serialize_sponsor_agent_payout_request(dict(row))
+                    if item and int(item.get("id") or 0) > 0:
+                        requests_by_id[int(item["id"])] = item
+            except Exception:
+                pass
             continue
         except Exception:
             logger.exception(
@@ -18197,8 +18207,13 @@ def list_admin_sponsor_agent_payouts(
             request_id = int(request_item.get("id") or 0)
             if request_id > 0:
                 requests_by_id[request_id] = dict(request_item)
-        if not dashboard.get("eligible"):
-            continue
+        # Deliberately NOT gating on dashboard.get("eligible") here: that flag depends on a
+        # separate, org-matching-sensitive project lookup (_list_public_sponsor_projects_for_agent)
+        # meant for the AGENT's own mobile session. Here, membership in agent_ids already IS
+        # the authorization — this admin explicitly selected this user for this exact project
+        # (or the user has a direct assignment/payout request on it) — so re-deriving eligibility
+        # a second time only risks re-excluding a correctly-registered agent over an unrelated
+        # organization_id mismatch, which is exactly what was happening before this fix.
         summary = dashboard.get("summary") or {}
         total_available += float(summary.get("available_amount") or 0)
         total_requested += float(summary.get("requested_amount") or 0)
