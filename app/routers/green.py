@@ -18161,13 +18161,26 @@ def list_admin_sponsor_agent_payouts(
     requests_by_id: dict[int, dict] = {}
     for agent_id in agent_ids:
         try:
+            # No organization_id filter here: this project's own public_sponsor_agent_user_ids
+            # (or a direct assignee/assigned-user match) is already the authorization for "is
+            # this a valid agent on this project" — re-checking the agent's own green_users
+            # organization_id for strict equality against the project's organization_id was
+            # silently 404'ing (and hiding) agents whose account organization_id happens to be
+            # unset or set differently from the project's, even though they were explicitly
+            # selected as an agent for this exact project.
             dashboard = _build_sponsor_agent_dashboard(
                 db,
                 user_id=int(agent_id),
-                organization_id=organization_id if organization_id > 0 else None,
+                organization_id=None,
                 project_id=int(project_id),
             )
-        except HTTPException:
+        except HTTPException as exc:
+            logger.warning(
+                "Sponsor agent payout dashboard skipped agent_id=%s project_id=%s: %s",
+                int(agent_id),
+                int(project_id),
+                str(exc.detail or exc),
+            )
             continue
         except Exception:
             logger.exception(
