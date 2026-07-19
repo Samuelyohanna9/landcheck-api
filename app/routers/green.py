@@ -16786,6 +16786,18 @@ def _render_sponsor_public_terms_html(request: Request | None = None) -> str:
 
 def _render_sponsor_public_reset_password_html(token: str) -> str:
     safe_token = html.escape(str(token or "").strip(), quote=True)
+    login_url = str(os.getenv("LANDCHECK_GREEN_URL") or "").strip() or "https://landcheck.online/green/login"
+    safe_login_url = html.escape(login_url, quote=True)
+    eye_open_svg = (
+        '<svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" '
+        'stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8Z"/>'
+        '<circle cx="12" cy="12" r="3"/></svg>'
+    )
+    eye_off_svg = (
+        '<svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" '
+        'stroke-linecap="round" stroke-linejoin="round"><path d="M17.94 17.94A10.94 10.94 0 0 1 12 20c-7 0-11-8-11-8a20.3 20.3 0 0 1 5.06-5.94M9.9 4.24A10.4 10.4 0 0 1 12 4c7 0 11 8 11 8a20.3 20.3 0 0 1-3.29 4.36M14.12 14.12a3 3 0 1 1-4.24-4.24"/>'
+        '<line x1="1" y1="1" x2="23" y2="23"/></svg>'
+    )
     return f"""<!doctype html>
 <html lang="en">
   <head>
@@ -16793,6 +16805,7 @@ def _render_sponsor_public_reset_password_html(token: str) -> str:
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Reset Sponsor Password</title>
     <style>
+      * {{ box-sizing: border-box; }}
       body {{
         margin: 0;
         font-family: Inter, "Segoe UI", system-ui, sans-serif;
@@ -16807,73 +16820,137 @@ def _render_sponsor_public_reset_password_html(token: str) -> str:
       }}
       .card {{
         width: min(100%, 440px);
-        background: rgba(255,255,255,0.97);
+        background: rgba(255,255,255,0.98);
         border: 1px solid rgba(15,111,57,0.10);
         border-radius: 24px;
-        box-shadow: 0 20px 48px rgba(10, 52, 28, 0.12);
+        box-shadow: 0 24px 56px rgba(10, 52, 28, 0.14);
         overflow: hidden;
       }}
       .hero {{
-        padding: 24px 24px 20px;
+        padding: 26px 26px 22px;
         background: linear-gradient(145deg,#0c5f2e 0%,#1b8245 100%);
         color: #fff;
+        position: relative;
+      }}
+      .hero-icon {{
+        width: 44px;
+        height: 44px;
+        border-radius: 12px;
+        background: rgba(255,255,255,0.14);
+        display: grid;
+        place-items: center;
+        margin-bottom: 14px;
       }}
       .hero h1, .hero p {{ margin: 0; }}
       .hero h1 {{
-        margin-top: 10px;
-        font-size: 1.9rem;
-        line-height: 1.1;
+        font-size: 1.7rem;
+        line-height: 1.15;
+        font-weight: 800;
       }}
       .hero p {{
         margin-top: 8px;
-        color: rgba(255,255,255,0.86);
-        line-height: 1.65;
+        color: rgba(255,255,255,0.88);
+        line-height: 1.6;
+        font-size: 0.94rem;
       }}
-      .body {{ padding: 22px 24px 26px; }}
+      .body {{ padding: 24px 26px 28px; }}
       label {{
         display: block;
         margin-bottom: 8px;
-        font-size: 0.92rem;
+        font-size: 0.88rem;
         font-weight: 700;
         color: #1a3d28;
       }}
+      .field {{ position: relative; margin-bottom: 16px; }}
       input {{
         width: 100%;
-        min-height: 54px;
-        padding: 0 16px;
-        border-radius: 16px;
-        border: 1px solid rgba(15,111,57,0.16);
+        min-height: 52px;
+        padding: 0 48px 0 16px;
+        border-radius: 14px;
+        border: 1.5px solid rgba(15,111,57,0.14);
         background: #fbfefb;
         font: inherit;
+        font-size: 0.96rem;
         color: #173624;
-        margin-bottom: 14px;
+        transition: border-color 0.15s ease, box-shadow 0.15s ease;
       }}
-      button {{
-        width: 100%;
-        min-height: 54px;
+      input:focus {{
+        outline: none;
+        border-color: #1b8245;
+        box-shadow: 0 0 0 3px rgba(27,130,69,0.12);
+      }}
+      .toggle-eye {{
+        position: absolute;
+        right: 6px;
+        top: 6px;
+        width: 40px;
+        height: 40px;
         border: 0;
-        border-radius: 16px;
+        background: transparent;
+        color: #6b8577;
+        cursor: pointer;
+        display: grid;
+        place-items: center;
+        border-radius: 10px;
+      }}
+      .toggle-eye:hover {{ background: rgba(15,111,57,0.08); color: #0f6f39; }}
+      .hint {{
+        font-size: 0.78rem;
+        color: #6b8577;
+        margin: -10px 0 16px;
+      }}
+      button[type="submit"] {{
+        width: 100%;
+        min-height: 52px;
+        border: 0;
+        border-radius: 14px;
         background: #0f6f39;
         color: #fff;
         font: inherit;
+        font-size: 0.98rem;
         font-weight: 800;
         cursor: pointer;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        gap: 10px;
+        transition: background 0.15s ease, transform 0.1s ease;
       }}
-      button:disabled {{ opacity: 0.6; cursor: wait; }}
+      button[type="submit"]:hover:not(:disabled) {{ background: #0c5f2e; }}
+      button[type="submit"]:active:not(:disabled) {{ transform: scale(0.99); }}
+      button[type="submit"]:disabled {{ opacity: 0.65; cursor: wait; }}
+      .spinner {{
+        width: 16px;
+        height: 16px;
+        border: 2.5px solid rgba(255,255,255,0.4);
+        border-top-color: #fff;
+        border-radius: 50%;
+        animation: spin 0.7s linear infinite;
+        display: none;
+      }}
+      @keyframes spin {{ to {{ transform: rotate(360deg); }} }}
       .status {{
-        margin-top: 14px;
+        margin-top: 16px;
         padding: 14px 16px;
         border-radius: 14px;
         background: #f4faf5;
         border: 1px solid rgba(15,111,57,0.10);
-        color: #486652;
-        line-height: 1.65;
+        color: #316146;
+        line-height: 1.6;
+        font-size: 0.9rem;
         display: none;
       }}
+      .status.success {{ display: flex; align-items: center; gap: 10px; }}
       .status.error {{
         background: #fff5f5;
         border-color: rgba(185, 28, 28, 0.12);
         color: #9f1d1d;
+      }}
+      .footer-note {{
+        margin-top: 18px;
+        text-align: center;
+        font-size: 0.8rem;
+        color: #8aa397;
       }}
     </style>
   </head>
@@ -16881,54 +16958,91 @@ def _render_sponsor_public_reset_password_html(token: str) -> str:
     <main class="shell">
       <section class="card">
         <div class="hero">
-          <div style="font-size:12px;font-weight:800;letter-spacing:0.14em;text-transform:uppercase;color:#d8f7df;">LandCheck Green sponsor route</div>
+          <div class="hero-icon">
+            <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="10" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
+          </div>
+          <div style="font-size:11.5px;font-weight:800;letter-spacing:0.14em;text-transform:uppercase;color:#d8f7df;">LandCheck Green sponsor route</div>
           <h1>Reset your password</h1>
-          <p>Choose a new password for your sponsor account. After saving it, you can sign back in from the app.</p>
+          <p>Choose a new password for your account. You'll be signed back in automatically once it's saved.</p>
         </div>
         <div class="body">
-          <form id="reset-form">
+          <form id="reset-form" novalidate>
             <input id="token" type="hidden" value="{safe_token}" />
+
             <label for="password">New password</label>
-            <input id="password" type="password" autocomplete="new-password" minlength="8" placeholder="Enter new password" required />
+            <div class="field">
+              <input id="password" type="password" autocomplete="new-password" minlength="8" placeholder="Enter new password" required />
+              <button type="button" class="toggle-eye" data-target="password" aria-label="Show password">{eye_open_svg}</button>
+            </div>
+            <div class="hint">At least 8 characters.</div>
+
             <label for="confirm-password">Confirm new password</label>
-            <input id="confirm-password" type="password" autocomplete="new-password" minlength="8" placeholder="Repeat new password" required />
-            <button id="submit-btn" type="submit">Save new password</button>
+            <div class="field">
+              <input id="confirm-password" type="password" autocomplete="new-password" minlength="8" placeholder="Repeat new password" required />
+              <button type="button" class="toggle-eye" data-target="confirm-password" aria-label="Show password">{eye_open_svg}</button>
+            </div>
+
+            <button id="submit-btn" type="submit">
+              <span class="spinner" id="spinner"></span>
+              <span id="submit-label">Save new password</span>
+            </button>
             <div id="status" class="status"></div>
           </form>
+          <div class="footer-note">Having trouble? Request a new reset link from wherever you signed up.</div>
         </div>
       </section>
     </main>
     <script>
+      const EYE_OPEN = {eye_open_svg!r};
+      const EYE_OFF = {eye_off_svg!r};
+      const LOGIN_URL = {safe_login_url!r};
+
+      document.querySelectorAll('.toggle-eye').forEach((btn) => {{
+        btn.innerHTML = EYE_OPEN;
+        btn.addEventListener('click', () => {{
+          const input = document.getElementById(btn.dataset.target);
+          const showing = input.type === 'text';
+          input.type = showing ? 'password' : 'text';
+          btn.innerHTML = showing ? EYE_OPEN : EYE_OFF;
+          btn.setAttribute('aria-label', showing ? 'Show password' : 'Hide password');
+        }});
+      }});
+
       const form = document.getElementById('reset-form');
       const statusEl = document.getElementById('status');
       const submitBtn = document.getElementById('submit-btn');
+      const spinner = document.getElementById('spinner');
+      const submitLabel = document.getElementById('submit-label');
+
+      const showStatus = (message, isError) => {{
+        statusEl.textContent = message;
+        statusEl.className = 'status ' + (isError ? 'error' : 'success');
+        statusEl.style.display = 'block';
+      }};
+
       form.addEventListener('submit', async (event) => {{
         event.preventDefault();
         const token = document.getElementById('token').value.trim();
         const password = document.getElementById('password').value;
         const confirmPassword = document.getElementById('confirm-password').value;
         statusEl.style.display = 'none';
-        statusEl.className = 'status';
+
         if (!token) {{
-          statusEl.textContent = 'This reset link is invalid or missing a token.';
-          statusEl.classList.add('error');
-          statusEl.style.display = 'block';
+          showStatus('This reset link is invalid or missing a token.', true);
           return;
         }}
         if (password.length < 8) {{
-          statusEl.textContent = 'Password must be at least 8 characters.';
-          statusEl.classList.add('error');
-          statusEl.style.display = 'block';
+          showStatus('Password must be at least 8 characters.', true);
           return;
         }}
         if (password !== confirmPassword) {{
-          statusEl.textContent = 'The two password entries do not match.';
-          statusEl.classList.add('error');
-          statusEl.style.display = 'block';
+          showStatus('The two password entries do not match.', true);
           return;
         }}
+
         submitBtn.disabled = true;
-        submitBtn.textContent = 'Saving...';
+        spinner.style.display = 'inline-block';
+        submitLabel.textContent = 'Saving...';
         try {{
           const response = await fetch('/green/sponsor-auth/reset-password', {{
             method: 'POST',
@@ -16939,17 +17053,17 @@ def _render_sponsor_public_reset_password_html(token: str) -> str:
           if (!response.ok) {{
             throw new Error(payload.detail || 'Could not reset the password.');
           }}
-          statusEl.textContent = payload.message || 'Password updated successfully. You can return to the app and sign in now.';
-          statusEl.style.display = 'block';
+          showStatus('Password saved. Redirecting you to sign in...', false);
           form.reset();
+          submitLabel.textContent = 'Redirecting...';
+          setTimeout(() => {{ window.location.href = LOGIN_URL; }}, 1500);
+          return;
         }} catch (error) {{
-          statusEl.textContent = error.message || 'Could not reset the password.';
-          statusEl.classList.add('error');
-          statusEl.style.display = 'block';
-        }} finally {{
-          submitBtn.disabled = false;
-          submitBtn.textContent = 'Save new password';
+          showStatus(error.message || 'Could not reset the password.', true);
         }}
+        submitBtn.disabled = false;
+        spinner.style.display = 'none';
+        submitLabel.textContent = 'Save new password';
       }});
     </script>
   </body>
