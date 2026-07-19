@@ -11936,7 +11936,7 @@ def sponsor_auth_reset_password(payload: SponsorResetPasswordPayload, db: Sessio
     row = db.execute(
         text(
             """
-            SELECT id, email
+            SELECT id, email, account_type
             FROM green_sponsor_accounts
             WHERE password_reset_token_hash = :token_hash
               AND password_reset_token_expires_at IS NOT NULL
@@ -11974,7 +11974,11 @@ def sponsor_auth_reset_password(payload: SponsorResetPasswordPayload, db: Sessio
         details={},
     )
     db.commit()
-    return {"ok": True, "message": "Password updated successfully. You can sign in now."}
+    return {
+        "ok": True,
+        "message": "Password updated successfully. You can sign in now.",
+        "account_type": _normalize_sponsor_account_type(row.get("account_type")),
+    }
 
 
 def _ensure_guest_sponsor_account(db: Session, *, full_name: str, email: str, phone: str | None) -> dict:
@@ -16786,11 +16790,16 @@ def _render_sponsor_public_terms_html(request: Request | None = None) -> str:
 
 def _render_sponsor_public_reset_password_html(token: str) -> str:
     safe_token = html.escape(str(token or "").strip(), quote=True)
-    # Route straight to the sponsor login form (works for individual/organization/merchant
-    # accounts alike) rather than the bare /green/login selector page, which only offers
-    # "Sponsor Trees" / "Perform Field Work" — neither reads as "I just reset my password."
-    login_url = str(os.getenv("LANDCHECK_GREEN_URL") or "").strip() or "https://landcheck.online/green/login/sponsor"
+    # Two possible destinations after saving: individual/organization sponsors go to the
+    # shared sponsor login form; merchants go to their own dedicated login page (never the
+    # bare /green/login selector, which only offers "Sponsor Trees" / "Perform Field Work" —
+    # neither reads as "I just reset my password"). The reset-password response tells us
+    # which account type this was, so the redirect is chosen at save time, not render time.
+    configured_green_url = str(os.getenv("LANDCHECK_GREEN_URL") or "").strip()
+    login_url = configured_green_url or "https://landcheck.online/green/login/sponsor"
+    merchant_login_url = str(os.getenv("LANDCHECK_MERCHANT_URL") or "").strip() or "https://landcheck.online/green-merchant/login"
     safe_login_url = html.escape(login_url, quote=True)
+    safe_merchant_login_url = html.escape(merchant_login_url, quote=True)
     eye_open_svg = (
         '<svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" '
         'stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8Z"/>'
@@ -16999,6 +17008,7 @@ def _render_sponsor_public_reset_password_html(token: str) -> str:
       const EYE_OPEN = {eye_open_svg!r};
       const EYE_OFF = {eye_off_svg!r};
       const LOGIN_URL = {safe_login_url!r};
+      const MERCHANT_LOGIN_URL = {safe_merchant_login_url!r};
 
       document.querySelectorAll('.toggle-eye').forEach((btn) => {{
         btn.innerHTML = EYE_OPEN;
@@ -17059,7 +17069,8 @@ def _render_sponsor_public_reset_password_html(token: str) -> str:
           showStatus('Password saved. Redirecting you to sign in...', false);
           form.reset();
           submitLabel.textContent = 'Redirecting...';
-          setTimeout(() => {{ window.location.href = LOGIN_URL; }}, 1500);
+          const target = payload.account_type === 'merchant' ? MERCHANT_LOGIN_URL : LOGIN_URL;
+          setTimeout(() => {{ window.location.href = target; }}, 1500);
           return;
         }} catch (error) {{
           showStatus(error.message || 'Could not reset the password.', true);
