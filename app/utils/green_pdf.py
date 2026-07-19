@@ -104,6 +104,103 @@ def render_green_org_credentials_pdf(organization: dict, users: list[dict]) -> b
     return buffer.getvalue()
 
 
+def render_green_merchant_report_pdf(merchant: dict, summary: dict, rows: list[dict]) -> bytes:
+    """Merchant impact report: which trees were sponsored through this merchant's
+    integration, for which customer/order, and whether they're planted and alive."""
+    buffer = io.BytesIO()
+    c = canvas.Canvas(buffer, pagesize=A4)
+    page_w, page_h = A4
+    org_name = str(merchant.get("organization_name") or merchant.get("full_name") or "Merchant").strip()
+
+    def draw_header(page_no: int):
+        c.setFillColor(HexColor("#0f172a"))
+        c.setFont("Helvetica-Bold", 16)
+        c.drawString(36, page_h - 42, "LandCheck Green - Merchant Impact Report")
+        c.setFont("Helvetica", 9)
+        c.setFillColorRGB(0.35, 0.35, 0.35)
+        c.drawString(36, page_h - 58, f"Merchant: {org_name}")
+        c.drawString(36, page_h - 72, f"Generated: {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}")
+        c.drawRightString(page_w - 36, page_h - 58, f"Ref: {merchant.get('sponsor_uid') or '-'}")
+        c.drawRightString(page_w - 36, page_h - 72, f"Page {page_no}")
+
+    def draw_summary(y: float) -> float:
+        card_w = (page_w - 72 - 3 * 10) / 4
+        card_h = 52
+        tiles = [
+            ("Orders", str(summary.get("total_orders") or 0)),
+            ("Trees Sponsored", str(summary.get("total_trees") or 0)),
+            ("Trees Planted", str(summary.get("planted_trees") or 0)),
+            ("Survival Rate", f"{summary.get('survival_rate') or 0}%"),
+        ]
+        for idx, (label, value) in enumerate(tiles):
+            x = 36 + idx * (card_w + 10)
+            _draw_stat_card(c, x, y - card_h, card_w, card_h, label, value, color=HexColor("#eef6f0"))
+        return y - card_h - 20
+
+    def draw_table_header(y: float):
+        c.setFillColor(HexColor("#e8f5eb"))
+        c.rect(36, y - 16, page_w - 72, 18, stroke=0, fill=1)
+        c.setFillColorRGB(0.12, 0.25, 0.16)
+        c.setFont("Helvetica-Bold", 8)
+        for x, label in [
+            (40, "Tree"),
+            (110, "Species"),
+            (210, "Planted"),
+            (280, "Status"),
+            (340, "Order"),
+            (430, "Customer"),
+        ]:
+            c.drawString(x, y - 10, label)
+
+    def trunc(value, max_len: int) -> str:
+        text_value = str(value or "-").strip() or "-"
+        if len(text_value) <= max_len:
+            return text_value
+        return text_value[: max_len - 1] + "..."
+
+    page_no = 1
+    draw_header(page_no)
+    y = draw_summary(page_h - 108)
+    draw_table_header(y)
+    y -= 26
+    row_h = 16
+    rows_drawn = 0
+    c.setFont("Helvetica", 7.5)
+    for row in rows:
+        if y < 64:
+            c.showPage()
+            page_no += 1
+            draw_header(page_no)
+            y = page_h - 108
+            draw_table_header(y)
+            y -= 26
+            c.setFont("Helvetica", 7.5)
+        if rows_drawn % 2 == 0:
+            c.setFillColorRGB(0.98, 0.99, 0.985)
+            c.rect(36, y - 12, page_w - 72, row_h, stroke=0, fill=1)
+        c.setFillColorRGB(0.14, 0.14, 0.14)
+        planted = str(row.get("planting_date") or "-") if row.get("tree_id") else "Not planted"
+        status = str(row.get("tree_status") or "-").title() if row.get("tree_id") else "-"
+        c.drawString(40, y - 2, trunc(row.get("unit_uid"), 14))
+        c.drawString(110, y - 2, trunc(row.get("species"), 20))
+        c.drawString(210, y - 2, trunc(planted, 16))
+        c.drawString(280, y - 2, trunc(status, 12))
+        c.drawString(340, y - 2, trunc(row.get("external_order_id") or row.get("order_uid"), 18))
+        c.drawString(430, y - 2, trunc(row.get("customer_name"), 22))
+        y -= row_h
+        rows_drawn += 1
+
+    if rows_drawn == 0:
+        c.setFont("Helvetica", 9)
+        c.setFillColorRGB(0.4, 0.4, 0.4)
+        c.drawString(36, y, "No sponsored trees recorded for this merchant yet.")
+
+    c.showPage()
+    c.save()
+    buffer.seek(0)
+    return buffer.getvalue()
+
+
 def _fetch_image_bytes(url: str, timeout: int = 8) -> bytes | None:
     if not url:
         return None

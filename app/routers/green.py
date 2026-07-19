@@ -45,6 +45,7 @@ from app.utils.green_pdf import (
     render_green_sponsor_certificate_pdf,
     render_green_sponsor_qr_sheet_pdf,
     render_green_tree_qr_tag_pdf,
+    render_green_merchant_report_pdf,
 )
 from app.utils.green_remote_monitoring import compute_remote_monitoring_report
 from app.utils.r2_exports import upload_export_file_best_effort, _build_export_r2_settings
@@ -124,7 +125,9 @@ WORKFLOW_PROFILE_VALUES = {"green", "agric", "relief_recovery"}
 DEFAULT_WORKFLOW_PROFILE = "green"
 PROJECT_ACCESS_MODEL_VALUES = {"partner_org", "public_sponsorship"}
 DEFAULT_PROJECT_ACCESS_MODEL = "partner_org"
-SPONSOR_ACCOUNT_TYPE_VALUES = {"individual", "organization"}
+SPONSOR_ACCOUNT_TYPE_VALUES = {"individual", "organization", "merchant"}
+MERCHANT_WEBHOOK_PLATFORM_VALUES = {"shopify"}
+MERCHANT_SPONSORSHIP_SOURCE_VALUES = {"api", "webhook_shopify", "admin"}
 SPONSOR_PAYMENT_STATUS_VALUES = {"pending", "proof_submitted", "verified", "rejected", "refunded"}
 SPONSOR_ORDER_STATUS_VALUES = {"pending_payment", "payment_review", "paid", "allocated", "completed", "cancelled"}
 SPONSOR_UNIT_STATUS_VALUES = {"awaiting_payment", "awaiting_tree", "linked", "active", "replaced", "cancelled"}
@@ -3033,6 +3036,57 @@ def _verify_flutterwave_webhook_signature(raw_body: bytes, signature: str | None
     return hmac.compare_digest(expected_b64, provided_signature)
 
 
+def _verify_hmac_sha256_signature(secret: str | None, raw_body: bytes, signature_b64: str | None) -> bool:
+    """Shared base64 HMAC-SHA256 verification — same shape Shopify/WooCommerce webhook
+    signing uses, and identical to _verify_flutterwave_webhook_signature above but for an
+    arbitrary per-merchant secret instead of the single platform-wide Flutterwave one."""
+    secret_value = str(secret or "").strip()
+    provided_signature = str(signature_b64 or "").strip()
+    if not secret_value or not provided_signature:
+        return False
+    expected_signature = hmac.new(secret_value.encode("utf-8"), raw_body, hashlib.sha256).digest()
+    expected_b64 = base64.b64encode(expected_signature).decode("utf-8")
+    return hmac.compare_digest(expected_b64, provided_signature)
+
+
+def _generate_merchant_api_key() -> str:
+    return f"lck_live_{secrets.token_urlsafe(32)}"
+
+
+def _generate_merchant_webhook_secret() -> str:
+    return secrets.token_hex(32)
+
+
+def _hash_merchant_api_key(api_key: str) -> str:
+    # A fast deterministic hash (not the slow salted PBKDF2 used for human passwords) is the
+    # right fit here: the key itself is already 256 bits of randomness, so brute-forcing the
+    # hash isn't the threat model — and a deterministic hash lets us look the merchant up
+    # directly by hash equality instead of scanning every merchant row on every API call.
+    return hashlib.sha256(str(api_key or "").strip().encode("utf-8")).hexdigest()
+
+
+def _resolve_merchant_by_api_key(db: Session, api_key: str | None) -> dict | None:
+    raw_key = str(api_key or "").strip()
+    if not raw_key:
+        return None
+    row = db.execute(
+        text(
+            """
+            SELECT id, sponsor_uid, full_name, organization_name, email, is_active,
+                   default_project_id, agreed_price_per_tree, webhook_secret
+            FROM green_sponsor_accounts
+            WHERE account_type = 'merchant'
+              AND api_key_hash = :api_key_hash
+            LIMIT 1
+            """
+        ),
+        {"api_key_hash": _hash_merchant_api_key(raw_key)},
+    ).mappings().first()
+    if not row or not bool(row.get("is_active", True)):
+        return None
+    return dict(row)
+
+
 def _verify_flutterwave_transaction(transaction_id: int | None = None, tx_ref: str | None = None) -> dict:
     if int(transaction_id or 0) > 0:
         return _call_flutterwave_api("GET", f"/transactions/{int(transaction_id)}/verify")
@@ -5251,6 +5305,10 @@ def ensure_green_tables(db: Session):
         db.execute(text("ALTER TABLE green_sponsor_accounts ADD COLUMN IF NOT EXISTS legacy_order_points_reconciled_at TIMESTAMP"))
         db.execute(text("ALTER TABLE green_sponsor_accounts ADD COLUMN IF NOT EXISTS is_guest BOOLEAN NOT NULL DEFAULT FALSE"))
         db.execute(text("ALTER TABLE green_sponsor_accounts ADD COLUMN IF NOT EXISTS claimed_at TIMESTAMP"))
+        db.execute(text("ALTER TABLE green_sponsor_accounts ADD COLUMN IF NOT EXISTS api_key_hash TEXT"))
+        db.execute(text("ALTER TABLE green_sponsor_accounts ADD COLUMN IF NOT EXISTS webhook_secret TEXT"))
+        db.execute(text("ALTER TABLE green_sponsor_accounts ADD COLUMN IF NOT EXISTS default_project_id INTEGER REFERENCES tree_projects(id) ON DELETE SET NULL"))
+        db.execute(text("ALTER TABLE green_sponsor_accounts ADD COLUMN IF NOT EXISTS agreed_price_per_tree NUMERIC"))
         db.execute(text("ALTER TABLE green_sponsorship_orders ADD COLUMN IF NOT EXISTS points_awarded BOOLEAN NOT NULL DEFAULT FALSE"))
         db.execute(text("ALTER TABLE green_push_tokens ADD COLUMN IF NOT EXISTS organization_id INTEGER"))
         db.execute(text("ALTER TABLE green_push_tokens ADD COLUMN IF NOT EXISTS platform TEXT"))
@@ -5657,6 +5715,14 @@ def ensure_green_tables(db: Session):
         db.execute(text("ALTER TABLE green_sponsorship_orders ADD COLUMN IF NOT EXISTS sponsor_confirmation_sent_at TIMESTAMP"))
         db.execute(text("ALTER TABLE green_sponsorship_orders ADD COLUMN IF NOT EXISTS payment_confirmation_sent_at TIMESTAMP"))
         db.execute(text("ALTER TABLE green_sponsorship_orders ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW()"))
+        db.execute(text("ALTER TABLE green_sponsorship_orders ADD COLUMN IF NOT EXISTS merchant_account_id INTEGER REFERENCES green_sponsor_accounts(id) ON DELETE SET NULL"))
+        db.execute(text("ALTER TABLE green_sponsorship_orders ADD COLUMN IF NOT EXISTS external_order_id TEXT"))
+        db.execute(text("ALTER TABLE green_sponsorship_orders ADD COLUMN IF NOT EXISTS source TEXT"))
+        db.execute(text(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_sponsorship_orders_merchant_external_order "
+            "ON green_sponsorship_orders(merchant_account_id, external_order_id) "
+            "WHERE merchant_account_id IS NOT NULL AND external_order_id IS NOT NULL"
+        ))
         db.execute(text("ALTER TABLE green_sponsorship_units ADD COLUMN IF NOT EXISTS unit_uid TEXT"))
         db.execute(text("ALTER TABLE green_sponsorship_units ADD COLUMN IF NOT EXISTS tree_project_no INTEGER"))
         db.execute(text("ALTER TABLE green_sponsorship_units ADD COLUMN IF NOT EXISTS dedication_type TEXT"))
@@ -5672,6 +5738,7 @@ def ensure_green_tables(db: Session):
         db.execute(text("ALTER TABLE green_sponsorship_units ADD COLUMN IF NOT EXISTS last_qr_downloaded_at TIMESTAMP"))
         db.execute(text("ALTER TABLE green_sponsorship_units ADD COLUMN IF NOT EXISTS last_qr_downloaded_by TEXT"))
         db.execute(text("ALTER TABLE green_sponsorship_units ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW()"))
+        db.execute(text("ALTER TABLE green_sponsorship_units ADD COLUMN IF NOT EXISTS merchant_account_id INTEGER REFERENCES green_sponsor_accounts(id) ON DELETE SET NULL"))
         db.execute(text("ALTER TABLE green_sponsor_agent_bank_accounts ADD COLUMN IF NOT EXISTS organization_id INTEGER"))
         db.execute(text("ALTER TABLE green_sponsor_agent_bank_accounts ADD COLUMN IF NOT EXISTS currency TEXT NOT NULL DEFAULT 'NGN'"))
         db.execute(text("ALTER TABLE green_sponsor_agent_bank_accounts ADD COLUMN IF NOT EXISTS bank_code TEXT"))
@@ -5864,6 +5931,24 @@ def ensure_green_tables(db: Session):
             created_at TIMESTAMP DEFAULT NOW()
         )
     """))
+    db.execute(text("""
+        CREATE TABLE IF NOT EXISTS green_merchant_webhook_events (
+            id SERIAL PRIMARY KEY,
+            merchant_account_id INTEGER NOT NULL REFERENCES green_sponsor_accounts(id) ON DELETE CASCADE,
+            platform TEXT NOT NULL,
+            external_event_id TEXT,
+            order_id INTEGER REFERENCES green_sponsorship_orders(id) ON DELETE SET NULL,
+            status TEXT NOT NULL DEFAULT 'received',
+            error_message TEXT,
+            raw_payload JSONB,
+            created_at TIMESTAMP DEFAULT NOW()
+        )
+    """))
+    db.execute(text(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_merchant_webhook_event_dedup "
+        "ON green_merchant_webhook_events(merchant_account_id, platform, external_event_id) "
+        "WHERE external_event_id IS NOT NULL"
+    ))
     db.execute(text("""
         CREATE TABLE IF NOT EXISTS green_verra_exports (
             id SERIAL PRIMARY KEY,
@@ -12086,6 +12171,678 @@ def create_sponsor_order(
         "sponsor_id": sponsor_id,
         "is_guest": bool(sponsor_row.get("is_guest", False)),
     }
+
+
+##################################################################
+# MERCHANT INTEGRATION — automated tree sponsorship on behalf of a
+# merchant's end customers, via direct API call or platform webhook.
+# See _create_merchant_sponsorship for the single shared creation path
+# both entry points call.
+##################################################################
+
+
+class AdminCreateMerchantPayload(BaseModel):
+    organization_name: str
+    contact_name: str
+    contact_email: str
+    contact_phone: str | None = None
+    default_project_id: int | None = None
+    agreed_price_per_tree: float | None = None
+
+
+class MerchantSponsorRequestPayload(BaseModel):
+    external_order_id: str
+    customer_name: str
+    customer_email: str
+    quantity: int = 1
+    dedication_message: str | None = None
+
+
+def _get_merchant_account_row(db: Session, merchant_id: int) -> dict:
+    row = db.execute(
+        text(
+            """
+            SELECT id, sponsor_uid, account_type, full_name, organization_name, email, phone,
+                   is_active, default_project_id, agreed_price_per_tree, webhook_secret, created_at
+            FROM green_sponsor_accounts
+            WHERE id = :merchant_id AND account_type = 'merchant'
+            LIMIT 1
+            """
+        ),
+        {"merchant_id": int(merchant_id)},
+    ).mappings().first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Merchant not found")
+    return dict(row)
+
+
+def _serialize_merchant_account(row: dict) -> dict:
+    return {
+        "id": int(row.get("id") or 0),
+        "sponsor_uid": str(row.get("sponsor_uid") or "").strip() or None,
+        "organization_name": str(row.get("organization_name") or "").strip() or None,
+        "contact_name": str(row.get("full_name") or "").strip() or None,
+        "contact_email": str(row.get("email") or "").strip() or None,
+        "contact_phone": str(row.get("phone") or "").strip() or None,
+        "is_active": bool(row.get("is_active", True)),
+        "default_project_id": int(row.get("default_project_id") or 0) or None,
+        "agreed_price_per_tree": (
+            round(float(row.get("agreed_price_per_tree")), 2) if row.get("agreed_price_per_tree") is not None else None
+        ),
+        "has_webhook_secret": bool(str(row.get("webhook_secret") or "").strip()),
+        "created_at": row.get("created_at"),
+    }
+
+
+def _create_merchant_sponsorship(
+    db: Session,
+    *,
+    merchant_row: dict,
+    external_order_id: str,
+    customer_name: str,
+    customer_email: str,
+    quantity: int,
+    dedication_message: str | None,
+    source: str,
+    request: Request | None = None,
+) -> dict:
+    merchant_id = int(merchant_row.get("id") or 0)
+    external_order_id_clean = _clean_text(external_order_id, 160)
+    if not external_order_id_clean:
+        raise HTTPException(status_code=400, detail="external_order_id is required")
+
+    # Idempotent by design: a webhook redelivery or an accidental duplicate API call for the
+    # same merchant + external order must never create a second tree — return the original
+    # result instead of erroring, so retries are always safe.
+    existing_order = db.execute(
+        text(
+            """
+            SELECT o.id, o.order_uid, o.quantity
+            FROM green_sponsorship_orders o
+            WHERE o.merchant_account_id = :merchant_id AND o.external_order_id = :external_order_id
+            LIMIT 1
+            """
+        ),
+        {"merchant_id": merchant_id, "external_order_id": external_order_id_clean},
+    ).mappings().first()
+    if existing_order:
+        existing_units = db.execute(
+            text(
+                "SELECT id, unit_uid FROM green_sponsorship_units WHERE order_id = :order_id ORDER BY id ASC"
+            ),
+            {"order_id": int(existing_order["id"])},
+        ).mappings().all()
+        return _serialize_merchant_sponsorship_result(
+            order_id=int(existing_order["id"]),
+            order_uid=str(existing_order["order_uid"]),
+            external_order_id=external_order_id_clean,
+            units=existing_units,
+            already_existed=True,
+            request=request,
+        )
+
+    quantity_clean = max(1, min(int(quantity or 1), 500))
+    customer_name_clean = _clean_text(customer_name, 160)
+    customer_email_clean = _normalize_email_address(customer_email)
+    if not customer_name_clean or not customer_email_clean:
+        raise HTTPException(status_code=400, detail="customer_name and customer_email are required")
+
+    default_project_id = int(merchant_row.get("default_project_id") or 0)
+    if default_project_id <= 0:
+        raise HTTPException(status_code=409, detail="This merchant has no default project configured yet — set one in LandCheck Work before integrating.")
+    project = get_project(project_id=default_project_id, db=db, assignee_name=None)
+    if not _is_public_sponsorship_project(project):
+        raise HTTPException(status_code=409, detail="This merchant's default project is not open for sponsorship")
+
+    checkout_currency = _normalize_currency_code(project.get("sponsor_currency"), "NGN")
+    agreed_price = merchant_row.get("agreed_price_per_tree")
+    amount_per_tree = (
+        round(float(agreed_price), 2)
+        if agreed_price is not None
+        else round(float(_get_project_sponsor_price(project, checkout_currency, fallback_to_any=True) or 0), 2)
+    )
+    amount_total = round(amount_per_tree * quantity_clean, 2)
+
+    customer_row = _ensure_guest_sponsor_account(db, full_name=customer_name_clean, email=customer_email_clean, phone=None)
+    db.commit()
+    customer_id = int(customer_row["id"])
+
+    order_uid = _generate_prefixed_uid("ORD")
+    order_id = 0
+    try:
+        order_row = db.execute(
+            text(
+                """
+                INSERT INTO green_sponsorship_orders (
+                    order_uid, sponsor_account_id, project_id, quantity, amount_per_tree, amount_total, currency,
+                    payment_method, payment_status, order_status,
+                    dedication_type, dedication_message, purchaser_note,
+                    accepted_terms, accepted_policy, consent_version,
+                    merchant_account_id, external_order_id, source
+                )
+                VALUES (
+                    :order_uid, :sponsor_account_id, :project_id, :quantity, :amount_per_tree, :amount_total, :currency,
+                    'merchant_invoiced', 'verified', 'paid',
+                    'self', :dedication_message, :purchaser_note,
+                    TRUE, TRUE, :consent_version,
+                    :merchant_account_id, :external_order_id, :source
+                )
+                RETURNING id, order_uid
+                """
+            ),
+            {
+                "order_uid": order_uid,
+                "sponsor_account_id": customer_id,
+                "project_id": int(project["id"]),
+                "quantity": quantity_clean,
+                "amount_per_tree": amount_per_tree,
+                "amount_total": amount_total,
+                "currency": checkout_currency,
+                "dedication_message": _clean_text(dedication_message, 500),
+                "purchaser_note": f"Merchant order via {str(merchant_row.get('organization_name') or merchant_row.get('full_name') or 'merchant').strip()} — external order {external_order_id_clean}",
+                "consent_version": SPONSOR_TERMS_VERSION,
+                "merchant_account_id": merchant_id,
+                "external_order_id": external_order_id_clean,
+                "source": source if source in MERCHANT_SPONSORSHIP_SOURCE_VALUES else "api",
+            },
+        ).mappings().first()
+        order_id = int(order_row["id"])
+        created_units: list[dict] = []
+        for _ in range(quantity_clean):
+            unit_row = db.execute(
+                text(
+                    """
+                    INSERT INTO green_sponsorship_units (
+                        unit_uid, order_id, sponsor_account_id, project_id, sponsorship_status,
+                        dedication_type, merchant_account_id
+                    )
+                    VALUES (
+                        :unit_uid, :order_id, :sponsor_account_id, :project_id, 'awaiting_tree',
+                        'self', :merchant_account_id
+                    )
+                    RETURNING id, unit_uid
+                    """
+                ),
+                {
+                    "unit_uid": _generate_prefixed_uid("UNT"),
+                    "order_id": order_id,
+                    "sponsor_account_id": customer_id,
+                    "project_id": int(project["id"]),
+                    "merchant_account_id": merchant_id,
+                },
+            ).mappings().first()
+            created_units.append(dict(unit_row))
+        _refresh_sponsorship_order_status(db, order_id)
+        _log_audit_event(
+            db,
+            project_id=int(project["id"]),
+            entity_type="sponsorship_order",
+            entity_id=order_id,
+            action="merchant_sponsorship_order_created",
+            actor=str(merchant_row.get("organization_name") or merchant_row.get("full_name") or "").strip(),
+            details={
+                "merchant_account_id": merchant_id,
+                "external_order_id": external_order_id_clean,
+                "quantity": quantity_clean,
+                "amount_total": amount_total,
+                "source": source,
+            },
+        )
+        db.commit()
+    except HTTPException:
+        db.rollback()
+        raise
+    except Exception:
+        db.rollback()
+        raise
+
+    try:
+        _notify_sponsor_order_created_email(db, order_id, request=request)
+        _notify_sponsor_payment_confirmed_email(db, order_id, request=request)
+    except Exception:
+        _rollback_quietly(db)
+
+    return _serialize_merchant_sponsorship_result(
+        order_id=order_id,
+        order_uid=order_uid,
+        external_order_id=external_order_id_clean,
+        units=created_units,
+        already_existed=False,
+        request=request,
+    )
+
+
+def _serialize_merchant_sponsorship_result(
+    *,
+    order_id: int,
+    order_uid: str,
+    external_order_id: str,
+    units: list,
+    already_existed: bool,
+    request: Request | None,
+) -> dict:
+    tree_units = []
+    for unit in units:
+        unit_uid = str(unit.get("unit_uid") or "").strip()
+        tree_units.append(
+            {
+                "unit_id": int(unit.get("id") or 0),
+                "unit_uid": unit_uid,
+                "tracking_url": _build_sponsor_public_story_url(unit_uid, request),
+                "certificate_url": _build_sponsor_public_certificate_url(unit_uid, request),
+            }
+        )
+    return {
+        "ok": True,
+        "already_existed": already_existed,
+        "order_id": order_id,
+        "order_uid": order_uid,
+        "external_order_id": external_order_id,
+        "quantity": len(tree_units),
+        "tree_units": tree_units,
+    }
+
+
+@router.post("/admin/merchants")
+def create_admin_merchant(payload: AdminCreateMerchantPayload, request: Request, db: Session = Depends(get_db)):
+    organization_name = _clean_text(payload.organization_name, 160)
+    contact_name = _clean_text(payload.contact_name, 160)
+    contact_email = _normalize_email_address(payload.contact_email)
+    if not organization_name or not contact_name or not contact_email:
+        raise HTTPException(status_code=400, detail="organization_name, contact_name and contact_email are required")
+    existing = db.execute(
+        text("SELECT id FROM green_sponsor_accounts WHERE LOWER(email) = LOWER(:email) LIMIT 1"),
+        {"email": contact_email},
+    ).first()
+    if existing:
+        raise HTTPException(status_code=409, detail="A sponsor/merchant account with this email already exists")
+    if payload.default_project_id:
+        project = get_project(project_id=int(payload.default_project_id), db=db, assignee_name=None)
+        if not _is_public_sponsorship_project(project):
+            raise HTTPException(status_code=400, detail="default_project_id must be a public-sponsorship project")
+    api_key = _generate_merchant_api_key()
+    webhook_secret = _generate_merchant_webhook_secret()
+    sponsor_uid = _ensure_unique_sponsor_uid(db, candidate=f"MER-{_slugify_text(organization_name)}")
+    row = db.execute(
+        text(
+            """
+            INSERT INTO green_sponsor_accounts (
+                sponsor_uid, account_type, full_name, organization_name, email, phone, password_hash,
+                is_active, api_key_hash, webhook_secret, default_project_id, agreed_price_per_tree
+            )
+            VALUES (
+                :sponsor_uid, 'merchant', :contact_name, :organization_name, :email, :phone, :password_hash,
+                TRUE, :api_key_hash, :webhook_secret, :default_project_id, :agreed_price_per_tree
+            )
+            RETURNING id, sponsor_uid, account_type, full_name, organization_name, email, phone,
+                      is_active, default_project_id, agreed_price_per_tree, webhook_secret, created_at
+            """
+        ),
+        {
+            "sponsor_uid": sponsor_uid,
+            "contact_name": contact_name,
+            "organization_name": organization_name,
+            "email": contact_email,
+            "phone": _clean_text(payload.contact_phone, 40),
+            "password_hash": _hash_password_value(_generate_temporary_login_password()),
+            "api_key_hash": _hash_merchant_api_key(api_key),
+            "webhook_secret": webhook_secret,
+            "default_project_id": int(payload.default_project_id) if payload.default_project_id else None,
+            "agreed_price_per_tree": round(float(payload.agreed_price_per_tree), 2) if payload.agreed_price_per_tree is not None else None,
+        },
+    ).mappings().first()
+    db.commit()
+    result = _serialize_merchant_account(dict(row))
+    # The plaintext API key and webhook secret are only ever returned here, at creation time —
+    # only the hash is retained afterward, matching how every other credential in this codebase
+    # (passwords, reset tokens) is stored.
+    result["api_key"] = api_key
+    result["webhook_secret"] = webhook_secret
+    result["webhook_url_shopify"] = f"{_build_public_api_base_url(request) or ''}/green/merchant/webhooks/shopify/{result['sponsor_uid']}"
+    return result
+
+
+@router.post("/admin/merchants/{merchant_id}/rotate-key")
+def rotate_admin_merchant_key(merchant_id: int, db: Session = Depends(get_db)):
+    _get_merchant_account_row(db, merchant_id)
+    api_key = _generate_merchant_api_key()
+    db.execute(
+        text("UPDATE green_sponsor_accounts SET api_key_hash = :api_key_hash, updated_at = NOW() WHERE id = :id"),
+        {"api_key_hash": _hash_merchant_api_key(api_key), "id": int(merchant_id)},
+    )
+    db.commit()
+    return {"ok": True, "api_key": api_key}
+
+
+@router.post("/admin/merchants/{merchant_id}/rotate-webhook-secret")
+def rotate_admin_merchant_webhook_secret(merchant_id: int, request: Request, db: Session = Depends(get_db)):
+    row = _get_merchant_account_row(db, merchant_id)
+    webhook_secret = _generate_merchant_webhook_secret()
+    db.execute(
+        text("UPDATE green_sponsor_accounts SET webhook_secret = :webhook_secret, updated_at = NOW() WHERE id = :id"),
+        {"webhook_secret": webhook_secret, "id": int(merchant_id)},
+    )
+    db.commit()
+    return {
+        "ok": True,
+        "webhook_secret": webhook_secret,
+        "webhook_url_shopify": f"{_build_public_api_base_url(request) or ''}/green/merchant/webhooks/shopify/{row['sponsor_uid']}",
+    }
+
+
+@router.get("/admin/merchants")
+def list_admin_merchants(db: Session = Depends(get_db)):
+    rows = db.execute(
+        text(
+            """
+            SELECT
+                m.id, m.sponsor_uid, m.account_type, m.full_name, m.organization_name, m.email, m.phone,
+                m.is_active, m.default_project_id, m.agreed_price_per_tree, m.webhook_secret, m.created_at,
+                COALESCE(order_stats.order_count, 0) AS order_count,
+                COALESCE(order_stats.tree_count, 0) AS tree_count,
+                COALESCE(order_stats.linked_count, 0) AS linked_count
+            FROM green_sponsor_accounts m
+            LEFT JOIN (
+                SELECT
+                    o.merchant_account_id,
+                    COUNT(DISTINCT o.id) AS order_count,
+                    COUNT(u.id) AS tree_count,
+                    COUNT(u.id) FILTER (WHERE u.tree_id IS NOT NULL) AS linked_count
+                FROM green_sponsorship_orders o
+                LEFT JOIN green_sponsorship_units u ON u.order_id = o.id
+                WHERE o.merchant_account_id IS NOT NULL
+                GROUP BY o.merchant_account_id
+            ) order_stats ON order_stats.merchant_account_id = m.id
+            WHERE m.account_type = 'merchant'
+            ORDER BY m.created_at DESC
+            """
+        ),
+    ).mappings().all()
+    items = []
+    for row in rows:
+        item = _serialize_merchant_account(dict(row))
+        item["order_count"] = int(row.get("order_count") or 0)
+        item["tree_count"] = int(row.get("tree_count") or 0)
+        item["linked_count"] = int(row.get("linked_count") or 0)
+        items.append(item)
+    return items
+
+
+@router.get("/admin/merchants/{merchant_id}")
+def get_admin_merchant(merchant_id: int, request: Request, db: Session = Depends(get_db)):
+    row = _get_merchant_account_row(db, merchant_id)
+    orders = db.execute(
+        text(
+            """
+            SELECT
+                o.id, o.order_uid, o.external_order_id, o.source, o.quantity, o.amount_total, o.currency,
+                o.order_status, o.created_at,
+                COUNT(u.id) FILTER (WHERE u.tree_id IS NOT NULL) AS linked_count
+            FROM green_sponsorship_orders o
+            LEFT JOIN green_sponsorship_units u ON u.order_id = o.id
+            WHERE o.merchant_account_id = :merchant_id
+            GROUP BY o.id
+            ORDER BY o.created_at DESC
+            LIMIT 100
+            """
+        ),
+        {"merchant_id": int(merchant_id)},
+    ).mappings().all()
+    result = _serialize_merchant_account(row)
+    result["webhook_url_shopify"] = f"{_build_public_api_base_url(request) or ''}/green/merchant/webhooks/shopify/{result['sponsor_uid']}"
+    result["orders"] = [dict(order) for order in orders]
+    return result
+
+
+@router.get("/admin/merchants/{merchant_id}/webhook-events")
+def list_admin_merchant_webhook_events(merchant_id: int, db: Session = Depends(get_db)):
+    _get_merchant_account_row(db, merchant_id)
+    rows = db.execute(
+        text(
+            """
+            SELECT id, platform, external_event_id, order_id, status, error_message, created_at
+            FROM green_merchant_webhook_events
+            WHERE merchant_account_id = :merchant_id
+            ORDER BY created_at DESC
+            LIMIT 100
+            """
+        ),
+        {"merchant_id": int(merchant_id)},
+    ).mappings().all()
+    return [dict(row) for row in rows]
+
+
+def _get_active_merchant_account_row(db: Session, merchant_id: int) -> dict:
+    row = db.execute(
+        text(
+            """
+            SELECT id, sponsor_uid, account_type, full_name, organization_name, email, phone, is_active
+            FROM green_sponsor_accounts
+            WHERE id = :merchant_id AND account_type = 'merchant'
+            LIMIT 1
+            """
+        ),
+        {"merchant_id": int(merchant_id)},
+    ).mappings().first()
+    if not row or not bool(row.get("is_active", True)):
+        raise HTTPException(status_code=404, detail="Merchant account not found")
+    return dict(row)
+
+
+def _build_merchant_report_rows(db: Session, merchant_id: int) -> list[dict]:
+    rows = db.execute(
+        text(
+            """
+            SELECT
+                u.id AS unit_id, u.unit_uid, u.tree_id, u.sponsorship_status,
+                o.order_uid, o.external_order_id, o.source, o.created_at AS order_created_at,
+                t.species, t.planting_date, t.status AS tree_status,
+                ST_X(t.geom) AS lng, ST_Y(t.geom) AS lat,
+                sa.full_name AS customer_name
+            FROM green_sponsorship_units u
+            JOIN green_sponsorship_orders o ON o.id = u.order_id
+            JOIN green_sponsor_accounts sa ON sa.id = u.sponsor_account_id
+            LEFT JOIN trees t ON t.id = u.tree_id
+            WHERE u.merchant_account_id = :merchant_id
+            ORDER BY o.created_at DESC, u.id ASC
+            """
+        ),
+        {"merchant_id": int(merchant_id)},
+    ).mappings().all()
+    return [dict(row) for row in rows]
+
+
+def _summarize_merchant_report_rows(rows: list[dict]) -> dict:
+    total_trees = len(rows)
+    planted_rows = [row for row in rows if row.get("tree_id")]
+    planted_count = len(planted_rows)
+    alive_count = sum(1 for row in planted_rows if _normalize_tree_status(row.get("tree_status")) in HEALTHY_TREE_STATUSES)
+    survival_rate = round((alive_count / planted_count) * 100, 1) if planted_count else 0.0
+    order_uids = {row.get("order_uid") for row in rows if row.get("order_uid")}
+    return {
+        "total_orders": len(order_uids),
+        "total_trees": total_trees,
+        "planted_trees": planted_count,
+        "awaiting_tree": total_trees - planted_count,
+        "survival_rate": survival_rate,
+    }
+
+
+@router.get("/merchant-auth/dashboard")
+def get_merchant_dashboard(merchant_id: int = Query(...), db: Session = Depends(get_db)):
+    merchant_row = _get_active_merchant_account_row(db, merchant_id)
+    report_rows = _build_merchant_report_rows(db, merchant_id)
+    summary = _summarize_merchant_report_rows(report_rows)
+    orders = db.execute(
+        text(
+            """
+            SELECT
+                o.id, o.order_uid, o.external_order_id, o.source, o.quantity, o.amount_total, o.currency,
+                o.order_status, o.created_at,
+                COUNT(u.id) FILTER (WHERE u.tree_id IS NOT NULL) AS linked_count
+            FROM green_sponsorship_orders o
+            LEFT JOIN green_sponsorship_units u ON u.order_id = o.id
+            WHERE o.merchant_account_id = :merchant_id
+            GROUP BY o.id
+            ORDER BY o.created_at DESC
+            LIMIT 200
+            """
+        ),
+        {"merchant_id": int(merchant_id)},
+    ).mappings().all()
+    map_points = [
+        {"lat": float(row["lat"]), "lng": float(row["lng"])}
+        for row in report_rows
+        if row.get("lat") is not None and row.get("lng") is not None
+    ]
+    return {
+        "merchant": _serialize_merchant_account(merchant_row),
+        "summary": summary,
+        "orders": [dict(order) for order in orders],
+        "map_points": map_points,
+    }
+
+
+@router.get("/merchant-auth/report.pdf")
+def get_merchant_report_pdf(merchant_id: int = Query(...), db: Session = Depends(get_db)):
+    merchant_row = _get_active_merchant_account_row(db, merchant_id)
+    report_rows = _build_merchant_report_rows(db, merchant_id)
+    summary = _summarize_merchant_report_rows(report_rows)
+    try:
+        pdf_bytes = render_green_merchant_report_pdf(merchant_row, summary, report_rows)
+    except Exception:
+        logger.exception("Merchant report PDF render failed for merchant_id=%s", int(merchant_id))
+        raise HTTPException(status_code=500, detail="Failed to generate merchant report PDF")
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={
+            "Content-Disposition": f'inline; filename="merchant_report_{merchant_row.get("sponsor_uid") or merchant_id}.pdf"',
+            "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+        },
+    )
+
+
+@router.post("/merchant/v1/sponsor")
+def create_merchant_sponsor_via_api(
+    payload: MerchantSponsorRequestPayload,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    auth_header = request.headers.get("Authorization") or ""
+    api_key = auth_header[7:].strip() if auth_header.lower().startswith("bearer ") else auth_header.strip()
+    merchant_row = _resolve_merchant_by_api_key(db, api_key)
+    if not merchant_row:
+        raise HTTPException(status_code=401, detail="Invalid or missing API key")
+    result = _create_merchant_sponsorship(
+        db,
+        merchant_row=merchant_row,
+        external_order_id=payload.external_order_id,
+        customer_name=payload.customer_name,
+        customer_email=payload.customer_email,
+        quantity=payload.quantity,
+        dedication_message=payload.dedication_message,
+        source="api",
+        request=request,
+    )
+    return result
+
+
+@router.post("/merchant/webhooks/shopify/{merchant_uid}")
+async def shopify_merchant_webhook(merchant_uid: str, request: Request, db: Session = Depends(get_db)):
+    raw_body = await request.body()
+    merchant_row_lookup = db.execute(
+        text(
+            """
+            SELECT id, sponsor_uid, full_name, organization_name, email, is_active,
+                   default_project_id, agreed_price_per_tree, webhook_secret
+            FROM green_sponsor_accounts
+            WHERE account_type = 'merchant' AND UPPER(sponsor_uid) = UPPER(:merchant_uid)
+            LIMIT 1
+            """
+        ),
+        {"merchant_uid": str(merchant_uid or "").strip()},
+    ).mappings().first()
+    if not merchant_row_lookup or not bool(merchant_row_lookup.get("is_active", True)):
+        raise HTTPException(status_code=404, detail="Unknown merchant")
+    merchant_row = dict(merchant_row_lookup)
+    signature = request.headers.get("x-shopify-hmac-sha256")
+    if not _verify_hmac_sha256_signature(merchant_row.get("webhook_secret"), raw_body, signature):
+        raise HTTPException(status_code=401, detail="Invalid webhook signature")
+    try:
+        payload = json.loads(raw_body.decode("utf-8"))
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid webhook payload")
+
+    external_event_id = str(request.headers.get("x-shopify-webhook-id") or payload.get("id") or "").strip() or None
+    merchant_id = int(merchant_row["id"])
+    if external_event_id:
+        duplicate = db.execute(
+            text(
+                """
+                SELECT id FROM green_merchant_webhook_events
+                WHERE merchant_account_id = :merchant_id AND platform = 'shopify' AND external_event_id = :external_event_id
+                LIMIT 1
+                """
+            ),
+            {"merchant_id": merchant_id, "external_event_id": external_event_id},
+        ).first()
+        if duplicate:
+            return {"ok": True, "duplicate": True}
+
+    event_row = db.execute(
+        text(
+            """
+            INSERT INTO green_merchant_webhook_events (merchant_account_id, platform, external_event_id, status, raw_payload)
+            VALUES (:merchant_account_id, 'shopify', :external_event_id, 'received', CAST(:raw_payload AS JSONB))
+            RETURNING id
+            """
+        ),
+        {"merchant_account_id": merchant_id, "external_event_id": external_event_id, "raw_payload": _safe_json(payload)},
+    ).mappings().first()
+    event_id = int(event_row["id"])
+    db.commit()
+
+    customer = payload.get("customer") or {}
+    customer_name = " ".join(
+        part for part in [str(customer.get("first_name") or "").strip(), str(customer.get("last_name") or "").strip()] if part
+    ).strip() or str(payload.get("email") or "customer").strip()
+    customer_email = str(customer.get("email") or payload.get("email") or payload.get("contact_email") or "").strip()
+    external_order_id = str(payload.get("id") or payload.get("order_number") or "").strip()
+
+    try:
+        if not customer_email or not external_order_id:
+            raise HTTPException(status_code=400, detail="Shopify payload missing customer email or order id")
+        result = _create_merchant_sponsorship(
+            db,
+            merchant_row=merchant_row,
+            external_order_id=external_order_id,
+            customer_name=customer_name,
+            customer_email=customer_email,
+            quantity=1,
+            dedication_message=None,
+            source="webhook_shopify",
+            request=request,
+        )
+        db.execute(
+            text(
+                "UPDATE green_merchant_webhook_events SET status = 'processed', order_id = :order_id WHERE id = :id"
+            ),
+            {"order_id": int(result["order_id"]), "id": event_id},
+        )
+        db.commit()
+        return {"ok": True}
+    except HTTPException as exc:
+        _rollback_quietly(db)
+        db.execute(
+            text("UPDATE green_merchant_webhook_events SET status = 'error', error_message = :error WHERE id = :id"),
+            {"error": str(exc.detail or exc), "id": event_id},
+        )
+        db.commit()
+        # Still return 200: Shopify treats non-2xx as "retry forever," but a payload we can't
+        # process (e.g. missing customer email) will never succeed on retry either — the error
+        # is recorded in green_merchant_webhook_events for an admin to investigate instead.
+        return {"ok": False, "error": str(exc.detail or exc)}
 
 
 @router.post("/sponsor/guest/claim")
