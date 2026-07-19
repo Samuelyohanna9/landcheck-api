@@ -16786,7 +16786,10 @@ def _render_sponsor_public_terms_html(request: Request | None = None) -> str:
 
 def _render_sponsor_public_reset_password_html(token: str) -> str:
     safe_token = html.escape(str(token or "").strip(), quote=True)
-    login_url = str(os.getenv("LANDCHECK_GREEN_URL") or "").strip() or "https://landcheck.online/green/login"
+    # Route straight to the sponsor login form (works for individual/organization/merchant
+    # accounts alike) rather than the bare /green/login selector page, which only offers
+    # "Sponsor Trees" / "Perform Field Work" — neither reads as "I just reset my password."
+    login_url = str(os.getenv("LANDCHECK_GREEN_URL") or "").strip() or "https://landcheck.online/green/login/sponsor"
     safe_login_url = html.escape(login_url, quote=True)
     eye_open_svg = (
         '<svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" '
