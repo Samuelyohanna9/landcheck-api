@@ -1790,6 +1790,84 @@ def _send_sponsor_welcome_email(*, to_email: str, full_name: str, account_type: 
     )
 
 
+def _send_merchant_welcome_email(
+    *,
+    to_email: str,
+    contact_name: str,
+    organization_name: str,
+    api_key: str,
+    webhook_url_shopify: str | None,
+    reset_url: str | None,
+    reset_expires_at: datetime | None,
+):
+    recipient_name = str(contact_name or "").strip() or "there"
+    org_name = str(organization_name or "").strip() or "your organization"
+    expiry_label = reset_expires_at.strftime("%d %b %Y %H:%M UTC") if reset_expires_at else None
+    set_password_line = (
+        f"Set your dashboard password (link valid until {expiry_label}):\n{reset_url}\n\n"
+        if reset_url
+        else ""
+    )
+    webhook_line = f"Shopify webhook URL: {webhook_url_shopify}\n" if webhook_url_shopify else ""
+    body = (
+        f"Hello {recipient_name},\n\n"
+        f"{org_name} has been set up as a LandCheck Green merchant integration partner. "
+        "Every tree your customers sponsor through your integration will be verified, planted by our field agents, "
+        "and tracked with GPS, photos, and a certificate for your customer.\n\n"
+        f"{set_password_line}"
+        "Your API key (for a direct integration):\n"
+        f"{api_key}\n\n"
+        f"{webhook_line}"
+        "Keep your API key and webhook secret private — they authenticate requests as your organization. "
+        "Once you've set your password, sign in at the usual LandCheck Green login page to see your live "
+        "dashboard: trees sponsored, planted, survival rate, and a downloadable impact report.\n\n"
+        "Regards,\n"
+        "LandCheck Green"
+    )
+    reset_button = (
+        f"""
+            <div style="margin:0 0 18px;">
+              <a href="{html.escape(reset_url, quote=True)}" style="display:inline-block;padding:13px 20px;border-radius:999px;background:#0f6f39;color:#ffffff;font-weight:800;text-decoration:none;">Set your dashboard password</a>
+              {f'<div style="margin-top:8px;font-size:12px;color:#6b8577;">Link valid until {html.escape(expiry_label)}</div>' if expiry_label else ''}
+            </div>
+        """
+        if reset_url
+        else ""
+    )
+    html_body = f"""
+    <html>
+      <body style="margin:0;padding:28px;background:#eef8ef;font-family:Arial,sans-serif;color:#173624;">
+        <div style="max-width:680px;margin:0 auto;background:#ffffff;border:1px solid #d8ebdd;border-radius:20px;overflow:hidden;box-shadow:0 18px 42px rgba(12,73,34,0.10);">
+          <div style="padding:28px 28px 22px;background:linear-gradient(140deg,#0c5f2e 0%,#1a8a4a 100%);color:#ffffff;">
+            <div style="font-size:12px;font-weight:800;letter-spacing:0.16em;text-transform:uppercase;color:#d8f7df;">LandCheck Green — Merchant</div>
+            <div style="margin-top:10px;font-size:26px;font-weight:800;line-height:1.15;">Welcome, {html.escape(org_name)}</div>
+            <div style="margin-top:10px;font-size:15px;line-height:1.7;color:#eefcf0;">Your merchant sponsorship integration is ready.</div>
+          </div>
+          <div style="padding:26px 28px 30px;">
+            <p style="margin:0 0 14px;font-size:15px;line-height:1.7;">Hello {html.escape(recipient_name)},</p>
+            <p style="margin:0 0 18px;font-size:15px;line-height:1.7;">{html.escape(org_name)} has been set up as a LandCheck Green merchant integration partner. Every tree your customers sponsor through your integration is verified, planted by our field agents, and tracked with GPS, photos, and a certificate for your customer.</p>
+            {reset_button}
+            <div style="border:1px solid #dbece0;border-radius:16px;background:#f8fcf9;padding:18px;margin:0 0 18px;">
+              <div style="font-size:13px;font-weight:800;letter-spacing:0.08em;text-transform:uppercase;color:#4e6b58;">Your API key</div>
+              <div style="margin-top:8px;font-size:13px;font-family:monospace;color:#143522;word-break:break-all;">{html.escape(api_key)}</div>
+              {f'<div style="margin-top:14px;font-size:13px;font-weight:800;letter-spacing:0.08em;text-transform:uppercase;color:#4e6b58;">Shopify webhook URL</div><div style="margin-top:8px;font-size:13px;font-family:monospace;color:#143522;word-break:break-all;">{html.escape(webhook_url_shopify)}</div>' if webhook_url_shopify else ''}
+              <div style="margin-top:14px;font-size:13px;color:#6b8577;">Keep these private — they authenticate requests as {html.escape(org_name)}.</div>
+            </div>
+            <p style="margin:0;font-size:14px;line-height:1.7;color:#486652;">Once you've set your password, sign in at the usual LandCheck Green login page to see your live dashboard — trees sponsored, planted, survival rate, and a downloadable impact report.</p>
+            <p style="margin:16px 0 0;font-size:14px;line-height:1.7;color:#486652;">Regards,<br/>LandCheck Green</p>
+          </div>
+        </div>
+      </body>
+    </html>
+    """
+    _send_html_email(
+        to_email=to_email,
+        subject=f"Welcome to LandCheck Green — {org_name} merchant integration",
+        text_body=body,
+        html_body=html_body,
+    )
+
+
 def _build_field_public_reset_password_url(token: str, request: Request | None = None) -> str | None:
     reset_token = str(token or "").strip()
     if not reset_token:
@@ -11771,6 +11849,38 @@ def sponsor_auth_login(payload: SponsorLoginPayload, db: Session = Depends(get_d
     return _build_sponsor_auth_payload(dict(row))
 
 
+def _issue_sponsor_password_reset_token(db: Session, *, sponsor_id: int, request: Request | None = None) -> tuple[str, datetime] | None:
+    """Generates and stores a password-reset token for a green_sponsor_accounts row
+    (used for the forgot-password flow, and reused to send a new merchant their first
+    "set your password" link right at account creation). Returns (reset_url, expires_at),
+    or None if a reset URL couldn't be built (no public base URL configured).
+    Note: expires_at is a naive UTC datetime — the reset-password endpoint compares it
+    against (NOW() AT TIME ZONE 'UTC'), not bare NOW(), so this stays correct regardless
+    of the database session's configured timezone."""
+    token = secrets.token_urlsafe(32)
+    token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
+    expires_at = datetime.utcnow() + timedelta(hours=SPONSOR_RESET_TOKEN_TTL_HOURS)
+    db.execute(
+        text(
+            """
+            UPDATE green_sponsor_accounts
+            SET password_reset_token_hash = :token_hash,
+                password_reset_token_expires_at = :expires_at,
+                password_reset_requested_at = NOW(),
+                updated_at = NOW()
+            WHERE id = :sponsor_id
+            """
+        ),
+        {
+            "sponsor_id": int(sponsor_id),
+            "token_hash": token_hash,
+            "expires_at": expires_at,
+        },
+    )
+    reset_url = _build_sponsor_public_reset_password_url(token, request=request)
+    return (reset_url, expires_at) if reset_url else None
+
+
 @router.post("/sponsor-auth/forgot-password")
 def sponsor_auth_forgot_password(payload: SponsorForgotPasswordPayload, request: Request, db: Session = Depends(get_db)):
     email = _normalize_email_address(payload.email)
@@ -11789,26 +11899,7 @@ def sponsor_auth_forgot_password(payload: SponsorForgotPasswordPayload, request:
     if not row:
         return {"ok": True, "message": "If that sponsor email exists, a reset link has been sent."}
 
-    token = secrets.token_urlsafe(32)
-    token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
-    expires_at = datetime.utcnow() + timedelta(hours=SPONSOR_RESET_TOKEN_TTL_HOURS)
-    db.execute(
-        text(
-            """
-            UPDATE green_sponsor_accounts
-            SET password_reset_token_hash = :token_hash,
-                password_reset_token_expires_at = :expires_at,
-                password_reset_requested_at = NOW(),
-                updated_at = NOW()
-            WHERE id = :sponsor_id
-            """
-        ),
-        {
-            "sponsor_id": int(row["id"]),
-            "token_hash": token_hash,
-            "expires_at": expires_at,
-        },
-    )
+    reset_result = _issue_sponsor_password_reset_token(db, sponsor_id=int(row["id"]), request=request)
     _log_audit_event(
         db,
         project_id=None,
@@ -11816,11 +11907,11 @@ def sponsor_auth_forgot_password(payload: SponsorForgotPasswordPayload, request:
         entity_id=int(row["id"]),
         action="sponsor_password_reset_requested",
         actor=str(row.get("email") or "").strip(),
-        details={"expires_at": expires_at.isoformat()},
+        details={"expires_at": reset_result[1].isoformat() if reset_result else None},
     )
     db.commit()
-    reset_url = _build_sponsor_public_reset_password_url(token, request=request)
-    if reset_url:
+    if reset_result:
+        reset_url, expires_at = reset_result
         try:
             _send_sponsor_password_reset_email(
                 to_email=str(row.get("email") or "").strip(),
@@ -11849,7 +11940,7 @@ def sponsor_auth_reset_password(payload: SponsorResetPasswordPayload, db: Sessio
             FROM green_sponsor_accounts
             WHERE password_reset_token_hash = :token_hash
               AND password_reset_token_expires_at IS NOT NULL
-              AND password_reset_token_expires_at >= NOW()
+              AND password_reset_token_expires_at >= (NOW() AT TIME ZONE 'UTC')
             LIMIT 1
             """
         ),
@@ -12499,6 +12590,26 @@ def create_admin_merchant(payload: AdminCreateMerchantPayload, request: Request,
     result["api_key"] = api_key
     result["webhook_secret"] = webhook_secret
     result["webhook_url_shopify"] = f"{_build_public_api_base_url(request) or ''}/green/merchant/webhooks/shopify/{result['sponsor_uid']}"
+
+    try:
+        reset_result = _issue_sponsor_password_reset_token(db, sponsor_id=int(row["id"]), request=request)
+        db.commit()
+        _send_merchant_welcome_email(
+            to_email=contact_email,
+            contact_name=contact_name,
+            organization_name=organization_name,
+            api_key=api_key,
+            webhook_url_shopify=result["webhook_url_shopify"],
+            reset_url=reset_result[0] if reset_result else None,
+            reset_expires_at=reset_result[1] if reset_result else None,
+        )
+    except Exception:
+        # Merchant creation itself already succeeded and committed above — a failed welcome
+        # email shouldn't undo that or fail this request. "Send Login Invite" in the Merchants
+        # tab re-sends the set-password link if this email didn't arrive.
+        _rollback_quietly(db)
+        logger.exception("Merchant welcome email failed for merchant_id=%s", int(row["id"]))
+
     return result
 
 
@@ -23572,7 +23683,7 @@ def green_auth_reset_password(payload: FieldResetPasswordPayload, db: Session = 
             FROM green_users
             WHERE password_reset_token_hash = :token_hash
               AND password_reset_token_expires_at IS NOT NULL
-              AND password_reset_token_expires_at >= NOW()
+              AND password_reset_token_expires_at >= (NOW() AT TIME ZONE 'UTC')
             LIMIT 1
             """
         ),
