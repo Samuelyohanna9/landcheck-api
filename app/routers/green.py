@@ -17795,7 +17795,7 @@ def get_sponsor_agent_payout_dashboard(
 
 
 @router.post("/agent-payouts/requests")
-def create_sponsor_agent_payout_request(payload: SponsorAgentPayoutRequestPayload, db: Session = Depends(get_db)):
+def create_sponsor_agent_payout_request(payload: SponsorAgentPayoutRequestPayload, request: Request, db: Session = Depends(get_db)):
     dashboard = _build_sponsor_agent_dashboard(
         db,
         user_id=int(payload.user_id),
@@ -17856,7 +17856,53 @@ def create_sponsor_agent_payout_request(payload: SponsorAgentPayoutRequestPayloa
         },
     ).mappings().first()
     db.commit()
-    return {"ok": True, "request": _serialize_sponsor_agent_payout_request(dict(row) if row else None)}
+
+    updated_row = dict(row) if row else None
+    transfer_error: str | None = None
+    # Automatically attempt the Flutterwave payout right here — no super admin click
+    # required. If Flutterwave isn't configured, or the attempt fails for any reason (bad
+    # bank details, gateway down, IP not whitelisted, transfers not enabled on the account,
+    # etc.), this must NOT fail or block the agent's request — it just falls back to the
+    # existing pending/failed state, which the admin can review or retry manually exactly as
+    # before (the "Retry Auto Payout" button already handles a failed transfer_status).
+    if updated_row and _flutterwave_secret_key():
+        try:
+            updated_row = _create_flutterwave_transfer_for_payout(request, db, updated_row)
+            db.commit()
+        except HTTPException as exc:
+            transfer_error = str(exc.detail or "Automatic payout failed")
+            try:
+                refreshed = db.execute(
+                    text(
+                        """
+                        UPDATE green_sponsor_agent_payout_requests
+                        SET status = 'failed',
+                            transfer_status = 'error',
+                            review_notes = COALESCE(NULLIF(review_notes, ''), :error),
+                            updated_at = NOW()
+                        WHERE id = :id
+                        RETURNING *
+                        """
+                    ),
+                    {"id": int(updated_row["id"]), "error": transfer_error},
+                ).mappings().first()
+                db.commit()
+                if refreshed:
+                    updated_row = dict(refreshed)
+            except Exception:
+                _rollback_quietly(db)
+        except Exception:
+            _rollback_quietly(db)
+            logger.exception(
+                "Automatic payout attempt failed for payout_request_id=%s",
+                int(updated_row["id"]) if updated_row else None,
+            )
+
+    return {
+        "ok": True,
+        "request": _serialize_sponsor_agent_payout_request(updated_row),
+        "transfer_error": transfer_error,
+    }
 
 
 @router.get("/agent/sponsor-qr-tags")
