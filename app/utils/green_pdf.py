@@ -2996,6 +2996,13 @@ def render_green_existing_trees_report_pdf(
 ):
     c = canvas.Canvas(output_path, pagesize=A4)
     width, height = A4
+    report_label = str(project.get("report_export_label") or "Existing Trees Report")
+    report_entity_label = str(project.get("report_export_entity_label") or "Existing Trees")
+    report_subtitle = str(
+        project.get("report_export_subtitle")
+        or "Detailed existing-tree inventory with per-tree CO2 estimates and optional photo appendix"
+    )
+    report_footer = str(project.get("report_export_footer") or "Existing Trees Detailed Export")
 
     def _fmt_num(value, digits=2):
         try:
@@ -3027,8 +3034,8 @@ def render_green_existing_trees_report_pdf(
         width,
         height,
         project,
-        report_label="Existing Trees Report",
-        subtitle="Detailed existing-tree inventory with per-tree CO2 estimates and optional photo appendix",
+        report_label=report_label,
+        subtitle=report_subtitle,
         bar_height=78,
     )
 
@@ -3042,7 +3049,7 @@ def render_green_existing_trees_report_pdf(
         project_meta.append(f"Location: {project.get('location_text')}")
     if project.get("sponsor"):
         project_meta.append(f"Sponsor: {project.get('sponsor')}")
-    project_meta.append(f"Existing trees in report: {int(summary.get('total_existing_trees', 0) or 0)}")
+    project_meta.append(f"{report_entity_label} in report: {int(summary.get('total_existing_trees', 0) or 0)}")
     project_meta.append(f"Rows: {int(summary.get('total_existing_rows', len(rows)) or 0)}")
     if float(summary.get("total_existing_area_sqm", 0) or 0) > 0:
         project_meta.append(f"Area: {_fmt_num(summary.get('total_existing_area_ha', 0), 4)} ha")
@@ -3053,7 +3060,7 @@ def render_green_existing_trees_report_pdf(
     card_h = 58
     _draw_stat_card(
         c, 34, card_y, card_w, card_h,
-        "Existing Trees",
+        report_entity_label,
         int(summary.get("total_existing_trees", 0) or 0),
         sub=(
             f"Rows: {int(summary.get('total_existing_rows', len(rows)) or 0)}"
@@ -3110,7 +3117,7 @@ def render_green_existing_trees_report_pdf(
         for idx, item in enumerate(top_species[:8]):
             label = str(item.get("species") or "Unknown")
             bar_data.append((label[:18], float(item.get("co2_kg") or 0.0), colors[idx % len(colors)]))
-        _draw_bar_chart(c, 34, height - 470, width - 68, 150, bar_data, title="Top Existing Species by Current CO2 (kg)")
+        _draw_bar_chart(c, 34, height - 470, width - 68, 150, bar_data, title=f"Top {report_entity_label} Species by Current CO2 (kg)")
         c.setFont("Helvetica", 7)
         c.setFillColorRGB(0.42, 0.42, 0.42)
         c.drawString(34, height - 480, "Context: current existing-tree CO2 totals by species (rows excluded from carbon scope contribute 0).")
@@ -3139,7 +3146,7 @@ def render_green_existing_trees_report_pdf(
 
     c.setFont("Helvetica", 7)
     c.setFillColorRGB(0.55, 0.55, 0.55)
-    c.drawString(34, 24, "Powered by LandCheck | Existing Trees Detailed Export")
+    c.drawString(34, 24, f"Powered by LandCheck | {report_footer}")
     c.drawRightString(width - 34, 24, f"Rows: {len(rows)}")
 
     # ------------------------------------------------------------------
@@ -3169,13 +3176,13 @@ def render_green_existing_trees_report_pdf(
         return y_head - 14
 
     c.showPage()
-    y = _draw_carbon_table_page_header("Existing Trees CO2 Detail")
+    y = _draw_carbon_table_page_header(f"{report_entity_label} CO2 Detail")
     c.setFont("Helvetica", 6.6)
 
     for row in rows:
         if y < 44:
             c.showPage()
-            y = _draw_carbon_table_page_header("Existing Trees CO2 Detail (continued)")
+            y = _draw_carbon_table_page_header(f"{report_entity_label} CO2 Detail (continued)")
             c.setFont("Helvetica", 6.6)
 
         height_val = "-"
@@ -3246,13 +3253,13 @@ def render_green_existing_trees_report_pdf(
         return y_head - 14
 
     c.showPage()
-    y = _draw_meta_table_page_header("Existing Trees Operational Detail")
+    y = _draw_meta_table_page_header(f"{report_entity_label} Operational Detail")
     c.setFont("Helvetica", 6.4)
 
     for row in rows:
         if y < 44:
             c.showPage()
-            y = _draw_meta_table_page_header("Existing Trees Operational Detail (continued)")
+            y = _draw_meta_table_page_header(f"{report_entity_label} Operational Detail (continued)")
             c.setFont("Helvetica", 6.4)
 
         review_state = str(row.get("last_review_state") or "-")[:8]
@@ -3281,6 +3288,351 @@ def render_green_existing_trees_report_pdf(
         c.drawString(462, y, photo_flag)
         c.drawString(495, y, str(row.get("created_at") or "-")[:10])
         y -= 10
+
+    if include_photos:
+        _render_photo_appendix_pages(
+            c,
+            width,
+            height,
+            project,
+            [dict(row) for row in (photo_rows or []) if str(row.get("photo_url") or "").strip()],
+            assignee_name=None,
+        )
+
+    c.save()
+
+
+def render_green_csr_programme_report_pdf(
+    output_path: str,
+    project: dict,
+    rows: list[dict],
+    summary: dict,
+    *,
+    include_photos: bool = False,
+    photo_rows: list[dict] | None = None,
+    overview_map_png: bytes | None = None,
+    team_rows: list[dict] | None = None,
+):
+    c = canvas.Canvas(output_path, pagesize=A4)
+    width, height = A4
+    csr_config = project.get("csr_config") or {}
+    team_rows = list(team_rows or [])
+
+    def _fmt_num(value, digits=2):
+        try:
+            return f"{float(value):,.{digits}f}"
+        except Exception:
+            return f"{0:.{digits}f}"
+
+    def _fmt_date(value) -> str:
+        text_value = str(value or "").strip()
+        return text_value[:10] if text_value else "-"
+
+    def _fmt_label(value: object) -> str:
+        text_value = str(value or "").strip()
+        if not text_value:
+            return "-"
+        return text_value.replace("_", " ").replace("-", " ").title()
+
+    def _draw_text_box(x: float, y: float, w: float, h: float, title: str, lines: list[str], *, fill="#ffffff"):
+        _draw_rounded_box(c, x, y, w, h, 8, fill_color=HexColor(fill), stroke_color=HexColor("#d7ead9"))
+        c.setFillColor(HexColor("#163826"))
+        c.setFont("Helvetica-Bold", 10.5)
+        c.drawString(x + 12, y + h - 18, title)
+        cursor = y + h - 34
+        for line in lines:
+            if cursor < y + 14:
+                break
+            cursor = _draw_wrapped_text(
+                c,
+                line,
+                x + 12,
+                cursor,
+                w - 24,
+                line_height=9,
+                font_name="Helvetica",
+                font_size=7.6,
+                color=HexColor("#40574a"),
+                max_lines=2,
+            )
+            cursor -= 2
+
+    def _draw_footer(page_no: int):
+        c.setFont("Helvetica", 7)
+        c.setFillColor(HexColor("#6b7280"))
+        c.drawString(34, 22, "Powered by LandCheck | CSR Programme Report")
+        c.drawRightString(width - 34, 22, f"Page {page_no}")
+
+    total_rows = int(summary.get("total_existing_rows", len(rows)) or len(rows))
+    total_trees = int(summary.get("total_existing_trees", 0) or 0)
+    alive_trees = int(summary.get("alive_trees", 0) or 0)
+    attention_trees = int(summary.get("attention_trees", 0) or 0)
+    dead_trees = int(summary.get("dead_trees", 0) or 0)
+    field_team_count = int(summary.get("field_team_count", len(team_rows)) or len(team_rows))
+    field_team_active_count = int(summary.get("field_team_active_count", 0) or 0)
+    photo_rows_count = int(summary.get("rows_with_photos", 0) or 0)
+    reviewed_rows_count = int(summary.get("rows_with_review_activity", 0) or 0)
+    mapped_rows_count = int(summary.get("rows_with_map", 0) or 0)
+    maintenance_total = int(summary.get("maintenance_total", 0) or 0)
+    maintenance_done = int(summary.get("maintenance_done", 0) or 0)
+    maintenance_pending = int(summary.get("maintenance_pending", 0) or 0)
+    maintenance_overdue = int(summary.get("maintenance_overdue", 0) or 0)
+    tasks_total = int(summary.get("implementation_tasks_total", 0) or 0)
+    tasks_completed = int(summary.get("implementation_tasks_completed", 0) or 0)
+    tasks_live = int(summary.get("implementation_tasks_live", 0) or 0)
+
+    survival_pct = round((float(alive_trees) / float(total_trees)) * 100.0, 1) if total_trees > 0 else 0.0
+    client_name = str(csr_config.get("client_name") or project.get("organization_name") or "").strip() or "CSR Client"
+    reporting_cycle = str(csr_config.get("reporting_cycle") or "Current reporting cycle").strip()
+    implementation_scope = str(csr_config.get("implementation_scope") or "Tree implementation and verified field evidence").strip()
+    target_outcomes = str(csr_config.get("target_outcomes") or "").strip()
+
+    executive_lines = [
+        f"{total_trees} implementation tree(s) are currently recorded across {total_rows} verified programme record(s).",
+        f"Status mix: {alive_trees} healthy/alive, {attention_trees} needing attention, and {dead_trees} dead or removed.",
+        f"Photo evidence is present on {photo_rows_count}/{total_rows} records ({_fmt_num(summary.get('photo_coverage_pct', 0), 1)}%), while mapped geospatial coverage is {mapped_rows_count}/{total_rows} ({_fmt_num(summary.get('map_coverage_pct', 0), 1)}%).",
+        f"Field review activity exists on {reviewed_rows_count}/{total_rows} records, and {maintenance_done}/{maintenance_total or 1} maintenance actions are marked done.",
+        f"Estimated carbon snapshot currently stands at {_fmt_num(summary.get('current_co2_tonnes', 0), 2)} t CO2 with a {_fmt_num(summary.get('projected_lifetime_co2_tonnes', 0), 2)} t long-range projection.",
+    ]
+    programme_lines = [
+        f"Client: {client_name}",
+        f"Programme type: {_fmt_label(csr_config.get('program_type') or 'tree_planting')}",
+        f"Reporting cycle: {reporting_cycle}",
+        f"Location: {str(project.get('location_text') or '-').strip() or '-'}",
+        f"Scope: {implementation_scope}",
+    ]
+    assurance_lines = [
+        "This report is structured around common CSR reporting themes used in board and stakeholder updates: programme scope, implementation footprint, evidence quality, field assurance, and impact indicators.",
+        f"Maintenance ledger: total {maintenance_total}, done {maintenance_done}, pending {maintenance_pending}, overdue {maintenance_overdue}.",
+        f"Implementation task activity: {tasks_total} tracked task(s), {tasks_completed} completed, {tasks_live} still live.",
+        f"Field team visibility: {field_team_count} team member(s) currently appear in roster or implementation activity, with {field_team_active_count} marked active.",
+    ]
+    next_action_lines = [
+        f"Close the {tasks_live} live implementation task(s) still open in the field queue.",
+        f"Resolve the {attention_trees} record(s) flagged for attention and the {maintenance_overdue} overdue care action(s).",
+        f"Expand photo evidence on the remaining {max(total_rows - photo_rows_count, 0)} record(s) where field proof is still missing.",
+    ]
+    if target_outcomes:
+        next_action_lines.insert(0, f"Target outcomes: {target_outcomes}")
+
+    _draw_project_brand_header_bar(
+        c,
+        width,
+        height,
+        project,
+        report_label="CSR Programme Report",
+        subtitle="Client-ready implementation summary covering scope, evidence, team readiness, and impact.",
+        bar_height=78,
+        bar_color="#0b3d24",
+    )
+
+    c.setFillColor(HexColor("#163826"))
+    c.setFont("Helvetica-Bold", 12.5)
+    c.drawString(34, height - 96, str(project.get("name") or "CSR Project"))
+    c.setFont("Helvetica", 8.8)
+    c.setFillColor(HexColor("#5a6f64"))
+    c.drawString(
+        34,
+        height - 110,
+        f"Client route: {client_name} | Reporting cycle: {reporting_cycle} | Generated scope: verified implementation and field evidence",
+    )
+
+    metric_y = height - 186
+    metric_w = (width - 68 - 24) / 4
+    _draw_metric_chip(c, 34, metric_y, metric_w, 66, str(total_trees), "Trees implemented")
+    _draw_metric_chip(c, 34 + metric_w + 8, metric_y, metric_w, 66, f"{survival_pct:.1f}%", "Healthy / alive rate")
+    _draw_metric_chip(c, 34 + (metric_w + 8) * 2, metric_y, metric_w, 66, f"{photo_rows_count}/{total_rows}", "Photo evidence")
+    _draw_metric_chip(c, 34 + (metric_w + 8) * 3, metric_y, metric_w, 66, str(field_team_count), "Field team")
+
+    metric_y2 = metric_y - 78
+    _draw_metric_chip(c, 34, metric_y2, metric_w, 66, f"{_fmt_num(summary.get('current_co2_tonnes', 0), 2)} t", "Current CO2")
+    _draw_metric_chip(c, 34 + metric_w + 8, metric_y2, metric_w, 66, f"{_fmt_num(summary.get('annual_co2_tonnes', 0), 2)} t", "Annual CO2")
+    _draw_metric_chip(c, 34 + (metric_w + 8) * 2, metric_y2, metric_w, 66, f"{_fmt_num(summary.get('projected_lifetime_co2_tonnes', 0), 2)} t", "40Y projection")
+    _draw_metric_chip(c, 34 + (metric_w + 8) * 3, metric_y2, metric_w, 66, f"{_fmt_num(summary.get('total_existing_area_ha', 0), 2)} ha", "Mapped area")
+
+    box_y = metric_y2 - 136
+    _draw_text_box(34, box_y, 316, 124, "Executive Summary", executive_lines, fill="#fbfdfb")
+    _draw_text_box(360, box_y, width - 394, 124, "Programme Scope", programme_lines, fill="#f7fbf8")
+
+    map_y = 80
+    map_h = 176
+    _draw_rounded_box(c, 34, map_y, width - 68, map_h, 8, fill_color=HexColor("#f8faf9"), stroke_color=HexColor("#d7ead9"))
+    c.setFillColor(HexColor("#163826"))
+    c.setFont("Helvetica-Bold", 10.5)
+    c.drawString(46, map_y + map_h - 18, "Implementation Footprint")
+    c.setFont("Helvetica", 7.6)
+    c.setFillColor(HexColor("#5a6f64"))
+    c.drawString(46, map_y + map_h - 30, "Map preview of the verified CSR implementation footprint captured in LandCheck Green.")
+    if overview_map_png:
+        try:
+            map_reader = ImageReader(io.BytesIO(overview_map_png))
+            c.drawImage(map_reader, 46, map_y + 14, width - 92, map_h - 52, preserveAspectRatio=True, mask="auto")
+        except Exception:
+            c.setFillColor(HexColor("#7a8d82"))
+            c.setFont("Helvetica", 9)
+            c.drawString(46, map_y + 74, "Map preview could not be rendered for this export.")
+    else:
+        c.setFillColor(HexColor("#7a8d82"))
+        c.setFont("Helvetica", 9)
+        c.drawString(46, map_y + 74, "No map preview is available yet. Add point or polygon geometry to implementation records.")
+
+    _draw_footer(c.getPageNumber())
+
+    c.showPage()
+    _draw_project_brand_header_bar(
+        c,
+        width,
+        height,
+        project,
+        report_label="CSR Programme Report",
+        subtitle="Implementation quality, evidence coverage, and field delivery readiness.",
+        bar_height=62,
+        bar_color="#0b3d24",
+    )
+
+    _draw_text_box(34, height - 238, 250, 146, "Evidence & Assurance", assurance_lines, fill="#fbfdfb")
+    _draw_text_box(294, height - 238, width - 328, 146, "Next Actions", next_action_lines, fill="#fffdf7")
+
+    top_species = summary.get("top_species") or []
+    if top_species:
+        chart_data = []
+        colors = ["#1f7a3d", "#2f9e44", "#52b788", "#74c69d", "#0ea5e9", "#f97316"]
+        for idx, item in enumerate(top_species[:6]):
+            chart_data.append(
+                (
+                    str(item.get("species") or "Unknown")[:18],
+                    float(item.get("co2_kg") or 0.0),
+                    colors[idx % len(colors)],
+                )
+            )
+        _draw_bar_chart(c, 34, height - 428, 250, 150, chart_data, title="Top Species by Current CO2 (kg)")
+    else:
+        _draw_text_box(
+            34,
+            height - 428,
+            250,
+            150,
+            "Top Species by Current CO2",
+            ["Species-level carbon distribution is not available yet because no eligible implementation records were found in scope."],
+            fill="#fbfdfb",
+        )
+
+    team_box_y = height - 428
+    team_box_h = 290
+    _draw_rounded_box(c, 294, team_box_y, width - 328, team_box_h, 8, fill_color=HexColor("#fbfdfb"), stroke_color=HexColor("#d7ead9"))
+    c.setFillColor(HexColor("#163826"))
+    c.setFont("Helvetica-Bold", 10.5)
+    c.drawString(306, team_box_y + team_box_h - 18, "Field Team Activity")
+    c.setFont("Helvetica", 7.6)
+    c.setFillColor(HexColor("#5a6f64"))
+    c.drawString(306, team_box_y + team_box_h - 30, "Selected CSR field agents plus detected implementation activity in the current project.")
+    header_y = team_box_y + team_box_h - 48
+    c.setFont("Helvetica-Bold", 7.1)
+    c.setFillColor(HexColor("#163826"))
+    c.drawString(306, header_y, "Name")
+    c.drawString(408, header_y, "Role")
+    c.drawRightString(486, header_y, "Records")
+    c.drawRightString(528, header_y, "Tasks")
+    c.drawRightString(width - 42, header_y, "Done")
+    c.line(306, header_y - 4, width - 42, header_y - 4)
+    row_y = header_y - 14
+    c.setFont("Helvetica", 6.8)
+    if not team_rows:
+        c.setFillColor(HexColor("#6b7280"))
+        c.drawString(306, row_y, "No field team roster or activity has been captured yet.")
+    else:
+        for row in team_rows[:12]:
+            if row_y < team_box_y + 18:
+                break
+            c.setFillColor(HexColor("#1f2937"))
+            c.drawString(306, row_y, str(row.get("name") or "-")[:24])
+            c.drawString(408, row_y, _fmt_label(row.get("role_name"))[:12])
+            c.drawRightString(486, row_y, str(int(row.get("tree_units_captured") or row.get("records_captured") or 0)))
+            c.drawRightString(528, row_y, str(int(row.get("tasks_assigned") or 0)))
+            c.drawRightString(width - 42, row_y, str(int(row.get("tasks_completed") or 0)))
+            row_y -= 12
+
+    c.setFont("Helvetica", 7.2)
+    c.setFillColor(HexColor("#5a6f64"))
+    c.drawString(34, 82, "Methodology")
+    _draw_wrapped_text(
+        c,
+        str(summary.get("methodology") or ""),
+        34,
+        70,
+        width - 68,
+        line_height=9,
+        font_name="Helvetica",
+        font_size=7.2,
+        color=HexColor("#5a6f64"),
+        max_lines=4,
+    )
+    _draw_footer(c.getPageNumber())
+
+    def _draw_table_header(title: str):
+        _draw_project_brand_header_bar(
+            c,
+            width,
+            height,
+            project,
+            report_label=title,
+            subtitle="Detailed implementation register",
+            bar_height=58,
+            bar_color="#0b3d24",
+        )
+        c.setFont("Helvetica-Bold", 7.2)
+        c.setFillColor(HexColor("#163826"))
+        y_head = height - 78
+        c.drawString(28, y_head, "Tree")
+        c.drawString(60, y_head, "Species")
+        c.drawString(142, y_head, "Status")
+        c.drawString(194, y_head, "Date")
+        c.drawString(242, y_head, "Custodian / Site")
+        c.drawRightString(432, y_head, "Height")
+        c.drawRightString(486, y_head, "CO2 Now")
+        c.drawRightString(530, y_head, "Maint")
+        c.drawString(536, y_head, "Photo")
+        c.line(28, y_head - 4, width - 28, y_head - 4)
+        return y_head - 14
+
+    c.showPage()
+    y = _draw_table_header("CSR Implementation Register")
+    c.setFont("Helvetica", 6.4)
+    for row in rows:
+        if y < 40:
+            _draw_footer(c.getPageNumber())
+            c.showPage()
+            y = _draw_table_header("CSR Implementation Register (continued)")
+            c.setFont("Helvetica", 6.4)
+        tree_label = f"#{row.get('project_tree_no') or row.get('id') or '-'}"
+        count_suffix = ""
+        try:
+            row_count = max(int(row.get("inventory_tree_count") or 1), 1)
+            if row_count > 1:
+                count_suffix = f" x{row_count}"
+        except Exception:
+            count_suffix = ""
+        species_label = str(row.get("species") or "-")[:16]
+        status_label = _fmt_label(row.get("status"))[:10]
+        custodian_label = str(row.get("custodian_name") or row.get("record_profile_data", {}).get("plot_name") or "-")
+        try:
+            height_label = f"{float(row.get('tree_height_m')):.1f}m" if row.get("tree_height_m") is not None else "-"
+        except Exception:
+            height_label = "-"
+        photo_flag = "Y" if str(row.get("photo_url") or "").strip() or (row.get("photo_urls") or []) else "-"
+        c.setFillColor(HexColor("#1f2937"))
+        c.drawString(28, y, f"{tree_label}{count_suffix}")
+        c.drawString(60, y, species_label)
+        c.drawString(142, y, status_label)
+        c.drawString(194, y, _fmt_date(row.get("planting_date")))
+        c.drawString(242, y, custodian_label[:34])
+        c.drawRightString(432, y, height_label)
+        c.drawRightString(486, y, _fmt_num(row.get("current_co2_kg"), 1))
+        c.drawRightString(530, y, str(int(row.get("maintenance_count") or 0)))
+        c.drawString(536, y, photo_flag)
+        y -= 10
+
+    _draw_footer(c.getPageNumber())
 
     if include_photos:
         _render_photo_appendix_pages(

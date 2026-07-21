@@ -38,6 +38,7 @@ from app.utils.green_pdf import (
     render_green_report_pdf,
     render_green_agric_programme_pdf,
     render_green_relief_programme_pdf,
+    render_green_csr_programme_report_pdf,
     render_green_work_report_pdf,
     render_green_custodian_report_pdf,
     render_green_existing_trees_report_pdf,
@@ -121,9 +122,9 @@ PLANTING_MODEL_VALUES = {"direct", "community_distributed", "mixed"}
 DEFAULT_PLANTING_MODEL = "direct"
 EXISTING_TREE_SCOPE_VALUES = {"exclude_from_planting_kpi", "include_in_planting_kpi"}
 DEFAULT_EXISTING_TREE_SCOPE = "exclude_from_planting_kpi"
-WORKFLOW_PROFILE_VALUES = {"green", "agric", "relief_recovery"}
+WORKFLOW_PROFILE_VALUES = {"green", "agric", "relief_recovery", "csr"}
 DEFAULT_WORKFLOW_PROFILE = "green"
-PROJECT_ACCESS_MODEL_VALUES = {"partner_org", "public_sponsorship"}
+PROJECT_ACCESS_MODEL_VALUES = {"partner_org", "public_sponsorship", "csr_programme"}
 DEFAULT_PROJECT_ACCESS_MODEL = "partner_org"
 SPONSOR_ACCOUNT_TYPE_VALUES = {"individual", "organization", "merchant"}
 MERCHANT_WEBHOOK_PLATFORM_VALUES = {"shopify"}
@@ -157,6 +158,14 @@ RELIEF_PROGRAM_TYPE_VALUES = {
     "construction_materials",
     "infrastructure_rehab",
     "cash_voucher",
+    "mixed",
+}
+CSR_PROGRAM_TYPE_VALUES = {
+    "tree_planting",
+    "urban_greening",
+    "school_greening",
+    "community_restoration",
+    "employee_volunteering",
     "mixed",
 }
 AGRIC_GENDER_VALUES = {"male", "female"}
@@ -2592,6 +2601,10 @@ def _is_relief_workflow_profile(value: str | None) -> bool:
     return _normalize_workflow_profile(value) == "relief_recovery"
 
 
+def _is_csr_workflow_profile(value: str | None) -> bool:
+    return _normalize_workflow_profile(value) == "csr"
+
+
 def _get_workflow_labels(value: str | None) -> dict[str, str]:
     workflow_profile = _normalize_workflow_profile(value)
     if workflow_profile == "agric":
@@ -2621,6 +2634,20 @@ def _get_workflow_labels(value: str | None) -> dict[str, str]:
             "placeholder_species": "Site pending assessment",
             "field_capture_notes": "Open Map & Assess Sites in the mobile app, capture the site as a point, line, or polygon based on the asset type, attach evidence photos, and save the first site assessment.",
             "support_visit_notes": "Review site condition, capture GPS, upload visit photos, and document relief delivery, construction progress, or recovery follow-up.",
+        }
+    if workflow_profile == "csr":
+        return {
+            "mode_label": "CSR",
+            "owner_singular": "community partner",
+            "owner_plural": "community partners",
+            "entity_singular": "tree",
+            "entity_plural": "trees",
+            "visit_label": "Field implementation visit",
+            "field_capture_label": "Implementation capture",
+            "placeholder_name": "Tree pending implementation",
+            "placeholder_species": "Tree pending implementation",
+            "field_capture_notes": "Open Map & Add Trees in the mobile app, capture planted trees with GPS, QR, and photo evidence, and save the first implementation record.",
+            "support_visit_notes": "Check tree condition, capture GPS, upload field photos, and document maintenance, verification, or follow-up work.",
         }
     return {
         "mode_label": "Green",
@@ -2674,6 +2701,29 @@ def _normalize_relief_config(value: object) -> dict | None:
     target_zone = _clean_text(raw.get("target_zone"), 160)
     if target_zone:
         normalized["target_zone"] = target_zone
+    return normalized or None
+
+
+def _normalize_csr_config(value: object) -> dict | None:
+    raw = _normalize_json_object(value) or {}
+    if not raw:
+        return None
+    normalized: dict[str, object] = {}
+    program_type = _clean_choice(raw.get("program_type"), CSR_PROGRAM_TYPE_VALUES)
+    if program_type:
+        normalized["program_type"] = program_type
+    client_name = _clean_text(raw.get("client_name"), 180)
+    if client_name:
+        normalized["client_name"] = client_name
+    implementation_scope = _clean_text(raw.get("implementation_scope"), 240)
+    if implementation_scope:
+        normalized["implementation_scope"] = implementation_scope
+    reporting_cycle = _clean_text(raw.get("reporting_cycle"), 120)
+    if reporting_cycle:
+        normalized["reporting_cycle"] = reporting_cycle
+    target_outcomes = _clean_text(raw.get("target_outcomes"), 400)
+    if target_outcomes:
+        normalized["target_outcomes"] = target_outcomes
     return normalized or None
 
 
@@ -4342,7 +4392,7 @@ def _get_project_settings(db: Session, project_id: int) -> dict:
     row = db.execute(
         text(
             """
-            SELECT id, workflow_profile, agric_config, relief_config, planting_model, allow_existing_tree_link, default_existing_tree_scope
+            SELECT id, workflow_profile, agric_config, relief_config, csr_config, planting_model, allow_existing_tree_link, default_existing_tree_scope
             FROM tree_projects
             WHERE id = :project_id
             """
@@ -4356,6 +4406,7 @@ def _get_project_settings(db: Session, project_id: int) -> dict:
         "workflow_profile": _normalize_workflow_profile(row.get("workflow_profile")),
         "agric_config": _normalize_agric_config(row.get("agric_config")),
         "relief_config": _normalize_relief_config(row.get("relief_config")),
+        "csr_config": _normalize_csr_config(row.get("csr_config")),
         "planting_model": _normalize_planting_model(row.get("planting_model")),
         "allow_existing_tree_link": bool(row.get("allow_existing_tree_link")),
         "default_existing_tree_scope": _normalize_existing_tree_scope(row.get("default_existing_tree_scope")),
@@ -5175,6 +5226,7 @@ def ensure_green_tables(db: Session):
             sponsor_agent_maintenance_fee NUMERIC,
             agric_config JSONB,
             relief_config JSONB,
+            csr_config JSONB,
             planting_model TEXT NOT NULL DEFAULT 'direct',
             allow_existing_tree_link BOOLEAN NOT NULL DEFAULT FALSE,
             default_existing_tree_scope TEXT NOT NULL DEFAULT 'exclude_from_planting_kpi',
@@ -5424,6 +5476,7 @@ def ensure_green_tables(db: Session):
         db.execute(text("ALTER TABLE tree_projects ADD COLUMN IF NOT EXISTS sponsor_agent_maintenance_fee NUMERIC"))
         db.execute(text("ALTER TABLE tree_projects ADD COLUMN IF NOT EXISTS agric_config JSONB"))
         db.execute(text("ALTER TABLE tree_projects ADD COLUMN IF NOT EXISTS relief_config JSONB"))
+        db.execute(text("ALTER TABLE tree_projects ADD COLUMN IF NOT EXISTS csr_config JSONB"))
         db.execute(text("ALTER TABLE tree_projects ADD COLUMN IF NOT EXISTS planting_model TEXT NOT NULL DEFAULT 'direct'"))
         db.execute(text("ALTER TABLE tree_projects ADD COLUMN IF NOT EXISTS allow_existing_tree_link BOOLEAN NOT NULL DEFAULT FALSE"))
         db.execute(
@@ -7617,14 +7670,17 @@ def create_project(
     sponsor_agent_maintenance_fee: float | None = Body(default=None),
     agric_config: dict | None = Body(default=None),
     relief_config: dict | None = Body(default=None),
+    csr_config: dict | None = Body(default=None),
     planting_model: str = Body(default=DEFAULT_PLANTING_MODEL),
     allow_existing_tree_link: bool = Body(default=False),
     default_existing_tree_scope: str = Body(default=DEFAULT_EXISTING_TREE_SCOPE),
 ):
     normalized_workflow_profile = _normalize_workflow_profile(workflow_profile)
     normalized_access_model = _normalize_project_access_model(access_model)
+    normalized_public_sponsor_enabled = _is_public_sponsorship_enabled(normalized_access_model, public_sponsor_enabled)
     normalized_agric_config = _normalize_agric_config(agric_config)
     normalized_relief_config = _normalize_relief_config(relief_config)
+    normalized_csr_config = _normalize_csr_config(csr_config)
     normalized_model = _normalize_planting_model(planting_model)
     normalized_existing_scope = _normalize_existing_tree_scope(default_existing_tree_scope)
     normalized_public_title = _clean_text(public_sponsor_title, 160)
@@ -7669,7 +7725,7 @@ def create_project(
             organization_id=org_id_value,
             user_ids=public_sponsor_agent_user_ids or [],
         )
-        if _is_public_sponsorship_enabled(normalized_access_model, public_sponsor_enabled)
+        if _supports_project_agent_roster(normalized_access_model, normalized_public_sponsor_enabled)
         else []
     )
     row = db.execute(
@@ -7681,7 +7737,7 @@ def create_project(
                 sponsor_price_per_tree, sponsor_currency, sponsor_capacity, sponsor_max_per_order,
                 sponsor_dedication_enabled, sponsor_payment_instructions, public_sponsor_agent_user_ids,
                 sponsor_agent_planting_fee, sponsor_agent_maintenance_fee,
-                agric_config, relief_config,
+                agric_config, relief_config, csr_config,
                 planting_model, allow_existing_tree_link, default_existing_tree_scope
             )
             VALUES (
@@ -7691,7 +7747,7 @@ def create_project(
                 :sponsor_price_per_tree, :sponsor_currency, :sponsor_capacity, :sponsor_max_per_order,
                 :sponsor_dedication_enabled, :sponsor_payment_instructions, CAST(:public_sponsor_agent_user_ids AS JSONB),
                 :sponsor_agent_planting_fee, :sponsor_agent_maintenance_fee,
-                CAST(:agric_config AS JSONB), CAST(:relief_config AS JSONB),
+                CAST(:agric_config AS JSONB), CAST(:relief_config AS JSONB), CAST(:csr_config AS JSONB),
                 :planting_model, :allow_existing_tree_link, :default_existing_tree_scope
             )
             RETURNING id, organization_id, name, location_text, sponsor, workflow_profile, access_model,
@@ -7700,7 +7756,7 @@ def create_project(
                       sponsor_price_per_tree, sponsor_currency, sponsor_capacity, sponsor_max_per_order,
                       sponsor_dedication_enabled, sponsor_payment_instructions, public_sponsor_agent_user_ids,
                       sponsor_agent_planting_fee, sponsor_agent_maintenance_fee,
-                      agric_config, relief_config,
+                      agric_config, relief_config, csr_config,
                       planting_model, allow_existing_tree_link, default_existing_tree_scope, created_at
         """),
         {
@@ -7710,7 +7766,7 @@ def create_project(
             "sponsor": sponsor,
             "workflow_profile": normalized_workflow_profile,
             "access_model": normalized_access_model,
-            "public_sponsor_enabled": bool(public_sponsor_enabled),
+            "public_sponsor_enabled": normalized_public_sponsor_enabled,
             "public_sponsor_title": normalized_public_title,
             "public_sponsor_description": normalized_public_description,
             "sponsor_price_per_tree_ngn": normalized_price_ngn,
@@ -7726,6 +7782,7 @@ def create_project(
             "sponsor_agent_maintenance_fee": normalized_maintenance_fee,
             "agric_config": _safe_json(normalized_agric_config),
             "relief_config": _safe_json(normalized_relief_config),
+            "csr_config": _safe_json(normalized_csr_config),
             "planting_model": normalized_model,
             "allow_existing_tree_link": bool(allow_existing_tree_link),
             "default_existing_tree_scope": normalized_existing_scope,
@@ -7735,6 +7792,7 @@ def create_project(
     project["workflow_profile"] = _normalize_workflow_profile(project.get("workflow_profile"))
     project["agric_config"] = _normalize_agric_config(project.get("agric_config"))
     project["relief_config"] = _normalize_relief_config(project.get("relief_config"))
+    project["csr_config"] = _normalize_csr_config(project.get("csr_config"))
     project = _apply_project_access_fields(project)
     _log_audit_event(
         db,
@@ -7756,6 +7814,7 @@ def create_project(
             "sponsor_agent_maintenance_fee": project.get("sponsor_agent_maintenance_fee"),
             "agric_config": project.get("agric_config"),
             "relief_config": project.get("relief_config"),
+            "csr_config": project.get("csr_config"),
             "planting_model": project.get("planting_model"),
             "allow_existing_tree_link": bool(project.get("allow_existing_tree_link")),
             "default_existing_tree_scope": project.get("default_existing_tree_scope"),
@@ -7778,7 +7837,19 @@ def create_project(
 
 
 def _is_public_sponsorship_enabled(access_model: str | None = None, public_sponsor_enabled: object | None = None) -> bool:
-    return _normalize_project_access_model(access_model) == "public_sponsorship" or bool(public_sponsor_enabled)
+    normalized_access_model = _normalize_project_access_model(access_model)
+    return normalized_access_model == "public_sponsorship" or (
+        normalized_access_model != "csr_programme" and bool(public_sponsor_enabled)
+    )
+
+
+def _is_csr_programme_access_model(access_model: str | None = None) -> bool:
+    return _normalize_project_access_model(access_model) == "csr_programme"
+
+
+def _supports_project_agent_roster(access_model: str | None = None, public_sponsor_enabled: object | None = None) -> bool:
+    normalized_access_model = _normalize_project_access_model(access_model)
+    return normalized_access_model in {"public_sponsorship", "csr_programme"} or bool(public_sponsor_enabled)
 
 
 def _is_public_sponsorship_project(project: dict | None) -> bool:
@@ -9313,7 +9384,10 @@ def _list_public_sponsor_project_ids_for_user_ids(
             ) AS selected(user_id_text)
             WHERE (
                     LOWER(COALESCE(p.access_model, 'partner_org')) = 'public_sponsorship'
-                 OR COALESCE(p.public_sponsor_enabled, FALSE) = TRUE
+                 OR (
+                        LOWER(COALESCE(p.access_model, 'partner_org')) <> 'csr_programme'
+                    AND COALESCE(p.public_sponsor_enabled, FALSE) = TRUE
+                    )
                   )
               AND CAST(selected.user_id_text AS INTEGER) IN :user_ids
               AND (
@@ -9363,7 +9437,10 @@ def _list_public_sponsor_projects_for_agent(
             FROM tree_projects p
             WHERE (
                     LOWER(COALESCE(p.access_model, 'partner_org')) = 'public_sponsorship'
-                 OR COALESCE(p.public_sponsor_enabled, FALSE) = TRUE
+                 OR (
+                        LOWER(COALESCE(p.access_model, 'partner_org')) <> 'csr_programme'
+                    AND COALESCE(p.public_sponsor_enabled, FALSE) = TRUE
+                    )
                   )
               AND (
                     :organization_id IS NULL
@@ -10881,6 +10958,7 @@ def update_project_settings(
     sponsor_agent_maintenance_fee: float | None = Body(default=None),
     agric_config: dict | None = Body(default=None),
     relief_config: dict | None = Body(default=None),
+    csr_config: dict | None = Body(default=None),
     planting_model: str | None = Body(default=None),
     allow_existing_tree_link: bool | None = Body(default=None),
     default_existing_tree_scope: str | None = Body(default=None),
@@ -10894,7 +10972,7 @@ def update_project_settings(
                    sponsor_price_per_tree, sponsor_currency, sponsor_capacity, sponsor_max_per_order,
                    sponsor_dedication_enabled, sponsor_payment_instructions, public_sponsor_agent_user_ids,
                    sponsor_agent_planting_fee, sponsor_agent_maintenance_fee, organization_id,
-                   agric_config, relief_config, planting_model, allow_existing_tree_link, default_existing_tree_scope
+                   agric_config, relief_config, csr_config, planting_model, allow_existing_tree_link, default_existing_tree_scope
             FROM tree_projects
             WHERE id = :project_id
             """
@@ -10922,11 +11000,12 @@ def update_project_settings(
         if access_model is not None
         else _normalize_project_access_model(existing.get("access_model"))
     )
-    next_public_sponsor_enabled = (
+    requested_public_sponsor_enabled = (
         bool(public_sponsor_enabled)
         if public_sponsor_enabled is not None
         else bool(existing.get("public_sponsor_enabled"))
     )
+    next_public_sponsor_enabled = _is_public_sponsorship_enabled(next_access_model, requested_public_sponsor_enabled)
     next_public_title = (
         _clean_text(public_sponsor_title, 160)
         if public_sponsor_title is not None
@@ -11016,10 +11095,10 @@ def update_project_settings(
             organization_id=int(existing.get("organization_id")) if existing.get("organization_id") is not None else None,
             user_ids=public_sponsor_agent_user_ids,
         )
-        if public_sponsor_agent_user_ids is not None and _is_public_sponsorship_enabled(next_access_model, next_public_sponsor_enabled)
+        if public_sponsor_agent_user_ids is not None and _supports_project_agent_roster(next_access_model, next_public_sponsor_enabled)
         else (
             _normalize_positive_int_list(existing.get("public_sponsor_agent_user_ids"))
-            if _is_public_sponsorship_enabled(next_access_model, next_public_sponsor_enabled)
+            if _supports_project_agent_roster(next_access_model, next_public_sponsor_enabled)
             else []
         )
     )
@@ -11032,6 +11111,11 @@ def update_project_settings(
         _normalize_relief_config(relief_config)
         if relief_config is not None
         else _normalize_relief_config(existing.get("relief_config"))
+    )
+    next_csr_config = (
+        _normalize_csr_config(csr_config)
+        if csr_config is not None
+        else _normalize_csr_config(existing.get("csr_config"))
     )
     next_model = _normalize_planting_model(planting_model) if planting_model is not None else _normalize_planting_model(existing.get("planting_model"))
     next_allow_existing = (
@@ -11068,6 +11152,7 @@ def update_project_settings(
                 sponsor_agent_maintenance_fee = :sponsor_agent_maintenance_fee,
                 agric_config = CAST(:agric_config AS JSONB),
                 relief_config = CAST(:relief_config AS JSONB),
+                csr_config = CAST(:csr_config AS JSONB),
                 planting_model = :planting_model,
                 allow_existing_tree_link = :allow_existing_tree_link,
                 default_existing_tree_scope = :default_existing_tree_scope
@@ -11078,7 +11163,7 @@ def update_project_settings(
                       sponsor_price_per_tree, sponsor_currency, sponsor_capacity, sponsor_max_per_order,
                       sponsor_dedication_enabled, sponsor_payment_instructions, public_sponsor_agent_user_ids,
                       sponsor_agent_planting_fee, sponsor_agent_maintenance_fee,
-                      agric_config, relief_config,
+                      agric_config, relief_config, csr_config,
                       planting_model, allow_existing_tree_link, default_existing_tree_scope, created_at
             """
         ),
@@ -11103,6 +11188,7 @@ def update_project_settings(
             "sponsor_agent_maintenance_fee": next_sponsor_agent_maintenance_fee,
             "agric_config": _safe_json(next_agric_config),
             "relief_config": _safe_json(next_relief_config),
+            "csr_config": _safe_json(next_csr_config),
             "planting_model": next_model,
             "allow_existing_tree_link": next_allow_existing,
             "default_existing_tree_scope": next_scope,
@@ -11112,6 +11198,7 @@ def update_project_settings(
     payload["workflow_profile"] = _normalize_workflow_profile(payload.get("workflow_profile"))
     payload["agric_config"] = _normalize_agric_config(payload.get("agric_config"))
     payload["relief_config"] = _normalize_relief_config(payload.get("relief_config"))
+    payload["csr_config"] = _normalize_csr_config(payload.get("csr_config"))
     payload = _apply_project_access_fields(payload)
     
     _log_activity(
@@ -11143,6 +11230,7 @@ def update_project_settings(
                 "sponsor_agent_maintenance_fee": next_sponsor_agent_maintenance_fee,
                 "agric_config": next_agric_config,
                 "relief_config": next_relief_config,
+                "csr_config": next_csr_config,
                 "planting_model": next_model,
                 "allow_existing_tree_link": next_allow_existing,
                 "default_existing_tree_scope": next_scope,
@@ -11229,7 +11317,7 @@ def list_public_sponsorship_projects(db: Session = Depends(get_db)):
                 p.sponsor_price_per_tree, p.sponsor_currency, p.sponsor_price_per_tree_ngn, p.sponsor_price_per_tree_usd,
                 p.sponsor_capacity, p.sponsor_max_per_order,
                 p.sponsor_dedication_enabled, p.sponsor_payment_instructions,
-                p.workflow_profile, p.status, p.created_at,
+                p.workflow_profile, p.csr_config, p.status, p.created_at,
                 o.name AS organization_name, o.slug AS organization_slug, o.status AS organization_status,
                 COALESCE(o.is_active, TRUE) AS organization_is_active,
                 o.logo_url AS organization_logo_url
@@ -11237,7 +11325,10 @@ def list_public_sponsorship_projects(db: Session = Depends(get_db)):
             LEFT JOIN green_organizations o ON o.id = p.organization_id
             WHERE (
                     LOWER(COALESCE(p.access_model, 'partner_org')) = 'public_sponsorship'
-                 OR COALESCE(p.public_sponsor_enabled, FALSE) = TRUE
+                 OR (
+                        LOWER(COALESCE(p.access_model, 'partner_org')) <> 'csr_programme'
+                    AND COALESCE(p.public_sponsor_enabled, FALSE) = TRUE
+                    )
                   )
               AND (o.id IS NULL OR COALESCE(o.is_active, TRUE) = TRUE)
             ORDER BY
@@ -11252,6 +11343,8 @@ def list_public_sponsorship_projects(db: Session = Depends(get_db)):
     items: list[dict] = []
     for row in rows:
         item = dict(row)
+        item["workflow_profile"] = _normalize_workflow_profile(item.get("workflow_profile"))
+        item["csr_config"] = _normalize_csr_config(item.get("csr_config"))
         item["organization_logo_url"] = _normalize_logo_asset_path(item.get("organization_logo_url"))
         items.append(_build_public_project_snapshot(item, db))
     return items
@@ -11399,7 +11492,7 @@ def get_public_org_impact(org_slug: str, db: Session = Depends(get_db)):
     project_rows = db.execute(
         text(
             """
-            SELECT id, name, location_text, workflow_profile, agric_config, relief_config, created_at
+            SELECT id, name, location_text, workflow_profile, agric_config, relief_config, csr_config, created_at
             FROM tree_projects
             WHERE organization_id = :org_id
             ORDER BY created_at
@@ -11626,6 +11719,7 @@ def get_public_org_impact(org_slug: str, db: Session = Depends(get_db)):
             "labels": labels,
             "agric_config": _normalize_agric_config(proj_row.get("agric_config")),
             "relief_config": _normalize_relief_config(proj_row.get("relief_config")),
+            "csr_config": _normalize_csr_config(proj_row.get("csr_config")),
             "stats": {
                 "total_records": total_rec,
                 "active_records": active_rec,
@@ -19131,7 +19225,13 @@ def list_admin_sponsor_agent_payouts(
                 SELECT id, public_sponsor_agent_user_ids
                 FROM tree_projects
                 WHERE organization_id = :organization_id
-                  AND (LOWER(COALESCE(access_model, '')) = 'public_sponsorship' OR COALESCE(public_sponsor_enabled, FALSE) = TRUE)
+                  AND (
+                        LOWER(COALESCE(access_model, '')) = 'public_sponsorship'
+                     OR (
+                            LOWER(COALESCE(access_model, 'partner_org')) <> 'csr_programme'
+                        AND COALESCE(public_sponsor_enabled, FALSE) = TRUE
+                        )
+                    )
                 """
             ),
             {"organization_id": organization_id},
@@ -19147,7 +19247,13 @@ def list_admin_sponsor_agent_payouts(
                 SELECT id, public_sponsor_agent_user_ids
                 FROM tree_projects
                 WHERE organization_id IS NULL
-                  AND (LOWER(COALESCE(access_model, '')) = 'public_sponsorship' OR COALESCE(public_sponsor_enabled, FALSE) = TRUE)
+                  AND (
+                        LOWER(COALESCE(access_model, '')) = 'public_sponsorship'
+                     OR (
+                            LOWER(COALESCE(access_model, 'partner_org')) <> 'csr_programme'
+                        AND COALESCE(public_sponsor_enabled, FALSE) = TRUE
+                        )
+                    )
                 """
             ),
             {},
@@ -20077,7 +20183,7 @@ def list_projects(
             p.sponsor_capacity, p.sponsor_max_per_order,
             p.sponsor_dedication_enabled, p.sponsor_payment_instructions, p.public_sponsor_agent_user_ids,
             p.sponsor_agent_planting_fee, p.sponsor_agent_maintenance_fee,
-            p.workflow_profile, p.agric_config, p.relief_config,
+            p.workflow_profile, p.agric_config, p.relief_config, p.csr_config,
             p.planting_model, p.allow_existing_tree_link, p.default_existing_tree_scope, p.status, p.created_at,
             o.name AS organization_name, o.slug AS organization_slug, o.status AS organization_status,
             o.logo_url AS organization_logo_url
@@ -20140,7 +20246,7 @@ def list_projects(
                         p.sponsor_capacity, p.sponsor_max_per_order,
                         p.sponsor_dedication_enabled, p.sponsor_payment_instructions, p.public_sponsor_agent_user_ids,
                         p.sponsor_agent_planting_fee, p.sponsor_agent_maintenance_fee,
-                        p.workflow_profile, p.agric_config, p.relief_config,
+                        p.workflow_profile, p.agric_config, p.relief_config, p.csr_config,
                         p.planting_model, p.allow_existing_tree_link, p.default_existing_tree_scope, p.created_at,
                         o.name AS organization_name, o.slug AS organization_slug, o.status AS organization_status,
                         o.logo_url AS organization_logo_url
@@ -20157,6 +20263,7 @@ def list_projects(
         item["workflow_profile"] = _normalize_workflow_profile(item.get("workflow_profile"))
         item["agric_config"] = _normalize_agric_config(item.get("agric_config"))
         item["relief_config"] = _normalize_relief_config(item.get("relief_config"))
+        item["csr_config"] = _normalize_csr_config(item.get("csr_config"))
         item["organization_logo_url"] = _normalize_logo_asset_path(item.get("organization_logo_url"))
         _apply_project_access_fields(item)
     items.sort(key=lambda item: _to_iso_text(item.get("created_at")) or "", reverse=True)
@@ -20178,7 +20285,7 @@ def get_project(
             p.sponsor_capacity, p.sponsor_max_per_order,
             p.sponsor_dedication_enabled, p.sponsor_payment_instructions, p.public_sponsor_agent_user_ids,
             p.sponsor_agent_planting_fee, p.sponsor_agent_maintenance_fee,
-            p.workflow_profile, p.agric_config, p.relief_config,
+            p.workflow_profile, p.agric_config, p.relief_config, p.csr_config,
             p.planting_model, p.allow_existing_tree_link, p.default_existing_tree_scope, p.status, p.created_at,
             o.name AS organization_name, o.slug AS organization_slug, o.status AS organization_status,
             o.logo_url AS organization_logo_url
@@ -20192,6 +20299,7 @@ def get_project(
     project["workflow_profile"] = _normalize_workflow_profile(project.get("workflow_profile"))
     project["agric_config"] = _normalize_agric_config(project.get("agric_config"))
     project["relief_config"] = _normalize_relief_config(project.get("relief_config"))
+    project["csr_config"] = _normalize_csr_config(project.get("csr_config"))
     project["organization_logo_url"] = _normalize_logo_asset_path(project.get("organization_logo_url"))
     project = _apply_project_access_fields(project)
 
@@ -20344,6 +20452,7 @@ def get_project(
             "access_model": _normalize_project_access_model(project.get("access_model")),
             "agric_config": _normalize_agric_config(project.get("agric_config")),
             "relief_config": _normalize_relief_config(project.get("relief_config")),
+            "csr_config": _normalize_csr_config(project.get("csr_config")),
             "planting_model": _normalize_planting_model(project.get("planting_model")),
             "allow_existing_tree_link": bool(project.get("allow_existing_tree_link")),
             "default_existing_tree_scope": _normalize_existing_tree_scope(project.get("default_existing_tree_scope")),
@@ -29054,10 +29163,30 @@ def _build_tree_carbon_metrics(
     }
 
 
-def _fetch_existing_tree_export_rows(project_id: int, db: Session) -> list[dict]:
+def _fetch_tree_export_rows(
+    project_id: int,
+    db: Session,
+    *,
+    include_all_project_trees: bool = False,
+) -> list[dict]:
+    tree_scope_filter = (
+        ""
+        if include_all_project_trees
+        else """
+              AND (
+                    (
+                        LOWER(REPLACE(COALESCE(t.tree_origin, ''), ' ', '_')) <> ''
+                        AND LOWER(REPLACE(COALESCE(t.tree_origin, ''), ' ', '_')) <> 'new_planting'
+                    )
+                    OR LOWER(REPLACE(COALESCE(t.attribution_scope, ''), ' ', '_')) = 'monitor_only'
+                    OR COALESCE(t.count_in_planting_kpis, TRUE) = FALSE
+                    OR COALESCE(t.source_project_id, 0) > 0
+                  )
+        """
+    )
     rows = db.execute(
         text(
-            """
+            f"""
             SELECT
                 t.id,
                 t.project_id,
@@ -29089,15 +29218,7 @@ def _fetch_existing_tree_export_rows(project_id: int, db: Session) -> list[dict]
             FROM trees t
             LEFT JOIN green_custodians c ON c.id = t.custodian_id
             WHERE t.project_id = :project_id
-              AND (
-                    (
-                        LOWER(REPLACE(COALESCE(t.tree_origin, ''), ' ', '_')) <> ''
-                        AND LOWER(REPLACE(COALESCE(t.tree_origin, ''), ' ', '_')) <> 'new_planting'
-                    )
-                    OR LOWER(REPLACE(COALESCE(t.attribution_scope, ''), ' ', '_')) = 'monitor_only'
-                    OR COALESCE(t.count_in_planting_kpis, TRUE) = FALSE
-                    OR COALESCE(t.source_project_id, 0) > 0
-                  )
+              {tree_scope_filter}
             ORDER BY t.created_at DESC, t.id DESC
             """
         ),
@@ -29137,6 +29258,14 @@ def _fetch_existing_tree_export_rows(project_id: int, db: Session) -> list[dict]
     return enriched
 
 
+def _fetch_existing_tree_export_rows(project_id: int, db: Session) -> list[dict]:
+    return _fetch_tree_export_rows(project_id, db, include_all_project_trees=False)
+
+
+def _fetch_csr_implementation_export_rows(project_id: int, db: Session) -> list[dict]:
+    return _fetch_tree_export_rows(project_id, db, include_all_project_trees=True)
+
+
 def _summarize_existing_tree_export_rows(rows: list[dict]) -> dict:
     total_rows = len(rows)
     total_existing_trees = 0
@@ -29155,7 +29284,15 @@ def _summarize_existing_tree_export_rows(rows: list[dict]) -> dict:
     lifetime_co2_kg = 0.0
     total_existing_area_sqm = 0.0
     rows_with_existing_area = 0
+    rows_with_photos = 0
+    rows_with_map = 0
+    rows_with_review_activity = 0
+    maintenance_total = 0
+    maintenance_done = 0
+    maintenance_pending = 0
+    maintenance_overdue = 0
     species_agg: dict[str, dict] = {}
+    custodian_keys: set[str] = set()
 
     for row in rows:
         try:
@@ -29206,6 +29343,36 @@ def _summarize_existing_tree_export_rows(rows: list[dict]) -> dict:
             total_existing_area_sqm += area_sqm
             rows_with_existing_area += 1
 
+        photo_urls = _normalize_photo_urls(row.get("photo_urls"))
+        if not photo_urls and str(row.get("photo_url") or "").strip():
+            photo_urls = [str(row.get("photo_url") or "").strip()]
+        if photo_urls:
+            rows_with_photos += 1
+
+        has_point = False
+        try:
+            has_point = row.get("lng") is not None and row.get("lat") is not None
+        except Exception:
+            has_point = False
+        if has_point or row.get("existing_area_geojson") is not None:
+            rows_with_map += 1
+
+        review_activity = int(row.get("review_submitted") or 0) + int(row.get("review_approved") or 0) + int(row.get("review_rejected") or 0)
+        if review_activity > 0 or _normalize_name(row.get("last_review_state")) in {"submitted", "approved", "metadata_edit"}:
+            rows_with_review_activity += 1
+
+        maintenance_total += int(row.get("maintenance_count") or 0)
+        maintenance_done += int(row.get("maintenance_done") or 0)
+        maintenance_pending += int(row.get("maintenance_pending") or 0)
+        maintenance_overdue += int(row.get("maintenance_overdue") or 0)
+
+        custodian_id = int(row.get("custodian_id") or 0)
+        custodian_name = str(row.get("custodian_name") or "").strip()
+        if custodian_id > 0:
+            custodian_keys.add(f"id:{custodian_id}")
+        elif custodian_name:
+            custodian_keys.add(f"name:{custodian_name.lower()}")
+
         species_label = str(row.get("species") or "").strip() or str(row.get("species_matched") or "Unknown")
         species_key = species_label.lower()
         if species_key not in species_agg:
@@ -29232,12 +29399,20 @@ def _summarize_existing_tree_export_rows(rows: list[dict]) -> dict:
         "rows_with_height": rows_with_height,
         "rows_missing_height": rows_missing_height,
         "rows_with_existing_area": rows_with_existing_area,
+        "rows_with_photos": rows_with_photos,
+        "rows_with_map": rows_with_map,
+        "rows_with_review_activity": rows_with_review_activity,
         "total_existing_area_sqm": round(total_existing_area_sqm, 2),
         "total_existing_area_ha": round(total_existing_area_sqm / 10000.0, 4),
         "trees_missing_age_data": trees_missing_age_data,
         "trees_with_fallback_age": trees_with_fallback_age,
         "carbon_scope_rows": carbon_scope_rows,
         "carbon_excluded_rows": carbon_excluded_rows,
+        "maintenance_total": maintenance_total,
+        "maintenance_done": maintenance_done,
+        "maintenance_pending": maintenance_pending,
+        "maintenance_overdue": maintenance_overdue,
+        "custodian_count": len(custodian_keys),
         "current_co2_kg": round(current_co2_kg, 2),
         "current_co2_tonnes": round(current_co2_kg / 1000.0, 3),
         "annual_co2_kg": round(annual_co2_kg, 2),
@@ -29245,6 +29420,9 @@ def _summarize_existing_tree_export_rows(rows: list[dict]) -> dict:
         "projected_lifetime_co2_kg": round(lifetime_co2_kg, 2),
         "projected_lifetime_co2_tonnes": round(lifetime_co2_kg / 1000.0, 3),
         "projection_years": 40,
+        "photo_coverage_pct": round((rows_with_photos / total_rows) * 100.0, 1) if total_rows > 0 else 0.0,
+        "map_coverage_pct": round((rows_with_map / total_rows) * 100.0, 1) if total_rows > 0 else 0.0,
+        "review_coverage_pct": round((rows_with_review_activity / total_rows) * 100.0, 1) if total_rows > 0 else 0.0,
         "methodology": (
             "IPCC Tier 1 + Chave et al. (2014); per-tree current CO2 uses measured height where available "
             "(tree_height_m), otherwise modeled height. Annual and 40-year values use species-age growth model."
@@ -29259,6 +29437,200 @@ def _is_export_task_complete(row: dict) -> bool:
     if review_key == "approved":
         return True
     return status_key in {"done", "completed", "closed"} and review_key in {"none", "approved"}
+
+
+def _build_csr_programme_export_context(
+    project_id: int,
+    db: Session,
+    *,
+    include_map: bool = False,
+) -> dict:
+    project = get_project(project_id, db)
+    project_copy = dict(project)
+    project_copy["csr_config"] = _normalize_csr_config(project.get("csr_config")) or {}
+
+    rows = _fetch_csr_implementation_export_rows(project_id, db)
+    summary = _summarize_existing_tree_export_rows(rows)
+
+    task_rows = [
+        dict(row)
+        for row in db.execute(
+            text(
+                """
+                SELECT
+                    LOWER(COALESCE(t.task_type, '')) AS task_type,
+                    LOWER(COALESCE(t.status, '')) AS status,
+                    LOWER(COALESCE(t.review_state, 'none')) AS review_state,
+                    COALESCE(NULLIF(TRIM(t.assignee_name), ''), '') AS assignee_name,
+                    t.created_at,
+                    t.submitted_at,
+                    t.reviewed_at
+                FROM tree_tasks t
+                JOIN trees tr ON tr.id = t.tree_id
+                WHERE tr.project_id = :project_id
+                ORDER BY COALESCE(t.reviewed_at, t.submitted_at, t.created_at) DESC, t.id DESC
+                """
+            ),
+            {"project_id": project_id},
+        ).mappings().all()
+    ]
+
+    explicit_agent_ids = _normalize_positive_int_list(project.get("public_sponsor_agent_user_ids"))
+    roster_rows: list[dict] = []
+    if explicit_agent_ids:
+        roster_rows = [
+            dict(row)
+            for row in db.execute(
+                text(
+                    """
+                    SELECT
+                        id,
+                        full_name,
+                        work_username,
+                        role,
+                        COALESCE(is_active, TRUE) AS is_active
+                    FROM green_users
+                    WHERE id IN :user_ids
+                    ORDER BY COALESCE(full_name, work_username, user_uid)
+                    """
+                ).bindparams(bindparam("user_ids", expanding=True)),
+                {"user_ids": tuple(explicit_agent_ids)},
+            ).mappings().all()
+        ]
+
+    team_activity_by_key: dict[str, dict] = {}
+
+    def _touch_team_row(name: str, *, role_name: str = "", work_username: str = "", is_active: bool = True) -> dict:
+        clean_name = str(name or "").strip()
+        if not clean_name:
+            clean_name = "Field team"
+        key = _normalize_name(clean_name)
+        row = team_activity_by_key.get(key)
+        if row is None:
+            row = {
+                "name": clean_name,
+                "role_name": role_name,
+                "work_username": work_username,
+                "is_active": bool(is_active),
+                "records_captured": 0,
+                "tree_units_captured": 0,
+                "tasks_assigned": 0,
+                "tasks_completed": 0,
+                "latest_activity_at": None,
+            }
+            team_activity_by_key[key] = row
+        else:
+            if role_name and not row.get("role_name"):
+                row["role_name"] = role_name
+            if work_username and not row.get("work_username"):
+                row["work_username"] = work_username
+            row["is_active"] = bool(row.get("is_active")) or bool(is_active)
+        return row
+
+    for user in roster_rows:
+        _touch_team_row(
+            str(user.get("full_name") or user.get("work_username") or f"User {user.get('id')}").strip(),
+            role_name=str(user.get("role") or "").strip(),
+            work_username=str(user.get("work_username") or "").strip(),
+            is_active=bool(user.get("is_active")),
+        )
+
+    for row in rows:
+        actor_name = str(row.get("created_by") or "").strip()
+        if not actor_name:
+            continue
+        team_row = _touch_team_row(actor_name)
+        team_row["records_captured"] += 1
+        try:
+            team_row["tree_units_captured"] += max(int(row.get("inventory_tree_count") or 1), 1)
+        except Exception:
+            team_row["tree_units_captured"] += 1
+        activity_date = row.get("created_at")
+        if activity_date and team_row.get("latest_activity_at") is None:
+            team_row["latest_activity_at"] = activity_date
+
+    completed_task_count = 0
+    for row in task_rows:
+        if _is_export_task_complete(row):
+            completed_task_count += 1
+        actor_name = str(row.get("assignee_name") or "").strip()
+        if not actor_name:
+            continue
+        team_row = _touch_team_row(actor_name)
+        team_row["tasks_assigned"] += 1
+        if _is_export_task_complete(row):
+            team_row["tasks_completed"] += 1
+        activity_date = row.get("reviewed_at") or row.get("submitted_at") or row.get("created_at")
+        if activity_date and team_row.get("latest_activity_at") is None:
+            team_row["latest_activity_at"] = activity_date
+
+    team_rows = sorted(
+        team_activity_by_key.values(),
+        key=lambda item: (
+            int(item.get("tree_units_captured") or 0) + int(item.get("tasks_assigned") or 0),
+            int(item.get("records_captured") or 0),
+            str(item.get("name") or "").lower(),
+        ),
+        reverse=True,
+    )
+
+    latest_activity_date = None
+    for candidate in [
+        *(row.get("latest_activity_at") for row in team_rows),
+        *(row.get("reviewed_at") or row.get("submitted_at") or row.get("created_at") for row in task_rows),
+        *(row.get("created_at") for row in rows),
+    ]:
+        if candidate is not None:
+            latest_activity_date = candidate
+            break
+
+    summary["field_team_count"] = len(team_rows)
+    summary["field_team_active_count"] = sum(1 for row in team_rows if bool(row.get("is_active")))
+    summary["implementation_tasks_total"] = len(task_rows)
+    summary["implementation_tasks_completed"] = completed_task_count
+    summary["implementation_tasks_live"] = max(len(task_rows) - completed_task_count, 0)
+    summary["latest_activity_at"] = latest_activity_date
+
+    overview_map_view = None
+    overview_map_png = None
+    if include_map:
+        overview_map_rows = [
+            {
+                "id": row.get("id"),
+                "status": row.get("status"),
+                "lng": row.get("lng"),
+                "lat": row.get("lat"),
+                "existing_area_geojson": row.get("existing_area_geojson"),
+            }
+            for row in rows
+        ]
+        try:
+            overview_map_view = _estimate_report_map_view(overview_map_rows, width=800, height=500)
+            overview_map_png = (
+                _build_report_map_png(
+                    overview_map_rows,
+                    lng=overview_map_view.get("lng"),
+                    lat=overview_map_view.get("lat"),
+                    zoom=overview_map_view.get("zoom"),
+                    bearing=overview_map_view.get("bearing"),
+                    pitch=overview_map_view.get("pitch"),
+                    include_markers=True,
+                )
+                if overview_map_view
+                else None
+            )
+        except Exception:
+            overview_map_view = None
+            overview_map_png = None
+
+    return {
+        "project": project_copy,
+        "summary": summary,
+        "rows": rows,
+        "team_rows": team_rows,
+        "overview_map_png": overview_map_png,
+        "overview_map_view": overview_map_view,
+    }
 
 
 def _build_agric_programme_export_context(
@@ -30529,12 +30901,19 @@ def export_existing_trees_csv(project_id: int, db: Session = Depends(get_db)):
         filename = f"project_{project_id}_relief_programme.csv"
         return FileResponse(csv_path, media_type="text/csv", filename=filename)
 
-    rows = _fetch_existing_tree_export_rows(project_id, db)
+    rows = (
+        _fetch_csr_implementation_export_rows(project_id, db)
+        if workflow_profile == "csr"
+        else _fetch_existing_tree_export_rows(project_id, db)
+    )
     summary = _summarize_existing_tree_export_rows(rows)
     agric_config = _normalize_agric_config(project.get("agric_config")) or {}
+    csr_config = _normalize_csr_config(project.get("csr_config")) or {}
     export_title = (
         "LandCheck Agric Plot Records Detailed Export"
         if workflow_profile == "agric"
+        else "LandCheck CSR Programme Detailed Export"
+        if workflow_profile == "csr"
         else "LandCheck Existing Trees Detailed Export"
     )
 
@@ -30557,11 +30936,20 @@ def export_existing_trees_csv(project_id: int, db: Session = Depends(get_db)):
                 agric_config.get("support_packages") or "",
                 agric_config.get("season_label") or "",
             ])
+        elif workflow_profile == "csr":
+            writer.writerow([
+                "CSR Program",
+                csr_config.get("program_type") or "",
+                csr_config.get("client_name") or "",
+                csr_config.get("implementation_scope") or "",
+                csr_config.get("reporting_cycle") or "",
+                csr_config.get("target_outcomes") or "",
+            ])
         writer.writerow(["Generated At (UTC)", datetime.utcnow().isoformat()])
         writer.writerow([])
         writer.writerow([
             "Summary",
-            f"Existing Trees {summary.get('total_existing_trees', 0)}",
+            f"{'Implementation Trees' if workflow_profile == 'csr' else 'Existing Trees'} {summary.get('total_existing_trees', 0)}",
             f"Rows {summary.get('total_existing_rows', len(rows))}",
             f"Area {summary.get('total_existing_area_ha', 0)} ha",
             f"Carbon Scope {summary.get('carbon_scope_rows', 0)}",
@@ -30729,7 +31117,11 @@ def export_existing_trees_csv(project_id: int, db: Session = Depends(get_db)):
                 _safe_json(custodian_profile_data) if custodian_profile_data else "",
             ])
 
-    filename = f"project_{project_id}_existing_trees_detailed.csv"
+    filename = (
+        f"project_{project_id}_csr_implementation_detailed.csv"
+        if workflow_profile == "csr"
+        else f"project_{project_id}_existing_trees_detailed.csv"
+    )
     return FileResponse(csv_path, media_type="text/csv", filename=filename)
 
 
@@ -30741,6 +31133,45 @@ def export_existing_trees_pdf(
 ):
     project = get_project(project_id, db)
     workflow_profile = _normalize_workflow_profile(project.get("workflow_profile"))
+    if workflow_profile == "csr":
+        context = _build_csr_programme_export_context(project_id, db, include_map=True)
+        rows = context.get("rows") or []
+        photo_rows: list[dict] = []
+        if include_photos:
+            for row in rows:
+                merged_urls = _normalize_photo_urls(row.get("photo_urls"))
+                if not merged_urls and str(row.get("photo_url") or "").strip():
+                    merged_urls = [str(row.get("photo_url") or "").strip()]
+                if not merged_urls:
+                    continue
+                for index, photo_url in enumerate(merged_urls, start=1):
+                    item = dict(row)
+                    item["photo_url"] = photo_url
+                    item["photo_index"] = index
+                    item["photo_total"] = len(merged_urls)
+                    photo_rows.append(item)
+        os.makedirs(REPORTS_DIR, exist_ok=True)
+        tmp_pdf = tempfile.NamedTemporaryFile(suffix="_csr_programme.pdf", delete=False)
+        pdf_path = tmp_pdf.name
+        tmp_pdf.close()
+        render_green_csr_programme_report_pdf(
+            pdf_path,
+            project=context["project"],
+            rows=[dict(row) for row in rows],
+            summary=dict(context.get("summary") or {}),
+            include_photos=include_photos,
+            photo_rows=photo_rows,
+            overview_map_png=context.get("overview_map_png"),
+            team_rows=[dict(row) for row in (context.get("team_rows") or [])],
+        )
+        filename = f"project_{project_id}_csr_programme_report.pdf"
+        return _pdf_response_with_r2(
+            pdf_path,
+            filename,
+            category="green-csr-programme-report",
+            project_id=project_id,
+            organization_id=int(context["project"].get("organization_id") or 0) or None,
+        )
     if workflow_profile == "agric":
         context = _build_agric_programme_export_context(project_id, db, include_map=True)
         os.makedirs(REPORTS_DIR, exist_ok=True)
@@ -30803,7 +31234,13 @@ def export_existing_trees_pdf(
                 photo_rows.append(item)
     render_green_existing_trees_report_pdf(
         pdf_path,
-        project=project,
+        project={
+            **project,
+            "report_export_label": "Existing Trees Report",
+            "report_export_footer": "Existing Trees Detailed Export",
+            "report_export_entity_label": "Existing Trees",
+            "report_export_subtitle": "Detailed existing-tree inventory with per-tree CO2 estimates and optional photo appendix",
+        },
         rows=[dict(r) for r in rows],
         summary=summary,
         include_photos=include_photos,
