@@ -27815,7 +27815,13 @@ def create_work_order(
         raise HTTPException(status_code=404, detail="Project not found")
     sponsor_agent_user_id: int | None = None
     project_organization_id = int(project_access_row.get("organization_id") or 0) or None
+    project_access_model = _normalize_project_access_model(project_access_row.get("access_model"))
+    csr_route_project = project_access_model == "csr_programme"
     public_sponsor_project = _is_public_sponsorship_project(dict(project_access_row))
+    agent_roster_project = _supports_project_agent_roster(
+        project_access_row.get("access_model"),
+        project_access_row.get("public_sponsor_enabled"),
+    )
     if area_enabled and work_type != "planting":
         raise HTTPException(status_code=400, detail="Area assignment is only available for planting orders")
     normalized_species_allocations = _normalize_species_allocations(species_allocations)
@@ -27825,8 +27831,7 @@ def create_work_order(
         target_trees = int(sum(int(item.get("count") or 0) for item in normalized_species_allocations))
     if work_type == "planting" and int(target_trees or 0) <= 0:
         raise HTTPException(status_code=400, detail="Target trees must be greater than 0 for planting orders")
-    if work_type == "planting" and public_sponsor_project:
-        _promote_project_paid_units_to_awaiting_tree(db, int(project_id))
+    if work_type == "planting" and agent_roster_project:
         explicit_agent_ids = _normalize_positive_int_list(_json_value_or(project_access_row.get("public_sponsor_agent_user_ids"), []))
         try:
             selected_agent_ids = _collect_public_sponsor_agent_user_ids_for_project(
@@ -27838,14 +27843,31 @@ def create_work_order(
         except Exception:
             _rollback_quietly(db)
             selected_agent_ids = explicit_agent_ids
+        selected_agent_ids = _normalize_positive_int_list(selected_agent_ids)
+        if not selected_agent_ids:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "No CSR field agents are saved for this project yet. Open Users and save at least one CSR field agent first."
+                    if csr_route_project
+                    else "No public sponsor agents are saved for this project yet. Open Users and save at least one sponsor agent first."
+                ),
+            )
         sponsor_agent_row = _match_selected_public_sponsor_user_for_assignee(
             db,
             assignee_name=assignee_clean,
             organization_id=project_organization_id,
-            selected_user_ids=_normalize_positive_int_list(selected_agent_ids),
+            selected_user_ids=selected_agent_ids,
         )
         if not sponsor_agent_row:
-            raise HTTPException(status_code=403, detail="Only saved public sponsor agents can receive sponsor-funded planting work")
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    "Only saved CSR field agents can receive implementation orders."
+                    if csr_route_project
+                    else "Only saved public sponsor agents can receive sponsor-funded planting work"
+                ),
+            )
         sponsor_agent_user_id = int(sponsor_agent_row.get("id") or 0) or None
         if sponsor_agent_user_id and sponsor_agent_user_id not in set(explicit_agent_ids):
             try:
@@ -27856,7 +27878,9 @@ def create_work_order(
                 )
             except Exception:
                 _rollback_quietly(db)
-                logger.warning("Could not auto-register agent %s in project %s sponsor agent list", sponsor_agent_user_id, project_id)
+                logger.warning("Could not auto-register agent %s in project %s field-agent list", sponsor_agent_user_id, project_id)
+    if work_type == "planting" and public_sponsor_project:
+        _promote_project_paid_units_to_awaiting_tree(db, int(project_id))
         awaiting_tree_backlog = db.execute(
             text(
                 """
