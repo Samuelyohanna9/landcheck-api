@@ -1385,12 +1385,27 @@ def _draw_stat_card(c, x, y, w, h, label, value, sub=None, color=None):
         c.drawCentredString(x + w / 2, y + 6, sub)
 
 
-def _draw_bar_chart(c, x, y, w, h, data, title=""):
+def _draw_bar_chart(
+    c,
+    x,
+    y,
+    w,
+    h,
+    data,
+    title="",
+    *,
+    title_font="Helvetica-Bold",
+    label_font="Helvetica",
+    value_font="Helvetica",
+    title_color=HexColor("#262626"),
+    label_color=HexColor("#4d4d4d"),
+    value_color=HexColor("#333333"),
+):
     """Draw a simple horizontal bar chart. data = list of (label, value, color_hex)."""
     if not data:
         return
-    c.setFont("Helvetica-Bold", 9)
-    c.setFillColorRGB(0.15, 0.15, 0.15)
+    c.setFont(title_font, 9)
+    c.setFillColor(title_color)
     c.drawString(x, y + h + 4, title)
     max_val = max((d[1] for d in data), default=1) or 1
     bar_h = min(14, (h - 4) / max(len(data), 1))
@@ -1398,13 +1413,13 @@ def _draw_bar_chart(c, x, y, w, h, data, title=""):
     cy = y + h - bar_h - 2
     for label, value, color_hex in data:
         bar_w = max((value / max_val) * (w - 100), 2)
-        c.setFont("Helvetica", 7)
-        c.setFillColorRGB(0.3, 0.3, 0.3)
+        c.setFont(label_font, 7)
+        c.setFillColor(label_color)
         c.drawRightString(x + 88, cy + 3, str(label)[:14])
         c.setFillColor(HexColor(color_hex))
         c.rect(x + 92, cy, bar_w, bar_h - 2, stroke=0, fill=1)
-        c.setFillColorRGB(0.2, 0.2, 0.2)
-        c.setFont("Helvetica", 6.5)
+        c.setFillColor(value_color)
+        c.setFont(value_font, 6.5)
         c.drawString(x + 94 + bar_w, cy + 2, f"{value:.1f}")
         cy -= (bar_h + gap)
         if cy < y:
@@ -3323,6 +3338,16 @@ def render_green_csr_programme_report_pdf(
     stakeholder_rows = list(stakeholder_rows or [])
     timeline_rows = list(timeline_rows or [])
     csr_report_profile = dict(csr_report_profile or {})
+    premium_forest = HexColor("#123629")
+    premium_green = HexColor("#254f3f")
+    premium_gold = HexColor("#b38a44")
+    premium_paper = HexColor("#fbf8f1")
+    premium_panel = HexColor("#fffdf8")
+    premium_panel_alt = HexColor("#f5f0e5")
+    premium_border = HexColor("#d7cdbb")
+    premium_text = HexColor("#23312a")
+    premium_muted = HexColor("#6a756d")
+    premium_soft = HexColor("#dce7de")
 
     def _fmt_num(value, digits=2):
         try:
@@ -3341,11 +3366,15 @@ def render_green_csr_programme_report_pdf(
         return text_value.replace("_", " ").replace("-", " ").title()
 
     def _draw_text_box(x: float, y: float, w: float, h: float, title: str, lines: list[str], *, fill="#ffffff"):
-        _draw_rounded_box(c, x, y, w, h, 8, fill_color=HexColor(fill), stroke_color=HexColor("#d7ead9"))
-        c.setFillColor(HexColor("#163826"))
-        c.setFont("Helvetica-Bold", 10.5)
-        c.drawString(x + 12, y + h - 18, title)
-        cursor = y + h - 34
+        _draw_rounded_box(c, x, y, w, h, 6, fill_color=HexColor(fill), stroke_color=premium_border)
+        c.setFillColor(premium_forest)
+        c.setFont("Times-Bold", 11.2)
+        c.drawString(x + 12, y + h - 20, title)
+        c.setStrokeColor(premium_gold)
+        c.setLineWidth(0.7)
+        c.line(x + 12, y + h - 25, min(x + 82, x + w - 12), y + h - 25)
+        cursor = y + h - 39
+        max_lines = max(int((h - 46) / 9.2), 1)
         for line in lines:
             if cursor < y + 14:
                 break
@@ -3355,17 +3384,62 @@ def render_green_csr_programme_report_pdf(
                 x + 12,
                 cursor,
                 w - 24,
-                line_height=9,
-                font_name="Helvetica",
-                font_size=7.6,
-                color=HexColor("#40574a"),
-                max_lines=2,
+                line_height=9.2,
+                font_name="Times-Roman",
+                font_size=8.1,
+                color=premium_text,
+                max_lines=max_lines,
             )
-            cursor -= 2
+            cursor -= 1.5
+
+    def _draw_premium_metric(x: float, y: float, w: float, h: float, value: str, label: str):
+        _draw_rounded_box(c, x, y, w, h, 6, fill_color=premium_panel, stroke_color=premium_border)
+        c.setFillColor(premium_muted)
+        c.setFont("Times-Roman", 7.1)
+        c.drawString(x + 12, y + h - 16, label.upper()[:30])
+        c.setFillColor(premium_forest)
+        c.setFont("Times-Bold", 18)
+        c.drawString(x + 12, y + h - 38, value)
+
+    def _draw_csr_header_bar(report_label: str, subtitle: str | None = None, *, bar_height: float = 80):
+        left = 34
+        right = 34
+        top = height
+        bar_h = float(bar_height)
+        c.setFillColor(premium_forest)
+        c.rect(0, top - bar_h, width, bar_h, stroke=0, fill=1)
+
+        org_name = str(project.get("organization_name") or "").strip()
+        project_name = str(project.get("name") or "").strip() or "Project"
+        heading = org_name or project_name
+
+        logo_size = 28 if bar_h <= 72 else 32
+        logo_y = top - bar_h + max((bar_h - logo_size) / 2, 4)
+        logo_dx = _draw_project_logo(c, project, left, logo_y, logo_size)
+        text_x = left + logo_dx
+
+        c.setFillColor(premium_paper)
+        c.setFont("Times-Bold", 17 if bar_h <= 72 else 19)
+        c.drawString(text_x, top - 28, heading[:64])
+        c.setStrokeColor(premium_gold)
+        c.setLineWidth(1.1)
+        c.line(text_x, top - 33, min(text_x + 150, width - 180), top - 33)
+
+        c.setFont("Times-Bold", 9.4)
+        c.setFillColor(premium_gold)
+        c.drawString(text_x, top - 46, report_label[:96])
+
+        c.setFont("Times-Italic", 8.5)
+        c.setFillColor(premium_soft)
+        c.drawString(text_x, top - (60 if bar_h > 72 else 57), (subtitle or "Powered by LandCheck")[:120])
+
+        c.setFont("Times-Roman", 8.4)
+        c.setFillColor(premium_soft)
+        c.drawRightString(width - right, top - 28, datetime.utcnow().strftime("Generated %d %b %Y %H:%M UTC"))
 
     def _draw_footer(page_no: int):
-        c.setFont("Helvetica", 7)
-        c.setFillColor(HexColor("#6b7280"))
+        c.setFont("Times-Roman", 7.3)
+        c.setFillColor(premium_muted)
         c.drawString(34, 22, "Powered by LandCheck | CSR Programme Report")
         c.drawRightString(width - 34, 22, f"Page {page_no}")
 
@@ -3451,22 +3525,17 @@ def render_green_csr_programme_report_pdf(
         "Stakeholder view focuses on implementation visibility, site coverage, evidence quality, and follow-up readiness."
     ]
 
-    _draw_project_brand_header_bar(
-        c,
-        width,
-        height,
-        project,
-        report_label="CSR Programme Impact Report",
-        subtitle="Client-ready programme summary covering mandate, stakeholder reach, evidence integrity, and impact indicators.",
+    _draw_csr_header_bar(
+        "CSR Programme Impact Report",
+        "Client-ready programme summary covering mandate, stakeholder reach, evidence integrity, and impact indicators.",
         bar_height=78,
-        bar_color="#0b3d24",
     )
 
-    c.setFillColor(HexColor("#163826"))
-    c.setFont("Helvetica-Bold", 12.5)
+    c.setFillColor(premium_forest)
+    c.setFont("Times-Bold", 13.5)
     c.drawString(34, height - 96, str(project.get("name") or "CSR Project"))
-    c.setFont("Helvetica", 8.8)
-    c.setFillColor(HexColor("#5a6f64"))
+    c.setFont("Times-Roman", 9.0)
+    c.setFillColor(premium_muted)
     c.drawString(
         34,
         height - 110,
@@ -3475,64 +3544,59 @@ def render_green_csr_programme_report_pdf(
 
     metric_y = height - 186
     metric_w = (width - 68 - 24) / 4
-    _draw_metric_chip(c, 34, metric_y, metric_w, 66, str(total_trees), "Trees delivered")
-    _draw_metric_chip(c, 34 + metric_w + 8, metric_y, metric_w, 66, f"{survival_pct:.1f}%", "Healthy / alive rate")
-    _draw_metric_chip(c, 34 + (metric_w + 8) * 2, metric_y, metric_w, 66, f"{photo_rows_count}/{total_rows}", "Photo proof")
-    _draw_metric_chip(c, 34 + (metric_w + 8) * 3, metric_y, metric_w, 66, str(stakeholder_count), "Stakeholder sites")
+    _draw_premium_metric(34, metric_y, metric_w, 66, str(total_trees), "Trees delivered")
+    _draw_premium_metric(34 + metric_w + 8, metric_y, metric_w, 66, f"{survival_pct:.1f}%", "Healthy / alive rate")
+    _draw_premium_metric(34 + (metric_w + 8) * 2, metric_y, metric_w, 66, f"{photo_rows_count}/{total_rows}", "Photo proof")
+    _draw_premium_metric(34 + (metric_w + 8) * 3, metric_y, metric_w, 66, str(stakeholder_count), "Stakeholder sites")
 
     metric_y2 = metric_y - 78
-    _draw_metric_chip(c, 34, metric_y2, metric_w, 66, f"{_fmt_num(summary.get('map_coverage_pct', 0), 1)}%", "Mapped coverage")
-    _draw_metric_chip(c, 34 + metric_w + 8, metric_y2, metric_w, 66, f"{_fmt_num(summary.get('review_coverage_pct', 0), 1)}%", "Reviewed records")
-    _draw_metric_chip(c, 34 + (metric_w + 8) * 2, metric_y2, metric_w, 66, str(field_team_count), "Field team")
-    _draw_metric_chip(c, 34 + (metric_w + 8) * 3, metric_y2, metric_w, 66, f"{_fmt_num(summary.get('projected_lifetime_co2_tonnes', 0), 2)} t", "40Y projection")
+    _draw_premium_metric(34, metric_y2, metric_w, 66, f"{_fmt_num(summary.get('map_coverage_pct', 0), 1)}%", "Mapped coverage")
+    _draw_premium_metric(34 + metric_w + 8, metric_y2, metric_w, 66, f"{_fmt_num(summary.get('review_coverage_pct', 0), 1)}%", "Reviewed records")
+    _draw_premium_metric(34 + (metric_w + 8) * 2, metric_y2, metric_w, 66, str(field_team_count), "Field team")
+    _draw_premium_metric(34 + (metric_w + 8) * 3, metric_y2, metric_w, 66, f"{_fmt_num(summary.get('projected_lifetime_co2_tonnes', 0), 2)} t", "40Y projection")
 
     box_y = metric_y2 - 136
-    _draw_text_box(34, box_y, 316, 124, "Board Summary", board_summary_lines, fill="#fbfdfb")
-    _draw_text_box(360, box_y, width - 394, 124, "Programme Mandate", programme_lines, fill="#f7fbf8")
+    _draw_text_box(34, box_y, 316, 124, "Board Summary", board_summary_lines, fill="#fffdf8")
+    _draw_text_box(360, box_y, width - 394, 124, "Programme Mandate", programme_lines, fill="#f7f1e7")
 
     stakeholder_y = box_y - 82
-    _draw_text_box(34, stakeholder_y, width - 68, 70, "Stakeholder Reach", stakeholder_summary_lines, fill="#f9fcfa")
+    _draw_text_box(34, stakeholder_y, width - 68, 70, "Stakeholder Reach", stakeholder_summary_lines, fill="#fffdf8")
 
     basis_y = stakeholder_y - 78
-    _draw_text_box(34, basis_y, width - 68, 66, "Reporting Basis", reporting_note_lines, fill="#fffdf7")
+    _draw_text_box(34, basis_y, width - 68, 66, "Reporting Basis", reporting_note_lines, fill="#f7f1e7")
 
     map_y = 80
     map_h = max(int(basis_y - map_y - 12), 148)
-    _draw_rounded_box(c, 34, map_y, width - 68, map_h, 8, fill_color=HexColor("#f8faf9"), stroke_color=HexColor("#d7ead9"))
-    c.setFillColor(HexColor("#163826"))
-    c.setFont("Helvetica-Bold", 10.5)
+    _draw_rounded_box(c, 34, map_y, width - 68, map_h, 6, fill_color=premium_panel, stroke_color=premium_border)
+    c.setFillColor(premium_forest)
+    c.setFont("Times-Bold", 11.2)
     c.drawString(46, map_y + map_h - 18, "Implementation Footprint")
-    c.setFont("Helvetica", 7.6)
-    c.setFillColor(HexColor("#5a6f64"))
+    c.setFont("Times-Roman", 8.0)
+    c.setFillColor(premium_muted)
     c.drawString(46, map_y + map_h - 30, "Map preview of the verified CSR implementation footprint captured in LandCheck Green.")
     if overview_map_png:
         try:
             map_reader = ImageReader(io.BytesIO(overview_map_png))
             c.drawImage(map_reader, 46, map_y + 14, width - 92, map_h - 52, preserveAspectRatio=True, mask="auto")
         except Exception:
-            c.setFillColor(HexColor("#7a8d82"))
-            c.setFont("Helvetica", 9)
+            c.setFillColor(premium_muted)
+            c.setFont("Times-Italic", 9)
             c.drawString(46, map_y + 74, "Map preview could not be rendered for this export.")
     else:
-        c.setFillColor(HexColor("#7a8d82"))
-        c.setFont("Helvetica", 9)
+        c.setFillColor(premium_muted)
+        c.setFont("Times-Italic", 9)
         c.drawString(46, map_y + 74, "No map preview is available yet. Add point or polygon geometry to implementation records.")
 
     _draw_footer(c.getPageNumber())
 
     c.showPage()
-    _draw_project_brand_header_bar(
-        c,
-        width,
-        height,
-        project,
-        report_label="CSR Delivery, Assurance & Community Coverage",
-        subtitle="Material topics, stakeholder evidence, implementation assurance, and cycle-by-cycle delivery view.",
+    _draw_csr_header_bar(
+        "CSR Delivery, Assurance & Community Coverage",
+        "Material topics, stakeholder evidence, implementation assurance, and cycle-by-cycle delivery view.",
         bar_height=62,
-        bar_color="#0b3d24",
     )
 
-    _draw_text_box(34, height - 252, 250, 160, "Material Topics & SDG Focus", material_and_sdg_lines or ["CSR material topics have not been configured yet."], fill="#fbfdfb")
+    _draw_text_box(34, height - 252, 250, 160, "Material Topics & SDG Focus", material_and_sdg_lines or ["CSR material topics have not been configured yet."], fill="#fffdf8")
     _draw_text_box(
         294,
         height - 252,
@@ -3540,7 +3604,7 @@ def render_green_csr_programme_report_pdf(
         160,
         "Delivery Assurance & Next Actions",
         [*delivery_assurance_lines, *stakeholder_priority_lines[:2], *next_action_lines[:2]],
-        fill="#fffdf7",
+        fill="#f7f1e7",
     )
 
     top_species = summary.get("top_species") or []
@@ -3555,7 +3619,21 @@ def render_green_csr_programme_report_pdf(
                     colors[idx % len(colors)],
                 )
             )
-        _draw_bar_chart(c, 34, height - 432, 250, 156, chart_data, title="Top Species by Current CO2 (kg)")
+        _draw_bar_chart(
+            c,
+            34,
+            height - 432,
+            250,
+            156,
+            chart_data,
+            title="Top Species by Current CO2 (kg)",
+            title_font="Times-Bold",
+            label_font="Times-Roman",
+            value_font="Times-Roman",
+            title_color=premium_forest,
+            label_color=premium_muted,
+            value_color=premium_text,
+        )
     else:
         _draw_text_box(
             34,
@@ -3564,75 +3642,81 @@ def render_green_csr_programme_report_pdf(
             156,
             "Top Species by Current CO2",
             ["Species-level carbon distribution is not available yet because no eligible implementation records were found in scope."],
-            fill="#fbfdfb",
+            fill="#fffdf8",
         )
 
     stakeholder_box_y = height - 432
     stakeholder_box_h = 156
-    _draw_rounded_box(c, 294, stakeholder_box_y, width - 328, stakeholder_box_h, 8, fill_color=HexColor("#fbfdfb"), stroke_color=HexColor("#d7ead9"))
-    c.setFillColor(HexColor("#163826"))
-    c.setFont("Helvetica-Bold", 10.5)
+    _draw_rounded_box(c, 294, stakeholder_box_y, width - 328, stakeholder_box_h, 6, fill_color=premium_panel, stroke_color=premium_border)
+    c.setFillColor(premium_forest)
+    c.setFont("Times-Bold", 11.0)
     c.drawString(306, stakeholder_box_y + stakeholder_box_h - 18, "Stakeholder / Site Coverage")
-    c.setFont("Helvetica", 7.6)
-    c.setFillColor(HexColor("#5a6f64"))
+    c.setFont("Times-Roman", 8.0)
+    c.setFillColor(premium_muted)
     c.drawString(306, stakeholder_box_y + stakeholder_box_h - 30, "Top stakeholder or site groupings currently visible in the CSR implementation register.")
     header_y = stakeholder_box_y + stakeholder_box_h - 48
-    c.setFont("Helvetica-Bold", 7.1)
-    c.setFillColor(HexColor("#163826"))
-    c.drawString(306, header_y, "Name")
-    c.drawRightString(460, header_y, "Units")
-    c.drawRightString(504, header_y, "Healthy")
-    c.drawRightString(548, header_y, "Photo")
-    c.drawRightString(width - 42, header_y, "Mapped")
+    c.setFont("Times-Bold", 6.2)
+    c.setFillColor(premium_forest)
+    c.drawString(306, header_y, "Stakeholder / Site")
+    c.drawRightString(448, header_y, "Trees")
+    c.drawRightString(486, header_y, "Alive")
+    c.drawRightString(523, header_y, "Photo")
+    c.drawRightString(width - 42, header_y, "Map")
+    c.setStrokeColor(premium_border)
+    c.setLineWidth(0.45)
     c.line(306, header_y - 4, width - 42, header_y - 4)
     row_y = header_y - 14
-    c.setFont("Helvetica", 6.8)
+    c.setFont("Times-Roman", 6.7)
     if not stakeholder_rows:
-        c.setFillColor(HexColor("#6b7280"))
+        c.setFillColor(premium_muted)
+        c.setFont("Times-Italic", 7.4)
         c.drawString(306, row_y, "No stakeholder or site labels have been captured yet.")
     else:
         for row in stakeholder_rows[:8]:
             if row_y < stakeholder_box_y + 18:
                 break
-            c.setFillColor(HexColor("#1f2937"))
-            c.drawString(306, row_y, str(row.get("name") or "-")[:24])
-            c.drawRightString(460, row_y, str(int(row.get("tree_units") or 0)))
-            c.drawRightString(504, row_y, str(int(row.get("healthy_units") or 0)))
-            c.drawRightString(548, row_y, str(int(row.get("photo_records") or 0)))
+            c.setFillColor(premium_text)
+            c.drawString(306, row_y, str(row.get("name") or "-")[:22])
+            c.drawRightString(448, row_y, str(int(row.get("tree_units") or 0)))
+            c.drawRightString(486, row_y, str(int(row.get("healthy_units") or 0)))
+            c.drawRightString(523, row_y, str(int(row.get("photo_records") or 0)))
             c.drawRightString(width - 42, row_y, str(int(row.get("mapped_records") or 0)))
             row_y -= 12
 
     timeline_box_y = 86
     timeline_box_h = 154
-    _draw_rounded_box(c, 34, timeline_box_y, width - 68, timeline_box_h, 8, fill_color=HexColor("#fbfdfb"), stroke_color=HexColor("#d7ead9"))
-    c.setFillColor(HexColor("#163826"))
-    c.setFont("Helvetica-Bold", 10.5)
+    _draw_rounded_box(c, 34, timeline_box_y, width - 68, timeline_box_h, 6, fill_color=premium_panel, stroke_color=premium_border)
+    c.setFillColor(premium_forest)
+    c.setFont("Times-Bold", 11.0)
     c.drawString(46, timeline_box_y + timeline_box_h - 18, "Delivery Timeline & Reporting Basis")
-    c.setFont("Helvetica", 7.4)
-    c.setFillColor(HexColor("#5a6f64"))
+    c.setFont("Times-Roman", 7.8)
+    c.setFillColor(premium_muted)
     c.drawString(46, timeline_box_y + timeline_box_h - 30, "Cycle view of implementation records plus the current reporting methodology.")
     c.drawString(46, timeline_box_y + timeline_box_h - 42, str(summary.get("methodology") or "")[:148])
     timeline_header_y = timeline_box_y + timeline_box_h - 60
-    c.setFont("Helvetica-Bold", 7.0)
-    c.setFillColor(HexColor("#163826"))
+    c.setFont("Times-Bold", 6.4)
+    c.setFillColor(premium_forest)
     c.drawString(46, timeline_header_y, "Period")
     c.drawRightString(236, timeline_header_y, "Units")
     c.drawRightString(300, timeline_header_y, "Healthy")
     c.drawRightString(376, timeline_header_y, "Photo")
     c.drawRightString(454, timeline_header_y, "Reviewed")
     c.drawString(474, timeline_header_y, "Note")
+    c.setStrokeColor(premium_border)
+    c.setLineWidth(0.45)
     c.line(46, timeline_header_y - 4, width - 46, timeline_header_y - 4)
-    c.setFont("Helvetica", 6.9)
+    c.setFont("Times-Roman", 6.8)
     timeline_row_y = timeline_header_y - 14
     if not timeline_rows:
-        c.setFillColor(HexColor("#6b7280"))
+        c.setFillColor(premium_muted)
+        c.setFont("Times-Italic", 7.3)
         c.drawString(46, timeline_row_y, "No cycle-by-cycle delivery rows are available yet.")
     else:
         for row in timeline_rows[:6]:
             if timeline_row_y < timeline_box_y + 18:
                 break
             reviewed_count = int(row.get("reviewed_records") or 0)
-            c.setFillColor(HexColor("#1f2937"))
+            c.setFillColor(premium_text)
             c.drawString(46, timeline_row_y, str(row.get("period_label") or "-"))
             c.drawRightString(236, timeline_row_y, str(int(row.get("tree_units") or 0)))
             c.drawRightString(300, timeline_row_y, str(int(row.get("healthy_units") or 0)))
@@ -3644,18 +3728,9 @@ def render_green_csr_programme_report_pdf(
     _draw_footer(c.getPageNumber())
 
     def _draw_table_header(title: str):
-        _draw_project_brand_header_bar(
-            c,
-            width,
-            height,
-            project,
-            report_label=title,
-            subtitle="Detailed implementation register",
-            bar_height=58,
-            bar_color="#0b3d24",
-        )
-        c.setFont("Helvetica-Bold", 7.2)
-        c.setFillColor(HexColor("#163826"))
+        _draw_csr_header_bar(title, "Detailed implementation register", bar_height=58)
+        c.setFont("Times-Bold", 7.0)
+        c.setFillColor(premium_forest)
         y_head = height - 78
         c.drawString(28, y_head, "Tree")
         c.drawString(60, y_head, "Species")
@@ -3666,18 +3741,20 @@ def render_green_csr_programme_report_pdf(
         c.drawRightString(486, y_head, "CO2 Now")
         c.drawRightString(530, y_head, "Maint")
         c.drawString(536, y_head, "Photo")
+        c.setStrokeColor(premium_border)
+        c.setLineWidth(0.45)
         c.line(28, y_head - 4, width - 28, y_head - 4)
         return y_head - 14
 
     c.showPage()
     y = _draw_table_header("CSR Implementation Register")
-    c.setFont("Helvetica", 6.4)
+    c.setFont("Times-Roman", 6.5)
     for row in rows:
         if y < 40:
             _draw_footer(c.getPageNumber())
             c.showPage()
             y = _draw_table_header("CSR Implementation Register (continued)")
-            c.setFont("Helvetica", 6.4)
+            c.setFont("Times-Roman", 6.5)
         tree_label = f"#{row.get('project_tree_no') or row.get('id') or '-'}"
         count_suffix = ""
         try:
@@ -3694,7 +3771,7 @@ def render_green_csr_programme_report_pdf(
         except Exception:
             height_label = "-"
         photo_flag = "Y" if str(row.get("photo_url") or "").strip() or (row.get("photo_urls") or []) else "-"
-        c.setFillColor(HexColor("#1f2937"))
+        c.setFillColor(premium_text)
         c.drawString(28, y, f"{tree_label}{count_suffix}")
         c.drawString(60, y, species_label)
         c.drawString(142, y, status_label)
