@@ -30755,6 +30755,64 @@ def _render_relief_programme_pdf_with_fallback(
         raise last_error
 
 
+def _render_csr_programme_pdf_with_fallback(
+    pdf_path: str,
+    context: dict,
+    *,
+    include_photos: bool,
+) -> None:
+    map_png = context.get("overview_map_png")
+    map_view = context.get("overview_map_view")
+    rows = [dict(row) for row in (context.get("rows") or [])]
+
+    photo_rows: list[dict] = []
+    if include_photos:
+        for row in rows:
+            merged_urls = _normalize_photo_urls(row.get("photo_urls"))
+            if not merged_urls and str(row.get("photo_url") or "").strip():
+                merged_urls = [str(row.get("photo_url") or "").strip()]
+            if not merged_urls:
+                continue
+            for index, photo_url in enumerate(merged_urls, start=1):
+                item = dict(row)
+                item["photo_url"] = photo_url
+                item["photo_index"] = index
+                item["photo_total"] = len(merged_urls)
+                photo_rows.append(item)
+
+    attempts: list[tuple[bytes | None, dict | None, bool]] = [
+        (map_png, map_view, include_photos),
+    ]
+    if map_png is not None or map_view is not None:
+        attempts.append((None, None, include_photos))
+    if include_photos:
+        attempts.append((map_png, map_view, False))
+        if map_png is not None or map_view is not None:
+            attempts.append((None, None, False))
+
+    last_error: Exception | None = None
+    for next_map_png, _next_map_view, next_include_photos in attempts:
+        try:
+            render_green_csr_programme_report_pdf(
+                pdf_path,
+                project=context["project"],
+                rows=rows,
+                summary=dict(context.get("summary") or {}),
+                include_photos=next_include_photos,
+                photo_rows=photo_rows if next_include_photos else [],
+                overview_map_png=next_map_png,
+                team_rows=[dict(row) for row in (context.get("team_rows") or [])],
+                stakeholder_rows=[dict(row) for row in (context.get("stakeholder_rows") or [])],
+                timeline_rows=[dict(row) for row in (context.get("timeline_rows") or [])],
+                csr_report_profile=dict(context.get("csr_report_profile") or {}),
+            )
+            return
+        except Exception as exc:
+            last_error = exc
+    if last_error is not None:
+        raise last_error
+
+
 @router.get("/projects/{project_id}/existing-trees/metrics")
 def get_existing_tree_metrics(project_id: int, db: Session = Depends(get_db)):
     _get_project_settings(db, project_id)
@@ -30792,6 +30850,7 @@ def get_existing_tree_metrics(project_id: int, db: Session = Depends(get_db)):
 def export_existing_trees_csv(project_id: int, db: Session = Depends(get_db)):
     project = get_project(project_id, db)
     workflow_profile = _normalize_workflow_profile(project.get("workflow_profile"))
+    csr_report_mode = workflow_profile == "csr" or _is_csr_programme_access_model(project.get("access_model"))
     if workflow_profile == "agric":
         context = _build_agric_programme_export_context(project_id, db, include_map=False)
         project_copy = context["project"]
@@ -31180,11 +31239,7 @@ def export_existing_trees_csv(project_id: int, db: Session = Depends(get_db)):
         filename = f"project_{project_id}_relief_programme.csv"
         return FileResponse(csv_path, media_type="text/csv", filename=filename)
 
-    rows = (
-        _fetch_csr_implementation_export_rows(project_id, db)
-        if workflow_profile == "csr"
-        else _fetch_existing_tree_export_rows(project_id, db)
-    )
+    rows = _fetch_csr_implementation_export_rows(project_id, db) if csr_report_mode else _fetch_existing_tree_export_rows(project_id, db)
     summary = _summarize_existing_tree_export_rows(rows)
     agric_config = _normalize_agric_config(project.get("agric_config")) or {}
     csr_config = _normalize_csr_config(project.get("csr_config")) or {}
@@ -31192,7 +31247,7 @@ def export_existing_trees_csv(project_id: int, db: Session = Depends(get_db)):
         "LandCheck Agric Plot Records Detailed Export"
         if workflow_profile == "agric"
         else "LandCheck CSR Programme Detailed Export"
-        if workflow_profile == "csr"
+        if csr_report_mode
         else "LandCheck Existing Trees Detailed Export"
     )
 
@@ -31215,7 +31270,7 @@ def export_existing_trees_csv(project_id: int, db: Session = Depends(get_db)):
                 agric_config.get("support_packages") or "",
                 agric_config.get("season_label") or "",
             ])
-        elif workflow_profile == "csr":
+        elif csr_report_mode:
             writer.writerow([
                 "CSR Program",
                 csr_config.get("program_type") or "",
@@ -31396,11 +31451,7 @@ def export_existing_trees_csv(project_id: int, db: Session = Depends(get_db)):
                 _safe_json(custodian_profile_data) if custodian_profile_data else "",
             ])
 
-    filename = (
-        f"project_{project_id}_csr_implementation_detailed.csv"
-        if workflow_profile == "csr"
-        else f"project_{project_id}_existing_trees_detailed.csv"
-    )
+    filename = f"project_{project_id}_csr_implementation_detailed.csv" if csr_report_mode else f"project_{project_id}_existing_trees_detailed.csv"
     return FileResponse(csv_path, media_type="text/csv", filename=filename)
 
 
@@ -31412,40 +31463,14 @@ def export_existing_trees_pdf(
 ):
     project = get_project(project_id, db)
     workflow_profile = _normalize_workflow_profile(project.get("workflow_profile"))
-    if workflow_profile == "csr":
+    csr_report_mode = workflow_profile == "csr" or _is_csr_programme_access_model(project.get("access_model"))
+    if csr_report_mode:
         context = _build_csr_programme_export_context(project_id, db, include_map=True)
-        rows = context.get("rows") or []
-        photo_rows: list[dict] = []
-        if include_photos:
-            for row in rows:
-                merged_urls = _normalize_photo_urls(row.get("photo_urls"))
-                if not merged_urls and str(row.get("photo_url") or "").strip():
-                    merged_urls = [str(row.get("photo_url") or "").strip()]
-                if not merged_urls:
-                    continue
-                for index, photo_url in enumerate(merged_urls, start=1):
-                    item = dict(row)
-                    item["photo_url"] = photo_url
-                    item["photo_index"] = index
-                    item["photo_total"] = len(merged_urls)
-                    photo_rows.append(item)
         os.makedirs(REPORTS_DIR, exist_ok=True)
         tmp_pdf = tempfile.NamedTemporaryFile(suffix="_csr_programme.pdf", delete=False)
         pdf_path = tmp_pdf.name
         tmp_pdf.close()
-        render_green_csr_programme_report_pdf(
-            pdf_path,
-            project=context["project"],
-            rows=[dict(row) for row in rows],
-            summary=dict(context.get("summary") or {}),
-            include_photos=include_photos,
-            photo_rows=photo_rows,
-            overview_map_png=context.get("overview_map_png"),
-            team_rows=[dict(row) for row in (context.get("team_rows") or [])],
-            stakeholder_rows=[dict(row) for row in (context.get("stakeholder_rows") or [])],
-            timeline_rows=[dict(row) for row in (context.get("timeline_rows") or [])],
-            csr_report_profile=dict(context.get("csr_report_profile") or {}),
-        )
+        _render_csr_programme_pdf_with_fallback(pdf_path, context, include_photos=include_photos)
         filename = f"project_{project_id}_csr_programme_report.pdf"
         return _pdf_response_with_r2(
             pdf_path,
@@ -31706,6 +31731,22 @@ def export_project_pdf(
     pitch_value = _coerce_optional_float(pitch)
 
     project = get_project(project_id, db)
+    workflow_profile = _normalize_workflow_profile(project.get("workflow_profile"))
+    csr_report_mode = workflow_profile == "csr" or _is_csr_programme_access_model(project.get("access_model"))
+    if csr_report_mode:
+        context = _build_csr_programme_export_context(project_id, db, include_map=True)
+        os.makedirs(REPORTS_DIR, exist_ok=True)
+        tmp_pdf = tempfile.NamedTemporaryFile(suffix="_csr_programme.pdf", delete=False)
+        pdf_path = tmp_pdf.name
+        tmp_pdf.close()
+        _render_csr_programme_pdf_with_fallback(pdf_path, context, include_photos=False)
+        return _pdf_response_with_r2(
+            pdf_path,
+            f"project_{project_id}_csr_programme_report.pdf",
+            category="green-csr-programme-report",
+            project_id=project_id,
+            organization_id=int(context["project"].get("organization_id") or 0) or None,
+        )
     rows = db.execute(text("""
         SELECT
                t.id,
@@ -31889,6 +31930,7 @@ def _render_work_report_to_pdf(
     assignee_clean = assignee_name.strip() if isinstance(assignee_name, str) else None
     project = get_project(project_id=project_id, db=db, assignee_name=assignee_clean)
     workflow_profile = _normalize_workflow_profile(project.get("workflow_profile"))
+    csr_report_mode = workflow_profile == "csr" or _is_csr_programme_access_model(project.get("access_model"))
     if workflow_profile == "agric":
         context = _build_agric_programme_export_context(project_id, db, include_map=True)
         _render_agric_programme_pdf_with_fallback(
@@ -31905,6 +31947,14 @@ def _render_work_report_to_pdf(
             include_photos=include_photos,
         )
         return f"project_{project_id}_relief_programme_report.pdf", int(context["project"].get("organization_id") or 0) or None
+    if csr_report_mode:
+        context = _build_csr_programme_export_context(project_id, db, include_map=True)
+        _render_csr_programme_pdf_with_fallback(
+            pdf_path,
+            context,
+            include_photos=include_photos,
+        )
+        return f"project_{project_id}_csr_programme_report.pdf", int(context["project"].get("organization_id") or 0) or None
     if assignee_name:
         rows = db.execute(text("""
             SELECT
