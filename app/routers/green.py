@@ -126,6 +126,8 @@ WORKFLOW_PROFILE_VALUES = {"green", "agric", "relief_recovery", "csr"}
 DEFAULT_WORKFLOW_PROFILE = "green"
 PROJECT_ACCESS_MODEL_VALUES = {"partner_org", "public_sponsorship", "csr_programme"}
 DEFAULT_PROJECT_ACCESS_MODEL = "partner_org"
+ORGANIZATION_TYPE_VALUES = {"standard", "csr"}
+DEFAULT_ORGANIZATION_TYPE = "standard"
 SPONSOR_ACCOUNT_TYPE_VALUES = {"individual", "organization", "merchant"}
 MERCHANT_WEBHOOK_PLATFORM_VALUES = {"shopify"}
 MERCHANT_SPONSORSHIP_SOURCE_VALUES = {"api", "webhook_shopify", "admin"}
@@ -1548,6 +1550,7 @@ def _send_organization_welcome_email(
     *,
     to_email: str,
     organization_name: str,
+    organization_type: str | None = None,
     organization_slug: str | None = None,
     status: str | None = None,
     short_name: str | None = None,
@@ -1571,9 +1574,11 @@ def _send_organization_welcome_email(
     use_tls = _env_bool("SMTP_USE_TLS", not use_ssl)
     green_url = str(os.getenv("LANDCHECK_GREEN_URL") or "").strip() or "https://landcheck.online/green/login"
     work_url = str(os.getenv("LANDCHECK_WORK_URL") or "").strip() or "https://landcheck.online/green-work/login"
+    normalized_org_type = _normalize_organization_type(organization_type)
 
     detail_lines: list[str] = []
     detail_lines.append(f"Organization: {organization_name}")
+    detail_lines.append(f"Organization type: {'CSR client' if normalized_org_type == 'csr' else 'Standard partner'}")
     if short_name:
         detail_lines.append(f"Short name: {short_name}")
     if organization_slug:
@@ -1588,29 +1593,58 @@ def _send_organization_welcome_email(
     if website_url:
         detail_lines.append(f"Website: {website_url}")
 
-    body = (
-        f"Hello {organization_name},\n\n"
-        "Welcome to the LandCheck partnership.\n\n"
-        "Your organization has been created on LandCheck and onboarding has been completed.\n\n"
-        "Organization details:\n"
-        f"{chr(10).join(f'- {line}' for line in detail_lines)}\n\n"
-        "What LandCheck does:\n"
-        "- LandCheck Green helps field teams capture tree planting and maintenance activities with GPS and photo evidence.\n"
-        "- LandCheck Work helps supervisors assign tasks, review submissions, monitor progress, and export reports.\n"
-        "- The platform supports project-based monitoring for planting, survival tracking, and operational reporting.\n\n"
-        "We value your commitment to environmental stewardship and climate action. Welcome onboard!\n\n"
-        "Regards,\n"
-        "Samuel Yohanna\n"
-        "Founder\n"
-        "LandCheck Geospatial Technologies Limited\n"
-        "RC: 9350241\n\n"
-        f"LandCheck Green: {green_url}\n"
-        f"LandCheck Work: {work_url}\n"
-        "WhatsApp: +49 1776732638\n"
-    )
+    if normalized_org_type == "csr":
+        body = (
+            f"Hello {organization_name},\n\n"
+            "Welcome to the LandCheck CSR client dashboard.\n\n"
+            "Your organization has been onboarded as a CSR client on LandCheck. This route is designed for organizations that need verified programme implementation evidence, mapped delivery records, field photos, and client-ready CSR reporting.\n\n"
+            "Organization details:\n"
+            f"{chr(10).join(f'- {line}' for line in detail_lines)}\n\n"
+            "What your CSR dashboard is for:\n"
+            "- View live implementation progress for your approved CSR project(s).\n"
+            "- See mapped project footprint, tree records, and field photo evidence.\n"
+            "- Track implementation quality, survival status, and follow-up activity.\n"
+            "- Download CSR-ready PDF reports for management, stakeholders, and annual reporting.\n\n"
+            "How to access it:\n"
+            f"- Open LandCheck Work: {work_url}\n"
+            "- Sign in with the organization user credentials created for your team.\n"
+            "- After login, open your CSR project dashboard to review progress, evidence, and downloadable reports.\n\n"
+            "Field work is captured in LandCheck Green and synchronized into your client dashboard so your team can monitor evidence without waiting for manual reports.\n\n"
+            "Regards,\n"
+            "Samuel Yohanna\n"
+            "Founder\n"
+            "LandCheck Geospatial Technologies Limited\n"
+            "RC: 9350241\n\n"
+            f"LandCheck Green: {green_url}\n"
+            f"LandCheck Work: {work_url}\n"
+            "WhatsApp: +49 1776732638\n"
+        )
+        subject = f"Welcome to the LandCheck CSR Dashboard - {organization_name}"
+    else:
+        body = (
+            f"Hello {organization_name},\n\n"
+            "Welcome to the LandCheck partnership.\n\n"
+            "Your organization has been created on LandCheck and onboarding has been completed.\n\n"
+            "Organization details:\n"
+            f"{chr(10).join(f'- {line}' for line in detail_lines)}\n\n"
+            "What LandCheck does:\n"
+            "- LandCheck Green helps field teams capture tree planting and maintenance activities with GPS and photo evidence.\n"
+            "- LandCheck Work helps supervisors assign tasks, review submissions, monitor progress, and export reports.\n"
+            "- The platform supports project-based monitoring for planting, survival tracking, and operational reporting.\n\n"
+            "We value your commitment to environmental stewardship and climate action. Welcome onboard!\n\n"
+            "Regards,\n"
+            "Samuel Yohanna\n"
+            "Founder\n"
+            "LandCheck Geospatial Technologies Limited\n"
+            "RC: 9350241\n\n"
+            f"LandCheck Green: {green_url}\n"
+            f"LandCheck Work: {work_url}\n"
+            "WhatsApp: +49 1776732638\n"
+        )
+        subject = f"Welcome to LandCheck Partnership - {organization_name}"
 
     msg = EmailMessage()
-    msg["Subject"] = f"Welcome to LandCheck Partnership - {organization_name}"
+    msg["Subject"] = subject
     msg["From"] = f"{smtp_from_name} <{smtp_from_email}>" if smtp_from_name else smtp_from_email
     msg["To"] = to_email
     msg.set_content(body)
@@ -2591,6 +2625,13 @@ def _normalize_project_access_model(value: str | None) -> str:
     if normalized in PROJECT_ACCESS_MODEL_VALUES:
         return normalized
     return DEFAULT_PROJECT_ACCESS_MODEL
+
+
+def _normalize_organization_type(value: str | None) -> str:
+    normalized = _normalize_name(value)
+    if normalized in ORGANIZATION_TYPE_VALUES:
+        return normalized
+    return DEFAULT_ORGANIZATION_TYPE
 
 
 def _is_agric_workflow_profile(value: str | None) -> bool:
@@ -5185,6 +5226,7 @@ def ensure_green_tables(db: Session):
             id SERIAL PRIMARY KEY,
             name TEXT NOT NULL,
             slug TEXT NOT NULL UNIQUE,
+            organization_type TEXT NOT NULL DEFAULT 'standard',
             short_name TEXT,
             logo_url TEXT,
             status TEXT NOT NULL DEFAULT 'pilot',
@@ -5821,6 +5863,7 @@ def ensure_green_tables(db: Session):
         )
     """))
     try:
+        db.execute(text("ALTER TABLE green_organizations ADD COLUMN IF NOT EXISTS organization_type TEXT NOT NULL DEFAULT 'standard'"))
         db.execute(text("ALTER TABLE green_sponsor_accounts ADD COLUMN IF NOT EXISTS entity_category TEXT NOT NULL DEFAULT 'individual'"))
         db.execute(text("ALTER TABLE green_sponsor_accounts ADD COLUMN IF NOT EXISTS leaderboard_visibility TEXT NOT NULL DEFAULT 'public'"))
         db.execute(text("ALTER TABLE green_sponsorship_orders ADD COLUMN IF NOT EXISTS order_uid TEXT"))
@@ -19647,7 +19690,7 @@ def list_admin_organizations(db: Session = Depends(get_db)):
         text(
             """
             SELECT
-                o.id, o.name, o.slug, o.short_name, o.logo_url, o.status, o.contact_email, o.contact_phone, o.website_url,
+                o.id, o.name, o.slug, o.organization_type, o.short_name, o.logo_url, o.status, o.contact_email, o.contact_phone, o.website_url,
                 o.country, o.state_region, o.city, o.address_text, o.notes, COALESCE(o.is_active, TRUE) AS is_active,
                 o.created_at, o.updated_at,
                 COALESCE((
@@ -19729,6 +19772,7 @@ def create_admin_organization(
     db: Session = Depends(get_db),
     name: str = Body(...),
     slug: str | None = Body(default=None),
+    organization_type: str = Body(default="standard"),
     short_name: str | None = Body(default=None),
     logo_url: str | None = Body(default=None),
     status: str = Body(default="pilot"),
@@ -19746,16 +19790,17 @@ def create_admin_organization(
     if not name_clean:
         raise HTTPException(status_code=400, detail="Organization name is required")
     status_clean = _normalize_name(status) or "pilot"
+    organization_type_clean = _normalize_organization_type(organization_type)
     final_slug = _ensure_unique_org_slug(db, (slug or "").strip() or name_clean)
     row = db.execute(
         text(
             """
             INSERT INTO green_organizations (
-                name, slug, short_name, status, contact_email, contact_phone, website_url,
+                name, slug, organization_type, short_name, status, contact_email, contact_phone, website_url,
                 country, state_region, city, address_text, notes, logo_url, is_active
             )
             VALUES (
-                :name, :slug, :short_name, :status, :contact_email, :contact_phone, :website_url,
+                :name, :slug, :organization_type, :short_name, :status, :contact_email, :contact_phone, :website_url,
                 :country, :state_region, :city, :address_text, :notes, :logo_url, :is_active
             )
             RETURNING *
@@ -19764,6 +19809,7 @@ def create_admin_organization(
         {
             "name": name_clean,
             "slug": final_slug,
+            "organization_type": organization_type_clean,
             "short_name": (short_name or "").strip() or None,
             "status": status_clean,
             "contact_email": (contact_email or "").strip() or None,
@@ -19786,7 +19832,12 @@ def create_admin_organization(
         entity_id=int(org["id"]),
         action="organization_created",
         actor="super_admin",
-        details={"name": org.get("name"), "slug": org.get("slug"), "status": org.get("status")},
+        details={
+            "name": org.get("name"),
+            "slug": org.get("slug"),
+            "status": org.get("status"),
+            "organization_type": org.get("organization_type"),
+        },
     )
     db.commit()
     org["welcome_email_attempted"] = False
@@ -19799,6 +19850,7 @@ def create_admin_organization(
             _send_organization_welcome_email(
                 to_email=org_contact_email,
                 organization_name=str(org.get("name") or "Organization"),
+                organization_type=str(org.get("organization_type") or "").strip() or None,
                 organization_slug=str(org.get("slug") or "").strip() or None,
                 status=str(org.get("status") or "").strip() or None,
                 short_name=str(org.get("short_name") or "").strip() or None,
@@ -19820,6 +19872,7 @@ def update_admin_organization(
     db: Session = Depends(get_db),
     name: str | None = Body(default=None),
     slug: str | None = Body(default=None),
+    organization_type: str | None = Body(default=None),
     short_name: str | None = Body(default=None),
     logo_url: str | None = Body(default=None),
     status: str | None = Body(default=None),
@@ -19846,6 +19899,11 @@ def update_admin_organization(
     next_slug_source = (slug or "").strip() if slug is not None else str(existing.get("slug") or next_name)
     next_slug = _ensure_unique_org_slug(db, next_slug_source or next_name, exclude_org_id=org_id)
     next_status = _normalize_name(status) if status is not None else _normalize_name(existing.get("status"))
+    next_organization_type = (
+        _normalize_organization_type(organization_type)
+        if organization_type is not None
+        else _normalize_organization_type(existing.get("organization_type"))
+    )
     if not next_status:
         next_status = "pilot"
     row = db.execute(
@@ -19854,6 +19912,7 @@ def update_admin_organization(
             UPDATE green_organizations
             SET name = :name,
                 slug = :slug,
+                organization_type = :organization_type,
                 short_name = :short_name,
                 logo_url = :logo_url,
                 status = :status,
@@ -19875,6 +19934,7 @@ def update_admin_organization(
             "org_id": org_id,
             "name": next_name,
             "slug": next_slug,
+            "organization_type": next_organization_type,
             "short_name": (short_name.strip() if isinstance(short_name, str) else (existing.get("short_name") or None)) or None,
             "logo_url": (logo_url.strip() if isinstance(logo_url, str) else (existing.get("logo_url") or None)) or None,
             "status": next_status,
@@ -19897,8 +19957,18 @@ def update_admin_organization(
         action="organization_updated",
         actor="super_admin",
         details={
-            "before": {"name": existing.get("name"), "slug": existing.get("slug"), "status": existing.get("status")},
-            "after": {"name": next_name, "slug": next_slug, "status": next_status},
+            "before": {
+                "name": existing.get("name"),
+                "slug": existing.get("slug"),
+                "status": existing.get("status"),
+                "organization_type": existing.get("organization_type"),
+            },
+            "after": {
+                "name": next_name,
+                "slug": next_slug,
+                "status": next_status,
+                "organization_type": next_organization_type,
+            },
         },
     )
     db.commit()
@@ -29439,6 +29509,208 @@ def _is_export_task_complete(row: dict) -> bool:
     return status_key in {"done", "completed", "closed"} and review_key in {"none", "approved"}
 
 
+def _parse_report_datetime(value: object) -> datetime | None:
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, date):
+        return datetime.combine(value, datetime.min.time())
+    text_value = str(value or "").strip()
+    if not text_value:
+        return None
+    candidate = text_value.replace("Z", "+00:00")
+    try:
+        return datetime.fromisoformat(candidate)
+    except Exception:
+        pass
+    try:
+        return datetime.strptime(text_value[:10], "%Y-%m-%d")
+    except Exception:
+        return None
+
+
+def _build_csr_report_profile(project: dict, summary: dict) -> dict:
+    csr_config = _normalize_csr_config(project.get("csr_config")) or {}
+    program_type = _clean_choice(csr_config.get("program_type"), CSR_PROGRAM_TYPE_VALUES) or "tree_planting"
+    programme_titles = {
+        "tree_planting": "Tree Planting & Landscape Restoration",
+        "urban_greening": "Urban Greening & Place-Making",
+        "school_greening": "School Greening & Learning Environments",
+        "community_restoration": "Community Restoration & Resilience",
+        "employee_volunteering": "Employee Volunteering & Climate Action",
+        "mixed": "Mixed CSR Environmental Programme",
+    }
+    material_topic_map = {
+        "tree_planting": [
+            "Climate action and carbon stewardship",
+            "Local ecosystem restoration and survival performance",
+            "Community visibility through mapped trees and field proof",
+        ],
+        "urban_greening": [
+            "Urban environmental quality and green-space access",
+            "Visible place-based regeneration",
+            "Ongoing maintenance readiness and public accountability",
+        ],
+        "school_greening": [
+            "Education-facing green infrastructure",
+            "Safe and visible school-site implementation evidence",
+            "Long-term care and stewardship around learning spaces",
+        ],
+        "community_restoration": [
+            "Community resilience and degraded-land recovery",
+            "Field evidence for implementation footprint and quality",
+            "Maintenance and follow-up readiness over time",
+        ],
+        "employee_volunteering": [
+            "Employee participation linked to verified delivery",
+            "Transparent field evidence for internal and public updates",
+            "Long-term programme continuity after activation days",
+        ],
+        "mixed": [
+            "Programme governance and implementation assurance",
+            "Community reach, mapped coverage, and field visibility",
+            "Impact metrics, maintenance, and follow-up actions",
+        ],
+    }
+    stakeholder_focus_map = {
+        "tree_planting": [
+            "Community partners or custodians linked to planted trees",
+            "Field teams responsible for planting, verification, and maintenance",
+            "Management and stakeholders needing evidence-backed CSR updates",
+        ],
+        "urban_greening": [
+            "Host communities and site owners around public green spaces",
+            "Implementation teams managing mapped urban interventions",
+            "Client leadership tracking visible city-facing outcomes",
+        ],
+        "school_greening": [
+            "Schools and learning communities receiving the intervention",
+            "Field teams capturing site photos, maps, and condition updates",
+            "CSR and communications teams preparing education-impact updates",
+        ],
+        "community_restoration": [
+            "Local communities linked to restoration parcels or planting sites",
+            "Field teams coordinating site establishment and follow-up care",
+            "Stakeholders monitoring resilience, recovery, and evidence quality",
+        ],
+        "employee_volunteering": [
+            "Employee participants linked to real field outcomes",
+            "Operations teams converting volunteer days into verified records",
+            "CSR managers reporting both participation and implementation quality",
+        ],
+        "mixed": [
+            "Implementation stakeholders who need a shared evidence base",
+            "Field teams and partner communities represented in mapped records",
+            "Decision-makers requiring clear progress, risk, and impact signals",
+        ],
+    }
+    sdg_focus_map = {
+        "tree_planting": ["SDG 13 Climate Action", "SDG 15 Life on Land", "SDG 17 Partnerships for the Goals"],
+        "urban_greening": ["SDG 11 Sustainable Cities and Communities", "SDG 13 Climate Action", "SDG 15 Life on Land"],
+        "school_greening": ["SDG 4 Quality Education", "SDG 13 Climate Action", "SDG 15 Life on Land"],
+        "community_restoration": ["SDG 13 Climate Action", "SDG 15 Life on Land", "SDG 1 No Poverty"],
+        "employee_volunteering": ["SDG 13 Climate Action", "SDG 17 Partnerships for the Goals", "SDG 15 Life on Land"],
+        "mixed": ["SDG 13 Climate Action", "SDG 15 Life on Land", "SDG 17 Partnerships for the Goals"],
+    }
+    reporting_basis = [
+        "Board-ready structure covering programme governance, delivery scope, stakeholder reach, evidence assurance, and metrics.",
+        "Evidence chain built from mapped records, field photos, task workflow, review history, and maintenance follow-up.",
+        f"Current cycle includes {int(summary.get('rows_with_map') or 0)} mapped record(s), {int(summary.get('rows_with_photos') or 0)} record(s) with photo proof, and {int(summary.get('implementation_tasks_total') or 0)} tracked implementation task(s).",
+    ]
+    return {
+        "programme_title": programme_titles.get(program_type, "CSR Environmental Programme"),
+        "material_topics": material_topic_map.get(program_type, material_topic_map["mixed"]),
+        "stakeholder_priorities": stakeholder_focus_map.get(program_type, stakeholder_focus_map["mixed"]),
+        "sdg_focus": sdg_focus_map.get(program_type, sdg_focus_map["mixed"]),
+        "reporting_basis": reporting_basis,
+    }
+
+
+def _build_csr_stakeholder_rows(rows: list[dict]) -> list[dict]:
+    by_key: dict[str, dict] = {}
+    for row in rows:
+        profile_data = _normalize_tree_record_profile_data(row.get("record_profile_data")) or {}
+        stakeholder_name = (
+            str(row.get("custodian_name") or "").strip()
+            or str(profile_data.get("community_name") or "").strip()
+            or str(profile_data.get("site_name") or "").strip()
+            or str(profile_data.get("plot_name") or "").strip()
+            or "Implementation site"
+        )
+        stakeholder_key = _normalize_name(stakeholder_name) or f"site-{len(by_key) + 1}"
+        item = by_key.setdefault(
+            stakeholder_key,
+            {
+                "name": stakeholder_name,
+                "tree_units": 0,
+                "healthy_units": 0,
+                "attention_units": 0,
+                "dead_units": 0,
+                "photo_records": 0,
+                "mapped_records": 0,
+            },
+        )
+        try:
+            tree_units = max(int(row.get("inventory_tree_count") or 1), 1)
+        except Exception:
+            tree_units = 1
+        item["tree_units"] += tree_units
+        status_key = _normalize_tree_status(row.get("status"))
+        if status_key in HEALTHY_TREE_STATUSES:
+            item["healthy_units"] += tree_units
+        elif status_key in ATTENTION_TREE_STATUSES:
+            item["attention_units"] += tree_units
+        elif status_key in DEAD_TREE_STATUSES:
+            item["dead_units"] += tree_units
+        photo_urls = _normalize_photo_urls(row.get("photo_urls"))
+        if photo_urls or str(row.get("photo_url") or "").strip():
+            item["photo_records"] += 1
+        if row.get("existing_area_geojson") is not None or (row.get("lng") is not None and row.get("lat") is not None):
+            item["mapped_records"] += 1
+    return sorted(
+        by_key.values(),
+        key=lambda item: (
+            int(item.get("tree_units") or 0),
+            int(item.get("photo_records") or 0),
+            str(item.get("name") or "").lower(),
+        ),
+        reverse=True,
+    )
+
+
+def _build_csr_timeline_rows(rows: list[dict]) -> list[dict]:
+    by_period: dict[str, dict] = {}
+    for row in rows:
+        dt_value = _parse_report_datetime(row.get("planting_date")) or _parse_report_datetime(row.get("created_at"))
+        if dt_value is None:
+            continue
+        period_key = dt_value.strftime("%Y-%m")
+        period_label = dt_value.strftime("%b %Y")
+        item = by_period.setdefault(
+            period_key,
+            {
+                "period_key": period_key,
+                "period_label": period_label,
+                "tree_units": 0,
+                "healthy_units": 0,
+                "photo_records": 0,
+                "reviewed_records": 0,
+            },
+        )
+        try:
+            tree_units = max(int(row.get("inventory_tree_count") or 1), 1)
+        except Exception:
+            tree_units = 1
+        item["tree_units"] += tree_units
+        if _normalize_tree_status(row.get("status")) in HEALTHY_TREE_STATUSES:
+            item["healthy_units"] += tree_units
+        photo_urls = _normalize_photo_urls(row.get("photo_urls"))
+        if photo_urls or str(row.get("photo_url") or "").strip():
+            item["photo_records"] += 1
+        if int(row.get("review_approved") or 0) > 0 or _normalize_name(row.get("last_review_state")) == "approved":
+            item["reviewed_records"] += 1
+    return sorted(by_period.values(), key=lambda item: str(item.get("period_key") or ""), reverse=True)
+
+
 def _build_csr_programme_export_context(
     project_id: int,
     db: Session,
@@ -29590,6 +29862,10 @@ def _build_csr_programme_export_context(
     summary["implementation_tasks_completed"] = completed_task_count
     summary["implementation_tasks_live"] = max(len(task_rows) - completed_task_count, 0)
     summary["latest_activity_at"] = latest_activity_date
+    stakeholder_rows = _build_csr_stakeholder_rows(rows)
+    timeline_rows = _build_csr_timeline_rows(rows)
+    summary["stakeholder_count"] = len(stakeholder_rows)
+    summary["timeline_period_count"] = len(timeline_rows)
 
     overview_map_view = None
     overview_map_png = None
@@ -29628,6 +29904,9 @@ def _build_csr_programme_export_context(
         "summary": summary,
         "rows": rows,
         "team_rows": team_rows,
+        "stakeholder_rows": stakeholder_rows,
+        "timeline_rows": timeline_rows,
+        "csr_report_profile": _build_csr_report_profile(project_copy, summary),
         "overview_map_png": overview_map_png,
         "overview_map_view": overview_map_view,
     }
@@ -31163,6 +31442,9 @@ def export_existing_trees_pdf(
             photo_rows=photo_rows,
             overview_map_png=context.get("overview_map_png"),
             team_rows=[dict(row) for row in (context.get("team_rows") or [])],
+            stakeholder_rows=[dict(row) for row in (context.get("stakeholder_rows") or [])],
+            timeline_rows=[dict(row) for row in (context.get("timeline_rows") or [])],
+            csr_report_profile=dict(context.get("csr_report_profile") or {}),
         )
         filename = f"project_{project_id}_csr_programme_report.pdf"
         return _pdf_response_with_r2(

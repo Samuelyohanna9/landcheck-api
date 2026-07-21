@@ -3312,11 +3312,17 @@ def render_green_csr_programme_report_pdf(
     photo_rows: list[dict] | None = None,
     overview_map_png: bytes | None = None,
     team_rows: list[dict] | None = None,
+    stakeholder_rows: list[dict] | None = None,
+    timeline_rows: list[dict] | None = None,
+    csr_report_profile: dict | None = None,
 ):
     c = canvas.Canvas(output_path, pagesize=A4)
     width, height = A4
     csr_config = project.get("csr_config") or {}
     team_rows = list(team_rows or [])
+    stakeholder_rows = list(stakeholder_rows or [])
+    timeline_rows = list(timeline_rows or [])
+    csr_report_profile = dict(csr_report_profile or {})
 
     def _fmt_num(value, digits=2):
         try:
@@ -3370,6 +3376,7 @@ def render_green_csr_programme_report_pdf(
     dead_trees = int(summary.get("dead_trees", 0) or 0)
     field_team_count = int(summary.get("field_team_count", len(team_rows)) or len(team_rows))
     field_team_active_count = int(summary.get("field_team_active_count", 0) or 0)
+    stakeholder_count = int(summary.get("stakeholder_count", len(stakeholder_rows)) or len(stakeholder_rows))
     photo_rows_count = int(summary.get("rows_with_photos", 0) or 0)
     reviewed_rows_count = int(summary.get("rows_with_review_activity", 0) or 0)
     mapped_rows_count = int(summary.get("rows_with_map", 0) or 0)
@@ -3386,42 +3393,71 @@ def render_green_csr_programme_report_pdf(
     reporting_cycle = str(csr_config.get("reporting_cycle") or "Current reporting cycle").strip()
     implementation_scope = str(csr_config.get("implementation_scope") or "Tree implementation and verified field evidence").strip()
     target_outcomes = str(csr_config.get("target_outcomes") or "").strip()
+    programme_title = str(csr_report_profile.get("programme_title") or "CSR Environmental Programme").strip()
+    material_topic_lines = [str(item).strip() for item in (csr_report_profile.get("material_topics") or []) if str(item).strip()]
+    stakeholder_priority_lines = [str(item).strip() for item in (csr_report_profile.get("stakeholder_priorities") or []) if str(item).strip()]
+    reporting_basis_lines = [str(item).strip() for item in (csr_report_profile.get("reporting_basis") or []) if str(item).strip()]
+    sdg_focus_lines = [str(item).strip() for item in (csr_report_profile.get("sdg_focus") or []) if str(item).strip()]
+    latest_activity = _fmt_date(summary.get("latest_activity_at"))
 
-    executive_lines = [
-        f"{total_trees} implementation tree(s) are currently recorded across {total_rows} verified programme record(s).",
-        f"Status mix: {alive_trees} healthy/alive, {attention_trees} needing attention, and {dead_trees} dead or removed.",
-        f"Photo evidence is present on {photo_rows_count}/{total_rows} records ({_fmt_num(summary.get('photo_coverage_pct', 0), 1)}%), while mapped geospatial coverage is {mapped_rows_count}/{total_rows} ({_fmt_num(summary.get('map_coverage_pct', 0), 1)}%).",
-        f"Field review activity exists on {reviewed_rows_count}/{total_rows} records, and {maintenance_done}/{maintenance_total or 1} maintenance actions are marked done.",
-        f"Estimated carbon snapshot currently stands at {_fmt_num(summary.get('current_co2_tonnes', 0), 2)} t CO2 with a {_fmt_num(summary.get('projected_lifetime_co2_tonnes', 0), 2)} t long-range projection.",
+    top_stakeholders = stakeholder_rows[:3]
+    board_summary_lines = [
+        f"{client_name} currently has {total_trees} verified implementation tree(s) on record across {total_rows} CSR field record(s).",
+        f"Operational status mix: {alive_trees} healthy/alive, {attention_trees} needing attention, and {dead_trees} dead or removed.",
+        f"Evidence coverage stands at {photo_rows_count}/{total_rows} photo-backed record(s) and {mapped_rows_count}/{total_rows} mapped record(s).",
+        f"Review and care status: {reviewed_rows_count} record(s) already reviewed, with {maintenance_done}/{maintenance_total or 1} maintenance action(s) marked done.",
+        f"Climate metrics currently estimate {_fmt_num(summary.get('current_co2_tonnes', 0), 2)} t CO2 stored and {_fmt_num(summary.get('projected_lifetime_co2_tonnes', 0), 2)} t projected over 40 years.",
     ]
     programme_lines = [
-        f"Client: {client_name}",
+        f"Programme title: {programme_title}",
         f"Programme type: {_fmt_label(csr_config.get('program_type') or 'tree_planting')}",
         f"Reporting cycle: {reporting_cycle}",
         f"Location: {str(project.get('location_text') or '-').strip() or '-'}",
-        f"Scope: {implementation_scope}",
+        f"Implementation scope: {implementation_scope}",
     ]
-    assurance_lines = [
-        "This report is structured around common CSR reporting themes used in board and stakeholder updates: programme scope, implementation footprint, evidence quality, field assurance, and impact indicators.",
-        f"Maintenance ledger: total {maintenance_total}, done {maintenance_done}, pending {maintenance_pending}, overdue {maintenance_overdue}.",
+    if target_outcomes:
+        programme_lines.append(f"Target outcomes: {target_outcomes}")
+    stakeholder_summary_lines = [
+        f"{stakeholder_count} stakeholder or site grouping(s) currently appear in the verified CSR evidence base.",
+    ]
+    if top_stakeholders:
+        stakeholder_summary_lines.extend(
+            [
+                f"{str(item.get('name') or 'Implementation site')}: {int(item.get('tree_units') or 0)} tree unit(s), {int(item.get('photo_records') or 0)} photo-backed record(s), {int(item.get('mapped_records') or 0)} mapped record(s)."
+                for item in top_stakeholders
+            ]
+        )
+    else:
+        stakeholder_summary_lines.append("Community partner naming has not been fully linked yet, but implementation records are still being tracked in the register.")
+    reporting_note_lines = reporting_basis_lines or [
+        "This CSR report is structured for management, board, and stakeholder updates across programme scope, evidence assurance, and metrics.",
+        "Evidence is drawn from mapped records, field photos, review workflow, and maintenance activity captured in LandCheck Green.",
+    ]
+    material_and_sdg_lines = material_topic_lines[:]
+    if sdg_focus_lines:
+        material_and_sdg_lines.append(f"SDG focus: {', '.join(sdg_focus_lines)}")
+    delivery_assurance_lines = [
         f"Implementation task activity: {tasks_total} tracked task(s), {tasks_completed} completed, {tasks_live} still live.",
-        f"Field team visibility: {field_team_count} team member(s) currently appear in roster or implementation activity, with {field_team_active_count} marked active.",
+        f"Maintenance ledger: total {maintenance_total}, done {maintenance_done}, pending {maintenance_pending}, overdue {maintenance_overdue}.",
+        f"Field team visibility: {field_team_count} team member(s) in roster or implementation activity, with {field_team_active_count} currently active.",
+        f"Latest recorded project activity: {latest_activity}.",
     ]
     next_action_lines = [
         f"Close the {tasks_live} live implementation task(s) still open in the field queue.",
         f"Resolve the {attention_trees} record(s) flagged for attention and the {maintenance_overdue} overdue care action(s).",
         f"Expand photo evidence on the remaining {max(total_rows - photo_rows_count, 0)} record(s) where field proof is still missing.",
     ]
-    if target_outcomes:
-        next_action_lines.insert(0, f"Target outcomes: {target_outcomes}")
+    stakeholder_priority_lines = stakeholder_priority_lines or [
+        "Stakeholder view focuses on implementation visibility, site coverage, evidence quality, and follow-up readiness."
+    ]
 
     _draw_project_brand_header_bar(
         c,
         width,
         height,
         project,
-        report_label="CSR Programme Report",
-        subtitle="Client-ready implementation summary covering scope, evidence, team readiness, and impact.",
+        report_label="CSR Programme Impact Report",
+        subtitle="Client-ready programme summary covering mandate, stakeholder reach, evidence integrity, and impact indicators.",
         bar_height=78,
         bar_color="#0b3d24",
     )
@@ -3434,28 +3470,34 @@ def render_green_csr_programme_report_pdf(
     c.drawString(
         34,
         height - 110,
-        f"Client route: {client_name} | Reporting cycle: {reporting_cycle} | Generated scope: verified implementation and field evidence",
+        f"Client: {client_name} | Cycle: {reporting_cycle} | Scope: verified implementation footprint, evidence, and follow-up",
     )
 
     metric_y = height - 186
     metric_w = (width - 68 - 24) / 4
-    _draw_metric_chip(c, 34, metric_y, metric_w, 66, str(total_trees), "Trees implemented")
+    _draw_metric_chip(c, 34, metric_y, metric_w, 66, str(total_trees), "Trees delivered")
     _draw_metric_chip(c, 34 + metric_w + 8, metric_y, metric_w, 66, f"{survival_pct:.1f}%", "Healthy / alive rate")
-    _draw_metric_chip(c, 34 + (metric_w + 8) * 2, metric_y, metric_w, 66, f"{photo_rows_count}/{total_rows}", "Photo evidence")
-    _draw_metric_chip(c, 34 + (metric_w + 8) * 3, metric_y, metric_w, 66, str(field_team_count), "Field team")
+    _draw_metric_chip(c, 34 + (metric_w + 8) * 2, metric_y, metric_w, 66, f"{photo_rows_count}/{total_rows}", "Photo proof")
+    _draw_metric_chip(c, 34 + (metric_w + 8) * 3, metric_y, metric_w, 66, str(stakeholder_count), "Stakeholder sites")
 
     metric_y2 = metric_y - 78
-    _draw_metric_chip(c, 34, metric_y2, metric_w, 66, f"{_fmt_num(summary.get('current_co2_tonnes', 0), 2)} t", "Current CO2")
-    _draw_metric_chip(c, 34 + metric_w + 8, metric_y2, metric_w, 66, f"{_fmt_num(summary.get('annual_co2_tonnes', 0), 2)} t", "Annual CO2")
-    _draw_metric_chip(c, 34 + (metric_w + 8) * 2, metric_y2, metric_w, 66, f"{_fmt_num(summary.get('projected_lifetime_co2_tonnes', 0), 2)} t", "40Y projection")
-    _draw_metric_chip(c, 34 + (metric_w + 8) * 3, metric_y2, metric_w, 66, f"{_fmt_num(summary.get('total_existing_area_ha', 0), 2)} ha", "Mapped area")
+    _draw_metric_chip(c, 34, metric_y2, metric_w, 66, f"{_fmt_num(summary.get('map_coverage_pct', 0), 1)}%", "Mapped coverage")
+    _draw_metric_chip(c, 34 + metric_w + 8, metric_y2, metric_w, 66, f"{_fmt_num(summary.get('review_coverage_pct', 0), 1)}%", "Reviewed records")
+    _draw_metric_chip(c, 34 + (metric_w + 8) * 2, metric_y2, metric_w, 66, str(field_team_count), "Field team")
+    _draw_metric_chip(c, 34 + (metric_w + 8) * 3, metric_y2, metric_w, 66, f"{_fmt_num(summary.get('projected_lifetime_co2_tonnes', 0), 2)} t", "40Y projection")
 
     box_y = metric_y2 - 136
-    _draw_text_box(34, box_y, 316, 124, "Executive Summary", executive_lines, fill="#fbfdfb")
-    _draw_text_box(360, box_y, width - 394, 124, "Programme Scope", programme_lines, fill="#f7fbf8")
+    _draw_text_box(34, box_y, 316, 124, "Board Summary", board_summary_lines, fill="#fbfdfb")
+    _draw_text_box(360, box_y, width - 394, 124, "Programme Mandate", programme_lines, fill="#f7fbf8")
+
+    stakeholder_y = box_y - 82
+    _draw_text_box(34, stakeholder_y, width - 68, 70, "Stakeholder Reach", stakeholder_summary_lines, fill="#f9fcfa")
+
+    basis_y = stakeholder_y - 78
+    _draw_text_box(34, basis_y, width - 68, 66, "Reporting Basis", reporting_note_lines, fill="#fffdf7")
 
     map_y = 80
-    map_h = 176
+    map_h = max(int(basis_y - map_y - 12), 148)
     _draw_rounded_box(c, 34, map_y, width - 68, map_h, 8, fill_color=HexColor("#f8faf9"), stroke_color=HexColor("#d7ead9"))
     c.setFillColor(HexColor("#163826"))
     c.setFont("Helvetica-Bold", 10.5)
@@ -3484,14 +3526,22 @@ def render_green_csr_programme_report_pdf(
         width,
         height,
         project,
-        report_label="CSR Programme Report",
-        subtitle="Implementation quality, evidence coverage, and field delivery readiness.",
+        report_label="CSR Delivery, Assurance & Community Coverage",
+        subtitle="Material topics, stakeholder evidence, implementation assurance, and cycle-by-cycle delivery view.",
         bar_height=62,
         bar_color="#0b3d24",
     )
 
-    _draw_text_box(34, height - 238, 250, 146, "Evidence & Assurance", assurance_lines, fill="#fbfdfb")
-    _draw_text_box(294, height - 238, width - 328, 146, "Next Actions", next_action_lines, fill="#fffdf7")
+    _draw_text_box(34, height - 252, 250, 160, "Material Topics & SDG Focus", material_and_sdg_lines or ["CSR material topics have not been configured yet."], fill="#fbfdfb")
+    _draw_text_box(
+        294,
+        height - 252,
+        width - 328,
+        160,
+        "Delivery Assurance & Next Actions",
+        [*delivery_assurance_lines, *stakeholder_priority_lines[:2], *next_action_lines[:2]],
+        fill="#fffdf7",
+    )
 
     top_species = summary.get("top_species") or []
     if top_species:
@@ -3505,68 +3555,92 @@ def render_green_csr_programme_report_pdf(
                     colors[idx % len(colors)],
                 )
             )
-        _draw_bar_chart(c, 34, height - 428, 250, 150, chart_data, title="Top Species by Current CO2 (kg)")
+        _draw_bar_chart(c, 34, height - 432, 250, 156, chart_data, title="Top Species by Current CO2 (kg)")
     else:
         _draw_text_box(
             34,
-            height - 428,
+            height - 432,
             250,
-            150,
+            156,
             "Top Species by Current CO2",
             ["Species-level carbon distribution is not available yet because no eligible implementation records were found in scope."],
             fill="#fbfdfb",
         )
 
-    team_box_y = height - 428
-    team_box_h = 290
-    _draw_rounded_box(c, 294, team_box_y, width - 328, team_box_h, 8, fill_color=HexColor("#fbfdfb"), stroke_color=HexColor("#d7ead9"))
+    stakeholder_box_y = height - 432
+    stakeholder_box_h = 156
+    _draw_rounded_box(c, 294, stakeholder_box_y, width - 328, stakeholder_box_h, 8, fill_color=HexColor("#fbfdfb"), stroke_color=HexColor("#d7ead9"))
     c.setFillColor(HexColor("#163826"))
     c.setFont("Helvetica-Bold", 10.5)
-    c.drawString(306, team_box_y + team_box_h - 18, "Field Team Activity")
+    c.drawString(306, stakeholder_box_y + stakeholder_box_h - 18, "Stakeholder / Site Coverage")
     c.setFont("Helvetica", 7.6)
     c.setFillColor(HexColor("#5a6f64"))
-    c.drawString(306, team_box_y + team_box_h - 30, "Selected CSR field agents plus detected implementation activity in the current project.")
-    header_y = team_box_y + team_box_h - 48
+    c.drawString(306, stakeholder_box_y + stakeholder_box_h - 30, "Top stakeholder or site groupings currently visible in the CSR implementation register.")
+    header_y = stakeholder_box_y + stakeholder_box_h - 48
     c.setFont("Helvetica-Bold", 7.1)
     c.setFillColor(HexColor("#163826"))
     c.drawString(306, header_y, "Name")
-    c.drawString(408, header_y, "Role")
-    c.drawRightString(486, header_y, "Records")
-    c.drawRightString(528, header_y, "Tasks")
-    c.drawRightString(width - 42, header_y, "Done")
+    c.drawRightString(460, header_y, "Units")
+    c.drawRightString(504, header_y, "Healthy")
+    c.drawRightString(548, header_y, "Photo")
+    c.drawRightString(width - 42, header_y, "Mapped")
     c.line(306, header_y - 4, width - 42, header_y - 4)
     row_y = header_y - 14
     c.setFont("Helvetica", 6.8)
-    if not team_rows:
+    if not stakeholder_rows:
         c.setFillColor(HexColor("#6b7280"))
-        c.drawString(306, row_y, "No field team roster or activity has been captured yet.")
+        c.drawString(306, row_y, "No stakeholder or site labels have been captured yet.")
     else:
-        for row in team_rows[:12]:
-            if row_y < team_box_y + 18:
+        for row in stakeholder_rows[:8]:
+            if row_y < stakeholder_box_y + 18:
                 break
             c.setFillColor(HexColor("#1f2937"))
             c.drawString(306, row_y, str(row.get("name") or "-")[:24])
-            c.drawString(408, row_y, _fmt_label(row.get("role_name"))[:12])
-            c.drawRightString(486, row_y, str(int(row.get("tree_units_captured") or row.get("records_captured") or 0)))
-            c.drawRightString(528, row_y, str(int(row.get("tasks_assigned") or 0)))
-            c.drawRightString(width - 42, row_y, str(int(row.get("tasks_completed") or 0)))
+            c.drawRightString(460, row_y, str(int(row.get("tree_units") or 0)))
+            c.drawRightString(504, row_y, str(int(row.get("healthy_units") or 0)))
+            c.drawRightString(548, row_y, str(int(row.get("photo_records") or 0)))
+            c.drawRightString(width - 42, row_y, str(int(row.get("mapped_records") or 0)))
             row_y -= 12
 
-    c.setFont("Helvetica", 7.2)
+    timeline_box_y = 86
+    timeline_box_h = 154
+    _draw_rounded_box(c, 34, timeline_box_y, width - 68, timeline_box_h, 8, fill_color=HexColor("#fbfdfb"), stroke_color=HexColor("#d7ead9"))
+    c.setFillColor(HexColor("#163826"))
+    c.setFont("Helvetica-Bold", 10.5)
+    c.drawString(46, timeline_box_y + timeline_box_h - 18, "Delivery Timeline & Reporting Basis")
+    c.setFont("Helvetica", 7.4)
     c.setFillColor(HexColor("#5a6f64"))
-    c.drawString(34, 82, "Methodology")
-    _draw_wrapped_text(
-        c,
-        str(summary.get("methodology") or ""),
-        34,
-        70,
-        width - 68,
-        line_height=9,
-        font_name="Helvetica",
-        font_size=7.2,
-        color=HexColor("#5a6f64"),
-        max_lines=4,
-    )
+    c.drawString(46, timeline_box_y + timeline_box_h - 30, "Cycle view of implementation records plus the current reporting methodology.")
+    c.drawString(46, timeline_box_y + timeline_box_h - 42, str(summary.get("methodology") or "")[:148])
+    timeline_header_y = timeline_box_y + timeline_box_h - 60
+    c.setFont("Helvetica-Bold", 7.0)
+    c.setFillColor(HexColor("#163826"))
+    c.drawString(46, timeline_header_y, "Period")
+    c.drawRightString(236, timeline_header_y, "Units")
+    c.drawRightString(300, timeline_header_y, "Healthy")
+    c.drawRightString(376, timeline_header_y, "Photo")
+    c.drawRightString(454, timeline_header_y, "Reviewed")
+    c.drawString(474, timeline_header_y, "Note")
+    c.line(46, timeline_header_y - 4, width - 46, timeline_header_y - 4)
+    c.setFont("Helvetica", 6.9)
+    timeline_row_y = timeline_header_y - 14
+    if not timeline_rows:
+        c.setFillColor(HexColor("#6b7280"))
+        c.drawString(46, timeline_row_y, "No cycle-by-cycle delivery rows are available yet.")
+    else:
+        for row in timeline_rows[:6]:
+            if timeline_row_y < timeline_box_y + 18:
+                break
+            reviewed_count = int(row.get("reviewed_records") or 0)
+            c.setFillColor(HexColor("#1f2937"))
+            c.drawString(46, timeline_row_y, str(row.get("period_label") or "-"))
+            c.drawRightString(236, timeline_row_y, str(int(row.get("tree_units") or 0)))
+            c.drawRightString(300, timeline_row_y, str(int(row.get("healthy_units") or 0)))
+            c.drawRightString(376, timeline_row_y, str(int(row.get("photo_records") or 0)))
+            c.drawRightString(454, timeline_row_y, str(reviewed_count))
+            note = "Strong evidence" if reviewed_count > 0 and int(row.get("photo_records") or 0) > 0 else "Needs more proof"
+            c.drawString(474, timeline_row_y, note)
+            timeline_row_y -= 12
     _draw_footer(c.getPageNumber())
 
     def _draw_table_header(title: str):
