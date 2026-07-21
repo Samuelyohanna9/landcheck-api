@@ -3392,6 +3392,58 @@ def render_green_csr_programme_report_pdf(
             )
             cursor -= 1.5
 
+    def _draw_empty_state_box(
+        x: float,
+        y: float,
+        w: float,
+        h: float,
+        title: str,
+        body_lines: list[str],
+        *,
+        fill_color=HexColor("#fffdf8"),
+        accent_label: str = "Awaiting verified records",
+    ):
+        _draw_rounded_box(c, x, y, w, h, 6, fill_color=fill_color, stroke_color=premium_border)
+        c.setFillColor(premium_forest)
+        c.setFont("Times-Bold", 11.2)
+        c.drawString(x + 12, y + h - 20, title)
+        c.setStrokeColor(premium_gold)
+        c.setLineWidth(0.7)
+        c.line(x + 12, y + h - 25, min(x + 88, x + w - 12), y + h - 25)
+
+        pill_w = max(min(w * 0.42, 128), 104)
+        pill_h = 18
+        pill_x = x + 12
+        pill_y = y + h - 52
+        _draw_rounded_box(c, pill_x, pill_y, pill_w, pill_h, 9, fill_color=premium_panel_alt, stroke_color=premium_border)
+        c.setFillColor(premium_gold)
+        c.setFont("Times-Bold", 7.4)
+        c.drawCentredString(pill_x + pill_w / 2, pill_y + 5.5, accent_label[:28])
+
+        text_y = y + h - 78
+        for line in body_lines:
+            text_y = _draw_wrapped_text(
+                c,
+                line,
+                x + 12,
+                text_y,
+                w - 24,
+                line_height=11,
+                font_name="Times-Roman",
+                font_size=8.5,
+                color=premium_text,
+                max_lines=3,
+            )
+            text_y -= 2
+
+        c.setStrokeColor(premium_border)
+        c.setDash(2, 3)
+        c.line(x + 12, y + 24, x + w - 12, y + 24)
+        c.setDash()
+        c.setFillColor(premium_muted)
+        c.setFont("Times-Italic", 7.4)
+        c.drawString(x + 12, y + 10, "This section will populate automatically once eligible CSR implementation evidence is available.")
+
     def _draw_premium_metric(x: float, y: float, w: float, h: float, value: str, label: str):
         _draw_rounded_box(c, x, y, w, h, 6, fill_color=premium_panel, stroke_color=premium_border)
         c.setFillColor(premium_muted)
@@ -3635,43 +3687,57 @@ def render_green_csr_programme_report_pdf(
             value_color=premium_text,
         )
     else:
-        _draw_text_box(
+        _draw_empty_state_box(
             34,
             height - 432,
             250,
             156,
             "Top Species by Current CO2",
-            ["Species-level carbon distribution is not available yet because no eligible implementation records were found in scope."],
-            fill="#fffdf8",
+            [
+                "Species-level carbon distribution is not available yet because no eligible implementation records were found in scope.",
+                "Once verified implementation trees are available, this panel will rank the strongest species contributors by current carbon value.",
+            ],
+            fill_color=premium_panel,
+            accent_label="No ranked species yet",
         )
 
     stakeholder_box_y = height - 432
     stakeholder_box_h = 156
-    _draw_rounded_box(c, 294, stakeholder_box_y, width - 328, stakeholder_box_h, 6, fill_color=premium_panel, stroke_color=premium_border)
-    c.setFillColor(premium_forest)
-    c.setFont("Times-Bold", 11.0)
-    c.drawString(306, stakeholder_box_y + stakeholder_box_h - 18, "Stakeholder / Site Coverage")
-    c.setFont("Times-Roman", 8.0)
-    c.setFillColor(premium_muted)
-    c.drawString(306, stakeholder_box_y + stakeholder_box_h - 30, "Top stakeholder or site groupings currently visible in the CSR implementation register.")
-    header_y = stakeholder_box_y + stakeholder_box_h - 48
-    c.setFont("Times-Bold", 6.2)
-    c.setFillColor(premium_forest)
-    c.drawString(306, header_y, "Stakeholder / Site")
-    c.drawRightString(448, header_y, "Trees")
-    c.drawRightString(486, header_y, "Alive")
-    c.drawRightString(523, header_y, "Photo")
-    c.drawRightString(width - 42, header_y, "Map")
-    c.setStrokeColor(premium_border)
-    c.setLineWidth(0.45)
-    c.line(306, header_y - 4, width - 42, header_y - 4)
-    row_y = header_y - 14
-    c.setFont("Times-Roman", 6.7)
     if not stakeholder_rows:
-        c.setFillColor(premium_muted)
-        c.setFont("Times-Italic", 7.4)
-        c.drawString(306, row_y, "No stakeholder or site labels have been captured yet.")
+        _draw_empty_state_box(
+            294,
+            stakeholder_box_y,
+            width - 328,
+            stakeholder_box_h,
+            "Stakeholder / Site Coverage",
+            [
+                "Top stakeholder or site groupings are not visible yet because stakeholder labels have not been captured in the current CSR implementation records.",
+                "When community partner, site, or custodian names are added, this section will summarize tree coverage, health, photos, and mapped presence.",
+            ],
+            fill_color=premium_panel,
+            accent_label="No stakeholder labels yet",
+        )
     else:
+        _draw_rounded_box(c, 294, stakeholder_box_y, width - 328, stakeholder_box_h, 6, fill_color=premium_panel, stroke_color=premium_border)
+        c.setFillColor(premium_forest)
+        c.setFont("Times-Bold", 11.0)
+        c.drawString(306, stakeholder_box_y + stakeholder_box_h - 18, "Stakeholder / Site Coverage")
+        c.setFont("Times-Roman", 8.0)
+        c.setFillColor(premium_muted)
+        c.drawString(306, stakeholder_box_y + stakeholder_box_h - 30, "Top stakeholder or site groupings currently visible in the CSR implementation register.")
+        header_y = stakeholder_box_y + stakeholder_box_h - 48
+        c.setFont("Times-Bold", 6.2)
+        c.setFillColor(premium_forest)
+        c.drawString(306, header_y, "Stakeholder / Site")
+        c.drawRightString(448, header_y, "Trees")
+        c.drawRightString(486, header_y, "Alive")
+        c.drawRightString(523, header_y, "Photo")
+        c.drawRightString(width - 42, header_y, "Map")
+        c.setStrokeColor(premium_border)
+        c.setLineWidth(0.45)
+        c.line(306, header_y - 4, width - 42, header_y - 4)
+        row_y = header_y - 14
+        c.setFont("Times-Roman", 6.7)
         for row in stakeholder_rows[:8]:
             if row_y < stakeholder_box_y + 18:
                 break
