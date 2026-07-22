@@ -56,7 +56,9 @@ for origin in [*default_origins, *_parse_csv_env("CORS_ALLOW_ORIGINS")]:
     if clean and clean not in origins:
         origins.append(clean)
 
-local_origin_regex = str(os.getenv("CORS_ALLOW_ORIGIN_REGEX", "") or "").strip()
+default_local_origin_regex = r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$"
+configured_origin_regex = str(os.getenv("CORS_ALLOW_ORIGIN_REGEX", "") or "").strip()
+local_origin_regex = configured_origin_regex or default_local_origin_regex
 
 app.add_middleware(
     CORSMiddleware,
