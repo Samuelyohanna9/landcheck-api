@@ -491,7 +491,6 @@ def _request_ip_address(request: Request) -> str | None:
 def get_db():
     db = SessionLocal()
     try:
-        _ensure_green_schema_ready(db)
         yield db
     finally:
         db.close()
@@ -531,6 +530,14 @@ def _ensure_green_schema_ready(db: Session):
                     db.commit()
                 except Exception:
                     db.rollback()
+
+
+def bootstrap_green_schema():
+    db = SessionLocal()
+    try:
+        _ensure_green_schema_ready(db)
+    finally:
+        db.close()
 
 
 def _normalize_name(value: str | None) -> str:
@@ -4156,9 +4163,8 @@ def _run_remote_monitoring_query(db: Session, statement: str, params: dict | Non
         if not _is_remote_monitoring_schema_error(exc):
             raise
         db.rollback()
-        ensure_green_tables(db)
-        db.commit()
-        return db.execute(text(statement), query_params)
+        logger.exception("Remote monitoring schema is missing during request handling; green schema bootstrap must complete at startup before serving traffic.")
+        raise
 
 
 def _count_trees_in_geojson(db: Session, *, project_id: int, area_geojson: dict) -> dict[str, int]:
@@ -28159,7 +28165,6 @@ def create_work_order(
         def _bg_sync_sponsor_units():
             bg_db = SessionLocal()
             try:
-                _ensure_green_schema_ready(bg_db)
                 _try_assign_available_sponsor_units_for_project(bg_db, project_id=_bg_project_id, context="create_work_order_bg")
                 if _bg_agent_user_id is not None:
                     _try_assign_available_sponsor_units_for_agent(

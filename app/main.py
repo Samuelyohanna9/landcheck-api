@@ -63,6 +63,7 @@ def _should_log_request_activity(request: Request, *, status_code: int, duration
 def startup_event():
     init_db()
     ensure_activity_log_table()
+    green.bootstrap_green_schema()
 
 # ✅ SPEED OPTIMIZATION: Gzip Compression
 # This shrinks large JSON/Report data (like your 210MB I/O) before sending it
