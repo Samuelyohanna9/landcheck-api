@@ -8559,6 +8559,7 @@ def _find_reserved_sponsor_unit_for_assignee(
     normalized_organization_id = int(organization_id or 0) or None
     if normalized_user_id is None and not normalized_assignee_name:
         return None
+    matched_user = None
     project_row = db.execute(
         text(
             """
@@ -8579,27 +8580,17 @@ def _find_reserved_sponsor_unit_for_assignee(
     selected_user_ids = _normalize_positive_int_list(
         _json_value_or(project_row.get("public_sponsor_agent_user_ids"), [])
     )
-    matched_user = None
     if normalized_user_id is not None:
         try:
-            matched_user = _get_green_user_for_sponsor_agent(
+            access_project_row, matched_user, selected_user_ids = _ensure_public_sponsor_agent_project_access(
                 db,
-                user_id=normalized_user_id,
+                project_id=int(project_id),
+                user_id=int(normalized_user_id),
                 organization_id=normalized_organization_id,
             )
+            project_row = dict(access_project_row or project_row)
+            selected_user_ids = _normalize_positive_int_list(selected_user_ids or selected_user_ids)
         except HTTPException:
-            if normalized_organization_id is not None:
-                try:
-                    matched_user = _get_green_user_for_sponsor_agent(
-                        db,
-                        user_id=normalized_user_id,
-                        organization_id=None,
-                    )
-                except HTTPException:
-                    matched_user = None
-            else:
-                matched_user = None
-        if matched_user and selected_user_ids and int(matched_user.get("id") or 0) not in set(selected_user_ids):
             matched_user = None
     if not matched_user:
         matched_user = _match_selected_public_sponsor_user_for_assignee(
