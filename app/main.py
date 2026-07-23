@@ -24,6 +24,40 @@ def _parse_csv_env(name: str) -> list[str]:
             values.append(clean)
     return values
 
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        return int(str(raw).strip())
+    except Exception:
+        return default
+
+
+REQUEST_ACTIVITY_LOG_ALL = _env_bool("REQUEST_ACTIVITY_LOG_ALL", False)
+REQUEST_ACTIVITY_LOG_SLOW_MS = max(_env_int("REQUEST_ACTIVITY_LOG_SLOW_MS", 1500), 0)
+
+
+def _should_log_request_activity(request: Request, *, status_code: int, duration_ms: float) -> bool:
+    if should_skip_request_logging(request):
+        return False
+    if REQUEST_ACTIVITY_LOG_ALL:
+        return True
+    method = str(request.method or "").upper()
+    if int(status_code) >= 400:
+        return True
+    if method != "GET":
+        return True
+    return float(duration_ms) >= float(REQUEST_ACTIVITY_LOG_SLOW_MS)
+
 # ✅ Create tables on startup
 @app.on_event("startup")
 def startup_event():
@@ -73,17 +107,17 @@ app.add_middleware(
 
 @app.middleware("http")
 async def capture_system_activity(request: Request, call_next):
-    if should_skip_request_logging(request):
-        return await call_next(request)
     started_at = perf_counter()
     try:
         response = await call_next(request)
     except Exception as exc:
         duration_ms = (perf_counter() - started_at) * 1000
-        log_request_activity(request, status_code=500, duration_ms=duration_ms, error_message=str(exc))
+        if _should_log_request_activity(request, status_code=500, duration_ms=duration_ms):
+            log_request_activity(request, status_code=500, duration_ms=duration_ms, error_message=str(exc))
         raise
     duration_ms = (perf_counter() - started_at) * 1000
-    log_request_activity(request, status_code=response.status_code, duration_ms=duration_ms)
+    if _should_log_request_activity(request, status_code=response.status_code, duration_ms=duration_ms):
+        log_request_activity(request, status_code=response.status_code, duration_ms=duration_ms)
     return response
 
 
