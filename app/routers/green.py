@@ -9646,7 +9646,11 @@ def _build_sponsor_agent_earning_rows(
             LEFT JOIN green_sponsor_accounts sa ON sa.id = u.sponsor_account_id
             WHERE u.project_id IN :project_ids
               AND u.tree_id IS NOT NULL
-              AND LOWER(COALESCE(o.payment_status, '')) = 'verified'
+              AND (
+                    LOWER(COALESCE(o.payment_status, '')) IN ('verified', 'paid')
+                 OR LOWER(COALESCE(o.order_status, '')) IN ('paid', 'allocated', 'completed')
+                 OR o.payment_verified_at IS NOT NULL
+              )
               AND LOWER(COALESCE(u.sponsorship_status, '')) IN ('linked', 'active', 'replaced')
             ORDER BY u.tree_id, COALESCE(u.linked_at, u.updated_at, u.created_at) DESC, u.id DESC
         )
@@ -9847,10 +9851,7 @@ def _build_sponsor_agent_reconciliation_snapshot(
                 ) AS active_order_count,
                 COALESCE(SUM(target_trees) FILTER (
                     WHERE LOWER(COALESCE(status, 'assigned')) NOT IN ('done', 'completed', 'closed', 'cancelled')
-                ), 0) AS assigned_target_trees,
-                COALESCE(SUM(GREATEST(target_trees - COALESCE(planted_count, 0), 0)) FILTER (
-                    WHERE LOWER(COALESCE(status, 'assigned')) NOT IN ('done', 'completed', 'closed', 'cancelled')
-                ), 0) AS remaining_target_trees
+                ), 0) AS assigned_target_trees
             FROM green_work_orders
             WHERE project_id = :project_id
               AND LOWER(REPLACE(REPLACE(COALESCE(work_type, ''), '-', '_'), ' ', '_')) = 'planting'
@@ -9901,6 +9902,24 @@ def _build_sponsor_agent_reconciliation_snapshot(
         },
     ).scalar()
 
+    confirmed_planted_count = db.execute(
+        text(
+            """
+            SELECT COUNT(*)
+            FROM trees t
+            WHERE t.project_id = :project_id
+              AND LOWER(COALESCE(t.tree_origin, 'new_planting')) = 'new_planting'
+              AND COALESCE(t.count_in_planting_kpis, TRUE) = TRUE
+              AND LOWER(REGEXP_REPLACE(TRIM(COALESCE(t.created_by, '')), '\\s+', ' ', 'g')) IN :aliases
+              AND LOWER(REPLACE(REPLACE(COALESCE(t.status, ''), '-', '_'), ' ', '_')) <> 'pending_planting'
+            """
+        ).bindparams(bindparam("aliases", expanding=True)),
+        {
+            "project_id": normalized_project_id,
+            "aliases": aliases or [""],
+        },
+    ).scalar()
+
     linked_count = _count_linked_sponsor_units_for_assignee(
         db,
         project_id=normalized_project_id,
@@ -9923,9 +9942,10 @@ def _build_sponsor_agent_reconciliation_snapshot(
 
     saved_count_value = int(saved_count or 0)
     approved_count_value = int(approved_count or 0)
+    confirmed_planted_count_value = int(confirmed_planted_count or 0)
     assigned_target_trees = int(order_stats.get("assigned_target_trees") or 0) if order_stats else 0
     active_order_count = int(order_stats.get("active_order_count") or 0) if order_stats else 0
-    remaining_target_trees = int(order_stats.get("remaining_target_trees") or 0) if order_stats else 0
+    remaining_target_trees = max(assigned_target_trees - confirmed_planted_count_value, 0)
     linked_count_value = int(linked_count or 0)
 
     return {
