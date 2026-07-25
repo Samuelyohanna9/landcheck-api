@@ -455,6 +455,12 @@ class SponsorAgentPayoutReviewPayload(BaseModel):
     settlement_reference: str | None = None
 
 
+class SponsorAgentPayoutClearancePayload(BaseModel):
+    action: str
+    reviewer_name: str | None = None
+    review_notes: str | None = None
+
+
 class SponsorProfileSettingsPayload(BaseModel):
     entity_category: str | None = None
     leaderboard_visibility: str | None = None
@@ -5917,6 +5923,10 @@ def ensure_green_tables(db: Session):
         db.execute(text("ALTER TABLE green_sponsorship_units ADD COLUMN IF NOT EXISTS first_qr_downloaded_at TIMESTAMP"))
         db.execute(text("ALTER TABLE green_sponsorship_units ADD COLUMN IF NOT EXISTS last_qr_downloaded_at TIMESTAMP"))
         db.execute(text("ALTER TABLE green_sponsorship_units ADD COLUMN IF NOT EXISTS last_qr_downloaded_by TEXT"))
+        db.execute(text("ALTER TABLE green_sponsorship_units ADD COLUMN IF NOT EXISTS manual_payout_clearance BOOLEAN NOT NULL DEFAULT FALSE"))
+        db.execute(text("ALTER TABLE green_sponsorship_units ADD COLUMN IF NOT EXISTS manual_payout_clearance_by TEXT"))
+        db.execute(text("ALTER TABLE green_sponsorship_units ADD COLUMN IF NOT EXISTS manual_payout_clearance_at TIMESTAMP"))
+        db.execute(text("ALTER TABLE green_sponsorship_units ADD COLUMN IF NOT EXISTS manual_payout_clearance_reason TEXT"))
         db.execute(text("ALTER TABLE green_sponsorship_units ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW()"))
         db.execute(text("ALTER TABLE green_sponsorship_units ADD COLUMN IF NOT EXISTS merchant_account_id INTEGER REFERENCES green_sponsor_accounts(id) ON DELETE SET NULL"))
         db.execute(text("ALTER TABLE green_sponsor_agent_bank_accounts ADD COLUMN IF NOT EXISTS organization_id INTEGER"))
@@ -8372,6 +8382,10 @@ def _ensure_sponsor_qr_unit_columns(db: Session):
         db.execute(text("ALTER TABLE green_sponsorship_units ADD COLUMN IF NOT EXISTS last_qr_downloaded_by TEXT"))
         db.execute(text("ALTER TABLE green_sponsorship_units ADD COLUMN IF NOT EXISTS allocated_species TEXT"))
         db.execute(text("ALTER TABLE green_sponsorship_units ADD COLUMN IF NOT EXISTS assigned_work_order_id INTEGER REFERENCES green_work_orders(id)"))
+        db.execute(text("ALTER TABLE green_sponsorship_units ADD COLUMN IF NOT EXISTS manual_payout_clearance BOOLEAN NOT NULL DEFAULT FALSE"))
+        db.execute(text("ALTER TABLE green_sponsorship_units ADD COLUMN IF NOT EXISTS manual_payout_clearance_by TEXT"))
+        db.execute(text("ALTER TABLE green_sponsorship_units ADD COLUMN IF NOT EXISTS manual_payout_clearance_at TIMESTAMP"))
+        db.execute(text("ALTER TABLE green_sponsorship_units ADD COLUMN IF NOT EXISTS manual_payout_clearance_reason TEXT"))
         db.execute(text("CREATE INDEX IF NOT EXISTS idx_sponsor_units_project_assigned_user ON green_sponsorship_units(project_id, assigned_user_id, sponsorship_status, created_at DESC)"))
         db.execute(text("CREATE INDEX IF NOT EXISTS idx_sponsor_units_assigned_work_order_id ON green_sponsorship_units(assigned_work_order_id)"))
         db.commit()
@@ -9967,6 +9981,116 @@ def _build_sponsor_agent_reconciliation_snapshot(
     }
 
 
+def _list_sponsor_agent_payout_clearance_blockers(
+    db: Session,
+    *,
+    project_id: int,
+    user_row: dict,
+) -> list[dict]:
+    normalized_project_id = int(project_id or 0)
+    normalized_user_id = int(user_row.get("id") or 0) or None
+    aliases = [
+        str(item or "").strip().lower()
+        for item in (_build_sponsor_agent_aliases(user_row) or [])
+        if str(item or "").strip()
+    ]
+    if normalized_project_id <= 0 or (normalized_user_id is None and not aliases):
+        return []
+    rows = db.execute(
+        text(
+            """
+            SELECT
+                u.id AS unit_id,
+                u.unit_uid,
+                u.tree_id,
+                u.tree_project_no,
+                u.sponsorship_status,
+                u.linked_at,
+                COALESCE(u.manual_payout_clearance, FALSE) AS manual_payout_clearance,
+                u.manual_payout_clearance_by,
+                u.manual_payout_clearance_at,
+                u.manual_payout_clearance_reason,
+                o.id AS order_id,
+                o.order_uid,
+                o.payment_status,
+                o.order_status,
+                o.payment_verified_at,
+                sa.full_name AS sponsor_name,
+                sa.organization_name AS sponsor_organization_name,
+                t.species,
+                t.created_by,
+                t.planting_date
+            FROM green_sponsorship_units u
+            JOIN green_sponsorship_orders o ON o.id = u.order_id
+            LEFT JOIN green_sponsor_accounts sa ON sa.id = u.sponsor_account_id
+            LEFT JOIN trees t ON t.id = u.tree_id
+            WHERE u.project_id = :project_id
+              AND u.tree_id IS NOT NULL
+              AND LOWER(COALESCE(u.sponsorship_status, '')) IN ('linked', 'active', 'replaced')
+              AND (
+                    (:user_id IS NOT NULL AND COALESCE(u.assigned_user_id, 0) = :user_id)
+                 OR LOWER(REGEXP_REPLACE(TRIM(COALESCE(u.assigned_assignee_name, '')), '\\s+', ' ', 'g')) IN :aliases
+                 OR LOWER(REGEXP_REPLACE(TRIM(COALESCE(t.created_by, '')), '\\s+', ' ', 'g')) IN :aliases
+              )
+              AND NOT (
+                    COALESCE(u.manual_payout_clearance, FALSE) = TRUE
+                 OR LOWER(COALESCE(o.payment_status, '')) IN ('verified', 'paid')
+                 OR LOWER(COALESCE(o.order_status, '')) IN ('paid', 'allocated', 'completed')
+                 OR o.payment_verified_at IS NOT NULL
+              )
+            ORDER BY COALESCE(t.planting_date::timestamp, t.created_at, u.linked_at, u.updated_at, u.created_at) DESC, u.id DESC
+            """
+        ).bindparams(bindparam("aliases", expanding=True)),
+        {
+            "project_id": normalized_project_id,
+            "user_id": normalized_user_id,
+            "aliases": aliases or [""],
+        },
+    ).mappings().all()
+    payload: list[dict] = []
+    for row in rows:
+        payment_status = _normalize_sponsor_payment_status(row.get("payment_status"))
+        order_status = _normalize_sponsor_order_status(row.get("order_status"))
+        if row.get("payment_verified_at"):
+            blocker_reason = "Linked tree is waiting for payout refresh despite a recorded payment verification timestamp."
+        elif payment_status in {"pending", "proof_submitted"}:
+            blocker_reason = "Sponsor payment is still pending review in the order record."
+        elif payment_status in {"rejected", "refunded"}:
+            blocker_reason = "Sponsor order is rejected or refunded, so payout is blocked."
+        elif order_status in {"pending_payment", "payment_review"}:
+            blocker_reason = "Sponsor order is not yet marked as payment-cleared."
+        else:
+            blocker_reason = "Linked sponsor tree is waiting for manual payout clearance."
+        payload.append(
+            {
+                "unit_id": int(row.get("unit_id") or 0),
+                "unit_uid": str(row.get("unit_uid") or "").strip() or None,
+                "tree_id": int(row.get("tree_id") or 0) or None,
+                "tree_label": (
+                    f"Tree {int(row.get('tree_project_no') or 0)}"
+                    if int(row.get("tree_project_no") or 0) > 0
+                    else f"Tree #{int(row.get('tree_id') or 0)}"
+                ),
+                "species": str(row.get("species") or "").strip() or None,
+                "order_id": int(row.get("order_id") or 0) or None,
+                "order_uid": str(row.get("order_uid") or "").strip() or None,
+                "payment_status": payment_status or None,
+                "order_status": order_status or None,
+                "payment_verified_at": row.get("payment_verified_at"),
+                "sponsor_name": str(row.get("sponsor_name") or "").strip() or None,
+                "sponsor_organization_name": str(row.get("sponsor_organization_name") or "").strip() or None,
+                "linked_at": row.get("linked_at"),
+                "created_by": str(row.get("created_by") or "").strip() or None,
+                "manual_payout_clearance": bool(row.get("manual_payout_clearance")),
+                "manual_payout_clearance_by": str(row.get("manual_payout_clearance_by") or "").strip() or None,
+                "manual_payout_clearance_at": row.get("manual_payout_clearance_at"),
+                "manual_payout_clearance_reason": str(row.get("manual_payout_clearance_reason") or "").strip() or None,
+                "blocker_reason": blocker_reason,
+            }
+        )
+    return payload
+
+
 def _build_sponsor_agent_dashboard(
     db: Session,
     *,
@@ -10064,6 +10188,17 @@ def _build_sponsor_agent_dashboard(
     except Exception:
         _rollback_quietly(db)
         earnings = []
+    payout_clearance_blockers: list[dict] = []
+    if requested_project_id is not None and requested_project_id > 0:
+        try:
+            payout_clearance_blockers = _list_sponsor_agent_payout_clearance_blockers(
+                db,
+                project_id=int(requested_project_id),
+                user_row=user_row,
+            )
+        except Exception:
+            _rollback_quietly(db)
+            payout_clearance_blockers = []
     request_by_key: dict[str, dict] = {}
     for request in serialized_requests:
         for earning_key in request.get("earning_keys") or []:
@@ -10157,6 +10292,7 @@ def _build_sponsor_agent_dashboard(
         "project_summaries": sorted(project_summaries.values(), key=lambda item: str(item.get("project_name") or "").lower()),
         "earnings": earning_rows,
         "requests": serialized_requests,
+        "payout_clearance_blockers": payout_clearance_blockers,
     }
     if requested_project_id is not None and requested_project_id > 0:
         dashboard["reconciliation"] = _build_sponsor_agent_reconciliation_snapshot(
@@ -19843,6 +19979,126 @@ def list_admin_sponsor_agent_payouts(
     if debug:
         payload_out["_diagnostics"] = diagnostics
     return payload_out
+
+
+@router.patch("/admin/sponsor-agent-payout-clearance/{unit_id}")
+def review_admin_sponsor_agent_payout_clearance(
+    unit_id: int,
+    payload: SponsorAgentPayoutClearancePayload,
+    db: Session = Depends(get_db),
+):
+    row = db.execute(
+        text(
+            """
+            SELECT
+                u.id,
+                u.project_id,
+                u.order_id,
+                u.tree_id,
+                u.tree_project_no,
+                u.sponsorship_status,
+                COALESCE(u.manual_payout_clearance, FALSE) AS manual_payout_clearance,
+                u.manual_payout_clearance_by,
+                u.manual_payout_clearance_at,
+                u.manual_payout_clearance_reason,
+                o.order_uid,
+                o.payment_status,
+                o.order_status
+            FROM green_sponsorship_units u
+            JOIN green_sponsorship_orders o ON o.id = u.order_id
+            WHERE u.id = :unit_id
+            LIMIT 1
+            """
+        ),
+        {"unit_id": int(unit_id)},
+    ).mappings().first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Sponsor payout clearance item not found")
+    if int(row.get("tree_id") or 0) <= 0:
+        raise HTTPException(status_code=400, detail="This sponsor unit is not linked to a planted tree yet")
+    if _normalize_sponsor_unit_status(row.get("sponsorship_status")) not in {"linked", "active", "replaced"}:
+        raise HTTPException(status_code=400, detail="Only linked sponsor trees can be reviewed for payout clearance")
+    action = _normalize_name(payload.action)
+    reviewer_name = _clean_text(payload.reviewer_name, 120) or "super_admin"
+    review_notes = _clean_text(payload.review_notes, 500)
+    if action in {"clear", "cleared", "clear_for_payment"} and not review_notes:
+        raise HTTPException(status_code=400, detail="Enter a short review note before clearing this tree for payout")
+    if action in {"revoke", "revoked", "undo"} and not review_notes:
+        raise HTTPException(status_code=400, detail="Enter a short review note before revoking this payout clearance")
+    if action not in {"clear", "cleared", "clear_for_payment", "revoke", "revoked", "undo"}:
+        raise HTTPException(status_code=400, detail="Unsupported payout clearance action")
+
+    if action in {"clear", "cleared", "clear_for_payment"}:
+        updated = db.execute(
+            text(
+                """
+                UPDATE green_sponsorship_units
+                SET manual_payout_clearance = TRUE,
+                    manual_payout_clearance_by = :reviewer_name,
+                    manual_payout_clearance_at = NOW(),
+                    manual_payout_clearance_reason = :review_notes,
+                    updated_at = NOW()
+                WHERE id = :unit_id
+                RETURNING id, project_id, tree_id, order_id, manual_payout_clearance, manual_payout_clearance_by, manual_payout_clearance_at, manual_payout_clearance_reason
+                """
+            ),
+            {
+                "unit_id": int(unit_id),
+                "reviewer_name": reviewer_name,
+                "review_notes": review_notes,
+            },
+        ).mappings().first()
+        action_name = "manual_agent_payout_cleared"
+    else:
+        updated = db.execute(
+            text(
+                """
+                UPDATE green_sponsorship_units
+                SET manual_payout_clearance = FALSE,
+                    manual_payout_clearance_by = :reviewer_name,
+                    manual_payout_clearance_at = NOW(),
+                    manual_payout_clearance_reason = :review_notes,
+                    updated_at = NOW()
+                WHERE id = :unit_id
+                RETURNING id, project_id, tree_id, order_id, manual_payout_clearance, manual_payout_clearance_by, manual_payout_clearance_at, manual_payout_clearance_reason
+                """
+            ),
+            {
+                "unit_id": int(unit_id),
+                "reviewer_name": reviewer_name,
+                "review_notes": review_notes,
+            },
+        ).mappings().first()
+        action_name = "manual_agent_payout_clearance_revoked"
+    if not updated:
+        raise HTTPException(status_code=500, detail="Could not update payout clearance")
+    _log_audit_event(
+        db,
+        project_id=int(updated.get("project_id") or row.get("project_id") or 0),
+        entity_type="sponsorship_unit",
+        entity_id=int(updated.get("id") or unit_id),
+        action=action_name,
+        actor=reviewer_name,
+        details={
+            "tree_id": int(updated.get("tree_id") or row.get("tree_id") or 0) or None,
+            "order_id": int(updated.get("order_id") or row.get("order_id") or 0) or None,
+            "order_uid": str(row.get("order_uid") or "").strip() or None,
+            "payment_status": _normalize_sponsor_payment_status(row.get("payment_status")) or None,
+            "order_status": _normalize_sponsor_order_status(row.get("order_status")) or None,
+            "review_notes": review_notes,
+        },
+    )
+    db.commit()
+    return {
+        "ok": True,
+        "unit_id": int(updated.get("id") or unit_id),
+        "project_id": int(updated.get("project_id") or row.get("project_id") or 0),
+        "tree_id": int(updated.get("tree_id") or row.get("tree_id") or 0) or None,
+        "manual_payout_clearance": bool(updated.get("manual_payout_clearance")),
+        "manual_payout_clearance_by": str(updated.get("manual_payout_clearance_by") or "").strip() or None,
+        "manual_payout_clearance_at": updated.get("manual_payout_clearance_at"),
+        "manual_payout_clearance_reason": str(updated.get("manual_payout_clearance_reason") or "").strip() or None,
+    }
 
 
 @router.patch("/admin/sponsor-agent-payouts/{request_id}")
