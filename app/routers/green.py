@@ -468,6 +468,13 @@ class SponsorAgentPayoutReconcilePayload(BaseModel):
     review_notes: str | None = None
 
 
+class SponsorAgentManualPayoutPayload(BaseModel):
+    project_id: int
+    user_id: int
+    reviewer_name: str | None = None
+    review_notes: str | None = None
+
+
 class SponsorProfileSettingsPayload(BaseModel):
     entity_category: str | None = None
     leaderboard_visibility: str | None = None
@@ -5881,6 +5888,25 @@ def ensure_green_tables(db: Session):
             updated_at TIMESTAMP DEFAULT NOW()
         )
     """))
+    db.execute(text("""
+        CREATE TABLE IF NOT EXISTS green_sponsor_agent_manual_payout_items (
+            id SERIAL PRIMARY KEY,
+            project_id INTEGER NOT NULL REFERENCES tree_projects(id) ON DELETE CASCADE,
+            user_id INTEGER NOT NULL REFERENCES green_users(id) ON DELETE CASCADE,
+            organization_id INTEGER REFERENCES green_organizations(id) ON DELETE SET NULL,
+            tree_id INTEGER REFERENCES trees(id) ON DELETE SET NULL,
+            work_type TEXT NOT NULL DEFAULT 'planting',
+            currency TEXT NOT NULL DEFAULT 'NGN',
+            amount NUMERIC NOT NULL DEFAULT 0,
+            status TEXT NOT NULL DEFAULT 'active',
+            review_notes TEXT,
+            reviewed_by TEXT,
+            reviewed_at TIMESTAMP,
+            revoked_at TIMESTAMP,
+            created_at TIMESTAMP DEFAULT NOW(),
+            updated_at TIMESTAMP DEFAULT NOW()
+        )
+    """))
     try:
         db.execute(text("ALTER TABLE green_organizations ADD COLUMN IF NOT EXISTS organization_type TEXT NOT NULL DEFAULT 'standard'"))
         db.execute(text("ALTER TABLE green_sponsor_accounts ADD COLUMN IF NOT EXISTS entity_category TEXT NOT NULL DEFAULT 'individual'"))
@@ -5970,6 +5996,18 @@ def ensure_green_tables(db: Session):
         db.execute(text("ALTER TABLE green_sponsor_agent_payout_requests ADD COLUMN IF NOT EXISTS transfer_processed_at TIMESTAMP"))
         db.execute(text("ALTER TABLE green_sponsor_agent_payout_requests ADD COLUMN IF NOT EXISTS paid_at TIMESTAMP"))
         db.execute(text("ALTER TABLE green_sponsor_agent_payout_requests ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW()"))
+        db.execute(text("ALTER TABLE green_sponsor_agent_manual_payout_items ADD COLUMN IF NOT EXISTS organization_id INTEGER"))
+        db.execute(text("ALTER TABLE green_sponsor_agent_manual_payout_items ADD COLUMN IF NOT EXISTS tree_id INTEGER"))
+        db.execute(text("ALTER TABLE green_sponsor_agent_manual_payout_items ADD COLUMN IF NOT EXISTS work_type TEXT NOT NULL DEFAULT 'planting'"))
+        db.execute(text("ALTER TABLE green_sponsor_agent_manual_payout_items ADD COLUMN IF NOT EXISTS currency TEXT NOT NULL DEFAULT 'NGN'"))
+        db.execute(text("ALTER TABLE green_sponsor_agent_manual_payout_items ADD COLUMN IF NOT EXISTS amount NUMERIC NOT NULL DEFAULT 0"))
+        db.execute(text("ALTER TABLE green_sponsor_agent_manual_payout_items ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'active'"))
+        db.execute(text("ALTER TABLE green_sponsor_agent_manual_payout_items ADD COLUMN IF NOT EXISTS review_notes TEXT"))
+        db.execute(text("ALTER TABLE green_sponsor_agent_manual_payout_items ADD COLUMN IF NOT EXISTS reviewed_by TEXT"))
+        db.execute(text("ALTER TABLE green_sponsor_agent_manual_payout_items ADD COLUMN IF NOT EXISTS reviewed_at TIMESTAMP"))
+        db.execute(text("ALTER TABLE green_sponsor_agent_manual_payout_items ADD COLUMN IF NOT EXISTS revoked_at TIMESTAMP"))
+        db.execute(text("ALTER TABLE green_sponsor_agent_manual_payout_items ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT NOW()"))
+        db.execute(text("ALTER TABLE green_sponsor_agent_manual_payout_items ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW()"))
     except Exception:
         db.rollback()
     db.execute(text("""
@@ -9751,6 +9789,15 @@ def _build_sponsor_agent_earning_rows(
     except Exception:
         _rollback_quietly(db)
         maintenance_rows = []
+    try:
+        manual_rows = _list_sponsor_agent_manual_payout_rows(
+            db,
+            project_ids=project_ids,
+            user_row=user_row,
+        )
+    except Exception:
+        _rollback_quietly(db)
+        manual_rows = []
     earnings: list[dict] = []
     for row in planting_rows:
         project_id = int(row.get("project_id") or 0)
@@ -9813,6 +9860,45 @@ def _build_sponsor_agent_earning_rows(
                 "sponsor_organization_name": str(row.get("sponsor_organization_name") or "").strip() or None,
             }
         )
+    for row in manual_rows:
+        project_id = int(row.get("project_id") or 0)
+        project_info = project_meta.get(project_id, {})
+        work_type = _normalize_name(row.get("work_type")) or "planting"
+        amount = round(float(row.get("amount") or 0), 2)
+        if amount <= 0:
+            continue
+        earnings.append(
+            {
+                "earning_key": f"manual-{work_type}-{int(row.get('id') or 0)}",
+                "work_type": work_type,
+                "project_id": project_id,
+                "project_name": project_info.get("project_name") or f"Project #{project_id}",
+                "currency": _normalize_currency_code(row.get("currency"), project_info.get("currency") or SPONSOR_AGENT_ACCOUNT_CURRENCY),
+                "amount": amount,
+                "tree_id": int(row.get("tree_id") or 0) or None,
+                "task_id": None,
+                "unit_id": None,
+                "order_id": None,
+                "order_uid": None,
+                "project_tree_no": int(row.get("project_tree_no") or 0) or None,
+                "tree_label": (
+                    f"Tree {int(row.get('project_tree_no') or 0)}"
+                    if int(row.get("project_tree_no") or 0) > 0
+                    else f"Tree #{int(row.get('tree_id') or 0)}"
+                    if int(row.get("tree_id") or 0) > 0
+                    else f"Manual {work_type.title()} Clearance"
+                ),
+                "species": str(row.get("species") or "").strip() or None,
+                "actor_name": str(row.get("created_by") or "").strip() or None,
+                "task_label": "Manual payout clearance",
+                "earned_at": row.get("reviewed_at") or row.get("created_at"),
+                "sponsor_name": None,
+                "sponsor_organization_name": None,
+                "manual_payout_exception": True,
+                "review_notes": str(row.get("review_notes") or "").strip() or None,
+                "reviewed_by": str(row.get("reviewed_by") or "").strip() or None,
+            }
+        )
     earnings.sort(key=lambda item: str(item.get("earned_at") or ""), reverse=True)
     return earnings
 
@@ -9848,6 +9934,7 @@ def _build_sponsor_agent_reconciliation_snapshot(
         "unlinked_approved_count": 0,
         "unpaid_linked_count": 0,
         "approved_beyond_assignment_count": 0,
+        "manual_payout_exception_count": 0,
     }
     if normalized_project_id <= 0 or (normalized_user_id is None and not aliases):
         return empty_payload
@@ -9949,6 +10036,22 @@ def _build_sponsor_agent_reconciliation_snapshot(
         user_id=normalized_user_id,
         aliases=aliases,
     )
+    manual_payout_exception_count = db.execute(
+        text(
+            """
+            SELECT COUNT(*)
+            FROM green_sponsor_agent_manual_payout_items
+            WHERE project_id = :project_id
+              AND user_id = :user_id
+              AND LOWER(COALESCE(status, 'active')) = 'active'
+              AND LOWER(COALESCE(work_type, 'planting')) = 'planting'
+            """
+        ),
+        {
+            "project_id": normalized_project_id,
+            "user_id": normalized_user_id,
+        },
+    ).scalar()
 
     project_earnings = [
         dict(item)
@@ -9970,6 +10073,7 @@ def _build_sponsor_agent_reconciliation_snapshot(
     active_order_count = int(order_stats.get("active_order_count") or 0) if order_stats else 0
     remaining_target_trees = max(assigned_target_trees - confirmed_planted_count_value, 0)
     linked_count_value = int(linked_count or 0)
+    manual_payout_exception_count_value = int(manual_payout_exception_count or 0)
 
     return {
         "project_id": normalized_project_id,
@@ -9984,9 +10088,10 @@ def _build_sponsor_agent_reconciliation_snapshot(
         "payable_requested_count": int(payable_requested_count),
         "payable_paid_count": int(payable_paid_count),
         "unreviewed_count": max(saved_count_value - approved_count_value, 0),
-        "unlinked_approved_count": max(approved_count_value - linked_count_value, 0),
+        "unlinked_approved_count": max(approved_count_value - linked_count_value - manual_payout_exception_count_value, 0),
         "unpaid_linked_count": max(linked_count_value - payable_count, 0),
-        "approved_beyond_assignment_count": max(approved_count_value - assigned_target_trees, 0),
+        "approved_beyond_assignment_count": max(approved_count_value - assigned_target_trees - manual_payout_exception_count_value, 0),
+        "manual_payout_exception_count": manual_payout_exception_count_value,
     }
 
 
@@ -10098,6 +10203,233 @@ def _list_sponsor_agent_payout_clearance_blockers(
             }
         )
     return payload
+
+
+def _list_sponsor_agent_manual_payout_rows(
+    db: Session,
+    *,
+    project_ids: list[int],
+    user_row: dict,
+) -> list[dict]:
+    normalized_project_ids = [int(item) for item in project_ids if int(item or 0) > 0]
+    normalized_user_id = int(user_row.get("id") or 0) or None
+    if not normalized_project_ids or normalized_user_id is None:
+        return []
+    return db.execute(
+        text(
+            """
+            SELECT
+                m.id,
+                m.project_id,
+                m.user_id,
+                m.organization_id,
+                m.tree_id,
+                m.work_type,
+                m.currency,
+                m.amount,
+                m.status,
+                m.review_notes,
+                m.reviewed_by,
+                m.reviewed_at,
+                m.created_at,
+                t.project_tree_no,
+                t.species,
+                t.created_by,
+                t.planting_date
+            FROM green_sponsor_agent_manual_payout_items m
+            LEFT JOIN trees t ON t.id = m.tree_id
+            WHERE m.user_id = :user_id
+              AND m.project_id IN :project_ids
+              AND LOWER(COALESCE(m.status, 'active')) = 'active'
+            ORDER BY COALESCE(m.reviewed_at, m.created_at, NOW()) DESC, m.id DESC
+            """
+        ).bindparams(bindparam("project_ids", expanding=True)),
+        {
+            "user_id": normalized_user_id,
+            "project_ids": normalized_project_ids,
+        },
+    ).mappings().all()
+
+
+def _find_next_manual_payout_tree_candidate(
+    db: Session,
+    *,
+    project_id: int,
+    user_row: dict,
+) -> dict | None:
+    normalized_project_id = int(project_id or 0)
+    aliases = [
+        str(item or "").strip().lower()
+        for item in (_build_sponsor_agent_aliases(user_row) or [])
+        if str(item or "").strip()
+    ]
+    if normalized_project_id <= 0 or not aliases:
+        return None
+    return db.execute(
+        text(
+            """
+            SELECT DISTINCT
+                t.id AS tree_id,
+                t.project_tree_no,
+                t.species,
+                COALESCE(t.planting_date::timestamp, t.created_at, NOW()) AS planted_rank
+            FROM trees t
+            JOIN tree_tasks tt ON tt.tree_id = t.id
+            WHERE t.project_id = :project_id
+              AND LOWER(COALESCE(t.tree_origin, 'new_planting')) = 'new_planting'
+              AND COALESCE(t.count_in_planting_kpis, TRUE) = TRUE
+              AND LOWER(REPLACE(REPLACE(COALESCE(tt.task_type, ''), '-', '_'), ' ', '_')) = 'planting'
+              AND LOWER(REPLACE(REPLACE(COALESCE(tt.review_state, ''), '-', '_'), ' ', '_')) = 'approved'
+              AND (
+                    LOWER(REGEXP_REPLACE(TRIM(COALESCE(t.created_by, '')), '\\s+', ' ', 'g')) IN :aliases
+                 OR LOWER(REGEXP_REPLACE(TRIM(COALESCE(tt.assignee_name, '')), '\\s+', ' ', 'g')) IN :aliases
+              )
+              AND NOT EXISTS (
+                    SELECT 1
+                    FROM green_sponsorship_units u
+                    WHERE u.project_id = :project_id
+                      AND u.tree_id = t.id
+                      AND LOWER(COALESCE(u.sponsorship_status, '')) IN ('linked', 'active', 'replaced')
+              )
+              AND NOT EXISTS (
+                    SELECT 1
+                    FROM green_sponsor_agent_manual_payout_items m
+                    WHERE m.project_id = :project_id
+                      AND m.tree_id = t.id
+                      AND LOWER(COALESCE(m.status, 'active')) = 'active'
+                      AND LOWER(COALESCE(m.work_type, 'planting')) = 'planting'
+              )
+            ORDER BY COALESCE(t.planting_date::timestamp, t.created_at, NOW()) ASC, t.id ASC
+            LIMIT 1
+            """
+        ).bindparams(bindparam("aliases", expanding=True)),
+        {
+            "project_id": normalized_project_id,
+            "aliases": aliases or [""],
+        },
+    ).mappings().first()
+
+
+def _grant_manual_sponsor_agent_payout_exception(
+    db: Session,
+    *,
+    project_id: int,
+    user_row: dict,
+    reviewer_name: str | None = None,
+    review_notes: str | None = None,
+) -> dict:
+    normalized_project_id = int(project_id or 0)
+    normalized_user_id = int(user_row.get("id") or 0) or None
+    if normalized_project_id <= 0 or normalized_user_id is None:
+        raise HTTPException(status_code=400, detail="Project and agent are required for manual payout clearance")
+
+    project_row = db.execute(
+        text(
+            """
+            SELECT id, name, sponsor_currency, sponsor_agent_planting_fee, organization_id
+            FROM tree_projects
+            WHERE id = :project_id
+            LIMIT 1
+            """
+        ),
+        {"project_id": normalized_project_id},
+    ).mappings().first()
+    if not project_row:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    candidate = _find_next_manual_payout_tree_candidate(db, project_id=normalized_project_id, user_row=user_row)
+    if not candidate:
+        raise HTTPException(
+            status_code=400,
+            detail="No extra approved unlinked tree is available for manual payout clearance",
+        )
+
+    existing = db.execute(
+        text(
+            """
+            SELECT id
+            FROM green_sponsor_agent_manual_payout_items
+            WHERE project_id = :project_id
+              AND user_id = :user_id
+              AND tree_id = :tree_id
+              AND LOWER(COALESCE(status, 'active')) = 'active'
+              AND LOWER(COALESCE(work_type, 'planting')) = 'planting'
+            LIMIT 1
+            """
+        ),
+        {
+            "project_id": normalized_project_id,
+            "user_id": normalized_user_id,
+            "tree_id": int(candidate.get("tree_id") or 0),
+        },
+    ).mappings().first()
+    if existing:
+        raise HTTPException(status_code=400, detail="This extra approved tree is already cleared manually for payout")
+
+    amount = round(float(project_row.get("sponsor_agent_planting_fee") or 0), 2)
+    if amount <= 0:
+        raise HTTPException(status_code=400, detail="Project planting fee is not configured for sponsor-agent payout")
+
+    inserted = db.execute(
+        text(
+            """
+            INSERT INTO green_sponsor_agent_manual_payout_items (
+                project_id, user_id, organization_id, tree_id, work_type, currency, amount,
+                status, review_notes, reviewed_by, reviewed_at
+            )
+            VALUES (
+                :project_id, :user_id, :organization_id, :tree_id, 'planting', :currency, :amount,
+                'active', :review_notes, :reviewed_by, NOW()
+            )
+            RETURNING id, project_id, user_id, tree_id, currency, amount, status, review_notes, reviewed_by, reviewed_at, created_at
+            """
+        ),
+        {
+            "project_id": normalized_project_id,
+            "user_id": normalized_user_id,
+            "organization_id": int(user_row.get("organization_id") or 0) or int(project_row.get("organization_id") or 0) or None,
+            "tree_id": int(candidate.get("tree_id") or 0),
+            "currency": _normalize_currency_code(project_row.get("sponsor_currency"), SPONSOR_AGENT_ACCOUNT_CURRENCY),
+            "amount": amount,
+            "review_notes": _clean_text(review_notes, 500),
+            "reviewed_by": _clean_text(reviewer_name, 120) or "super_admin",
+        },
+    ).mappings().first()
+    if not inserted:
+        raise HTTPException(status_code=500, detail="Could not create manual payout clearance")
+
+    _log_audit_event(
+        db,
+        project_id=normalized_project_id,
+        entity_type="sponsor_agent_manual_payout",
+        entity_id=int(inserted.get("id") or 0),
+        action="manual_extra_tree_cleared_for_payout",
+        actor=_clean_text(reviewer_name, 120) or "super_admin",
+        details={
+            "user_id": normalized_user_id,
+            "tree_id": int(candidate.get("tree_id") or 0),
+            "tree_label": (
+                f"Tree {int(candidate.get('project_tree_no') or 0)}"
+                if int(candidate.get("project_tree_no") or 0) > 0
+                else f"Tree #{int(candidate.get('tree_id') or 0)}"
+            ),
+            "species": str(candidate.get("species") or "").strip() or None,
+            "amount": amount,
+            "currency": _normalize_currency_code(project_row.get("sponsor_currency"), SPONSOR_AGENT_ACCOUNT_CURRENCY),
+            "review_notes": _clean_text(review_notes, 500),
+        },
+    )
+    return {
+        "manual_item_id": int(inserted.get("id") or 0),
+        "tree_id": int(candidate.get("tree_id") or 0),
+        "tree_label": (
+            f"Tree {int(candidate.get('project_tree_no') or 0)}"
+            if int(candidate.get("project_tree_no") or 0) > 0
+            else f"Tree #{int(candidate.get('tree_id') or 0)}"
+        ),
+        "amount": amount,
+        "currency": _normalize_currency_code(project_row.get("sponsor_currency"), SPONSOR_AGENT_ACCOUNT_CURRENCY),
+    }
 
 
 def _auto_reconcile_sponsor_agent_units_to_approved_trees(
@@ -20045,6 +20377,7 @@ def list_admin_sponsor_agent_payouts(
         "unlinked_approved_count": 0,
         "unpaid_linked_count": 0,
         "approved_beyond_assignment_count": 0,
+        "manual_payout_exception_count": 0,
     }
     requests_by_id: dict[int, dict] = {}
     for agent_id in agent_ids:
@@ -20124,6 +20457,7 @@ def list_admin_sponsor_agent_payouts(
             "unlinked_approved_count",
             "unpaid_linked_count",
             "approved_beyond_assignment_count",
+            "manual_payout_exception_count",
         ]:
             reconciliation_totals[field_name] = int(reconciliation_totals.get(field_name) or 0) + int(reconciliation.get(field_name) or 0)
         agents.append(dashboard)
@@ -20287,6 +20621,27 @@ def reconcile_admin_sponsor_agent_payouts(
         raise HTTPException(status_code=400, detail="Project and agent are required for payout reconciliation")
     user_row = _get_green_user_for_sponsor_agent(db, user_id=normalized_user_id, organization_id=None)
     result = _auto_reconcile_sponsor_agent_units_to_approved_trees(
+        db,
+        project_id=normalized_project_id,
+        user_row=user_row,
+        reviewer_name=payload.reviewer_name,
+        review_notes=payload.review_notes,
+    )
+    db.commit()
+    return {"ok": True, **result}
+
+
+@router.post("/admin/sponsor-agent-payout-manual-clear")
+def manually_clear_admin_sponsor_agent_extra_tree(
+    payload: SponsorAgentManualPayoutPayload,
+    db: Session = Depends(get_db),
+):
+    normalized_project_id = int(payload.project_id or 0)
+    normalized_user_id = int(payload.user_id or 0)
+    if normalized_project_id <= 0 or normalized_user_id <= 0:
+        raise HTTPException(status_code=400, detail="Project and agent are required for manual payout clearance")
+    user_row = _get_green_user_for_sponsor_agent(db, user_id=normalized_user_id, organization_id=None)
+    result = _grant_manual_sponsor_agent_payout_exception(
         db,
         project_id=normalized_project_id,
         user_row=user_row,
