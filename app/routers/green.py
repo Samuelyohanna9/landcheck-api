@@ -9661,6 +9661,8 @@ def _build_sponsor_agent_earning_rows(
             WHERE u.project_id IN :project_ids
               AND u.tree_id IS NOT NULL
               AND (
+                    COALESCE(u.manual_payout_clearance, FALSE) = TRUE
+                 OR
                     LOWER(COALESCE(o.payment_status, '')) IN ('verified', 'paid')
                  OR LOWER(COALESCE(o.order_status, '')) IN ('paid', 'allocated', 'completed')
                  OR o.payment_verified_at IS NOT NULL
