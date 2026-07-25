@@ -461,6 +461,13 @@ class SponsorAgentPayoutClearancePayload(BaseModel):
     review_notes: str | None = None
 
 
+class SponsorAgentPayoutReconcilePayload(BaseModel):
+    project_id: int
+    user_id: int
+    reviewer_name: str | None = None
+    review_notes: str | None = None
+
+
 class SponsorProfileSettingsPayload(BaseModel):
     entity_category: str | None = None
     leaderboard_visibility: str | None = None
@@ -10091,6 +10098,172 @@ def _list_sponsor_agent_payout_clearance_blockers(
             }
         )
     return payload
+
+
+def _auto_reconcile_sponsor_agent_units_to_approved_trees(
+    db: Session,
+    *,
+    project_id: int,
+    user_row: dict,
+    reviewer_name: str | None = None,
+    review_notes: str | None = None,
+) -> dict:
+    normalized_project_id = int(project_id or 0)
+    normalized_user_id = int(user_row.get("id") or 0) or None
+    aliases = [
+        str(item or "").strip().lower()
+        for item in (_build_sponsor_agent_aliases(user_row) or [])
+        if str(item or "").strip()
+    ]
+    if normalized_project_id <= 0 or (normalized_user_id is None and not aliases):
+        return {"relinked_units": 0, "candidate_units": 0, "available_trees": 0, "remaining_gap": 0}
+
+    linked_rows = db.execute(
+        text(
+            """
+            SELECT
+                u.id AS unit_id,
+                u.tree_id,
+                u.tree_project_no,
+                COALESCE(u.linked_at, u.updated_at, u.created_at) AS linked_rank,
+                LOWER(COALESCE(t.tree_origin, 'new_planting')) AS tree_origin,
+                COALESCE(t.count_in_planting_kpis, TRUE) AS count_in_planting_kpis,
+                CASE
+                    WHEN EXISTS (
+                        SELECT 1
+                        FROM tree_tasks tt
+                        WHERE tt.tree_id = t.id
+                          AND LOWER(REPLACE(REPLACE(COALESCE(tt.task_type, ''), '-', '_'), ' ', '_')) = 'planting'
+                          AND LOWER(REPLACE(REPLACE(COALESCE(tt.review_state, ''), '-', '_'), ' ', '_')) = 'approved'
+                    )
+                    THEN TRUE
+                    ELSE FALSE
+                END AS planting_approved
+            FROM green_sponsorship_units u
+            LEFT JOIN trees t ON t.id = u.tree_id
+            WHERE u.project_id = :project_id
+              AND u.tree_id IS NOT NULL
+              AND LOWER(COALESCE(u.sponsorship_status, '')) IN ('linked', 'active', 'replaced')
+              AND (
+                    (:user_id IS NOT NULL AND COALESCE(u.assigned_user_id, 0) = :user_id)
+                 OR LOWER(REGEXP_REPLACE(TRIM(COALESCE(u.assigned_assignee_name, '')), '\\s+', ' ', 'g')) IN :aliases
+                 OR LOWER(REGEXP_REPLACE(TRIM(COALESCE(t.created_by, '')), '\\s+', ' ', 'g')) IN :aliases
+              )
+            ORDER BY COALESCE(u.linked_at, u.updated_at, u.created_at) ASC, u.id ASC
+            """
+        ).bindparams(bindparam("aliases", expanding=True)),
+        {
+            "project_id": normalized_project_id,
+            "user_id": normalized_user_id,
+            "aliases": aliases or [""],
+        },
+    ).mappings().all()
+
+    candidate_units: list[dict] = []
+    seen_tree_ids: set[int] = set()
+    for row in linked_rows:
+        tree_id = int(row.get("tree_id") or 0) or None
+        if tree_id is None:
+            continue
+        tree_origin = str(row.get("tree_origin") or "").strip().lower() or "new_planting"
+        count_in_kpis = bool(row.get("count_in_planting_kpis"))
+        planting_approved = bool(row.get("planting_approved"))
+        duplicate_tree_link = tree_id in seen_tree_ids
+        if not duplicate_tree_link:
+            seen_tree_ids.add(tree_id)
+        if duplicate_tree_link or tree_origin != "new_planting" or not count_in_kpis or not planting_approved:
+            candidate_units.append(
+                {
+                    "unit_id": int(row.get("unit_id") or 0),
+                    "tree_id": tree_id,
+                    "duplicate_tree_link": duplicate_tree_link,
+                    "tree_origin": tree_origin,
+                    "count_in_planting_kpis": count_in_kpis,
+                    "planting_approved": planting_approved,
+                }
+            )
+
+    approved_unlinked_trees = db.execute(
+        text(
+            """
+            SELECT DISTINCT
+                t.id AS tree_id,
+                t.project_tree_no,
+                COALESCE(t.planting_date::timestamp, t.created_at, NOW()) AS planted_rank
+            FROM trees t
+            JOIN tree_tasks tt ON tt.tree_id = t.id
+            WHERE t.project_id = :project_id
+              AND LOWER(COALESCE(t.tree_origin, 'new_planting')) = 'new_planting'
+              AND COALESCE(t.count_in_planting_kpis, TRUE) = TRUE
+              AND LOWER(REPLACE(REPLACE(COALESCE(tt.task_type, ''), '-', '_'), ' ', '_')) = 'planting'
+              AND LOWER(REPLACE(REPLACE(COALESCE(tt.review_state, ''), '-', '_'), ' ', '_')) = 'approved'
+              AND (
+                    LOWER(REGEXP_REPLACE(TRIM(COALESCE(t.created_by, '')), '\\s+', ' ', 'g')) IN :aliases
+                 OR LOWER(REGEXP_REPLACE(TRIM(COALESCE(tt.assignee_name, '')), '\\s+', ' ', 'g')) IN :aliases
+              )
+              AND NOT EXISTS (
+                    SELECT 1
+                    FROM green_sponsorship_units u
+                    WHERE u.project_id = :project_id
+                      AND u.tree_id = t.id
+                      AND LOWER(COALESCE(u.sponsorship_status, '')) IN ('linked', 'active', 'replaced')
+              )
+            ORDER BY COALESCE(t.planting_date::timestamp, t.created_at, NOW()) ASC, t.id ASC
+            """
+        ).bindparams(bindparam("aliases", expanding=True)),
+        {
+            "project_id": normalized_project_id,
+            "aliases": aliases or [""],
+        },
+    ).mappings().all()
+
+    relink_pairs = list(zip(candidate_units, approved_unlinked_trees))
+    relinked_units: list[int] = []
+    for unit_row, tree_row in relink_pairs:
+        updated = db.execute(
+            text(
+                """
+                UPDATE green_sponsorship_units
+                SET tree_id = :tree_id,
+                    tree_project_no = :tree_project_no,
+                    linked_at = NOW(),
+                    updated_at = NOW()
+                WHERE id = :unit_id
+                RETURNING id
+                """
+            ),
+            {
+                "unit_id": int(unit_row["unit_id"]),
+                "tree_id": int(tree_row["tree_id"]),
+                "tree_project_no": int(tree_row.get("project_tree_no") or 0) or None,
+            },
+        ).mappings().first()
+        if updated:
+            relinked_units.append(int(updated["id"]))
+
+    if relinked_units:
+        _log_audit_event(
+            db,
+            project_id=normalized_project_id,
+            entity_type="sponsor_agent_reconciliation",
+            entity_id=normalized_user_id or 0,
+            action="auto_match_approved_trees",
+            actor=_clean_text(reviewer_name, 120) or "super_admin",
+            details={
+                "user_id": normalized_user_id,
+                "relinked_units": relinked_units,
+                "candidate_units": len(candidate_units),
+                "available_trees": len(approved_unlinked_trees),
+                "review_notes": _clean_text(review_notes, 500),
+            },
+        )
+
+    return {
+        "relinked_units": len(relinked_units),
+        "candidate_units": len(candidate_units),
+        "available_trees": len(approved_unlinked_trees),
+        "remaining_gap": max(len(candidate_units) - len(relinked_units), 0),
+    }
 
 
 def _build_sponsor_agent_dashboard(
@@ -20101,6 +20274,27 @@ def review_admin_sponsor_agent_payout_clearance(
         "manual_payout_clearance_at": updated.get("manual_payout_clearance_at"),
         "manual_payout_clearance_reason": str(updated.get("manual_payout_clearance_reason") or "").strip() or None,
     }
+
+
+@router.post("/admin/sponsor-agent-payout-reconcile")
+def reconcile_admin_sponsor_agent_payouts(
+    payload: SponsorAgentPayoutReconcilePayload,
+    db: Session = Depends(get_db),
+):
+    normalized_project_id = int(payload.project_id or 0)
+    normalized_user_id = int(payload.user_id or 0)
+    if normalized_project_id <= 0 or normalized_user_id <= 0:
+        raise HTTPException(status_code=400, detail="Project and agent are required for payout reconciliation")
+    user_row = _get_green_user_for_sponsor_agent(db, user_id=normalized_user_id, organization_id=None)
+    result = _auto_reconcile_sponsor_agent_units_to_approved_trees(
+        db,
+        project_id=normalized_project_id,
+        user_row=user_row,
+        reviewer_name=payload.reviewer_name,
+        review_notes=payload.review_notes,
+    )
+    db.commit()
+    return {"ok": True, **result}
 
 
 @router.patch("/admin/sponsor-agent-payouts/{request_id}")
