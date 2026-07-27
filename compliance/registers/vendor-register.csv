@@ -1,0 +1,4 @@
+vendor_id,vendor_name,service_category,owner,criticality,data_shared,security_review_date,status,notes
+VND-001,Hetzner,Hosting,Platform Owner,High,Application and database hosting,,,Production hosting provider
+VND-002,Cloudflare R2,Object Storage,Platform Owner,High,Field and sponsor photos,,,Public/private storage review needed
+VND-003,Flutterwave,Payments,Finance Owner,High,Payment metadata,,,Webhook and settlement controls

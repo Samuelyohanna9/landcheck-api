@@ -1,0 +1,2 @@
+incident_id,opened_at,severity,category,summary,owner,status,contained_at,resolved_at,post_incident_review,notes
+INC-001,,,,,,,,,,

@@ -163,6 +163,65 @@ SPONSOR_AGENT_MIN_PAYOUT_NAIRA = 8000
 SPONSOR_AGENT_PAYOUT_STATUS_VALUES = {"requested", "approved", "processing", "paid", "rejected", "failed", "cancelled"}
 SPONSOR_AGENT_DEFAULT_PLANTING_RATIO = 0.30
 SPONSOR_AGENT_DEFAULT_MAINTENANCE_RATIO = 0.10
+COMPLIANCE_CHECKLIST_STATUS_VALUES = {"pending", "completed", "skipped"}
+MONTHLY_COMPLIANCE_CHECKLIST_DEFINITIONS = (
+    {
+        "checklist_key": "security_maintenance_run",
+        "category": "Platform hygiene",
+        "title": "Run security maintenance",
+        "description": "Run retention cleanup for expired sessions and aged activity logs from the live production workspace.",
+        "automation_level": "automated",
+    },
+    {
+        "checklist_key": "privileged_access_review",
+        "category": "Access control",
+        "title": "Review privileged access",
+        "description": "Confirm super admin, partner admin, and privileged field roles are still valid for the month.",
+        "automation_level": "human_review",
+    },
+    {
+        "checklist_key": "audit_log_review",
+        "category": "Monitoring",
+        "title": "Review audit and activity logs",
+        "description": "Inspect high-risk operational events, payment actions, and authentication activity across the platform.",
+        "automation_level": "human_review",
+    },
+    {
+        "checklist_key": "vulnerability_review",
+        "category": "Vulnerability management",
+        "title": "Review vulnerabilities and patch status",
+        "description": "Check dependency exposure, infrastructure patching, and unresolved security issues for the current month.",
+        "automation_level": "human_review",
+    },
+    {
+        "checklist_key": "backup_restore_test",
+        "category": "Business continuity",
+        "title": "Confirm backup and restore test",
+        "description": "Record the latest successful restore validation for database and operational evidence backups.",
+        "automation_level": "human_review",
+    },
+    {
+        "checklist_key": "vendor_review",
+        "category": "Third-party risk",
+        "title": "Review vendors and integrations",
+        "description": "Confirm critical vendors, gateways, storage, and email providers remain approved and operational.",
+        "automation_level": "human_review",
+    },
+    {
+        "checklist_key": "incident_readiness_review",
+        "category": "Incident response",
+        "title": "Confirm incident readiness",
+        "description": "Verify response contacts, escalation runbooks, and emergency access instructions remain current.",
+        "automation_level": "human_review",
+    },
+    {
+        "checklist_key": "management_review",
+        "category": "Governance",
+        "title": "Record management review",
+        "description": "Document leadership review of security posture, risk actions, and monthly control completion.",
+        "automation_level": "human_review",
+    },
+)
 FLUTTERWAVE_API_BASE_URL = str(os.getenv("FLUTTERWAVE_API_BASE_URL") or "https://api.flutterwave.com/v3").strip().rstrip("/")
 LANDCHECK_API_PUBLIC_URL = str(os.getenv("LANDCHECK_API_PUBLIC_URL") or "").strip().rstrip("/")
 LANDCHECK_MOBILE_SCHEME = str(os.getenv("LANDCHECK_MOBILE_SCHEME") or "landcheckmobile").strip() or "landcheckmobile"
@@ -492,6 +551,18 @@ class SponsorAgentManualPayoutPayload(BaseModel):
     user_id: int
     reviewer_name: str | None = None
     review_notes: str | None = None
+
+
+class ComplianceChecklistEnsurePayload(BaseModel):
+    year: int | None = None
+    month: int | None = None
+
+
+class ComplianceChecklistUpdatePayload(BaseModel):
+    status: str | None = None
+    owner_name: str | None = None
+    evidence_location: str | None = None
+    notes: str | None = None
 
 
 class SponsorProfileSettingsPayload(BaseModel):
@@ -983,9 +1054,129 @@ def admin_security_posture(request: Request, db: Session = Depends(get_db)):
 
 @router.post("/admin/security/maintenance")
 def admin_security_maintenance(request: Request, db: Session = Depends(get_db)):
-    require_super_admin_request(db, request)
+    session = require_super_admin_request(db, request)
     cleanup = cleanup_security_artifacts(db)
+    _mark_security_maintenance_checklist_completed(db, session, cleanup)
     return {"ok": True, "cleanup": cleanup, "posture": get_security_posture(db)}
+
+
+@router.get("/admin/compliance/dashboard")
+def admin_compliance_dashboard(
+    request: Request,
+    year: int | None = Query(None),
+    month: int | None = Query(None),
+    db: Session = Depends(get_db),
+):
+    require_super_admin_request(db, request)
+    period_year, period_month = _resolve_compliance_period(year, month)
+    _ensure_compliance_checklist_for_period(db, period_year, period_month)
+    return {"ok": True, "dashboard": _build_compliance_dashboard(db, period_year, period_month)}
+
+
+@router.post("/admin/compliance/checklist/ensure")
+def admin_compliance_checklist_ensure(
+    payload: ComplianceChecklistEnsurePayload,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    session = require_super_admin_request(db, request)
+    period_year, period_month = _resolve_compliance_period(payload.year, payload.month)
+    created = _ensure_compliance_checklist_for_period(db, period_year, period_month)
+    _log_activity(
+        db,
+        "backend_api",
+        "compliance_checklist_ensured",
+        f"Compliance checklist ensured for {period_year}-{period_month:02d}",
+        _compliance_actor_name(session),
+        {
+            "period_year": period_year,
+            "period_month": period_month,
+            "created_items": created,
+        },
+    )
+    return {
+        "ok": True,
+        "created": int(created),
+        "dashboard": _build_compliance_dashboard(db, period_year, period_month),
+    }
+
+
+@router.post("/admin/compliance/checklist/{item_id}")
+def admin_compliance_checklist_update(
+    item_id: int,
+    payload: ComplianceChecklistUpdatePayload,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    session = require_super_admin_request(db, request)
+    row = db.execute(
+        text(
+            """
+            SELECT id, period_year, period_month, checklist_key, title, status
+            FROM green_compliance_checklist_items
+            WHERE id = :item_id
+            LIMIT 1
+            """
+        ),
+        {"item_id": int(item_id)},
+    ).mappings().first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Compliance checklist item not found")
+    current = dict(row)
+    status = _normalize_compliance_status(payload.status or current.get("status"))
+    owner_name = str(payload.owner_name or "").strip() or None
+    evidence_location = str(payload.evidence_location or "").strip() or None
+    notes = str(payload.notes or "").strip() or None
+    completed_by = _compliance_actor_name(session) if status == "completed" else None
+    completed_at_sql = "NOW()" if status == "completed" else "NULL"
+    db.execute(
+        text(
+            f"""
+            UPDATE green_compliance_checklist_items
+            SET status = :status,
+                owner_name = :owner_name,
+                evidence_location = :evidence_location,
+                notes = :notes,
+                completed_by = :completed_by,
+                completed_at = {completed_at_sql},
+                updated_at = NOW()
+            WHERE id = :item_id
+            """
+        ),
+        {
+            "status": status,
+            "owner_name": owner_name,
+            "evidence_location": evidence_location,
+            "notes": notes,
+            "completed_by": completed_by,
+            "item_id": int(item_id),
+        },
+    )
+    db.commit()
+    _log_activity(
+        db,
+        "backend_api",
+        "compliance_checklist_updated",
+        f"Compliance checklist item '{current.get('title') or current.get('checklist_key')}' marked {status}",
+        _compliance_actor_name(session),
+        {
+            "item_id": int(item_id),
+            "checklist_key": current.get("checklist_key"),
+            "title": current.get("title"),
+            "status": status,
+            "period_year": int(current.get("period_year") or 0),
+            "period_month": int(current.get("period_month") or 0),
+            "evidence_location": evidence_location,
+        },
+    )
+    return {
+        "ok": True,
+        "dashboard": _build_compliance_dashboard(
+            db,
+            int(current.get("period_year") or 0),
+            int(current.get("period_month") or 0),
+        ),
+    }
 
 
 def _normalize_name(value: str | None) -> str:
@@ -1442,6 +1633,189 @@ def _log_activity(
         message=message,
         details=details,
     )
+
+
+def _resolve_compliance_period(year: int | None = None, month: int | None = None) -> tuple[int, int]:
+    now = datetime.now(timezone.utc)
+    resolved_year = int(year or now.year)
+    resolved_month = int(month or now.month)
+    if resolved_year < 2024 or resolved_year > 2100:
+        raise HTTPException(status_code=400, detail="Compliance year is out of range")
+    if resolved_month < 1 or resolved_month > 12:
+        raise HTTPException(status_code=400, detail="Compliance month must be between 1 and 12")
+    return resolved_year, resolved_month
+
+
+def _compliance_due_date(year: int, month: int) -> date:
+    if month == 12:
+        return date(year + 1, 1, 1) - timedelta(days=1)
+    return date(year, month + 1, 1) - timedelta(days=1)
+
+
+def _compliance_actor_name(session) -> str:
+    return str(
+        session.display_name
+        or session.metadata.get("full_name")
+        or session.metadata.get("user_name")
+        or session.role_key
+        or "super_admin"
+    ).strip() or "super_admin"
+
+
+def _normalize_compliance_status(value: str | None) -> str:
+    normalized = str(value or "pending").strip().lower() or "pending"
+    if normalized not in COMPLIANCE_CHECKLIST_STATUS_VALUES:
+        raise HTTPException(status_code=400, detail="Unsupported compliance checklist status")
+    return normalized
+
+
+def _ensure_compliance_checklist_for_period(db: Session, year: int, month: int) -> int:
+    due_date = _compliance_due_date(year, month)
+    created = 0
+    for definition in MONTHLY_COMPLIANCE_CHECKLIST_DEFINITIONS:
+        result = db.execute(
+            text(
+                """
+                INSERT INTO green_compliance_checklist_items (
+                    period_year,
+                    period_month,
+                    checklist_key,
+                    category,
+                    title,
+                    description,
+                    status,
+                    due_date,
+                    automation_level,
+                    created_at,
+                    updated_at
+                )
+                VALUES (
+                    :period_year,
+                    :period_month,
+                    :checklist_key,
+                    :category,
+                    :title,
+                    :description,
+                    'pending',
+                    :due_date,
+                    :automation_level,
+                    NOW(),
+                    NOW()
+                )
+                ON CONFLICT (period_year, period_month, checklist_key) DO NOTHING
+                """
+            ),
+            {
+                "period_year": int(year),
+                "period_month": int(month),
+                "checklist_key": str(definition["checklist_key"]).strip(),
+                "category": str(definition["category"]).strip(),
+                "title": str(definition["title"]).strip(),
+                "description": str(definition["description"]).strip(),
+                "due_date": due_date,
+                "automation_level": str(definition["automation_level"]).strip(),
+            },
+        )
+        created += int(result.rowcount or 0)
+    if created:
+        db.commit()
+    return created
+
+
+def _load_compliance_items_for_period(db: Session, year: int, month: int) -> list[dict]:
+    rows = db.execute(
+        text(
+            """
+            SELECT
+                id,
+                period_year,
+                period_month,
+                checklist_key,
+                category,
+                title,
+                description,
+                status,
+                owner_name,
+                due_date,
+                completed_at,
+                completed_by,
+                evidence_location,
+                notes,
+                automation_level,
+                created_at,
+                updated_at
+            FROM green_compliance_checklist_items
+            WHERE period_year = :period_year
+              AND period_month = :period_month
+            ORDER BY
+                CASE WHEN status = 'completed' THEN 1 ELSE 0 END,
+                category ASC,
+                id ASC
+            """
+        ),
+        {"period_year": int(year), "period_month": int(month)},
+    ).mappings().all()
+    return [dict(row) for row in rows]
+
+
+def _build_compliance_dashboard(db: Session, year: int, month: int) -> dict:
+    posture = get_security_posture(db)
+    items = _load_compliance_items_for_period(db, year, month)
+    total = len(items)
+    completed = sum(1 for item in items if str(item.get("status") or "").strip().lower() == "completed")
+    skipped = sum(1 for item in items if str(item.get("status") or "").strip().lower() == "skipped")
+    pending = max(total - completed - skipped, 0)
+    period_label = date(year, month, 1).strftime("%B %Y")
+    return {
+        "period": {
+            "year": int(year),
+            "month": int(month),
+            "label": period_label,
+            "due_date": _compliance_due_date(year, month).isoformat(),
+        },
+        "summary": {
+            "total": total,
+            "completed": completed,
+            "skipped": skipped,
+            "pending": pending,
+            "completion_rate": round((completed / total) * 100, 1) if total else 0.0,
+        },
+        "posture": posture,
+        "items": items,
+    }
+
+
+def _mark_security_maintenance_checklist_completed(db: Session, session, cleanup: dict[str, int]) -> None:
+    year, month = _resolve_compliance_period()
+    _ensure_compliance_checklist_for_period(db, year, month)
+    db.execute(
+        text(
+            """
+            UPDATE green_compliance_checklist_items
+            SET status = 'completed',
+                owner_name = COALESCE(owner_name, :owner_name),
+                completed_at = NOW(),
+                completed_by = :completed_by,
+                notes = :notes,
+                evidence_location = COALESCE(NULLIF(evidence_location, ''), 'LandCheck Work > System Logs & Reports > Security maintenance'),
+                updated_at = NOW()
+            WHERE period_year = :period_year
+              AND period_month = :period_month
+              AND checklist_key = 'security_maintenance_run'
+            """
+        ),
+        {
+            "owner_name": _compliance_actor_name(session),
+            "completed_by": _compliance_actor_name(session),
+            "notes": (
+                f"Expired sessions deleted: {int(cleanup.get('deleted_sessions', 0))}. "
+                f"Activity logs deleted by retention: {int(cleanup.get('deleted_activity_logs', 0))}."
+            ),
+            "period_year": int(year),
+            "period_month": int(month),
+        },
+    )
+    db.commit()
 
 
 def _project_organization_id(db: Session, project_id: int) -> int | None:
@@ -7031,6 +7405,29 @@ def ensure_green_tables(db: Session):
             id SERIAL PRIMARY KEY,
             tree_id INTEGER NOT NULL REFERENCES trees(id) ON DELETE CASCADE,
             printed_at TIMESTAMP DEFAULT NOW()
+        )
+    """))
+
+    db.execute(text("""
+        CREATE TABLE IF NOT EXISTS green_compliance_checklist_items (
+            id SERIAL PRIMARY KEY,
+            period_year INTEGER NOT NULL,
+            period_month INTEGER NOT NULL,
+            checklist_key TEXT NOT NULL,
+            category TEXT NOT NULL,
+            title TEXT NOT NULL,
+            description TEXT,
+            status TEXT NOT NULL DEFAULT 'pending',
+            owner_name TEXT,
+            due_date DATE,
+            completed_at TIMESTAMP,
+            completed_by TEXT,
+            evidence_location TEXT,
+            notes TEXT,
+            automation_level TEXT,
+            created_at TIMESTAMP DEFAULT NOW(),
+            updated_at TIMESTAMP DEFAULT NOW(),
+            UNIQUE (period_year, period_month, checklist_key)
         )
     """))
 

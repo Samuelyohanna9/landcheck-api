@@ -1,0 +1,4 @@
+risk_id,title,description,asset_or_process,likelihood,impact,risk_rating,owner,treatment,target_date,status,notes
+RSK-001,Unauthorized admin access,Privileged access could be abused or compromised,Admin authentication,Medium,High,High,Platform Owner,Mitigate,,,MFA rollout
+RSK-002,Payout manipulation,Incorrect payout approval or reconciliation could cause financial loss,Payout workflow,Medium,High,High,Finance Owner,Mitigate,,,Needs monthly review evidence
+RSK-003,Storage exposure,Photos or evidence could be exposed through misconfiguration,Object storage,Medium,High,High,Platform Owner,Mitigate,,,Review bucket policy

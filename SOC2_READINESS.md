@@ -21,6 +21,13 @@ Implemented controls
 - Flutterwave webhook signature enforcement controls for production deployments.
 - Production guardrail to disable destructive activity-log reset unless explicitly enabled.
 - Security maintenance endpoints for posture reporting and retention cleanup.
+- Compliance pack for audit operations, including:
+  - policy templates
+  - risk and vendor registers
+  - access review and evidence logs
+  - backup/restore runbooks
+  - ISMS scope and SoA drafts
+  - monthly review working files
 
 Environment variables
 
@@ -56,3 +63,12 @@ Remaining readiness work outside this patch
 - Formal access review cadence for partner and sponsor administrators.
 - Incident response runbook and tabletop evidence.
 - Centralized monitoring/alerting around authentication anomalies, payout operations, and webhook failures.
+
+Repository assets for the operational layer are now in:
+
+- [compliance/README.md](./compliance/README.md)
+- [compliance/policies](./compliance/policies)
+- [compliance/registers](./compliance/registers)
+- [compliance/isms](./compliance/isms)
+- [compliance/runbooks](./compliance/runbooks)
+- [scripts/compliance](./scripts/compliance)

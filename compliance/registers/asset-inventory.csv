@@ -1,0 +1,4 @@
+asset_id,asset_name,asset_type,environment,owner,data_classification,criticality,location_or_provider,backup_required,notes
+AST-001,LandCheck API,Application,Production,Platform Owner,Confidential,High,Hetzner,Yes,
+AST-002,LandCheck PostgreSQL,Database,Production,Platform Owner,Sensitive,High,PostGIS container,Yes,
+AST-003,Cloudflare R2 Sponsor Photos,Object Storage,Production,Platform Owner,Sensitive,High,Cloudflare R2,Yes,
