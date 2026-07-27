@@ -67,7 +67,18 @@ _GREEN_ADMIN_PUBLIC_CALLBACKS = {
 }
 
 
+def _is_cors_preflight_request(request: Request) -> bool:
+    method = str(request.method or "").strip().upper()
+    if method != "OPTIONS":
+        return False
+    origin = str(request.headers.get("origin") or "").strip()
+    requested_method = str(request.headers.get("access-control-request-method") or "").strip()
+    return bool(origin and requested_method)
+
+
 def _requires_super_admin_session(request: Request) -> bool:
+    if _is_cors_preflight_request(request):
+        return False
     clean_path = str(request.url.path or "").strip().lower()
     if clean_path in _GREEN_ADMIN_PUBLIC_CALLBACKS:
         return False
