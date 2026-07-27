@@ -28,7 +28,7 @@ This pack is designed for the LandCheck platform, including:
 - `policies/`
   - formal security and operating policies
 - `registers/`
-  - live tracking sheets for risks, access, vendors, changes, incidents, and evidence
+  - template tracking sheets for risks, access, vendors, changes, incidents, and evidence
 - `isms/`
   - ISO 27001 scope, SoA, risk method, internal audit, and management review templates
 - `runbooks/`
@@ -70,3 +70,4 @@ This pack is designed for the LandCheck platform, including:
 - These files do not themselves create compliance. They are the operating pack needed to run the controls.
 - Evidence must be maintained continuously for SOC 2 Type II.
 - ISO 27001 certification will still require a formal ISMS scope decision, internal audit, management review, and external audit.
+- If this repository is public, keep only blank templates here. Store filled registers, evidence logs, incident records, and restore evidence in a private workspace, not in public GitHub.
