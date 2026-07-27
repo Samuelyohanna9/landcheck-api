@@ -50,7 +50,26 @@ from app.utils.green_pdf import (
 )
 from app.utils.green_remote_monitoring import compute_remote_monitoring_report
 from app.utils.r2_exports import upload_export_file_best_effort, _build_export_r2_settings
-from app.utils.activity_logger import ensure_activity_log_table, require_super_admin_request, safe_log_activity
+from app.utils.activity_logger import ensure_activity_log_table, safe_log_activity
+from app.utils.auth_security import (
+    allow_activity_log_reset,
+    auth_session_idle_minutes,
+    build_totp_uri,
+    cleanup_security_artifacts,
+    ensure_auth_security_schema,
+    env_admin_login_enabled,
+    generate_backup_codes,
+    generate_totp_secret,
+    get_env_admin_credentials,
+    get_security_posture,
+    hash_backup_codes,
+    issue_auth_session,
+    require_authenticated_session,
+    require_signed_flutterwave_webhooks,
+    require_super_admin_request,
+    revoke_request_session,
+    verify_totp_code,
+)
 from app.utils.carbon import (
     compute_project_carbon,
     generate_co2_projection_table,
@@ -480,6 +499,14 @@ class SponsorProfileSettingsPayload(BaseModel):
     leaderboard_visibility: str | None = None
 
 
+class AuthMfaEnablePayload(BaseModel):
+    code: str
+
+
+class AuthMfaDisablePayload(BaseModel):
+    code: str
+
+
 def _normalize_privacy_scope(value: str | None) -> str:
     scope = str(value or "").strip().lower()
     if scope not in PRIVACY_CONSENT_SCOPE_VALUES:
@@ -556,8 +583,409 @@ def bootstrap_green_schema():
     db = SessionLocal()
     try:
         _ensure_green_schema_ready(db)
+        ensure_auth_security_schema()
     finally:
         db.close()
+
+
+def _session_actor_name(session) -> str:
+    return str(getattr(session, "display_name", "") or "").strip() or "authenticated_user"
+
+
+def _build_auth_response(payload: dict, session_bundle: dict[str, object] | None = None) -> dict:
+    response = dict(payload or {})
+    if session_bundle:
+        response.update(session_bundle)
+    return response
+
+
+def _issue_partner_auth_response(
+    db: Session,
+    request: Request,
+    *,
+    user_row: dict,
+    app_mode: str,
+) -> dict:
+    role_key = str(user_row.get("role_key") or user_row.get("role") or "").strip() or None
+    payload = {
+        "ok": True,
+        "auth_mode": "partner_user",
+        "user": {
+            "id": int(user_row["id"]),
+            "user_uid": user_row.get("user_uid"),
+            "full_name": user_row.get("full_name"),
+            "role": user_row.get("role"),
+            "role_id": user_row.get("role_id"),
+            "role_uid": user_row.get("role_uid"),
+            "role_key": role_key,
+            "role_name": user_row.get("role_name") or user_row.get("role"),
+            "allow_work": bool(user_row.get("allow_work")),
+            "allow_green": bool(user_row.get("allow_green")),
+            "work_username": user_row.get("work_username"),
+            "organization_id": user_row.get("organization_id"),
+            "organization_name": user_row.get("organization_name"),
+            "organization_slug": user_row.get("organization_slug"),
+            "organization_status": user_row.get("organization_status"),
+            "organization_is_active": bool(user_row.get("organization_is_active", True)),
+            "organization_logo_url": _normalize_logo_asset_path(user_row.get("organization_logo_url")),
+            "profile_photo_url": _normalize_logo_asset_path(user_row.get("profile_photo_url")),
+            "email": user_row.get("email"),
+        },
+    }
+    session_bundle = issue_auth_session(
+        db,
+        subject_type="green_user",
+        subject_id=int(user_row["id"]),
+        auth_mode="partner_user",
+        app_mode=app_mode,
+        role_key=role_key,
+        organization_id=int(user_row.get("organization_id") or 0) or None,
+        user_id=int(user_row["id"]),
+        display_name=str(user_row.get("full_name") or "").strip() or None,
+        request=request,
+        mfa_enabled=bool(user_row.get("mfa_enabled", False)),
+        mfa_verified=not bool(user_row.get("mfa_enabled", False)),
+        metadata={"organization_slug": user_row.get("organization_slug")},
+    )
+    return _build_auth_response(payload, session_bundle)
+
+
+def _issue_env_admin_auth_response(db: Session, request: Request) -> dict:
+    payload = {
+        "ok": True,
+        "auth_mode": "env_admin",
+        "user": {
+            "id": 0,
+            "user_uid": "SYS-ADMIN",
+            "full_name": "System Admin",
+            "role": "super_admin",
+            "role_key": "super_admin",
+            "role_name": "Super Admin",
+            "allow_work": True,
+            "allow_green": True,
+            "organization_id": None,
+            "organization_name": None,
+            "organization_logo_url": None,
+        },
+    }
+    session_bundle = issue_auth_session(
+        db,
+        subject_type="env_admin",
+        subject_id=None,
+        auth_mode="env_admin",
+        app_mode="green_work",
+        role_key="super_admin",
+        organization_id=None,
+        user_id=None,
+        sponsor_account_id=None,
+        display_name="System Admin",
+        request=request,
+        mfa_enabled=False,
+        mfa_verified=True,
+        metadata={"source": "environment_credentials"},
+    )
+    return _build_auth_response(payload, session_bundle)
+
+
+def _require_sponsor_session_for_id(db: Session, request: Request, sponsor_id: int):
+    session = require_authenticated_session(db, request, auth_modes={"sponsor_user"})
+    if int(session.sponsor_account_id or 0) != int(sponsor_id):
+        raise HTTPException(status_code=403, detail="Session does not match the requested sponsor account")
+    return session
+
+
+def _validate_optional_sponsor_session_for_id(db: Session, request: Request, sponsor_id: int) -> None:
+    session = require_authenticated_session(db, request, auth_modes={"sponsor_user"})
+    if int(session.sponsor_account_id or 0) != int(sponsor_id):
+        raise HTTPException(status_code=403, detail="Session does not match the requested sponsor account")
+
+
+def _require_partner_session_for_user(
+    db: Session,
+    request: Request,
+    *,
+    user_id: int,
+    organization_id: int | None = None,
+):
+    session = require_authenticated_session(db, request, auth_modes={"partner_user", "env_admin"})
+    if session.is_super_admin:
+        return session
+    if int(session.user_id or 0) != int(user_id):
+        raise HTTPException(status_code=403, detail="Session does not match the requested field user")
+    if organization_id is not None and int(session.organization_id or 0) != int(organization_id or 0):
+        raise HTTPException(status_code=403, detail="Session organization does not match the requested organization")
+    return session
+
+
+def _load_session_subject_mfa_row(db: Session, session) -> dict | None:
+    if str(session.auth_mode or "").strip().lower() == "sponsor_user":
+        row = db.execute(
+            text(
+                """
+                SELECT id, full_name, email,
+                       COALESCE(mfa_enabled, FALSE) AS mfa_enabled,
+                       mfa_secret,
+                       mfa_backup_codes
+                FROM green_sponsor_accounts
+                WHERE id = :sponsor_id
+                LIMIT 1
+                """
+            ),
+            {"sponsor_id": int(session.sponsor_account_id or 0)},
+        ).mappings().first()
+        return dict(row) if row else None
+    if str(session.auth_mode or "").strip().lower() == "partner_user":
+        row = db.execute(
+            text(
+                """
+                SELECT id, full_name, email,
+                       COALESCE(mfa_enabled, FALSE) AS mfa_enabled,
+                       mfa_secret,
+                       mfa_backup_codes
+                FROM green_users
+                WHERE id = :user_id
+                LIMIT 1
+                """
+            ),
+            {"user_id": int(session.user_id or 0)},
+        ).mappings().first()
+        return dict(row) if row else None
+    return None
+
+
+def _update_session_mfa_flag(db: Session, session, *, verified: bool) -> None:
+    metadata = dict(session.metadata or {})
+    metadata["mfa_verified"] = bool(verified)
+    db.execute(
+        text(
+            """
+            UPDATE green_auth_sessions
+            SET metadata = CAST(:metadata AS JSONB),
+                last_seen_at = NOW(),
+                idle_timeout_at = NOW() + (:idle_minutes * INTERVAL '1 minute')
+            WHERE session_uid = :session_uid
+            """
+        ),
+        {
+            "session_uid": session.session_uid,
+            "metadata": json.dumps(metadata, default=str),
+            "idle_minutes": auth_session_idle_minutes(),
+        },
+    )
+    session.metadata = metadata
+    session.mfa_verified = bool(verified)
+
+
+def _serialize_mfa_status(session, subject_row: dict | None, *, supported: bool = True) -> dict:
+    return {
+        "supported": bool(supported),
+        "auth_mode": str(session.auth_mode or "").strip(),
+        "session_uid": session.session_uid,
+        "mfa_enabled": bool(subject_row.get("mfa_enabled", False)) if subject_row else False,
+        "mfa_verified": bool(session.mfa_verified),
+        "account_name": str(subject_row.get("full_name") or session.display_name or "").strip() or None,
+        "email": str(subject_row.get("email") or "").strip() or None if subject_row else None,
+    }
+
+
+@router.post("/auth/logout")
+def auth_logout(request: Request, db: Session = Depends(get_db)):
+    revoked = revoke_request_session(db, request, reason="user_logout")
+    return {"ok": True, "revoked": bool(revoked)}
+
+
+@router.get("/auth/mfa/status")
+def auth_mfa_status(request: Request, db: Session = Depends(get_db)):
+    session = require_authenticated_session(db, request, auth_modes={"partner_user", "sponsor_user", "env_admin"})
+    if session.auth_mode == "env_admin":
+        return _serialize_mfa_status(session, None, supported=False)
+    subject_row = _load_session_subject_mfa_row(db, session)
+    if not subject_row:
+        raise HTTPException(status_code=404, detail="Authenticated account not found")
+    return _serialize_mfa_status(session, subject_row, supported=True)
+
+
+@router.post("/auth/mfa/setup")
+def auth_mfa_setup(request: Request, db: Session = Depends(get_db)):
+    session = require_authenticated_session(db, request, auth_modes={"partner_user", "sponsor_user"})
+    subject_row = _load_session_subject_mfa_row(db, session)
+    if not subject_row:
+        raise HTTPException(status_code=404, detail="Authenticated account not found")
+    secret = generate_totp_secret()
+    backup_codes = generate_backup_codes()
+    account_name = str(subject_row.get("email") or subject_row.get("full_name") or session.display_name or "user").strip()
+    if session.auth_mode == "sponsor_user":
+        db.execute(
+            text(
+                """
+                UPDATE green_sponsor_accounts
+                SET mfa_secret = :mfa_secret,
+                    mfa_backup_codes = CAST(:mfa_backup_codes AS JSONB),
+                    mfa_enabled = FALSE,
+                    mfa_enabled_at = NULL,
+                    updated_at = NOW()
+                WHERE id = :sponsor_id
+                """
+            ),
+            {
+                "sponsor_id": int(session.sponsor_account_id or 0),
+                "mfa_secret": secret,
+                "mfa_backup_codes": json.dumps(hash_backup_codes(backup_codes)),
+            },
+        )
+    else:
+        db.execute(
+            text(
+                """
+                UPDATE green_users
+                SET mfa_secret = :mfa_secret,
+                    mfa_backup_codes = CAST(:mfa_backup_codes AS JSONB),
+                    mfa_enabled = FALSE,
+                    mfa_enabled_at = NULL,
+                    updated_at = NOW()
+                WHERE id = :user_id
+                """
+            ),
+            {
+                "user_id": int(session.user_id or 0),
+                "mfa_secret": secret,
+                "mfa_backup_codes": json.dumps(hash_backup_codes(backup_codes)),
+            },
+        )
+    _update_session_mfa_flag(db, session, verified=False)
+    db.commit()
+    return {
+        "ok": True,
+        "secret": secret,
+        "totp_uri": build_totp_uri(secret, account_name),
+        "backup_codes": backup_codes,
+        "status": _serialize_mfa_status(session, {**subject_row, "mfa_enabled": False}, supported=True),
+    }
+
+
+@router.post("/auth/mfa/verify")
+def auth_mfa_verify(payload: AuthMfaEnablePayload, request: Request, db: Session = Depends(get_db)):
+    session = require_authenticated_session(db, request, auth_modes={"partner_user", "sponsor_user"})
+    subject_row = _load_session_subject_mfa_row(db, session)
+    if not subject_row:
+        raise HTTPException(status_code=404, detail="Authenticated account not found")
+    secret = str(subject_row.get("mfa_secret") or "").strip()
+    if not secret:
+        raise HTTPException(status_code=409, detail="MFA setup has not been initialized for this account")
+    if not verify_totp_code(secret, payload.code):
+        raise HTTPException(status_code=400, detail="Invalid authentication code")
+    _update_session_mfa_flag(db, session, verified=True)
+    db.commit()
+    return {"ok": True, "status": _serialize_mfa_status(session, subject_row, supported=True)}
+
+
+@router.post("/auth/mfa/enable")
+def auth_mfa_enable(payload: AuthMfaEnablePayload, request: Request, db: Session = Depends(get_db)):
+    session = require_authenticated_session(db, request, auth_modes={"partner_user", "sponsor_user"})
+    subject_row = _load_session_subject_mfa_row(db, session)
+    if not subject_row:
+        raise HTTPException(status_code=404, detail="Authenticated account not found")
+    secret = str(subject_row.get("mfa_secret") or "").strip()
+    if not secret:
+        raise HTTPException(status_code=409, detail="Run MFA setup before enabling this control")
+    if not verify_totp_code(secret, payload.code):
+        raise HTTPException(status_code=400, detail="Invalid authentication code")
+    backup_codes = generate_backup_codes()
+    statement = (
+        text(
+            """
+            UPDATE green_sponsor_accounts
+            SET mfa_enabled = TRUE,
+                mfa_enabled_at = NOW(),
+                mfa_backup_codes = CAST(:mfa_backup_codes AS JSONB),
+                updated_at = NOW()
+            WHERE id = :subject_id
+            """
+        )
+        if session.auth_mode == "sponsor_user"
+        else text(
+            """
+            UPDATE green_users
+            SET mfa_enabled = TRUE,
+                mfa_enabled_at = NOW(),
+                mfa_backup_codes = CAST(:mfa_backup_codes AS JSONB),
+                updated_at = NOW()
+            WHERE id = :subject_id
+            """
+        )
+    )
+    db.execute(
+        statement,
+        {
+            "subject_id": int(session.sponsor_account_id or 0) if session.auth_mode == "sponsor_user" else int(session.user_id or 0),
+            "mfa_backup_codes": json.dumps(hash_backup_codes(backup_codes)),
+        },
+    )
+    _update_session_mfa_flag(db, session, verified=True)
+    db.commit()
+    return {
+        "ok": True,
+        "backup_codes": backup_codes,
+        "status": _serialize_mfa_status(session, {**subject_row, "mfa_enabled": True}, supported=True),
+    }
+
+
+@router.post("/auth/mfa/disable")
+def auth_mfa_disable(payload: AuthMfaDisablePayload, request: Request, db: Session = Depends(get_db)):
+    session = require_authenticated_session(db, request, auth_modes={"partner_user", "sponsor_user"})
+    subject_row = _load_session_subject_mfa_row(db, session)
+    if not subject_row:
+        raise HTTPException(status_code=404, detail="Authenticated account not found")
+    if not bool(subject_row.get("mfa_enabled", False)):
+        raise HTTPException(status_code=409, detail="MFA is not currently enabled on this account")
+    secret = str(subject_row.get("mfa_secret") or "").strip()
+    if not secret or not verify_totp_code(secret, payload.code):
+        raise HTTPException(status_code=400, detail="Invalid authentication code")
+    statement = (
+        text(
+            """
+            UPDATE green_sponsor_accounts
+            SET mfa_enabled = FALSE,
+                mfa_secret = NULL,
+                mfa_backup_codes = '[]'::jsonb,
+                mfa_enabled_at = NULL,
+                updated_at = NOW()
+            WHERE id = :subject_id
+            """
+        )
+        if session.auth_mode == "sponsor_user"
+        else text(
+            """
+            UPDATE green_users
+            SET mfa_enabled = FALSE,
+                mfa_secret = NULL,
+                mfa_backup_codes = '[]'::jsonb,
+                mfa_enabled_at = NULL,
+                updated_at = NOW()
+            WHERE id = :subject_id
+            """
+        )
+    )
+    db.execute(
+        statement,
+        {"subject_id": int(session.sponsor_account_id or 0) if session.auth_mode == "sponsor_user" else int(session.user_id or 0)},
+    )
+    _update_session_mfa_flag(db, session, verified=False)
+    db.commit()
+    return {"ok": True, "status": _serialize_mfa_status(session, {**subject_row, "mfa_enabled": False}, supported=True)}
+
+
+@router.get("/admin/security/posture")
+def admin_security_posture(request: Request, db: Session = Depends(get_db)):
+    require_super_admin_request(db, request)
+    return {"ok": True, "posture": get_security_posture(db)}
+
+
+@router.post("/admin/security/maintenance")
+def admin_security_maintenance(request: Request, db: Session = Depends(get_db)):
+    require_super_admin_request(db, request)
+    cleanup = cleanup_security_artifacts(db)
+    return {"ok": True, "cleanup": cleanup, "posture": get_security_posture(db)}
 
 
 def _normalize_name(value: str | None) -> str:
@@ -8052,9 +8480,9 @@ def _serialize_sponsor_account(row: dict) -> dict:
     }
 
 
-def _build_sponsor_auth_payload(row: dict) -> dict:
+def _build_sponsor_auth_payload(row: dict, session_bundle: dict[str, object] | None = None) -> dict:
     account = _serialize_sponsor_account(row)
-    return {
+    payload = {
         "ok": True,
         "auth_mode": "sponsor_user",
         "user": {
@@ -8080,6 +8508,7 @@ def _build_sponsor_auth_payload(row: dict) -> dict:
             "leaderboard_visibility": account["leaderboard_visibility"],
         },
     }
+    return _build_auth_response(payload, session_bundle)
 
 
 def _serialize_sponsor_agent_bank_account(row: dict | None) -> dict | None:
@@ -12932,22 +13361,36 @@ def sponsor_auth_signup(payload: SponsorSignupPayload, request: Request, db: Ses
         row.get('full_name'),
         {"sponsor_id": int(row["id"]), "account_type": row.get("account_type")}
     )
+    session_bundle = issue_auth_session(
+        db,
+        subject_type="sponsor_account",
+        subject_id=int(row["id"]),
+        auth_mode="sponsor_user",
+        app_mode="green_sponsor",
+        role_key="sponsor",
+        sponsor_account_id=int(row["id"]),
+        display_name=str(row.get("full_name") or "").strip() or None,
+        request=request,
+        mfa_enabled=bool(row.get("mfa_enabled", False)),
+        mfa_verified=not bool(row.get("mfa_enabled", False)),
+        metadata={"account_type": row.get("account_type")},
+    )
     db.commit()
     try:
         _notify_sponsor_welcome_email(db, int(row["id"]), request=request)
     except Exception:
         db.rollback()
-    return _build_sponsor_auth_payload(dict(row))
+    return _build_sponsor_auth_payload(dict(row), session_bundle=session_bundle)
 
 
 @router.post("/sponsor-auth/login")
-def sponsor_auth_login(payload: SponsorLoginPayload, db: Session = Depends(get_db)):
+def sponsor_auth_login(payload: SponsorLoginPayload, request: Request, db: Session = Depends(get_db)):
     email = _normalize_email_address(payload.email)
     row = db.execute(
         text(
             """
             SELECT id, sponsor_uid, account_type, full_name, organization_name, email, phone, password_hash, is_active,
-                   entity_category, leaderboard_visibility
+                   entity_category, leaderboard_visibility, COALESCE(mfa_enabled, FALSE) AS mfa_enabled
             FROM green_sponsor_accounts
             WHERE LOWER(email) = LOWER(:email)
             LIMIT 1
@@ -12967,7 +13410,22 @@ def sponsor_auth_login(payload: SponsorLoginPayload, db: Session = Depends(get_d
         row.get('full_name'),
         {"sponsor_id": int(row["id"])}
     )
-    return _build_sponsor_auth_payload(dict(row))
+    session_bundle = issue_auth_session(
+        db,
+        subject_type="sponsor_account",
+        subject_id=int(row["id"]),
+        auth_mode="sponsor_user",
+        app_mode="green_sponsor",
+        role_key="sponsor",
+        sponsor_account_id=int(row["id"]),
+        display_name=str(row.get("full_name") or "").strip() or None,
+        request=request,
+        mfa_enabled=bool(row.get("mfa_enabled", False)),
+        mfa_verified=not bool(row.get("mfa_enabled", False)),
+        metadata={"account_type": row.get("account_type")},
+    )
+    db.commit()
+    return _build_sponsor_auth_payload(dict(row), session_bundle=session_bundle)
 
 
 def _issue_sponsor_password_reset_token(db: Session, *, sponsor_id: int, request: Request | None = None) -> tuple[str, datetime] | None:
@@ -13076,6 +13534,7 @@ def sponsor_auth_reset_password(payload: SponsorResetPasswordPayload, db: Sessio
             SET password_hash = :password_hash,
                 password_reset_token_hash = NULL,
                 password_reset_token_expires_at = NULL,
+                last_password_change_at = NOW(),
                 updated_at = NOW()
             WHERE id = :sponsor_id
             """
@@ -13159,6 +13618,7 @@ def create_sponsor_order(
 ):
     sponsor_id = int(payload.sponsor_id or 0)
     if sponsor_id > 0:
+        _require_sponsor_session_for_id(db, request, sponsor_id)
         sponsor_row = db.execute(
             text("SELECT id, full_name, email, phone, is_active, is_guest FROM green_sponsor_accounts WHERE id = :sponsor_id"),
             {"sponsor_id": int(sponsor_id)},
@@ -14082,7 +14542,7 @@ async def shopify_merchant_webhook(merchant_uid: str, request: Request, db: Sess
 
 
 @router.post("/sponsor/guest/claim")
-def claim_guest_sponsor_account(payload: SponsorGuestClaimPayload, db: Session = Depends(get_db)):
+def claim_guest_sponsor_account(payload: SponsorGuestClaimPayload, request: Request, db: Session = Depends(get_db)):
     """Turn a guest checkout account into a fully login-capable sponsor account.
 
     Requires the sponsor_id + the email on file to match, so an order confirmation
@@ -14126,23 +14586,40 @@ def claim_guest_sponsor_account(payload: SponsorGuestClaimPayload, db: Session =
             """
             SELECT id, sponsor_uid, account_type, full_name, organization_name, email, phone, is_active,
                    entity_category, leaderboard_visibility, green_points, lifetime_points, referral_code,
-                   referred_by_id, is_guest, claimed_at
+                   referred_by_id, is_guest, claimed_at, COALESCE(mfa_enabled, FALSE) AS mfa_enabled
             FROM green_sponsor_accounts
             WHERE id = :sponsor_id
             """
         ),
         {"sponsor_id": int(row["id"])},
     ).mappings().first()
-    return _build_sponsor_auth_payload(dict(claimed_row))
+    session_bundle = issue_auth_session(
+        db,
+        subject_type="sponsor_account",
+        subject_id=int(row["id"]),
+        auth_mode="sponsor_user",
+        app_mode="green_sponsor",
+        role_key="sponsor",
+        sponsor_account_id=int(row["id"]),
+        display_name=str(claimed_row.get("full_name") or "").strip() or None,
+        request=request,
+        mfa_enabled=bool(claimed_row.get("mfa_enabled", False)),
+        mfa_verified=not bool(claimed_row.get("mfa_enabled", False)),
+        metadata={"account_type": claimed_row.get("account_type")},
+    )
+    db.commit()
+    return _build_sponsor_auth_payload(dict(claimed_row), session_bundle=session_bundle)
 
 
 @router.get("/sponsor/orders/{order_uid}/payment-status")
 def get_sponsor_order_payment_status(
     order_uid: str,
+    request: Request,
     sponsor_id: int = Query(...),
     refresh: bool = Query(default=False),
     db: Session = Depends(get_db),
 ):
+    _require_sponsor_session_for_id(db, request, sponsor_id)
     row = db.execute(
         text(
             """
@@ -14392,11 +14869,12 @@ def sponsor_flutterwave_return(
 async def sponsor_flutterwave_webhook(request: Request, db: Session = Depends(get_db)):
     raw_body = await request.body()
     signature = request.headers.get("flutterwave-signature")
-    secret_hash_configured = bool(_flutterwave_secret_hash())
+    secret_hash = _flutterwave_secret_hash()
+    secret_hash_configured = bool(secret_hash)
+    if require_signed_flutterwave_webhooks() and not secret_hash_configured:
+        raise HTTPException(status_code=503, detail="Flutterwave webhook signing is not configured")
     if secret_hash_configured and not _verify_flutterwave_webhook_signature(raw_body, signature):
         raise HTTPException(status_code=401, detail="Invalid webhook signature")
-    # If FLW_SECRET_HASH is not configured, accept all webhooks from Flutterwave
-    # (they are still validated against the actual Flutterwave API when processing)
     try:
         payload = json.loads(raw_body.decode("utf-8") or "{}")
     except Exception as exc:
@@ -14456,7 +14934,8 @@ async def sponsor_flutterwave_webhook(request: Request, db: Session = Depends(ge
 
 
 @router.get("/sponsor/orders")
-def list_sponsor_orders(sponsor_id: int = Query(...), db: Session = Depends(get_db)):
+def list_sponsor_orders(request: Request, sponsor_id: int = Query(...), db: Session = Depends(get_db)):
+    _require_sponsor_session_for_id(db, request, sponsor_id)
     sponsor_row = db.execute(
         text("SELECT id FROM green_sponsor_accounts WHERE id = :sponsor_id AND COALESCE(is_active, TRUE) = TRUE"),
         {"sponsor_id": int(sponsor_id)},
@@ -14524,7 +15003,8 @@ def list_sponsor_orders(sponsor_id: int = Query(...), db: Session = Depends(get_
 
 
 @router.get("/sponsor/trees")
-def list_sponsor_trees(sponsor_id: int = Query(...), db: Session = Depends(get_db)):
+def list_sponsor_trees(request: Request, sponsor_id: int = Query(...), db: Session = Depends(get_db)):
+    _require_sponsor_session_for_id(db, request, sponsor_id)
     sponsor_row = db.execute(
         text("SELECT id FROM green_sponsor_accounts WHERE id = :sponsor_id AND COALESCE(is_active, TRUE) = TRUE"),
         {"sponsor_id": int(sponsor_id)},
@@ -15166,9 +15646,11 @@ def _render_sponsor_leaderboard_html(data: dict) -> str:
 @router.patch("/sponsor/profile/settings")
 def update_sponsor_profile_settings(
     payload: SponsorProfileSettingsPayload,
+    request: Request,
     sponsor_id: int = Query(...),
     db: Session = Depends(get_db),
 ):
+    _require_sponsor_session_for_id(db, request, sponsor_id)
     sponsor = db.execute(
         text("SELECT id FROM green_sponsor_accounts WHERE id = :sponsor_id AND COALESCE(is_active, TRUE) = TRUE"),
         {"sponsor_id": int(sponsor_id)},
@@ -15226,9 +15708,11 @@ def get_public_leaderboard_view(db: Session = Depends(get_db)):
 
 @router.get("/sponsor/profile/achievements")
 def get_sponsor_profile_achievements(
+    request: Request,
     sponsor_id: int = Query(...),
     db: Session = Depends(get_db),
 ):
+    _require_sponsor_session_for_id(db, request, sponsor_id)
     sponsor = db.execute(
         text("SELECT id FROM green_sponsor_accounts WHERE id = :sponsor_id AND COALESCE(is_active, TRUE) = TRUE"),
         {"sponsor_id": int(sponsor_id)},
@@ -15506,7 +15990,8 @@ def _compute_sponsor_merch_points(db: Session, sponsor_id: int, current_points: 
 
 
 @router.get("/sponsor/points")
-def get_sponsor_points(sponsor_id: int = Query(...), db: Session = Depends(get_db)):
+def get_sponsor_points(request: Request, sponsor_id: int = Query(...), db: Session = Depends(get_db)):
+    _require_sponsor_session_for_id(db, request, sponsor_id)
     import uuid
     import json
     row = db.execute(
@@ -15558,9 +16043,10 @@ def get_sponsor_points(sponsor_id: int = Query(...), db: Session = Depends(get_d
 
 
 @router.post("/sponsor/redeem")
-def redeem_sponsor_reward(payload: SponsorRedeemPayload, db: Session = Depends(get_db)):
+def redeem_sponsor_reward(payload: SponsorRedeemPayload, request: Request, db: Session = Depends(get_db)):
     import json
     sponsor_id = payload.sponsor_id
+    _require_sponsor_session_for_id(db, request, sponsor_id)
     reward_type = payload.reward_type.strip()
     
     row = db.execute(
@@ -15695,8 +16181,9 @@ def redeem_sponsor_reward(payload: SponsorRedeemPayload, db: Session = Depends(g
 
 
 @router.post("/sponsor/nominate-school")
-def nominate_school(payload: SponsorNominateSchoolPayload, db: Session = Depends(get_db)):
+def nominate_school(payload: SponsorNominateSchoolPayload, request: Request, db: Session = Depends(get_db)):
     sponsor_id = payload.sponsor_id
+    _require_sponsor_session_for_id(db, request, sponsor_id)
     cost = 100
     
     row = db.execute(
@@ -15742,8 +16229,9 @@ def nominate_school(payload: SponsorNominateSchoolPayload, db: Session = Depends
 
 
 @router.post("/sponsor/points/share-earn")
-def sponsor_share_earn(payload: SponsorShareEarnPayload, db: Session = Depends(get_db)):
+def sponsor_share_earn(payload: SponsorShareEarnPayload, request: Request, db: Session = Depends(get_db)):
     sponsor_id = payload.sponsor_id
+    _require_sponsor_session_for_id(db, request, sponsor_id)
     
     row = db.execute(
         text("SELECT id FROM green_sponsor_accounts WHERE id = :sponsor_id AND COALESCE(is_active, TRUE) = TRUE"),
@@ -15768,7 +16256,8 @@ def sponsor_share_earn(payload: SponsorShareEarnPayload, db: Session = Depends(g
 
 
 @router.post("/sponsor/game/action")
-def sponsor_game_action(payload: SponsorGameActionPayload, db: Session = Depends(get_db)):
+def sponsor_game_action(payload: SponsorGameActionPayload, request: Request, db: Session = Depends(get_db)):
+    _require_sponsor_session_for_id(db, request, int(payload.sponsor_id))
     row = db.execute(
         text("SELECT id, green_points FROM green_sponsor_accounts WHERE id = :sid AND COALESCE(is_active, TRUE) = TRUE"),
         {"sid": payload.sponsor_id}
@@ -15814,9 +16303,11 @@ def sponsor_game_action(payload: SponsorGameActionPayload, db: Session = Depends
 
 @router.get("/sponsor/social-follow-claim")
 def get_sponsor_social_follow_claim(
+    request: Request,
     sponsor_id: int = Query(...),
     db: Session = Depends(get_db),
 ):
+    _require_sponsor_session_for_id(db, request, sponsor_id)
     sponsor = db.execute(
         text(
             """
@@ -15860,8 +16351,10 @@ def get_sponsor_social_follow_claim(
 @router.post("/sponsor/social-follow-claim")
 def submit_sponsor_social_follow_claim(
     payload: SponsorSocialFollowClaimPayload,
+    request: Request,
     db: Session = Depends(get_db),
 ):
+    _require_sponsor_session_for_id(db, request, int(payload.sponsor_id))
     sponsor = db.execute(
         text(
             """
@@ -15997,8 +16490,9 @@ def submit_sponsor_social_follow_claim(
 
 
 @router.post("/sponsor/complaints")
-def sponsor_create_complaint(payload: SponsorComplaintPayload, db: Session = Depends(get_db)):
+def sponsor_create_complaint(payload: SponsorComplaintPayload, request: Request, db: Session = Depends(get_db)):
     sponsor_id = payload.sponsor_id
+    _require_sponsor_session_for_id(db, request, sponsor_id)
     
     row = db.execute(
         text("SELECT id FROM green_sponsor_accounts WHERE id = :sponsor_id AND COALESCE(is_active, TRUE) = TRUE"),
@@ -16745,8 +17239,9 @@ def review_community_project(project_id: int, payload: CommunityProjectStatusPay
 
 
 @router.post("/sponsor/community-project")
-def create_community_project(payload: SponsorCommunityProjectPayload, db: Session = Depends(get_db)):
+def create_community_project(payload: SponsorCommunityProjectPayload, request: Request, db: Session = Depends(get_db)):
     sponsor_id = payload.sponsor_id
+    _require_sponsor_session_for_id(db, request, sponsor_id)
     points = payload.points
     if points <= 0:
         raise HTTPException(status_code=400, detail="Points contributed must be greater than zero")
@@ -16941,7 +17436,7 @@ def create_public_log(payload: PublicLogPayload, db: Session = Depends(get_db)):
 
 @router.get("/admin/logs")
 def get_admin_logs(request: Request, db: Session = Depends(get_db)):
-    require_super_admin_request(request)
+    require_super_admin_request(db, request)
     ensure_activity_log_table()
     rows = db.execute(
         text(
@@ -16968,7 +17463,12 @@ def get_admin_logs(request: Request, db: Session = Depends(get_db)):
 
 @router.post("/admin/logs/reset")
 def reset_admin_logs(request: Request, db: Session = Depends(get_db)):
-    require_super_admin_request(request)
+    require_super_admin_request(db, request)
+    if not allow_activity_log_reset():
+        raise HTTPException(
+            status_code=403,
+            detail="Activity log reset is disabled in this environment. Use retention cleanup instead.",
+        )
     ensure_activity_log_table()
     db.execute(text("TRUNCATE TABLE green_activity_logs"))
     db.commit()
@@ -16984,7 +17484,7 @@ def reset_admin_logs(request: Request, db: Session = Depends(get_db)):
 
 @router.get("/admin/qr-prints")
 def get_admin_qr_prints(request: Request, db: Session = Depends(get_db)):
-    require_super_admin_request(request)
+    require_super_admin_request(db, request)
     rows = db.execute(
         text(
             """
@@ -17002,7 +17502,8 @@ def get_admin_qr_prints(request: Request, db: Session = Depends(get_db)):
 
 
 @router.post("/sponsor/update-profile-photo")
-def update_sponsor_profile_photo(payload: SponsorUpdateProfilePhotoPayload, db: Session = Depends(get_db)):
+def update_sponsor_profile_photo(payload: SponsorUpdateProfilePhotoPayload, request: Request, db: Session = Depends(get_db)):
+    _require_sponsor_session_for_id(db, request, int(payload.sponsor_id))
     db.execute(
         text("UPDATE green_sponsor_accounts SET profile_photo_url = :photo_url, updated_at = NOW() WHERE id = :sponsor_id"),
         {"photo_url": payload.profile_photo_url.strip(), "sponsor_id": payload.sponsor_id}
@@ -17012,9 +17513,10 @@ def update_sponsor_profile_photo(payload: SponsorUpdateProfilePhotoPayload, db: 
 
 
 @router.post("/sponsor/update-appearance")
-def update_sponsor_appearance(payload: SponsorUpdateAppearancePayload, db: Session = Depends(get_db)):
+def update_sponsor_appearance(payload: SponsorUpdateAppearancePayload, request: Request, db: Session = Depends(get_db)):
     import json
     sponsor_id = payload.sponsor_id
+    _require_sponsor_session_for_id(db, request, int(sponsor_id))
     avatar_border = payload.avatar_border
     map_icon = payload.map_icon
     
@@ -17054,8 +17556,9 @@ def update_sponsor_appearance(payload: SponsorUpdateAppearancePayload, db: Sessi
 
 
 @router.post("/sponsor/apply-referral")
-def apply_referral_code(payload: SponsorApplyReferralPayload, db: Session = Depends(get_db)):
+def apply_referral_code(payload: SponsorApplyReferralPayload, request: Request, db: Session = Depends(get_db)):
     sponsor_id = payload.sponsor_id
+    _require_sponsor_session_for_id(db, request, int(sponsor_id))
     ref_code = payload.referral_code.strip()
     
     sponsor = db.execute(
@@ -18207,6 +18710,7 @@ def _render_sponsor_public_reset_password_html(token: str) -> str:
 
 @router.get("/sponsor/trees/{unit_id}")
 def get_sponsor_tree_detail(unit_id: int, request: Request, sponsor_id: int = Query(...), db: Session = Depends(get_db)):
+    _require_sponsor_session_for_id(db, request, sponsor_id)
     row = db.execute(
         text(
             """
@@ -18242,7 +18746,7 @@ def export_sponsor_tree_certificate(
     sponsor_id: int = Query(...),
     db: Session = Depends(get_db),
 ):
-    
+    _require_sponsor_session_for_id(db, request, sponsor_id)
     row = db.execute(
         text(
             """
@@ -18815,7 +19319,13 @@ def resolve_sponsor_agent_bank_account(payload: SponsorAgentBankResolvePayload):
 
 
 @router.put("/agent-payouts/account")
-def save_sponsor_agent_bank_account(payload: SponsorAgentBankAccountPayload, db: Session = Depends(get_db)):
+def save_sponsor_agent_bank_account(payload: SponsorAgentBankAccountPayload, request: Request, db: Session = Depends(get_db)):
+    _require_partner_session_for_user(
+        db,
+        request,
+        user_id=int(payload.user_id),
+        organization_id=int(payload.organization_id) if payload.organization_id is not None else None,
+    )
     user_row = _get_green_user_for_sponsor_agent(
         db,
         user_id=int(payload.user_id),
@@ -18902,11 +19412,18 @@ def save_sponsor_agent_bank_account(payload: SponsorAgentBankAccountPayload, db:
 
 @router.get("/agent-payouts/me")
 def get_sponsor_agent_payout_dashboard(
+    request: Request,
     user_id: int = Query(...),
     organization_id: int | None = Query(default=None),
     project_id: int | None = Query(default=None),
     db: Session = Depends(get_db),
 ):
+    _require_partner_session_for_user(
+        db,
+        request,
+        user_id=int(user_id),
+        organization_id=int(organization_id) if organization_id is not None else None,
+    )
     return _build_sponsor_agent_dashboard(
         db,
         user_id=int(user_id),
@@ -18917,6 +19434,12 @@ def get_sponsor_agent_payout_dashboard(
 
 @router.post("/agent-payouts/requests")
 def create_sponsor_agent_payout_request(payload: SponsorAgentPayoutRequestPayload, request: Request, db: Session = Depends(get_db)):
+    _require_partner_session_for_user(
+        db,
+        request,
+        user_id=int(payload.user_id),
+        organization_id=int(payload.organization_id) if payload.organization_id is not None else None,
+    )
     dashboard = _build_sponsor_agent_dashboard(
         db,
         user_id=int(payload.user_id),
@@ -19028,12 +19551,19 @@ def create_sponsor_agent_payout_request(payload: SponsorAgentPayoutRequestPayloa
 
 @router.get("/agent/sponsor-qr-tags")
 def list_agent_sponsor_qr_tags(
+    request: Request,
     project_id: int = Query(...),
     user_id: int = Query(...),
     organization_id: int | None = Query(default=None),
     sync: bool = Query(default=True),
     db: Session = Depends(get_db),
 ):
+    _require_partner_session_for_user(
+        db,
+        request,
+        user_id=int(user_id),
+        organization_id=int(organization_id) if organization_id is not None else None,
+    )
     _ensure_sponsor_qr_unit_columns(db)
     project_row, user_row, _selected_agent_ids = _ensure_public_sponsor_agent_project_access(
         db,
@@ -20832,7 +21362,10 @@ def review_admin_sponsor_agent_payout_request(
 async def sponsor_agent_payout_flutterwave_callback(request: Request, db: Session = Depends(get_db)):
     raw_body = await request.body()
     signature = request.headers.get("flutterwave-signature")
-    secret_hash_configured = bool(_flutterwave_secret_hash())
+    secret_hash = _flutterwave_secret_hash()
+    secret_hash_configured = bool(secret_hash)
+    if require_signed_flutterwave_webhooks() and not secret_hash_configured:
+        raise HTTPException(status_code=503, detail="Flutterwave webhook signing is not configured")
     if secret_hash_configured and not _verify_flutterwave_webhook_signature(raw_body, signature):
         raise HTTPException(status_code=401, detail="Invalid webhook signature")
     try:
@@ -24755,6 +25288,7 @@ def reset_user_password(
             SET user_uid = :user_uid,
                 work_username = :work_username,
                 work_password_hash = :work_password_hash,
+                last_password_change_at = NOW(),
                 updated_at = NOW()
             WHERE id = :user_id
             """
@@ -24821,6 +25355,7 @@ def reset_user_password(
 
 @router.post("/auth/change-password")
 def change_own_password(
+    request: Request,
     db: Session = Depends(get_db),
     user_id: int = Body(...),
     current_password: str = Body(...),
@@ -24831,6 +25366,7 @@ def change_own_password(
         user_id_value = int(user_id)
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid user id")
+    _require_partner_session_for_user(db, request, user_id=user_id_value, organization_id=None)
     if user_id_value <= 0:
         raise HTTPException(status_code=400, detail="Password change is not available for this account")
 
@@ -24884,6 +25420,7 @@ def change_own_password(
             """
             UPDATE green_users
             SET work_password_hash = :work_password_hash,
+                last_password_change_at = NOW(),
                 updated_at = NOW()
             WHERE id = :user_id
             """
@@ -24955,6 +25492,7 @@ def update_green_user_profile_photo(
 
 @router.post("/work-auth/login")
 def work_auth_login(
+    request: Request,
     db: Session = Depends(get_db),
     username: str = Body(...),
     password: str = Body(...),
@@ -24964,27 +25502,11 @@ def work_auth_login(
     if not username_clean:
         raise HTTPException(status_code=400, detail="Username is required")
 
-    # Preserve existing env-based admin login as a fallback.
-    env_username = str(os.getenv("WORK_USERNAME") or os.getenv("VITE_WORK_USERNAME") or "admin").strip()
-    env_password = str(os.getenv("WORK_PASSWORD") or os.getenv("VITE_WORK_PASSWORD") or "landcheckwork")
-    if username_clean == env_username and str(password or "") == env_password:
-        return {
-            "ok": True,
-            "auth_mode": "env_admin",
-            "user": {
-                "id": 0,
-                "user_uid": "SYS-ADMIN",
-                "full_name": "System Admin",
-                "role": "super_admin",
-                "role_key": "super_admin",
-                "role_name": "Super Admin",
-                "allow_work": True,
-                "allow_green": True,
-                "organization_id": None,
-                "organization_name": None,
-                "organization_logo_url": None,
-            },
-        }
+    env_credentials = get_env_admin_credentials()
+    if env_credentials and username_clean == env_credentials[0] and str(password or "") == env_credentials[1]:
+        response = _issue_env_admin_auth_response(db, request)
+        db.commit()
+        return response
 
     org_id_filter = int(organization_id) if organization_id is not None else None
     if org_id_filter is not None and org_id_filter <= 0:
@@ -24997,7 +25519,8 @@ def work_auth_login(
                 COALESCE(u.allow_green, TRUE) AS allow_green,
                 COALESCE(u.allow_work, FALSE) AS allow_work,
                 COALESCE(u.is_active, TRUE) AS is_active,
-                u.work_username, u.work_password_hash, u.profile_photo_url,
+                u.work_username, u.work_password_hash, u.profile_photo_url, u.email,
+                COALESCE(u.mfa_enabled, FALSE) AS mfa_enabled,
                 u.organization_id,
                 o.name AS organization_name, o.slug AS organization_slug, o.status AS organization_status,
                 COALESCE(o.is_active, TRUE) AS organization_is_active,
@@ -25031,35 +25554,14 @@ def work_auth_login(
         raise HTTPException(status_code=403, detail="This organization is suspended")
     if not _verify_password_value(password, user_row.get("work_password_hash")):
         raise HTTPException(status_code=401, detail="Invalid username or password")
-
-    return {
-        "ok": True,
-        "auth_mode": "partner_user",
-        "user": {
-            "id": int(user_row["id"]),
-            "user_uid": user_row.get("user_uid"),
-            "full_name": user_row.get("full_name"),
-            "role": user_row.get("role"),
-            "role_id": user_row.get("role_id"),
-            "role_uid": user_row.get("role_uid"),
-            "role_key": user_row.get("role_key") or user_row.get("role"),
-            "role_name": user_row.get("role_name") or user_row.get("role"),
-            "allow_work": bool(user_row.get("allow_work")),
-            "allow_green": bool(user_row.get("allow_green")),
-            "work_username": user_row.get("work_username"),
-            "organization_id": user_row.get("organization_id"),
-            "organization_name": user_row.get("organization_name"),
-            "organization_slug": user_row.get("organization_slug"),
-            "organization_status": user_row.get("organization_status"),
-            "organization_is_active": bool(user_row.get("organization_is_active", True)),
-            "organization_logo_url": _normalize_logo_asset_path(user_row.get("organization_logo_url")),
-            "profile_photo_url": _normalize_logo_asset_path(user_row.get("profile_photo_url")),
-        },
-    }
+    response = _issue_partner_auth_response(db, request, user_row=dict(user_row), app_mode="green_work")
+    db.commit()
+    return response
 
 
 @router.post("/green-auth/login")
 def green_auth_login(
+    request: Request,
     db: Session = Depends(get_db),
     username: str = Body(...),
     password: str = Body(...),
@@ -25069,27 +25571,11 @@ def green_auth_login(
     if not username_clean:
         raise HTTPException(status_code=400, detail="Username is required")
 
-    # Preserve env admin fallback for setup/support access.
-    env_username = str(os.getenv("WORK_USERNAME") or os.getenv("VITE_WORK_USERNAME") or "admin").strip()
-    env_password = str(os.getenv("WORK_PASSWORD") or os.getenv("VITE_WORK_PASSWORD") or "landcheckwork")
-    if username_clean == env_username and str(password or "") == env_password:
-        return {
-            "ok": True,
-            "auth_mode": "env_admin",
-            "user": {
-                "id": 0,
-                "user_uid": "SYS-ADMIN",
-                "full_name": "System Admin",
-                "role": "super_admin",
-                "role_key": "super_admin",
-                "role_name": "Super Admin",
-                "allow_work": True,
-                "allow_green": True,
-                "organization_id": None,
-                "organization_name": None,
-                "organization_logo_url": None,
-            },
-        }
+    env_credentials = get_env_admin_credentials()
+    if env_credentials and username_clean == env_credentials[0] and str(password or "") == env_credentials[1]:
+        response = _issue_env_admin_auth_response(db, request)
+        db.commit()
+        return response
 
     org_id_filter = int(organization_id) if organization_id is not None else None
     if org_id_filter is not None and org_id_filter <= 0:
@@ -25102,7 +25588,8 @@ def green_auth_login(
                 COALESCE(u.allow_green, TRUE) AS allow_green,
                 COALESCE(u.allow_work, FALSE) AS allow_work,
                 COALESCE(u.is_active, TRUE) AS is_active,
-                u.work_username, u.work_password_hash, u.profile_photo_url,
+                u.work_username, u.work_password_hash, u.profile_photo_url, u.email,
+                COALESCE(u.mfa_enabled, FALSE) AS mfa_enabled,
                 u.organization_id,
                 o.name AS organization_name, o.slug AS organization_slug, o.status AS organization_status,
                 COALESCE(o.is_active, TRUE) AS organization_is_active,
@@ -25136,30 +25623,9 @@ def green_auth_login(
         raise HTTPException(status_code=403, detail="This organization is suspended")
     if not _verify_password_value(password, user_row.get("work_password_hash")):
         raise HTTPException(status_code=401, detail="Invalid username or password")
-
-    return {
-        "ok": True,
-        "auth_mode": "partner_user",
-        "user": {
-            "id": int(user_row["id"]),
-            "user_uid": user_row.get("user_uid"),
-            "full_name": user_row.get("full_name"),
-            "role": user_row.get("role"),
-            "role_id": user_row.get("role_id"),
-            "role_uid": user_row.get("role_uid"),
-            "role_key": user_row.get("role_key") or user_row.get("role"),
-            "role_name": user_row.get("role_name") or user_row.get("role"),
-            "allow_work": bool(user_row.get("allow_work")),
-            "allow_green": bool(user_row.get("allow_green")),
-            "organization_id": user_row.get("organization_id"),
-            "organization_name": user_row.get("organization_name"),
-            "organization_slug": user_row.get("organization_slug"),
-            "organization_status": user_row.get("organization_status"),
-            "organization_is_active": bool(user_row.get("organization_is_active", True)),
-            "organization_logo_url": _normalize_logo_asset_path(user_row.get("organization_logo_url")),
-            "profile_photo_url": _normalize_logo_asset_path(user_row.get("profile_photo_url")),
-        },
-    }
+    response = _issue_partner_auth_response(db, request, user_row=dict(user_row), app_mode="green")
+    db.commit()
+    return response
 
 
 @router.post("/green-auth/forgot-password")
@@ -25253,7 +25719,9 @@ def green_auth_reset_password(payload: FieldResetPasswordPayload, db: Session = 
             UPDATE green_users
             SET work_password_hash = :password_hash,
                 password_reset_token_hash = NULL,
-                password_reset_token_expires_at = NULL
+                password_reset_token_expires_at = NULL,
+                last_password_change_at = NOW(),
+                updated_at = NOW()
             WHERE id = :user_id
             """
         ),
@@ -25283,9 +25751,16 @@ def field_public_reset_password(token: str = Query(default="")):
 @router.post("/mobile/push-tokens/register")
 def register_mobile_push_token(
     payload: MobilePushTokenPayload,
+    request: Request,
     db: Session = Depends(get_db),
 ):
     user_id = int(payload.user_id or 0)
+    _require_partner_session_for_user(
+        db,
+        request,
+        user_id=user_id,
+        organization_id=int(payload.organization_id) if payload.organization_id is not None else None,
+    )
     if user_id <= 0:
         raise HTTPException(status_code=400, detail="Valid user_id required")
     user_row = db.execute(
@@ -25330,8 +25805,17 @@ def register_mobile_push_token(
 @router.post("/mobile/push-tokens/deactivate")
 def deactivate_mobile_push_token(
     payload: MobilePushTokenDeactivatePayload,
+    request: Request,
     db: Session = Depends(get_db),
 ):
+    if payload.user_id is None:
+        raise HTTPException(status_code=400, detail="Valid user_id required")
+    _require_partner_session_for_user(
+        db,
+        request,
+        user_id=int(payload.user_id),
+        organization_id=None,
+    )
     token = _normalize_expo_push_token(payload.token)
     _deactivate_green_push_tokens(
         db,
@@ -25345,9 +25829,11 @@ def deactivate_mobile_push_token(
 @router.post("/sponsor/mobile/push-tokens/register")
 def register_sponsor_mobile_push_token(
     payload: SponsorPushTokenPayload,
+    request: Request,
     db: Session = Depends(get_db),
 ):
     sponsor_id = int(payload.sponsor_id or 0)
+    _require_sponsor_session_for_id(db, request, sponsor_id)
     if sponsor_id <= 0:
         raise HTTPException(status_code=400, detail="Valid sponsor_id required")
     sponsor_row = db.execute(
@@ -25381,8 +25867,12 @@ def register_sponsor_mobile_push_token(
 @router.post("/sponsor/mobile/push-tokens/deactivate")
 def deactivate_sponsor_mobile_push_token(
     payload: SponsorPushTokenDeactivatePayload,
+    request: Request,
     db: Session = Depends(get_db),
 ):
+    if payload.sponsor_id is None:
+        raise HTTPException(status_code=400, detail="Valid sponsor_id required")
+    _require_sponsor_session_for_id(db, request, int(payload.sponsor_id))
     token = _normalize_sponsor_push_token(payload.token)
     _deactivate_green_sponsor_push_tokens(
         db,

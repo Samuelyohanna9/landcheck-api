@@ -9,6 +9,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from app.db import SessionLocal, engine
+from app.utils.auth_security import AuthSessionContext
 
 _ACTIVITY_LOG_SCHEMA_READY = False
 _ACTIVITY_LOG_SCHEMA_LOCK = Lock()
@@ -160,9 +161,10 @@ def classify_request_source(request: Request) -> str:
 
 
 def request_is_super_admin(request: Request) -> bool:
-    auth_mode = str(request.headers.get("X-LC-Auth-Mode") or "").strip().lower()
-    role_key = str(request.headers.get("X-LC-Role-Key") or "").strip().lower()
-    return auth_mode == "env_admin" or role_key == "super_admin"
+    session = getattr(request.state, "landcheck_session", None)
+    if isinstance(session, AuthSessionContext):
+        return session.is_super_admin
+    return False
 
 
 def require_super_admin_request(request: Request) -> None:
@@ -210,6 +212,12 @@ def build_request_log_details(
     error_message: str | None = None,
 ) -> dict[str, Any]:
     path = str(request.url.path or "").strip()
+    session = getattr(request.state, "landcheck_session", None)
+    session_auth_mode = session.auth_mode if isinstance(session, AuthSessionContext) else None
+    session_app_mode = session.app_mode if isinstance(session, AuthSessionContext) else None
+    session_role_key = session.role_key if isinstance(session, AuthSessionContext) else None
+    session_user_id = session.user_id if isinstance(session, AuthSessionContext) else None
+    session_organization_id = session.organization_id if isinstance(session, AuthSessionContext) else None
     return {
         "product": classify_request_source(request),
         "client": _request_client_label(request),
@@ -218,11 +226,12 @@ def build_request_log_details(
         "query": _request_query_payload(request),
         "status_code": int(status_code),
         "duration_ms": round(float(duration_ms), 2),
-        "auth_mode": _normalize_text(request.headers.get("X-LC-Auth-Mode"), 80),
-        "app_mode": _normalize_text(request.headers.get("X-LC-Session-App-Mode"), 80),
-        "role_key": _normalize_text(request.headers.get("X-LC-Role-Key"), 120),
-        "user_id": _normalize_text(request.headers.get("X-LC-User-Id"), 80),
-        "organization_id": _normalize_text(request.headers.get("X-LC-Organization-Id"), 80),
+        "auth_mode": _normalize_text(session_auth_mode or request.headers.get("X-LC-Auth-Mode"), 80),
+        "app_mode": _normalize_text(session_app_mode or request.headers.get("X-LC-Session-App-Mode"), 80),
+        "role_key": _normalize_text(session_role_key or request.headers.get("X-LC-Role-Key"), 120),
+        "user_id": _normalize_text(session_user_id or request.headers.get("X-LC-User-Id"), 80),
+        "organization_id": _normalize_text(session_organization_id or request.headers.get("X-LC-Organization-Id"), 80),
+        "session_uid": _normalize_text(session.session_uid, 120) if isinstance(session, AuthSessionContext) else None,
         "route_path": _normalize_text(request.headers.get("X-LC-App-Route"), 200),
         "ip_address": _request_ip(request),
         "user_agent": _normalize_text(request.headers.get("user-agent"), 500),
@@ -243,6 +252,7 @@ def log_request_activity(
     try:
         path = str(request.url.path or "").strip()
         method = str(request.method or "").upper()
+        session = getattr(request.state, "landcheck_session", None)
         details = build_request_log_details(
             request,
             status_code=status_code,
@@ -253,7 +263,13 @@ def log_request_activity(
             db,
             source=classify_request_source(request),
             event_type="request_completed" if int(status_code) < 400 else "request_failed",
-            actor=resolve_actor_label(_normalize_text(request.headers.get("X-LC-User-Name"), 255), details),
+            actor=resolve_actor_label(
+                _normalize_text(
+                    session.display_name if isinstance(session, AuthSessionContext) else request.headers.get("X-LC-User-Name"),
+                    255,
+                ),
+                details,
+            ),
             message=f"{method} {path} -> {int(status_code)}",
             details=details,
         )

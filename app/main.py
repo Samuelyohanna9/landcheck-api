@@ -2,13 +2,16 @@
 import os
 from time import perf_counter
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware  # Added for speed
+from fastapi.responses import JSONResponse
 
+from app.db import SessionLocal
 from app.routers import health, plots, analytics, feedback, hazards, green
 from app.db_init import init_db
 from app.utils.activity_logger import ensure_activity_log_table, log_request_activity, should_skip_request_logging
+from app.utils.auth_security import resolve_request_session
 
 app = FastAPI(title="LandCheck API")
 
@@ -57,6 +60,18 @@ def _should_log_request_activity(request: Request, *, status_code: int, duration
     if method != "GET":
         return True
     return float(duration_ms) >= float(REQUEST_ACTIVITY_LOG_SLOW_MS)
+
+
+_GREEN_ADMIN_PUBLIC_CALLBACKS = {
+    "/green/admin/sponsor-agent-payouts/flutterwave/callback",
+}
+
+
+def _requires_super_admin_session(request: Request) -> bool:
+    clean_path = str(request.url.path or "").strip().lower()
+    if clean_path in _GREEN_ADMIN_PUBLIC_CALLBACKS:
+        return False
+    return clean_path.startswith("/green/admin/")
 
 # ✅ Create tables on startup
 @app.on_event("startup")
@@ -109,13 +124,34 @@ app.add_middleware(
 @app.middleware("http")
 async def capture_system_activity(request: Request, call_next):
     started_at = perf_counter()
+    session_db = SessionLocal()
     try:
+        try:
+            resolve_request_session(session_db, request)
+        except Exception:
+            session_db.rollback()
+        if _requires_super_admin_session(request):
+            session = getattr(request.state, "landcheck_session", None)
+            if session is None:
+                raise HTTPException(status_code=401, detail="Authentication required")
+            if not bool(getattr(session, "is_super_admin", False)):
+                raise HTTPException(status_code=403, detail="Super Admin access is required for this action.")
         response = await call_next(request)
+    except HTTPException as exc:
+        duration_ms = (perf_counter() - started_at) * 1000
+        if _should_log_request_activity(request, status_code=exc.status_code, duration_ms=duration_ms):
+            log_request_activity(request, status_code=exc.status_code, duration_ms=duration_ms, error_message=str(exc.detail))
+        return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
     except Exception as exc:
         duration_ms = (perf_counter() - started_at) * 1000
         if _should_log_request_activity(request, status_code=500, duration_ms=duration_ms):
             log_request_activity(request, status_code=500, duration_ms=duration_ms, error_message=str(exc))
         raise
+    finally:
+        try:
+            session_db.close()
+        except Exception:
+            pass
     duration_ms = (perf_counter() - started_at) * 1000
     if _should_log_request_activity(request, status_code=response.status_code, duration_ms=duration_ms):
         log_request_activity(request, status_code=response.status_code, duration_ms=duration_ms)
