@@ -1,6 +1,6 @@
 # LandCheck Compliance Pack
 
-This directory contains the operational, governance, and evidence templates required to move LandCheck from technical security hardening toward audit readiness for:
+ toward audit readiness for:
 
 - SOC 2 Type I readiness
 - SOC 2 Type II evidence collection
@@ -64,10 +64,3 @@ This pack is designed for the LandCheck platform, including:
 5. Start monthly evidence logging in `registers/monthly-evidence-log.csv`
 6. Run a restore test and record it in `registers/backup-restore-test-log.csv`
 7. Run a privileged-user access review and record it in `registers/access-review-register.csv`
-
-## Important Notes
-
-- These files do not themselves create compliance. They are the operating pack needed to run the controls.
-- Evidence must be maintained continuously for SOC 2 Type II.
-- ISO 27001 certification will still require a formal ISMS scope decision, internal audit, management review, and external audit.
-- If this repository is public, keep only blank templates here. Store filled registers, evidence logs, incident records, and restore evidence in a private workspace, not in public GitHub.
