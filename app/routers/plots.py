@@ -1,6 +1,6 @@
 # app/routers/plots.py
 
-from fastapi import APIRouter, Depends, Body, HTTPException, BackgroundTasks, Query
+from fastapi import APIRouter, Depends, Body, HTTPException, BackgroundTasks, Query, Request
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 from geoalchemy2.shape import from_shape
@@ -24,6 +24,8 @@ import json
 import hashlib
 import math
 import textwrap
+import uuid
+import threading
 from threading import Lock
 import matplotlib
 matplotlib.use("Agg")
@@ -69,6 +71,7 @@ PREVIEW_CACHE_MAX_FILES_PER_PLOT = max(5, int(os.getenv("PLOT_PREVIEW_CACHE_MAX_
 PREVIEW_LAYOUT_VERSION = "survey_layout_2026_03_23_clockwise_v84"
 SURVEY_REPORT_RENDER_VERSION = "survey_report_2026_03_23_clockwise_v1"
 CLEAN_COPY_RENDER_VERSION = "clean_copy_2026_03_20_layout_v14"
+PLOT_EXPORT_JOB_STATUS_VALUES = {"queued", "running", "completed", "failed"}
 
 
 class PlotGeometryUpdateRequest(BaseModel):
@@ -123,6 +126,7 @@ def ensure_plots_schema_once(db: Session):
         ensure_plot_meta_table(db)
         ensure_plot_feature_overrides_table(db)
         ensure_plot_subdivision_tables(db)
+        ensure_plot_export_jobs_table(db)
         ensure_plot_query_indexes(db)
         _PLOTS_SCHEMA_READY = True
 
@@ -357,6 +361,38 @@ def ensure_plot_subdivision_tables(db: Session):
         "CREATE INDEX IF NOT EXISTS idx_plot_meta_subdivision_batch ON plot_meta(subdivision_batch_id)",
     ]
     for ddl in index_sql:
+        try:
+            db.execute(text(ddl))
+        except Exception:
+            pass
+    db.commit()
+
+
+def ensure_plot_export_jobs_table(db: Session):
+    db.execute(
+        text(
+            """
+            CREATE TABLE IF NOT EXISTS plot_export_jobs (
+                id TEXT PRIMARY KEY,
+                export_type TEXT NOT NULL,
+                plot_id INTEGER REFERENCES plots(id) ON DELETE CASCADE,
+                subdivision_batch_id INTEGER REFERENCES plot_subdivision_batches(id) ON DELETE CASCADE,
+                status TEXT NOT NULL DEFAULT 'queued',
+                file_name TEXT,
+                local_path TEXT,
+                error_text TEXT,
+                started_at TIMESTAMP,
+                completed_at TIMESTAMP,
+                created_at TIMESTAMP DEFAULT NOW(),
+                updated_at TIMESTAMP DEFAULT NOW()
+            )
+            """
+        )
+    )
+    for ddl in [
+        "CREATE INDEX IF NOT EXISTS idx_plot_export_jobs_status_created ON plot_export_jobs(status, created_at DESC)",
+        "CREATE INDEX IF NOT EXISTS idx_plot_export_jobs_batch_created ON plot_export_jobs(subdivision_batch_id, created_at DESC)",
+    ]:
         try:
             db.execute(text(ddl))
         except Exception:
@@ -2405,12 +2441,7 @@ def get_plot_subdivision_batch(batch_id: int, include_geojson: bool = Query(Fals
     }
 
 
-@router.get("/subdivision/batches/{batch_id}/export/survey-plans.zip")
-def export_subdivision_batch_survey_plans(
-    batch_id: int,
-    db: Session = Depends(get_db),
-    background_tasks: BackgroundTasks = None,
-):
+def _get_subdivision_batch_export_context(db: Session, batch_id: int) -> dict[str, Any]:
     batch_row = db.execute(
         text(
             """
@@ -2443,12 +2474,25 @@ def export_subdivision_batch_survey_plans(
     cache_dir = os.path.join(REPORTS_DIR, "subdivision_batches")
     os.makedirs(cache_dir, exist_ok=True)
     cached_zip_path = os.path.join(cache_dir, zip_name)
+    return {
+        "batch": dict(batch_row),
+        "items": [dict(item) for item in items],
+        "zip_name": zip_name,
+        "cached_zip_path": cached_zip_path,
+    }
+
+
+def _generate_subdivision_batch_zip(
+    db: Session,
+    *,
+    batch_id: int,
+    items: list[dict[str, Any]],
+    zip_name: str,
+    cached_zip_path: str,
+    require_cached_copy: bool = False,
+) -> tuple[str, str | None]:
     if os.path.isfile(cached_zip_path):
-        return FileResponse(
-            cached_zip_path,
-            media_type="application/zip",
-            filename=zip_name,
-        )
+        return cached_zip_path, None
 
     tmp_dir = tempfile.mkdtemp(prefix=f"subdivision_batch_{batch_id}_")
     export_rows: list[list[str]] = [["sep=,"], ["lot_no", "child_plot_id", "area_m2"]]
@@ -2499,7 +2543,11 @@ def export_subdivision_batch_survey_plans(
                         if len(coords_wgs) >= 2 and coords_wgs[0] == coords_wgs[-1]:
                             coords_wgs = coords_wgs[:-1]
                         utm_epsg = _metric_epsg_for_wgs84_polygon(geom_obj)
-                        metric_poly = gpd.GeoDataFrame(geometry=[geom_obj], crs="EPSG:4326").to_crs(epsg=utm_epsg).geometry.iloc[0]
+                        metric_poly = (
+                            gpd.GeoDataFrame(geometry=[geom_obj], crs="EPSG:4326")
+                            .to_crs(epsg=utm_epsg)
+                            .geometry.iloc[0]
+                        )
                         coords_metric = list(metric_poly.exterior.coords)
                         if len(coords_metric) >= 2 and coords_metric[0] == coords_metric[-1]:
                             coords_metric = coords_metric[:-1]
@@ -2531,7 +2579,6 @@ def export_subdivision_batch_survey_plans(
                                 str(int(utm_epsg)),
                             ])
             except Exception:
-                # Continue export even if setting-out rows for one lot fail.
                 pass
 
         manifest_path = os.path.join(tmp_dir, "batch_manifest.csv")
@@ -2555,6 +2602,7 @@ def export_subdivision_batch_survey_plans(
                 lineterminator="\n",
             )
             writer.writerows(setting_out_rows)
+
         setting_out_raw_path = os.path.join(tmp_dir, "setting_out_points_dgps_raw.csv")
         with open(setting_out_raw_path, "w", encoding="utf-8", newline="") as f:
             writer = csv.writer(
@@ -2567,7 +2615,6 @@ def export_subdivision_batch_survey_plans(
             writer.writerows(setting_out_rows_raw)
 
         zip_path = os.path.join(tmp_dir, zip_name)
-
         with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
             zf.write(manifest_path, arcname="batch_manifest.csv")
             zf.write(setting_out_path, arcname="setting_out_points_dgps.csv")
@@ -2575,27 +2622,326 @@ def export_subdivision_batch_survey_plans(
             for fp in pdf_files:
                 if os.path.isfile(fp):
                     zf.write(fp, arcname=os.path.basename(fp))
+
         try:
             shutil.copyfile(zip_path, cached_zip_path)
-        except Exception:
-            pass
-
-        if background_tasks is None:
-            background_tasks = BackgroundTasks()
-        background_tasks.add_task(safe_rmtree, tmp_dir)
-
-        return FileResponse(
-            zip_path,
-            media_type="application/zip",
-            filename=zip_name,
-            background=background_tasks,
-        )
+            safe_rmtree(tmp_dir)
+            return cached_zip_path, None
+        except Exception as exc:
+            if require_cached_copy:
+                safe_rmtree(tmp_dir)
+                raise HTTPException(status_code=500, detail=f"Failed to persist subdivision batch export: {exc}") from exc
+            return zip_path, tmp_dir
     except HTTPException:
         safe_rmtree(tmp_dir)
         raise
     except Exception as exc:
         safe_rmtree(tmp_dir)
-        raise HTTPException(status_code=500, detail=f"Failed to export subdivision batch: {exc}")
+        raise HTTPException(status_code=500, detail=f"Failed to export subdivision batch: {exc}") from exc
+
+
+def _get_plot_export_job(db: Session, job_id: str) -> dict[str, Any] | None:
+    row = db.execute(
+        text(
+            """
+            SELECT
+                id,
+                export_type,
+                plot_id,
+                subdivision_batch_id,
+                status,
+                file_name,
+                local_path,
+                error_text,
+                started_at,
+                completed_at,
+                created_at,
+                updated_at
+            FROM plot_export_jobs
+            WHERE id = :job_id
+            LIMIT 1
+            """
+        ),
+        {"job_id": str(job_id)},
+    ).mappings().first()
+    return dict(row) if row else None
+
+
+def _set_plot_export_job_status(
+    db: Session,
+    job_id: str,
+    *,
+    status: str,
+    local_path: str | None = None,
+    file_name: str | None = None,
+    error_text: str | None = None,
+    started: bool = False,
+    completed: bool = False,
+):
+    if status not in PLOT_EXPORT_JOB_STATUS_VALUES:
+        raise ValueError(f"Unsupported plot export job status: {status}")
+    updates = ["status = :status", "updated_at = NOW()"]
+    params: dict[str, Any] = {"job_id": str(job_id), "status": status}
+    if started:
+        updates.append("started_at = COALESCE(started_at, NOW())")
+    if completed:
+        updates.append("completed_at = NOW()")
+    if local_path is not None:
+        updates.append("local_path = :local_path")
+        params["local_path"] = local_path
+    if file_name is not None:
+        updates.append("file_name = :file_name")
+        params["file_name"] = file_name
+    if error_text is not None:
+        updates.append("error_text = :error_text")
+        params["error_text"] = error_text
+    db.execute(text(f"UPDATE plot_export_jobs SET {', '.join(updates)} WHERE id = :job_id"), params)
+    db.commit()
+
+
+def _serialize_plot_export_job(job: dict[str, Any], request: Request | None = None) -> dict[str, Any]:
+    item = dict(job)
+    download_url: str | None = None
+    if str(item.get("status") or "").strip().lower() == "completed":
+        if request is not None:
+            try:
+                download_url = str(request.url_for("download_plot_export_job", job_id=str(item.get("id") or "")))
+            except Exception:
+                download_url = None
+        if not download_url:
+            download_url = f"/plots/export-jobs/{str(item.get('id') or '').strip()}/download"
+    item["download_url"] = download_url
+    return item
+
+
+def _run_subdivision_batch_export_job(job_id: str):
+    db = SessionLocal()
+    try:
+        job = _get_plot_export_job(db, job_id)
+        if not job:
+            return
+        batch_id = int(job.get("subdivision_batch_id") or 0)
+        if batch_id <= 0:
+            raise RuntimeError("Subdivision batch export job is missing a batch id.")
+        _set_plot_export_job_status(db, job_id, status="running", started=True, error_text="")
+        context = _get_subdivision_batch_export_context(db, batch_id)
+        export_path, _cleanup_dir = _generate_subdivision_batch_zip(
+            db,
+            batch_id=batch_id,
+            items=context["items"],
+            zip_name=context["zip_name"],
+            cached_zip_path=context["cached_zip_path"],
+            require_cached_copy=True,
+        )
+        _set_plot_export_job_status(
+            db,
+            job_id,
+            status="completed",
+            local_path=export_path,
+            file_name=context["zip_name"],
+            error_text="",
+            completed=True,
+        )
+    except Exception as exc:
+        try:
+            _set_plot_export_job_status(db, job_id, status="failed", error_text=str(exc), completed=True)
+        except Exception:
+            db.rollback()
+    finally:
+        db.close()
+
+
+@router.get("/subdivision/batches/{batch_id}/export/survey-plans.zip")
+def export_subdivision_batch_survey_plans(
+    batch_id: int,
+    db: Session = Depends(get_db),
+    background_tasks: BackgroundTasks = None,
+):
+    context = _get_subdivision_batch_export_context(db, batch_id)
+    served_path, cleanup_dir = _generate_subdivision_batch_zip(
+        db,
+        batch_id=batch_id,
+        items=context["items"],
+        zip_name=context["zip_name"],
+        cached_zip_path=context["cached_zip_path"],
+        require_cached_copy=False,
+    )
+    served_background = background_tasks
+    if cleanup_dir:
+        if served_background is None:
+            served_background = BackgroundTasks()
+        served_background.add_task(safe_rmtree, cleanup_dir)
+    return FileResponse(
+        served_path,
+        media_type="application/zip",
+        filename=context["zip_name"],
+        background=served_background,
+    )
+
+
+@router.post("/subdivision/batches/{batch_id}/export-jobs/survey-plans")
+def create_subdivision_batch_export_job(
+    batch_id: int,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    context = _get_subdivision_batch_export_context(db, batch_id)
+    existing = db.execute(
+        text(
+            """
+            SELECT
+                id,
+                export_type,
+                plot_id,
+                subdivision_batch_id,
+                status,
+                file_name,
+                local_path,
+                error_text,
+                started_at,
+                completed_at,
+                created_at,
+                updated_at
+            FROM plot_export_jobs
+            WHERE export_type = 'subdivision_batch_survey_plans'
+              AND subdivision_batch_id = :batch_id
+              AND status IN ('queued', 'running')
+            ORDER BY created_at DESC
+            LIMIT 1
+            """
+        ),
+        {"batch_id": int(batch_id)},
+    ).mappings().first()
+    if existing:
+        return _serialize_plot_export_job(dict(existing), request=request)
+
+    job_id = uuid.uuid4().hex
+    if os.path.isfile(context["cached_zip_path"]):
+        db.execute(
+            text(
+                """
+                INSERT INTO plot_export_jobs (
+                    id,
+                    export_type,
+                    plot_id,
+                    subdivision_batch_id,
+                    status,
+                    file_name,
+                    local_path,
+                    started_at,
+                    completed_at,
+                    created_at,
+                    updated_at
+                )
+                VALUES (
+                    :id,
+                    'subdivision_batch_survey_plans',
+                    :plot_id,
+                    :batch_id,
+                    'completed',
+                    :file_name,
+                    :local_path,
+                    NOW(),
+                    NOW(),
+                    NOW(),
+                    NOW()
+                )
+                """
+            ),
+            {
+                "id": job_id,
+                "plot_id": int(context["batch"].get("parent_plot_id") or 0) or None,
+                "batch_id": int(batch_id),
+                "file_name": context["zip_name"],
+                "local_path": context["cached_zip_path"],
+            },
+        )
+        db.commit()
+        job = _get_plot_export_job(db, job_id)
+        return _serialize_plot_export_job(job or {"id": job_id, "status": "completed"}, request=request)
+
+    db.execute(
+        text(
+            """
+            INSERT INTO plot_export_jobs (
+                id,
+                export_type,
+                plot_id,
+                subdivision_batch_id,
+                status,
+                file_name,
+                created_at,
+                updated_at
+            )
+            VALUES (
+                :id,
+                'subdivision_batch_survey_plans',
+                :plot_id,
+                :batch_id,
+                'queued',
+                :file_name,
+                NOW(),
+                NOW()
+            )
+            """
+        ),
+        {
+            "id": job_id,
+            "plot_id": int(context["batch"].get("parent_plot_id") or 0) or None,
+            "batch_id": int(batch_id),
+            "file_name": context["zip_name"],
+        },
+    )
+    db.commit()
+    threading.Thread(target=_run_subdivision_batch_export_job, args=(job_id,), daemon=True).start()
+    job = _get_plot_export_job(db, job_id)
+    return _serialize_plot_export_job(job or {"id": job_id, "status": "queued"}, request=request)
+
+
+@router.get("/export-jobs/{job_id}")
+def get_plot_export_job_status(
+    job_id: str,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    job = _get_plot_export_job(db, job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Plot export job not found.")
+    return _serialize_plot_export_job(job, request=request)
+
+
+@router.get("/export-jobs/{job_id}/download", name="download_plot_export_job")
+def download_plot_export_job(
+    job_id: str,
+    db: Session = Depends(get_db),
+):
+    job = _get_plot_export_job(db, job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Plot export job not found.")
+    if str(job.get("status") or "").strip().lower() != "completed":
+        raise HTTPException(status_code=409, detail="Plot export job is not finished yet.")
+
+    local_path = str(job.get("local_path") or "").strip()
+    file_name = str(job.get("file_name") or "").strip() or "plot_export.zip"
+    if (not local_path or not os.path.isfile(local_path)) and int(job.get("subdivision_batch_id") or 0) > 0:
+        context = _get_subdivision_batch_export_context(db, int(job.get("subdivision_batch_id") or 0))
+        if os.path.isfile(context["cached_zip_path"]):
+            local_path = context["cached_zip_path"]
+            file_name = context["zip_name"]
+            _set_plot_export_job_status(
+                db,
+                job_id,
+                status="completed",
+                local_path=local_path,
+                file_name=file_name,
+            )
+    if not local_path or not os.path.isfile(local_path):
+        raise HTTPException(status_code=404, detail="Export file is no longer available.")
+    return FileResponse(
+        local_path,
+        media_type="application/zip",
+        filename=file_name,
+    )
 
 
 @router.post("/subdivision/batches/{batch_id}/export/clean-copy.pdf")

@@ -95,6 +95,7 @@ _GREEN_SCHEMA_ADVISORY_LOCK_ID = 903670421
 BASE_DIR = os.path.dirname(os.path.dirname(__file__))
 REPORTS_DIR = os.path.join(BASE_DIR, "reports", "green")
 EXPO_PUSH_SEND_URL = "https://exp.host/--/api/v2/push/send"
+REMOTE_MONITORING_CACHE_SCHEMA_VERSION = "remote_monitoring_v1"
 LIVE_SOURCE_REFERENCES = [
     {
         "label": "FAO - Forest restoration monitoring and maintenance sequence",
@@ -4967,7 +4968,7 @@ def _is_remote_monitoring_schema_error(exc: Exception) -> bool:
     if not message:
         return False
     return (
-        "green_remote_monitoring_areas" in message
+        ("green_remote_monitoring_areas" in message or "green_remote_monitoring_cache" in message)
         and (
             "does not exist" in message
             or "undefinedtable" in message
@@ -7042,6 +7043,16 @@ def ensure_green_tables(db: Session):
             updated_at TIMESTAMP DEFAULT NOW()
         )
     """))
+    db.execute(text("""
+        CREATE TABLE IF NOT EXISTS green_remote_monitoring_cache (
+            cache_key TEXT PRIMARY KEY,
+            project_id INTEGER NOT NULL REFERENCES tree_projects(id) ON DELETE CASCADE,
+            area_id INTEGER REFERENCES green_remote_monitoring_areas(id) ON DELETE CASCADE,
+            payload JSONB NOT NULL,
+            created_at TIMESTAMP DEFAULT NOW(),
+            updated_at TIMESTAMP DEFAULT NOW()
+        )
+    """))
     db.execute(text("ALTER TABLE green_export_jobs ADD COLUMN IF NOT EXISTS lng DOUBLE PRECISION"))
     db.execute(text("ALTER TABLE green_export_jobs ADD COLUMN IF NOT EXISTS lat DOUBLE PRECISION"))
     db.execute(text("ALTER TABLE green_export_jobs ADD COLUMN IF NOT EXISTS zoom DOUBLE PRECISION"))
@@ -7092,6 +7103,8 @@ def ensure_green_tables(db: Session):
     db.execute(text("CREATE INDEX IF NOT EXISTS idx_green_export_jobs_status_created ON green_export_jobs(status, created_at DESC)"))
     db.execute(text("CREATE INDEX IF NOT EXISTS idx_green_export_jobs_project_created ON green_export_jobs(project_id, created_at DESC)"))
     db.execute(text("CREATE INDEX IF NOT EXISTS idx_green_remote_monitoring_project_created ON green_remote_monitoring_areas(project_id, created_at DESC)"))
+    db.execute(text("CREATE INDEX IF NOT EXISTS idx_green_remote_monitoring_cache_project_updated ON green_remote_monitoring_cache(project_id, updated_at DESC)"))
+    db.execute(text("CREATE INDEX IF NOT EXISTS idx_green_remote_monitoring_cache_area_updated ON green_remote_monitoring_cache(area_id, updated_at DESC)"))
     db.execute(text("CREATE INDEX IF NOT EXISTS idx_tree_projects_model ON tree_projects(planting_model)"))
     db.execute(text("CREATE INDEX IF NOT EXISTS idx_tree_projects_workflow_profile ON tree_projects(workflow_profile)"))
     db.execute(text("CREATE INDEX IF NOT EXISTS idx_tree_projects_access_model ON tree_projects(access_model, public_sponsor_enabled)"))
@@ -30511,6 +30524,184 @@ def _get_remote_monitoring_area_row(db: Session, *, area_id: int, project_id: in
     return _run_remote_monitoring_query(db, query, params).mappings().first()
 
 
+def _serialize_remote_monitoring_tree_snapshot_rows(tree_rows: list[dict] | None) -> list[dict]:
+    snapshot_rows: list[dict] = []
+    for item in tree_rows or []:
+        created_at_value = item.get("created_at")
+        if hasattr(created_at_value, "isoformat"):
+            created_at_value = created_at_value.isoformat()
+        elif created_at_value is None:
+            created_at_value = ""
+        else:
+            created_at_value = str(created_at_value)
+        snapshot_rows.append(
+            {
+                "id": int(item.get("id") or 0),
+                "project_tree_no": int(item.get("project_tree_no") or 0) if item.get("project_tree_no") is not None else None,
+                "species": str(item.get("species") or "").strip().lower(),
+                "planting_date": str(item.get("planting_date") or ""),
+                "status": str(item.get("status") or "").strip().lower(),
+                "tree_origin": str(item.get("tree_origin") or "").strip().lower(),
+                "created_by": str(item.get("created_by") or "").strip().lower(),
+                "created_at": created_at_value,
+                "inventory_tree_count": int(item.get("inventory_tree_count") or 1),
+                "lng": round(float(item.get("lng") or 0.0), 7) if item.get("lng") is not None else None,
+                "lat": round(float(item.get("lat") or 0.0), 7) if item.get("lat") is not None else None,
+            }
+        )
+    return snapshot_rows
+
+
+def _build_remote_monitoring_cache_key(
+    *,
+    project_id: int,
+    area_id: int | None,
+    area_geojson: dict,
+    area_sqm: float | None,
+    baseline_date: date | datetime | str | None,
+    series_months: int,
+    summary_window_days: int,
+    tree_counts: dict[str, int],
+    tree_rows: list[dict] | None,
+) -> str:
+    baseline_value = baseline_date.isoformat() if hasattr(baseline_date, "isoformat") else str(baseline_date or "")
+    signature_payload = {
+        "schema_version": REMOTE_MONITORING_CACHE_SCHEMA_VERSION,
+        "cache_day": date.today().isoformat(),
+        "project_id": int(project_id),
+        "area_id": int(area_id) if area_id else None,
+        "area_geojson": area_geojson,
+        "area_sqm": round(float(area_sqm or 0.0), 2) if area_sqm is not None else None,
+        "baseline_date": baseline_value,
+        "series_months": max(1, min(int(series_months or 6), 12)),
+        "summary_window_days": max(30, min(int(summary_window_days or 90), 180)),
+        "tree_counts": {
+            "tree_record_count": int(tree_counts.get("tree_record_count") or 0),
+            "tree_count": int(tree_counts.get("tree_count") or 0),
+            "new_planting_tree_count": int(tree_counts.get("new_planting_tree_count") or 0),
+            "existing_inventory_tree_count": int(tree_counts.get("existing_inventory_tree_count") or 0),
+            "other_tree_count": int(tree_counts.get("other_tree_count") or 0),
+        },
+        "tree_rows": _serialize_remote_monitoring_tree_snapshot_rows(tree_rows),
+    }
+    signature_text = json.dumps(signature_payload, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(signature_text.encode("utf-8")).hexdigest()
+
+
+def _get_remote_monitoring_cached_report(db: Session, *, cache_key: str) -> dict | None:
+    row = _run_remote_monitoring_query(
+        db,
+        """
+        SELECT payload
+        FROM green_remote_monitoring_cache
+        WHERE cache_key = :cache_key
+        LIMIT 1
+        """,
+        {"cache_key": str(cache_key)},
+    ).mappings().first()
+    if not row:
+        return None
+    payload = row.get("payload")
+    if isinstance(payload, str):
+        try:
+            payload = json.loads(payload)
+        except Exception:
+            payload = None
+    return payload if isinstance(payload, dict) else None
+
+
+def _store_remote_monitoring_cached_report(
+    db: Session,
+    *,
+    cache_key: str,
+    project_id: int,
+    area_id: int | None,
+    payload: dict,
+):
+    _run_remote_monitoring_query(
+        db,
+        """
+        INSERT INTO green_remote_monitoring_cache (
+            cache_key,
+            project_id,
+            area_id,
+            payload,
+            created_at,
+            updated_at
+        )
+        VALUES (
+            :cache_key,
+            :project_id,
+            :area_id,
+            CAST(:payload AS JSONB),
+            NOW(),
+            NOW()
+        )
+        ON CONFLICT (cache_key) DO UPDATE
+        SET payload = EXCLUDED.payload,
+            project_id = EXCLUDED.project_id,
+            area_id = EXCLUDED.area_id,
+            updated_at = NOW()
+        """,
+        {
+            "cache_key": str(cache_key),
+            "project_id": int(project_id),
+            "area_id": int(area_id) if area_id else None,
+            "payload": _safe_json(payload),
+        },
+    )
+    db.commit()
+
+
+def _get_or_compute_remote_monitoring_report(
+    db: Session,
+    *,
+    project_id: int,
+    area_geojson: dict,
+    area_sqm: float | None,
+    baseline_date: date | datetime | str | None = None,
+    area_id: int | None = None,
+    tree_counts: dict[str, int],
+    tree_rows: list[dict] | None,
+    series_months: int = 6,
+    summary_window_days: int = 90,
+    refresh: bool = False,
+) -> dict:
+    cache_key = _build_remote_monitoring_cache_key(
+        project_id=project_id,
+        area_id=area_id,
+        area_geojson=area_geojson,
+        area_sqm=area_sqm,
+        baseline_date=baseline_date,
+        series_months=series_months,
+        summary_window_days=summary_window_days,
+        tree_counts=tree_counts,
+        tree_rows=tree_rows,
+    )
+    if not refresh:
+        cached_report = _get_remote_monitoring_cached_report(db, cache_key=cache_key)
+        if cached_report:
+            return cached_report
+
+    report = compute_remote_monitoring_report(
+        boundary_geojson=area_geojson,
+        tree_count=int(tree_counts.get("tree_count") or 0),
+        tree_items=tree_rows or [],
+        polygon_area_sqm=area_sqm,
+        baseline_date=baseline_date,
+        series_months=series_months,
+        summary_window_days=summary_window_days,
+    )
+    _store_remote_monitoring_cached_report(
+        db,
+        cache_key=cache_key,
+        project_id=project_id,
+        area_id=area_id,
+        payload=report,
+    )
+    return report
+
+
 @router.get("/remote-monitoring/areas")
 @router.get("/vegetation-areas")
 def list_remote_monitoring_areas(
@@ -30537,6 +30728,7 @@ def analyze_remote_monitoring_area(
     payload: VegetationAnalysisPayload,
     series_months: int = Query(default=6, ge=1, le=12),
     summary_window_days: int = Query(default=90, ge=30, le=180),
+    refresh: bool = Query(default=False),
     db: Session = Depends(get_db),
 ):
     project_id = int(payload.project_id)
@@ -30549,13 +30741,16 @@ def analyze_remote_monitoring_area(
     tree_counts = _count_trees_in_geojson(db, project_id=project_id, area_geojson=normalized_area_geojson)
     tree_rows = _list_trees_in_geojson(db, project_id=project_id, area_geojson=normalized_area_geojson)
     try:
-        report = compute_remote_monitoring_report(
-            boundary_geojson=normalized_area_geojson,
-            tree_count=tree_counts["tree_count"],
-            tree_items=tree_rows,
-            polygon_area_sqm=area_sqm,
+        report = _get_or_compute_remote_monitoring_report(
+            db,
+            project_id=project_id,
+            area_geojson=normalized_area_geojson,
+            area_sqm=area_sqm,
+            tree_counts=tree_counts,
+            tree_rows=tree_rows,
             series_months=series_months,
             summary_window_days=summary_window_days,
+            refresh=refresh,
         )
     except RuntimeError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
@@ -30646,6 +30841,7 @@ def remote_monitoring_area_analysis(
     area_id: int,
     series_months: int = Query(default=6, ge=1, le=12),
     summary_window_days: int = Query(default=90, ge=30, le=180),
+    refresh: bool = Query(default=False),
     db: Session = Depends(get_db),
 ):
     area_row = _get_remote_monitoring_area_row(db, area_id=area_id)
@@ -30664,14 +30860,18 @@ def remote_monitoring_area_analysis(
     tree_counts = _count_trees_in_geojson(db, project_id=project_id, area_geojson=area_geojson)
     tree_rows = _list_trees_in_geojson(db, project_id=project_id, area_geojson=area_geojson)
     try:
-        report = compute_remote_monitoring_report(
-            boundary_geojson=area_geojson,
-            tree_count=tree_counts["tree_count"],
-            tree_items=tree_rows,
-            polygon_area_sqm=area_payload.get("area_sqm"),
+        report = _get_or_compute_remote_monitoring_report(
+            db,
+            project_id=project_id,
+            area_id=area_id,
+            area_geojson=area_geojson,
+            area_sqm=area_payload.get("area_sqm"),
             baseline_date=area_payload.get("baseline_date"),
+            tree_counts=tree_counts,
+            tree_rows=tree_rows,
             series_months=series_months,
             summary_window_days=summary_window_days,
+            refresh=refresh,
         )
     except RuntimeError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
