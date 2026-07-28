@@ -26,6 +26,7 @@ import math
 import textwrap
 import uuid
 import threading
+import mimetypes
 from threading import Lock
 import matplotlib
 matplotlib.use("Agg")
@@ -377,9 +378,11 @@ def ensure_plot_export_jobs_table(db: Session):
                 export_type TEXT NOT NULL,
                 plot_id INTEGER REFERENCES plots(id) ON DELETE CASCADE,
                 subdivision_batch_id INTEGER REFERENCES plot_subdivision_batches(id) ON DELETE CASCADE,
+                cache_key TEXT,
                 status TEXT NOT NULL DEFAULT 'queued',
                 file_name TEXT,
                 local_path TEXT,
+                request_payload JSONB,
                 error_text TEXT,
                 started_at TIMESTAMP,
                 completed_at TIMESTAMP,
@@ -389,9 +392,16 @@ def ensure_plot_export_jobs_table(db: Session):
             """
         )
     )
+    try:
+        db.execute(text("ALTER TABLE plot_export_jobs ADD COLUMN IF NOT EXISTS cache_key TEXT"))
+        db.execute(text("ALTER TABLE plot_export_jobs ADD COLUMN IF NOT EXISTS request_payload JSONB"))
+    except Exception:
+        pass
     for ddl in [
         "CREATE INDEX IF NOT EXISTS idx_plot_export_jobs_status_created ON plot_export_jobs(status, created_at DESC)",
         "CREATE INDEX IF NOT EXISTS idx_plot_export_jobs_batch_created ON plot_export_jobs(subdivision_batch_id, created_at DESC)",
+        "CREATE INDEX IF NOT EXISTS idx_plot_export_jobs_type_batch_created ON plot_export_jobs(export_type, subdivision_batch_id, created_at DESC)",
+        "CREATE INDEX IF NOT EXISTS idx_plot_export_jobs_plot_cache_created ON plot_export_jobs(plot_id, export_type, cache_key, created_at DESC)",
     ]:
         try:
             db.execute(text(ddl))
@@ -2649,9 +2659,11 @@ def _get_plot_export_job(db: Session, job_id: str) -> dict[str, Any] | None:
                 export_type,
                 plot_id,
                 subdivision_batch_id,
+                cache_key,
                 status,
                 file_name,
                 local_path,
+                request_payload,
                 error_text,
                 started_at,
                 completed_at,
@@ -2714,6 +2726,238 @@ def _serialize_plot_export_job(job: dict[str, Any], request: Request | None = No
     return item
 
 
+def _normalize_plot_export_job_payload(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return dict(value)
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+            if isinstance(parsed, dict):
+                return parsed
+        except Exception:
+            return {}
+    return {}
+
+
+def _build_plot_export_cache_key(
+    db: Session,
+    *,
+    plot_id: int,
+    export_type: str,
+    payload: dict[str, Any] | None = None,
+) -> str:
+    normalized_payload = dict(payload or {})
+    revision_token = (
+        build_preview_revision_token(db, plot_id)
+        if str(export_type or "").strip().lower() == "survey-plan.pdf"
+        else build_plot_geom_revision_token(db, plot_id)
+    )
+    signature_payload = {
+        "schema_version": "plot_export_job_v1",
+        "plot_id": int(plot_id),
+        "export_type": str(export_type or "").strip().lower(),
+        "render_options": normalized_payload,
+        "revision": revision_token,
+    }
+    signature_text = json.dumps(signature_payload, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(signature_text.encode("utf-8")).hexdigest()
+
+
+def _find_plot_export_job_by_cache_key(
+    db: Session,
+    *,
+    plot_id: int,
+    export_type: str,
+    cache_key: str,
+) -> dict[str, Any] | None:
+    row = db.execute(
+        text(
+            """
+            SELECT
+                id,
+                export_type,
+                plot_id,
+                subdivision_batch_id,
+                cache_key,
+                status,
+                file_name,
+                local_path,
+                request_payload,
+                error_text,
+                started_at,
+                completed_at,
+                created_at,
+                updated_at
+            FROM plot_export_jobs
+            WHERE plot_id = :plot_id
+              AND export_type = :export_type
+              AND cache_key = :cache_key
+            ORDER BY
+                CASE status
+                    WHEN 'completed' THEN 0
+                    WHEN 'running' THEN 1
+                    WHEN 'queued' THEN 2
+                    ELSE 3
+                END,
+                created_at DESC
+            LIMIT 1
+            """
+        ),
+        {
+            "plot_id": int(plot_id),
+            "export_type": str(export_type or "").strip(),
+            "cache_key": str(cache_key or "").strip(),
+        },
+    ).mappings().first()
+    return dict(row) if row else None
+
+
+def _get_subdivision_batch_clean_copy_context(
+    db: Session,
+    *,
+    batch_id: int,
+    title_text: str = "",
+    area_labels: list[dict] | None = None,
+    paper_size: str | None = None,
+    scale_text: str | None = None,
+    coordinate_system: str | None = None,
+    station_names: list[str] | None = None,
+    north_arrow_style: str = "one_side_stem",
+    north_arrow_color: str = "blue",
+    beacon_style: str = "cross",
+    road_width_m: float | None = None,
+) -> dict[str, Any]:
+    batch_row = db.execute(
+        text(
+            """
+            SELECT id, parent_plot_id, estate_name, method, created_at
+            FROM plot_subdivision_batches
+            WHERE id = :batch_id
+            """
+        ),
+        {"batch_id": int(batch_id)},
+    ).mappings().first()
+    if not batch_row:
+        raise HTTPException(status_code=404, detail="Subdivision batch not found.")
+
+    child_rows = db.execute(
+        text(
+            """
+            SELECT
+                i.child_plot_id,
+                i.lot_no,
+                i.area_m2,
+                ST_AsGeoJSON(p.geom) AS geom_geojson
+            FROM plot_subdivision_items i
+            JOIN plots p ON p.id = i.child_plot_id
+            WHERE i.batch_id = :batch_id
+            ORDER BY i.id ASC
+            """
+        ),
+        {"batch_id": int(batch_id)},
+    ).mappings().all()
+    if not child_rows:
+        raise HTTPException(status_code=404, detail="Subdivision batch has no generated plots.")
+
+    parent_plot_id = int(batch_row.get("parent_plot_id") or 0)
+    if parent_plot_id <= 0:
+        raise HTTPException(status_code=400, detail="Subdivision batch parent parcel is invalid.")
+
+    parent_meta = get_plot_meta(db, parent_plot_id)
+    effective_paper_size = str(paper_size or parent_meta.get("paper_size") or "A4").upper()
+    if effective_paper_size not in {"A4", "A3", "A2", "A1", "A0"}:
+        effective_paper_size = "A4"
+    effective_scale_text = str(scale_text or parent_meta.get("scale_text") or "1 : 1000")
+    effective_coordinate_system = str(coordinate_system or parent_meta.get("coordinate_system") or "wgs84")
+    effective_epsg = COORDINATE_SYSTEMS.get(effective_coordinate_system, 4326)
+
+    clean_title = str(title_text or "").strip()
+    if not clean_title:
+        estate_name = str(batch_row.get("estate_name") or "").strip()
+        clean_title = f"{estate_name} CLEAN COPY PLAN" if estate_name else "SURVEY PLAN"
+
+    area_override_map = _extract_clean_copy_area_overrides(area_labels)
+    cache_key_payload = {
+        "render_version": CLEAN_COPY_RENDER_VERSION,
+        "batch_id": int(batch_id),
+        "title_text": clean_title,
+        "paper_size": effective_paper_size,
+        "scale_text": effective_scale_text,
+        "coordinate_system": effective_coordinate_system,
+        "station_names": list(station_names or []),
+        "north_arrow_style": str(north_arrow_style or "one_side_stem"),
+        "north_arrow_color": str(north_arrow_color or "blue"),
+        "beacon_style": str(beacon_style or "cross"),
+        "road_width_m": float(road_width_m or 0.0),
+        "area_overrides": sorted(area_override_map.items()),
+    }
+    cache_hash = hashlib.sha1(json.dumps(cache_key_payload, sort_keys=True).encode("utf-8")).hexdigest()[:12]
+    estate_tag = _safe_filename_fragment(str(batch_row.get("estate_name") or ""), f"batch_{batch_id}")
+    pdf_name = f"{estate_tag}_clean_copy_batch_{batch_id}_{cache_hash}.pdf"
+    cache_dir = os.path.join(REPORTS_DIR, "subdivision_clean_copy")
+    os.makedirs(cache_dir, exist_ok=True)
+    cached_pdf_path = os.path.join(cache_dir, pdf_name)
+    return {
+        "batch": dict(batch_row),
+        "child_rows": [dict(row) for row in child_rows],
+        "parent_plot_id": parent_plot_id,
+        "pdf_name": pdf_name,
+        "cached_pdf_path": cached_pdf_path,
+        "title_text": clean_title,
+        "paper_size": effective_paper_size,
+        "scale_text": effective_scale_text,
+        "coordinate_system": effective_coordinate_system,
+        "epsg_code": int(effective_epsg),
+        "station_names": list(station_names or []),
+        "north_arrow_style": str(north_arrow_style or "one_side_stem"),
+        "north_arrow_color": str(north_arrow_color or "blue"),
+        "beacon_style": str(beacon_style or "cross"),
+        "road_width_m": road_width_m,
+        "area_overrides": area_override_map,
+    }
+
+
+def _generate_subdivision_batch_clean_copy_pdf(
+    db: Session,
+    *,
+    context: dict[str, Any],
+) -> str:
+    cached_pdf_path = str(context.get("cached_pdf_path") or "").strip()
+    if not cached_pdf_path:
+        raise HTTPException(status_code=500, detail="Clean copy export cache path is missing.")
+    if os.path.isfile(cached_pdf_path):
+        return cached_pdf_path
+
+    parent_plot_id = int(context.get("parent_plot_id") or 0)
+    parent_poly_wgs84 = _load_plot_polygon_wgs84(db, parent_plot_id)
+    try:
+        _render_subdivision_clean_copy_pdf(
+            db=db,
+            parent_plot_id=parent_plot_id,
+            parent_poly_wgs84=parent_poly_wgs84,
+            child_rows=list(context.get("child_rows") or []),
+            output_pdf_path=cached_pdf_path,
+            title_text=str(context.get("title_text") or ""),
+            paper_size=str(context.get("paper_size") or "A4"),
+            scale_text=str(context.get("scale_text") or "1 : 1000"),
+            coordinate_system=str(context.get("coordinate_system") or "wgs84"),
+            epsg_code=int(context.get("epsg_code") or 4326),
+            station_names=list(context.get("station_names") or []),
+            north_arrow_style=str(context.get("north_arrow_style") or "one_side_stem"),
+            north_arrow_color=str(context.get("north_arrow_color") or "blue"),
+            beacon_style=str(context.get("beacon_style") or "cross"),
+            road_width_m=context.get("road_width_m"),
+            area_overrides=dict(context.get("area_overrides") or {}),
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        safe_remove(cached_pdf_path)
+        raise HTTPException(status_code=500, detail=f"Failed to export clean copy PDF: {exc}") from exc
+
+    return cached_pdf_path
+
+
 def _run_subdivision_batch_export_job(job_id: str):
     db = SessionLocal()
     try:
@@ -2739,6 +2983,50 @@ def _run_subdivision_batch_export_job(job_id: str):
             status="completed",
             local_path=export_path,
             file_name=context["zip_name"],
+            error_text="",
+            completed=True,
+        )
+    except Exception as exc:
+        try:
+            _set_plot_export_job_status(db, job_id, status="failed", error_text=str(exc), completed=True)
+        except Exception:
+            db.rollback()
+    finally:
+        db.close()
+
+
+def _run_subdivision_batch_clean_copy_export_job(job_id: str):
+    db = SessionLocal()
+    try:
+        job = _get_plot_export_job(db, job_id)
+        if not job:
+            return
+        batch_id = int(job.get("subdivision_batch_id") or 0)
+        if batch_id <= 0:
+            raise RuntimeError("Subdivision clean copy export job is missing a batch id.")
+        payload = _normalize_plot_export_job_payload(job.get("request_payload"))
+        _set_plot_export_job_status(db, job_id, status="running", started=True, error_text="")
+        context = _get_subdivision_batch_clean_copy_context(
+            db,
+            batch_id=batch_id,
+            title_text=str(payload.get("title_text") or ""),
+            area_labels=payload.get("area_labels") if isinstance(payload.get("area_labels"), list) else None,
+            paper_size=str(payload.get("paper_size") or "") or None,
+            scale_text=str(payload.get("scale_text") or "") or None,
+            coordinate_system=str(payload.get("coordinate_system") or "") or None,
+            station_names=payload.get("station_names") if isinstance(payload.get("station_names"), list) else None,
+            north_arrow_style=str(payload.get("north_arrow_style") or "one_side_stem"),
+            north_arrow_color=str(payload.get("north_arrow_color") or "blue"),
+            beacon_style=str(payload.get("beacon_style") or "cross"),
+            road_width_m=float(payload.get("road_width_m") or 0.0) if payload.get("road_width_m") is not None else None,
+        )
+        export_path = _generate_subdivision_batch_clean_copy_pdf(db, context=context)
+        _set_plot_export_job_status(
+            db,
+            job_id,
+            status="completed",
+            local_path=export_path,
+            file_name=str(context.get("pdf_name") or "subdivision_clean_copy.pdf"),
             error_text="",
             completed=True,
         )
@@ -2937,11 +3225,593 @@ def download_plot_export_job(
             )
     if not local_path or not os.path.isfile(local_path):
         raise HTTPException(status_code=404, detail="Export file is no longer available.")
+    media_type = mimetypes.guess_type(file_name)[0] or "application/octet-stream"
     return FileResponse(
         local_path,
-        media_type="application/zip",
+        media_type=media_type,
         filename=file_name,
     )
+
+
+def _cache_single_plot_export_file(
+    *,
+    plot_id: int,
+    export_type: str,
+    cache_key: str,
+    source_path: str,
+    file_name: str,
+) -> str:
+    cache_dir = os.path.join(REPORTS_DIR, "export_jobs", str(int(plot_id)))
+    os.makedirs(cache_dir, exist_ok=True)
+    safe_export_type = re.sub(r"[^a-z0-9]+", "_", str(export_type or "").strip().lower()).strip("_") or "export"
+    ext = os.path.splitext(str(file_name or source_path))[1] or os.path.splitext(source_path)[1] or ".bin"
+    cache_path = os.path.join(cache_dir, f"{safe_export_type}_{str(cache_key or '')[:12]}{ext}")
+    if os.path.abspath(source_path) != os.path.abspath(cache_path):
+        shutil.copyfile(source_path, cache_path)
+    return cache_path
+
+
+def _run_single_plot_export_job(job_id: str):
+    db = SessionLocal()
+    source_path = ""
+    cleanup_dir = ""
+    try:
+        job = _get_plot_export_job(db, job_id)
+        if not job:
+            return
+        plot_id = int(job.get("plot_id") or 0)
+        if plot_id <= 0:
+            raise RuntimeError("Plot export job is missing a plot id.")
+        export_type = str(job.get("export_type") or "").strip().lower()
+        cache_key = str(job.get("cache_key") or "").strip()
+        payload = _normalize_plot_export_job_payload(job.get("request_payload"))
+        _set_plot_export_job_status(db, job_id, status="running", started=True, error_text="")
+        response = None
+        if export_type == "survey-plan.pdf":
+            response = download_plot_report_pdf(plot_id=plot_id, db=db, background_tasks=None, **payload)
+        elif export_type == "orthophoto.pdf":
+            response = orthophoto_pdf(plot_id=plot_id, db=db, background_tasks=None, **payload)
+        elif export_type == "topomap.pdf":
+            response = orthophoto_pdf(
+                plot_id=plot_id,
+                db=db,
+                background_tasks=None,
+                **{
+                    **payload,
+                    "use_topo_map": True,
+                    "title_text": str(payload.get("title_text") or "TOPO MAP"),
+                },
+            )
+        elif export_type == "survey-plan.dxf":
+            response = download_survey_plan_dwg(plot_id=plot_id, db=db)
+        elif export_type == "survey-plan.shapefile":
+            response = download_survey_plan_shapefile(plot_id=plot_id, db=db, background_tasks=None)
+            source_path = str(getattr(response, "path", "") or "").strip()
+            cleanup_dir = os.path.dirname(source_path) if source_path else ""
+        else:
+            raise RuntimeError(f"Unsupported plot export job type: {export_type}")
+
+        if not source_path:
+            source_path = str(getattr(response, "path", "") or "").strip()
+        if not source_path or not os.path.isfile(source_path):
+            raise RuntimeError("Export generated without a readable output file.")
+        file_name = str(getattr(response, "filename", "") or "").strip() or str(job.get("file_name") or "").strip() or os.path.basename(source_path)
+        local_path = source_path
+        if export_type == "survey-plan.shapefile":
+            local_path = _cache_single_plot_export_file(
+                plot_id=plot_id,
+                export_type=export_type,
+                cache_key=cache_key,
+                source_path=source_path,
+                file_name=file_name,
+            )
+        _set_plot_export_job_status(
+            db,
+            job_id,
+            status="completed",
+            local_path=local_path,
+            file_name=file_name,
+            error_text="",
+            completed=True,
+        )
+    except Exception as exc:
+        try:
+            _set_plot_export_job_status(db, job_id, status="failed", error_text=str(exc), completed=True)
+        except Exception:
+            db.rollback()
+    finally:
+        if cleanup_dir:
+            safe_rmtree(cleanup_dir)
+        db.close()
+
+
+def _insert_single_plot_export_job(
+    db: Session,
+    *,
+    plot_id: int,
+    export_type: str,
+    cache_key: str,
+    file_name: str,
+    request_payload: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    job_id = uuid.uuid4().hex
+    db.execute(
+        text(
+            """
+            INSERT INTO plot_export_jobs (
+                id,
+                export_type,
+                plot_id,
+                cache_key,
+                status,
+                file_name,
+                request_payload,
+                created_at,
+                updated_at
+            )
+            VALUES (
+                :id,
+                :export_type,
+                :plot_id,
+                :cache_key,
+                'queued',
+                :file_name,
+                CAST(:request_payload AS JSONB),
+                NOW(),
+                NOW()
+            )
+            """
+        ),
+        {
+            "id": job_id,
+            "export_type": export_type,
+            "plot_id": int(plot_id),
+            "cache_key": cache_key,
+            "file_name": file_name,
+            "request_payload": json.dumps(request_payload or {}),
+        },
+    )
+    db.commit()
+    threading.Thread(target=_run_single_plot_export_job, args=(job_id,), daemon=True).start()
+    return _get_plot_export_job(db, job_id) or {"id": job_id, "status": "queued"}
+
+
+@router.post("/{plot_id}/export-jobs/survey-plan.pdf")
+def create_plot_survey_report_export_job(
+    plot_id: int,
+    request: Request,
+    db: Session = Depends(get_db),
+    title_text: str = Body("SURVEY PLAN"),
+    location_text: str = Body(""),
+    lga_text: str = Body(""),
+    state_text: str = Body(""),
+    scale_text: str = Body("1 : 1000"),
+    surveyor_name: str = Body(""),
+    surveyor_rank: str = Body(""),
+    certification_statement: str = Body(DEFAULT_CERTIFICATION_STATEMENT),
+    station_names: list[str] = Body(default=[]),
+    coordinate_system: str = Body("wgs84"),
+    paper_size: str = Body("A4"),
+    north_arrow_style: str = Body("one_side_stem"),
+    north_arrow_color: str = Body("blue"),
+    beacon_style: str = Body("cross"),
+    road_width_m: float | None = Body(None),
+    road_width_override_m: float | None = Body(None),
+    template_name: str = Body(DEFAULT_TEMPLATE_NAME),
+    adamawa_rof_no: str = Body(""),
+    adamawa_owner_name: str = Body(""),
+    adamawa_authority_title: str = Body(DEFAULT_ADAMAWA_AUTHORITY_TITLE),
+    adamawa_authority_date_text: str = Body(DEFAULT_ADAMAWA_AUTHORITY_DATE),
+    adamawa_control_point_name: str = Body(""),
+    adamawa_northing: str = Body(""),
+    adamawa_easting: str = Body(""),
+    adamawa_elevation: str = Body(""),
+    adamawa_origin_text: str = Body(DEFAULT_ADAMAWA_ORIGIN_TEXT),
+    adamawa_topo_sheet_text: str = Body(DEFAULT_ADAMAWA_TOPO_SHEET_TEXT),
+    adamawa_computation_no: str = Body(""),
+    adamawa_cadastral_sheet_no: str = Body(""),
+    adamawa_plan_no: str = Body(""),
+    adamawa_surveyed_by_text: str = Body(""),
+    adamawa_disclaimer_text: str = Body(DEFAULT_ADAMAWA_DISCLAIMER_TEXT),
+):
+    request_payload = {
+        "title_text": title_text,
+        "location_text": location_text,
+        "lga_text": lga_text,
+        "state_text": state_text,
+        "scale_text": scale_text,
+        "surveyor_name": surveyor_name,
+        "surveyor_rank": surveyor_rank,
+        "certification_statement": certification_statement,
+        "station_names": station_names or [],
+        "coordinate_system": coordinate_system,
+        "paper_size": paper_size,
+        "north_arrow_style": north_arrow_style,
+        "north_arrow_color": north_arrow_color,
+        "beacon_style": beacon_style,
+        "road_width_m": road_width_m,
+        "road_width_override_m": road_width_override_m,
+        "template_name": template_name,
+        "adamawa_rof_no": adamawa_rof_no,
+        "adamawa_owner_name": adamawa_owner_name,
+        "adamawa_authority_title": adamawa_authority_title,
+        "adamawa_authority_date_text": adamawa_authority_date_text,
+        "adamawa_control_point_name": adamawa_control_point_name,
+        "adamawa_northing": adamawa_northing,
+        "adamawa_easting": adamawa_easting,
+        "adamawa_elevation": adamawa_elevation,
+        "adamawa_origin_text": adamawa_origin_text,
+        "adamawa_topo_sheet_text": adamawa_topo_sheet_text,
+        "adamawa_computation_no": adamawa_computation_no,
+        "adamawa_cadastral_sheet_no": adamawa_cadastral_sheet_no,
+        "adamawa_plan_no": adamawa_plan_no,
+        "adamawa_surveyed_by_text": adamawa_surveyed_by_text,
+        "adamawa_disclaimer_text": adamawa_disclaimer_text,
+    }
+    cache_key = _build_plot_export_cache_key(
+        db,
+        plot_id=int(plot_id),
+        export_type="survey-plan.pdf",
+        payload=request_payload,
+    )
+    existing = _find_plot_export_job_by_cache_key(
+        db,
+        plot_id=int(plot_id),
+        export_type="survey-plan.pdf",
+        cache_key=cache_key,
+    )
+    if existing:
+        return _serialize_plot_export_job(existing, request=request)
+    job = _insert_single_plot_export_job(
+        db,
+        plot_id=int(plot_id),
+        export_type="survey-plan.pdf",
+        cache_key=cache_key,
+        file_name=f"plot_{int(plot_id)}_report.pdf",
+        request_payload=request_payload,
+    )
+    return _serialize_plot_export_job(job, request=request)
+
+
+@router.post("/{plot_id}/export-jobs/orthophoto.pdf")
+def create_plot_orthophoto_export_job(
+    plot_id: int,
+    request: Request,
+    db: Session = Depends(get_db),
+    title_text: str = Body("ORTHOPHOTO"),
+    location_text: str = Body(""),
+    lga_text: str = Body(""),
+    state_text: str = Body(""),
+    scale_text: str = Body("1 : 1000"),
+    surveyor_name: str = Body(""),
+    surveyor_rank: str = Body(""),
+    station_names: list[str] = Body(default=[]),
+    coordinate_system: str = Body("wgs84"),
+    paper_size: str = Body("A4"),
+    use_topo_map: bool = Body(False),
+    north_arrow_style: str = Body("one_side_stem"),
+    north_arrow_color: str = Body("blue"),
+):
+    request_payload = {
+        "title_text": title_text,
+        "location_text": location_text,
+        "lga_text": lga_text,
+        "state_text": state_text,
+        "scale_text": scale_text,
+        "surveyor_name": surveyor_name,
+        "surveyor_rank": surveyor_rank,
+        "station_names": station_names or [],
+        "coordinate_system": coordinate_system,
+        "paper_size": paper_size,
+        "use_topo_map": False,
+        "north_arrow_style": north_arrow_style,
+        "north_arrow_color": north_arrow_color,
+    }
+    cache_key = _build_plot_export_cache_key(
+        db,
+        plot_id=int(plot_id),
+        export_type="orthophoto.pdf",
+        payload=request_payload,
+    )
+    existing = _find_plot_export_job_by_cache_key(
+        db,
+        plot_id=int(plot_id),
+        export_type="orthophoto.pdf",
+        cache_key=cache_key,
+    )
+    if existing:
+        return _serialize_plot_export_job(existing, request=request)
+    job = _insert_single_plot_export_job(
+        db,
+        plot_id=int(plot_id),
+        export_type="orthophoto.pdf",
+        cache_key=cache_key,
+        file_name=f"plot_{int(plot_id)}_orthophoto.pdf",
+        request_payload=request_payload,
+    )
+    return _serialize_plot_export_job(job, request=request)
+
+
+@router.post("/{plot_id}/export-jobs/topomap.pdf")
+def create_plot_topomap_export_job(
+    plot_id: int,
+    request: Request,
+    db: Session = Depends(get_db),
+    title_text: str = Body("TOPO MAP"),
+    location_text: str = Body(""),
+    lga_text: str = Body(""),
+    state_text: str = Body(""),
+    scale_text: str = Body("1 : 1000"),
+    surveyor_name: str = Body(""),
+    surveyor_rank: str = Body(""),
+    station_names: list[str] = Body(default=[]),
+    coordinate_system: str = Body("wgs84"),
+    paper_size: str = Body("A4"),
+    north_arrow_style: str = Body("one_side_stem"),
+    north_arrow_color: str = Body("blue"),
+):
+    request_payload = {
+        "title_text": title_text,
+        "location_text": location_text,
+        "lga_text": lga_text,
+        "state_text": state_text,
+        "scale_text": scale_text,
+        "surveyor_name": surveyor_name,
+        "surveyor_rank": surveyor_rank,
+        "station_names": station_names or [],
+        "coordinate_system": coordinate_system,
+        "paper_size": paper_size,
+        "use_topo_map": True,
+        "north_arrow_style": north_arrow_style,
+        "north_arrow_color": north_arrow_color,
+    }
+    cache_key = _build_plot_export_cache_key(
+        db,
+        plot_id=int(plot_id),
+        export_type="topomap.pdf",
+        payload=request_payload,
+    )
+    existing = _find_plot_export_job_by_cache_key(
+        db,
+        plot_id=int(plot_id),
+        export_type="topomap.pdf",
+        cache_key=cache_key,
+    )
+    if existing:
+        return _serialize_plot_export_job(existing, request=request)
+    job = _insert_single_plot_export_job(
+        db,
+        plot_id=int(plot_id),
+        export_type="topomap.pdf",
+        cache_key=cache_key,
+        file_name=f"plot_{int(plot_id)}_topomap.pdf",
+        request_payload=request_payload,
+    )
+    return _serialize_plot_export_job(job, request=request)
+
+
+@router.post("/{plot_id}/export-jobs/survey-plan.dxf")
+def create_plot_dxf_export_job(
+    plot_id: int,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    cache_key = _build_plot_export_cache_key(
+        db,
+        plot_id=int(plot_id),
+        export_type="survey-plan.dxf",
+        payload={},
+    )
+    existing = _find_plot_export_job_by_cache_key(
+        db,
+        plot_id=int(plot_id),
+        export_type="survey-plan.dxf",
+        cache_key=cache_key,
+    )
+    if existing:
+        return _serialize_plot_export_job(existing, request=request)
+    job = _insert_single_plot_export_job(
+        db,
+        plot_id=int(plot_id),
+        export_type="survey-plan.dxf",
+        cache_key=cache_key,
+        file_name=f"plot_{int(plot_id)}_survey_plan.dxf",
+        request_payload={},
+    )
+    return _serialize_plot_export_job(job, request=request)
+
+
+@router.post("/{plot_id}/export-jobs/survey-plan.shapefile")
+def create_plot_shapefile_export_job(
+    plot_id: int,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    cache_key = _build_plot_export_cache_key(
+        db,
+        plot_id=int(plot_id),
+        export_type="survey-plan.shapefile",
+        payload={},
+    )
+    existing = _find_plot_export_job_by_cache_key(
+        db,
+        plot_id=int(plot_id),
+        export_type="survey-plan.shapefile",
+        cache_key=cache_key,
+    )
+    if existing:
+        return _serialize_plot_export_job(existing, request=request)
+    job = _insert_single_plot_export_job(
+        db,
+        plot_id=int(plot_id),
+        export_type="survey-plan.shapefile",
+        cache_key=cache_key,
+        file_name=f"plot_{int(plot_id)}_survey_plan_shapefile.zip",
+        request_payload={},
+    )
+    return _serialize_plot_export_job(job, request=request)
+
+
+@router.post("/subdivision/batches/{batch_id}/export-jobs/clean-copy.pdf")
+def create_subdivision_batch_clean_copy_export_job(
+    batch_id: int,
+    request: Request,
+    db: Session = Depends(get_db),
+    title_text: str = Body(""),
+    area_labels: list[dict] | None = Body(None),
+    paper_size: str | None = Body(None),
+    scale_text: str | None = Body(None),
+    coordinate_system: str | None = Body(None),
+    station_names: list[str] | None = Body(None),
+    north_arrow_style: str = Body("one_side_stem"),
+    north_arrow_color: str = Body("blue"),
+    beacon_style: str = Body("cross"),
+    road_width_m: float | None = Body(None),
+):
+    payload = {
+        "title_text": str(title_text or ""),
+        "area_labels": area_labels if isinstance(area_labels, list) else [],
+        "paper_size": paper_size,
+        "scale_text": scale_text,
+        "coordinate_system": coordinate_system,
+        "station_names": station_names if isinstance(station_names, list) else [],
+        "north_arrow_style": str(north_arrow_style or "one_side_stem"),
+        "north_arrow_color": str(north_arrow_color or "blue"),
+        "beacon_style": str(beacon_style or "cross"),
+        "road_width_m": road_width_m,
+    }
+    context = _get_subdivision_batch_clean_copy_context(
+        db,
+        batch_id=int(batch_id),
+        title_text=str(payload.get("title_text") or ""),
+        area_labels=payload["area_labels"],
+        paper_size=paper_size,
+        scale_text=scale_text,
+        coordinate_system=coordinate_system,
+        station_names=payload["station_names"],
+        north_arrow_style=str(payload.get("north_arrow_style") or "one_side_stem"),
+        north_arrow_color=str(payload.get("north_arrow_color") or "blue"),
+        beacon_style=str(payload.get("beacon_style") or "cross"),
+        road_width_m=road_width_m,
+    )
+    existing = db.execute(
+        text(
+            """
+            SELECT
+                id,
+                export_type,
+                plot_id,
+                subdivision_batch_id,
+                status,
+                file_name,
+                local_path,
+                request_payload,
+                error_text,
+                started_at,
+                completed_at,
+                created_at,
+                updated_at
+            FROM plot_export_jobs
+            WHERE export_type = 'subdivision_batch_clean_copy_pdf'
+              AND subdivision_batch_id = :batch_id
+              AND file_name = :file_name
+              AND status IN ('queued', 'running')
+            ORDER BY created_at DESC
+            LIMIT 1
+            """
+        ),
+        {"batch_id": int(batch_id), "file_name": str(context.get("pdf_name") or "")},
+    ).mappings().first()
+    if existing:
+        return _serialize_plot_export_job(dict(existing), request=request)
+
+    job_id = uuid.uuid4().hex
+    if os.path.isfile(str(context.get("cached_pdf_path") or "").strip()):
+        db.execute(
+            text(
+                """
+                INSERT INTO plot_export_jobs (
+                    id,
+                    export_type,
+                    plot_id,
+                    subdivision_batch_id,
+                    status,
+                    file_name,
+                    local_path,
+                    request_payload,
+                    started_at,
+                    completed_at,
+                    created_at,
+                    updated_at
+                )
+                VALUES (
+                    :id,
+                    'subdivision_batch_clean_copy_pdf',
+                    :plot_id,
+                    :batch_id,
+                    'completed',
+                    :file_name,
+                    :local_path,
+                    CAST(:request_payload AS JSONB),
+                    NOW(),
+                    NOW(),
+                    NOW(),
+                    NOW()
+                )
+                """
+            ),
+            {
+                "id": job_id,
+                "plot_id": int(context.get("parent_plot_id") or 0) or None,
+                "batch_id": int(batch_id),
+                "file_name": str(context.get("pdf_name") or "subdivision_clean_copy.pdf"),
+                "local_path": str(context.get("cached_pdf_path") or ""),
+                "request_payload": json.dumps(payload),
+            },
+        )
+        db.commit()
+        job = _get_plot_export_job(db, job_id)
+        return _serialize_plot_export_job(job or {"id": job_id, "status": "completed"}, request=request)
+
+    db.execute(
+        text(
+            """
+            INSERT INTO plot_export_jobs (
+                id,
+                export_type,
+                plot_id,
+                subdivision_batch_id,
+                status,
+                file_name,
+                request_payload,
+                created_at,
+                updated_at
+            )
+            VALUES (
+                :id,
+                'subdivision_batch_clean_copy_pdf',
+                :plot_id,
+                :batch_id,
+                'queued',
+                :file_name,
+                CAST(:request_payload AS JSONB),
+                NOW(),
+                NOW()
+            )
+            """
+        ),
+        {
+            "id": job_id,
+            "plot_id": int(context.get("parent_plot_id") or 0) or None,
+            "batch_id": int(batch_id),
+            "file_name": str(context.get("pdf_name") or "subdivision_clean_copy.pdf"),
+            "request_payload": json.dumps(payload),
+        },
+    )
+    db.commit()
+    threading.Thread(target=_run_subdivision_batch_clean_copy_export_job, args=(job_id,), daemon=True).start()
+    job = _get_plot_export_job(db, job_id)
+    return _serialize_plot_export_job(job or {"id": job_id, "status": "queued"}, request=request)
 
 
 @router.post("/subdivision/batches/{batch_id}/export/clean-copy.pdf")
@@ -2959,107 +3829,24 @@ def export_subdivision_batch_clean_copy_pdf(
     beacon_style: str = Body("cross"),
     road_width_m: float | None = Body(None),
 ):
-    batch_row = db.execute(
-        text(
-            """
-            SELECT id, parent_plot_id, estate_name, method, created_at
-            FROM plot_subdivision_batches
-            WHERE id = :batch_id
-            """
-        ),
-        {"batch_id": int(batch_id)},
-    ).mappings().first()
-    if not batch_row:
-        raise HTTPException(status_code=404, detail="Subdivision batch not found.")
-
-    child_rows = db.execute(
-        text(
-            """
-            SELECT
-                i.child_plot_id,
-                i.lot_no,
-                i.area_m2,
-                ST_AsGeoJSON(p.geom) AS geom_geojson
-            FROM plot_subdivision_items i
-            JOIN plots p ON p.id = i.child_plot_id
-            WHERE i.batch_id = :batch_id
-            ORDER BY i.id ASC
-            """
-        ),
-        {"batch_id": int(batch_id)},
-    ).mappings().all()
-    if not child_rows:
-        raise HTTPException(status_code=404, detail="Subdivision batch has no generated plots.")
-
-    parent_plot_id = int(batch_row.get("parent_plot_id") or 0)
-    if parent_plot_id <= 0:
-        raise HTTPException(status_code=400, detail="Subdivision batch parent parcel is invalid.")
-
-    parent_meta = get_plot_meta(db, parent_plot_id)
-    effective_paper_size = str(paper_size or parent_meta.get("paper_size") or "A4").upper()
-    if effective_paper_size not in {"A4", "A3", "A2", "A1", "A0"}:
-        effective_paper_size = "A4"
-    effective_scale_text = str(scale_text or parent_meta.get("scale_text") or "1 : 1000")
-    effective_coordinate_system = str(coordinate_system or parent_meta.get("coordinate_system") or "wgs84")
-    effective_epsg = COORDINATE_SYSTEMS.get(effective_coordinate_system, 4326)
-
-    clean_title = str(title_text or "").strip()
-    if not clean_title:
-        estate_name = str(batch_row.get("estate_name") or "").strip()
-        clean_title = f"{estate_name} CLEAN COPY PLAN" if estate_name else "SURVEY PLAN"
-
-    area_override_map = _extract_clean_copy_area_overrides(area_labels)
-    cache_key_payload = {
-        "render_version": CLEAN_COPY_RENDER_VERSION,
-        "batch_id": int(batch_id),
-        "title_text": clean_title,
-        "paper_size": effective_paper_size,
-        "scale_text": effective_scale_text,
-        "coordinate_system": effective_coordinate_system,
-        "station_names": list(station_names or []),
-        "north_arrow_style": str(north_arrow_style or "one_side_stem"),
-        "north_arrow_color": str(north_arrow_color or "blue"),
-        "beacon_style": str(beacon_style or "cross"),
-        "road_width_m": float(road_width_m or 0.0),
-        "area_overrides": sorted(area_override_map.items()),
-    }
-    cache_hash = hashlib.sha1(json.dumps(cache_key_payload, sort_keys=True).encode("utf-8")).hexdigest()[:12]
-    estate_tag = _safe_filename_fragment(str(batch_row.get("estate_name") or ""), f"batch_{batch_id}")
-    pdf_name = f"{estate_tag}_clean_copy_batch_{batch_id}_{cache_hash}.pdf"
-    cache_dir = os.path.join(REPORTS_DIR, "subdivision_clean_copy")
-    os.makedirs(cache_dir, exist_ok=True)
-    cached_pdf_path = os.path.join(cache_dir, pdf_name)
-
-    if not os.path.isfile(cached_pdf_path):
-        parent_poly_wgs84 = _load_plot_polygon_wgs84(db, parent_plot_id)
-        try:
-            _render_subdivision_clean_copy_pdf(
-                db=db,
-                parent_plot_id=int(parent_plot_id),
-                parent_poly_wgs84=parent_poly_wgs84,
-                child_rows=[dict(r) for r in child_rows],
-                output_pdf_path=cached_pdf_path,
-                title_text=clean_title,
-                paper_size=effective_paper_size,
-                scale_text=effective_scale_text,
-                coordinate_system=effective_coordinate_system,
-                epsg_code=int(effective_epsg),
-                station_names=list(station_names or []),
-                north_arrow_style=str(north_arrow_style or "one_side_stem"),
-                north_arrow_color=str(north_arrow_color or "blue"),
-                beacon_style=str(beacon_style or "cross"),
-                road_width_m=road_width_m,
-                area_overrides=area_override_map,
-            )
-        except HTTPException:
-            raise
-        except Exception as exc:
-            safe_remove(cached_pdf_path)
-            raise HTTPException(status_code=500, detail=f"Failed to export clean copy PDF: {exc}")
-
+    context = _get_subdivision_batch_clean_copy_context(
+        db,
+        batch_id=int(batch_id),
+        title_text=title_text,
+        area_labels=area_labels,
+        paper_size=paper_size,
+        scale_text=scale_text,
+        coordinate_system=coordinate_system,
+        station_names=station_names,
+        north_arrow_style=north_arrow_style,
+        north_arrow_color=north_arrow_color,
+        beacon_style=beacon_style,
+        road_width_m=road_width_m,
+    )
+    cached_pdf_path = _generate_subdivision_batch_clean_copy_pdf(db, context=context)
     return _pdf_response_with_r2(
         cached_pdf_path,
-        pdf_name,
+        str(context.get("pdf_name") or "subdivision_clean_copy.pdf"),
         category="survey_subdivision_clean_copy",
     )
 

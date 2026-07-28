@@ -8,7 +8,19 @@ from fastapi.middleware.gzip import GZipMiddleware  # Added for speed
 from fastapi.responses import JSONResponse
 
 from app.db import SessionLocal
-from app.routers import health, plots, analytics, feedback, hazards, green
+from app.routers import (
+    health,
+    plots,
+    analytics,
+    feedback,
+    hazards,
+    green,
+    green_work,
+    green_sponsor,
+    green_reports,
+    green_remote_monitoring,
+    green_payouts,
+)
 from app.db_init import init_db
 from app.utils.activity_logger import ensure_activity_log_table, log_request_activity, should_skip_request_logging
 from app.utils.auth_security import resolve_request_session
@@ -175,7 +187,11 @@ app.include_router(plots.router)
 app.include_router(analytics.router)
 app.include_router(feedback.router)
 app.include_router(hazards.router)
-app.include_router(green.router)
+app.include_router(green_work.router)
+app.include_router(green_sponsor.router)
+app.include_router(green_reports.router)
+app.include_router(green_remote_monitoring.router)
+app.include_router(green_payouts.router)
 
 @app.get("/")
 def root():

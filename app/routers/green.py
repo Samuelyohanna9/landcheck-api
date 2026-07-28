@@ -403,6 +403,29 @@ class VegetationAnalysisPayload(BaseModel):
     area_geojson: dict | str
 
 
+class RemoteMonitoringJobPayload(BaseModel):
+    project_id: int
+    area_geojson: dict | str
+    series_months: int = 6
+    summary_window_days: int = 90
+    refresh: bool = False
+    threshold: float | None = None
+    requested_by: str | None = None
+
+
+class GreenReportExportJobPayload(BaseModel):
+    export_type: str
+    project_id: int
+    assignee_name: str | None = None
+    include_photos: bool = False
+    lng: float | None = None
+    lat: float | None = None
+    zoom: float | None = None
+    bearing: float | None = 0.0
+    pitch: float | None = 0.0
+    requested_by: str | None = None
+
+
 class MobilePushTokenPayload(BaseModel):
     user_id: int
     organization_id: int | None = None
@@ -1267,6 +1290,152 @@ def _build_export_proxy_url(object_key: str | None, request: Request | None = No
     return f"{base}{path}" if base else path
 
 
+def _normalize_green_export_job_payload(value) -> dict:
+    if isinstance(value, dict):
+        return dict(value)
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except Exception:
+            return {}
+        return dict(parsed) if isinstance(parsed, dict) else {}
+    return {}
+
+
+def _get_green_project_last_updated_token(db: Session, project_id: int) -> str:
+    row = db.execute(
+        text(
+            """
+            SELECT MAX(ts) AS last_updated
+            FROM (
+                SELECT MAX(created_at) AS ts
+                FROM tree_projects
+                WHERE id = :project_id
+
+                UNION ALL
+
+                SELECT MAX(created_at) AS ts
+                FROM trees
+                WHERE project_id = :project_id
+
+                UNION ALL
+
+                SELECT MAX(COALESCE(reviewed_at, submitted_at, completed_at, created_at)) AS ts
+                FROM tree_tasks
+                WHERE tree_id IN (
+                    SELECT id FROM trees WHERE project_id = :project_id
+                )
+
+                UNION ALL
+
+                SELECT MAX(COALESCE(updated_at, created_at)) AS ts
+                FROM green_custodians
+                WHERE project_id = :project_id
+
+                UNION ALL
+
+                SELECT MAX(COALESCE(updated_at, created_at)) AS ts
+                FROM green_sponsorship_orders
+                WHERE project_id = :project_id
+
+                UNION ALL
+
+                SELECT MAX(COALESCE(updated_at, linked_at, created_at)) AS ts
+                FROM green_sponsorship_units
+                WHERE project_id = :project_id
+
+                UNION ALL
+
+                SELECT MAX(COALESCE(updated_at, created_at)) AS ts
+                FROM green_remote_monitoring_areas
+                WHERE project_id = :project_id
+            ) snapshots
+            """
+        ),
+        {"project_id": int(project_id)},
+    ).mappings().first()
+    stamp = row.get("last_updated") if row else None
+    if hasattr(stamp, "isoformat"):
+        return stamp.isoformat()
+    return str(stamp or "")
+
+
+def _build_green_report_cache_key(
+    db: Session,
+    *,
+    export_type: str,
+    project_id: int,
+    filters: dict | None = None,
+) -> str:
+    signature_payload = {
+        "schema_version": "green_report_job_v1",
+        "export_type": str(export_type or "").strip().lower(),
+        "project_id": int(project_id),
+        "filters": filters or {},
+        "last_updated": _get_green_project_last_updated_token(db, int(project_id)),
+    }
+    signature_text = json.dumps(signature_payload, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(signature_text.encode("utf-8")).hexdigest()
+
+
+def _build_remote_monitoring_job_cache_key(
+    db: Session,
+    *,
+    project_id: int,
+    area_geojson: dict,
+    series_months: int,
+    summary_window_days: int,
+    threshold: float | None = None,
+) -> str:
+    polygon_hash = hashlib.sha256(
+        json.dumps(area_geojson, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+    ).hexdigest()
+    signature_payload = {
+        "schema_version": "remote_monitoring_job_v1",
+        "project_id": int(project_id),
+        "polygon_hash": polygon_hash,
+        "date_window": {
+            "series_months": max(1, min(int(series_months or 6), 12)),
+            "summary_window_days": max(30, min(int(summary_window_days or 90), 180)),
+        },
+        "threshold": float(threshold) if threshold is not None else None,
+        "last_updated": _get_green_project_last_updated_token(db, int(project_id)),
+    }
+    signature_text = json.dumps(signature_payload, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(signature_text.encode("utf-8")).hexdigest()
+
+
+def _find_green_export_job_by_cache_key(db: Session, *, export_type: str, cache_key: str) -> dict | None:
+    clean_export_type = str(export_type or "").strip()
+    clean_cache_key = str(cache_key or "").strip()
+    if not clean_export_type or not clean_cache_key:
+        return None
+    row = db.execute(
+        text(
+            """
+            SELECT *
+            FROM green_export_jobs
+            WHERE export_type = :export_type
+              AND cache_key = :cache_key
+            ORDER BY
+                CASE status
+                    WHEN 'completed' THEN 0
+                    WHEN 'running' THEN 1
+                    WHEN 'queued' THEN 2
+                    ELSE 3
+                END,
+                created_at DESC
+            LIMIT 1
+            """
+        ),
+        {
+            "export_type": clean_export_type,
+            "cache_key": clean_cache_key,
+        },
+    ).mappings().first()
+    return dict(row) if row else None
+
+
 def _serialize_green_export_job(row: dict | None, request: Request | None = None) -> dict | None:
     if not row:
         return None
@@ -1274,6 +1443,12 @@ def _serialize_green_export_job(row: dict | None, request: Request | None = None
     object_key = str(data.get("object_key") or "").strip()
     public_url = str(data.get("public_url") or "").strip()
     proxy_url = _build_export_proxy_url(object_key, request=request)
+    result_payload = data.get("result_payload")
+    if isinstance(result_payload, str):
+        try:
+            result_payload = json.loads(result_payload)
+        except Exception:
+            result_payload = None
     return {
         "id": str(data.get("id") or ""),
         "export_type": str(data.get("export_type") or ""),
@@ -1281,11 +1456,13 @@ def _serialize_green_export_job(row: dict | None, request: Request | None = None
         "organization_id": int(data.get("organization_id") or 0) or None,
         "assignee_name": str(data.get("assignee_name") or "").strip() or None,
         "include_photos": bool(data.get("include_photos")),
+        "cache_key": str(data.get("cache_key") or "").strip() or None,
         "status": str(data.get("status") or "queued"),
         "file_name": str(data.get("file_name") or "").strip() or None,
         "object_key": object_key or None,
         "public_url": public_url or None,
         "download_url": proxy_url or public_url or None,
+        "result_payload": result_payload if isinstance(result_payload, dict) else None,
         "error_text": str(data.get("error_text") or "").strip() or None,
         "requested_by": str(data.get("requested_by") or "").strip() or None,
         "created_at": data.get("created_at"),
@@ -1319,6 +1496,7 @@ def _set_green_export_job_status(
     object_key: str | None = None,
     public_url: str | None = None,
     file_name: str | None = None,
+    result_payload: dict | None = None,
     started: bool = False,
     completed: bool = False,
 ):
@@ -1331,6 +1509,7 @@ def _set_green_export_job_status(
                 object_key = COALESCE(:object_key, object_key),
                 public_url = COALESCE(:public_url, public_url),
                 file_name = COALESCE(:file_name, file_name),
+                result_payload = COALESCE(CAST(:result_payload AS JSONB), result_payload),
                 started_at = CASE WHEN :started THEN COALESCE(started_at, NOW()) ELSE started_at END,
                 completed_at = CASE WHEN :completed THEN NOW() ELSE completed_at END,
                 updated_at = NOW()
@@ -1344,6 +1523,7 @@ def _set_green_export_job_status(
             "object_key": (object_key or "").strip() or None,
             "public_url": (public_url or "").strip() or None,
             "file_name": (file_name or "").strip() or None,
+            "result_payload": json.dumps(result_payload) if isinstance(result_payload, dict) else None,
             "started": bool(started),
             "completed": bool(completed),
         },
@@ -7012,6 +7192,9 @@ def ensure_green_tables(db: Session):
             organization_id INTEGER REFERENCES green_organizations(id) ON DELETE SET NULL,
             assignee_name TEXT,
             include_photos BOOLEAN NOT NULL DEFAULT FALSE,
+            cache_key TEXT,
+            request_payload JSONB,
+            result_payload JSONB,
             lng DOUBLE PRECISION,
             lat DOUBLE PRECISION,
             zoom DOUBLE PRECISION,
@@ -7058,6 +7241,9 @@ def ensure_green_tables(db: Session):
     db.execute(text("ALTER TABLE green_export_jobs ADD COLUMN IF NOT EXISTS zoom DOUBLE PRECISION"))
     db.execute(text("ALTER TABLE green_export_jobs ADD COLUMN IF NOT EXISTS bearing DOUBLE PRECISION"))
     db.execute(text("ALTER TABLE green_export_jobs ADD COLUMN IF NOT EXISTS pitch DOUBLE PRECISION"))
+    db.execute(text("ALTER TABLE green_export_jobs ADD COLUMN IF NOT EXISTS cache_key TEXT"))
+    db.execute(text("ALTER TABLE green_export_jobs ADD COLUMN IF NOT EXISTS request_payload JSONB"))
+    db.execute(text("ALTER TABLE green_export_jobs ADD COLUMN IF NOT EXISTS result_payload JSONB"))
     db.execute(text("CREATE INDEX IF NOT EXISTS idx_trees_project_id ON trees(project_id)"))
     db.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS idx_trees_project_tree_no ON trees(project_id, project_tree_no)"))
     db.execute(text("CREATE INDEX IF NOT EXISTS idx_trees_geom ON trees USING GIST (geom)"))
@@ -7102,6 +7288,7 @@ def ensure_green_tables(db: Session):
     db.execute(text("CREATE INDEX IF NOT EXISTS idx_verra_exports_project_time ON green_verra_exports(project_id, created_at DESC)"))
     db.execute(text("CREATE INDEX IF NOT EXISTS idx_green_export_jobs_status_created ON green_export_jobs(status, created_at DESC)"))
     db.execute(text("CREATE INDEX IF NOT EXISTS idx_green_export_jobs_project_created ON green_export_jobs(project_id, created_at DESC)"))
+    db.execute(text("CREATE INDEX IF NOT EXISTS idx_green_export_jobs_type_cache_created ON green_export_jobs(export_type, cache_key, created_at DESC)"))
     db.execute(text("CREATE INDEX IF NOT EXISTS idx_green_remote_monitoring_project_created ON green_remote_monitoring_areas(project_id, created_at DESC)"))
     db.execute(text("CREATE INDEX IF NOT EXISTS idx_green_remote_monitoring_cache_project_updated ON green_remote_monitoring_cache(project_id, updated_at DESC)"))
     db.execute(text("CREATE INDEX IF NOT EXISTS idx_green_remote_monitoring_cache_area_updated ON green_remote_monitoring_cache(area_id, updated_at DESC)"))
@@ -19583,7 +19770,11 @@ def export_tree_qr_tag_pdf(
 
 @router.get("/app/version-check")
 def app_version_check(db: Session = Depends(get_db)):
-    latest = os.getenv("LANDCHECK_LATEST_APP_VERSION", "1.0.17")
+    # Defaults are a safety net only - set LANDCHECK_LATEST_APP_VERSION on every Play Store
+    # release, or every installed user permanently looks "up to date" (or, if left stale below
+    # the real installed version, permanently "outdated"). Keep this in sync with
+    # landcheck-mobile's app.config.ts `version` at release time.
+    latest = os.getenv("LANDCHECK_LATEST_APP_VERSION", "1.0.43")
     minimum = os.getenv("LANDCHECK_MIN_APP_VERSION", "1.0.0")
     return {
         "latest_version": latest.strip(),
@@ -30768,6 +30959,139 @@ def analyze_remote_monitoring_area(
     }
 
 
+def _run_remote_monitoring_export_job(job_id: str):
+    db = SessionLocal()
+    try:
+        job = _get_green_export_job(db, job_id)
+        if not job:
+            return
+        _set_green_export_job_status(db, job_id, status="running", started=True)
+        payload = _normalize_green_export_job_payload(job.get("request_payload"))
+        project_id = int(payload.get("project_id") or job.get("project_id") or 0)
+        normalized_area_geojson = _normalize_polygon_area_geojson(payload.get("area_geojson"))
+        if normalized_area_geojson is None:
+            raise RuntimeError("Draw a valid polygon area")
+        series_months = max(1, min(int(payload.get("series_months") or 6), 12))
+        summary_window_days = max(30, min(int(payload.get("summary_window_days") or 90), 180))
+        refresh = bool(payload.get("refresh"))
+        area_sqm = _compute_geojson_area_sqm(db, area_geojson=normalized_area_geojson)
+        tree_counts = _count_trees_in_geojson(db, project_id=project_id, area_geojson=normalized_area_geojson)
+        tree_rows = _list_trees_in_geojson(db, project_id=project_id, area_geojson=normalized_area_geojson)
+        report = _get_or_compute_remote_monitoring_report(
+            db,
+            project_id=project_id,
+            area_geojson=normalized_area_geojson,
+            area_sqm=area_sqm,
+            tree_counts=tree_counts,
+            tree_rows=tree_rows,
+            series_months=series_months,
+            summary_window_days=summary_window_days,
+            refresh=refresh,
+        )
+        result_payload = {
+            "area": {
+                "project_id": project_id,
+                "area_geojson": normalized_area_geojson,
+                "area_sqm": round(area_sqm, 2),
+                **tree_counts,
+            },
+            **report,
+        }
+        _set_green_export_job_status(
+            db,
+            job_id,
+            status="completed",
+            result_payload=result_payload,
+            completed=True,
+        )
+    except Exception as exc:
+        try:
+            _set_green_export_job_status(db, job_id, status="failed", error_text=str(exc), completed=True)
+        except Exception:
+            pass
+    finally:
+        db.close()
+
+
+@router.post("/remote-monitoring/jobs")
+def create_remote_monitoring_analysis_job(
+    payload: RemoteMonitoringJobPayload,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    project_id = int(payload.project_id)
+    _get_project_settings(db, project_id)
+    normalized_area_geojson = _normalize_polygon_area_geojson(payload.area_geojson)
+    if normalized_area_geojson is None:
+        raise HTTPException(status_code=400, detail="Draw a valid polygon area")
+    request_payload = {
+        "project_id": project_id,
+        "area_geojson": normalized_area_geojson,
+        "series_months": max(1, min(int(payload.series_months or 6), 12)),
+        "summary_window_days": max(30, min(int(payload.summary_window_days or 90), 180)),
+        "refresh": bool(payload.refresh),
+        "threshold": payload.threshold,
+    }
+    cache_key = _build_remote_monitoring_job_cache_key(
+        db,
+        project_id=project_id,
+        area_geojson=normalized_area_geojson,
+        series_months=request_payload["series_months"],
+        summary_window_days=request_payload["summary_window_days"],
+        threshold=payload.threshold,
+    )
+    if not bool(payload.refresh):
+        existing = _find_green_export_job_by_cache_key(
+            db,
+            export_type="green-remote-monitoring-analysis",
+            cache_key=cache_key,
+        )
+        if existing:
+            return _serialize_green_export_job(existing, request=request)
+    job_id = uuid.uuid4().hex
+    db.execute(
+        text(
+            """
+            INSERT INTO green_export_jobs (
+                id,
+                export_type,
+                project_id,
+                cache_key,
+                request_payload,
+                status,
+                file_name,
+                requested_by,
+                created_at,
+                updated_at
+            )
+            VALUES (
+                :id,
+                'green-remote-monitoring-analysis',
+                :project_id,
+                :cache_key,
+                CAST(:request_payload AS JSONB),
+                'queued',
+                NULL,
+                :requested_by,
+                NOW(),
+                NOW()
+            )
+            """
+        ),
+        {
+            "id": job_id,
+            "project_id": project_id,
+            "cache_key": cache_key,
+            "request_payload": json.dumps(request_payload),
+            "requested_by": (payload.requested_by or "").strip() or None,
+        },
+    )
+    db.commit()
+    threading.Thread(target=_run_remote_monitoring_export_job, args=(job_id,), daemon=True).start()
+    job = _get_green_export_job(db, job_id)
+    return _serialize_green_export_job(job, request=request)
+
+
 @router.post("/remote-monitoring/areas")
 @router.post("/vegetation-areas")
 def create_remote_monitoring_area(
@@ -34531,6 +34855,21 @@ def export_work_report_pdf(
     )
 
 
+def _resolve_file_response_local_path(response) -> str:
+    return str(getattr(response, "path", "") or "").strip()
+
+
+def _resolve_file_response_filename(response, fallback: str | None = None) -> str:
+    filename = str(getattr(response, "filename", "") or "").strip()
+    if filename:
+        return filename
+    header_value = str(getattr(response, "headers", {}).get("content-disposition") or "").strip()
+    match = re.search(r'filename="([^"]+)"', header_value)
+    if match:
+        return match.group(1).strip()
+    return str(fallback or "").strip() or "landcheck-export.pdf"
+
+
 def _run_work_report_export_job(job_id: str):
     db = SessionLocal()
     pdf_path = ""
@@ -34599,6 +34938,28 @@ def create_work_report_export_job(
         db=db,
         assignee_name=(payload.assignee_name or "").strip() or None,
     )
+    request_payload = {
+        "assignee_name": (payload.assignee_name or "").strip() or None,
+        "include_photos": bool(payload.include_photos),
+        "lng": payload.lng,
+        "lat": payload.lat,
+        "zoom": payload.zoom,
+        "bearing": payload.bearing,
+        "pitch": payload.pitch,
+    }
+    cache_key = _build_green_report_cache_key(
+        db,
+        export_type="green-work-report",
+        project_id=int(payload.project_id),
+        filters=request_payload,
+    )
+    existing = _find_green_export_job_by_cache_key(
+        db,
+        export_type="green-work-report",
+        cache_key=cache_key,
+    )
+    if existing:
+        return _serialize_green_export_job(existing, request=request)
     job_id = uuid.uuid4().hex
     file_name = (
         f"project_{int(payload.project_id)}_work_report_{payload.assignee_name}.pdf"
@@ -34615,6 +34976,8 @@ def create_work_report_export_job(
                 organization_id,
                 assignee_name,
                 include_photos,
+                cache_key,
+                request_payload,
                 status,
                 file_name,
                 requested_by,
@@ -34630,6 +34993,8 @@ def create_work_report_export_job(
                 :organization_id,
                 :assignee_name,
                 :include_photos,
+                :cache_key,
+                CAST(:request_payload AS JSONB),
                 'queued',
                 :file_name,
                 :requested_by,
@@ -34646,6 +35011,8 @@ def create_work_report_export_job(
             "organization_id": int(project.get("organization_id") or 0) or None,
             "assignee_name": (payload.assignee_name or "").strip() or None,
             "include_photos": bool(payload.include_photos),
+            "cache_key": cache_key,
+            "request_payload": json.dumps(request_payload),
             "file_name": file_name,
             "requested_by": (payload.requested_by or "").strip() or None,
         },
@@ -34689,6 +35056,180 @@ def create_work_report_export_job(
     )
     db.commit()
     threading.Thread(target=_run_work_report_export_job, args=(job_id,), daemon=True).start()
+    job = _get_green_export_job(db, job_id)
+    return _serialize_green_export_job(job, request=request)
+
+
+def _run_green_file_export_job(job_id: str):
+    db = SessionLocal()
+    local_path = ""
+    try:
+        job = _get_green_export_job(db, job_id)
+        if not job:
+            return
+        _set_green_export_job_status(db, job_id, status="running", started=True)
+        payload = _normalize_green_export_job_payload(job.get("request_payload"))
+        export_type = str(job.get("export_type") or "").strip().lower()
+        project_id = int(job.get("project_id") or 0)
+        organization_id = int(job.get("organization_id") or 0) or None
+        if export_type == "green-existing-trees-report":
+            response = export_existing_trees_pdf(
+                project_id=project_id,
+                include_photos=bool(payload.get("include_photos")),
+                db=db,
+            )
+            category = "green-existing-trees-report"
+        elif export_type == "green-project-report":
+            response = export_project_pdf(
+                project_id=project_id,
+                lng=payload.get("lng"),
+                lat=payload.get("lat"),
+                zoom=payload.get("zoom"),
+                bearing=payload.get("bearing"),
+                pitch=payload.get("pitch"),
+                db=db,
+            )
+            category = "green-project-report"
+        else:
+            raise RuntimeError(f"Unsupported green export job type: {export_type}")
+
+        local_path = _resolve_file_response_local_path(response)
+        if not local_path or not os.path.exists(local_path):
+            raise RuntimeError("Export generated without a readable output file.")
+        file_name = _resolve_file_response_filename(response, fallback=str(job.get("file_name") or ""))
+        upload_meta = upload_export_file_best_effort(
+            local_path,
+            file_name,
+            category=category,
+            project_id=project_id or None,
+            organization_id=organization_id,
+            content_type="application/pdf",
+        )
+        if not upload_meta or not str(upload_meta.get("public_url") or "").strip():
+            raise RuntimeError("Report generated but upload to cloud storage failed.")
+        _set_green_export_job_status(
+            db,
+            job_id,
+            status="completed",
+            object_key=str(upload_meta.get("object_key") or ""),
+            public_url=str(upload_meta.get("public_url") or ""),
+            file_name=file_name,
+            completed=True,
+        )
+    except Exception as exc:
+        try:
+            _set_green_export_job_status(db, job_id, status="failed", error_text=str(exc), completed=True)
+        except Exception:
+            pass
+    finally:
+        try:
+            if local_path and os.path.exists(local_path):
+                os.remove(local_path)
+        except Exception:
+            pass
+        db.close()
+
+
+def _build_green_export_file_name(export_type: str, project_id: int, assignee_name: str | None = None) -> str:
+    clean_export_type = str(export_type or "").strip().lower()
+    clean_assignee = str(assignee_name or "").strip()
+    if clean_export_type == "green-work-report":
+        return f"project_{project_id}_work_report_{clean_assignee}.pdf" if clean_assignee else f"project_{project_id}_work_report_all.pdf"
+    if clean_export_type == "green-existing-trees-report":
+        return f"project_{project_id}_existing_trees_detailed.pdf"
+    if clean_export_type == "green-project-report":
+        return f"project_{project_id}_map_report.pdf"
+    return f"project_{project_id}_export.pdf"
+
+
+@router.post("/report-export-jobs")
+def create_green_report_export_job(
+    payload: GreenReportExportJobPayload,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    export_type = str(payload.export_type or "").strip().lower()
+    if export_type not in {"green-existing-trees-report", "green-project-report"}:
+        raise HTTPException(status_code=400, detail="Unsupported report export type")
+    project = get_project(
+        project_id=int(payload.project_id),
+        db=db,
+        assignee_name=(payload.assignee_name or "").strip() or None,
+    )
+    request_payload = {
+        "assignee_name": (payload.assignee_name or "").strip() or None,
+        "include_photos": bool(payload.include_photos),
+        "lng": payload.lng,
+        "lat": payload.lat,
+        "zoom": payload.zoom,
+        "bearing": payload.bearing,
+        "pitch": payload.pitch,
+    }
+    cache_key = _build_green_report_cache_key(
+        db,
+        export_type=export_type,
+        project_id=int(payload.project_id),
+        filters=request_payload,
+    )
+    existing = _find_green_export_job_by_cache_key(db, export_type=export_type, cache_key=cache_key)
+    if existing:
+        return _serialize_green_export_job(existing, request=request)
+    job_id = uuid.uuid4().hex
+    file_name = _build_green_export_file_name(
+        export_type,
+        int(payload.project_id),
+        assignee_name=(payload.assignee_name or "").strip() or None,
+    )
+    db.execute(
+        text(
+            """
+            INSERT INTO green_export_jobs (
+                id,
+                export_type,
+                project_id,
+                organization_id,
+                assignee_name,
+                include_photos,
+                cache_key,
+                request_payload,
+                status,
+                file_name,
+                requested_by,
+                created_at,
+                updated_at
+            )
+            VALUES (
+                :id,
+                :export_type,
+                :project_id,
+                :organization_id,
+                :assignee_name,
+                :include_photos,
+                :cache_key,
+                CAST(:request_payload AS JSONB),
+                'queued',
+                :file_name,
+                :requested_by,
+                NOW(),
+                NOW()
+            )
+            """
+        ),
+        {
+            "id": job_id,
+            "export_type": export_type,
+            "project_id": int(payload.project_id),
+            "organization_id": int(project.get("organization_id") or 0) or None,
+            "assignee_name": (payload.assignee_name or "").strip() or None,
+            "include_photos": bool(payload.include_photos),
+            "cache_key": cache_key,
+            "request_payload": json.dumps(request_payload),
+            "file_name": file_name,
+            "requested_by": (payload.requested_by or "").strip() or None,
+        },
+    )
+    db.commit()
+    threading.Thread(target=_run_green_file_export_job, args=(job_id,), daemon=True).start()
     job = _get_green_export_job(db, job_id)
     return _serialize_green_export_job(job, request=request)
 
