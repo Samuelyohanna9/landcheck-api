@@ -36,6 +36,7 @@ from pydantic import BaseModel
 from app.db import SessionLocal
 from app.utils.green_pdf import (
     render_green_report_pdf,
+    render_green_agric_farmer_sheet_pdf,
     render_green_agric_programme_pdf,
     render_green_relief_programme_pdf,
     render_green_csr_programme_report_pdf,
@@ -34090,6 +34091,32 @@ def export_existing_trees_csv(project_id: int, db: Session = Depends(get_db)):
 
     filename = f"project_{project_id}_csr_implementation_detailed.csv" if csr_report_mode else f"project_{project_id}_existing_trees_detailed.csv"
     return FileResponse(csv_path, media_type="text/csv", filename=filename)
+
+
+@router.get("/projects/{project_id}/agric/farmers-sheet/export/pdf")
+def export_agric_farmers_sheet_pdf(project_id: int, db: Session = Depends(get_db)):
+    project = get_project(project_id, db)
+    if _normalize_workflow_profile(project.get("workflow_profile")) != "agric":
+        raise HTTPException(status_code=400, detail="Farmer sheet export is available only for agric projects.")
+    context = _build_agric_programme_export_context(project_id, db, include_map=False)
+    os.makedirs(REPORTS_DIR, exist_ok=True)
+    tmp_pdf = tempfile.NamedTemporaryFile(suffix="_agric_farmers_sheet.pdf", delete=False)
+    pdf_path = tmp_pdf.name
+    tmp_pdf.close()
+    render_green_agric_farmer_sheet_pdf(
+        pdf_path,
+        project=context["project"],
+        summary=context["summary"],
+        farmer_rows=context["farmer_rows"],
+    )
+    filename = f"project_{project_id}_agric_farmers_sheet.pdf"
+    return _pdf_response_with_r2(
+        pdf_path,
+        filename,
+        category="green-agric-farmers-sheet",
+        project_id=project_id,
+        organization_id=int(context["project"].get("organization_id") or 0) or None,
+    )
 
 
 @router.get("/projects/{project_id}/existing-trees/export/pdf")

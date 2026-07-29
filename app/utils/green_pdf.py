@@ -1,4 +1,4 @@
-from reportlab.lib.pagesizes import A4
+from reportlab.lib.pagesizes import A4, landscape
 from reportlab.pdfgen import canvas
 from reportlab.lib.colors import HexColor
 from reportlab.lib.utils import ImageReader, simpleSplit
@@ -4213,6 +4213,286 @@ def _draw_plot_photo_panel(c, *, x: float, y: float, w: float, h: float, row: di
         c.setFont("Helvetica-Oblique", 8)
         c.setFillColorRGB(0.46, 0.46, 0.46)
         c.drawCentredString(img_x + (img_w / 2), img_y + (img_h / 2), f"No photo embedded for this {entity_singular_label}")
+
+
+def render_green_agric_farmer_sheet_pdf(
+    output_path: str,
+    project: dict,
+    summary: dict,
+    farmer_rows: list[dict],
+):
+    c = canvas.Canvas(output_path, pagesize=landscape(A4))
+    width, height = landscape(A4)
+    rows = sorted(
+        [dict(item) for item in farmer_rows],
+        key=lambda item: (str(item.get("name") or "").strip().lower(), int(item.get("id") or 0)),
+    )
+    total_pages = max(1, int(math.ceil(len(rows) / 8.0)))
+
+    def _fmt_date(value) -> str:
+        if value is None:
+            return "-"
+        if hasattr(value, "strftime"):
+            try:
+                return value.strftime("%d %b %Y")
+            except Exception:
+                pass
+        text_value = str(value or "").strip()
+        if not text_value:
+            return "-"
+        try:
+            return datetime.fromisoformat(text_value.replace("Z", "+00:00")).strftime("%d %b %Y")
+        except Exception:
+            return text_value[:10]
+
+    def _fmt_bool(value) -> str:
+        return "Yes" if bool(value) else "No"
+
+    def _fmt_text(value, fallback: str = "-") -> str:
+        clean = str(value or "").strip()
+        return clean or fallback
+
+    def _fmt_area(value) -> str:
+        numeric = _safe_float_value(value)
+        return f"{numeric:.2f} ha" if numeric > 0 else "-"
+
+    def _fmt_yield(value) -> str:
+        numeric = _safe_float_value(value)
+        return f"{numeric:,.0f} kg" if numeric > 0 else "-"
+
+    def _draw_lines(
+        lines: list[str],
+        x: float,
+        y: float,
+        w: float,
+        h: float,
+        *,
+        first_line_font: str = "Helvetica-Bold",
+        body_font: str = "Helvetica",
+        font_size: float = 7.35,
+        max_lines: int = 4,
+        leading: float = 8.0,
+        color: str = "#163826",
+    ) -> None:
+        rendered: list[tuple[str, str]] = []
+        for idx, raw_line in enumerate(lines):
+            clean_line = str(raw_line or "").strip()
+            if not clean_line:
+                continue
+            wrapped = _wrap_pdf_text_lines(
+                c,
+                clean_line,
+                first_line_font if idx == 0 else body_font,
+                font_size,
+                max(w - 8, 8),
+            )
+            for wrap_idx, part in enumerate(wrapped):
+                rendered.append((first_line_font if idx == 0 and wrap_idx == 0 else body_font, part))
+        current_y = y + h - 11
+        c.setFillColor(HexColor(color))
+        for font_name, part in rendered[:max_lines]:
+            if current_y < y + 5:
+                break
+            c.setFont(font_name, font_size)
+            c.drawString(x + 4, current_y, part)
+            current_y -= leading
+
+    def _draw_footer(page_no: int) -> None:
+        c.setStrokeColor(HexColor("#d8e6dc"))
+        c.setLineWidth(0.5)
+        c.line(30, 24, width - 30, 24)
+        c.setFillColor(HexColor("#4f6858"))
+        c.setFont("Helvetica", 8)
+        c.drawString(30, 11, "LandCheck Agric farmer registry sheet")
+        c.drawRightString(width - 30, 11, f"Page {page_no} of {total_pages}")
+
+    def _draw_page_header(page_no: int) -> tuple[float, float, float, float]:
+        _draw_project_brand_header_bar(
+            c,
+            width,
+            height,
+            project,
+            report_label="Agric Farmer Registry Sheet",
+            subtitle=str(project.get("location_text") or "Field onboarding and capture register").strip() or None,
+            bar_height=72,
+            bar_color="#123d27",
+        )
+        c.setFillColor(HexColor("#13281d"))
+        c.setFont("Times-Bold", 19)
+        c.drawString(34, height - 94, "Farmer Registry Master Sheet")
+        c.setFillColor(HexColor("#557163"))
+        c.setFont("Helvetica", 9.2)
+        c.drawString(
+            34,
+            height - 108,
+            "Professional register of all farmers captured in this agric project, prepared for field teams, managers, and partner records.",
+        )
+        c.setFont("Helvetica", 8.5)
+        c.setFillColor(HexColor("#6d8577"))
+        c.drawRightString(width - 34, height - 108, f"Generated for {str(project.get('name') or 'Project').strip()[:68]}")
+
+        chip_y = height - 164
+        chip_h = 42
+        gap = 10
+        chip_w = (width - 68 - (gap * 4)) / 5
+        _draw_metric_chip(c, 34, chip_y, chip_w, chip_h, str(len(rows)), "Registered farmers")
+        _draw_metric_chip(
+            c,
+            34 + (chip_w + gap),
+            chip_y,
+            chip_w,
+            chip_h,
+            str(_safe_int_value(summary.get("verified_farmers"))),
+            "Verified",
+        )
+        _draw_metric_chip(
+            c,
+            34 + ((chip_w + gap) * 2),
+            chip_y,
+            chip_w,
+            chip_h,
+            str(_safe_int_value(summary.get("mapped_plots"))),
+            "Mapped plots",
+        )
+        _draw_metric_chip(
+            c,
+            34 + ((chip_w + gap) * 3),
+            chip_y,
+            chip_w,
+            chip_h,
+            f"{_safe_int_value(summary.get('field_capture_done'))}/{_safe_int_value(summary.get('field_capture_assigned'))}",
+            "Field capture",
+        )
+        _draw_metric_chip(
+            c,
+            34 + ((chip_w + gap) * 4),
+            chip_y,
+            chip_w,
+            chip_h,
+            f"{_safe_float_value(summary.get('allocated_units')):,.0f}",
+            "Units allocated",
+        )
+
+        table_x = 34
+        table_y = 42
+        table_w = width - 68
+        table_h = chip_y - table_y - 16
+        _draw_rounded_box(
+            c,
+            table_x,
+            table_y,
+            table_w,
+            table_h,
+            10,
+            fill_color=HexColor("#fbfcfb"),
+            stroke_color=HexColor("#d6e4da"),
+        )
+        return table_x, table_y, table_w, table_h
+
+    columns = [
+        ("No.", 30),
+        ("Farmer", 168),
+        ("Contact", 128),
+        ("Location & Farm Profile", 218),
+        ("Programme Status", 230),
+    ]
+    page_no = 1
+    row_index = 0
+    while True:
+        table_x, table_y, table_w, table_h = _draw_page_header(page_no)
+        header_h = 24
+        row_h = 40
+        usable_top = table_y + table_h - 18
+        c.setFillColor(HexColor("#eef7f0"))
+        c.rect(table_x + 1, usable_top - header_h, table_w - 2, header_h, stroke=0, fill=1)
+        c.setFont("Helvetica-Bold", 8.1)
+        c.setFillColor(HexColor("#163826"))
+        cursor_x = table_x + 4
+        for label, col_w in columns:
+            c.drawString(cursor_x + 1, usable_top - 15, label)
+            cursor_x += col_w
+        c.setStrokeColor(HexColor("#d7e5db"))
+        c.setLineWidth(0.45)
+        c.line(table_x + 1, usable_top - header_h, table_x + table_w - 1, usable_top - header_h)
+
+        rows_on_page = 0
+        current_y = usable_top - header_h
+        while row_index < len(rows) and rows_on_page < 8:
+            row = rows[row_index]
+            profile = row.get("profile_data") if isinstance(row.get("profile_data"), dict) else {}
+            current_y -= row_h
+            if rows_on_page % 2 == 0:
+                c.setFillColor(HexColor("#f9fcfa"))
+                c.rect(table_x + 1, current_y, table_w - 2, row_h, stroke=0, fill=1)
+            c.setStrokeColor(HexColor("#ebf2ed"))
+            c.line(table_x + 1, current_y, table_x + table_w - 1, current_y)
+
+            farmer_lines = [
+                _fmt_text(row.get("name")),
+                f"Code: {_fmt_text(profile.get('farmer_code'))} | ID: {_fmt_text(profile.get('national_id'))}",
+                f"Verification: {_fmt_text(row.get('verification_status')).title()} | Type: {_fmt_text(row.get('custodian_type')).title()}",
+            ]
+            contact_lines = [
+                _fmt_text(row.get("phone")),
+                f"Email: {_fmt_text(row.get('email'))}",
+                f"Contact: {_fmt_text(row.get('contact_person'))}",
+                f"Created: {_fmt_date(row.get('created_at'))}",
+            ]
+            location_profile_lines = [
+                f"{_fmt_text(row.get('community_name'))}, {_fmt_text(row.get('local_government'))}",
+                f"State/Ward: {_fmt_text(profile.get('state_name'))} / {_fmt_text(profile.get('ward_name'))}",
+                f"Crop: {_fmt_text(profile.get('primary_crop'))} | Group: {_fmt_text(profile.get('farmer_group'))}",
+                f"Tenure: {_fmt_text(profile.get('land_tenure'))} | Irrigation: {_fmt_text(profile.get('irrigation_access'))}",
+            ]
+            programme_lines = [
+                f"Plots: {_safe_int_value(row.get('plot_count'))} | Area: {_fmt_area(row.get('mapped_area_ha'))} | Yield: {_fmt_yield(row.get('estimated_yield_kg'))}",
+                f"Allocations: {_safe_int_value(row.get('allocation_count'))} | Units: {_safe_float_value(row.get('allocated_units')):,.0f} | Target: {_safe_int_value(row.get('support_target'))}",
+                f"Field capture: {_safe_int_value(row.get('field_capture_done'))}/{_safe_int_value(row.get('field_capture_assigned'))} | Visits: {_safe_int_value(row.get('support_visit_done'))}/{_safe_int_value(row.get('support_visit_assigned'))}",
+                f"Finance: {_fmt_bool(profile.get('finance_access'))} | Insurance: {_fmt_bool(profile.get('insurance_access'))} | HH size: {_fmt_text(profile.get('household_size'))}",
+            ]
+
+            cell_x = table_x + 4
+            c.setFillColor(HexColor("#163826"))
+            c.setFont("Helvetica-Bold", 8.4)
+            c.drawString(cell_x + 1, current_y + row_h - 12, str(row_index + 1))
+            cell_x += columns[0][1]
+            _draw_lines(farmer_lines, cell_x, current_y, columns[1][1], row_h)
+            cell_x += columns[1][1]
+            _draw_lines(contact_lines, cell_x, current_y, columns[2][1], row_h, max_lines=4)
+            cell_x += columns[2][1]
+            _draw_lines(location_profile_lines, cell_x, current_y, columns[3][1], row_h, max_lines=4)
+            cell_x += columns[3][1]
+            _draw_lines(programme_lines, cell_x, current_y, columns[4][1], row_h, max_lines=4)
+
+            row_index += 1
+            rows_on_page += 1
+
+        if not rows:
+            c.setFillColor(HexColor("#5e7165"))
+            c.setFont("Helvetica", 10)
+            c.drawString(table_x + 14, table_y + table_h - 62, "No farmer records are currently available for this project.")
+
+        vertical_x = table_x + 4
+        c.setStrokeColor(HexColor("#e5eee7"))
+        c.setLineWidth(0.35)
+        for _, col_w in columns[:-1]:
+            vertical_x += col_w
+            c.line(vertical_x, table_y + 1, vertical_x, usable_top)
+
+        c.setFillColor(HexColor("#5a705f"))
+        c.setFont("Helvetica-Oblique", 7.7)
+        c.drawString(
+            table_x + 4,
+            table_y + 12,
+            "Prepared for field capture and farmer verification workflows. Powered by LandCheck.",
+        )
+        _draw_footer(page_no)
+        if row_index >= len(rows):
+            break
+        c.showPage()
+        page_no += 1
+
+    c.save()
 
 
 def render_green_agric_programme_pdf(
