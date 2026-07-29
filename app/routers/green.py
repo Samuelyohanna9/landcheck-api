@@ -13546,7 +13546,7 @@ def get_public_org_impact(org_slug: str, db: Session = Depends(get_db)):
     project_rows = db.execute(
         text(
             """
-            SELECT id, name, location_text, workflow_profile, agric_config, relief_config, csr_config, created_at
+            SELECT id, name, location_text, workflow_profile, agric_config, relief_config, csr_config, sponsor, created_at
             FROM tree_projects
             WHERE organization_id = :org_id
             ORDER BY created_at
@@ -13632,6 +13632,110 @@ def get_public_org_impact(org_slug: str, db: Session = Depends(get_db)):
             {"pid": proj_id},
         ).mappings().all()
         species_breakdown = [{"label": row["label"], "count": int(row["count"])} for row in breakdown_rows]
+
+        # Agric-only: aggregate-only farmer registry / field-support snapshot for the public donor
+        # page, mirroring the Farmer Registry Sheet's headline numbers. No per-farmer PII (names,
+        # phone numbers, national IDs) ever leaves this block - only counts and category breakdowns.
+        agric_summary = None
+        if workflow == "agric":
+            farmer_agg_row = db.execute(
+                text(
+                    """
+                    SELECT
+                        COUNT(*) AS total_farmers,
+                        COUNT(*) FILTER (WHERE LOWER(COALESCE(verification_status, '')) = 'verified') AS verified_farmers,
+                        COUNT(*) FILTER (WHERE COALESCE((profile_data->>'finance_access')::boolean, false)) AS finance_access_count,
+                        COUNT(*) FILTER (WHERE COALESCE((profile_data->>'insurance_access')::boolean, false)) AS insurance_access_count,
+                        COUNT(*) FILTER (WHERE NULLIF(TRIM(profile_data->>'farmer_group'), '') IS NOT NULL) AS group_member_count,
+                        COUNT(*) FILTER (WHERE NULLIF(profile_data->>'household_size', '') IS NOT NULL) AS household_known_count,
+                        COALESCE(SUM(NULLIF(profile_data->>'household_size', '')::int), 0) AS household_reach_total
+                    FROM green_custodians
+                    WHERE project_id = :pid
+                    """
+                ),
+                {"pid": proj_id},
+            ).mappings().first()
+            farmer_agg = dict(farmer_agg_row) if farmer_agg_row else {}
+            total_farmers = int(farmer_agg.get("total_farmers") or 0)
+
+            tenure_rows = db.execute(
+                text(
+                    """
+                    SELECT COALESCE(NULLIF(TRIM(profile_data->>'land_tenure'), ''), 'Not specified') AS label, COUNT(*) AS count
+                    FROM green_custodians
+                    WHERE project_id = :pid
+                    GROUP BY label
+                    ORDER BY count DESC
+                    """
+                ),
+                {"pid": proj_id},
+            ).mappings().all()
+
+            irrigation_rows = db.execute(
+                text(
+                    """
+                    SELECT COALESCE(NULLIF(TRIM(profile_data->>'irrigation_access'), ''), 'Not specified') AS label, COUNT(*) AS count
+                    FROM green_custodians
+                    WHERE project_id = :pid
+                    GROUP BY label
+                    ORDER BY count DESC
+                    """
+                ),
+                {"pid": proj_id},
+            ).mappings().all()
+
+            allocation_row = db.execute(
+                text(
+                    """
+                    SELECT
+                        COALESCE(SUM(a.quantity_allocated), 0) AS allocated_units,
+                        COUNT(DISTINCT a.custodian_id) AS supported_farmers
+                    FROM green_distribution_allocations a
+                    WHERE a.project_id = :pid
+                    """
+                ),
+                {"pid": proj_id},
+            ).mappings().first()
+
+            field_capture_row = db.execute(
+                text(
+                    """
+                    SELECT
+                        COUNT(*) FILTER (WHERE LOWER(COALESCE(t.task_type, '')) = 'field_capture') AS field_capture_assigned,
+                        COUNT(*) FILTER (
+                            WHERE LOWER(COALESCE(t.task_type, '')) = 'field_capture'
+                              AND (
+                                    LOWER(COALESCE(t.review_state, 'none')) = 'approved'
+                                    OR (
+                                        LOWER(COALESCE(t.status, '')) IN ('done', 'completed', 'closed')
+                                        AND LOWER(COALESCE(t.review_state, 'none')) IN ('none', 'approved')
+                                    )
+                                  )
+                        ) AS field_capture_done
+                    FROM tree_tasks t
+                    JOIN trees tr ON tr.id = t.tree_id
+                    WHERE tr.project_id = :pid
+                      AND t.custodian_id IS NOT NULL
+                    """
+                ),
+                {"pid": proj_id},
+            ).mappings().first()
+
+            agric_summary = {
+                "total_farmers": total_farmers,
+                "verified_farmers": int(farmer_agg.get("verified_farmers") or 0),
+                "group_member_farmers": int(farmer_agg.get("group_member_count") or 0),
+                "finance_access_rate": round(int(farmer_agg.get("finance_access_count") or 0) / total_farmers * 100, 1) if total_farmers else 0.0,
+                "insurance_access_rate": round(int(farmer_agg.get("insurance_access_count") or 0) / total_farmers * 100, 1) if total_farmers else 0.0,
+                "household_reach_total": int(farmer_agg.get("household_reach_total") or 0),
+                "household_known_count": int(farmer_agg.get("household_known_count") or 0),
+                "tenure_breakdown": [{"label": row["label"], "count": int(row["count"])} for row in tenure_rows],
+                "irrigation_breakdown": [{"label": row["label"], "count": int(row["count"])} for row in irrigation_rows],
+                "allocated_units": round(float((allocation_row or {}).get("allocated_units") or 0.0), 2),
+                "supported_farmers": int((allocation_row or {}).get("supported_farmers") or 0),
+                "field_capture_assigned": int((field_capture_row or {}).get("field_capture_assigned") or 0),
+                "field_capture_done": int((field_capture_row or {}).get("field_capture_done") or 0),
+            }
 
         # Recent approved photos
         photo_rows = db.execute(
@@ -13769,11 +13873,13 @@ def get_public_org_impact(org_slug: str, db: Session = Depends(get_db)):
             "id": proj_id,
             "name": str(proj_row.get("name") or ""),
             "location_text": str(proj_row.get("location_text") or ""),
+            "sponsor": str(proj_row.get("sponsor") or "").strip() or None,
             "workflow_profile": workflow,
             "labels": labels,
             "agric_config": _normalize_agric_config(proj_row.get("agric_config")),
             "relief_config": _normalize_relief_config(proj_row.get("relief_config")),
             "csr_config": _normalize_csr_config(proj_row.get("csr_config")),
+            "agric_summary": agric_summary,
             "stats": {
                 "total_records": total_rec,
                 "active_records": active_rec,
