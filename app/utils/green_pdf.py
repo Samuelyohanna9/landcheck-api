@@ -1380,7 +1380,13 @@ def _draw_project_brand_header_bar(
     heading_available_w = available_w - timestamp_w - 12
 
     c.setFillColorRGB(1, 1, 1)
-    heading_font_size = 16 if bar_h <= 72 else 18
+    heading_base_size = 16 if bar_h <= 72 else 18
+    heading_min_size = 10.5
+    # An "org / sponsor" heading can run long - shrink the font in small steps before ever
+    # truncating, so the full name stays readable instead of getting cut off with an ellipsis.
+    heading_font_size = heading_base_size
+    while heading_font_size > heading_min_size and c.stringWidth(heading, "Helvetica-Bold", heading_font_size) > heading_available_w:
+        heading_font_size -= 0.5
     c.setFont("Helvetica-Bold", heading_font_size)
     c.drawString(text_x, top - 28, _fit_to_width(heading, "Helvetica-Bold", heading_font_size, heading_available_w))
 
