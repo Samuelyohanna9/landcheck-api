@@ -1357,20 +1357,40 @@ def _draw_project_brand_header_bar(
     logo_dx = _draw_project_logo(c, project, left, logo_y, logo_size)
     text_x = left + logo_dx
 
+    def _fit_to_width(text: str, font_name: str, font_size: float, max_width: float) -> str:
+        # A fixed character-count slice (the previous approach) cuts off at an arbitrary point
+        # regardless of the string's actual rendered width - long enough org/project/report-label
+        # combinations were getting truncated mid-word (e.g. "Sheet" -> "Shee"). Truncate by the
+        # real available width instead, with an ellipsis only when something was actually cut.
+        if c.stringWidth(text, font_name, font_size) <= max_width:
+            return text
+        truncated = text
+        while truncated and c.stringWidth(truncated + "…", font_name, font_size) > max_width:
+            truncated = truncated[:-1]
+        return f"{truncated.rstrip()}…" if truncated else text[:1]
+
+    available_w = width - right - text_x
+    timestamp_text = datetime.utcnow().strftime("Generated %d %b %Y %H:%M UTC")
+    timestamp_w = c.stringWidth(timestamp_text, "Helvetica", 9)
+    # The heading shares its baseline with the right-aligned timestamp, so it needs a narrower
+    # budget than the subtitle/powered-by lines below it, which have the row to themselves.
+    heading_available_w = available_w - timestamp_w - 12
+
     c.setFillColorRGB(1, 1, 1)
-    c.setFont("Helvetica-Bold", 16 if bar_h <= 72 else 18)
-    c.drawString(text_x, top - 28, heading[:64])
+    heading_font_size = 16 if bar_h <= 72 else 18
+    c.setFont("Helvetica-Bold", heading_font_size)
+    c.drawString(text_x, top - 28, _fit_to_width(heading, "Helvetica-Bold", heading_font_size, heading_available_w))
 
     c.setFont("Helvetica", 10.2)
     c.setFillColorRGB(0.88, 0.96, 0.9)
-    c.drawString(text_x, top - 43, line2[:96])
+    c.drawString(text_x, top - 43, _fit_to_width(line2, "Helvetica", 10.2, available_w))
     c.setFont("Helvetica-Oblique", 8.8)
     powered_text = f"Powered by LandCheck{f' | {subtitle}' if subtitle else ''}"
-    c.drawString(text_x, top - (58 if bar_h > 72 else 55), powered_text[:120])
+    c.drawString(text_x, top - (58 if bar_h > 72 else 55), _fit_to_width(powered_text, "Helvetica-Oblique", 8.8, available_w))
 
     c.setFont("Helvetica", 9)
     c.setFillColorRGB(0.82, 0.95, 0.86)
-    c.drawRightString(width - right, top - 28, datetime.utcnow().strftime("Generated %d %b %Y %H:%M UTC"))
+    c.drawRightString(width - right, top - 28, timestamp_text)
 
 
 def _draw_stat_card(c, x, y, w, h, label, value, sub=None, color=None):
