@@ -1263,12 +1263,16 @@ def _draw_wrapped_text(
 
 def _draw_metric_chip(c, x: float, y: float, width: float, height: float, value: str, label: str):
     _draw_rounded_box(c, x, y, width, height, 18, fill_color=HexColor("#f7fbf8"), stroke_color=HexColor("#d7ead9"))
+    # Value and label baselines are anchored from the top and bottom of the box respectively
+    # (rather than fixed offsets tuned for a taller box) so they stay clear of each other even
+    # in a compact chip - a fixed-offset version previously let the value's descender collide
+    # with the label's ascender at this chip's height.
     c.setFillColor(HexColor("#163826"))
-    c.setFont("Helvetica-Bold", 18)
-    c.drawString(x + 14, y + height - 28, value)
+    c.setFont("Helvetica-Bold", 15)
+    c.drawString(x + 14, y + height - 18, value)
     c.setFillColor(HexColor("#53705f"))
-    c.setFont("Helvetica", 10)
-    c.drawString(x + 14, y + 18, label)
+    c.setFont("Helvetica", 8.4)
+    c.drawString(x + 14, y + 8, label)
 
 
 def _draw_qr_code(c, value: str, x: float, y: float, size: float):
@@ -1701,7 +1705,15 @@ def _load_photo_reader(photo_url, image_cache):
                         data = response.read()
         else:
             if raw.startswith("/"):
-                base_url = (os.getenv("GREEN_REPORT_PHOTO_BASE_URL") or os.getenv("BACKEND_URL") or "").strip().rstrip("/")
+                # LANDCHECK_API_PUBLIC_URL is this API's own established public-base-URL env var
+                # (see app/routers/green.py) - GREEN_REPORT_PHOTO_BASE_URL/BACKEND_URL are kept as
+                # fallbacks in case a deployment sets one of those instead.
+                base_url = (
+                    os.getenv("LANDCHECK_API_PUBLIC_URL")
+                    or os.getenv("GREEN_REPORT_PHOTO_BASE_URL")
+                    or os.getenv("BACKEND_URL")
+                    or ""
+                ).strip().rstrip("/")
                 if base_url:
                     remote_url = f"{base_url}{raw}"
                     req = Request(remote_url, headers={"User-Agent": "LandCheck-Green-Report/1.0"})
@@ -4227,7 +4239,20 @@ def render_green_agric_farmer_sheet_pdf(
         [dict(item) for item in farmer_rows],
         key=lambda item: (str(item.get("name") or "").strip().lower(), int(item.get("id") or 0)),
     )
-    total_pages = max(1, int(math.ceil(len(rows) / 8.0)))
+    header_h = 24
+    row_h = 40
+    # Continuation pages carry a slim single-line header instead of the full title/chip block, so
+    # they have noticeably more vertical room for the table than page 1 - compute each page's real
+    # capacity instead of assuming a uniform row count, so the "Page X of Y" footer stays accurate.
+    _table_h_page1 = height - 164 - 42 - 16
+    _table_h_cont = height - 40 - 42 - 14
+    first_page_capacity = max(1, int((_table_h_page1 - header_h - 18) // row_h))
+    cont_page_capacity = max(1, int((_table_h_cont - header_h - 18) // row_h))
+    if len(rows) <= first_page_capacity:
+        total_pages = 1
+    else:
+        remaining_rows = len(rows) - first_page_capacity
+        total_pages = 1 + int(math.ceil(remaining_rows / cont_page_capacity))
 
     def _fmt_date(value) -> str:
         if value is None:
@@ -4307,76 +4332,106 @@ def render_green_agric_farmer_sheet_pdf(
         c.drawRightString(width - 30, 11, f"Page {page_no} of {total_pages}")
 
     def _draw_page_header(page_no: int) -> tuple[float, float, float, float]:
-        _draw_project_brand_header_bar(
-            c,
-            width,
-            height,
-            project,
-            report_label="Agric Farmer Registry Sheet",
-            subtitle=str(project.get("location_text") or "Field onboarding and capture register").strip() or None,
-            bar_height=72,
-            bar_color="#123d27",
-        )
-        c.setFillColor(HexColor("#13281d"))
-        c.setFont("Times-Bold", 19)
-        c.drawString(34, height - 94, "Farmer Registry Master Sheet")
-        c.setFillColor(HexColor("#557163"))
-        c.setFont("Helvetica", 9.2)
-        c.drawString(
-            34,
-            height - 108,
-            "Professional register of all farmers captured in this agric project, prepared for field teams, managers, and partner records.",
-        )
-        c.setFont("Helvetica", 8.5)
-        c.setFillColor(HexColor("#6d8577"))
-        c.drawRightString(width - 34, height - 108, f"Generated for {str(project.get('name') or 'Project').strip()[:68]}")
+        # The full branded header (title, description, stat chips) only makes sense once - repeating
+        # it on every one of up to 19 pages wastes vertical space and reads as sloppy. Continuation
+        # pages get a slim single-line strip instead (still carrying the logo and page context).
+        if page_no == 1:
+            _draw_project_brand_header_bar(
+                c,
+                width,
+                height,
+                project,
+                report_label="Agric Farmer Registry Sheet",
+                subtitle=str(project.get("location_text") or "Field onboarding and capture register").strip() or None,
+                bar_height=72,
+                bar_color="#123d27",
+            )
+            c.setFillColor(HexColor("#13281d"))
+            c.setFont("Times-Bold", 19)
+            c.drawString(34, height - 94, "Farmer Registry Master Sheet")
+            c.setFillColor(HexColor("#557163"))
+            c.setFont("Helvetica", 9.2)
+            c.drawString(
+                34,
+                height - 108,
+                "Professional register of all farmers captured in this agric project, prepared for field teams, managers, and partner records.",
+            )
+            c.setFont("Helvetica", 8.5)
+            c.setFillColor(HexColor("#6d8577"))
+            c.drawRightString(width - 34, height - 108, f"Generated for {str(project.get('name') or 'Project').strip()[:68]}")
 
-        chip_y = height - 164
-        chip_h = 42
-        gap = 10
-        chip_w = (width - 68 - (gap * 4)) / 5
-        _draw_metric_chip(c, 34, chip_y, chip_w, chip_h, str(len(rows)), "Registered farmers")
-        _draw_metric_chip(
-            c,
-            34 + (chip_w + gap),
-            chip_y,
-            chip_w,
-            chip_h,
-            str(_safe_int_value(summary.get("verified_farmers"))),
-            "Verified",
-        )
-        _draw_metric_chip(
-            c,
-            34 + ((chip_w + gap) * 2),
-            chip_y,
-            chip_w,
-            chip_h,
-            str(_safe_int_value(summary.get("mapped_plots"))),
-            "Mapped plots",
-        )
-        _draw_metric_chip(
-            c,
-            34 + ((chip_w + gap) * 3),
-            chip_y,
-            chip_w,
-            chip_h,
-            f"{_safe_int_value(summary.get('field_capture_done'))}/{_safe_int_value(summary.get('field_capture_assigned'))}",
-            "Field capture",
-        )
-        _draw_metric_chip(
-            c,
-            34 + ((chip_w + gap) * 4),
-            chip_y,
-            chip_w,
-            chip_h,
-            f"{_safe_float_value(summary.get('allocated_units')):,.0f}",
-            "Units allocated",
-        )
+            chip_y = height - 164
+            chip_h = 42
+            gap = 10
+            chip_w = (width - 68 - (gap * 4)) / 5
+            _draw_metric_chip(c, 34, chip_y, chip_w, chip_h, str(len(rows)), "Registered farmers")
+            _draw_metric_chip(
+                c,
+                34 + (chip_w + gap),
+                chip_y,
+                chip_w,
+                chip_h,
+                str(_safe_int_value(summary.get("verified_farmers"))),
+                "Verified",
+            )
+            _draw_metric_chip(
+                c,
+                34 + ((chip_w + gap) * 2),
+                chip_y,
+                chip_w,
+                chip_h,
+                str(_safe_int_value(summary.get("mapped_plots"))),
+                "Mapped plots",
+            )
+            _draw_metric_chip(
+                c,
+                34 + ((chip_w + gap) * 3),
+                chip_y,
+                chip_w,
+                chip_h,
+                f"{_safe_int_value(summary.get('field_capture_done'))}/{_safe_int_value(summary.get('field_capture_assigned'))}",
+                "Field capture",
+            )
+            _draw_metric_chip(
+                c,
+                34 + ((chip_w + gap) * 4),
+                chip_y,
+                chip_w,
+                chip_h,
+                f"{_safe_float_value(summary.get('allocated_units')):,.0f}",
+                "Units allocated",
+            )
 
-        table_x = 34
-        table_y = 42
-        table_w = width - 68
-        table_h = chip_y - table_y - 16
+            table_x = 34
+            table_y = 42
+            table_w = width - 68
+            table_h = chip_y - table_y - 16
+        else:
+            bar_h = 40
+            c.setFillColor(HexColor("#123d27"))
+            c.rect(0, height - bar_h, width, bar_h, stroke=0, fill=1)
+            logo_size = 24
+            logo_y = height - bar_h + (bar_h - logo_size) / 2
+            logo_dx = _draw_project_logo(c, project, 34, logo_y, logo_size)
+            text_x = 34 + logo_dx
+            mid_y = height - bar_h + (bar_h / 2) - 4
+            c.setFillColorRGB(1, 1, 1)
+            c.setFont("Helvetica-Bold", 11)
+            org_heading = str(project.get("organization_name") or project.get("name") or "Project").strip()
+            c.drawString(text_x, mid_y, org_heading[:70])
+            c.setFont("Helvetica-Oblique", 8.4)
+            c.setFillColorRGB(0.85, 0.95, 0.88)
+            c.drawRightString(
+                width - 34,
+                mid_y,
+                f"Farmer Registry Master Sheet — continued · {len(rows)} farmers total",
+            )
+
+            table_x = 34
+            table_y = 42
+            table_w = width - 68
+            table_h = height - bar_h - table_y - 14
+
         _draw_rounded_box(
             c,
             table_x,
@@ -4400,8 +4455,7 @@ def render_green_agric_farmer_sheet_pdf(
     row_index = 0
     while True:
         table_x, table_y, table_w, table_h = _draw_page_header(page_no)
-        header_h = 24
-        row_h = 40
+        page_row_capacity = first_page_capacity if page_no == 1 else cont_page_capacity
         usable_top = table_y + table_h - 18
         c.setFillColor(HexColor("#eef7f0"))
         c.rect(table_x + 1, usable_top - header_h, table_w - 2, header_h, stroke=0, fill=1)
@@ -4417,7 +4471,7 @@ def render_green_agric_farmer_sheet_pdf(
 
         rows_on_page = 0
         current_y = usable_top - header_h
-        while row_index < len(rows) and rows_on_page < 8:
+        while row_index < len(rows) and rows_on_page < page_row_capacity:
             row = rows[row_index]
             profile = row.get("profile_data") if isinstance(row.get("profile_data"), dict) else {}
             current_y -= row_h
