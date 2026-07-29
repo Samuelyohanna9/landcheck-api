@@ -4446,17 +4446,34 @@ def render_green_agric_farmer_sheet_pdf(
             logo_dx = _draw_project_logo(c, project, 34, logo_y, logo_size)
             text_x = 34 + logo_dx
             mid_y = height - bar_h + (bar_h / 2) - 4
-            c.setFillColorRGB(1, 1, 1)
-            c.setFont("Helvetica-Bold", 11)
             org_heading = str(project.get("organization_name") or project.get("name") or "Project").strip()
-            c.drawString(text_x, mid_y, org_heading[:70])
-            c.setFont("Helvetica-Oblique", 8.4)
+            sponsor_name = str(project.get("sponsor") or "").strip()
+            if sponsor_name and sponsor_name != org_heading:
+                org_heading = f"{org_heading} / {sponsor_name}" if org_heading else sponsor_name
+
+            continued_text = f"Farmer Registry Master Sheet — continued · {len(rows)} farmers total"
+            continued_font_size = 8.4
+            continued_w = c.stringWidth(continued_text, "Helvetica-Oblique", continued_font_size)
+            heading_base_size = 11
+            heading_min_size = 7.5
+            heading_available_w = (width - 34) - text_x - continued_w - 20
+            heading_font_size = heading_base_size
+            while heading_font_size > heading_min_size and c.stringWidth(org_heading, "Helvetica-Bold", heading_font_size) > heading_available_w:
+                heading_font_size -= 0.5
+            # Even at the smallest readable size an extreme-length name might still overflow -
+            # truncate as a last resort so it never bleeds into the "continued" note.
+            fitted_heading = org_heading
+            while fitted_heading and c.stringWidth(fitted_heading + "…", "Helvetica-Bold", heading_font_size) > heading_available_w:
+                fitted_heading = fitted_heading[:-1]
+            if fitted_heading != org_heading:
+                fitted_heading = f"{fitted_heading.rstrip()}…"
+
+            c.setFillColorRGB(1, 1, 1)
+            c.setFont("Helvetica-Bold", heading_font_size)
+            c.drawString(text_x, mid_y, fitted_heading or org_heading[:1])
+            c.setFont("Helvetica-Oblique", continued_font_size)
             c.setFillColorRGB(0.85, 0.95, 0.88)
-            c.drawRightString(
-                width - 34,
-                mid_y,
-                f"Farmer Registry Master Sheet — continued · {len(rows)} farmers total",
-            )
+            c.drawRightString(width - 34, mid_y, continued_text)
 
             table_x = 34
             table_y = 42
