@@ -13697,12 +13697,16 @@ def get_public_org_impact(org_slug: str, db: Session = Depends(get_db)):
                 {"pid": proj_id},
             ).mappings().first()
 
+            # Denominator is the full farmer registry (total_farmers), not the count of tasks that
+            # happen to exist - most registered farmers have no field_capture task yet at all (they
+            # haven't had an initial field visit), so counting only existing task rows understated
+            # the scope (e.g. "0/5" when 150 farmers are actually registered). Counting DISTINCT
+            # custodians also avoids double-counting a farmer with more than one plot/task.
             field_capture_row = db.execute(
                 text(
                     """
                     SELECT
-                        COUNT(*) FILTER (WHERE LOWER(COALESCE(t.task_type, '')) = 'field_capture') AS field_capture_assigned,
-                        COUNT(*) FILTER (
+                        COUNT(DISTINCT t.custodian_id) FILTER (
                             WHERE LOWER(COALESCE(t.task_type, '')) = 'field_capture'
                               AND (
                                     LOWER(COALESCE(t.review_state, 'none')) = 'approved'
@@ -13733,7 +13737,7 @@ def get_public_org_impact(org_slug: str, db: Session = Depends(get_db)):
                 "irrigation_breakdown": [{"label": row["label"], "count": int(row["count"])} for row in irrigation_rows],
                 "allocated_units": round(float((allocation_row or {}).get("allocated_units") or 0.0), 2),
                 "supported_farmers": int((allocation_row or {}).get("supported_farmers") or 0),
-                "field_capture_assigned": int((field_capture_row or {}).get("field_capture_assigned") or 0),
+                "field_capture_assigned": total_farmers,
                 "field_capture_done": int((field_capture_row or {}).get("field_capture_done") or 0),
             }
 
