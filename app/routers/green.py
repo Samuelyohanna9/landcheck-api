@@ -13725,6 +13725,45 @@ def get_public_org_impact(org_slug: str, db: Session = Depends(get_db)):
                 {"pid": proj_id},
             ).mappings().first()
 
+            # Public directory of the registered farmers, deliberately limited to safe fields only:
+            # name, general location, crop, group, verification status. Explicitly EXCLUDED:
+            # phone/alt_phone, email, contact_person, national_id, address_text, notes - none of
+            # that private/contact data is queried here, let alone returned to this public endpoint.
+            directory_rows = db.execute(
+                text(
+                    """
+                    SELECT
+                        c.name,
+                        c.community_name,
+                        c.local_government,
+                        LOWER(COALESCE(c.verification_status, '')) AS verification_status,
+                        NULLIF(TRIM(c.profile_data->>'primary_crop'), '') AS primary_crop,
+                        NULLIF(TRIM(c.profile_data->>'farmer_group'), '') AS farmer_group,
+                        NULLIF(TRIM(c.profile_data->>'state_name'), '') AS state_name,
+                        NULLIF(TRIM(c.profile_data->>'ward_name'), '') AS ward_name
+                    FROM green_custodians c
+                    WHERE c.project_id = :pid
+                      AND NULLIF(TRIM(c.name), '') IS NOT NULL
+                    ORDER BY c.name ASC
+                    LIMIT 1000
+                    """
+                ),
+                {"pid": proj_id},
+            ).mappings().all()
+            farmer_directory = [
+                {
+                    "name": str(row.get("name") or "").strip(),
+                    "location": ", ".join(
+                        [part for part in [row.get("community_name"), row.get("local_government")] if part]
+                    )
+                    or None,
+                    "crop": row.get("primary_crop"),
+                    "farmer_group": row.get("farmer_group"),
+                    "verified": row.get("verification_status") == "verified",
+                }
+                for row in directory_rows
+            ]
+
             agric_summary = {
                 "total_farmers": total_farmers,
                 "verified_farmers": int(farmer_agg.get("verified_farmers") or 0),
@@ -13739,6 +13778,7 @@ def get_public_org_impact(org_slug: str, db: Session = Depends(get_db)):
                 "supported_farmers": int((allocation_row or {}).get("supported_farmers") or 0),
                 "field_capture_assigned": total_farmers,
                 "field_capture_done": int((field_capture_row or {}).get("field_capture_done") or 0),
+                "farmer_directory": farmer_directory,
             }
 
         # Recent approved photos
