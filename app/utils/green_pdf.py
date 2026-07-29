@@ -1344,7 +1344,10 @@ def _draw_project_brand_header_bar(
 
     org_name = str(project.get("organization_name") or "").strip()
     project_name = str(project.get("name") or "").strip() or "Project"
+    sponsor_name = str(project.get("sponsor") or "").strip()
     heading = org_name or project_name
+    if sponsor_name and sponsor_name != heading:
+        heading = f"{heading} / {sponsor_name}" if heading else sponsor_name
     line_parts: list[str] = []
     if project_name and project_name != heading:
         line_parts.append(project_name)
