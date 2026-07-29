@@ -4383,14 +4383,19 @@ def render_green_agric_farmer_sheet_pdf(
                 str(_safe_int_value(summary.get("mapped_plots"))),
                 "Mapped plots",
             )
+            field_data_value = str(_safe_int_value(summary.get("mapped_plots")))
+            field_data_label = "Plots on record"
+            if _safe_int_value(summary.get("mapped_plots")) <= 0:
+                field_data_value = "Pending"
+                field_data_label = "Field data"
             _draw_metric_chip(
                 c,
                 34 + ((chip_w + gap) * 3),
                 chip_y,
                 chip_w,
                 chip_h,
-                f"{_safe_int_value(summary.get('field_capture_done'))}/{_safe_int_value(summary.get('field_capture_assigned'))}",
-                "Field capture",
+                field_data_value,
+                field_data_label,
             )
             _draw_metric_chip(
                 c,
