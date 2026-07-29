@@ -4356,9 +4356,6 @@ def render_green_agric_farmer_sheet_pdf(
                 height - 108,
                 "Professional register of all farmers captured in this agric project, prepared for field teams, managers, and partner records.",
             )
-            c.setFont("Helvetica", 8.5)
-            c.setFillColor(HexColor("#6d8577"))
-            c.drawRightString(width - 34, height - 108, f"Generated for {str(project.get('name') or 'Project').strip()[:68]}")
 
             chip_y = height - 164
             chip_h = 42
