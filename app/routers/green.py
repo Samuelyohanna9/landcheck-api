@@ -3,6 +3,7 @@ from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse, Resp
 from sqlalchemy.orm import Session
 from sqlalchemy import bindparam, text
 from datetime import datetime, date, timedelta, timezone
+from zoneinfo import ZoneInfo
 import logging
 import json
 import base64
@@ -166,6 +167,7 @@ SPONSOR_AGENT_PAYOUT_STATUS_VALUES = {"requested", "approved", "processing", "pa
 SPONSOR_AGENT_DEFAULT_PLANTING_RATIO = 0.30
 SPONSOR_AGENT_DEFAULT_MAINTENANCE_RATIO = 0.10
 COMPLIANCE_CHECKLIST_STATUS_VALUES = {"pending", "completed", "skipped"}
+LANDCHECK_TIMEZONE = ZoneInfo("Africa/Lagos")
 MONTHLY_COMPLIANCE_CHECKLIST_DEFINITIONS = (
     {
         "checklist_key": "security_maintenance_run",
@@ -2417,45 +2419,30 @@ def _send_new_user_credentials_email(
             "</ul>"
             "</div>"
         )
-    html_body = f"""
-    <html>
-      <body style="margin:0;padding:24px;background:#eef7f0;font-family:Arial,sans-serif;color:#163d22;">
-        <div style="max-width:680px;margin:0 auto;background:#ffffff;border:1px solid #d6eadb;border-radius:16px;overflow:hidden;box-shadow:0 12px 28px rgba(15,61,31,0.08);">
-          <div style="background:linear-gradient(180deg,#2cb056 0%,#1b7f3d 100%);padding:22px 24px;">
-            <div style="font-size:24px;font-weight:800;color:#ffffff;line-height:1.15;">LandCheck Login Credentials</div>
-            <div style="margin-top:6px;font-size:14px;color:#e8f8ee;">Your account is ready for first access.</div>
-          </div>
-          <div style="padding:24px;">
-            <p style="margin:0 0 14px;font-size:15px;line-height:1.6;">Hello {html.escape(recipient_name)},</p>
-            <p style="margin:0 0 16px;font-size:15px;line-height:1.6;">Your LandCheck account has been created.</p>
-            {f'<p style="margin:0 0 16px;font-size:14px;line-height:1.6;"><strong>Organization:</strong> {html.escape(organization_name or "")}</p>' if organization_name else ''}
-            <div style="border:1px solid #dbece0;border-radius:14px;background:#f8fcf9;padding:18px 18px 16px;margin:0 0 16px;">
-              <div style="font-size:14px;font-weight:800;color:#0f3d1f;margin:0 0 12px;">Login details</div>
-              <table role="presentation" cellspacing="0" cellpadding="0" style="width:100%;border-collapse:collapse;">
-                <tr>
-                  <td style="padding:0 0 8px;font-size:13px;color:#4f6f58;width:150px;">Username</td>
-                  <td style="padding:0 0 8px;font-size:15px;font-weight:700;color:#163d22;">{html.escape(username)}</td>
-                </tr>
-                <tr>
-                  <td style="padding:0;font-size:13px;color:#4f6f58;">Temporary Password</td>
-                  <td style="padding:0;font-size:15px;font-weight:700;color:#163d22;">{html.escape(password)}</td>
-                </tr>
-              </table>
-            </div>
-            <div style="border:1px solid #dbece0;border-radius:14px;background:#ffffff;padding:18px;margin:0 0 16px;">
-              <div style="font-size:14px;font-weight:800;color:#0f3d1f;margin:0 0 8px;">Access</div>
-              <ul style="padding-left:18px;margin:0;color:#244c30;font-size:14px;line-height:1.55;">{access_html}</ul>
-              {device_html}
-            </div>
-            <p style="margin:0 0 16px;font-size:14px;line-height:1.6;color:#35563f;">
-              Please log in and change/reset your password through your administrator after first access.
-            </p>
-            <p style="margin:0;font-size:14px;line-height:1.6;color:#35563f;">Regards,<br/>LandCheck</p>
-          </div>
-        </div>
-      </body>
-    </html>
+    body_html = f"""
+    <p style="margin:0 0 16px;font-size:15px;line-height:1.7;color:#173624;">Hello {html.escape(recipient_name)},</p>
+    <p style="margin:0 0 20px;font-size:15px;line-height:1.7;color:#173624;">Your LandCheck account has been created.</p>
+    {f'<p style="margin:0 0 20px;font-size:14px;line-height:1.6;color:#173624;"><strong>Organization:</strong> {html.escape(organization_name or "")}</p>' if organization_name else ''}
+    <div style="border:1px solid #dbece0;border-radius:16px;background:#f8fcf9;padding:20px;margin:0 0 20px;">
+      <div style="font-size:12.5px;font-weight:800;letter-spacing:0.06em;text-transform:uppercase;color:#5c7a68;margin:0 0 12px;">Login details</div>
+      <table role="presentation" cellspacing="0" cellpadding="0" style="width:100%;border-collapse:collapse;font-size:14.5px;">
+        <tr><td style="padding:5px 0;color:#5c7a68;">Username</td><td style="padding:5px 0;text-align:right;font-weight:700;color:#173624;">{html.escape(username)}</td></tr>
+        <tr><td style="padding:5px 0;color:#5c7a68;">Temporary Password</td><td style="padding:5px 0;text-align:right;font-weight:700;color:#173624;">{html.escape(password)}</td></tr>
+      </table>
+    </div>
+    <div style="border:1px solid #dbece0;border-radius:16px;background:#ffffff;padding:20px;margin:0 0 20px;">
+      <div style="font-size:12.5px;font-weight:800;letter-spacing:0.06em;text-transform:uppercase;color:#5c7a68;margin:0 0 10px;">Access</div>
+      <ul style="padding-left:18px;margin:0;color:#345542;font-size:14px;line-height:1.7;">{access_html}</ul>
+      {device_html}
+    </div>
+    <p style="margin:0;font-size:14px;line-height:1.7;color:#5c7a68;">Please log in and change/reset your password through your administrator after first access.</p>
     """
+    html_body = _render_premium_email_shell(
+        kicker="Account created",
+        title="Your LandCheck Login Credentials",
+        subtitle="Your account is ready for first access.",
+        body_html=body_html,
+    )
 
     msg = EmailMessage()
     msg["Subject"] = "Your LandCheck Login Credentials"
@@ -2507,25 +2494,24 @@ def _send_assistant_escalation_reply_email(*, to_email: str, visitor_name: str, 
         f"Here's the answer from our support team:\n{reply}\n\n"
         "Thanks for sponsoring with LandCheck Green!\n"
     )
-    html_body = f"""
-    <html>
-      <body style="margin:0;padding:24px;background:#f4f8f2;font-family:Arial,sans-serif;color:#13271d;">
-        <div style="max-width:560px;margin:0 auto;background:#ffffff;border:1px solid #d4e2d2;border-radius:16px;overflow:hidden;">
-          <div style="background:#0a3d20;padding:20px 24px;">
-            <div style="font-size:20px;font-weight:800;color:#ffffff;">LandCheck Green Support</div>
-          </div>
-          <div style="padding:24px;">
-            <p style="margin:0 0 14px;font-size:15px;">Hi {html.escape(visitor_name)},</p>
-            <p style="margin:0 0 8px;font-size:13px;color:#5a6f63;">You asked:</p>
-            <p style="margin:0 0 16px;font-size:14px;font-style:italic;color:#13271d;background:#f4f8f2;border-radius:10px;padding:10px 14px;">{html.escape(question)}</p>
-            <p style="margin:0 0 8px;font-size:13px;color:#5a6f63;">Our team's answer:</p>
-            <p style="margin:0 0 20px;font-size:15px;line-height:1.6;">{html.escape(reply)}</p>
-            <p style="margin:0;font-size:14px;color:#5a6f63;">Thanks for sponsoring with LandCheck Green!</p>
-          </div>
-        </div>
-      </body>
-    </html>
+    body_html = f"""
+    <p style="margin:0 0 16px;font-size:15px;line-height:1.7;color:#173624;">Hi {html.escape(visitor_name)},</p>
+    <div style="margin:0 0 18px;">
+      <div style="font-size:12.5px;font-weight:800;letter-spacing:0.06em;text-transform:uppercase;color:#5c7a68;margin:0 0 8px;">You asked</div>
+      <p style="margin:0;font-size:14px;font-style:italic;line-height:1.6;color:#173624;background:#f8fcf9;border:1px solid #dbece0;border-radius:12px;padding:12px 16px;">{html.escape(question)}</p>
+    </div>
+    <div style="margin:0 0 20px;">
+      <div style="font-size:12.5px;font-weight:800;letter-spacing:0.06em;text-transform:uppercase;color:#5c7a68;margin:0 0 8px;">Our team's answer</div>
+      <p style="margin:0;font-size:15px;line-height:1.7;color:#173624;">{html.escape(reply)}</p>
+    </div>
+    <p style="margin:0;font-size:14px;line-height:1.7;color:#5c7a68;">Thanks for sponsoring with LandCheck Green!</p>
     """
+    html_body = _render_premium_email_shell(
+        kicker="Support reply",
+        title="An answer from LandCheck Green support",
+        subtitle="Our team has replied to the question you asked Planty.",
+        body_html=body_html,
+    )
 
     msg = EmailMessage()
     msg["Subject"] = "An answer from LandCheck Green support"
@@ -2604,6 +2590,16 @@ def _send_organization_welcome_email(
     if website_url:
         detail_lines.append(f"Website: {website_url}")
 
+    detail_rows_html = "".join(
+        f'<tr><td style="padding:5px 0;color:#5c7a68;">{html.escape(line.split(":", 1)[0].strip())}</td>'
+        f'<td style="padding:5px 0;text-align:right;font-weight:700;color:#173624;">{html.escape(line.split(":", 1)[1].strip()) if ":" in line else ""}</td></tr>'
+        for line in detail_lines
+    )
+    signoff_html = """
+    <p style="margin:20px 0 0;font-size:14px;line-height:1.7;color:#5c7a68;">Regards,<br/>
+    Samuel Yohanna<br/>Founder<br/>LandCheck Geospatial Technologies Limited<br/>RC: 9350241</p>
+    """
+
     if normalized_org_type == "csr":
         body = (
             f"Hello {organization_name},\n\n"
@@ -2631,6 +2627,38 @@ def _send_organization_welcome_email(
             "WhatsApp: +49 1776732638\n"
         )
         subject = f"Welcome to the LandCheck CSR Dashboard - {organization_name}"
+        body_html = f"""
+        <p style="margin:0 0 20px;font-size:15px;line-height:1.7;color:#173624;">Your organization has been onboarded as a CSR client on LandCheck. This route is designed for organizations that need verified programme implementation evidence, mapped delivery records, field photos, and client-ready CSR reporting.</p>
+        <div style="border:1px solid #dbece0;border-radius:16px;background:#f8fcf9;padding:20px;margin:0 0 20px;">
+          <div style="font-size:12.5px;font-weight:800;letter-spacing:0.06em;text-transform:uppercase;color:#5c7a68;margin:0 0 12px;">Organization details</div>
+          <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse;font-size:14.5px;">{detail_rows_html}</table>
+        </div>
+        <div style="border:1px solid #dbece0;border-radius:16px;background:#ffffff;padding:20px;margin:0 0 20px;">
+          <div style="font-size:12.5px;font-weight:800;letter-spacing:0.06em;text-transform:uppercase;color:#5c7a68;margin:0 0 10px;">What your CSR dashboard is for</div>
+          <ul style="margin:0;padding-left:18px;color:#345542;font-size:14px;line-height:1.7;">
+            <li>View live implementation progress for your approved CSR project(s).</li>
+            <li>See mapped project footprint, tree records, and field photo evidence.</li>
+            <li>Track implementation quality, survival status, and follow-up activity.</li>
+            <li>Download CSR-ready PDF reports for management, stakeholders, and annual reporting.</li>
+          </ul>
+        </div>
+        <div style="border:1px solid #dbece0;border-radius:16px;background:#ffffff;padding:20px;margin:0 0 20px;">
+          <div style="font-size:12.5px;font-weight:800;letter-spacing:0.06em;text-transform:uppercase;color:#5c7a68;margin:0 0 10px;">How to access it</div>
+          <ul style="margin:0;padding-left:18px;color:#345542;font-size:14px;line-height:1.7;">
+            <li>Open <a href="{html.escape(work_url, quote=True)}" style="color:#1f8c58;font-weight:700;text-decoration:none;">LandCheck Work</a>.</li>
+            <li>Sign in with the organization user credentials created for your team.</li>
+            <li>After login, open your CSR project dashboard to review progress, evidence, and downloadable reports.</li>
+          </ul>
+        </div>
+        <p style="margin:0;font-size:14px;line-height:1.7;color:#5c7a68;">Field work is captured in LandCheck Green and synchronized into your client dashboard so your team can monitor evidence without waiting for manual reports.</p>
+        {signoff_html}
+        """
+        html_body = _render_premium_email_shell(
+            kicker="CSR client onboarded",
+            title="Welcome to the LandCheck CSR Dashboard",
+            subtitle=f"{organization_name} now has access to verified implementation evidence and client-ready reporting.",
+            body_html=body_html,
+        )
     else:
         body = (
             f"Hello {organization_name},\n\n"
@@ -2653,12 +2681,36 @@ def _send_organization_welcome_email(
             "WhatsApp: +49 1776732638\n"
         )
         subject = f"Welcome to LandCheck Partnership - {organization_name}"
+        body_html = f"""
+        <p style="margin:0 0 20px;font-size:15px;line-height:1.7;color:#173624;">Your organization has been created on LandCheck and onboarding has been completed.</p>
+        <div style="border:1px solid #dbece0;border-radius:16px;background:#f8fcf9;padding:20px;margin:0 0 20px;">
+          <div style="font-size:12.5px;font-weight:800;letter-spacing:0.06em;text-transform:uppercase;color:#5c7a68;margin:0 0 12px;">Organization details</div>
+          <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse;font-size:14.5px;">{detail_rows_html}</table>
+        </div>
+        <div style="border:1px solid #dbece0;border-radius:16px;background:#ffffff;padding:20px;margin:0 0 20px;">
+          <div style="font-size:12.5px;font-weight:800;letter-spacing:0.06em;text-transform:uppercase;color:#5c7a68;margin:0 0 10px;">What LandCheck does</div>
+          <ul style="margin:0;padding-left:18px;color:#345542;font-size:14px;line-height:1.7;">
+            <li>LandCheck Green helps field teams capture tree planting and maintenance activities with GPS and photo evidence.</li>
+            <li>LandCheck Work helps supervisors assign tasks, review submissions, monitor progress, and export reports.</li>
+            <li>The platform supports project-based monitoring for planting, survival tracking, and operational reporting.</li>
+          </ul>
+        </div>
+        <p style="margin:0;font-size:14px;line-height:1.7;color:#5c7a68;">We value your commitment to environmental stewardship and climate action. Welcome onboard!</p>
+        {signoff_html}
+        """
+        html_body = _render_premium_email_shell(
+            kicker="Partnership confirmed",
+            title="Welcome to LandCheck Partnership",
+            subtitle=f"{organization_name} is now onboarded on LandCheck Green and LandCheck Work.",
+            body_html=body_html,
+        )
 
     msg = EmailMessage()
     msg["Subject"] = subject
     msg["From"] = f"{smtp_from_name} <{smtp_from_email}>" if smtp_from_name else smtp_from_email
     msg["To"] = to_email
     msg.set_content(body)
+    msg.add_alternative(html_body, subtype="html")
 
     if use_ssl:
         with smtplib.SMTP_SSL(smtp_host, smtp_port, timeout=20) as server:
@@ -2741,6 +2793,64 @@ def _send_html_email(*, to_email: str, subject: str, text_body: str, html_body: 
     _deliver_email_message(msg, settings)
 
 
+def _render_premium_email_shell(
+    *,
+    kicker: str,
+    title: str,
+    subtitle: str,
+    body_html: str,
+    header_gradient: str = "linear-gradient(145deg,#0c5f2e 0%,#1d8a49 55%,#2aa852 100%)",
+) -> str:
+    """Shared branded shell (logo header + card body + footer) for sponsor-facing transactional
+    emails. Each template supplies only its own body_html; this keeps every email visually
+    consistent instead of every function hand-rolling its own header/footer from scratch."""
+    return f"""
+    <html>
+      <body style="margin:0;padding:0;background:#eef4f0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;color:#173624;">
+        <div style="max-width:640px;margin:0 auto;padding:32px 16px;">
+          <div style="background:#ffffff;border-radius:22px;overflow:hidden;box-shadow:0 18px 46px rgba(14,46,28,0.14);border:1px solid #dceee0;">
+            <div style="padding:30px 32px 28px;background:{header_gradient};">
+              <table role="presentation" cellpadding="0" cellspacing="0" style="border-collapse:collapse;">
+                <tr>
+                  <td style="vertical-align:middle;">
+                    <img src="https://landcheck.online/green-logo-cropped-700.png" width="36" height="36" alt="LandCheck"
+                         style="display:block;border-radius:9px;background:#ffffff;padding:3px;" />
+                  </td>
+                  <td style="vertical-align:middle;padding-left:10px;">
+                    <span style="font-size:13px;font-weight:800;letter-spacing:0.04em;color:#ffffff;">LandCheck Green</span>
+                  </td>
+                </tr>
+              </table>
+              <div style="margin-top:20px;font-size:11.5px;font-weight:800;letter-spacing:0.16em;text-transform:uppercase;color:#d6f5df;">{kicker}</div>
+              <div style="margin-top:8px;font-size:25px;font-weight:800;line-height:1.2;color:#ffffff;">{title}</div>
+              <div style="margin-top:10px;font-size:14.5px;line-height:1.7;color:#e9fbee;">{subtitle}</div>
+            </div>
+            <div style="padding:28px 32px 8px;">
+              {body_html}
+            </div>
+            <div style="padding:20px 32px 26px;border-top:1px solid #ecf4ee;margin-top:16px;">
+              <div style="font-size:12.5px;color:#7c9186;line-height:1.7;">
+                Powered by <strong style="color:#1f8c58;">LandCheck</strong> Geospatial Technologies Limited<br/>
+                <a href="mailto:landchecktech@gmail.com" style="color:#1f8c58;text-decoration:none;">landchecktech@gmail.com</a>
+                &nbsp;&middot;&nbsp;
+                <a href="https://landcheck.online" style="color:#1f8c58;text-decoration:none;">landcheck.online</a>
+              </div>
+              <div style="margin-top:10px;font-size:11.5px;color:#a9bdb0;">
+                <a href="https://www.instagram.com/land.check/" style="color:#a9bdb0;text-decoration:none;">Instagram</a> &middot;
+                <a href="https://www.facebook.com/landcheck/" style="color:#a9bdb0;text-decoration:none;">Facebook</a> &middot;
+                <a href="https://www.youtube.com/@LandCheckGreen" style="color:#a9bdb0;text-decoration:none;">YouTube</a> &middot;
+                <a href="https://www.tiktok.com/@landcheckgeo" style="color:#a9bdb0;text-decoration:none;">TikTok</a> &middot;
+                <a href="https://www.linkedin.com/company/landcheck-geospatial/" style="color:#a9bdb0;text-decoration:none;">LinkedIn</a>
+              </div>
+            </div>
+          </div>
+          <p style="text-align:center;font-size:11px;color:#9fb2a6;margin:18px 0 0;">You are receiving this email because of an action taken on LandCheck Green.</p>
+        </div>
+      </body>
+    </html>
+    """
+
+
 def _load_sponsor_order_email_payload(db: Session, order_id: int):
     return db.execute(
         text(
@@ -2801,41 +2911,33 @@ def _send_sponsor_welcome_email(*, to_email: str, full_name: str, account_type: 
         "Regards,\n"
         "LandCheck Green"
     )
-    html_body = f"""
-    <html>
-      <body style="margin:0;padding:28px;background:#eef8ef;font-family:Arial,sans-serif;color:#173624;">
-        <div style="max-width:680px;margin:0 auto;background:#ffffff;border:1px solid #d8ebdd;border-radius:20px;overflow:hidden;box-shadow:0 18px 42px rgba(12,73,34,0.10);">
-          <div style="padding:28px 28px 22px;background:linear-gradient(140deg,#0c5f2e 0%,#1a8a4a 100%);color:#ffffff;">
-            <div style="font-size:12px;font-weight:800;letter-spacing:0.16em;text-transform:uppercase;color:#d8f7df;">LandCheck Green</div>
-            <div style="margin-top:10px;font-size:28px;font-weight:800;line-height:1.15;">Welcome to verified tree sponsorship</div>
-            <div style="margin-top:10px;font-size:15px;line-height:1.7;color:#eefcf0;">Your account is ready for secure project support, live field evidence, and premium tree stories.</div>
-          </div>
-          <div style="padding:26px 28px 30px;">
-            <p style="margin:0 0 14px;font-size:15px;line-height:1.7;">Hello {html.escape(recipient_name)},</p>
-            <p style="margin:0 0 16px;font-size:15px;line-height:1.7;">Your public sponsor account is now active. You can sign in, support approved projects, and track each verified tree with map, photo, care history, and certificate records.</p>
-            <div style="border:1px solid #dbece0;border-radius:16px;background:#f8fcf9;padding:18px 18px 14px;margin:0 0 18px;">
-              <div style="font-size:13px;font-weight:800;letter-spacing:0.08em;text-transform:uppercase;color:#4e6b58;">Account profile</div>
-              <div style="margin-top:10px;font-size:16px;font-weight:700;color:#143522;">{html.escape(account_label)}</div>
-              {f'<div style="margin-top:8px;font-size:14px;color:#486652;"><strong>Organization:</strong> {html.escape(str(organization_name or "").strip())}</div>' if str(organization_name or "").strip() else ''}
-            </div>
-            <div style="border:1px solid #dbece0;border-radius:16px;background:#ffffff;padding:18px;margin:0 0 18px;">
-              <div style="font-size:14px;font-weight:800;color:#143522;margin:0 0 10px;">Before your first sponsorship</div>
-              <ul style="margin:0;padding-left:18px;color:#315540;font-size:14px;line-height:1.65;">
-                <li>Choose any public sponsor project that matches your interest.</li>
-                <li>Complete secure checkout before trees are reserved for you.</li>
-                <li>Use the same email address whenever you sign back in.</li>
-              </ul>
-            </div>
-            <div style="display:flex;gap:12px;flex-wrap:wrap;margin:0 0 18px;">
-              <a href="{html.escape(privacy_url, quote=True)}" style="display:inline-block;padding:13px 18px;border-radius:999px;background:#eff8f1;color:#0e5f2f;font-weight:800;text-decoration:none;border:1px solid #cfe6d5;">Privacy policy</a>
-              <a href="{html.escape(terms_url, quote=True)}" style="display:inline-block;padding:13px 18px;border-radius:999px;background:#0f6f39;color:#ffffff;font-weight:800;text-decoration:none;">Sponsorship terms</a>
-            </div>
-            <p style="margin:0;font-size:14px;line-height:1.7;color:#486652;">Regards,<br/>LandCheck Green</p>
-          </div>
-        </div>
-      </body>
-    </html>
+    body_html = f"""
+    <p style="margin:0 0 16px;font-size:15px;line-height:1.7;color:#173624;">Hello {html.escape(recipient_name)},</p>
+    <p style="margin:0 0 20px;font-size:15px;line-height:1.7;color:#173624;">Your public sponsor account is now active. You can sign in, support approved projects, and track each verified tree with map, photo, care history, and certificate records.</p>
+    <div style="border:1px solid #dbece0;border-radius:16px;background:#f8fcf9;padding:20px;margin:0 0 20px;">
+      <div style="font-size:12.5px;font-weight:800;letter-spacing:0.06em;text-transform:uppercase;color:#5c7a68;">Account profile</div>
+      <div style="margin-top:10px;font-size:16px;font-weight:700;color:#173624;">{html.escape(account_label)}</div>
+      {f'<div style="margin-top:8px;font-size:14px;color:#5c7a68;"><strong>Organization:</strong> {html.escape(str(organization_name or "").strip())}</div>' if str(organization_name or "").strip() else ''}
+    </div>
+    <div style="border:1px solid #dbece0;border-radius:16px;background:#ffffff;padding:20px;margin:0 0 20px;">
+      <div style="font-size:12.5px;font-weight:800;letter-spacing:0.06em;text-transform:uppercase;color:#5c7a68;margin:0 0 10px;">Before your first sponsorship</div>
+      <ul style="margin:0;padding-left:18px;color:#345542;font-size:14px;line-height:1.7;">
+        <li>Choose any public sponsor project that matches your interest.</li>
+        <li>Complete secure checkout before trees are reserved for you.</li>
+        <li>Use the same email address whenever you sign back in.</li>
+      </ul>
+    </div>
+    <div style="margin:0 0 4px;">
+      <a href="{html.escape(privacy_url, quote=True)}" style="display:inline-block;padding:13px 18px;border-radius:999px;background:#eff8f1;color:#0e5f2f;font-weight:800;text-decoration:none;border:1px solid #cfe6d5;margin:0 10px 10px 0;">Privacy policy</a>
+      <a href="{html.escape(terms_url, quote=True)}" style="display:inline-block;padding:13px 18px;border-radius:999px;background:linear-gradient(135deg,#1f8c58,#0f6f39);color:#ffffff;font-weight:800;text-decoration:none;box-shadow:0 10px 22px rgba(15,111,57,0.28);">Sponsorship terms</a>
+    </div>
     """
+    html_body = _render_premium_email_shell(
+        kicker="LandCheck Green",
+        title="Welcome to verified tree sponsorship",
+        subtitle="Your account is ready for secure project support, live field evidence, and premium tree stories.",
+        body_html=body_html,
+    )
     _send_html_email(
         to_email=to_email,
         subject="Welcome to LandCheck Green Sponsorship",
@@ -2880,40 +2982,32 @@ def _send_merchant_welcome_email(
     )
     reset_button = (
         f"""
-            <div style="margin:0 0 18px;">
-              <a href="{html.escape(reset_url, quote=True)}" style="display:inline-block;padding:13px 20px;border-radius:999px;background:#0f6f39;color:#ffffff;font-weight:800;text-decoration:none;">Set your dashboard password</a>
-              {f'<div style="margin-top:8px;font-size:12px;color:#6b8577;">Link valid until {html.escape(expiry_label)}</div>' if expiry_label else ''}
+            <div style="margin:0 0 20px;">
+              <a href="{html.escape(reset_url, quote=True)}" style="display:inline-block;padding:14px 22px;border-radius:999px;background:linear-gradient(135deg,#1f8c58,#0f6f39);color:#ffffff;font-weight:800;text-decoration:none;box-shadow:0 10px 22px rgba(15,111,57,0.28);">Set your dashboard password</a>
+              {f'<div style="margin-top:10px;font-size:12px;color:#a9bdb0;">Link valid until {html.escape(expiry_label)}</div>' if expiry_label else ''}
             </div>
         """
         if reset_url
         else ""
     )
-    html_body = f"""
-    <html>
-      <body style="margin:0;padding:28px;background:#eef8ef;font-family:Arial,sans-serif;color:#173624;">
-        <div style="max-width:680px;margin:0 auto;background:#ffffff;border:1px solid #d8ebdd;border-radius:20px;overflow:hidden;box-shadow:0 18px 42px rgba(12,73,34,0.10);">
-          <div style="padding:28px 28px 22px;background:linear-gradient(140deg,#0c5f2e 0%,#1a8a4a 100%);color:#ffffff;">
-            <div style="font-size:12px;font-weight:800;letter-spacing:0.16em;text-transform:uppercase;color:#d8f7df;">LandCheck Green — Merchant</div>
-            <div style="margin-top:10px;font-size:26px;font-weight:800;line-height:1.15;">Welcome, {html.escape(org_name)}</div>
-            <div style="margin-top:10px;font-size:15px;line-height:1.7;color:#eefcf0;">Your merchant sponsorship integration is ready.</div>
-          </div>
-          <div style="padding:26px 28px 30px;">
-            <p style="margin:0 0 14px;font-size:15px;line-height:1.7;">Hello {html.escape(recipient_name)},</p>
-            <p style="margin:0 0 18px;font-size:15px;line-height:1.7;">{html.escape(org_name)} has been set up as a LandCheck Green merchant integration partner. Every tree your customers sponsor through your integration is verified, planted by our field agents, and tracked with GPS, photos, and a certificate for your customer.</p>
-            {reset_button}
-            <div style="border:1px solid #dbece0;border-radius:16px;background:#f8fcf9;padding:18px;margin:0 0 18px;">
-              <div style="font-size:13px;font-weight:800;letter-spacing:0.08em;text-transform:uppercase;color:#4e6b58;">Your API key</div>
-              <div style="margin-top:8px;font-size:13px;font-family:monospace;color:#143522;word-break:break-all;">{html.escape(api_key)}</div>
-              {f'<div style="margin-top:14px;font-size:13px;font-weight:800;letter-spacing:0.08em;text-transform:uppercase;color:#4e6b58;">Shopify webhook URL</div><div style="margin-top:8px;font-size:13px;font-family:monospace;color:#143522;word-break:break-all;">{html.escape(webhook_url_shopify)}</div>' if webhook_url_shopify else ''}
-              <div style="margin-top:14px;font-size:13px;color:#6b8577;">Keep these private — they authenticate requests as {html.escape(org_name)}.</div>
-            </div>
-            <p style="margin:0;font-size:14px;line-height:1.7;color:#486652;">Once you've set your password, sign in at the usual LandCheck Green login page to see your live dashboard — trees sponsored, planted, survival rate, and a downloadable impact report.</p>
-            <p style="margin:16px 0 0;font-size:14px;line-height:1.7;color:#486652;">Regards,<br/>LandCheck Green</p>
-          </div>
-        </div>
-      </body>
-    </html>
+    body_html = f"""
+    <p style="margin:0 0 16px;font-size:15px;line-height:1.7;color:#173624;">Hello {html.escape(recipient_name)},</p>
+    <p style="margin:0 0 20px;font-size:15px;line-height:1.7;color:#173624;">{html.escape(org_name)} has been set up as a LandCheck Green merchant integration partner. Every tree your customers sponsor through your integration is verified, planted by our field agents, and tracked with GPS, photos, and a certificate for your customer.</p>
+    {reset_button}
+    <div style="border:1px solid #dbece0;border-radius:16px;background:#f8fcf9;padding:20px;margin:0 0 20px;">
+      <div style="font-size:12.5px;font-weight:800;letter-spacing:0.06em;text-transform:uppercase;color:#5c7a68;">Your API key</div>
+      <div style="margin-top:8px;font-size:13px;font-family:monospace;color:#173624;word-break:break-all;">{html.escape(api_key)}</div>
+      {f'<div style="margin-top:14px;font-size:12.5px;font-weight:800;letter-spacing:0.06em;text-transform:uppercase;color:#5c7a68;">Shopify webhook URL</div><div style="margin-top:8px;font-size:13px;font-family:monospace;color:#173624;word-break:break-all;">{html.escape(webhook_url_shopify)}</div>' if webhook_url_shopify else ''}
+      <div style="margin-top:14px;font-size:13px;color:#a9bdb0;">Keep these private — they authenticate requests as {html.escape(org_name)}.</div>
+    </div>
+    <p style="margin:0;font-size:14px;line-height:1.7;color:#5c7a68;">Once you've set your password, sign in at the usual LandCheck Green login page to see your live dashboard — trees sponsored, planted, survival rate, and a downloadable impact report.</p>
     """
+    html_body = _render_premium_email_shell(
+        kicker="LandCheck Green — Merchant",
+        title=f"Welcome, {html.escape(org_name)}",
+        subtitle="Your merchant sponsorship integration is ready.",
+        body_html=body_html,
+    )
     _send_html_email(
         to_email=to_email,
         subject=f"Welcome to LandCheck Green — {org_name} merchant integration",
@@ -2941,25 +3035,19 @@ def _send_field_password_reset_email(*, to_email: str, full_name: str, reset_url
         "Regards,\n"
         "LandCheck Green"
     )
-    html_body = f"""
-    <html>
-      <body style="margin:0;padding:28px;background:#f3f9f4;font-family:Arial,sans-serif;color:#173624;">
-        <div style="max-width:660px;margin:0 auto;background:#ffffff;border:1px solid #d8ebdd;border-radius:20px;overflow:hidden;">
-          <div style="padding:26px 28px;background:linear-gradient(145deg,#0d5e2e 0%,#1f7f43 100%);color:#ffffff;">
-            <div style="font-size:26px;font-weight:800;line-height:1.18;">Reset your field password</div>
-            <div style="margin-top:8px;font-size:14px;line-height:1.7;color:#eaf9ed;">Use the secure button below to choose a new password for your LandCheck Green field account.</div>
-          </div>
-          <div style="padding:26px 28px 30px;">
-            <p style="margin:0 0 14px;font-size:15px;line-height:1.7;">Hello {html.escape(recipient_name)},</p>
-            <p style="margin:0 0 18px;font-size:15px;line-height:1.7;">A password reset was requested for your field account. This secure link expires on <strong>{html.escape(expiry_label)}</strong>.</p>
-            <a href="{html.escape(reset_url, quote=True)}" style="display:inline-block;padding:14px 22px;border-radius:999px;background:#0f6f39;color:#ffffff;font-size:15px;font-weight:800;text-decoration:none;">Reset password</a>
-            <p style="margin:18px 0 0;font-size:13px;line-height:1.7;color:#4b6857;">If the button does not open, copy this link into your browser:<br/>{html.escape(reset_url)}</p>
-            <p style="margin:18px 0 0;font-size:13px;line-height:1.7;color:#4b6857;">If you did not request this, you can ignore this email.</p>
-          </div>
-        </div>
-      </body>
-    </html>
+    body_html = f"""
+    <p style="margin:0 0 16px;font-size:15px;line-height:1.7;color:#173624;">Hello {html.escape(recipient_name)},</p>
+    <p style="margin:0 0 20px;font-size:15px;line-height:1.7;color:#173624;">A password reset was requested for your field account. This secure link expires on <strong>{html.escape(expiry_label)}</strong>.</p>
+    <a href="{html.escape(reset_url, quote=True)}" style="display:inline-block;padding:14px 22px;border-radius:999px;background:linear-gradient(135deg,#1f8c58,#0f6f39);color:#ffffff;font-size:15px;font-weight:800;text-decoration:none;box-shadow:0 10px 22px rgba(15,111,57,0.28);">Reset password</a>
+    <p style="margin:20px 0 0;font-size:13px;line-height:1.7;color:#5c7a68;">If the button does not open, copy this link into your browser:<br/>{html.escape(reset_url)}</p>
+    <p style="margin:16px 0 0;font-size:13px;line-height:1.7;color:#5c7a68;">If you did not request this, you can ignore this email.</p>
     """
+    html_body = _render_premium_email_shell(
+        kicker="Password reset",
+        title="Reset your field password",
+        subtitle="Use the secure button below to choose a new password for your LandCheck Green field account.",
+        body_html=body_html,
+    )
     _send_html_email(
         to_email=to_email,
         subject="Reset your LandCheck Green field password",
@@ -3152,25 +3240,19 @@ def _send_sponsor_password_reset_email(*, to_email: str, full_name: str, reset_u
         "Regards,\n"
         "LandCheck Green"
     )
-    html_body = f"""
-    <html>
-      <body style="margin:0;padding:28px;background:#f3f9f4;font-family:Arial,sans-serif;color:#173624;">
-        <div style="max-width:660px;margin:0 auto;background:#ffffff;border:1px solid #d8ebdd;border-radius:20px;overflow:hidden;">
-          <div style="padding:26px 28px;background:linear-gradient(145deg,#0d5e2e 0%,#1f7f43 100%);color:#ffffff;">
-            <div style="font-size:26px;font-weight:800;line-height:1.18;">Reset your sponsor password</div>
-            <div style="margin-top:8px;font-size:14px;line-height:1.7;color:#eaf9ed;">Use the secure button below to choose a new password for your LandCheck Green sponsor account.</div>
-          </div>
-          <div style="padding:26px 28px 30px;">
-            <p style="margin:0 0 14px;font-size:15px;line-height:1.7;">Hello {html.escape(recipient_name)},</p>
-            <p style="margin:0 0 18px;font-size:15px;line-height:1.7;">A password reset was requested for your sponsor account. This secure link expires on <strong>{html.escape(expiry_label)}</strong>.</p>
-            <a href="{html.escape(reset_url, quote=True)}" style="display:inline-block;padding:14px 22px;border-radius:999px;background:#0f6f39;color:#ffffff;font-size:15px;font-weight:800;text-decoration:none;">Reset password</a>
-            <p style="margin:18px 0 0;font-size:13px;line-height:1.7;color:#4b6857;">If the button does not open, copy this link into your browser:<br/>{html.escape(reset_url)}</p>
-            <p style="margin:18px 0 0;font-size:13px;line-height:1.7;color:#4b6857;">If you did not request this, you can ignore this email.</p>
-          </div>
-        </div>
-      </body>
-    </html>
+    body_html = f"""
+    <p style="margin:0 0 16px;font-size:15px;line-height:1.7;color:#173624;">Hello {html.escape(recipient_name)},</p>
+    <p style="margin:0 0 20px;font-size:15px;line-height:1.7;color:#173624;">A password reset was requested for your sponsor account. This secure link expires on <strong>{html.escape(expiry_label)}</strong>.</p>
+    <a href="{html.escape(reset_url, quote=True)}" style="display:inline-block;padding:14px 22px;border-radius:999px;background:linear-gradient(135deg,#1f8c58,#0f6f39);color:#ffffff;font-size:15px;font-weight:800;text-decoration:none;box-shadow:0 10px 22px rgba(15,111,57,0.28);">Reset password</a>
+    <p style="margin:20px 0 0;font-size:13px;line-height:1.7;color:#5c7a68;">If the button does not open, copy this link into your browser:<br/>{html.escape(reset_url)}</p>
+    <p style="margin:16px 0 0;font-size:13px;line-height:1.7;color:#5c7a68;">If you did not request this, you can ignore this email.</p>
     """
+    html_body = _render_premium_email_shell(
+        kicker="Password reset",
+        title="Reset your sponsor password",
+        subtitle="Use the secure button below to choose a new password for your LandCheck Green sponsor account.",
+        body_html=body_html,
+    )
     _send_html_email(
         to_email=to_email,
         subject="Reset your LandCheck Green sponsor password",
@@ -3204,35 +3286,28 @@ def _send_sponsor_order_created_email(*, order_row: dict, request: Request | Non
         "Regards,\n"
         "LandCheck Green"
     )
-    html_body = f"""
-    <html>
-      <body style="margin:0;padding:28px;background:#eef8ef;font-family:Arial,sans-serif;color:#173624;">
-        <div style="max-width:680px;margin:0 auto;background:#ffffff;border:1px solid #d8ebdd;border-radius:20px;overflow:hidden;">
-          <div style="padding:28px;background:linear-gradient(145deg,#0c5f2e 0%,#1d8a49 100%);color:#ffffff;">
-            <div style="font-size:12px;font-weight:800;letter-spacing:0.16em;text-transform:uppercase;color:#daf7df;">Checkout started</div>
-            <div style="margin-top:10px;font-size:28px;font-weight:800;line-height:1.15;">Your sponsorship is almost active</div>
-            <div style="margin-top:10px;font-size:15px;line-height:1.7;color:#effcf1;">Complete secure payment to move this order into verified field allocation and live project updates.</div>
-          </div>
-          <div style="padding:26px 28px 30px;">
-            <p style="margin:0 0 14px;font-size:15px;line-height:1.7;">Hello {html.escape(sponsor_name)},</p>
-            <div style="border:1px solid #dbece0;border-radius:16px;background:#f8fcf9;padding:18px;margin:0 0 18px;">
-              <div style="font-size:14px;font-weight:800;color:#163826;margin:0 0 10px;">Order summary</div>
-              <div style="font-size:15px;line-height:1.8;color:#345542;">
-                <div><strong>Project:</strong> {html.escape(project_name)}</div>
-                <div><strong>Location:</strong> {html.escape(location_text or "-")}</div>
-                <div><strong>Trees reserved:</strong> {quantity}</div>
-                <div><strong>Amount:</strong> {html.escape(currency)} {amount_total:,.2f}</div>
-                <div><strong>Reference:</strong> {html.escape(str(order_row.get("order_uid") or "-"))}</div>
-              </div>
-            </div>
-            {f'<a href="{html.escape(payment_link, quote=True)}" style="display:inline-block;padding:14px 22px;border-radius:999px;background:#0f6f39;color:#ffffff;font-size:15px;font-weight:800;text-decoration:none;">Complete secure payment</a>' if payment_link else ''}
-            <p style="margin:18px 0 0;font-size:14px;line-height:1.7;color:#4b6857;">After payment is confirmed, you will receive another email and your sponsor dashboard will start showing tree allocation and field evidence as records are approved.</p>
-            <p style="margin:18px 0 0;font-size:13px;line-height:1.7;color:#4b6857;">Review terms: <a href="{html.escape(terms_url, quote=True)}" style="color:#0f6f39;font-weight:700;">LandCheck sponsor terms</a></p>
-          </div>
-        </div>
-      </body>
-    </html>
+    body_html = f"""
+    <p style="margin:0 0 16px;font-size:15px;line-height:1.7;color:#173624;">Hello {html.escape(sponsor_name)},</p>
+    <div style="border:1px solid #dbece0;border-radius:16px;background:#f8fcf9;padding:20px;margin:0 0 20px;">
+      <div style="font-size:12.5px;font-weight:800;letter-spacing:0.06em;text-transform:uppercase;color:#5c7a68;margin:0 0 12px;">Order summary</div>
+      <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse;font-size:14.5px;">
+        <tr><td style="padding:5px 0;color:#5c7a68;">Project</td><td style="padding:5px 0;text-align:right;font-weight:700;color:#173624;">{html.escape(project_name)}</td></tr>
+        <tr><td style="padding:5px 0;color:#5c7a68;">Location</td><td style="padding:5px 0;text-align:right;color:#173624;">{html.escape(location_text or "-")}</td></tr>
+        <tr><td style="padding:5px 0;color:#5c7a68;">Trees reserved</td><td style="padding:5px 0;text-align:right;color:#173624;">{quantity}</td></tr>
+        <tr><td style="padding:10px 0 6px;color:#5c7a68;border-top:1px solid #e3efe6;">Amount</td><td style="padding:10px 0 6px;text-align:right;font-weight:800;font-size:18px;color:#123d27;border-top:1px solid #e3efe6;">{html.escape(currency)} {amount_total:,.2f}</td></tr>
+        <tr><td style="padding:5px 0;color:#a9bdb0;font-size:12px;">Reference</td><td style="padding:5px 0;text-align:right;color:#a9bdb0;font-size:12px;">{html.escape(str(order_row.get("order_uid") or "-"))}</td></tr>
+      </table>
+    </div>
+    {f'<a href="{html.escape(payment_link, quote=True)}" style="display:inline-block;padding:15px 26px;border-radius:999px;background:linear-gradient(135deg,#1f8c58,#0f6f39);color:#ffffff;font-size:15px;font-weight:800;text-decoration:none;box-shadow:0 10px 22px rgba(15,111,57,0.28);">Complete secure payment &rarr;</a>' if payment_link else ''}
+    <p style="margin:20px 0 0;font-size:14px;line-height:1.7;color:#5c7a68;">After payment is confirmed, you will receive another email and your sponsor dashboard will start showing tree allocation and field evidence as records are approved.</p>
+    <p style="margin:16px 0 0;font-size:13px;line-height:1.7;color:#5c7a68;">Review terms: <a href="{html.escape(terms_url, quote=True)}" style="color:#1f8c58;font-weight:700;text-decoration:none;">LandCheck sponsor terms</a></p>
     """
+    html_body = _render_premium_email_shell(
+        kicker="Checkout started",
+        title="Your sponsorship is almost active",
+        subtitle="Complete secure payment to move this order into verified field allocation and live project updates.",
+        body_html=body_html,
+    )
     _send_html_email(
         to_email=sponsor_email,
         subject="Complete your LandCheck Green sponsorship payment",
@@ -3264,41 +3339,35 @@ def _send_sponsor_payment_confirmed_email(*, order_row: dict, request: Request |
         "Regards,\n"
         "LandCheck Green"
     )
-    html_body = f"""
-    <html>
-      <body style="margin:0;padding:28px;background:#eef8ef;font-family:Arial,sans-serif;color:#173624;">
-        <div style="max-width:680px;margin:0 auto;background:#ffffff;border:1px solid #d8ebdd;border-radius:20px;overflow:hidden;">
-          <div style="padding:28px;background:linear-gradient(145deg,#0b5d2d 0%,#16753d 55%,#3cb562 100%);color:#ffffff;">
-            <div style="font-size:12px;font-weight:800;letter-spacing:0.16em;text-transform:uppercase;color:#daf7df;">Payment confirmed</div>
-            <div style="margin-top:10px;font-size:28px;font-weight:800;line-height:1.15;">Your sponsorship is now active</div>
-            <div style="margin-top:10px;font-size:15px;line-height:1.7;color:#effcf1;">LandCheck Green has confirmed your payment and your order is ready for verified field allocation.</div>
-          </div>
-          <div style="padding:26px 28px 30px;">
-            <p style="margin:0 0 14px;font-size:15px;line-height:1.7;">Hello {html.escape(sponsor_name)},</p>
-            <div style="border:1px solid #dbece0;border-radius:16px;background:#f8fcf9;padding:18px;margin:0 0 18px;">
-              <div style="font-size:14px;font-weight:800;color:#163826;margin:0 0 10px;">Confirmed sponsorship</div>
-              <div style="font-size:15px;line-height:1.8;color:#345542;">
-                <div><strong>Project:</strong> {html.escape(project_name)}</div>
-                <div><strong>Location:</strong> {html.escape(location_text or "-")}</div>
-                <div><strong>Trees sponsored:</strong> {quantity}</div>
-                <div><strong>Confirmed amount:</strong> {html.escape(currency)} {amount_total:,.2f}</div>
-                <div><strong>Reference:</strong> {html.escape(str(order_row.get("order_uid") or "-"))}</div>
-              </div>
-            </div>
-            <div style="border:1px solid #d9ebdc;border-radius:16px;background:#ffffff;padding:18px;">
-              <div style="font-size:14px;font-weight:800;color:#163826;margin:0 0 8px;">What happens next</div>
-              <ul style="margin:0;padding-left:18px;color:#345542;font-size:14px;line-height:1.65;">
-                <li>Trees move into verified field allocation for this project.</li>
-                <li>Your dashboard will begin to show live map, photo, and maintenance evidence as records are approved.</li>
-                <li>Your digital certificate becomes available once trees are linked to your sponsorship units.</li>
-              </ul>
-            </div>
-            <p style="margin:18px 0 0;font-size:13px;line-height:1.7;color:#4b6857;">Confirmation time: {html.escape(payment_verified_at)}</p>
-          </div>
-        </div>
-      </body>
-    </html>
+    body_html = f"""
+    <p style="margin:0 0 16px;font-size:15px;line-height:1.7;color:#173624;">Hello {html.escape(sponsor_name)},</p>
+    <div style="border:1px solid #dbece0;border-radius:16px;background:#f8fcf9;padding:20px;margin:0 0 20px;">
+      <div style="font-size:12.5px;font-weight:800;letter-spacing:0.06em;text-transform:uppercase;color:#5c7a68;margin:0 0 12px;">Confirmed sponsorship</div>
+      <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse;font-size:14.5px;">
+        <tr><td style="padding:5px 0;color:#5c7a68;">Project</td><td style="padding:5px 0;text-align:right;font-weight:700;color:#173624;">{html.escape(project_name)}</td></tr>
+        <tr><td style="padding:5px 0;color:#5c7a68;">Location</td><td style="padding:5px 0;text-align:right;color:#173624;">{html.escape(location_text or "-")}</td></tr>
+        <tr><td style="padding:5px 0;color:#5c7a68;">Trees sponsored</td><td style="padding:5px 0;text-align:right;color:#173624;">{quantity}</td></tr>
+        <tr><td style="padding:10px 0 6px;color:#5c7a68;border-top:1px solid #e3efe6;">Confirmed amount</td><td style="padding:10px 0 6px;text-align:right;font-weight:800;font-size:18px;color:#123d27;border-top:1px solid #e3efe6;">{html.escape(currency)} {amount_total:,.2f}</td></tr>
+        <tr><td style="padding:5px 0;color:#a9bdb0;font-size:12px;">Reference</td><td style="padding:5px 0;text-align:right;color:#a9bdb0;font-size:12px;">{html.escape(str(order_row.get("order_uid") or "-"))}</td></tr>
+      </table>
+    </div>
+    <div style="border:1px solid #d9ebdc;border-radius:16px;background:#ffffff;padding:20px;margin:0 0 20px;">
+      <div style="font-size:12.5px;font-weight:800;letter-spacing:0.06em;text-transform:uppercase;color:#5c7a68;margin:0 0 10px;">What happens next</div>
+      <ul style="margin:0;padding-left:18px;color:#345542;font-size:14px;line-height:1.7;">
+        <li>Trees move into verified field allocation for this project.</li>
+        <li>Your dashboard will begin to show live map, photo, and maintenance evidence as records are approved.</li>
+        <li>Your digital certificate becomes available once trees are linked to your sponsorship units.</li>
+      </ul>
+    </div>
+    <p style="margin:0;font-size:13px;line-height:1.7;color:#5c7a68;">Confirmation time: {html.escape(payment_verified_at)}</p>
     """
+    html_body = _render_premium_email_shell(
+        kicker="Payment confirmed",
+        title="Your sponsorship is now active",
+        subtitle="LandCheck Green has confirmed your payment and your order is ready for verified field allocation.",
+        body_html=body_html,
+        header_gradient="linear-gradient(145deg,#0b5d2d 0%,#16753d 55%,#3cb562 100%)",
+    )
     _send_html_email(
         to_email=sponsor_email,
         subject="Your LandCheck Green sponsorship payment is confirmed",
@@ -6491,7 +6560,14 @@ def ensure_green_tables(db: Session):
         db.execute(text("ALTER TABLE green_sponsor_accounts ADD COLUMN IF NOT EXISTS webhook_secret TEXT"))
         db.execute(text("ALTER TABLE green_sponsor_accounts ADD COLUMN IF NOT EXISTS default_project_id INTEGER REFERENCES tree_projects(id) ON DELETE SET NULL"))
         db.execute(text("ALTER TABLE green_sponsor_accounts ADD COLUMN IF NOT EXISTS agreed_price_per_tree NUMERIC"))
+        db.execute(text("ALTER TABLE green_sponsor_accounts ADD COLUMN IF NOT EXISTS date_of_birth DATE"))
         db.execute(text("ALTER TABLE green_sponsorship_orders ADD COLUMN IF NOT EXISTS points_awarded BOOLEAN NOT NULL DEFAULT FALSE"))
+        db.execute(text("ALTER TABLE green_sponsorship_orders ADD COLUMN IF NOT EXISTS birthday_send_date DATE"))
+        db.execute(text("ALTER TABLE green_sponsorship_orders ADD COLUMN IF NOT EXISTS birthday_email_sent_at TIMESTAMP"))
+        db.execute(text("ALTER TABLE green_sponsorship_orders ADD COLUMN IF NOT EXISTS birthday_announcement_sent_at TIMESTAMP"))
+        db.execute(text("ALTER TABLE green_sponsor_accounts ADD COLUMN IF NOT EXISTS last_engagement_email_at TIMESTAMP"))
+        db.execute(text("ALTER TABLE green_sponsor_accounts ADD COLUMN IF NOT EXISTS engagement_emails_opt_out BOOLEAN NOT NULL DEFAULT FALSE"))
+        db.execute(text("ALTER TABLE green_sponsor_accounts ADD COLUMN IF NOT EXISTS engagement_emails_opt_out_at TIMESTAMP"))
         db.execute(text("ALTER TABLE green_push_tokens ADD COLUMN IF NOT EXISTS organization_id INTEGER"))
         db.execute(text("ALTER TABLE green_push_tokens ADD COLUMN IF NOT EXISTS platform TEXT"))
         db.execute(text("ALTER TABLE green_push_tokens ADD COLUMN IF NOT EXISTS app_version TEXT"))
@@ -12508,41 +12584,31 @@ def _notify_sponsor_tree_planted(db: Session, unit_id: int, request: Request | N
                 "LandCheck Green"
             )
             
-            email_html = f"""
-            <html>
-            <body style="margin:0;padding:28px;background:#eef8ef;font-family:Arial,sans-serif;color:#173624;">
-            <div style="max-width:680px;margin:0 auto;background:#ffffff;border:1px solid #d8ebdd;border-radius:20px;overflow:hidden;">
-            <div style="padding:28px;background:linear-gradient(145deg,#0c5f2e 0%,#1d8a49 100%);color:#ffffff;">
-            <div style="font-size:12px;font-weight:800;letter-spacing:0.16em;text-transform:uppercase;color:#daf7df;">Planting Update</div>
-            <div style="margin-top:10px;font-size:28px;font-weight:800;line-height:1.15;">Your Tree is Planted & Linked!</div>
-            <div style="margin-top:10px;font-size:15px;line-height:1.7;color:#effcf1;">A verified tree has been successfully linked to your sponsorship account.</div>
+            body_html = f"""
+            <p style="margin:0 0 20px;font-size:15px;line-height:1.7;color:#173624;">Hello {html.escape(sponsor_name)},</p>
+            <div style="border:1px solid #dbece0;border-radius:16px;background:#f8fcf9;padding:20px;margin:0 0 20px;">
+              <div style="font-size:12.5px;font-weight:800;letter-spacing:0.06em;text-transform:uppercase;color:#5c7a68;margin:0 0 12px;">Tree details</div>
+              <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse;font-size:14.5px;">
+                <tr><td style="padding:5px 0;color:#5c7a68;">Project</td><td style="padding:5px 0;text-align:right;font-weight:700;color:#173624;">{html.escape(project_name)}</td></tr>
+                <tr><td style="padding:5px 0;color:#5c7a68;">Location</td><td style="padding:5px 0;text-align:right;color:#173624;">{html.escape(location_text or "-")}</td></tr>
+                <tr><td style="padding:5px 0;color:#5c7a68;">Tree species</td><td style="padding:5px 0;text-align:right;color:#173624;">{html.escape(species)}</td></tr>
+                <tr><td style="padding:5px 0;color:#5c7a68;">Tree identifier</td><td style="padding:5px 0;text-align:right;color:#173624;">{html.escape(tree_num)}</td></tr>
+              </table>
             </div>
-            <div style="padding:26px 28px 30px;">
-            <p style="margin:0 0 14px;font-size:15px;line-height:1.7;">Hello {html.escape(sponsor_name)},</p>
-            <div style="border:1px solid #dbece0;border-radius:16px;background:#f8fcf9;padding:18px;margin:0 0 18px;">
-            <div style="font-size:14px;font-weight:800;color:#163826;margin:0 0 10px;">Tree Details</div>
-            <div style="font-size:15px;line-height:1.8;color:#345542;">
-            <div><strong>Project:</strong> {html.escape(project_name)}</div>
-            <div><strong>Location:</strong> {html.escape(location_text or "-")}</div>
-            <div><strong>Tree Species:</strong> {html.escape(species)}</div>
-            <div><strong>Tree Identifier:</strong> {html.escape(tree_num)}</div>
+            <div style="border:1px solid #dbece0;border-radius:16px;background:#ffffff;padding:20px;margin:0 0 20px;">
+              <div style="font-size:12.5px;font-weight:800;letter-spacing:0.06em;text-transform:uppercase;color:#5c7a68;margin:0 0 10px;">Your digital certificate</div>
+              <p style="margin:0;font-size:14px;line-height:1.7;color:#345542;">You can view, download, and share your digital certificate inside the <strong>LC Green</strong> mobile app under the <strong>"My Trees"</strong> tab. Simply tap on the tree card to access your certificate.</p>
             </div>
-            </div>
-            <div style="border:1px solid #dbece0;border-radius:16px;background:#f8fcf9;padding:18px;margin:0 0 18px;">
-            <div style="font-size:14px;font-weight:800;color:#163826;margin:0 0 10px;">Your Digital Certificate</div>
-            <p style="margin:0;font-size:14px;line-height:1.7;color:#345542;">
-            You can view, download, and share your digital certificate inside the <strong>LC Green</strong> mobile app under the <strong>"My Trees"</strong> tab. Simply tap on the tree card to access your certificate.
-            </p>
-            </div>
-            <p style="margin:18px 0;font-size:14px;line-height:1.7;color:#4b6857;">You can also check and share the public story webpage of your tree using the button below:</p>
-            <a href="{html.escape(public_story_url, quote=True)}" style="display:inline-block;padding:14px 22px;border-radius:999px;background:#0f6f39;color:#ffffff;font-size:15px;font-weight:800;text-decoration:none;">View Public Tree Story</a>
-            <p style="margin:24px 0 0;font-size:13px;line-height:1.7;color:#4b6857;">Regards,<br><strong>LandCheck Green</strong></p>
-            </div>
-            </div>
-            </body>
-            </html>
+            <p style="margin:0 0 18px;font-size:14px;line-height:1.7;color:#5c7a68;">You can also check and share the public story webpage of your tree using the button below:</p>
+            <a href="{html.escape(public_story_url, quote=True)}" style="display:inline-block;padding:14px 22px;border-radius:999px;background:linear-gradient(135deg,#1f8c58,#0f6f39);color:#ffffff;font-size:15px;font-weight:800;text-decoration:none;box-shadow:0 10px 22px rgba(15,111,57,0.28);">View public tree story &rarr;</a>
             """
-            
+            email_html = _render_premium_email_shell(
+                kicker="Planting update",
+                title="Your tree is planted & linked!",
+                subtitle="A verified tree has been successfully linked to your sponsorship account.",
+                body_html=body_html,
+            )
+
             _send_html_email(
                 to_email=sponsor_email,
                 subject=email_subject,
@@ -12650,50 +12716,40 @@ def _notify_sponsor_tree_maintenance(db: Session, tree_id: int, task_row: dict, 
                 )
                 
                 notes_html = f"""
-                <div style="border:1px solid #dbece0;border-radius:16px;background:#f8fcf9;padding:18px;margin:0 0 18px;">
-                <div style="font-size:14px;font-weight:800;color:#163826;margin:0 0 10px;">Supervisor Review Notes</div>
-                <p style="margin:0;font-size:14px;line-height:1.7;color:#345542;">{html.escape(review_notes)}</p>
+                <div style="border:1px solid #dbece0;border-radius:16px;background:#f8fcf9;padding:20px;margin:0 0 20px;">
+                  <div style="font-size:12.5px;font-weight:800;letter-spacing:0.06em;text-transform:uppercase;color:#5c7a68;margin:0 0 10px;">Supervisor review notes</div>
+                  <p style="margin:0;font-size:14px;line-height:1.7;color:#345542;">{html.escape(review_notes)}</p>
                 </div>
                 """ if review_notes else ""
-                
-                email_html = f"""
-                <html>
-                <body style="margin:0;padding:28px;background:#eef8ef;font-family:Arial,sans-serif;color:#173624;">
-                <div style="max-width:680px;margin:0 auto;background:#ffffff;border:1px solid #d8ebdd;border-radius:20px;overflow:hidden;">
-                <div style="padding:28px;background:linear-gradient(145deg,#0c5f2e 0%,#1d8a49 100%);color:#ffffff;">
-                <div style="font-size:12px;font-weight:800;letter-spacing:0.16em;text-transform:uppercase;color:#daf7df;">Care & Maintenance Update</div>
-                <div style="margin-top:10px;font-size:28px;font-weight:800;line-height:1.15;">New Maintenance Verified</div>
-                <div style="margin-top:10px;font-size:15px;line-height:1.7;color:#effcf1;">A verified care activity has been performed on your sponsored tree.</div>
-                </div>
-                <div style="padding:26px 28px 30px;">
-                <p style="margin:0 0 14px;font-size:15px;line-height:1.7;">Hello {html.escape(sponsor_name)},</p>
-                <div style="border:1px solid #dbece0;border-radius:16px;background:#f8fcf9;padding:18px;margin:0 0 18px;">
-                <div style="font-size:14px;font-weight:800;color:#163826;margin:0 0 10px;">Tree & Activity Details</div>
-                <div style="font-size:15px;line-height:1.8;color:#345542;">
-                <div><strong>Project:</strong> {html.escape(project_name)}</div>
-                <div><strong>Location:</strong> {html.escape(location_text or "-")}</div>
-                <div><strong>Tree Species:</strong> {html.escape(species)}</div>
-                <div><strong>Tree Identifier:</strong> {html.escape(tree_num)}</div>
-                <div><strong>Care Activity:</strong> {html.escape(activity_name)}</div>
-                <div><strong>Completed at:</strong> {html.escape(completed_at)}</div>
-                </div>
+
+                body_html = f"""
+                <p style="margin:0 0 20px;font-size:15px;line-height:1.7;color:#173624;">Hello {html.escape(sponsor_name)},</p>
+                <div style="border:1px solid #dbece0;border-radius:16px;background:#f8fcf9;padding:20px;margin:0 0 20px;">
+                  <div style="font-size:12.5px;font-weight:800;letter-spacing:0.06em;text-transform:uppercase;color:#5c7a68;margin:0 0 12px;">Tree & activity details</div>
+                  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse;font-size:14.5px;">
+                    <tr><td style="padding:5px 0;color:#5c7a68;">Project</td><td style="padding:5px 0;text-align:right;font-weight:700;color:#173624;">{html.escape(project_name)}</td></tr>
+                    <tr><td style="padding:5px 0;color:#5c7a68;">Location</td><td style="padding:5px 0;text-align:right;color:#173624;">{html.escape(location_text or "-")}</td></tr>
+                    <tr><td style="padding:5px 0;color:#5c7a68;">Tree species</td><td style="padding:5px 0;text-align:right;color:#173624;">{html.escape(species)}</td></tr>
+                    <tr><td style="padding:5px 0;color:#5c7a68;">Tree identifier</td><td style="padding:5px 0;text-align:right;color:#173624;">{html.escape(tree_num)}</td></tr>
+                    <tr><td style="padding:5px 0;color:#5c7a68;">Care activity</td><td style="padding:5px 0;text-align:right;color:#173624;">{html.escape(activity_name)}</td></tr>
+                    <tr><td style="padding:5px 0;color:#5c7a68;">Completed at</td><td style="padding:5px 0;text-align:right;color:#173624;">{html.escape(completed_at)}</td></tr>
+                  </table>
                 </div>
                 {notes_html}
-                <div style="border:1px solid #dbece0;border-radius:16px;background:#f8fcf9;padding:18px;margin:0 0 18px;">
-                <div style="font-size:14px;font-weight:800;color:#163826;margin:0 0 10px;">Your Digital Certificate</div>
-                <p style="margin:0;font-size:14px;line-height:1.7;color:#345542;">
-                You can view, download, and share your digital certificate inside the <strong>LC Green</strong> mobile app under the <strong>"My Trees"</strong> tab. Simply tap on the tree card to access your certificate.
-                </p>
+                <div style="border:1px solid #dbece0;border-radius:16px;background:#ffffff;padding:20px;margin:0 0 20px;">
+                  <div style="font-size:12.5px;font-weight:800;letter-spacing:0.06em;text-transform:uppercase;color:#5c7a68;margin:0 0 10px;">Your digital certificate</div>
+                  <p style="margin:0;font-size:14px;line-height:1.7;color:#345542;">You can view, download, and share your digital certificate inside the <strong>LC Green</strong> mobile app under the <strong>"My Trees"</strong> tab. Simply tap on the tree card to access your certificate.</p>
                 </div>
-                <p style="margin:18px 0;font-size:14px;line-height:1.7;color:#4b6857;">You can also check and share the public story webpage of your tree using the button below:</p>
-                <a href="{html.escape(public_story_url, quote=True)}" style="display:inline-block;padding:14px 22px;border-radius:999px;background:#0f6f39;color:#ffffff;font-size:15px;font-weight:800;text-decoration:none;">View Public Tree Story</a>
-                <p style="margin:24px 0 0;font-size:13px;line-height:1.7;color:#4b6857;">Regards,<br><strong>LandCheck Green</strong></p>
-                </div>
-                </div>
-                </body>
-                </html>
+                <p style="margin:0 0 18px;font-size:14px;line-height:1.7;color:#5c7a68;">You can also check and share the public story webpage of your tree using the button below:</p>
+                <a href="{html.escape(public_story_url, quote=True)}" style="display:inline-block;padding:14px 22px;border-radius:999px;background:linear-gradient(135deg,#1f8c58,#0f6f39);color:#ffffff;font-size:15px;font-weight:800;text-decoration:none;box-shadow:0 10px 22px rgba(15,111,57,0.28);">View public tree story &rarr;</a>
                 """
-                
+                email_html = _render_premium_email_shell(
+                    kicker="Care & maintenance update",
+                    title="New maintenance verified",
+                    subtitle="A verified care activity has been performed on your sponsored tree.",
+                    body_html=body_html,
+                )
+
                 _send_html_email(
                     to_email=sponsor_email,
                     subject=email_subject,
@@ -12741,40 +12797,28 @@ def _notify_agent_added_to_project(db: Session, project_id: int, agent_user_ids:
                 "LandCheck Green"
             )
             
-            email_html = f"""
-            <html>
-            <body style="margin:0;padding:28px;background:#f3fbf5;font-family:Arial,sans-serif;color:#183523;">
-            <div style="max-width:680px;margin:0 auto;background:#ffffff;border:1px solid #d4ecd9;border-radius:20px;overflow:hidden;box-shadow:0 4px 12px rgba(0,0,0,0.03);">
-            <div style="padding:28px;background:linear-gradient(135deg,#165a30 0%,#278e4d 100%);color:#ffffff;">
-            <div style="font-size:12px;font-weight:800;letter-spacing:0.16em;text-transform:uppercase;color:#daf7df;">LandCheck Work</div>
-            <div style="margin-top:10px;font-size:26px;font-weight:800;line-height:1.2;">Project Agent Assignment</div>
-            <div style="margin-top:10px;font-size:15px;line-height:1.7;color:#f0fbf3;">You have been successfully added as an agent for a public sponsor project.</div>
+            body_html = f"""
+            <p style="margin:0 0 16px;font-size:15px;line-height:1.7;color:#173624;">Hello {html.escape(agent_name)},</p>
+            <p style="margin:0 0 20px;font-size:15px;line-height:1.7;color:#173624;">You have been assigned as an agent for the public sponsorship project <strong>{html.escape(project_name)}</strong> in LandCheck Work.</p>
+            <div style="border:1px solid #dbece0;border-radius:16px;background:#f8fcf9;padding:20px;margin:0 0 20px;">
+              <div style="font-size:12.5px;font-weight:800;letter-spacing:0.06em;text-transform:uppercase;color:#5c7a68;margin:0 0 12px;">Project details</div>
+              <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse;font-size:14.5px;">
+                <tr><td style="padding:5px 0;color:#5c7a68;">Project</td><td style="padding:5px 0;text-align:right;font-weight:700;color:#173624;">{html.escape(project_name)}</td></tr>
+                <tr><td style="padding:5px 0;color:#5c7a68;">Location</td><td style="padding:5px 0;text-align:right;color:#173624;">{html.escape(location_text or "-")}</td></tr>
+                <tr><td style="padding:5px 0;color:#5c7a68;">Sponsor</td><td style="padding:5px 0;text-align:right;color:#173624;">{html.escape(sponsor or "-")}</td></tr>
+              </table>
             </div>
-            <div style="padding:26px 28px 30px;">
-            <p style="margin:0 0 14px;font-size:15px;line-height:1.7;">Hello {html.escape(agent_name)},</p>
-            <p style="margin:0 0 18px;font-size:15px;line-height:1.7;color:#33523e;">
-            You have been assigned as an agent for the public sponsorship project <strong>{html.escape(project_name)}</strong> in LandCheck Work.
-            </p>
-            <div style="border:1px solid #dbece0;border-radius:16px;background:#f8fcf9;padding:18px;margin:0 0 18px;">
-            <div style="font-size:14px;font-weight:800;color:#163826;margin:0 0 10px;">Project Details</div>
-            <div style="font-size:15px;line-height:1.8;color:#345542;">
-            <div><strong>Project:</strong> {html.escape(project_name)}</div>
-            <div><strong>Location:</strong> {html.escape(location_text or "-")}</div>
-            <div><strong>Sponsor:</strong> {html.escape(sponsor or "-")}</div>
+            <div style="border:1px solid #dbece0;border-radius:16px;background:#ffffff;padding:20px;">
+              <div style="font-size:12.5px;font-weight:800;letter-spacing:0.06em;text-transform:uppercase;color:#5c7a68;margin:0 0 10px;">Next steps</div>
+              <p style="margin:0;font-size:14px;line-height:1.7;color:#345542;">Please log into the <strong>LandCheck Mobile</strong> app, select the project name <strong>"{html.escape(project_name)}"</strong> from the project dropdown menu, and you can begin performing tasks for this project.</p>
             </div>
-            </div>
-            <div style="border:1px solid #dbece0;border-radius:16px;background:#f8fcf9;padding:18px;margin:0 0 18px;">
-            <div style="font-size:14px;font-weight:800;color:#163826;margin:0 0 10px;">Next Steps</div>
-            <p style="margin:0;font-size:14px;line-height:1.7;color:#345542;">
-            Please log into the <strong>LandCheck Mobile</strong> app, select the project name <strong>"{html.escape(project_name)}"</strong> from the project dropdown menu, and you can begin performing tasks for this project.
-            </p>
-            </div>
-            <p style="margin:24px 0 0;font-size:13px;line-height:1.7;color:#4b6857;">Regards,<br><strong>LandCheck Green Team</strong></p>
-            </div>
-            </div>
-            </body>
-            </html>
             """
+            email_html = _render_premium_email_shell(
+                kicker="LandCheck Work",
+                title="Project agent assignment",
+                subtitle="You have been successfully added as an agent for a public sponsor project.",
+                body_html=body_html,
+            )
             _send_html_email(
                 to_email=agent_email,
                 subject=email_subject,
@@ -12819,45 +12863,33 @@ def _notify_agent_first_planting_assignment(db: Session, project_id: int, assign
             "LandCheck Green"
         )
         
-        email_html = f"""
-        <html>
-        <body style="margin:0;padding:28px;background:#f3fbf5;font-family:Arial,sans-serif;color:#183523;">
-        <div style="max-width:680px;margin:0 auto;background:#ffffff;border:1px solid #d4ecd9;border-radius:20px;overflow:hidden;box-shadow:0 4px 12px rgba(0,0,0,0.03);">
-        <div style="padding:28px;background:linear-gradient(135deg,#165a30 0%,#278e4d 100%);color:#ffffff;">
-        <div style="font-size:12px;font-weight:800;letter-spacing:0.16em;text-transform:uppercase;color:#daf7df;">LandCheck Work</div>
-        <div style="margin-top:10px;font-size:26px;font-weight:800;line-height:1.2;">First Planting Assignment</div>
-        <div style="margin-top:10px;font-size:15px;line-height:1.7;color:#f0fbf3;">You have been assigned your first planting task.</div>
+        body_html = f"""
+        <p style="margin:0 0 16px;font-size:15px;line-height:1.7;color:#173624;">Hello {html.escape(agent_name)},</p>
+        <p style="margin:0 0 20px;font-size:15px;line-height:1.7;color:#173624;">You have been assigned your first planting task for the project <strong>{html.escape(project_name)}</strong> in LandCheck Work.</p>
+        <div style="border:1px solid #dbece0;border-radius:16px;background:#f8fcf9;padding:20px;margin:0 0 20px;">
+          <div style="font-size:12.5px;font-weight:800;letter-spacing:0.06em;text-transform:uppercase;color:#5c7a68;margin:0 0 12px;">Assignment details</div>
+          <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse;font-size:14.5px;">
+            <tr><td style="padding:5px 0;color:#5c7a68;">Project</td><td style="padding:5px 0;text-align:right;font-weight:700;color:#173624;">{html.escape(project_name)}</td></tr>
+            <tr><td style="padding:5px 0;color:#5c7a68;">Location</td><td style="padding:5px 0;text-align:right;color:#173624;">{html.escape(location_text or "-")}</td></tr>
+            <tr><td style="padding:5px 0;color:#5c7a68;">Trees assigned</td><td style="padding:5px 0;text-align:right;color:#173624;">{target_trees}</td></tr>
+          </table>
         </div>
-        <div style="padding:26px 28px 30px;">
-        <p style="margin:0 0 14px;font-size:15px;line-height:1.7;">Hello {html.escape(agent_name)},</p>
-        <p style="margin:0 0 18px;font-size:15px;line-height:1.7;color:#33523e;">
-        You have been assigned your first planting task for the project <strong>{html.escape(project_name)}</strong> in LandCheck Work.
-        </p>
-        <div style="border:1px solid #dbece0;border-radius:16px;background:#f8fcf9;padding:18px;margin:0 0 18px;">
-        <div style="font-size:14px;font-weight:800;color:#163826;margin:0 0 10px;">Assignment Details</div>
-        <div style="font-size:15px;line-height:1.8;color:#345542;">
-        <div><strong>Project:</strong> {html.escape(project_name)}</div>
-        <div><strong>Location:</strong> {html.escape(location_text or "-")}</div>
-        <div><strong>Trees Assigned:</strong> {target_trees}</div>
+        <div style="border:1px solid #dbece0;border-radius:16px;background:#ffffff;padding:20px;">
+          <div style="font-size:12.5px;font-weight:800;letter-spacing:0.06em;text-transform:uppercase;color:#5c7a68;margin:0 0 10px;">Instructions</div>
+          <p style="margin:0 0 8px;font-size:14px;line-height:1.7;color:#345542;">To perform this task:</p>
+          <ul style="margin:0;padding-left:20px;color:#345542;font-size:14px;line-height:1.7;">
+            <li>Log into the <strong>LandCheck Mobile</strong> app using your agent credentials.</li>
+            <li>Select the project name <strong>"{html.escape(project_name)}"</strong> from the project dropdown menu.</li>
+            <li>Record and submit your planting records.</li>
+          </ul>
         </div>
-        </div>
-        <div style="border:1px solid #dbece0;border-radius:16px;background:#f8fcf9;padding:18px;margin:0 0 18px;">
-        <div style="font-size:14px;font-weight:800;color:#163826;margin:0 0 10px;">Instructions</div>
-        <p style="margin:0;font-size:14px;line-height:1.7;color:#345542;">
-        To perform this task:
-        </p>
-        <ul style="margin:8px 0 0;padding-left:20px;color:#345542;font-size:14px;line-height:1.7;">
-          <li>Log into the <strong>LandCheck Mobile</strong> app using your agent credentials.</li>
-          <li>Select the project name <strong>"{html.escape(project_name)}"</strong> from the project dropdown menu.</li>
-          <li>Record and submit your planting records.</li>
-        </ul>
-        </div>
-        <p style="margin:24px 0 0;font-size:13px;line-height:1.7;color:#4b6857;">Regards,<br><strong>LandCheck Green Team</strong></p>
-        </div>
-        </div>
-        </body>
-        </html>
         """
+        email_html = _render_premium_email_shell(
+            kicker="LandCheck Work",
+            title="First planting assignment",
+            subtitle="You have been assigned your first planting task.",
+            body_html=body_html,
+        )
         _send_html_email(
             to_email=agent_email,
             subject=email_subject,
@@ -14944,6 +14976,653 @@ def create_admin_merchant(payload: AdminCreateMerchantPayload, request: Request,
         logger.exception("Merchant welcome email failed for merchant_id=%s", int(row["id"]))
 
     return result
+
+
+class AdminCreateBirthdayGiftPayload(BaseModel):
+    full_name: str
+    email: str
+    date_of_birth: date
+    project_id: int
+    quantity: int = 1
+    dedication_message: str | None = None
+
+
+def _compute_next_birthday_send_date(dob: date, *, today: date | None = None) -> date:
+    """Next occurrence of dob's month/day strictly after `today`.
+
+    Always strictly in the future (never same-day) so the celebration email never fires on the
+    day a gift is added. Feb 29 falls back to Feb 28 in a non-leap target year.
+    """
+    reference_today = today or datetime.now(LANDCHECK_TIMEZONE).date()
+    for year_offset in (0, 1):
+        candidate_year = reference_today.year + year_offset
+        try:
+            candidate = date(candidate_year, dob.month, dob.day)
+        except ValueError:
+            candidate = date(candidate_year, 2, 28)
+        if candidate > reference_today:
+            return candidate
+    raise AssertionError("unreachable")
+
+
+def _send_birthday_gift_announcement_email(*, to_email: str, full_name: str, project_name: str, request: Request | None = None):
+    recipient_name = str(full_name or "").strip() or "Friend"
+    android_apk_url = (
+        str(os.getenv("LANDCHECK_ANDROID_APK_URL") or "").strip()
+        or "https://play.google.com/store/apps/details?id=online.landcheck.mobile"
+    )
+    body = (
+        f"Hello {recipient_name},\n\n"
+        "Congratulations — your birthday is coming up, and we couldn't let it pass without doing something a little "
+        "different. Instead of a card that gets tucked in a drawer, LandCheck Green is preparing a living gift: a real "
+        f"tree, planted in your name, completely free of charge, at {project_name}.\n\n"
+        "Keep an eye on your inbox — on your actual birthday we'll send you the full details of your tree, "
+        "including exactly where it's being planted.\n\n"
+        f"In the meantime, get the LandCheck Green app so you're ready to see it: {android_apk_url}\n\n"
+        "Regards,\n"
+        "LandCheck Green"
+    )
+    body_html = f"""
+    <p style="margin:0 0 16px;font-size:15px;line-height:1.7;color:#173624;">Hello {html.escape(recipient_name)},</p>
+    <p style="margin:0 0 20px;font-size:15px;line-height:1.7;color:#173624;">Congratulations — your birthday is coming up, and we couldn't let it pass without doing something a little different. Instead of a card that gets tucked in a drawer, LandCheck Green is preparing a living gift: a real tree, planted in your name, completely free of charge, at <strong>{html.escape(project_name)}</strong>.</p>
+    <p style="margin:0 0 20px;font-size:15px;line-height:1.7;color:#173624;">Keep an eye on your inbox — on your actual birthday we'll send you the full details of your tree, including exactly where it's being planted.</p>
+    <a href="{html.escape(android_apk_url, quote=True)}" style="display:inline-block;padding:14px 22px;border-radius:999px;background:linear-gradient(135deg,#1f8c58,#0f6f39);color:#ffffff;font-size:15px;font-weight:800;text-decoration:none;box-shadow:0 10px 22px rgba(15,111,57,0.28);">Get the LandCheck Green app</a>
+    <p style="margin:20px 0 0;font-size:13px;line-height:1.7;color:#5c7a68;">Get ready — you'll be able to see your tree here once it's planted.</p>
+    """
+    html_body = _render_premium_email_shell(
+        kicker="A gift is on the way",
+        title="Happy early birthday from LandCheck!",
+        subtitle=f"We're preparing a free tree in your name at {project_name} to celebrate your birthday.",
+        body_html=body_html,
+    )
+    _send_html_email(
+        to_email=to_email,
+        subject="A birthday gift is on its way from LandCheck Green",
+        text_body=body,
+        html_body=html_body,
+    )
+
+
+def _send_birthday_gift_celebration_email(
+    *,
+    to_email: str,
+    full_name: str,
+    sponsor_id: int,
+    project_name: str,
+    location_text: str,
+    quantity: int,
+    dedication_message: str,
+    request: Request | None = None,
+):
+    recipient_name = str(full_name or "").strip() or "Friend"
+    android_apk_url = (
+        str(os.getenv("LANDCHECK_ANDROID_APK_URL") or "").strip()
+        or "https://play.google.com/store/apps/details?id=online.landcheck.mobile"
+    )
+    web_base_url = str(os.getenv("LANDCHECK_WEB_URL") or "").strip() or "https://landcheck.online"
+    claim_url = f"{web_base_url}/app/claim?sponsor_id={quote(str(sponsor_id))}&email={quote(to_email)}"
+    tree_word = "tree" if int(quantity or 1) == 1 else "trees"
+    dedication_block = f"{dedication_message}\n\n" if dedication_message else ""
+    birthday_wish = (
+        "Another year older, another beautiful chapter written. But this birthday leaves behind more than memories — "
+        "instead of candles that flicker and fade, you're leaving a living, growing legacy. Somewhere in the soil, "
+        "roots are about to take hold that will still be standing long after today, quietly cleaning the air, holding "
+        "the ground, and sheltering life for decades to come. That's the kind of gift that keeps giving back."
+    )
+    body = (
+        f"Hello {recipient_name},\n\n"
+        f"Happy Birthday from all of us at LandCheck Green!\n\n"
+        f"{birthday_wish}\n\n"
+        f"To celebrate you, we're planting {quantity} {tree_word} in your name "
+        f"at {project_name}{f', {location_text}' if location_text else ''} — completely free of charge.\n\n"
+        f"{dedication_block}"
+        "You'll receive a notification and email the moment our field agents plant and verify your tree(s).\n\n"
+        f"Set up your free LandCheck Green account (your name and email are already on file — just choose a password) here: {claim_url}\n\n"
+        f"Or get the app directly: {android_apk_url}\n\n"
+        "Happy Birthday, once again — here's to another year of growth, in every sense of the word.\n\n"
+        "Warmly,\n"
+        "The LandCheck Green Team"
+    )
+    body_html = f"""
+    <p style="margin:0 0 16px;font-size:15px;line-height:1.7;color:#173624;">Hello {html.escape(recipient_name)},</p>
+    <p style="margin:0 0 18px;font-size:15px;line-height:1.7;color:#173624;">Happy Birthday from all of us at LandCheck Green! 🎉</p>
+    <p style="margin:0 0 20px;font-size:15px;line-height:1.8;color:#173624;font-style:italic;">{html.escape(birthday_wish)}</p>
+    <p style="margin:0 0 20px;font-size:15px;line-height:1.7;color:#173624;">To celebrate you, we're planting <strong>{quantity} {html.escape(tree_word)}</strong> in your name at <strong>{html.escape(project_name)}</strong>{f', {html.escape(location_text)}' if location_text else ''} — completely free of charge.</p>
+    {f'<div style="border:1px solid #dbece0;border-radius:16px;background:#f8fcf9;padding:20px;margin:0 0 20px;"><p style="margin:0;font-size:14.5px;font-style:italic;line-height:1.7;color:#173624;">{html.escape(dedication_message)}</p></div>' if dedication_message else ''}
+    <p style="margin:0 0 20px;font-size:15px;line-height:1.7;color:#173624;">You'll receive a notification and email the moment our field agents plant and verify your tree(s).</p>
+    <a href="{html.escape(claim_url, quote=True)}" style="display:inline-block;padding:14px 22px;border-radius:999px;background:linear-gradient(135deg,#1f8c58,#0f6f39);color:#ffffff;font-size:15px;font-weight:800;text-decoration:none;box-shadow:0 10px 22px rgba(15,111,57,0.28);">Set up your account &amp; see your tree</a>
+    <p style="margin:20px 0 0;font-size:13px;line-height:1.7;color:#5c7a68;">Or get the app directly: <a href="{html.escape(android_apk_url, quote=True)}" style="color:#1f8c58;font-weight:700;text-decoration:none;">{html.escape(android_apk_url)}</a></p>
+    <p style="margin:22px 0 0;font-size:14px;line-height:1.7;color:#173624;">Happy Birthday, once again — here's to another year of growth, in every sense of the word.</p>
+    """
+    html_body = _render_premium_email_shell(
+        kicker="Happy Birthday",
+        title="A living legacy, planted in your name",
+        subtitle=f"To celebrate your birthday, LandCheck Green is gifting {quantity} {tree_word} at {project_name}, completely free of charge.",
+        body_html=body_html,
+    )
+    _send_html_email(
+        to_email=to_email,
+        subject="Happy Birthday! A tree is being planted in your name",
+        text_body=body,
+        html_body=html_body,
+    )
+
+
+@router.post("/admin/sponsorship-orders/birthday-gift")
+def create_admin_birthday_gift_sponsorship(payload: AdminCreateBirthdayGiftPayload, request: Request, db: Session = Depends(get_db)):
+    full_name_clean = _clean_text(payload.full_name, 160)
+    email_clean = _normalize_email_address(payload.email)
+    if not full_name_clean or not email_clean:
+        raise HTTPException(status_code=400, detail="full_name and email are required")
+    quantity_clean = max(1, min(int(payload.quantity or 1), 100))
+    project = get_project(project_id=int(payload.project_id), db=db, assignee_name=None)
+    if not _is_public_sponsorship_project(project):
+        raise HTTPException(status_code=400, detail="project_id must be a public-sponsorship project")
+
+    sponsor_row = _ensure_guest_sponsor_account(db, full_name=full_name_clean, email=email_clean, phone=None)
+    db.commit()
+    sponsor_id = int(sponsor_row["id"])
+    db.execute(
+        text("UPDATE green_sponsor_accounts SET date_of_birth = :dob, updated_at = NOW() WHERE id = :id"),
+        {"dob": payload.date_of_birth, "id": sponsor_id},
+    )
+    db.commit()
+
+    birthday_send_date = _compute_next_birthday_send_date(payload.date_of_birth)
+    checkout_currency = _normalize_currency_code(project.get("sponsor_currency"), "NGN")
+    amount_per_tree = round(float(_get_project_sponsor_price(project, checkout_currency, fallback_to_any=True) or 0), 2)
+    amount_total = round(amount_per_tree * quantity_clean, 2)
+    dedication_message_clean = _clean_text(payload.dedication_message, 500) or (
+        f"Happy Birthday, {full_name_clean}! LandCheck Green is planting {quantity_clean} tree"
+        f"{'s' if quantity_clean != 1 else ''} in your honor, free of charge."
+    )
+
+    order_uid = _generate_prefixed_uid("ORD")
+    order_id = 0
+    created_units: list[dict] = []
+    try:
+        order_row = db.execute(
+            text(
+                """
+                INSERT INTO green_sponsorship_orders (
+                    order_uid, sponsor_account_id, project_id, quantity, amount_per_tree, amount_total, currency,
+                    payment_method, payment_status, order_status, payment_verified_at,
+                    dedication_type, dedication_name, dedication_message, purchaser_note,
+                    accepted_terms, accepted_policy, consent_version,
+                    source, birthday_send_date
+                )
+                VALUES (
+                    :order_uid, :sponsor_account_id, :project_id, :quantity, :amount_per_tree, :amount_total, :currency,
+                    'birthday_gift', 'verified', 'paid', NOW(),
+                    'birthday', :dedication_name, :dedication_message, :purchaser_note,
+                    TRUE, TRUE, :consent_version,
+                    'birthday_gift', :birthday_send_date
+                )
+                RETURNING id, order_uid
+                """
+            ),
+            {
+                "order_uid": order_uid,
+                "sponsor_account_id": sponsor_id,
+                "project_id": int(project["id"]),
+                "quantity": quantity_clean,
+                "amount_per_tree": amount_per_tree,
+                "amount_total": amount_total,
+                "currency": checkout_currency,
+                "dedication_name": full_name_clean,
+                "dedication_message": dedication_message_clean,
+                "purchaser_note": "LandCheck birthday gift — added by superadmin",
+                "consent_version": SPONSOR_TERMS_VERSION,
+                "birthday_send_date": birthday_send_date,
+            },
+        ).mappings().first()
+        order_id = int(order_row["id"])
+        for _ in range(quantity_clean):
+            unit_row = db.execute(
+                text(
+                    """
+                    INSERT INTO green_sponsorship_units (
+                        unit_uid, order_id, sponsor_account_id, project_id, sponsorship_status,
+                        dedication_type, dedication_name
+                    )
+                    VALUES (
+                        :unit_uid, :order_id, :sponsor_account_id, :project_id, 'awaiting_tree',
+                        'birthday', :dedication_name
+                    )
+                    RETURNING id, unit_uid
+                    """
+                ),
+                {
+                    "unit_uid": _generate_prefixed_uid("UNT"),
+                    "order_id": order_id,
+                    "sponsor_account_id": sponsor_id,
+                    "project_id": int(project["id"]),
+                    "dedication_name": full_name_clean,
+                },
+            ).mappings().first()
+            created_units.append(dict(unit_row))
+        _refresh_sponsorship_order_status(db, order_id)
+        _log_audit_event(
+            db,
+            project_id=int(project["id"]),
+            entity_type="sponsorship_order",
+            entity_id=order_id,
+            action="birthday_gift_order_created",
+            actor="superadmin",
+            details={"sponsor_account_id": sponsor_id, "quantity": quantity_clean, "birthday_send_date": str(birthday_send_date)},
+        )
+        db.commit()
+    except HTTPException:
+        db.rollback()
+        raise
+    except Exception:
+        db.rollback()
+        raise
+
+    try:
+        _send_birthday_gift_announcement_email(
+            to_email=email_clean,
+            full_name=full_name_clean,
+            project_name=str(project.get("name") or "a LandCheck Green project"),
+            request=request,
+        )
+        db.execute(
+            text("UPDATE green_sponsorship_orders SET birthday_announcement_sent_at = NOW() WHERE id = :id"),
+            {"id": order_id},
+        )
+        db.commit()
+    except Exception:
+        _rollback_quietly(db)
+        logger.exception("Birthday gift announcement email failed for order_id=%s", order_id)
+
+    return {
+        "ok": True,
+        "order_id": order_id,
+        "order_uid": order_uid,
+        "sponsor_id": sponsor_id,
+        "birthday_send_date": str(birthday_send_date),
+        "quantity": len(created_units),
+        "tree_units": [{"unit_id": int(u["id"]), "unit_uid": u["unit_uid"]} for u in created_units],
+    }
+
+
+@router.get("/admin/birthday-gifts")
+def list_admin_birthday_gifts(db: Session = Depends(get_db)):
+    rows = db.execute(
+        text(
+            """
+            SELECT
+                o.id AS order_id, o.order_uid, o.quantity, o.birthday_send_date, o.birthday_email_sent_at,
+                o.birthday_announcement_sent_at, o.created_at,
+                sa.id AS sponsor_id, sa.full_name, sa.email, sa.date_of_birth,
+                p.id AS project_id, p.name AS project_name,
+                COUNT(u.id) FILTER (WHERE u.tree_id IS NOT NULL) AS linked_units,
+                COUNT(u.id) FILTER (WHERE u.tree_id IS NULL) AS awaiting_units
+            FROM green_sponsorship_orders o
+            JOIN green_sponsor_accounts sa ON sa.id = o.sponsor_account_id
+            JOIN tree_projects p ON p.id = o.project_id
+            LEFT JOIN green_sponsorship_units u ON u.order_id = o.id
+            WHERE o.source = 'birthday_gift'
+            GROUP BY o.id, sa.id, p.id
+            ORDER BY o.birthday_send_date ASC, o.created_at DESC
+            """
+        )
+    ).mappings().all()
+    return {
+        "birthday_gifts": [
+            {
+                "order_id": int(row["order_id"]),
+                "order_uid": row["order_uid"],
+                "sponsor_id": int(row["sponsor_id"]),
+                "full_name": row["full_name"],
+                "email": row["email"],
+                "date_of_birth": row["date_of_birth"],
+                "project_id": int(row["project_id"]),
+                "project_name": row["project_name"],
+                "quantity": int(row["quantity"] or 0),
+                "linked_units": int(row["linked_units"] or 0),
+                "awaiting_units": int(row["awaiting_units"] or 0),
+                "birthday_send_date": row["birthday_send_date"],
+                "birthday_email_sent_at": row["birthday_email_sent_at"],
+                "birthday_announcement_sent_at": row["birthday_announcement_sent_at"],
+                "created_at": row["created_at"],
+            }
+            for row in rows
+        ]
+    }
+
+
+def _run_birthday_gift_celebration_check(db: Session, request: Request | None = None) -> int:
+    """Fires the birthday celebration email for any birthday-gift order whose scheduled date is
+    today (Africa/Lagos). Safe to call more than once concurrently (e.g. the daily scheduler and
+    a manual trigger firing close together) — each order is atomically claimed via the
+    UPDATE ... WHERE birthday_email_sent_at IS NULL below before its email is sent, so only one
+    caller ever wins per order even without a global lock.
+    """
+    today = datetime.now(LANDCHECK_TIMEZONE).date()
+    due_orders = db.execute(
+        text(
+            """
+            SELECT o.id AS order_id, o.quantity, o.dedication_message,
+                   sa.id AS sponsor_id, sa.full_name, sa.email,
+                   p.name AS project_name, p.location_text AS project_location_text
+            FROM green_sponsorship_orders o
+            JOIN green_sponsor_accounts sa ON sa.id = o.sponsor_account_id
+            JOIN tree_projects p ON p.id = o.project_id
+            WHERE o.source = 'birthday_gift'
+              AND o.birthday_send_date = :today
+              AND o.birthday_email_sent_at IS NULL
+            """
+        ),
+        {"today": today},
+    ).mappings().all()
+
+    sent_count = 0
+    for row in due_orders:
+        order_id = int(row["order_id"])
+        claimed = db.execute(
+            text(
+                """
+                UPDATE green_sponsorship_orders
+                SET birthday_email_sent_at = NOW()
+                WHERE id = :id AND birthday_email_sent_at IS NULL
+                RETURNING id
+                """
+            ),
+            {"id": order_id},
+        ).first()
+        db.commit()
+        if not claimed:
+            continue
+        try:
+            _send_birthday_gift_celebration_email(
+                to_email=str(row["email"] or "").strip(),
+                full_name=str(row["full_name"] or "").strip() or "Friend",
+                sponsor_id=int(row["sponsor_id"]),
+                project_name=str(row["project_name"] or "a LandCheck Green project"),
+                location_text=str(row["project_location_text"] or "").strip(),
+                quantity=int(row["quantity"] or 1),
+                dedication_message=str(row["dedication_message"] or "").strip(),
+                request=request,
+            )
+            sent_count += 1
+        except Exception:
+            logger.exception("Birthday gift celebration email failed for order_id=%s", order_id)
+    return sent_count
+
+
+@router.post("/admin/birthday-gifts/run-check")
+def run_admin_birthday_gift_check(request: Request, db: Session = Depends(get_db)):
+    sent = _run_birthday_gift_celebration_check(db, request=request)
+    return {"ok": True, "sent": sent}
+
+
+def _build_sponsor_engagement_unsubscribe_url(sponsor_id: int, email: str, request: Request | None = None) -> str:
+    base_url = _build_public_api_base_url(request) or "https://api.landcheck.online"
+    return f"{base_url}/green/sponsor-engagement/unsubscribe?sponsor_id={sponsor_id}&email={quote(email)}"
+
+
+def _fetch_available_sponsor_projects_summary(db: Session, *, limit: int = 4) -> list[dict]:
+    try:
+        projects = list_public_sponsorship_projects(db=db)
+    except Exception:
+        return []
+    summary: list[dict] = []
+    for project in projects[:limit]:
+        name = str(project.get("name") or "").strip()
+        if not name:
+            continue
+        summary.append({"name": name, "location_text": str(project.get("location_text") or "").strip()})
+    return summary
+
+
+def _render_sponsor_engagement_projects_html(projects: list[dict]) -> str:
+    if not projects:
+        return ""
+    rows = "".join(
+        f"""
+        <div style="border:1px solid #dbece0;border-radius:14px;background:#f8fcf9;padding:14px 16px;margin:0 0 10px;">
+          <div style="font-size:14.5px;font-weight:700;color:#173624;">{html.escape(project["name"])}</div>
+          {f'<div style="margin-top:2px;font-size:12.5px;color:#5c7a68;">{html.escape(project["location_text"])}</div>' if project["location_text"] else ''}
+        </div>
+        """
+        for project in projects
+    )
+    return f"""
+    <div style="margin:0 0 20px;">
+      <div style="font-size:12.5px;font-weight:800;letter-spacing:0.06em;text-transform:uppercase;color:#5c7a68;margin:0 0 12px;">Projects open for sponsorship</div>
+      {rows}
+    </div>
+    """
+
+
+def _send_sponsor_engagement_prospect_email(
+    *, to_email: str, full_name: str, sponsor_id: int, projects: list[dict], request: Request | None = None
+):
+    recipient_name = str(full_name or "").strip() or "Friend"
+    sponsor_storefront_url = str(os.getenv("LANDCHECK_SPONSOR_URL") or "").strip() or "https://landcheck.online/sponsor"
+    unsubscribe_url = _build_sponsor_engagement_unsubscribe_url(sponsor_id, to_email, request)
+    body = (
+        f"Hello {recipient_name},\n\n"
+        "Climate action starts with a single tree. Your LandCheck Green account is ready whenever you'd like to sponsor "
+        "your first tree — every sponsorship is verified with GPS, photo evidence, and ongoing maintenance updates.\n\n"
+        f"See projects open for sponsorship: {sponsor_storefront_url}\n\n"
+        "Regards,\n"
+        "LandCheck Green\n\n"
+        f"No longer want these emails? Unsubscribe here: {unsubscribe_url}"
+    )
+    body_html = f"""
+    <p style="margin:0 0 16px;font-size:15px;line-height:1.7;color:#173624;">Hello {html.escape(recipient_name)},</p>
+    <p style="margin:0 0 20px;font-size:15px;line-height:1.7;color:#173624;">Climate action starts with a single tree. Your LandCheck Green account is ready whenever you'd like to sponsor your first tree — every sponsorship is verified with GPS, photo evidence, and ongoing maintenance updates.</p>
+    {_render_sponsor_engagement_projects_html(projects)}
+    <a href="{html.escape(sponsor_storefront_url, quote=True)}" style="display:inline-block;padding:14px 22px;border-radius:999px;background:linear-gradient(135deg,#1f8c58,#0f6f39);color:#ffffff;font-size:15px;font-weight:800;text-decoration:none;box-shadow:0 10px 22px rgba(15,111,57,0.28);">Sponsor your first tree</a>
+    <p style="margin:24px 0 0;font-size:12px;line-height:1.7;color:#a9bdb0;">No longer want these emails? <a href="{html.escape(unsubscribe_url, quote=True)}" style="color:#a9bdb0;">Unsubscribe</a></p>
+    """
+    html_body = _render_premium_email_shell(
+        kicker="Climate action starts here",
+        title="Ready to sponsor your first tree?",
+        subtitle="Every LandCheck Green sponsorship is verified with GPS, photo evidence, and ongoing care updates.",
+        body_html=body_html,
+    )
+    _send_html_email(
+        to_email=to_email,
+        subject="A tree is waiting for you on LandCheck Green",
+        text_body=body,
+        html_body=html_body,
+    )
+
+
+def _send_sponsor_engagement_thankyou_email(
+    *,
+    to_email: str,
+    full_name: str,
+    sponsor_id: int,
+    total_trees: int,
+    project_names: str,
+    projects: list[dict],
+    request: Request | None = None,
+):
+    recipient_name = str(full_name or "").strip() or "Friend"
+    tree_word = "tree" if int(total_trees or 0) == 1 else "trees"
+    sponsor_storefront_url = str(os.getenv("LANDCHECK_SPONSOR_URL") or "").strip() or "https://landcheck.online/sponsor"
+    unsubscribe_url = _build_sponsor_engagement_unsubscribe_url(sponsor_id, to_email, request)
+    body = (
+        f"Hello {recipient_name},\n\n"
+        f"Thank you for sponsoring {total_trees} {tree_word} with LandCheck Green at {project_names} — your support is "
+        "directly funding verified planting, maintenance, and field evidence.\n\n"
+        "If you'd like to grow your impact, here are projects currently open for sponsorship:\n"
+        f"{sponsor_storefront_url}\n\n"
+        "Regards,\n"
+        "LandCheck Green\n\n"
+        f"No longer want these emails? Unsubscribe here: {unsubscribe_url}"
+    )
+    body_html = f"""
+    <p style="margin:0 0 16px;font-size:15px;line-height:1.7;color:#173624;">Hello {html.escape(recipient_name)},</p>
+    <p style="margin:0 0 20px;font-size:15px;line-height:1.7;color:#173624;">Thank you for sponsoring <strong>{total_trees} {html.escape(tree_word)}</strong> with LandCheck Green at <strong>{html.escape(project_names)}</strong> — your support is directly funding verified planting, maintenance, and field evidence.</p>
+    <p style="margin:0 0 20px;font-size:15px;line-height:1.7;color:#173624;">If you'd like to grow your impact, here are projects currently open for sponsorship:</p>
+    {_render_sponsor_engagement_projects_html(projects)}
+    <a href="{html.escape(sponsor_storefront_url, quote=True)}" style="display:inline-block;padding:14px 22px;border-radius:999px;background:linear-gradient(135deg,#1f8c58,#0f6f39);color:#ffffff;font-size:15px;font-weight:800;text-decoration:none;box-shadow:0 10px 22px rgba(15,111,57,0.28);">Sponsor another tree</a>
+    <p style="margin:24px 0 0;font-size:12px;line-height:1.7;color:#a9bdb0;">No longer want these emails? <a href="{html.escape(unsubscribe_url, quote=True)}" style="color:#a9bdb0;">Unsubscribe</a></p>
+    """
+    html_body = _render_premium_email_shell(
+        kicker="Thank you",
+        title=f"You've helped plant {total_trees} {tree_word}",
+        subtitle=f"Your sponsorship at {project_names} is funding real, verified climate action.",
+        body_html=body_html,
+    )
+    _send_html_email(
+        to_email=to_email,
+        subject="Thank you for sponsoring trees with LandCheck Green",
+        text_body=body,
+        html_body=html_body,
+    )
+
+
+def _run_sponsor_engagement_email_check(db: Session, request: Request | None = None) -> dict:
+    """Monthly-cadence marketing emails: a prospect nudge for sign-ups who've never completed a
+    paid sponsorship, and a thank-you/cross-sell for people who have. Safe to call more than once
+    concurrently - each account is atomically claimed via UPDATE ... WHERE last_engagement_email_at
+    IS NULL OR < 30 days ago before its email sends, same pattern as the birthday-gift check.
+    """
+    projects = _fetch_available_sponsor_projects_summary(db)
+
+    prospect_rows = db.execute(
+        text(
+            """
+            SELECT sa.id, sa.full_name, sa.email
+            FROM green_sponsor_accounts sa
+            WHERE sa.account_type != 'merchant'
+              AND sa.is_active = TRUE
+              AND COALESCE(sa.engagement_emails_opt_out, FALSE) = FALSE
+              AND COALESCE(sa.email, '') != ''
+              AND (sa.last_engagement_email_at IS NULL OR sa.last_engagement_email_at < NOW() - INTERVAL '30 days')
+              AND NOT EXISTS (
+                  SELECT 1 FROM green_sponsorship_orders o
+                  WHERE o.sponsor_account_id = sa.id AND o.payment_status = 'verified'
+              )
+            ORDER BY sa.created_at ASC
+            LIMIT 150
+            """
+        )
+    ).mappings().all()
+
+    thankyou_rows = db.execute(
+        text(
+            """
+            SELECT sa.id, sa.full_name, sa.email,
+                   SUM(o.quantity) AS total_trees,
+                   STRING_AGG(DISTINCT p.name, ', ' ORDER BY p.name) AS project_names
+            FROM green_sponsor_accounts sa
+            JOIN green_sponsorship_orders o ON o.sponsor_account_id = sa.id
+            JOIN tree_projects p ON p.id = o.project_id
+            WHERE sa.account_type != 'merchant'
+              AND sa.is_active = TRUE
+              AND COALESCE(sa.engagement_emails_opt_out, FALSE) = FALSE
+              AND COALESCE(sa.email, '') != ''
+              AND (sa.last_engagement_email_at IS NULL OR sa.last_engagement_email_at < NOW() - INTERVAL '30 days')
+              AND o.payment_status = 'verified'
+              AND COALESCE(o.source, '') != 'birthday_gift'
+            GROUP BY sa.id, sa.full_name, sa.email
+            ORDER BY MIN(sa.created_at) ASC
+            LIMIT 150
+            """
+        )
+    ).mappings().all()
+
+    def _claim(sponsor_id: int) -> bool:
+        claimed = db.execute(
+            text(
+                """
+                UPDATE green_sponsor_accounts
+                SET last_engagement_email_at = NOW()
+                WHERE id = :id AND (last_engagement_email_at IS NULL OR last_engagement_email_at < NOW() - INTERVAL '30 days')
+                RETURNING id
+                """
+            ),
+            {"id": sponsor_id},
+        ).first()
+        db.commit()
+        return bool(claimed)
+
+    prospect_sent = 0
+    for row in prospect_rows:
+        sponsor_id = int(row["id"])
+        if not _claim(sponsor_id):
+            continue
+        try:
+            _send_sponsor_engagement_prospect_email(
+                to_email=str(row["email"] or "").strip(),
+                full_name=str(row["full_name"] or "").strip(),
+                sponsor_id=sponsor_id,
+                projects=projects,
+                request=request,
+            )
+            prospect_sent += 1
+        except Exception:
+            logger.exception("Sponsor engagement prospect email failed for sponsor_id=%s", sponsor_id)
+
+    thankyou_sent = 0
+    for row in thankyou_rows:
+        sponsor_id = int(row["id"])
+        if not _claim(sponsor_id):
+            continue
+        try:
+            _send_sponsor_engagement_thankyou_email(
+                to_email=str(row["email"] or "").strip(),
+                full_name=str(row["full_name"] or "").strip(),
+                sponsor_id=sponsor_id,
+                total_trees=int(row["total_trees"] or 0),
+                project_names=str(row["project_names"] or "").strip(),
+                projects=projects,
+                request=request,
+            )
+            thankyou_sent += 1
+        except Exception:
+            logger.exception("Sponsor engagement thank-you email failed for sponsor_id=%s", sponsor_id)
+
+    return {"prospect_sent": prospect_sent, "thankyou_sent": thankyou_sent}
+
+
+@router.get("/sponsor-engagement/unsubscribe")
+def unsubscribe_sponsor_engagement_emails(sponsor_id: int, email: str, db: Session = Depends(get_db)):
+    clean_email = _normalize_email_address(email)
+    row = db.execute(
+        text("SELECT id, email FROM green_sponsor_accounts WHERE id = :id LIMIT 1"),
+        {"id": int(sponsor_id)},
+    ).mappings().first()
+    matched = bool(row) and str(row.get("email") or "").strip().lower() == clean_email
+    if matched:
+        db.execute(
+            text(
+                """
+                UPDATE green_sponsor_accounts
+                SET engagement_emails_opt_out = TRUE, engagement_emails_opt_out_at = NOW()
+                WHERE id = :id
+                """
+            ),
+            {"id": int(sponsor_id)},
+        )
+        db.commit()
+    message = "You've been unsubscribed from LandCheck Green update emails." if matched else "We couldn't find a matching subscription to unsubscribe."
+    return HTMLResponse(
+        f"""<!doctype html>
+        <html lang="en">
+          <head><meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" /><title>Unsubscribe</title></head>
+          <body style="margin:0;padding:0;background:#eef4f0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;">
+            <div style="max-width:480px;margin:64px auto;padding:32px;background:#ffffff;border-radius:22px;border:1px solid #dceee0;box-shadow:0 18px 46px rgba(14,46,28,0.14);text-align:center;">
+              <div style="font-size:18px;font-weight:800;color:#173624;">{html.escape(message)}</div>
+              <div style="margin-top:12px;font-size:13px;color:#5c7a68;">You'll still receive emails about any active sponsorship (payment receipts, planting updates, certificates).</div>
+            </div>
+          </body>
+        </html>
+        """
+    )
+
+
+@router.post("/admin/sponsor-engagement/run-check")
+def run_admin_sponsor_engagement_check(request: Request, db: Session = Depends(get_db)):
+    result = _run_sponsor_engagement_email_check(db, request=request)
+    return {"ok": True, **result}
 
 
 @router.post("/admin/merchants/{merchant_id}/rotate-key")

@@ -7,6 +7,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware  # Added for speed
 from fastapi.responses import JSONResponse
 
+from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.cron import CronTrigger
+
 from app.db import SessionLocal
 from app.routers import (
     health,
@@ -96,12 +99,63 @@ def _requires_super_admin_session(request: Request) -> bool:
         return False
     return clean_path.startswith("/green/admin/")
 
+scheduler = BackgroundScheduler(timezone="Africa/Lagos")
+
+
+def _run_birthday_gift_celebration_check_job():
+    session_db = SessionLocal()
+    try:
+        green._run_birthday_gift_celebration_check(session_db)
+        session_db.commit()
+    except Exception:
+        session_db.rollback()
+        raise
+    finally:
+        session_db.close()
+
+
+def _run_sponsor_engagement_email_check_job():
+    session_db = SessionLocal()
+    try:
+        green._run_sponsor_engagement_email_check(session_db)
+        session_db.commit()
+    except Exception:
+        session_db.rollback()
+        raise
+    finally:
+        session_db.close()
+
+
 # ✅ Create tables on startup
 @app.on_event("startup")
 def startup_event():
     init_db()
     ensure_activity_log_table()
     green.bootstrap_green_schema()
+    # Fires the birthday-gift celebration email once daily — see _run_birthday_gift_celebration_check
+    # in green.py. Safe even if this ever runs across multiple instances, since each order is
+    # atomically claimed (UPDATE ... WHERE birthday_email_sent_at IS NULL) before its email sends.
+    scheduler.add_job(
+        _run_birthday_gift_celebration_check_job,
+        trigger=CronTrigger(hour=8, minute=0),
+        id="birthday_gift_celebration_check",
+        replace_existing=True,
+    )
+    # Monthly-cadence marketing emails (prospect nudge / thank-you) — see
+    # _run_sponsor_engagement_email_check in green.py. Runs at a different hour than the birthday
+    # check purely to spread load; same atomic per-account claim makes it safe to run more than once.
+    scheduler.add_job(
+        _run_sponsor_engagement_email_check_job,
+        trigger=CronTrigger(hour=9, minute=30),
+        id="sponsor_engagement_email_check",
+        replace_existing=True,
+    )
+    scheduler.start()
+
+
+@app.on_event("shutdown")
+def shutdown_event():
+    scheduler.shutdown(wait=False)
 
 # ✅ SPEED OPTIMIZATION: Gzip Compression
 # This shrinks large JSON/Report data (like your 210MB I/O) before sending it

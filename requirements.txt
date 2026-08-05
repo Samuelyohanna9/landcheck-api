@@ -21,3 +21,5 @@ google-auth
 boto3
 python-multipart
 python-docx
+apscheduler
+tzdata
