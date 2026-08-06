@@ -1,3 +1,4 @@
+import csv
 import hashlib
 import io
 import json
@@ -13,7 +14,7 @@ from typing import Any
 import numpy as np
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from fastapi.responses import Response, StreamingResponse
-from PIL import Image
+from PIL import Image, ImageOps
 from pydantic import BaseModel, Field, model_validator
 from pyproj import Transformer
 from sqlalchemy import text
@@ -549,6 +550,27 @@ async def create_georeference_session(
 
     try:
         image = Image.open(io.BytesIO(payload))
+        # Browsers auto-rotate <img> elements per EXIF orientation, so every pixel coordinate the
+        # frontend records (control points, digitized features) is captured against the ROTATED
+        # frame - but Image.size here would otherwise report the raw, pre-rotation dimensions.
+        # That mismatch doesn't affect the fitted transform itself (it's just linear regression
+        # over whatever pixel coordinates it's given), but it does corrupt the raster overlay's
+        # corner box on the map, which this endpoint computes from width/height directly. Baking
+        # the rotation into the pixel data up front keeps every consumer (browser display, GCP
+        # capture, overlay corners) working from the exact same frame.
+        orientation_tag = int((image.getexif() or {}).get(0x0112, 1) or 1)
+        if orientation_tag != 1:
+            image = ImageOps.exif_transpose(image)
+            buffer = io.BytesIO()
+            if content_type == "image/jpeg":
+                if image.mode not in ("RGB", "L"):
+                    image = image.convert("RGB")
+                image.save(buffer, format="JPEG", quality=95)
+            elif content_type == "image/png":
+                image.save(buffer, format="PNG")
+            else:
+                image.save(buffer, format="WEBP", quality=95)
+            payload = buffer.getvalue()
         width, height = image.size
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"Unable to read raster image: {exc}") from exc
@@ -716,16 +738,26 @@ def export_georeference_staking_csv(session_id: str, db: Session = Depends(get_d
     features = _safe_json_load(row.get("features_json"), [])
     rows = _build_staking_rows(features, str(row.get("target_coordinate_system") or "wgs84"))
 
-    csv_buffer = io.StringIO()
-    csv_buffer.write("station,feature,coordinate_system,easting,northing,longitude,latitude\n")
+    csv_buffer = io.StringIO(newline="")
+    csv_buffer.write("sep=,\r\n")
+    writer = csv.writer(csv_buffer, lineterminator="\r\n")
+    writer.writerow(["Station", "Feature", "Coordinate System", "Easting (m)", "Northing (m)", "Longitude", "Latitude"])
     for item in rows:
-        csv_buffer.write(
-            f"{item['station']},{item['feature']},{item['coordinate_system']},{item['easting']},{item['northing']},{item['longitude']},{item['latitude']}\n"
+        writer.writerow(
+            [
+                item["station"],
+                item["feature"],
+                str(item["coordinate_system"]).upper(),
+                item["easting"],
+                item["northing"],
+                item["longitude"],
+                item["latitude"],
+            ]
         )
     _touch_session(db, session_id)
     return Response(
-        content=csv_buffer.getvalue(),
-        media_type="text/csv",
+        content="\ufeff" + csv_buffer.getvalue(),
+        media_type="text/csv; charset=utf-8",
         headers={"Content-Disposition": f'attachment; filename="georeference_{session_id}_staking.csv"'},
     )
 

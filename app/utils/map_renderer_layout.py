@@ -540,9 +540,10 @@ def add_north_arrow(
     color: str = "black",
     anchor_x=None,
     anchor_y=None,
+    blue_hex: str = "blue",
 ):
     fig = ax.figure
-    col = "blue" if str(color).lower() == "blue" else "black"
+    col = blue_hex if str(color).lower() == "blue" else "black"
     style = str(style or "one_side_stem").strip().lower()
     # Keep north arrows vertically aligned to the right edge of the map frame
     # in both general and Adamawa templates.
@@ -1960,8 +1961,10 @@ def _draw_adamawa_north_arrow(
     style: str = "one_side_stem",
     color: str = "black",
 ):
-    # Reuse the same north-arrow style/color logic used by the general template.
-    add_north_arrow(ax, font_scale=font_scale, style=style, color=color)
+    # Reuse the same north-arrow style/color logic used by the general template, but resolve
+    # "blue" to the same navy already used for this template's grid frame, coordinate numbering,
+    # and header/footer text (ADAMAWA_BLUE) instead of the general template's plain "blue".
+    add_north_arrow(ax, font_scale=font_scale, style=style, color=color, blue_hex=ADAMAWA_BLUE)
 
 
 def _draw_adamawa_bottom_blocks(
