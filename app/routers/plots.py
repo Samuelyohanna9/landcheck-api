@@ -118,6 +118,8 @@ DEFAULT_TECHNICAL_REPORT_GENERAL_OBSERVATION = "The work was hitch-free."
 
 _PLOTS_SCHEMA_READY = False
 _PLOTS_SCHEMA_LOCK = Lock()
+_PLOT_META_TABLE_READY = False
+_PLOT_META_TABLE_LOCK = Lock()
 
 
 def ensure_plots_schema_once(db: Session):
@@ -132,6 +134,7 @@ def ensure_plots_schema_once(db: Session):
         ensure_plot_subdivision_tables(db)
         ensure_plot_export_jobs_table(db)
         ensure_plot_query_indexes(db)
+        ensure_plot_idempotency_columns(db)
         _PLOTS_SCHEMA_READY = True
 
 
@@ -181,6 +184,22 @@ def ensure_plot_query_indexes(db: Session):
 
 
 def ensure_plot_meta_table(db: Session):
+    # This is called from several hot paths (create_plot, upsert_plot_meta - itself called on
+    # every metadata save and every preview/orthophoto render), not just once at startup like
+    # the rest of the schema bootstrap. The CREATE + ~38 ALTER statements below are a no-op after
+    # the first successful run, so guard them the same way ensure_plots_schema_once already does
+    # to avoid paying that DDL round-trip cost on every single save/preview request.
+    global _PLOT_META_TABLE_READY
+    if _PLOT_META_TABLE_READY:
+        return
+    with _PLOT_META_TABLE_LOCK:
+        if _PLOT_META_TABLE_READY:
+            return
+        _ensure_plot_meta_table_impl(db)
+        _PLOT_META_TABLE_READY = True
+
+
+def _ensure_plot_meta_table_impl(db: Session):
     db.execute(text("""
         CREATE TABLE IF NOT EXISTS plot_meta (
             plot_id INTEGER PRIMARY KEY REFERENCES plots(id) ON DELETE CASCADE,
@@ -277,6 +296,28 @@ def ensure_plot_meta_table(db: Session):
 def ensure_plots_created_at(db: Session):
     try:
         db.execute(text("ALTER TABLE plots ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT NOW()"))
+        db.commit()
+    except Exception:
+        db.rollback()
+
+
+def ensure_plot_idempotency_columns(db: Session):
+    # Lets a client resend the same "create plot" / "save feature edit" request (e.g. after a
+    # dropped response on a flaky connection) without risking a duplicate row - the caller sends
+    # a per-attempt id and re-sends the SAME id on retry; a genuinely new action gets a new id.
+    # A partial unique index (rather than a plain UNIQUE column) means requests that don't send an
+    # id at all (NULL) never collide with each other, so older/other callers are unaffected.
+    try:
+        db.execute(text("ALTER TABLE plots ADD COLUMN IF NOT EXISTS client_request_id TEXT"))
+        db.execute(text(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_plots_client_request_id "
+            "ON plots (client_request_id) WHERE client_request_id IS NOT NULL"
+        ))
+        db.execute(text("ALTER TABLE plot_feature_overrides ADD COLUMN IF NOT EXISTS client_request_id TEXT"))
+        db.execute(text(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_plot_feature_overrides_client_request_id "
+            "ON plot_feature_overrides (client_request_id) WHERE client_request_id IS NOT NULL"
+        ))
         db.commit()
     except Exception:
         db.rollback()
@@ -1028,9 +1069,15 @@ def resolve_existing_path(candidates: list[str]) -> str | None:
 
 def cleanup_preview_files(plot_id: int):
     patterns = [
+        # .jpg is the current orthophoto/topo output format; .png patterns are kept so any
+        # leftover files from before that switch still get cleaned up.
+        os.path.join(REPORTS_DIR, "orthophoto", f"plot_{plot_id}_orthophoto_*_preview*.jpg"),
+        os.path.join(REPORTS_DIR, "orthophoto", f"plot_{plot_id}_orthophoto_preview*.jpg"),
         os.path.join(REPORTS_DIR, "orthophoto", f"plot_{plot_id}_orthophoto_*_preview*.png"),
         os.path.join(REPORTS_DIR, "orthophoto", f"plot_{plot_id}_orthophoto_preview*.png"),
         os.path.join(REPORTS_DIR, "previews", f"plot_{plot_id}_preview*.png"),
+        f"app/reports/orthophoto/plot_{plot_id}_orthophoto_*_preview*.jpg",
+        f"app/reports/orthophoto/plot_{plot_id}_orthophoto_preview*.jpg",
         f"app/reports/orthophoto/plot_{plot_id}_orthophoto_*_preview*.png",
         f"app/reports/orthophoto/plot_{plot_id}_orthophoto_preview*.png",
         f"app/reports/previews/plot_{plot_id}_preview*.png",
@@ -1093,14 +1140,15 @@ def build_plot_geom_revision_token(db: Session, plot_id: int) -> dict:
     }
 
 
-def preview_cache_path(plot_id: int, cache_key: str, variant: str = "preview") -> str:
+def preview_cache_path(plot_id: int, cache_key: str, variant: str = "preview", extension: str = "png") -> str:
     os.makedirs(PREVIEW_CACHE_DIR, exist_ok=True)
     safe_variant = re.sub(r"[^a-zA-Z0-9_-]", "_", str(variant or "preview"))
-    return os.path.join(PREVIEW_CACHE_DIR, f"plot_{plot_id}_{safe_variant}_{cache_key}.png")
+    safe_extension = re.sub(r"[^a-zA-Z0-9]", "", str(extension or "png")) or "png"
+    return os.path.join(PREVIEW_CACHE_DIR, f"plot_{plot_id}_{safe_variant}_{cache_key}.{safe_extension}")
 
 
-def get_cached_preview_path(plot_id: int, cache_key: str, variant: str = "preview") -> str | None:
-    cache_path = preview_cache_path(plot_id, cache_key, variant=variant)
+def get_cached_preview_path(plot_id: int, cache_key: str, variant: str = "preview", extension: str = "png") -> str | None:
+    cache_path = preview_cache_path(plot_id, cache_key, variant=variant, extension=extension)
     if not os.path.exists(cache_path):
         return None
     try:
@@ -1113,13 +1161,14 @@ def get_cached_preview_path(plot_id: int, cache_key: str, variant: str = "previe
         return None
 
 
-def prune_preview_cache(plot_id: int, variant: str | None = None):
+def prune_preview_cache(plot_id: int, variant: str | None = None, extension: str = "*"):
     os.makedirs(PREVIEW_CACHE_DIR, exist_ok=True)
+    safe_extension = re.sub(r"[^a-zA-Z0-9*]", "", str(extension or "*")) or "*"
     if variant:
         safe_variant = re.sub(r"[^a-zA-Z0-9_-]", "_", str(variant))
-        pattern = os.path.join(PREVIEW_CACHE_DIR, f"plot_{plot_id}_{safe_variant}_*.png")
+        pattern = os.path.join(PREVIEW_CACHE_DIR, f"plot_{plot_id}_{safe_variant}_*.{safe_extension}")
     else:
-        pattern = os.path.join(PREVIEW_CACHE_DIR, f"plot_{plot_id}_*.png")
+        pattern = os.path.join(PREVIEW_CACHE_DIR, f"plot_{plot_id}_*.{safe_extension}")
     files = []
     for path in glob.glob(pattern):
         try:
@@ -3089,6 +3138,38 @@ def _set_plot_export_job_status(
     db.commit()
 
 
+def sweep_stale_plot_export_jobs(db: Session, *, stale_after_minutes: int = 10) -> int:
+    """Marks any export job stuck in 'running' for longer than stale_after_minutes as failed.
+
+    Background export jobs run in daemon threads with no server-side timeout of their own - if
+    one hangs (e.g. inside a stalled basemap tile fetch), it would otherwise sit in
+    status='running' forever with no way for the client to know it's dead. Python can't safely
+    force-cancel a running thread, so this doesn't stop the runaway thread itself, but it does
+    free the job's cache-key slot (_find_plot_export_job_by_cache_key already excludes 'failed'
+    jobs) so the next request for the same export starts a clean new attempt instead of polling
+    a job that will never complete.
+    """
+    result = db.execute(
+        text(
+            """
+            UPDATE plot_export_jobs
+            SET status = 'failed',
+                error_text = 'Export timed out',
+                completed_at = NOW(),
+                updated_at = NOW()
+            WHERE status = 'running'
+              AND started_at IS NOT NULL
+              AND started_at < NOW() - make_interval(mins => :stale_after_minutes)
+            RETURNING id
+            """
+        ),
+        {"stale_after_minutes": int(stale_after_minutes)},
+    )
+    stale_ids = [row[0] for row in result.fetchall()]
+    db.commit()
+    return len(stale_ids)
+
+
 def _build_plot_export_public_base_url(request: Request | None = None) -> str:
     # request.url_for(...) trusts request.url.scheme, which resolves to "http" behind a reverse
     # proxy/tunnel (Cloudflare) that terminates TLS before forwarding to this app - producing a
@@ -3185,6 +3266,7 @@ def _find_plot_export_job_by_cache_key(
             WHERE plot_id = :plot_id
               AND export_type = :export_type
               AND cache_key = :cache_key
+              AND status != 'failed'
             ORDER BY
                 CASE status
                     WHEN 'completed' THEN 0
@@ -4253,16 +4335,32 @@ def create_plot(payload: Union[PlotCreateRequest, List[List[float]]], db: Sessio
 
     coords = payload.coordinates if isinstance(payload, PlotCreateRequest) else payload
     meta = payload.meta if isinstance(payload, PlotCreateRequest) else None
+    client_request_id = (
+        str(payload.client_request_id or "").strip()
+        if isinstance(payload, PlotCreateRequest) and payload.client_request_id
+        else ""
+    )
 
     if len(coords) < 3:
         raise HTTPException(status_code=400, detail="Polygon requires at least 3 points")
 
     ensure_plots_created_at(db)
 
+    if client_request_id:
+        # A resend of the same client-generated attempt id (e.g. after a dropped response on a
+        # flaky connection) returns the plot already created for it instead of creating a
+        # duplicate - see ensure_plot_idempotency_columns for the backing unique index.
+        existing_plot = db.execute(
+            text("SELECT id FROM plots WHERE client_request_id = :client_request_id LIMIT 1"),
+            {"client_request_id": client_request_id},
+        ).mappings().first()
+        if existing_plot:
+            return {"plot_id": int(existing_plot["id"])}
+
     polygon = Polygon(coords)
     geom = from_shape(polygon, srid=4326)
 
-    plot = Plot(geom=geom)
+    plot = Plot(geom=geom, client_request_id=client_request_id or None)
     db.add(plot)
     db.commit()
     db.refresh(plot)
@@ -4417,7 +4515,12 @@ def get_plot_features_geojson(plot_id: int, db: Session = Depends(get_db)):
         WHERE plot_id = :plot_id
     """), {"plot_id": plot_id}).fetchall()
 
-    # Roads from lines (same logic as renderer)
+    # Roads from lines (same logic as renderer), clipped to the plot buffer so a long
+    # real-world road doesn't ship in full over a slow connection. ST_Intersection can turn a
+    # road that crosses the buffer more than once into a MultiLineString (or a bare Point on a
+    # tangent touch) - ST_Dump explodes that into individual rows first, and the geometry-type
+    # filter drops degenerate points, so the CAD editor (which only understands plain
+    # LineString features) never receives anything it can't render.
     road_rows = db.execute(text("""
         WITH roads AS (
             SELECT
@@ -4430,11 +4533,18 @@ def get_plot_features_geojson(plot_id: int, db: Session = Depends(get_db)):
                 r.name
             FROM lines r
             WHERE r.highway IS NOT NULL
+        ),
+        clipped AS (
+            SELECT
+                roads.name,
+                (ST_Dump(ST_Intersection(roads.geom, b.geom))).geom AS geom
+            FROM roads
+            JOIN plot_buffers b ON b.plot_id = :plot_id
+            WHERE ST_Intersects(roads.geom, b.geom)
         )
-        SELECT ST_AsGeoJSON(roads.geom) AS geojson, roads.name
-        FROM roads
-        JOIN plot_buffers b ON b.plot_id = :plot_id
-        WHERE ST_Intersects(roads.geom, b.geom)
+        SELECT ST_AsGeoJSON(geom) AS geojson, name
+        FROM clipped
+        WHERE ST_GeometryType(geom) = 'ST_LineString'
     """), {"plot_id": plot_id}).fetchall()
 
     # Overrides
@@ -4590,11 +4700,23 @@ def add_feature_override(
     width_m: float | None = Body(default=None),
     wkt: str | None = Body(default=None),
     geojson: dict | None = Body(default=None),
+    client_request_id: str | None = Body(default=None),
 ):
     if feature_type not in {"road", "building", "river", "fence"}:
         raise HTTPException(status_code=400, detail="Invalid feature_type")
     if action not in {"add", "delete", "update"}:
         raise HTTPException(status_code=400, detail="Invalid action")
+
+    client_request_id = str(client_request_id or "").strip() or None
+    if client_request_id:
+        # See create_plot's matching check - lets a resend of the same attempt id (after a
+        # dropped response) return the existing row instead of inserting a duplicate override.
+        existing_override = db.execute(
+            text("SELECT id FROM plot_feature_overrides WHERE client_request_id = :client_request_id LIMIT 1"),
+            {"client_request_id": client_request_id},
+        ).mappings().first()
+        if existing_override:
+            return {"status": "ok"}
 
     geom_wkt = None
     geom_geojson = None
@@ -4612,8 +4734,8 @@ def add_feature_override(
     if geom_geojson:
         import json
         db.execute(text("""
-            INSERT INTO plot_feature_overrides (plot_id, feature_type, action, name, width_m, geom)
-            VALUES (:plot_id, :feature_type, :action, :name, :width_m, ST_SetSRID(ST_GeomFromGeoJSON(:geojson), 4326))
+            INSERT INTO plot_feature_overrides (plot_id, feature_type, action, name, width_m, geom, client_request_id)
+            VALUES (:plot_id, :feature_type, :action, :name, :width_m, ST_SetSRID(ST_GeomFromGeoJSON(:geojson), 4326), :client_request_id)
         """), {
             "plot_id": plot_id,
             "feature_type": feature_type,
@@ -4621,11 +4743,12 @@ def add_feature_override(
             "name": name or None,
             "width_m": width_m,
             "geojson": json.dumps(geom_geojson),
+            "client_request_id": client_request_id,
         })
     else:
         db.execute(text("""
-            INSERT INTO plot_feature_overrides (plot_id, feature_type, action, name, width_m, geom)
-            VALUES (:plot_id, :feature_type, :action, :name, :width_m, ST_SetSRID(ST_GeomFromText(:wkt), 4326))
+            INSERT INTO plot_feature_overrides (plot_id, feature_type, action, name, width_m, geom, client_request_id)
+            VALUES (:plot_id, :feature_type, :action, :name, :width_m, ST_SetSRID(ST_GeomFromText(:wkt), 4326), :client_request_id)
         """), {
             "plot_id": plot_id,
             "feature_type": feature_type,
@@ -4633,6 +4756,7 @@ def add_feature_override(
             "name": name or None,
             "width_m": width_m,
             "wkt": geom_wkt,
+            "client_request_id": client_request_id,
         })
     db.commit()
     return {"status": "ok"}
@@ -5361,16 +5485,16 @@ def orthophoto_preview(plot_id: int, db: Session = Depends(get_db), background_t
     cache_key = build_preview_cache_key(plot_id, payload_for_cache, revision_token)
     cache_variant = "topomap" if use_topo_map else "orthophoto"
     prune_preview_cache(plot_id, variant=cache_variant)
-    cached_path = get_cached_preview_path(plot_id, cache_key, variant=cache_variant)
+    cached_path = get_cached_preview_path(plot_id, cache_key, variant=cache_variant, extension="jpg")
     if cached_path:
         return FileResponse(
             cached_path,
-            media_type="image/png",
+            media_type="image/jpeg",
             headers={"Cache-Control": "no-store"},
         )
 
     cleanup_preview_files(plot_id)
-    tmp_png = tempfile.NamedTemporaryFile(suffix="_orthophoto_preview.png", delete=False)
+    tmp_png = tempfile.NamedTemporaryFile(suffix="_orthophoto_preview.jpg", delete=False)
     png_path = tmp_png.name
     tmp_png.close()
 
@@ -5405,7 +5529,7 @@ def orthophoto_preview(plot_id: int, db: Session = Depends(get_db), background_t
         preview_mode=True,
     )
 
-    cache_path = preview_cache_path(plot_id, cache_key, variant=cache_variant)
+    cache_path = preview_cache_path(plot_id, cache_key, variant=cache_variant, extension="jpg")
     served_path = png_path
     served_background = background_tasks
     try:
@@ -5423,7 +5547,7 @@ def orthophoto_preview(plot_id: int, db: Session = Depends(get_db), background_t
 
     return FileResponse(
         served_path,
-        media_type="image/png",
+        media_type="image/jpeg",
         headers={"Cache-Control": "no-store"},
         background=served_background,
     )
@@ -5452,7 +5576,7 @@ def orthophoto_pdf(plot_id: int, db: Session = Depends(get_db), background_tasks
     map_type = "topo" if use_topo_map else "satellite"
     pdf_path = f"{out_dir}/plot_{plot_id}_orthophoto_{map_type}.pdf"
 
-    tmp_png = tempfile.NamedTemporaryFile(suffix=f"_{map_type}.png", delete=False)
+    tmp_png = tempfile.NamedTemporaryFile(suffix=f"_{map_type}.jpg", delete=False)
     png_path = tmp_png.name
     tmp_png.close()
 
@@ -5732,7 +5856,7 @@ def get_saved_orthophoto_pdf(plot_id: int, map_type: str = "satellite", refresh:
         out_dir = os.path.join(REPORTS_DIR, "orthophoto")
         os.makedirs(out_dir, exist_ok=True)
         pdf_path = os.path.join(out_dir, f"plot_{plot_id}_orthophoto_{safe_type}.pdf")
-        tmp_png = tempfile.NamedTemporaryFile(suffix=f"_{safe_type}.png", delete=False)
+        tmp_png = tempfile.NamedTemporaryFile(suffix=f"_{safe_type}.jpg", delete=False)
         png_path = tmp_png.name
         tmp_png.close()
         epsg_code = COORDINATE_SYSTEMS.get(meta["coordinate_system"], 4326)

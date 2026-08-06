@@ -14,7 +14,7 @@ import numpy as np
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from fastapi.responses import Response, StreamingResponse
 from PIL import Image
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from pyproj import Transformer
 from sqlalchemy import text
 from sqlalchemy.orm import Session
@@ -44,8 +44,28 @@ class GroundControlPointInput(BaseModel):
     label: str | None = None
     image_x: float
     image_y: float
-    lng: float
-    lat: float
+    ground_x: float
+    ground_y: float
+    lng: float | None = None
+    lat: float | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_ground_coordinates(cls, value: Any):
+        if isinstance(value, cls):
+            return value
+        if not isinstance(value, dict):
+            return value
+        payload = dict(value)
+        ground_x = payload.get("ground_x", payload.get("lng"))
+        ground_y = payload.get("ground_y", payload.get("lat"))
+        if ground_x is None or ground_y is None:
+            return payload
+        payload["ground_x"] = ground_x
+        payload["ground_y"] = ground_y
+        payload.setdefault("lng", ground_x)
+        payload.setdefault("lat", ground_y)
+        return payload
 
 
 class SolveGeoreferenceRequest(BaseModel):
@@ -68,6 +88,10 @@ class DigitizedFeatureInput(BaseModel):
 
 class SaveDigitizedFeaturesRequest(BaseModel):
     features: list[DigitizedFeatureInput] = Field(default_factory=list)
+
+
+def _looks_like_projected_coordinates(x: float, y: float) -> bool:
+    return abs(float(x)) > 180 or abs(float(y)) > 90
 
 
 def _now_utc() -> datetime:
@@ -166,6 +190,20 @@ def _ensure_schema(db: Session):
 
 
 def _session_to_payload(row: dict[str, Any]) -> dict[str, Any]:
+    ground_control_points = _safe_json_load(row.get("gcps_json"), [])
+    normalized_gcps = [
+        GroundControlPointInput.model_validate(item).model_dump() for item in ground_control_points if isinstance(item, dict)
+    ]
+    transform = _safe_json_load(row.get("transform_json"), None)
+    if isinstance(transform, dict):
+        transform = {
+            **transform,
+            "residuals": [
+                GroundControlPointInput.model_validate(item).model_dump()
+                for item in list(transform.get("residuals") or [])
+                if isinstance(item, dict)
+            ],
+        }
     return {
         "id": str(row.get("id") or ""),
         "title_text": str(row.get("title_text") or ""),
@@ -176,8 +214,8 @@ def _session_to_payload(row: dict[str, Any]) -> dict[str, Any]:
         "source_content_type": str(row.get("source_content_type") or ""),
         "source_width": int(row.get("source_width") or 0),
         "source_height": int(row.get("source_height") or 0),
-        "ground_control_points": _safe_json_load(row.get("gcps_json"), []),
-        "transform": _safe_json_load(row.get("transform_json"), None),
+        "ground_control_points": normalized_gcps,
+        "transform": transform,
         "overlay": _safe_json_load(row.get("overlay_json"), None),
         "features": _safe_json_load(row.get("features_json"), []),
         "delete_after_at": row.get("delete_after_at").isoformat() if row.get("delete_after_at") else None,
@@ -238,9 +276,11 @@ def _solve_affine(width: int, height: int, coordinate_system_key: str, gcps: lis
 
     for gcp in gcps:
         if forward_transformer is None:
-            projected_pairs.append((float(gcp.lng), float(gcp.lat)))
+            projected_pairs.append((float(gcp.ground_x), float(gcp.ground_y)))
+        elif _looks_like_projected_coordinates(gcp.ground_x, gcp.ground_y):
+            projected_pairs.append((float(gcp.ground_x), float(gcp.ground_y)))
         else:
-            px, py = forward_transformer.transform(float(gcp.lng), float(gcp.lat))
+            px, py = forward_transformer.transform(float(gcp.ground_x), float(gcp.ground_y))
             projected_pairs.append((float(px), float(py)))
 
     a_matrix = np.asarray([[1.0, float(item.image_x), float(item.image_y)] for item in gcps], dtype=float)
@@ -274,8 +314,10 @@ def _solve_affine(width: int, height: int, coordinate_system_key: str, gcps: lis
                 "label": gcp.label or f"GCP {idx + 1}",
                 "image_x": float(gcp.image_x),
                 "image_y": float(gcp.image_y),
-                "lng": float(gcp.lng),
-                "lat": float(gcp.lat),
+                "ground_x": float(gcp.ground_x),
+                "ground_y": float(gcp.ground_y),
+                "lng": float(gcp.ground_x),
+                "lat": float(gcp.ground_y),
                 "error_m": round(error_m, 3),
             }
         )

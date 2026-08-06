@@ -19,3 +19,7 @@ class PlotCreateRequest(BaseModel):
     coordinates: List[List[float]]
     stations: Optional[List[Station]] = []
     meta: Optional[PlotMeta] = None
+    # Optional per-attempt id the client generates once and resends unchanged on any retry of the
+    # same logical "create this plot" action, so a lost response over a flaky connection can't
+    # result in a duplicate plot. Omitted entirely by older/other callers - fully backward compatible.
+    client_request_id: Optional[str] = None

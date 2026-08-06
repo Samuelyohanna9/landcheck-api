@@ -21,6 +21,12 @@ from reportlab.pdfgen import canvas
 from reportlab.lib.utils import ImageReader
 from matplotlib.backends.backend_agg import FigureCanvasAgg as FigureCanvas
 
+# (connect timeout, read timeout) in seconds for every basemap tile fetch. Without this, a
+# stalled (not cleanly failed) connection to the tile provider has no time budget of its own and
+# can hang well past the point where a retry/fallback would actually help - this matters most for
+# the full-export path below, which chains up to 3 providers sequentially.
+_BASEMAP_FETCH_TIMEOUT = (5, 20)
+
 # Paper size mapping (ReportLab points)
 PAPER_SIZES_REPORTLAB = {
     "A4": A4,
@@ -555,6 +561,7 @@ def render_orthophoto_png(
                     attribution=False,
                     zoom=topo_zoom,
                     reset_extent=True,
+                    timeout=_BASEMAP_FETCH_TIMEOUT,
                 )
                 basemap_loaded = True
             except Exception:
@@ -575,6 +582,7 @@ def render_orthophoto_png(
                         attribution=False,
                         zoom=topo_zoom,
                         reset_extent=True,
+                        timeout=_BASEMAP_FETCH_TIMEOUT,
                     )
                     basemap_loaded = True
                     print(f"Loaded topo basemap from {name}")
@@ -593,6 +601,7 @@ def render_orthophoto_png(
                         attribution=False,
                         zoom=topo_zoom,
                         reset_extent=True,
+                        timeout=_BASEMAP_FETCH_TIMEOUT,
                     )
                     basemap_loaded = True
                 except Exception as e:
@@ -609,6 +618,7 @@ def render_orthophoto_png(
                     attribution=False,
                     zoom=sat_zoom,
                     reset_extent=True,
+                    timeout=_BASEMAP_FETCH_TIMEOUT,
                 )
                 basemap_loaded = True
             except Exception:
@@ -620,6 +630,7 @@ def render_orthophoto_png(
                         attribution=False,
                         zoom=sat_zoom,
                         reset_extent=True,
+                        timeout=_BASEMAP_FETCH_TIMEOUT,
                     )
                     basemap_loaded = True
                 except Exception:
@@ -641,6 +652,7 @@ def render_orthophoto_png(
                     attribution=False,
                     zoom=sat_zoom,
                     reset_extent=True,
+                    timeout=_BASEMAP_FETCH_TIMEOUT,
                 )
                 basemap_loaded = True
             except Exception as e:
@@ -655,6 +667,7 @@ def render_orthophoto_png(
                         attribution=False,
                         zoom=sat_zoom,
                         reset_extent=True,
+                        timeout=_BASEMAP_FETCH_TIMEOUT,
                     )
                     basemap_loaded = True
                 except Exception as e:
@@ -671,6 +684,7 @@ def render_orthophoto_png(
                             attribution=False,
                             zoom=sat_zoom,
                             reset_extent=True,
+                            timeout=_BASEMAP_FETCH_TIMEOUT,
                         )
                         basemap_loaded = True
                         print(f"Loaded basemap from {name}")
@@ -715,9 +729,11 @@ def render_orthophoto_png(
     ax.set_aspect("equal")
     ax.axis("off")
 
-    # Save logic
+    # Save logic. Orthophoto/topo output is photographic (satellite/terrain tiles), which JPEG
+    # compresses far more efficiently than PNG at equivalent visual quality - callers pass a
+    # .jpg output_path so matplotlib infers JPEG from the extension; pil_kwargs controls quality.
     fig.canvas.draw()
-    fig.savefig(output_path, dpi=dpi)
+    fig.savefig(output_path, dpi=dpi, pil_kwargs={"quality": 85, "optimize": True})
     plt.close(fig)
 
 

@@ -9,6 +9,7 @@ from fastapi.responses import JSONResponse
 
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
+import contextily as ctx
 
 from app.db import SessionLocal
 from app.routers import (
@@ -139,12 +140,32 @@ def _run_georeference_retention_cleanup_job():
         session_db.close()
 
 
+def _run_stale_plot_export_job_sweep():
+    session_db = SessionLocal()
+    try:
+        plots.sweep_stale_plot_export_jobs(session_db)
+    except Exception:
+        session_db.rollback()
+        raise
+    finally:
+        session_db.close()
+
+
 # ✅ Create tables on startup
 @app.on_event("startup")
 def startup_event():
     init_db()
     ensure_activity_log_table()
     green.bootstrap_green_schema()
+    # Persistent on-disk cache for basemap tiles (orthophoto/topo rendering) so a plot rendered
+    # more than once reuses already-fetched tiles instead of re-hitting the external imagery
+    # provider every time - see app/utils/orthophoto_renderer.py.
+    try:
+        tile_cache_dir = os.path.join(os.path.dirname(__file__), "reports", "tile_cache")
+        os.makedirs(tile_cache_dir, exist_ok=True)
+        ctx.set_cache_dir(tile_cache_dir)
+    except Exception:
+        pass
     # Fires the birthday-gift celebration email once daily — see _run_birthday_gift_celebration_check
     # in green.py. Safe even if this ever runs across multiple instances, since each order is
     # atomically claimed (UPDATE ... WHERE birthday_email_sent_at IS NULL) before its email sends.
@@ -167,6 +188,14 @@ def startup_event():
         _run_georeference_retention_cleanup_job,
         trigger=CronTrigger(hour="*/6"),
         id="georeference_retention_cleanup",
+        replace_existing=True,
+    )
+    # Frees up any export job stuck in "running" for too long (e.g. a hung tile fetch) so it
+    # stops permanently blocking retries of the same export - see sweep_stale_plot_export_jobs.
+    scheduler.add_job(
+        _run_stale_plot_export_job_sweep,
+        trigger=CronTrigger(minute="*/5"),
+        id="stale_plot_export_job_sweep",
         replace_existing=True,
     )
     scheduler.start()

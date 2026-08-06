@@ -1,4 +1,4 @@
-LandCheck API SOC 2 Readiness Notes
+ LandCheck API SOC 2 Readiness Notes
 
 Scope
 
@@ -42,12 +42,6 @@ Environment variables
 - `WORK_USERNAME`
 - `WORK_PASSWORD`
 - `FLW_SECRET_HASH`
-
-Public repository hygiene
-
-- Keep real environment values only in private `.env` files on the server, in CI secrets, or in a secret manager.
-- Do not commit populated evidence registers, access reviews, incident notes, backup artifacts, customer exports, or database dumps to a public repository.
-- Keep tracked example files limited to placeholders and blank templates.
 
 Operational rollout checklist
 
