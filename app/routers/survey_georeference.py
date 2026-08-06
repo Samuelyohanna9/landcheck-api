@@ -190,12 +190,51 @@ def _ensure_schema(db: Session):
         _SCHEMA_READY = True
 
 
+def _normalize_session_transform(
+    row: dict[str, Any],
+    transform: Any,
+    gcps: list[GroundControlPointInput] | None = None,
+) -> dict[str, Any] | None:
+    if not isinstance(transform, dict):
+        return None
+    has_map_transform = isinstance(transform.get("map_coefficients"), dict) or (
+        isinstance(transform.get("map_homography"), list) and len(list(transform.get("map_homography") or [])) == 9
+    )
+    has_overlay_corners = isinstance(transform.get("overlay_corners"), list) and len(list(transform.get("overlay_corners") or [])) == 4
+    if has_map_transform and has_overlay_corners:
+        return transform
+    normalized_gcps = gcps or [
+        GroundControlPointInput.model_validate(item)
+        for item in list(_safe_json_load(row.get("gcps_json"), []))
+        if isinstance(item, dict)
+    ]
+    if len(normalized_gcps) < 3:
+        return transform
+    try:
+        return _solve_affine(
+            int(row.get("source_width") or 0),
+            int(row.get("source_height") or 0),
+            str(row.get("target_coordinate_system") or "wgs84"),
+            normalized_gcps,
+        )
+    except Exception:
+        return transform
+
+
 def _session_to_payload(row: dict[str, Any]) -> dict[str, Any]:
     ground_control_points = _safe_json_load(row.get("gcps_json"), [])
     normalized_gcps = [
         GroundControlPointInput.model_validate(item).model_dump() for item in ground_control_points if isinstance(item, dict)
     ]
-    transform = _safe_json_load(row.get("transform_json"), None)
+    transform = _normalize_session_transform(
+        row,
+        _safe_json_load(row.get("transform_json"), None),
+        [
+            GroundControlPointInput.model_validate(item)
+            for item in ground_control_points
+            if isinstance(item, dict)
+        ],
+    )
     if isinstance(transform, dict):
         transform = {
             **transform,
@@ -217,7 +256,7 @@ def _session_to_payload(row: dict[str, Any]) -> dict[str, Any]:
         "source_height": int(row.get("source_height") or 0),
         "ground_control_points": normalized_gcps,
         "transform": transform,
-        "overlay": _safe_json_load(row.get("overlay_json"), None),
+        "overlay": {"corners": list(transform.get("overlay_corners") or [])} if isinstance(transform, dict) else _safe_json_load(row.get("overlay_json"), None),
         "features": _safe_json_load(row.get("features_json"), []),
         "delete_after_at": row.get("delete_after_at").isoformat() if row.get("delete_after_at") else None,
         "created_at": row.get("created_at").isoformat() if row.get("created_at") else None,
@@ -265,6 +304,98 @@ def _make_transformers(target_epsg: int):
     )
 
 
+def _solve_planar_model(
+    gcps: list[GroundControlPointInput],
+    world_pairs: list[tuple[float, float]],
+) -> dict[str, Any]:
+    a_matrix = np.asarray([[1.0, float(item.image_x), float(item.image_y)] for item in gcps], dtype=float)
+    world_x = np.asarray([pair[0] for pair in world_pairs], dtype=float)
+    world_y = np.asarray([pair[1] for pair in world_pairs], dtype=float)
+
+    coeff_x, *_ = np.linalg.lstsq(a_matrix, world_x, rcond=None)
+    coeff_y, *_ = np.linalg.lstsq(a_matrix, world_y, rcond=None)
+
+    predicted_x = a_matrix @ coeff_x
+    predicted_y = a_matrix @ coeff_y
+
+    projective_matrix = None
+    projective_condition_number = None
+    if len(gcps) >= 4:
+        projective_rows: list[list[float]] = []
+        projective_targets: list[float] = []
+        for gcp, (target_x, target_y) in zip(gcps, world_pairs):
+            pixel_x = float(gcp.image_x)
+            pixel_y = float(gcp.image_y)
+            projective_rows.append(
+                [
+                    pixel_x,
+                    pixel_y,
+                    1.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    -pixel_x * float(target_x),
+                    -pixel_y * float(target_x),
+                ]
+            )
+            projective_targets.append(float(target_x))
+            projective_rows.append(
+                [
+                    0.0,
+                    0.0,
+                    0.0,
+                    pixel_x,
+                    pixel_y,
+                    1.0,
+                    -pixel_x * float(target_y),
+                    -pixel_y * float(target_y),
+                ]
+            )
+            projective_targets.append(float(target_y))
+        try:
+            projective_matrix_a = np.asarray(projective_rows, dtype=float)
+            projective_matrix_b = np.asarray(projective_targets, dtype=float)
+            projective_solution, *_ = np.linalg.lstsq(projective_matrix_a, projective_matrix_b, rcond=None)
+            projective_matrix = np.asarray(
+                [
+                    [projective_solution[0], projective_solution[1], projective_solution[2]],
+                    [projective_solution[3], projective_solution[4], projective_solution[5]],
+                    [projective_solution[6], projective_solution[7], 1.0],
+                ],
+                dtype=float,
+            )
+            projective_condition_number = float(np.linalg.cond(projective_matrix_a))
+        except Exception:
+            projective_matrix = None
+            projective_condition_number = None
+
+    def apply_affine(pixel_x: float, pixel_y: float) -> tuple[float, float]:
+        x_world = float(coeff_x[0] + coeff_x[1] * pixel_x + coeff_x[2] * pixel_y)
+        y_world = float(coeff_y[0] + coeff_y[1] * pixel_x + coeff_y[2] * pixel_y)
+        return x_world, y_world
+
+    def apply_projective(pixel_x: float, pixel_y: float) -> tuple[float, float]:
+        if projective_matrix is None:
+            return apply_affine(pixel_x, pixel_y)
+        denominator = float(projective_matrix[2, 0] * pixel_x + projective_matrix[2, 1] * pixel_y + projective_matrix[2, 2])
+        if abs(denominator) < 1e-9:
+            return apply_affine(pixel_x, pixel_y)
+        x_world = float((projective_matrix[0, 0] * pixel_x + projective_matrix[0, 1] * pixel_y + projective_matrix[0, 2]) / denominator)
+        y_world = float((projective_matrix[1, 0] * pixel_x + projective_matrix[1, 1] * pixel_y + projective_matrix[1, 2]) / denominator)
+        return x_world, y_world
+
+    return {
+        "coeff_x": coeff_x,
+        "coeff_y": coeff_y,
+        "predicted_x": predicted_x,
+        "predicted_y": predicted_y,
+        "projective_matrix": projective_matrix,
+        "transform_type": "projective" if projective_matrix is not None else "affine",
+        "condition_number": float(projective_condition_number if projective_condition_number is not None else np.linalg.cond(a_matrix)),
+        "apply": apply_projective if projective_matrix is not None else apply_affine,
+    }
+
+
 def _solve_affine(width: int, height: int, coordinate_system_key: str, gcps: list[GroundControlPointInput]) -> dict[str, Any]:
     if len(gcps) < 3:
         raise HTTPException(status_code=400, detail="At least 3 control points are required.")
@@ -273,35 +404,54 @@ def _solve_affine(width: int, height: int, coordinate_system_key: str, gcps: lis
 
     target_epsg = _coordinate_system_to_epsg(coordinate_system_key)
     forward_transformer, reverse_transformer = _make_transformers(target_epsg)
+    mercator_forward = Transformer.from_crs(4326, 3857, always_xy=True)
+    mercator_reverse = Transformer.from_crs(3857, 4326, always_xy=True)
     projected_pairs: list[tuple[float, float]] = []
+    wgs84_pairs: list[tuple[float, float]] = []
 
     for gcp in gcps:
         if forward_transformer is None:
-            projected_pairs.append((float(gcp.ground_x), float(gcp.ground_y)))
+            lng = float(gcp.ground_x)
+            lat = float(gcp.ground_y)
+            projected_pairs.append((lng, lat))
+            wgs84_pairs.append((lng, lat))
         elif _looks_like_projected_coordinates(gcp.ground_x, gcp.ground_y):
-            projected_pairs.append((float(gcp.ground_x), float(gcp.ground_y)))
+            projected_x = float(gcp.ground_x)
+            projected_y = float(gcp.ground_y)
+            projected_pairs.append((projected_x, projected_y))
+            lng, lat = reverse_transformer.transform(projected_x, projected_y)
+            wgs84_pairs.append((float(lng), float(lat)))
         else:
-            px, py = forward_transformer.transform(float(gcp.ground_x), float(gcp.ground_y))
+            lng = float(gcp.ground_x)
+            lat = float(gcp.ground_y)
+            px, py = forward_transformer.transform(lng, lat)
             projected_pairs.append((float(px), float(py)))
+            wgs84_pairs.append((lng, lat))
 
-    a_matrix = np.asarray([[1.0, float(item.image_x), float(item.image_y)] for item in gcps], dtype=float)
-    world_x = np.asarray([pair[0] for pair in projected_pairs], dtype=float)
-    world_y = np.asarray([pair[1] for pair in projected_pairs], dtype=float)
+    mercator_pairs = [
+        tuple(float(value) for value in mercator_forward.transform(float(lng), float(lat)))
+        for lng, lat in wgs84_pairs
+    ]
 
-    coeff_x, *_ = np.linalg.lstsq(a_matrix, world_x, rcond=None)
-    coeff_y, *_ = np.linalg.lstsq(a_matrix, world_y, rcond=None)
-
-    predicted_x = a_matrix @ coeff_x
-    predicted_y = a_matrix @ coeff_y
+    target_model = _solve_planar_model(gcps, projected_pairs)
+    map_model = _solve_planar_model(gcps, mercator_pairs)
 
     if target_epsg == 4326:
         meter_transformer = Transformer.from_crs(4326, 3857, always_xy=True)
+    transform_kind = str(target_model["transform_type"])
+    transform_applier = target_model["apply"]
 
     residuals: list[dict[str, Any]] = []
     squared_error = 0.0
     for idx, gcp in enumerate(gcps):
         actual_world = projected_pairs[idx]
-        predicted_world = (float(predicted_x[idx]), float(predicted_y[idx]))
+        if transform_kind == "projective":
+            predicted_world = transform_applier(float(gcp.image_x), float(gcp.image_y))
+        else:
+            predicted_world = (
+                float(target_model["predicted_x"][idx]),
+                float(target_model["predicted_y"][idx]),
+            )
         if target_epsg == 4326:
             ax, ay = meter_transformer.transform(actual_world[0], actual_world[1])
             px, py = meter_transformer.transform(predicted_world[0], predicted_world[1])
@@ -324,7 +474,6 @@ def _solve_affine(width: int, height: int, coordinate_system_key: str, gcps: lis
         )
 
     rms_error = math.sqrt(squared_error / max(1, len(gcps)))
-    condition_number = float(np.linalg.cond(a_matrix))
 
     if rms_error <= 1.5 and len(gcps) >= 4:
         quality = "strong"
@@ -333,29 +482,37 @@ def _solve_affine(width: int, height: int, coordinate_system_key: str, gcps: lis
     else:
         quality = "weak"
 
-    def apply_pixel(pixel_x: float, pixel_y: float) -> tuple[float, float]:
-        x_world = float(coeff_x[0] + coeff_x[1] * pixel_x + coeff_x[2] * pixel_y)
-        y_world = float(coeff_y[0] + coeff_y[1] * pixel_x + coeff_y[2] * pixel_y)
-        return x_world, y_world
-
     overlay_corners = []
     for pixel_x, pixel_y in [(0, 0), (width, 0), (width, height), (0, height)]:
-        world_x_val, world_y_val = apply_pixel(float(pixel_x), float(pixel_y))
-        if reverse_transformer is None:
-            lng, lat = world_x_val, world_y_val
-        else:
-            lng, lat = reverse_transformer.transform(world_x_val, world_y_val)
+        world_x_val, world_y_val = map_model["apply"](float(pixel_x), float(pixel_y))
+        lng, lat = mercator_reverse.transform(world_x_val, world_y_val)
         overlay_corners.append([round(float(lng), 8), round(float(lat), 8)])
 
     return {
+        "transform_type": transform_kind,
         "target_coordinate_system": coordinate_system_key,
         "target_epsg": target_epsg,
         "coefficients": {
-            "x": [round(float(value), 10) for value in coeff_x.tolist()],
-            "y": [round(float(value), 10) for value in coeff_y.tolist()],
+            "x": [round(float(value), 10) for value in target_model["coeff_x"].tolist()],
+            "y": [round(float(value), 10) for value in target_model["coeff_y"].tolist()],
         },
+        "homography": [
+            round(float(value), 12) for value in target_model["projective_matrix"].reshape(-1).tolist()
+        ]
+        if target_model["projective_matrix"] is not None
+        else None,
+        "map_transform_type": str(map_model["transform_type"]),
+        "map_coefficients": {
+            "x": [round(float(value), 10) for value in map_model["coeff_x"].tolist()],
+            "y": [round(float(value), 10) for value in map_model["coeff_y"].tolist()],
+        },
+        "map_homography": [
+            round(float(value), 12) for value in map_model["projective_matrix"].reshape(-1).tolist()
+        ]
+        if map_model["projective_matrix"] is not None
+        else None,
         "rms_error_m": round(float(rms_error), 3),
-        "condition_number": round(float(condition_number), 4),
+        "condition_number": round(float(target_model["condition_number"]), 4),
         "quality": quality,
         "points_used": len(gcps),
         "residuals": residuals,
@@ -363,9 +520,24 @@ def _solve_affine(width: int, height: int, coordinate_system_key: str, gcps: lis
     }
 
 
-def _apply_transform_to_pixel(transform: dict[str, Any], pixel_x: float, pixel_y: float) -> tuple[float, float]:
-    coeff_x = list(((transform or {}).get("coefficients") or {}).get("x") or [])
-    coeff_y = list(((transform or {}).get("coefficients") or {}).get("y") or [])
+def _apply_transform_to_pixel(
+    transform: dict[str, Any],
+    pixel_x: float,
+    pixel_y: float,
+    *,
+    space: str = "target",
+) -> tuple[float, float]:
+    homography_key = "map_homography" if str(space).strip().lower() == "map" else "homography"
+    coefficients_key = "map_coefficients" if str(space).strip().lower() == "map" else "coefficients"
+    homography = list((transform or {}).get(homography_key) or [])
+    if len(homography) == 9:
+        denominator = float(homography[6] * float(pixel_x) + homography[7] * float(pixel_y) + homography[8])
+        if abs(denominator) >= 1e-9:
+            x_world = float((homography[0] * float(pixel_x) + homography[1] * float(pixel_y) + homography[2]) / denominator)
+            y_world = float((homography[3] * float(pixel_x) + homography[4] * float(pixel_y) + homography[5]) / denominator)
+            return x_world, y_world
+    coeff_x = list(((transform or {}).get(coefficients_key) or {}).get("x") or [])
+    coeff_y = list(((transform or {}).get(coefficients_key) or {}).get("y") or [])
     if len(coeff_x) != 3 or len(coeff_y) != 3:
         raise HTTPException(status_code=400, detail="Georeference transform is incomplete.")
     x_world = float(coeff_x[0] + coeff_x[1] * float(pixel_x) + coeff_x[2] * float(pixel_y))
@@ -387,16 +559,21 @@ def _feature_to_saved_payload(feature: DigitizedFeatureInput, transform: dict[st
 
     target_epsg = int(transform.get("target_epsg") or 4326)
     _, reverse_transformer = _make_transformers(target_epsg)
+    mercator_reverse = Transformer.from_crs(3857, 4326, always_xy=True)
 
     target_coordinates = []
     wgs84_coordinates = []
     for point in pixels:
-        world_x, world_y = _apply_transform_to_pixel(transform, point["x"], point["y"])
+        world_x, world_y = _apply_transform_to_pixel(transform, point["x"], point["y"], space="target")
         target_coordinates.append([round(world_x, 6), round(world_y, 6)])
-        if reverse_transformer is None:
-            lng, lat = world_x, world_y
-        else:
-            lng, lat = reverse_transformer.transform(world_x, world_y)
+        try:
+            map_x, map_y = _apply_transform_to_pixel(transform, point["x"], point["y"], space="map")
+            lng, lat = mercator_reverse.transform(map_x, map_y)
+        except HTTPException:
+            if reverse_transformer is None:
+                lng, lat = world_x, world_y
+            else:
+                lng, lat = reverse_transformer.transform(world_x, world_y)
         wgs84_coordinates.append([round(float(lng), 8), round(float(lat), 8)])
 
     if feature_type == "polygon" and wgs84_coordinates[0] != wgs84_coordinates[-1]:
@@ -702,7 +879,7 @@ def solve_georeference_session(session_id: str, payload: SolveGeoreferenceReques
 @router.post("/sessions/{session_id}/features")
 def save_georeference_features(session_id: str, payload: SaveDigitizedFeaturesRequest, db: Session = Depends(get_db)):
     row = _load_session_row(db, session_id)
-    transform = _safe_json_load(row.get("transform_json"), None)
+    transform = _normalize_session_transform(row, _safe_json_load(row.get("transform_json"), None))
     if not isinstance(transform, dict):
         raise HTTPException(status_code=400, detail="Georeference the raster first before digitizing features.")
 
