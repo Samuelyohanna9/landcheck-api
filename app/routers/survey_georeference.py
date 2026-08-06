@@ -38,6 +38,8 @@ R2_PREFIX = str(os.getenv("R2_GEOREFERENCE_PREFIX") or "survey/georeference").st
 R2_SETTINGS_PREFIX = str(os.getenv("R2_GEOREFERENCE_SETTINGS_PREFIX") or "R2").strip() or "R2"
 RETENTION_DRAFT_DAYS = max(1, int(os.getenv("GEOREFERENCE_DRAFT_RETENTION_DAYS", "14")))
 RETENTION_FINAL_DAYS = max(RETENTION_DRAFT_DAYS, int(os.getenv("GEOREFERENCE_FINAL_RETENTION_DAYS", "45")))
+PREVIEW_MIN_DIMENSION = max(720, int(os.getenv("GEOREFERENCE_PREVIEW_MIN_DIMENSION", "960")))
+PREVIEW_MAX_DIMENSION = max(PREVIEW_MIN_DIMENSION, int(os.getenv("GEOREFERENCE_PREVIEW_MAX_DIMENSION", "1800")))
 
 
 class GroundControlPointInput(BaseModel):
@@ -226,6 +228,7 @@ def _session_to_payload(row: dict[str, Any]) -> dict[str, Any]:
     normalized_gcps = [
         GroundControlPointInput.model_validate(item).model_dump() for item in ground_control_points if isinstance(item, dict)
     ]
+    stored_overlay = _safe_json_load(row.get("overlay_json"), {}) or {}
     transform = _normalize_session_transform(
         row,
         _safe_json_load(row.get("transform_json"), None),
@@ -244,6 +247,14 @@ def _session_to_payload(row: dict[str, Any]) -> dict[str, Any]:
                 if isinstance(item, dict)
             ],
         }
+    overlay_payload = dict(stored_overlay) if isinstance(stored_overlay, dict) else {}
+    if isinstance(transform, dict) and not overlay_payload.get("corners"):
+        overlay_payload["corners"] = list(transform.get("overlay_corners") or [])
+    if overlay_payload:
+        updated_at = row.get("updated_at")
+        cache_bust = int(updated_at.timestamp()) if updated_at else int(_now_utc().timestamp())
+        overlay_payload["raster_url"] = f"/survey-georeference/sessions/{row.get('id')}/overlay-raster?_ts={cache_bust}"
+        overlay_payload["is_warped_preview"] = bool(overlay_payload.get("preview_object_key"))
     return {
         "id": str(row.get("id") or ""),
         "title_text": str(row.get("title_text") or ""),
@@ -256,7 +267,7 @@ def _session_to_payload(row: dict[str, Any]) -> dict[str, Any]:
         "source_height": int(row.get("source_height") or 0),
         "ground_control_points": normalized_gcps,
         "transform": transform,
-        "overlay": {"corners": list(transform.get("overlay_corners") or [])} if isinstance(transform, dict) else _safe_json_load(row.get("overlay_json"), None),
+        "overlay": overlay_payload or None,
         "features": _safe_json_load(row.get("features_json"), []),
         "delete_after_at": row.get("delete_after_at").isoformat() if row.get("delete_after_at") else None,
         "created_at": row.get("created_at").isoformat() if row.get("created_at") else None,
@@ -293,6 +304,46 @@ def _touch_session(db: Session, session_id: str):
         {"session_id": str(session_id)},
     )
     db.commit()
+
+
+def _ensure_overlay_preview_for_row(db: Session, row: dict[str, Any]) -> dict[str, Any]:
+    overlay_payload = _safe_json_load(row.get("overlay_json"), {}) or {}
+    if str((overlay_payload or {}).get("preview_object_key") or "").strip():
+        return row
+    ground_control_points = [
+        GroundControlPointInput.model_validate(item)
+        for item in list(_safe_json_load(row.get("gcps_json"), []))
+        if isinstance(item, dict)
+    ]
+    if len(ground_control_points) < 4:
+        return row
+    transform = _normalize_session_transform(row, _safe_json_load(row.get("transform_json"), None), ground_control_points)
+    if not isinstance(transform, dict):
+        return row
+    try:
+        next_overlay = _build_overlay_payload(row, transform, ground_control_points)
+        if not str((next_overlay or {}).get("preview_object_key") or "").strip():
+            return row
+        db.execute(
+            text(
+                """
+                UPDATE survey_georeference_sessions
+                SET overlay_json = CAST(:overlay_json AS JSONB),
+                    updated_at = NOW(),
+                    last_accessed_at = NOW()
+                WHERE id = :session_id
+                """
+            ),
+            {
+                "session_id": str(row.get("id") or ""),
+                "overlay_json": json.dumps(next_overlay),
+            },
+        )
+        db.commit()
+        return _load_session_row(db, str(row.get("id") or ""))
+    except Exception as exc:
+        logger.warning("Unable to auto-heal overlay preview for session %s: %s", row.get("id"), exc)
+        return row
 
 
 def _make_transformers(target_epsg: int):
@@ -658,13 +709,323 @@ def _raster_object_key(session_id: str, filename: str) -> str:
     return "/".join([R2_PREFIX, _now_utc().strftime("%Y"), _now_utc().strftime("%m"), f"{session_id}_{stamp}_{safe_name}"])
 
 
+def _overlay_preview_object_key(session_id: str) -> str:
+    stamp = _now_utc().strftime("%Y%m%dT%H%M%SZ")
+    return "/".join([R2_PREFIX, _now_utc().strftime("%Y"), _now_utc().strftime("%m"), f"{session_id}_{stamp}_overlay_preview.png"])
+
+
+def _download_r2_bytes(settings: dict[str, Any], object_key: str) -> bytes:
+    client = create_r2_client(settings)
+    obj = client.get_object(Bucket=settings["bucket"], Key=object_key)
+    return bytes(obj["Body"].read())
+
+
+def _signed_triangle_area(a: tuple[float, float], b: tuple[float, float], c: tuple[float, float]) -> float:
+    return ((b[0] - a[0]) * (c[1] - a[1])) - ((b[1] - a[1]) * (c[0] - a[0]))
+
+
+def _ensure_triangle_ccw(
+    triangle: tuple[int, int, int],
+    points: list[tuple[float, float]],
+) -> tuple[int, int, int]:
+    a, b, c = triangle
+    if _signed_triangle_area(points[a], points[b], points[c]) < 0:
+        return a, c, b
+    return triangle
+
+
+def _circumcircle_contains(
+    point: tuple[float, float],
+    triangle: tuple[int, int, int],
+    points: list[tuple[float, float]],
+) -> bool:
+    ax = points[triangle[0]][0] - point[0]
+    ay = points[triangle[0]][1] - point[1]
+    bx = points[triangle[1]][0] - point[0]
+    by = points[triangle[1]][1] - point[1]
+    cx = points[triangle[2]][0] - point[0]
+    cy = points[triangle[2]][1] - point[1]
+
+    determinant = (
+        (ax * ax + ay * ay) * (bx * cy - by * cx)
+        - (bx * bx + by * by) * (ax * cy - ay * cx)
+        + (cx * cx + cy * cy) * (ax * by - ay * bx)
+    )
+    orientation = _signed_triangle_area(points[triangle[0]], points[triangle[1]], points[triangle[2]])
+    epsilon = 1e-12
+    return determinant > epsilon if orientation >= 0 else determinant < -epsilon
+
+
+def _build_delaunay_triangles(points: list[tuple[float, float]]) -> list[tuple[int, int, int]]:
+    if len(points) < 3:
+        return []
+    min_x = min(point[0] for point in points)
+    max_x = max(point[0] for point in points)
+    min_y = min(point[1] for point in points)
+    max_y = max(point[1] for point in points)
+    delta = max(max_x - min_x, max_y - min_y, 1.0)
+    mid_x = (min_x + max_x) / 2.0
+    mid_y = (min_y + max_y) / 2.0
+
+    super_triangle = [
+        (mid_x - (24.0 * delta), mid_y - (8.0 * delta)),
+        (mid_x, mid_y + (24.0 * delta)),
+        (mid_x + (24.0 * delta), mid_y - (8.0 * delta)),
+    ]
+    work_points = list(points) + super_triangle
+    point_count = len(points)
+    triangles: list[tuple[int, int, int]] = [
+        _ensure_triangle_ccw((point_count, point_count + 1, point_count + 2), work_points)
+    ]
+
+    for point_index, point in enumerate(points):
+        bad_triangles = [triangle for triangle in triangles if _circumcircle_contains(point, triangle, work_points)]
+        boundary_counts: dict[tuple[int, int], int] = {}
+        for triangle in bad_triangles:
+            for edge in ((triangle[0], triangle[1]), (triangle[1], triangle[2]), (triangle[2], triangle[0])):
+                key = tuple(sorted(edge))
+                boundary_counts[key] = boundary_counts.get(key, 0) + 1
+        triangles = [triangle for triangle in triangles if triangle not in bad_triangles]
+        for edge, count in boundary_counts.items():
+            if count != 1:
+                continue
+            next_triangle = _ensure_triangle_ccw((edge[0], edge[1], point_index), work_points)
+            if abs(_signed_triangle_area(work_points[next_triangle[0]], work_points[next_triangle[1]], work_points[next_triangle[2]])) <= 1e-10:
+                continue
+            triangles.append(next_triangle)
+
+    finalized: list[tuple[int, int, int]] = []
+    seen: set[tuple[int, int, int]] = set()
+    for triangle in triangles:
+        if any(vertex >= point_count for vertex in triangle):
+            continue
+        normalized = _ensure_triangle_ccw(triangle, work_points)
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        finalized.append(normalized)
+    return finalized
+
+
+def _sample_rgba_bilinear(source_rgba: np.ndarray, sample_x: np.ndarray, sample_y: np.ndarray) -> np.ndarray:
+    height, width = source_rgba.shape[:2]
+    clipped_x = np.clip(sample_x.astype(np.float64), 0.0, max(0.0, float(width - 1)))
+    clipped_y = np.clip(sample_y.astype(np.float64), 0.0, max(0.0, float(height - 1)))
+    x0 = np.floor(clipped_x).astype(np.int32)
+    y0 = np.floor(clipped_y).astype(np.int32)
+    x1 = np.clip(x0 + 1, 0, max(0, width - 1))
+    y1 = np.clip(y0 + 1, 0, max(0, height - 1))
+    weight_x = (clipped_x - x0.astype(np.float64))[:, None]
+    weight_y = (clipped_y - y0.astype(np.float64))[:, None]
+    top = source_rgba[y0, x0] * (1.0 - weight_x) + source_rgba[y0, x1] * weight_x
+    bottom = source_rgba[y1, x0] * (1.0 - weight_x) + source_rgba[y1, x1] * weight_x
+    sampled = top * (1.0 - weight_y) + bottom * weight_y
+    return np.clip(sampled, 0.0, 255.0).astype(np.uint8)
+
+
+def _build_warped_overlay_preview(
+    source_payload: bytes,
+    session_transform: dict[str, Any],
+    gcps: list[GroundControlPointInput],
+    *,
+    width: int,
+    height: int,
+) -> tuple[bytes, list[list[float]]]:
+    if len(gcps) < 4:
+        raise ValueError("A warped overlay preview requires at least four control points.")
+
+    mercator_forward = Transformer.from_crs(4326, 3857, always_xy=True)
+    mercator_reverse = Transformer.from_crs(3857, 4326, always_xy=True)
+    target_epsg = int(session_transform.get("target_epsg") or 4326)
+    _, reverse_transformer = _make_transformers(target_epsg)
+
+    source_image = Image.open(io.BytesIO(source_payload)).convert("RGBA")
+    source_width, source_height = source_image.size
+    source_rgba = np.asarray(source_image, dtype=np.float32)
+
+    control_pairs: list[dict[str, float]] = []
+
+    def add_control(source_x: float, source_y: float, map_x: float, map_y: float):
+        if not all(math.isfinite(value) for value in (source_x, source_y, map_x, map_y)):
+            return
+        for current in control_pairs:
+            same_source = abs(current["source_x"] - source_x) <= 0.5 and abs(current["source_y"] - source_y) <= 0.5
+            same_map = abs(current["map_x"] - map_x) <= 0.25 and abs(current["map_y"] - map_y) <= 0.25
+            if same_source or same_map:
+                return
+        control_pairs.append(
+            {
+                "source_x": float(source_x),
+                "source_y": float(source_y),
+                "map_x": float(map_x),
+                "map_y": float(map_y),
+            }
+        )
+
+    for gcp in gcps:
+        if target_epsg == 4326:
+            lng = float(gcp.ground_x)
+            lat = float(gcp.ground_y)
+        elif _looks_like_projected_coordinates(gcp.ground_x, gcp.ground_y):
+            if reverse_transformer is None:
+                continue
+            lng, lat = reverse_transformer.transform(float(gcp.ground_x), float(gcp.ground_y))
+        else:
+            lng = float(gcp.ground_x)
+            lat = float(gcp.ground_y)
+        map_x, map_y = mercator_forward.transform(float(lng), float(lat))
+        add_control(float(gcp.image_x), float(gcp.image_y), float(map_x), float(map_y))
+
+    for corner_x, corner_y in ((0.0, 0.0), (float(width), 0.0), (float(width), float(height)), (0.0, float(height))):
+        map_x, map_y = _apply_transform_to_pixel(session_transform, corner_x, corner_y, space="map")
+        add_control(corner_x, corner_y, map_x, map_y)
+
+    if len(control_pairs) < 4:
+        raise ValueError("Not enough unique control pairs were available for the overlay preview.")
+
+    map_points = [(item["map_x"], item["map_y"]) for item in control_pairs]
+    source_points = [(item["source_x"], item["source_y"]) for item in control_pairs]
+
+    min_x = min(point[0] for point in map_points)
+    max_x = max(point[0] for point in map_points)
+    min_y = min(point[1] for point in map_points)
+    max_y = max(point[1] for point in map_points)
+    span_x = max(max_x - min_x, 1.0)
+    span_y = max(max_y - min_y, 1.0)
+
+    normalized_points = [((point[0] - min_x) / span_x, (point[1] - min_y) / span_y) for point in map_points]
+    triangles = _build_delaunay_triangles(normalized_points)
+    if not triangles:
+        raise ValueError("Unable to triangulate the control points for preview rendering.")
+
+    aspect_ratio = span_x / span_y if span_y > 0 else (float(source_width) / float(max(1, source_height)))
+    long_edge = min(PREVIEW_MAX_DIMENSION, max(PREVIEW_MIN_DIMENSION, max(source_width, source_height)))
+    if aspect_ratio >= 1.0:
+        output_width = int(long_edge)
+        output_height = max(PREVIEW_MIN_DIMENSION // 2, int(round(output_width / max(aspect_ratio, 1e-6))))
+    else:
+        output_height = int(long_edge)
+        output_width = max(PREVIEW_MIN_DIMENSION // 2, int(round(output_height * max(aspect_ratio, 1e-6))))
+    output_width = max(512, min(PREVIEW_MAX_DIMENSION, output_width))
+    output_height = max(512, min(PREVIEW_MAX_DIMENSION, output_height))
+
+    def map_to_output_pixels(map_x: float, map_y: float) -> tuple[float, float]:
+        output_x = ((map_x - min_x) / span_x) * float(output_width - 1)
+        output_y = ((max_y - map_y) / span_y) * float(output_height - 1)
+        return output_x, output_y
+
+    destination_points = [map_to_output_pixels(point[0], point[1]) for point in map_points]
+    preview_rgba = np.zeros((output_height, output_width, 4), dtype=np.uint8)
+    epsilon = 1e-5
+
+    for triangle in triangles:
+        src_a = source_points[triangle[0]]
+        src_b = source_points[triangle[1]]
+        src_c = source_points[triangle[2]]
+        dst_a = destination_points[triangle[0]]
+        dst_b = destination_points[triangle[1]]
+        dst_c = destination_points[triangle[2]]
+
+        denominator = (
+            (dst_b[1] - dst_c[1]) * (dst_a[0] - dst_c[0])
+            + (dst_c[0] - dst_b[0]) * (dst_a[1] - dst_c[1])
+        )
+        if abs(denominator) <= 1e-9:
+            continue
+
+        min_px = max(0, int(math.floor(min(dst_a[0], dst_b[0], dst_c[0]))))
+        max_px = min(output_width - 1, int(math.ceil(max(dst_a[0], dst_b[0], dst_c[0]))))
+        min_py = max(0, int(math.floor(min(dst_a[1], dst_b[1], dst_c[1]))))
+        max_py = min(output_height - 1, int(math.ceil(max(dst_a[1], dst_b[1], dst_c[1]))))
+        if min_px > max_px or min_py > max_py:
+            continue
+
+        grid_x, grid_y = np.meshgrid(
+            np.arange(min_px, max_px + 1, dtype=np.float64) + 0.5,
+            np.arange(min_py, max_py + 1, dtype=np.float64) + 0.5,
+        )
+        weight_a = ((dst_b[1] - dst_c[1]) * (grid_x - dst_c[0]) + (dst_c[0] - dst_b[0]) * (grid_y - dst_c[1])) / denominator
+        weight_b = ((dst_c[1] - dst_a[1]) * (grid_x - dst_c[0]) + (dst_a[0] - dst_c[0]) * (grid_y - dst_c[1])) / denominator
+        weight_c = 1.0 - weight_a - weight_b
+        inside = (weight_a >= -epsilon) & (weight_b >= -epsilon) & (weight_c >= -epsilon)
+        if not bool(np.any(inside)):
+            continue
+
+        sample_x = (weight_a * src_a[0]) + (weight_b * src_b[0]) + (weight_c * src_c[0])
+        sample_y = (weight_a * src_a[1]) + (weight_b * src_b[1]) + (weight_c * src_c[1])
+        sampled = _sample_rgba_bilinear(source_rgba, sample_x[inside], sample_y[inside])
+        preview_slice = preview_rgba[min_py : max_py + 1, min_px : max_px + 1]
+        preview_slice[inside] = sampled
+
+    preview_image = Image.fromarray(preview_rgba, mode="RGBA")
+    output_buffer = io.BytesIO()
+    preview_image.save(output_buffer, format="PNG", optimize=True)
+
+    overlay_corners: list[list[float]] = []
+    for corner_x, corner_y in ((min_x, max_y), (max_x, max_y), (max_x, min_y), (min_x, min_y)):
+        lng, lat = mercator_reverse.transform(corner_x, corner_y)
+        overlay_corners.append([round(float(lng), 8), round(float(lat), 8)])
+
+    return output_buffer.getvalue(), overlay_corners
+
+
+def _build_overlay_payload(
+    row: dict[str, Any],
+    session_transform: dict[str, Any],
+    gcps: list[GroundControlPointInput],
+) -> dict[str, Any]:
+    overlay_payload: dict[str, Any] = {
+        "corners": list(session_transform.get("overlay_corners") or []),
+    }
+    previous_overlay = _safe_json_load(row.get("overlay_json"), {}) or {}
+    previous_preview_key = str(previous_overlay.get("preview_object_key") or "").strip()
+    settings = _build_r2()
+
+    if len(gcps) >= 4 and str(row.get("source_object_key") or "").strip():
+        try:
+            source_payload = _download_r2_bytes(settings, str(row.get("source_object_key") or ""))
+            preview_bytes, preview_corners = _build_warped_overlay_preview(
+                source_payload,
+                session_transform,
+                gcps,
+                width=int(row.get("source_width") or 0),
+                height=int(row.get("source_height") or 0),
+            )
+            preview_key = _overlay_preview_object_key(str(row.get("id") or uuid.uuid4().hex))
+            upload_bytes(settings, preview_key, preview_bytes, content_type="image/png")
+            overlay_payload = {
+                "corners": preview_corners,
+                "preview_object_key": preview_key,
+                "preview_content_type": "image/png",
+            }
+            if previous_preview_key and previous_preview_key != preview_key:
+                delete_object_best_effort(settings, previous_preview_key)
+        except Exception as exc:
+            logger.warning("Unable to build warped georeference overlay preview for session %s: %s", row.get("id"), exc)
+            if previous_preview_key:
+                delete_object_best_effort(settings, previous_preview_key)
+    elif previous_preview_key:
+        delete_object_best_effort(settings, previous_preview_key)
+
+    return overlay_payload
+
+
+def _delete_overlay_preview_object(settings: dict[str, Any] | None, overlay_payload: Any) -> bool:
+    if not settings or not isinstance(overlay_payload, dict):
+        return False
+    object_key = str(overlay_payload.get("preview_object_key") or "").strip()
+    if not object_key:
+        return False
+    return delete_object_best_effort(settings, object_key)
+
+
 def cleanup_expired_georeference_sessions(db: Session) -> dict[str, int]:
     _ensure_schema(db)
     rows = (
         db.execute(
             text(
                 """
-                SELECT id, source_object_key
+                SELECT id, source_object_key, overlay_json
                 FROM survey_georeference_sessions
                 WHERE delete_after_at IS NOT NULL
                   AND delete_after_at <= NOW()
@@ -686,6 +1047,8 @@ def cleanup_expired_georeference_sessions(db: Session) -> dict[str, int]:
         if settings and row.get("source_object_key"):
             if delete_object_best_effort(settings, str(row.get("source_object_key") or "")):
                 r2_deleted += 1
+        if _delete_overlay_preview_object(settings, _safe_json_load(row.get("overlay_json"), None)):
+            r2_deleted += 1
         db.execute(text("DELETE FROM survey_georeference_sessions WHERE id = :session_id"), {"session_id": str(row.get("id") or "")})
         deleted_sessions += 1
     db.commit()
@@ -817,6 +1180,7 @@ async def create_georeference_session(
 @router.get("/sessions/{session_id}")
 def get_georeference_session(session_id: str, db: Session = Depends(get_db)):
     row = _load_session_row(db, session_id)
+    row = _ensure_overlay_preview_for_row(db, row)
     _touch_session(db, session_id)
     return {"ok": True, "session": _session_to_payload(row)}
 
@@ -838,12 +1202,42 @@ def stream_georeference_raster(session_id: str, db: Session = Depends(get_db)):
         raise HTTPException(status_code=404, detail=f"Unable to stream raster from storage: {exc}") from exc
 
 
+@router.get("/sessions/{session_id}/overlay-raster")
+def stream_georeference_overlay_raster(session_id: str, db: Session = Depends(get_db)):
+    row = _load_session_row(db, session_id)
+    settings = _build_r2()
+    overlay_payload = _safe_json_load(row.get("overlay_json"), {}) or {}
+    preview_object_key = str(overlay_payload.get("preview_object_key") or "").strip()
+    preview_content_type = str(overlay_payload.get("preview_content_type") or "image/png").strip() or "image/png"
+    candidates: list[tuple[str, str]] = []
+    if preview_object_key:
+        candidates.append((preview_object_key, preview_content_type))
+    source_object_key = str(row.get("source_object_key") or "").strip()
+    if source_object_key:
+        candidates.append((source_object_key, str(row.get("source_content_type") or "application/octet-stream")))
+    if not candidates:
+        raise HTTPException(status_code=404, detail="Raster overlay preview is no longer available.")
+
+    last_error: Exception | None = None
+    for object_key, media_type in candidates:
+        try:
+            client = create_r2_client(settings)
+            obj = client.get_object(Bucket=settings["bucket"], Key=object_key)
+            body = obj["Body"]
+            _touch_session(db, session_id)
+            return StreamingResponse(body.iter_chunks(chunk_size=1024 * 512), media_type=media_type)
+        except Exception as exc:
+            last_error = exc
+    raise HTTPException(status_code=404, detail=f"Unable to stream overlay raster from storage: {last_error}")
+
+
 @router.post("/sessions/{session_id}/solve")
 def solve_georeference_session(session_id: str, payload: SolveGeoreferenceRequest, db: Session = Depends(get_db)):
     row = _load_session_row(db, session_id)
     width = int(row.get("source_width") or 0)
     height = int(row.get("source_height") or 0)
     transform = _solve_affine(width, height, payload.target_coordinate_system, payload.ground_control_points)
+    overlay_payload = _build_overlay_payload(row, transform, payload.ground_control_points)
     delete_after_at = _now_utc() + timedelta(days=RETENTION_FINAL_DAYS)
     db.execute(
         text(
@@ -867,7 +1261,7 @@ def solve_georeference_session(session_id: str, payload: SolveGeoreferenceReques
             "target_epsg": int(transform.get("target_epsg") or 4326),
             "gcps_json": json.dumps([item.model_dump() for item in payload.ground_control_points]),
             "transform_json": json.dumps(transform),
-            "overlay_json": json.dumps({"corners": transform.get("overlay_corners") or []}),
+            "overlay_json": json.dumps(overlay_payload),
             "delete_after_at": delete_after_at,
         },
     )
@@ -945,6 +1339,7 @@ def delete_georeference_session(session_id: str, db: Session = Depends(get_db)):
     settings = build_r2_settings(prefix=R2_SETTINGS_PREFIX)
     if settings and row.get("source_object_key"):
         delete_object_best_effort(settings, str(row.get("source_object_key") or ""))
+    _delete_overlay_preview_object(settings, _safe_json_load(row.get("overlay_json"), None))
     db.execute(text("DELETE FROM survey_georeference_sessions WHERE id = :session_id"), {"session_id": session_id})
     db.commit()
     return {"ok": True}
