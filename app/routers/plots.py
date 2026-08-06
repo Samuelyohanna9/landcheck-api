@@ -889,10 +889,21 @@ def _render_technical_report_docx(meta: dict, area_m2: float, output_path: str) 
             run.font.size = Pt(12)
         return paragraph
 
+    # Text after the tab must land on the same column for every item regardless of label width
+    # ("i." vs "vii."/"viii.") - a bare "\t" alone snaps to Word's default tab grid, which puts
+    # each label's very next tick at a different offset, producing a ragged column. A hanging
+    # indent (first line pulled back to the label position) plus an explicit tab stop at the text
+    # column fixes that: every label sits flush left, every item's text starts at the same x.
+    LIST_LABEL_INDENT = Pt(24)
+    LIST_TEXT_INDENT = Pt(54)
+
     def add_list_item(label: str, text_value: str):
         paragraph = document.add_paragraph()
-        paragraph.paragraph_format.left_indent = Pt(24)
-        paragraph.paragraph_format.space_after = Pt(4)
+        paragraph_format = paragraph.paragraph_format
+        paragraph_format.left_indent = LIST_TEXT_INDENT
+        paragraph_format.first_line_indent = LIST_LABEL_INDENT - LIST_TEXT_INDENT
+        paragraph_format.space_after = Pt(4)
+        paragraph_format.tab_stops.add_tab_stop(LIST_TEXT_INDENT)
         run = paragraph.add_run(f"{label}.\t{text_value}")
         run.font.name = "Times New Roman"
         run.font.size = Pt(12)
