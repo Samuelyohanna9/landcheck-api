@@ -3089,17 +3089,32 @@ def _set_plot_export_job_status(
     db.commit()
 
 
+def _build_plot_export_public_base_url(request: Request | None = None) -> str:
+    # request.url_for(...) trusts request.url.scheme, which resolves to "http" behind a reverse
+    # proxy/tunnel (Cloudflare) that terminates TLS before forwarding to this app - producing a
+    # download_url like "http://api.landcheck.online/..." that browsers block as mixed content on
+    # an https:// page. Prefer an explicit public URL env var, then the X-Forwarded-Proto header
+    # the proxy actually sets, matching the same pattern already used for other public URLs in
+    # this codebase (see _build_public_api_base_url in routers/green.py).
+    configured = str(os.getenv("LANDCHECK_API_PUBLIC_URL") or "").strip().rstrip("/")
+    if configured:
+        return configured
+    if request is not None:
+        forwarded_proto = str(request.headers.get("x-forwarded-proto") or request.url.scheme or "https").split(",")[0].strip()
+        forwarded_host = str(request.headers.get("x-forwarded-host") or request.headers.get("host") or request.url.netloc).split(",")[0].strip()
+        if forwarded_proto and forwarded_host:
+            return f"{forwarded_proto}://{forwarded_host}".rstrip("/")
+        return str(request.base_url).rstrip("/")
+    return ""
+
+
 def _serialize_plot_export_job(job: dict[str, Any], request: Request | None = None) -> dict[str, Any]:
     item = dict(job)
     download_url: str | None = None
     if str(item.get("status") or "").strip().lower() == "completed":
-        if request is not None:
-            try:
-                download_url = str(request.url_for("download_plot_export_job", job_id=str(item.get("id") or "")))
-            except Exception:
-                download_url = None
-        if not download_url:
-            download_url = f"/plots/export-jobs/{str(item.get('id') or '').strip()}/download"
+        job_id = str(item.get("id") or "").strip()
+        base_url = _build_plot_export_public_base_url(request)
+        download_url = f"{base_url}/plots/export-jobs/{job_id}/download" if base_url else f"/plots/export-jobs/{job_id}/download"
     item["download_url"] = download_url
     return item
 
@@ -4422,7 +4437,7 @@ def get_plot_features_geojson(plot_id: int, db: Session = Depends(get_db)):
         WHERE ST_Intersects(roads.geom, b.geom)
     """), {"plot_id": plot_id}).fetchall()
 
-    # Overrides (adds only for display)
+    # Overrides
     override_rows = db.execute(text("""
         SELECT feature_type, action, name, width_m, ST_AsGeoJSON(geom) AS geojson
         FROM plot_feature_overrides
@@ -4436,47 +4451,84 @@ def get_plot_features_geojson(plot_id: int, db: Session = Depends(get_db)):
             "properties": props,
         }
 
-    import json
-
-    buildings = []
-    rivers = []
-    fences = []
+    # Each entry is (shapely geometry, feature dict) so overrides can be applied by spatial
+    # intersection - same proven pattern already used in map_renderer_layout.py's apply_overrides
+    # (and a third copy in this file's _render_subdivision_clean_copy_pdf), just not previously
+    # wired into this endpoint. Without this, a "delete" override was silently ignored on reload
+    # and an "update" override just appended a duplicate instead of replacing the original.
+    buildings: list[tuple[Any, dict]] = []
+    rivers: list[tuple[Any, dict]] = []
+    fences: list[tuple[Any, dict]] = []
     for r in feature_rows:
         if not r.geojson:
             continue
+        try:
+            geom = shape(json.loads(r.geojson))
+        except Exception:
+            continue
+        feat = to_feature(r.geojson, {"source": "detected"})
         if r.feature_type == "building":
-            buildings.append(to_feature(r.geojson, {"source": "detected"}))
+            buildings.append((geom, feat))
         elif r.feature_type == "river":
-            rivers.append(to_feature(r.geojson, {"source": "detected"}))
+            rivers.append((geom, feat))
         elif r.feature_type == "fence":
-            fences.append(to_feature(r.geojson, {"source": "detected"}))
+            fences.append((geom, feat))
 
-    roads = []
+    roads: list[tuple[Any, dict]] = []
     for r in road_rows:
         if not r.geojson:
             continue
-        roads.append(to_feature(r.geojson, {"source": "detected", "name": r.name}))
+        try:
+            geom = shape(json.loads(r.geojson))
+        except Exception:
+            continue
+        roads.append((geom, to_feature(r.geojson, {"source": "detected", "name": r.name})))
 
+    overrides: list[dict[str, Any]] = []
     for r in override_rows:
         if not r.geojson:
             continue
-        if r.action not in ("add", "update"):
+        try:
+            geom = shape(json.loads(r.geojson))
+        except Exception:
             continue
-        feat = to_feature(r.geojson, {"source": "override", "name": r.name, "width_m": r.width_m})
-        if r.feature_type == "road":
-            roads.append(feat)
-        elif r.feature_type == "building":
-            buildings.append(feat)
-        elif r.feature_type == "river":
-            rivers.append(feat)
-        elif r.feature_type == "fence":
-            fences.append(feat)
+        overrides.append({
+            "feature_type": str(r.feature_type or "").strip().lower(),
+            "action": str(r.action or "").strip().lower(),
+            "name": r.name,
+            "width_m": r.width_m,
+            "geom": geom,
+            "geojson": r.geojson,
+        })
+
+    def apply_overrides(base_pairs: list[tuple[Any, dict]], feature_type: str) -> list[tuple[Any, dict]]:
+        result = list(base_pairs)
+        for ov in overrides:
+            if ov["feature_type"] != feature_type:
+                continue
+            geom = ov["geom"]
+            try:
+                if not geom.is_valid:
+                    geom = geom.buffer(0)
+            except Exception:
+                pass
+            if ov["action"] in ("delete", "update"):
+                result = [(g, f) for (g, f) in result if not g.intersects(geom)]
+            if ov["action"] in ("add", "update"):
+                feat = to_feature(ov["geojson"], {"source": "override", "name": ov["name"], "width_m": ov["width_m"]})
+                result.append((geom, feat))
+        return result
+
+    buildings = apply_overrides(buildings, "building")
+    rivers = apply_overrides(rivers, "river")
+    fences = apply_overrides(fences, "fence")
+    roads = apply_overrides(roads, "road")
 
     return {
-        "roads": {"type": "FeatureCollection", "features": roads},
-        "buildings": {"type": "FeatureCollection", "features": buildings},
-        "rivers": {"type": "FeatureCollection", "features": rivers},
-        "fences": {"type": "FeatureCollection", "features": fences},
+        "roads": {"type": "FeatureCollection", "features": [f for _, f in roads]},
+        "buildings": {"type": "FeatureCollection", "features": [f for _, f in buildings]},
+        "rivers": {"type": "FeatureCollection", "features": [f for _, f in rivers]},
+        "fences": {"type": "FeatureCollection", "features": [f for _, f in fences]},
     }
 
 
