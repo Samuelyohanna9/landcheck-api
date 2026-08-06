@@ -112,6 +112,9 @@ DEFAULT_ADAMAWA_DISCLAIMER_TEXT = (
     "Detail shewn not the result of accurate survey. All bearing and distances shewn on this plan "
     "have been computed from registered Co-ordinates."
 )
+DEFAULT_TECHNICAL_REPORT_COMPUTATION_SOFTWARE = "AutoCAD software"
+DEFAULT_TECHNICAL_REPORT_PLOTTING_SOFTWARE = "AutoCAD software"
+DEFAULT_TECHNICAL_REPORT_GENERAL_OBSERVATION = "The work was hitch-free."
 
 _PLOTS_SCHEMA_READY = False
 _PLOTS_SCHEMA_LOCK = Lock()
@@ -207,6 +210,16 @@ def ensure_plot_meta_table(db: Session):
             adamawa_plan_no TEXT,
             adamawa_surveyed_by_text TEXT,
             adamawa_disclaimer_text TEXT,
+            technical_report_instruments JSONB DEFAULT '[]',
+            technical_report_dgps_type TEXT,
+            technical_report_num_surveyors INTEGER,
+            technical_report_num_technical_officers INTEGER,
+            technical_report_num_labourers INTEGER,
+            technical_report_recce_text TEXT,
+            technical_report_demarcation_text TEXT,
+            technical_report_computation_software_text TEXT,
+            technical_report_plotting_software_text TEXT,
+            technical_report_general_observation_text TEXT,
             created_at TIMESTAMP DEFAULT NOW(),
             updated_at TIMESTAMP DEFAULT NOW()
         )
@@ -239,6 +252,16 @@ def ensure_plot_meta_table(db: Session):
         ("adamawa_plan_no", "TEXT"),
         ("adamawa_surveyed_by_text", "TEXT"),
         ("adamawa_disclaimer_text", "TEXT"),
+        ("technical_report_instruments", "JSONB DEFAULT '[]'"),
+        ("technical_report_dgps_type", "TEXT"),
+        ("technical_report_num_surveyors", "INTEGER"),
+        ("technical_report_num_technical_officers", "INTEGER"),
+        ("technical_report_num_labourers", "INTEGER"),
+        ("technical_report_recce_text", "TEXT"),
+        ("technical_report_demarcation_text", "TEXT"),
+        ("technical_report_computation_software_text", "TEXT"),
+        ("technical_report_plotting_software_text", "TEXT"),
+        ("technical_report_general_observation_text", "TEXT"),
         ("created_at", "TIMESTAMP DEFAULT NOW()"),
         ("updated_at", "TIMESTAMP DEFAULT NOW()"),
     ]
@@ -439,9 +462,23 @@ def upsert_plot_meta(
     adamawa_plan_no: Optional[str] = None,
     adamawa_surveyed_by_text: Optional[str] = None,
     adamawa_disclaimer_text: Optional[str] = None,
+    technical_report_instruments: Optional[list] = None,
+    technical_report_dgps_type: Optional[str] = None,
+    technical_report_num_surveyors: Optional[int] = None,
+    technical_report_num_technical_officers: Optional[int] = None,
+    technical_report_num_labourers: Optional[int] = None,
+    technical_report_recce_text: Optional[str] = None,
+    technical_report_demarcation_text: Optional[str] = None,
+    technical_report_computation_software_text: Optional[str] = None,
+    technical_report_plotting_software_text: Optional[str] = None,
+    technical_report_general_observation_text: Optional[str] = None,
     commit: bool = True,
 ):
     ensure_plot_meta_table(db)
+
+    technical_report_instruments_json = (
+        json.dumps(technical_report_instruments) if technical_report_instruments is not None else None
+    )
 
     db.execute(text("""
         INSERT INTO plot_meta (
@@ -450,7 +487,12 @@ def upsert_plot_meta(
             template_name, adamawa_rof_no, adamawa_owner_name, adamawa_authority_title, adamawa_authority_date_text,
             adamawa_control_point_name, adamawa_northing, adamawa_easting, adamawa_elevation, adamawa_origin_text,
             adamawa_topo_sheet_text, adamawa_computation_no, adamawa_cadastral_sheet_no, adamawa_plan_no,
-            adamawa_surveyed_by_text, adamawa_disclaimer_text
+            adamawa_surveyed_by_text, adamawa_disclaimer_text,
+            technical_report_instruments, technical_report_dgps_type,
+            technical_report_num_surveyors, technical_report_num_technical_officers,
+            technical_report_num_labourers, technical_report_recce_text,
+            technical_report_demarcation_text, technical_report_computation_software_text,
+            technical_report_plotting_software_text, technical_report_general_observation_text
         )
         VALUES (
             :plot_id, :title_text, :location_text, :lga_text, :state_text,
@@ -458,7 +500,12 @@ def upsert_plot_meta(
             :template_name, :adamawa_rof_no, :adamawa_owner_name, :adamawa_authority_title, :adamawa_authority_date_text,
             :adamawa_control_point_name, :adamawa_northing, :adamawa_easting, :adamawa_elevation, :adamawa_origin_text,
             :adamawa_topo_sheet_text, :adamawa_computation_no, :adamawa_cadastral_sheet_no, :adamawa_plan_no,
-            :adamawa_surveyed_by_text, :adamawa_disclaimer_text
+            :adamawa_surveyed_by_text, :adamawa_disclaimer_text,
+            CAST(COALESCE(:technical_report_instruments, '[]') AS JSONB), :technical_report_dgps_type,
+            :technical_report_num_surveyors, :technical_report_num_technical_officers,
+            :technical_report_num_labourers, :technical_report_recce_text,
+            :technical_report_demarcation_text, :technical_report_computation_software_text,
+            :technical_report_plotting_software_text, :technical_report_general_observation_text
         )
         ON CONFLICT (plot_id) DO UPDATE SET
             title_text = COALESCE(NULLIF(EXCLUDED.title_text, ''), plot_meta.title_text),
@@ -487,6 +534,16 @@ def upsert_plot_meta(
             adamawa_plan_no = COALESCE(NULLIF(EXCLUDED.adamawa_plan_no, ''), plot_meta.adamawa_plan_no),
             adamawa_surveyed_by_text = COALESCE(NULLIF(EXCLUDED.adamawa_surveyed_by_text, ''), plot_meta.adamawa_surveyed_by_text),
             adamawa_disclaimer_text = COALESCE(NULLIF(EXCLUDED.adamawa_disclaimer_text, ''), plot_meta.adamawa_disclaimer_text),
+            technical_report_instruments = COALESCE(CAST(:technical_report_instruments AS JSONB), plot_meta.technical_report_instruments),
+            technical_report_dgps_type = COALESCE(NULLIF(EXCLUDED.technical_report_dgps_type, ''), plot_meta.technical_report_dgps_type),
+            technical_report_num_surveyors = COALESCE(EXCLUDED.technical_report_num_surveyors, plot_meta.technical_report_num_surveyors),
+            technical_report_num_technical_officers = COALESCE(EXCLUDED.technical_report_num_technical_officers, plot_meta.technical_report_num_technical_officers),
+            technical_report_num_labourers = COALESCE(EXCLUDED.technical_report_num_labourers, plot_meta.technical_report_num_labourers),
+            technical_report_recce_text = COALESCE(NULLIF(EXCLUDED.technical_report_recce_text, ''), plot_meta.technical_report_recce_text),
+            technical_report_demarcation_text = COALESCE(NULLIF(EXCLUDED.technical_report_demarcation_text, ''), plot_meta.technical_report_demarcation_text),
+            technical_report_computation_software_text = COALESCE(NULLIF(EXCLUDED.technical_report_computation_software_text, ''), plot_meta.technical_report_computation_software_text),
+            technical_report_plotting_software_text = COALESCE(NULLIF(EXCLUDED.technical_report_plotting_software_text, ''), plot_meta.technical_report_plotting_software_text),
+            technical_report_general_observation_text = COALESCE(NULLIF(EXCLUDED.technical_report_general_observation_text, ''), plot_meta.technical_report_general_observation_text),
             updated_at = NOW()
     """), {
         "plot_id": plot_id,
@@ -516,6 +573,16 @@ def upsert_plot_meta(
         "adamawa_plan_no": adamawa_plan_no,
         "adamawa_surveyed_by_text": adamawa_surveyed_by_text,
         "adamawa_disclaimer_text": adamawa_disclaimer_text,
+        "technical_report_instruments": technical_report_instruments_json,
+        "technical_report_dgps_type": technical_report_dgps_type,
+        "technical_report_num_surveyors": technical_report_num_surveyors,
+        "technical_report_num_technical_officers": technical_report_num_technical_officers,
+        "technical_report_num_labourers": technical_report_num_labourers,
+        "technical_report_recce_text": technical_report_recce_text,
+        "technical_report_demarcation_text": technical_report_demarcation_text,
+        "technical_report_computation_software_text": technical_report_computation_software_text,
+        "technical_report_plotting_software_text": technical_report_plotting_software_text,
+        "technical_report_general_observation_text": technical_report_general_observation_text,
     })
     if commit:
         db.commit()
@@ -529,7 +596,12 @@ def get_plot_meta(db: Session, plot_id: int) -> dict:
                adamawa_control_point_name, adamawa_northing, adamawa_easting, adamawa_elevation, adamawa_origin_text,
                adamawa_topo_sheet_text, adamawa_computation_no, adamawa_cadastral_sheet_no, adamawa_plan_no,
                adamawa_surveyed_by_text, adamawa_disclaimer_text,
-               parent_plot_id, subdivision_batch_id, subdivision_lot_no, estate_name
+               parent_plot_id, subdivision_batch_id, subdivision_lot_no, estate_name,
+               technical_report_instruments, technical_report_dgps_type,
+               technical_report_num_surveyors, technical_report_num_technical_officers,
+               technical_report_num_labourers, technical_report_recce_text,
+               technical_report_demarcation_text, technical_report_computation_software_text,
+               technical_report_plotting_software_text, technical_report_general_observation_text
         FROM plot_meta
         WHERE plot_id = :plot_id
     """), {"plot_id": plot_id}).mappings().first()
@@ -565,7 +637,25 @@ def get_plot_meta(db: Session, plot_id: int) -> dict:
             "subdivision_batch_id": None,
             "subdivision_lot_no": "",
             "estate_name": "",
+            "technical_report_instruments": [],
+            "technical_report_dgps_type": "",
+            "technical_report_num_surveyors": None,
+            "technical_report_num_technical_officers": None,
+            "technical_report_num_labourers": None,
+            "technical_report_recce_text": "",
+            "technical_report_demarcation_text": "",
+            "technical_report_computation_software_text": DEFAULT_TECHNICAL_REPORT_COMPUTATION_SOFTWARE,
+            "technical_report_plotting_software_text": DEFAULT_TECHNICAL_REPORT_PLOTTING_SOFTWARE,
+            "technical_report_general_observation_text": DEFAULT_TECHNICAL_REPORT_GENERAL_OBSERVATION,
         }
+    raw_instruments = row.get("technical_report_instruments")
+    if isinstance(raw_instruments, str):
+        try:
+            raw_instruments = json.loads(raw_instruments)
+        except Exception:
+            raw_instruments = []
+    if not isinstance(raw_instruments, list):
+        raw_instruments = []
     return {
         "title_text": row.get("title_text") or "SURVEY PLAN",
         "location_text": row.get("location_text") or "",
@@ -597,6 +687,16 @@ def get_plot_meta(db: Session, plot_id: int) -> dict:
         "subdivision_batch_id": row.get("subdivision_batch_id"),
         "subdivision_lot_no": row.get("subdivision_lot_no") or "",
         "estate_name": row.get("estate_name") or "",
+        "technical_report_instruments": raw_instruments,
+        "technical_report_dgps_type": row.get("technical_report_dgps_type") or "",
+        "technical_report_num_surveyors": row.get("technical_report_num_surveyors"),
+        "technical_report_num_technical_officers": row.get("technical_report_num_technical_officers"),
+        "technical_report_num_labourers": row.get("technical_report_num_labourers"),
+        "technical_report_recce_text": row.get("technical_report_recce_text") or "",
+        "technical_report_demarcation_text": row.get("technical_report_demarcation_text") or "",
+        "technical_report_computation_software_text": row.get("technical_report_computation_software_text") or DEFAULT_TECHNICAL_REPORT_COMPUTATION_SOFTWARE,
+        "technical_report_plotting_software_text": row.get("technical_report_plotting_software_text") or DEFAULT_TECHNICAL_REPORT_PLOTTING_SOFTWARE,
+        "technical_report_general_observation_text": row.get("technical_report_general_observation_text") or DEFAULT_TECHNICAL_REPORT_GENERAL_OBSERVATION,
     }
 
 
@@ -632,6 +732,284 @@ def _pdf_response_with_r2(
         if public_url:
             response.headers["X-LandCheck-R2-Url"] = str(public_url)
     return response
+
+
+def _docx_response_with_r2(
+    local_docx_path: str,
+    filename: str,
+    *,
+    category: str,
+    project_id: int | None = None,
+):
+    docx_media_type = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+    upload_meta = upload_export_file_best_effort(
+        local_docx_path,
+        filename,
+        category=category,
+        project_id=project_id,
+        content_type=docx_media_type,
+    )
+    response = FileResponse(local_docx_path, media_type=docx_media_type, filename=filename)
+    if upload_meta:
+        object_key = upload_meta.get("object_key")
+        public_url = upload_meta.get("public_url")
+        if object_key:
+            response.headers["X-LandCheck-R2-Key"] = str(object_key)
+        if public_url:
+            response.headers["X-LandCheck-R2-Url"] = str(public_url)
+    return response
+
+
+_LOWER_ROMAN_NUMERALS = [
+    "i", "ii", "iii", "iv", "v", "vi", "vii", "viii", "ix", "x",
+    "xi", "xii", "xiii", "xiv", "xv", "xvi", "xvii", "xviii", "xix", "xx",
+]
+
+
+def _to_lower_roman(n: int) -> str:
+    if 1 <= n <= len(_LOWER_ROMAN_NUMERALS):
+        return _LOWER_ROMAN_NUMERALS[n - 1]
+    return str(n)
+
+
+def _render_technical_report_docx(meta: dict, area_m2: float, output_path: str) -> None:
+    """Builds the Adamawa OSG "Survey Technical Report" narrative document, matching the
+    structure/style of the sample report the template is based on (title page, ASSIGNMENT page,
+    INSTRUMENT/PERSONNEL/RECCE/DEMARCATION/METHOD page, COMPUTATIONS/PLOTTING/OBSERVATION page).
+    """
+    try:
+        from docx import Document
+        from docx.shared import Pt
+        from docx.enum.text import WD_ALIGN_PARAGRAPH
+    except Exception as exc:
+        raise HTTPException(status_code=501, detail="Technical report export requires python-docx.") from exc
+
+    owner_name = str(meta.get("adamawa_owner_name") or "").strip() or "THE APPLICANT"
+    location_text = str(meta.get("location_text") or "").strip()
+    lga_text = str(meta.get("lga_text") or "").strip()
+    state_text = str(meta.get("state_text") or "ADAMAWA STATE").strip()
+    surveyor_name = str(meta.get("surveyor_name") or "").strip()
+    surveyor_rank = str(meta.get("surveyor_rank") or "").strip()
+    topo_sheet_text = str(meta.get("adamawa_topo_sheet_text") or "").strip()
+    authority_title = str(meta.get("adamawa_authority_title") or DEFAULT_ADAMAWA_AUTHORITY_TITLE).strip()
+    control_point_name = str(meta.get("adamawa_control_point_name") or "").strip() or "the reference control point"
+
+    instruments = meta.get("technical_report_instruments") or []
+    dgps_type = str(meta.get("technical_report_dgps_type") or "").strip()
+    num_surveyors = int(meta.get("technical_report_num_surveyors") or 0)
+    num_technical_officers = int(meta.get("technical_report_num_technical_officers") or 0)
+    num_labourers = int(meta.get("technical_report_num_labourers") or 0)
+    recce_text = str(meta.get("technical_report_recce_text") or "").strip()
+    demarcation_text = str(meta.get("technical_report_demarcation_text") or "").strip()
+    computation_software_text = str(
+        meta.get("technical_report_computation_software_text") or DEFAULT_TECHNICAL_REPORT_COMPUTATION_SOFTWARE
+    ).strip()
+    plotting_software_text = str(
+        meta.get("technical_report_plotting_software_text") or DEFAULT_TECHNICAL_REPORT_PLOTTING_SOFTWARE
+    ).strip()
+    general_observation_text = str(
+        meta.get("technical_report_general_observation_text") or DEFAULT_TECHNICAL_REPORT_GENERAL_OBSERVATION
+    ).strip()
+
+    surveyor_full = f"SURV. {surveyor_name}" if surveyor_name else "SURV."
+    surveyor_with_rank = f"{surveyor_full} ({surveyor_rank})" if surveyor_rank else surveyor_full
+
+    document = Document()
+    normal_style = document.styles["Normal"]
+    normal_style.font.name = "Times New Roman"
+    normal_style.font.size = Pt(12)
+
+    def add_line(text_value: str, *, bold: bool = False, center: bool = True, size: int = 13, space_after: int = 6):
+        paragraph = document.add_paragraph()
+        paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER if center else WD_ALIGN_PARAGRAPH.LEFT
+        paragraph.paragraph_format.space_after = Pt(space_after)
+        run = paragraph.add_run(text_value)
+        run.bold = bold
+        run.font.size = Pt(size)
+        run.font.name = "Times New Roman"
+        return paragraph
+
+    def add_heading(text_value: str):
+        paragraph = document.add_paragraph()
+        paragraph.paragraph_format.space_before = Pt(10)
+        paragraph.paragraph_format.space_after = Pt(6)
+        run = paragraph.add_run(text_value)
+        run.bold = True
+        run.underline = True
+        run.font.size = Pt(12)
+        run.font.name = "Times New Roman"
+        return paragraph
+
+    def add_body(text_value: str):
+        paragraph = document.add_paragraph(text_value)
+        paragraph.paragraph_format.space_after = Pt(10)
+        for run in paragraph.runs:
+            run.font.name = "Times New Roman"
+            run.font.size = Pt(12)
+        return paragraph
+
+    def add_list_item(label: str, text_value: str):
+        paragraph = document.add_paragraph()
+        paragraph.paragraph_format.left_indent = Pt(24)
+        paragraph.paragraph_format.space_after = Pt(4)
+        run = paragraph.add_run(f"{label}.\t{text_value}")
+        run.font.name = "Times New Roman"
+        run.font.size = Pt(12)
+        return paragraph
+
+    def add_bullet(text_value: str):
+        paragraph = document.add_paragraph()
+        paragraph.paragraph_format.left_indent = Pt(24)
+        paragraph.paragraph_format.space_after = Pt(4)
+        run = paragraph.add_run(f"• {text_value}")
+        run.font.name = "Times New Roman"
+        run.font.size = Pt(12)
+        return paragraph
+
+    # ---- Page 1: title page ----
+    add_line(f"SURVEY TECHNICAL REPORT IN RESPECT OF {owner_name.upper()}", bold=True, size=14)
+    add_line(f"LOCATED AT {location_text.upper()}", bold=True, size=13)
+    add_line(f"{lga_text.upper()} LOCAL GOVERNMENT AREA, {state_text.upper()}", bold=True, size=13)
+    if topo_sheet_text:
+        add_line(topo_sheet_text.upper(), bold=True, size=13, space_after=24)
+    add_line("SUBMITTED", bold=True, space_after=24)
+    add_line("TO", bold=True, space_after=24)
+    for line in authority_title.splitlines():
+        if line.strip():
+            add_line(line.strip().upper(), bold=True, space_after=4)
+    add_line("BY", bold=True, space_after=24)
+    add_line(surveyor_with_rank.upper(), bold=True, space_after=4)
+    add_line("OFFICE OF THE SURVEYOR GENERAL", bold=True, space_after=4)
+    add_line(state_text.upper(), bold=True)
+    document.add_page_break()
+
+    # ---- Page 2: assignment ----
+    add_line(f"A SURVEY REPORT ON DEMARCATION AND SURVEY IN RESPECT OF {owner_name.upper()}", bold=True, size=13, space_after=4)
+    add_line(f"LOCATED AT {location_text.upper()}, {lga_text.upper()} LOCAL GOVERNMENT AREA, {state_text.upper()}", bold=True, size=12, space_after=18)
+    add_heading("ASSIGNMENT")
+    add_body(
+        f"The instruction is to carry out the demarcation and re-survey of item in respect of "
+        f"{owner_name} Located At {location_text}, {lga_text} Local Government Area, {state_text}, "
+        f"Instruction to Survey (I to S) is here by attached."
+    )
+    add_body("The above job is fully completed and the following are hereby attached for submissions;")
+    for idx, attachment in enumerate([
+        "Instruction to Survey",
+        "Brief report on the job",
+        "Work diagram",
+        "Observation sheet",
+        "Area/back computation sheet",
+        "Orthophoto of the survey area",
+        "Survey plan",
+    ], start=1):
+        add_list_item(_to_lower_roman(idx), attachment)
+    add_body("Thanks")
+    closing = document.add_paragraph()
+    closing.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+    closing_run = closing.add_run("Yours faithfully")
+    closing_run.font.name = "Times New Roman"
+    closing_run.font.size = Pt(12)
+    for line in ["", surveyor_with_rank]:
+        p = document.add_paragraph()
+        p.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+        r = p.add_run(line)
+        r.font.name = "Times New Roman"
+        r.font.size = Pt(12)
+    document.add_page_break()
+
+    # ---- Page 3+: instruments, personnel, recce, demarcation, method ----
+    add_heading("INSTRUMENT / EQUIPMENT USED")
+    equipment_lines = list(instruments)
+    if dgps_type:
+        equipment_lines = [f"{dgps_type} Differential Global Positioning System (DGPS), with its accessories was used to carry out the survey"] + equipment_lines
+    if not equipment_lines:
+        equipment_lines = ["Standard survey equipment appropriate to the job"]
+    for idx, item in enumerate(equipment_lines, start=1):
+        add_list_item(_to_lower_roman(idx), item)
+
+    add_heading("SURVEY PARTY/PERSONNEL")
+    add_body(
+        f"{num_surveyors or 'One'} surveyor{'s' if num_surveyors > 1 else ''}, "
+        f"{num_technical_officers or 'one'} technical officer{'s' if num_technical_officers > 1 else ''} "
+        f"and {num_labourers or 'two'} labourer{'s' if num_labourers != 1 else ''}"
+    )
+
+    add_heading("RECONNAISSANCE (RECCE)")
+    add_body(f"Reconnaissance survey was carried out by the Surveyor as shown in the work diagram.")
+    if recce_text:
+        add_body(
+            f"{control_point_name} {recce_text} and was used as connection point for the survey as base station."
+        )
+
+    add_heading("DEMARCATION")
+    if demarcation_text:
+        add_body(
+            f"The entire corner point to be surveyed was demarcated with property beacon from "
+            f"{demarcation_text}, was capped and numbered appropriately as could be seen on the work diagram."
+        )
+    else:
+        add_body(
+            "The entire corner points to be surveyed were demarcated with property beacons, capped and "
+            "numbered appropriately as could be seen on the work diagram."
+        )
+
+    add_heading("SURVEY METHOD")
+    dgps_label = dgps_type or "Differential Global Positioning System (DGPS)"
+    add_body(
+        f"{dgps_label} was set up at a second order control point with the prefix number {control_point_name} "
+        "and levelled as its base station, the master was allowed for some time to receive satellite signal, "
+        "while the Rover was also set up on its pole at 2 meter height."
+    )
+
+    add_heading("MODE OF OBSERVATION")
+    add_body("RTK mode was used as the operational method of observation for in capturing field data.")
+    add_body(f"In setting up the {dgps_label} the following procedure was followed:")
+    for step in [
+        "Power on the master",
+        "Navigate to App to create your project",
+        "Set the project name",
+        "Select configuration",
+        "Connect the base with the Bluetooth name",
+        "Go to base and select",
+        "Then input the coordinate of the control point (coordinate of the tie) in the master. i.e NEH",
+        "Input the height of the station",
+        "Enter ok",
+        "Select start",
+        "Then disconnect the base",
+        "Connect to rover",
+        "Press start",
+        "At the extreme top it will display fixed (that means it is ready for work but when it shows "
+        "single or float then you allow it to completely receive the satellite until it displays fixed)",
+        "Then select survey",
+        "Press survey then it displays a count down from 5 seconds to zero on the screen",
+        "Edit the point name that will display on the screen",
+        "Then go to the next point and select survey again and wait for it to count down from 5 to zero",
+        "Then go round all the beacons along the boundary of the land to be surveyed and pick",
+        "After going round all your interested points to be surveyed",
+        "Select export to export the data to either computer or phone",
+        "Highlight all the display box on the screen",
+        "Edit the file name",
+        "Then press ok",
+    ]:
+        add_bullet(step)
+
+    add_heading("SURVEY COMPUTATIONS")
+    add_body(
+        f"{computation_software_text} was used for back & area computation to serve as a check to the values "
+        f"obtained by the use of the software. The computed area is A={area_m2:.3f} Sqm."
+    )
+
+    add_heading("PLOTTING")
+    add_body(f"{plotting_software_text} was used for survey plan production.")
+
+    add_heading("GENERAL OBSERVATION/ SUGGESTION")
+    add_body(general_observation_text)
+
+    add_line(surveyor_with_rank, center=False, bold=False, size=12, space_after=2)
+    add_line("Sign………………………...", center=False, bold=False, size=12, space_after=2)
+    add_line("Date ……………………….", center=False, bold=False, size=12, space_after=2)
+
+    document.save(output_path)
 
 
 def safe_rmtree(path: str):
@@ -3288,6 +3666,8 @@ def _run_single_plot_export_job(job_id: str):
             response = download_survey_plan_shapefile(plot_id=plot_id, db=db, background_tasks=None)
             source_path = str(getattr(response, "path", "") or "").strip()
             cleanup_dir = os.path.dirname(source_path) if source_path else ""
+        elif export_type == "technical-report.docx":
+            response = download_plot_technical_report_docx(plot_id=plot_id, db=db, **payload)
         else:
             raise RuntimeError(f"Unsupported plot export job type: {export_type}")
 
@@ -4448,6 +4828,165 @@ def download_plot_report_pdf(plot_id: int, db: Session = Depends(get_db), backgr
         category="survey-plan",
         project_id=plot_id,
     )
+
+
+def download_plot_technical_report_docx(plot_id: int, db: Session = Depends(get_db), **payload):
+    """Generates the Adamawa OSG "Survey Technical Report" .docx, auto-filled from plot_meta
+    (persisted via the same upsert used by every other export) plus the live computed area.
+    """
+    reports_dir = REPORTS_DIR
+    os.makedirs(reports_dir, exist_ok=True)
+    docx_path = f"{reports_dir}/plot_{plot_id}_technical_report.docx"
+
+    upsert_plot_meta(
+        db=db,
+        plot_id=plot_id,
+        title_text=payload.get("title_text"),
+        location_text=payload.get("location_text"),
+        lga_text=payload.get("lga_text"),
+        state_text=payload.get("state_text"),
+        surveyor_name=payload.get("surveyor_name"),
+        surveyor_rank=payload.get("surveyor_rank"),
+        template_name=payload.get("template_name"),
+        adamawa_rof_no=payload.get("adamawa_rof_no"),
+        adamawa_owner_name=payload.get("adamawa_owner_name"),
+        adamawa_authority_title=payload.get("adamawa_authority_title"),
+        adamawa_authority_date_text=payload.get("adamawa_authority_date_text"),
+        adamawa_control_point_name=payload.get("adamawa_control_point_name"),
+        adamawa_northing=payload.get("adamawa_northing"),
+        adamawa_easting=payload.get("adamawa_easting"),
+        adamawa_elevation=payload.get("adamawa_elevation"),
+        adamawa_origin_text=payload.get("adamawa_origin_text"),
+        adamawa_topo_sheet_text=payload.get("adamawa_topo_sheet_text"),
+        adamawa_computation_no=payload.get("adamawa_computation_no"),
+        adamawa_cadastral_sheet_no=payload.get("adamawa_cadastral_sheet_no"),
+        adamawa_plan_no=payload.get("adamawa_plan_no"),
+        adamawa_surveyed_by_text=payload.get("adamawa_surveyed_by_text"),
+        adamawa_disclaimer_text=payload.get("adamawa_disclaimer_text"),
+        technical_report_instruments=payload.get("technical_report_instruments"),
+        technical_report_dgps_type=payload.get("technical_report_dgps_type"),
+        technical_report_num_surveyors=payload.get("technical_report_num_surveyors"),
+        technical_report_num_technical_officers=payload.get("technical_report_num_technical_officers"),
+        technical_report_num_labourers=payload.get("technical_report_num_labourers"),
+        technical_report_recce_text=payload.get("technical_report_recce_text"),
+        technical_report_demarcation_text=payload.get("technical_report_demarcation_text"),
+        technical_report_computation_software_text=payload.get("technical_report_computation_software_text"),
+        technical_report_plotting_software_text=payload.get("technical_report_plotting_software_text"),
+        technical_report_general_observation_text=payload.get("technical_report_general_observation_text"),
+    )
+
+    meta = get_plot_meta(db, plot_id)
+    area_m2 = db.execute(
+        text("SELECT ST_Area(geom::geography) FROM plots WHERE id=:id"),
+        {"id": plot_id},
+    ).scalar() or 0
+
+    _render_technical_report_docx(meta, float(area_m2), docx_path)
+
+    filename = f"plot_{plot_id}_technical_report.docx"
+    return _docx_response_with_r2(
+        docx_path,
+        filename,
+        category="technical-report",
+        project_id=plot_id,
+    )
+
+
+@router.post("/{plot_id}/export-jobs/technical-report.docx")
+def create_plot_technical_report_export_job(
+    plot_id: int,
+    request: Request,
+    db: Session = Depends(get_db),
+    title_text: str = Body("SURVEY PLAN"),
+    location_text: str = Body(""),
+    lga_text: str = Body(""),
+    state_text: str = Body(""),
+    surveyor_name: str = Body(""),
+    surveyor_rank: str = Body(""),
+    template_name: str = Body(DEFAULT_TEMPLATE_NAME),
+    adamawa_rof_no: str = Body(""),
+    adamawa_owner_name: str = Body(""),
+    adamawa_authority_title: str = Body(DEFAULT_ADAMAWA_AUTHORITY_TITLE),
+    adamawa_authority_date_text: str = Body(DEFAULT_ADAMAWA_AUTHORITY_DATE),
+    adamawa_control_point_name: str = Body(""),
+    adamawa_northing: str = Body(""),
+    adamawa_easting: str = Body(""),
+    adamawa_elevation: str = Body(""),
+    adamawa_origin_text: str = Body(DEFAULT_ADAMAWA_ORIGIN_TEXT),
+    adamawa_topo_sheet_text: str = Body(DEFAULT_ADAMAWA_TOPO_SHEET_TEXT),
+    adamawa_computation_no: str = Body(""),
+    adamawa_cadastral_sheet_no: str = Body(""),
+    adamawa_plan_no: str = Body(""),
+    adamawa_surveyed_by_text: str = Body(""),
+    adamawa_disclaimer_text: str = Body(DEFAULT_ADAMAWA_DISCLAIMER_TEXT),
+    technical_report_instruments: list[str] = Body(default=[]),
+    technical_report_dgps_type: str = Body(""),
+    technical_report_num_surveyors: int | None = Body(None),
+    technical_report_num_technical_officers: int | None = Body(None),
+    technical_report_num_labourers: int | None = Body(None),
+    technical_report_recce_text: str = Body(""),
+    technical_report_demarcation_text: str = Body(""),
+    technical_report_computation_software_text: str = Body(""),
+    technical_report_plotting_software_text: str = Body(""),
+    technical_report_general_observation_text: str = Body(""),
+):
+    request_payload = {
+        "title_text": title_text,
+        "location_text": location_text,
+        "lga_text": lga_text,
+        "state_text": state_text,
+        "surveyor_name": surveyor_name,
+        "surveyor_rank": surveyor_rank,
+        "template_name": template_name,
+        "adamawa_rof_no": adamawa_rof_no,
+        "adamawa_owner_name": adamawa_owner_name,
+        "adamawa_authority_title": adamawa_authority_title,
+        "adamawa_authority_date_text": adamawa_authority_date_text,
+        "adamawa_control_point_name": adamawa_control_point_name,
+        "adamawa_northing": adamawa_northing,
+        "adamawa_easting": adamawa_easting,
+        "adamawa_elevation": adamawa_elevation,
+        "adamawa_origin_text": adamawa_origin_text,
+        "adamawa_topo_sheet_text": adamawa_topo_sheet_text,
+        "adamawa_computation_no": adamawa_computation_no,
+        "adamawa_cadastral_sheet_no": adamawa_cadastral_sheet_no,
+        "adamawa_plan_no": adamawa_plan_no,
+        "adamawa_surveyed_by_text": adamawa_surveyed_by_text,
+        "adamawa_disclaimer_text": adamawa_disclaimer_text,
+        "technical_report_instruments": technical_report_instruments or [],
+        "technical_report_dgps_type": technical_report_dgps_type,
+        "technical_report_num_surveyors": technical_report_num_surveyors,
+        "technical_report_num_technical_officers": technical_report_num_technical_officers,
+        "technical_report_num_labourers": technical_report_num_labourers,
+        "technical_report_recce_text": technical_report_recce_text,
+        "technical_report_demarcation_text": technical_report_demarcation_text,
+        "technical_report_computation_software_text": technical_report_computation_software_text,
+        "technical_report_plotting_software_text": technical_report_plotting_software_text,
+        "technical_report_general_observation_text": technical_report_general_observation_text,
+    }
+    cache_key = _build_plot_export_cache_key(
+        db,
+        plot_id=int(plot_id),
+        export_type="technical-report.docx",
+        payload=request_payload,
+    )
+    existing = _find_plot_export_job_by_cache_key(
+        db,
+        plot_id=int(plot_id),
+        export_type="technical-report.docx",
+        cache_key=cache_key,
+    )
+    if existing:
+        return _serialize_plot_export_job(existing, request=request)
+    job = _insert_single_plot_export_job(
+        db,
+        plot_id=int(plot_id),
+        export_type="technical-report.docx",
+        cache_key=cache_key,
+        file_name=f"plot_{int(plot_id)}_technical_report.docx",
+        request_payload=request_payload,
+    )
+    return _serialize_plot_export_job(job, request=request)
 
 
 # ---------------- SIMPLE PDF DOWNLOAD (GET) ----------------

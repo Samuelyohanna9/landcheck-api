@@ -2813,7 +2813,7 @@ def _render_premium_email_shell(
               <table role="presentation" cellpadding="0" cellspacing="0" style="border-collapse:collapse;">
                 <tr>
                   <td style="vertical-align:middle;">
-                    <img src="https://landcheck.online/green-logo-cropped-700.png" width="36" height="36" alt="LandCheck"
+                    <img src="https://landcheck.online/landcheck-email-logo.png" width="36" height="36" alt="LandCheck"
                          style="display:block;border-radius:9px;background:#ffffff;padding:3px;" />
                   </td>
                   <td style="vertical-align:middle;padding-left:10px;">

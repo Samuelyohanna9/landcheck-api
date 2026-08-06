@@ -23,6 +23,7 @@ from app.routers import (
     green_reports,
     green_remote_monitoring,
     green_payouts,
+    survey_georeference,
 )
 from app.db_init import init_db
 from app.utils.activity_logger import ensure_activity_log_table, log_request_activity, should_skip_request_logging
@@ -126,6 +127,18 @@ def _run_sponsor_engagement_email_check_job():
         session_db.close()
 
 
+def _run_georeference_retention_cleanup_job():
+    session_db = SessionLocal()
+    try:
+        survey_georeference.cleanup_expired_georeference_sessions(session_db)
+        session_db.commit()
+    except Exception:
+        session_db.rollback()
+        raise
+    finally:
+        session_db.close()
+
+
 # ✅ Create tables on startup
 @app.on_event("startup")
 def startup_event():
@@ -148,6 +161,12 @@ def startup_event():
         _run_sponsor_engagement_email_check_job,
         trigger=CronTrigger(hour=9, minute=30),
         id="sponsor_engagement_email_check",
+        replace_existing=True,
+    )
+    scheduler.add_job(
+        _run_georeference_retention_cleanup_job,
+        trigger=CronTrigger(hour="*/6"),
+        id="georeference_retention_cleanup",
         replace_existing=True,
     )
     scheduler.start()
@@ -246,6 +265,7 @@ app.include_router(green_sponsor.router)
 app.include_router(green_reports.router)
 app.include_router(green_remote_monitoring.router)
 app.include_router(green_payouts.router)
+app.include_router(survey_georeference.router)
 
 @app.get("/")
 def root():
