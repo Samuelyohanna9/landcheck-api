@@ -1303,6 +1303,18 @@ def save_georeference_features(session_id: str, payload: SaveDigitizedFeaturesRe
     return {"ok": True, "session": _session_to_payload(updated)}
 
 
+def _excel_text_number(value: float, decimals: int) -> str:
+    # A plain "211213.126" is only unambiguous on a "." decimal / "," thousands locale. On a
+    # system configured the other way around (comma decimal, period thousands - common outside
+    # the US/UK), Excel's CSV import silently reparses "." as a thousands separator instead of a
+    # decimal point, turning 211213.126 into the integer 211213126 and displaying it grouped as
+    # "211.213.126" - the data itself gets corrupted, not just the formatting. Wrapping the
+    # formatted string in ="..." forces Excel to treat the cell as literal text (a formula whose
+    # result is exactly this string), which is immune to regional number reparsing either way.
+    formatted = f"{float(value):,.{decimals}f}"
+    return f'="{formatted}"'
+
+
 @router.get("/sessions/{session_id}/exports/staking.csv")
 def export_georeference_staking_csv(session_id: str, db: Session = Depends(get_db)):
     row = _load_session_row(db, session_id)
@@ -1319,10 +1331,10 @@ def export_georeference_staking_csv(session_id: str, db: Session = Depends(get_d
                 item["station"],
                 item["feature"],
                 str(item["coordinate_system"]).upper(),
-                item["easting"],
-                item["northing"],
-                item["longitude"],
-                item["latitude"],
+                _excel_text_number(item["easting"], 4),
+                _excel_text_number(item["northing"], 4),
+                _excel_text_number(item["longitude"], 8),
+                _excel_text_number(item["latitude"], 8),
             ]
         )
     _touch_session(db, session_id)
