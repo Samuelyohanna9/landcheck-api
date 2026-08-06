@@ -1341,7 +1341,14 @@ def export_georeference_staking_csv(session_id: str, db: Session = Depends(get_d
     return Response(
         content="\ufeff" + csv_buffer.getvalue(),
         media_type="text/csv; charset=utf-8",
-        headers={"Content-Disposition": f'attachment; filename="georeference_{session_id}_staking.csv"'},
+        headers={
+            "Content-Disposition": f'attachment; filename="georeference_{session_id}_staking.csv"',
+            # This export reflects live, editable session data - a browser or edge cache (e.g.
+            # Cloudflare, in front of this API) serving a stale copy by URL would look exactly
+            # like "the fix didn't deploy" even after it has. Never cache it.
+            "Cache-Control": "no-store, no-cache, must-revalidate",
+            "Pragma": "no-cache",
+        },
     )
 
 
