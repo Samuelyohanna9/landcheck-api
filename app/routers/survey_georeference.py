@@ -533,8 +533,10 @@ def _solve_affine(width: int, height: int, coordinate_system_key: str, gcps: lis
     else:
         quality = "weak"
 
+    raster_max_x = max(float(max(width - 1, 1)), 1.0)
+    raster_max_y = max(float(max(height - 1, 1)), 1.0)
     overlay_corners = []
-    for pixel_x, pixel_y in [(0, 0), (width, 0), (width, height), (0, height)]:
+    for pixel_x, pixel_y in [(0.0, 0.0), (raster_max_x, 0.0), (raster_max_x, raster_max_y), (0.0, raster_max_y)]:
         world_x_val, world_y_val = map_model["apply"](float(pixel_x), float(pixel_y))
         lng, lat = mercator_reverse.transform(world_x_val, world_y_val)
         overlay_corners.append([round(float(lng), 8), round(float(lat), 8)])
@@ -834,57 +836,36 @@ def _build_warped_overlay_preview(
     if len(gcps) < 4:
         raise ValueError("A warped overlay preview requires at least four control points.")
 
-    mercator_forward = Transformer.from_crs(4326, 3857, always_xy=True)
     mercator_reverse = Transformer.from_crs(3857, 4326, always_xy=True)
-    target_epsg = int(session_transform.get("target_epsg") or 4326)
-    _, reverse_transformer = _make_transformers(target_epsg)
-
     source_image = Image.open(io.BytesIO(source_payload)).convert("RGBA")
     source_width, source_height = source_image.size
     source_rgba = np.asarray(source_image, dtype=np.float32)
+    raster_max_x = max(1.0, float(max(int(width or 0), source_width) - 1))
+    raster_max_y = max(1.0, float(max(int(height or 0), source_height) - 1))
+    raster_corners = [
+        (0.0, 0.0),
+        (raster_max_x, 0.0),
+        (raster_max_x, raster_max_y),
+        (0.0, raster_max_y),
+    ]
 
-    control_pairs: list[dict[str, float]] = []
-
-    def add_control(source_x: float, source_y: float, map_x: float, map_y: float):
-        if not all(math.isfinite(value) for value in (source_x, source_y, map_x, map_y)):
-            return
-        for current in control_pairs:
-            same_source = abs(current["source_x"] - source_x) <= 0.5 and abs(current["source_y"] - source_y) <= 0.5
-            same_map = abs(current["map_x"] - map_x) <= 0.25 and abs(current["map_y"] - map_y) <= 0.25
-            if same_source or same_map:
-                return
-        control_pairs.append(
-            {
-                "source_x": float(source_x),
-                "source_y": float(source_y),
-                "map_x": float(map_x),
-                "map_y": float(map_y),
-            }
-        )
-
+    map_corners = [
+        _apply_transform_to_pixel(session_transform, pixel_x, pixel_y, space="map")
+        for pixel_x, pixel_y in raster_corners
+    ]
+    map_points = list(map_corners)
     for gcp in gcps:
-        if target_epsg == 4326:
-            lng = float(gcp.ground_x)
-            lat = float(gcp.ground_y)
-        elif _looks_like_projected_coordinates(gcp.ground_x, gcp.ground_y):
-            if reverse_transformer is None:
-                continue
-            lng, lat = reverse_transformer.transform(float(gcp.ground_x), float(gcp.ground_y))
-        else:
-            lng = float(gcp.ground_x)
-            lat = float(gcp.ground_y)
-        map_x, map_y = mercator_forward.transform(float(lng), float(lat))
-        add_control(float(gcp.image_x), float(gcp.image_y), float(map_x), float(map_y))
-
-    for corner_x, corner_y in ((0.0, 0.0), (float(width), 0.0), (float(width), float(height)), (0.0, float(height))):
-        map_x, map_y = _apply_transform_to_pixel(session_transform, corner_x, corner_y, space="map")
-        add_control(corner_x, corner_y, map_x, map_y)
-
-    if len(control_pairs) < 4:
-        raise ValueError("Not enough unique control pairs were available for the overlay preview.")
-
-    map_points = [(item["map_x"], item["map_y"]) for item in control_pairs]
-    source_points = [(item["source_x"], item["source_y"]) for item in control_pairs]
+        try:
+            map_points.append(
+                _apply_transform_to_pixel(
+                    session_transform,
+                    float(gcp.image_x),
+                    float(gcp.image_y),
+                    space="map",
+                )
+            )
+        except HTTPException:
+            continue
 
     min_x = min(point[0] for point in map_points)
     max_x = max(point[0] for point in map_points)
@@ -892,11 +873,6 @@ def _build_warped_overlay_preview(
     max_y = max(point[1] for point in map_points)
     span_x = max(max_x - min_x, 1.0)
     span_y = max(max_y - min_y, 1.0)
-
-    normalized_points = [((point[0] - min_x) / span_x, (point[1] - min_y) / span_y) for point in map_points]
-    triangles = _build_delaunay_triangles(normalized_points)
-    if not triangles:
-        raise ValueError("Unable to triangulate the control points for preview rendering.")
 
     aspect_ratio = span_x / span_y if span_y > 0 else (float(source_width) / float(max(1, source_height)))
     long_edge = min(PREVIEW_MAX_DIMENSION, max(PREVIEW_MIN_DIMENSION, max(source_width, source_height)))
@@ -909,53 +885,77 @@ def _build_warped_overlay_preview(
     output_width = max(512, min(PREVIEW_MAX_DIMENSION, output_width))
     output_height = max(512, min(PREVIEW_MAX_DIMENSION, output_height))
 
-    def map_to_output_pixels(map_x: float, map_y: float) -> tuple[float, float]:
-        output_x = ((map_x - min_x) / span_x) * float(output_width - 1)
-        output_y = ((max_y - map_y) / span_y) * float(output_height - 1)
-        return output_x, output_y
+    grid_x, grid_y = np.meshgrid(
+        np.arange(output_width, dtype=np.float64) + 0.5,
+        np.arange(output_height, dtype=np.float64) + 0.5,
+    )
+    world_x = min_x + (grid_x / float(output_width)) * span_x
+    world_y = max_y - (grid_y / float(output_height)) * span_y
 
-    destination_points = [map_to_output_pixels(point[0], point[1]) for point in map_points]
-    preview_rgba = np.zeros((output_height, output_width, 4), dtype=np.uint8)
-    epsilon = 1e-5
+    map_homography = list(session_transform.get("map_homography") or [])
+    sample_x = np.zeros_like(world_x, dtype=np.float64)
+    sample_y = np.zeros_like(world_y, dtype=np.float64)
+    valid_mask = np.zeros_like(world_x, dtype=bool)
 
-    for triangle in triangles:
-        src_a = source_points[triangle[0]]
-        src_b = source_points[triangle[1]]
-        src_c = source_points[triangle[2]]
-        dst_a = destination_points[triangle[0]]
-        dst_b = destination_points[triangle[1]]
-        dst_c = destination_points[triangle[2]]
-
+    if len(map_homography) == 9:
+        homography_matrix = np.asarray(map_homography, dtype=float).reshape((3, 3))
+        if abs(float(np.linalg.det(homography_matrix))) <= 1e-12:
+            raise ValueError("The solved map homography is singular.")
+        inverse_homography = np.linalg.inv(homography_matrix)
         denominator = (
-            (dst_b[1] - dst_c[1]) * (dst_a[0] - dst_c[0])
-            + (dst_c[0] - dst_b[0]) * (dst_a[1] - dst_c[1])
+            inverse_homography[2, 0] * world_x
+            + inverse_homography[2, 1] * world_y
+            + inverse_homography[2, 2]
         )
-        if abs(denominator) <= 1e-9:
-            continue
-
-        min_px = max(0, int(math.floor(min(dst_a[0], dst_b[0], dst_c[0]))))
-        max_px = min(output_width - 1, int(math.ceil(max(dst_a[0], dst_b[0], dst_c[0]))))
-        min_py = max(0, int(math.floor(min(dst_a[1], dst_b[1], dst_c[1]))))
-        max_py = min(output_height - 1, int(math.ceil(max(dst_a[1], dst_b[1], dst_c[1]))))
-        if min_px > max_px or min_py > max_py:
-            continue
-
-        grid_x, grid_y = np.meshgrid(
-            np.arange(min_px, max_px + 1, dtype=np.float64) + 0.5,
-            np.arange(min_py, max_py + 1, dtype=np.float64) + 0.5,
+        valid_mask = np.abs(denominator) > 1e-9
+        safe_denominator = np.where(valid_mask, denominator, 1.0)
+        sample_x = (
+            inverse_homography[0, 0] * world_x
+            + inverse_homography[0, 1] * world_y
+            + inverse_homography[0, 2]
+        ) / safe_denominator
+        sample_y = (
+            inverse_homography[1, 0] * world_x
+            + inverse_homography[1, 1] * world_y
+            + inverse_homography[1, 2]
+        ) / safe_denominator
+    else:
+        coeff_x = list(((session_transform or {}).get("map_coefficients") or {}).get("x") or [])
+        coeff_y = list(((session_transform or {}).get("map_coefficients") or {}).get("y") or [])
+        if len(coeff_x) != 3 or len(coeff_y) != 3:
+            raise ValueError("The solved map transform is incomplete.")
+        affine_matrix = np.asarray(
+            [
+                [float(coeff_x[1]), float(coeff_x[2])],
+                [float(coeff_y[1]), float(coeff_y[2])],
+            ],
+            dtype=float,
         )
-        weight_a = ((dst_b[1] - dst_c[1]) * (grid_x - dst_c[0]) + (dst_c[0] - dst_b[0]) * (grid_y - dst_c[1])) / denominator
-        weight_b = ((dst_c[1] - dst_a[1]) * (grid_x - dst_c[0]) + (dst_a[0] - dst_c[0]) * (grid_y - dst_c[1])) / denominator
-        weight_c = 1.0 - weight_a - weight_b
-        inside = (weight_a >= -epsilon) & (weight_b >= -epsilon) & (weight_c >= -epsilon)
-        if not bool(np.any(inside)):
-            continue
+        if abs(float(np.linalg.det(affine_matrix))) <= 1e-12:
+            raise ValueError("The solved affine transform is singular.")
+        inverse_affine = np.linalg.inv(affine_matrix)
+        translated_x = world_x - float(coeff_x[0])
+        translated_y = world_y - float(coeff_y[0])
+        sample_x = (inverse_affine[0, 0] * translated_x) + (inverse_affine[0, 1] * translated_y)
+        sample_y = (inverse_affine[1, 0] * translated_x) + (inverse_affine[1, 1] * translated_y)
+        valid_mask = np.isfinite(sample_x) & np.isfinite(sample_y)
 
-        sample_x = (weight_a * src_a[0]) + (weight_b * src_b[0]) + (weight_c * src_c[0])
-        sample_y = (weight_a * src_a[1]) + (weight_b * src_b[1]) + (weight_c * src_c[1])
-        sampled = _sample_rgba_bilinear(source_rgba, sample_x[inside], sample_y[inside])
-        preview_slice = preview_rgba[min_py : max_py + 1, min_px : max_px + 1]
-        preview_slice[inside] = sampled
+    pixel_limit_x = float(max(source_width - 1, 0))
+    pixel_limit_y = float(max(source_height - 1, 0))
+    inside_mask = (
+        valid_mask
+        & np.isfinite(sample_x)
+        & np.isfinite(sample_y)
+        & (sample_x >= 0.0)
+        & (sample_x <= pixel_limit_x)
+        & (sample_y >= 0.0)
+        & (sample_y <= pixel_limit_y)
+    )
+
+    preview_rgba = np.zeros((output_height, output_width, 4), dtype=np.uint8)
+    if bool(np.any(inside_mask)):
+        sampled = _sample_rgba_bilinear(source_rgba, sample_x[inside_mask], sample_y[inside_mask])
+        preview_rgba[inside_mask] = sampled
 
     preview_image = Image.fromarray(preview_rgba, mode="RGBA")
     output_buffer = io.BytesIO()
