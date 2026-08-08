@@ -41,6 +41,7 @@ from app.utils.green_pdf import (
     render_green_agric_programme_pdf,
     render_green_relief_programme_pdf,
     render_green_csr_programme_report_pdf,
+    render_green_sustainability_disclosure_pdf,
     render_green_work_report_pdf,
     render_green_custodian_report_pdf,
     render_green_existing_trees_report_pdf,
@@ -34278,6 +34279,47 @@ def _render_csr_programme_pdf_with_fallback(
             last_error = exc
     if last_error is not None:
         raise last_error
+
+
+def _require_csr_workflow_project(project_id: int, db: Session) -> dict:
+    project = get_project(project_id, db)
+    workflow_profile = _normalize_workflow_profile(project.get("workflow_profile"))
+    if workflow_profile != "csr":
+        raise HTTPException(
+            status_code=400,
+            detail="The sustainability disclosure export is only available for CSR programme projects.",
+        )
+    return project
+
+
+@router.get("/projects/{project_id}/sustainability-disclosure/pdf")
+def export_sustainability_disclosure_pdf(project_id: int, db: Session = Depends(get_db)):
+    # CSR-only: mirrors the workflow_profile == "csr" gate used elsewhere for CSR-specific
+    # reporting (see _render_work_report_to_pdf). Reuses the same context builder as the CSR
+    # Programme Impact Report - same verified data, relabeled against IFRS S2.29 / GRI 304-305
+    # line items instead of donor-report language.
+    _require_csr_workflow_project(project_id, db)
+    context = _build_csr_programme_export_context(project_id, db, include_map=False)
+
+    os.makedirs(REPORTS_DIR, exist_ok=True)
+    tmp_pdf = tempfile.NamedTemporaryFile(suffix="_sustainability_disclosure.pdf", delete=False)
+    pdf_path = tmp_pdf.name
+    tmp_pdf.close()
+    render_green_sustainability_disclosure_pdf(
+        pdf_path,
+        project=context["project"],
+        summary=dict(context.get("summary") or {}),
+        csr_report_profile=dict(context.get("csr_report_profile") or {}),
+    )
+    organization_id = int(context["project"].get("organization_id") or 0) or None
+    filename = f"project_{project_id}_sustainability_disclosure.pdf"
+    return _pdf_response_with_r2(
+        pdf_path,
+        filename,
+        category="green-sustainability-disclosure",
+        project_id=project_id,
+        organization_id=organization_id,
+    )
 
 
 @router.get("/projects/{project_id}/existing-trees/metrics")

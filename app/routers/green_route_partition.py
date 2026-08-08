@@ -26,6 +26,7 @@ def _classify_green_route(path: str) -> str:
         or clean_path.endswith("/existing-trees/export/pdf")
         or clean_path.endswith("/existing-trees/export/csv")
         or clean_path.endswith("/custodians/export/pdf")
+        or clean_path.endswith("/sustainability-disclosure/pdf")
         or clean_path.endswith("/export/pdf")
         or clean_path.startswith("/green/public/impact/")
     ):
