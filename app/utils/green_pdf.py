@@ -4015,6 +4015,25 @@ def render_green_sustainability_disclosure_pdf(
         c.setFont("Times-Bold", 17)
         c.drawString(x + 12, y + h - 38, value)
 
+    def _draw_empty_state_box(x, y, w, h, title, body_lines, *, fill_color=None):
+        _draw_rounded_box(c, x, y, w, h, 6, fill_color=fill_color or ink_panel, stroke_color=ink_border)
+        c.setFillColor(ink_forest)
+        c.setFont("Times-Bold", 10.5)
+        c.drawString(x + 12, y + h - 18, title)
+        c.setStrokeColor(ink_gold)
+        c.setLineWidth(0.7)
+        c.line(x + 12, y + h - 25, min(x + 84, x + w - 12), y + h - 25)
+        cursor = y + h - 42
+        for line in body_lines:
+            if cursor < y + 12:
+                break
+            cursor = _draw_wrapped_text(
+                c, line, x + 12, cursor, w - 24,
+                line_height=10.2, font_name="Times-Italic", font_size=8.2,
+                color=ink_muted, max_lines=3,
+            )
+            cursor -= 2
+
     client_name = str(csr_config.get("client_name") or project.get("organization_name") or "").strip() or "CSR Client"
     reporting_cycle = str(csr_config.get("reporting_cycle") or "Current reporting cycle").strip()
     total_trees = int(summary.get("total_existing_trees", 0) or 0)
