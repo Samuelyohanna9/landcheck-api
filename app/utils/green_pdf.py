@@ -4127,8 +4127,9 @@ def render_green_sustainability_disclosure_pdf(
     ]
     context_lines = [
         "FRC Nigeria adopted IFRS S1/S2 (ISSB standards) as the private-sector sustainability reporting "
-        "framework; mandatory adoption applies to all Public Interest Entities and government/government "
-        "organizations from the accounting period beginning on or after 1 January 2028 (SMEs from 2030).",
+        "framework; mandatory adoption applies to all Public Interest Entities from the accounting period "
+        "beginning on or after 1 January 2028 (SMEs from 2030). Government and government organizations "
+        "move to mandatory reporting on the same 2028 date under a parallel IPSASB-issued standard.",
         "PIE status under the FRC Act covers listed entities, regulated non-listed entities, government "
         "licensees, and any entity with NGN 30 billion+ annual turnover — not only NGX-listed companies.",
     ]
