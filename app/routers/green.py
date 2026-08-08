@@ -34284,7 +34284,11 @@ def _render_csr_programme_pdf_with_fallback(
 def _require_csr_workflow_project(project_id: int, db: Session) -> dict:
     project = get_project(project_id, db)
     workflow_profile = _normalize_workflow_profile(project.get("workflow_profile"))
-    if workflow_profile != "csr":
+    # A project counts as "CSR" via either signal - same combined check _render_work_report_to_pdf
+    # already uses to pick the CSR report branch. Checking workflow_profile alone (as this guard
+    # originally did) incorrectly rejected CSR projects identified only by access_model.
+    is_csr = workflow_profile == "csr" or _is_csr_programme_access_model(project.get("access_model"))
+    if not is_csr:
         raise HTTPException(
             status_code=400,
             detail="The sustainability disclosure export is only available for CSR programme projects.",
