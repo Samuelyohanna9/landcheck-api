@@ -3943,6 +3943,14 @@ def render_green_sustainability_disclosure_pdf(
         except Exception:
             return f"{0:.{digits}f}"
 
+    def _fit_to_width(text: str, font_name: str, font_size: float, max_width: float) -> str:
+        if c.stringWidth(text, font_name, font_size) <= max_width:
+            return text
+        truncated = text
+        while truncated and c.stringWidth(truncated + "…", font_name, font_size) > max_width:
+            truncated = truncated[:-1]
+        return f"{truncated.rstrip()}…" if truncated else text[:1]
+
     def _draw_header_bar(report_label: str, subtitle: str, *, bar_height: float = 82):
         left = 34
         top = height
@@ -3959,24 +3967,32 @@ def render_green_sustainability_disclosure_pdf(
         logo_dx = _draw_project_logo(c, project, left, logo_y, logo_size)
         text_x = left + logo_dx
 
+        timestamp_text = datetime.utcnow().strftime("Generated %d %b %Y %H:%M UTC")
+        timestamp_w = c.stringWidth(timestamp_text, "Times-Roman", 8.2)
+        heading_available_w = width - 34 - text_x - timestamp_w - 12
+        heading_font_size = 18.0
+        while heading_font_size > 11.0 and c.stringWidth(heading, "Times-Bold", heading_font_size) > heading_available_w:
+            heading_font_size -= 0.5
+
         c.setFillColor(ink_paper)
-        c.setFont("Times-Bold", 18)
-        c.drawString(text_x, top - 28, heading[:60])
+        c.setFont("Times-Bold", heading_font_size)
+        c.drawString(text_x, top - 28, _fit_to_width(heading, "Times-Bold", heading_font_size, heading_available_w))
         c.setStrokeColor(ink_gold)
         c.setLineWidth(1.1)
         c.line(text_x, top - 33, min(text_x + 150, width - 180), top - 33)
 
+        label_available_w = width - 34 - text_x
         c.setFont("Times-Bold", 9.4)
         c.setFillColor(ink_gold)
-        c.drawString(text_x, top - 46, report_label[:100])
+        c.drawString(text_x, top - 46, _fit_to_width(report_label, "Times-Bold", 9.4, label_available_w))
 
         c.setFont("Times-Italic", 8.3)
         c.setFillColor(ink_soft)
-        c.drawString(text_x, top - 60, subtitle[:126])
+        c.drawString(text_x, top - 60, _fit_to_width(subtitle, "Times-Italic", 8.3, label_available_w))
 
         c.setFont("Times-Roman", 8.2)
         c.setFillColor(ink_soft)
-        c.drawRightString(width - 34, top - 28, datetime.utcnow().strftime("Generated %d %b %Y %H:%M UTC"))
+        c.drawRightString(width - 34, top - 28, timestamp_text)
         c.setFont("Times-Roman", 7.6)
         c.drawRightString(width - 34, top - 40, "LandCheck CSR")
 
@@ -4034,6 +4050,19 @@ def render_green_sustainability_disclosure_pdf(
             )
             cursor -= 2
 
+    def _measure_box_height(lines, w, *, font_name="Times-Roman", font_size=8.2, line_height=10.2, header_h=39, pad_bottom=14, min_h=64):
+        # Mirrors _draw_box's own cursor math exactly (same header offset, per-line advance, and
+        # 2pt gap after each paragraph) so a box is always sized to what it will actually draw,
+        # instead of a guessed constant that leaves a visibly empty band under short content.
+        total = 0.0
+        for line in lines:
+            text = str(line or "").strip()
+            if not text:
+                continue
+            wrapped = simpleSplit(text, font_name, font_size, w - 24)
+            total += len(wrapped) * line_height + 2
+        return max(header_h + total + pad_bottom, min_h)
+
     client_name = str(csr_config.get("client_name") or project.get("organization_name") or "").strip() or "CSR Client"
     reporting_cycle = str(csr_config.get("reporting_cycle") or "Current reporting cycle").strip()
     total_trees = int(summary.get("total_existing_trees", 0) or 0)
@@ -4055,6 +4084,9 @@ def render_green_sustainability_disclosure_pdf(
     sdg_focus = [str(item).strip() for item in (csr_report_profile.get("sdg_focus") or []) if str(item).strip()]
     stakeholder_priorities = [str(item).strip() for item in (csr_report_profile.get("stakeholder_priorities") or []) if str(item).strip()]
 
+    full_w = width - 68
+    half_w = (width - 68 - 16) / 2
+
     # ---------------- Page 1: Cover, purpose, and regulatory scope ----------------
     _draw_header_bar(
         "Sustainability Disclosure Data Export",
@@ -4064,23 +4096,26 @@ def render_green_sustainability_disclosure_pdf(
 
     c.setFillColor(ink_forest)
     c.setFont("Times-Bold", 13.5)
-    c.drawString(34, height - 100, str(project.get("name") or "CSR Project"))
+    c.drawString(34, height - 100, _fit_to_width(str(project.get("name") or "CSR Project"), "Times-Bold", 13.5, width - 68))
     c.setFont("Times-Roman", 9.0)
     c.setFillColor(ink_muted)
-    c.drawString(34, height - 114, f"Prepared for: {client_name}  |  Reporting cycle: {reporting_cycle}")
+    c.drawString(34, height - 114, _fit_to_width(f"Prepared for: {client_name}  |  Reporting cycle: {reporting_cycle}", "Times-Roman", 9.0, width - 68))
 
     purpose_lines = [
         "This export provides verified, field- and record-level environmental data generated through LandCheck's "
         "monitoring and audit-trail infrastructure, formatted against IFRS S2.29 climate-related metric categories "
         "and GRI 304/305 disclosure topics.",
         "It is supplied as an input to the reporting entity's own sustainability disclosure. It does not itself "
-        "constitute a Statement of Compliance under IFRS S1 - under FRC Sustainability Reporting Guideline 1 "
-        "(SRG1) SS2 and 15, that statement, and the disclosure it appears in, must be made and signed by the "
-        "reporting entity's own management team.",
+        "constitute a Statement of Compliance under IFRS S1 — under FRC Sustainability Reporting Guideline 1 "
+        "(SRG1) §2 and §15, that statement, and the disclosure it appears in, must be made and signed by "
+        "the reporting entity's own management team.",
         "All figures below are drawn directly from LandCheck's field records, task-review workflow, and carbon "
-        "model - see the Methodology & Sources note on the final page for full citations.",
+        "model — see the Methodology & Sources note on the final page for full citations.",
     ]
-    _draw_box(34, height - 320, width - 68, 190, "Purpose & Compliance Framing", purpose_lines, fill="#fffdf8")
+    cursor_y = height - 136
+    purpose_h = _measure_box_height(purpose_lines, full_w)
+    _draw_box(34, cursor_y - purpose_h, full_w, purpose_h, "Purpose & Compliance Framing", purpose_lines, fill="#fffdf8")
+    cursor_y -= purpose_h + 14
 
     scope_lines = [
         f"Reporting entity: {client_name}",
@@ -4089,25 +4124,27 @@ def render_green_sustainability_disclosure_pdf(
         f"Data as of: {datetime.utcnow().strftime('%d %b %Y')}",
         f"Verified implementation records in scope: {int(summary.get('total_existing_rows', 0) or 0)}",
     ]
-    _draw_box(34, height - 450, (width - 68 - 16) / 2, 116, "Disclosure Scope", scope_lines, fill=ink_panel_alt)
-
     context_lines = [
         "FRC Nigeria adopted IFRS S1/S2 (ISSB standards) as the private-sector sustainability reporting "
         "framework; mandatory adoption applies to all Public Interest Entities and government/government "
         "organizations from the accounting period beginning on or after 1 January 2028 (SMEs from 2030).",
         "PIE status under the FRC Act covers listed entities, regulated non-listed entities, government "
-        "licensees, and any entity with N30bn+ annual turnover - not only NGX-listed companies.",
+        "licensees, and any entity with NGN 30 billion+ annual turnover — not only NGX-listed companies.",
     ]
-    _draw_box(34 + (width - 68 - 16) / 2 + 16, height - 450, (width - 68 - 16) / 2, 116, "Regulatory Context", context_lines, fill="#fffdf8")
+    row_h = max(_measure_box_height(scope_lines, half_w), _measure_box_height(context_lines, half_w))
+    _draw_box(34, cursor_y - row_h, half_w, row_h, "Disclosure Scope", scope_lines, fill=ink_panel_alt)
+    _draw_box(34 + half_w + 16, cursor_y - row_h, half_w, row_h, "Regulatory Context", context_lines, fill="#fffdf8")
+    cursor_y -= row_h + 14
 
     flag_lines = [
-        "Per SRG1 SS5, images, award photos, and narrative interviews are explicitly named examples of "
+        "Per SRG1 §5, images, award photos, and narrative interviews are explicitly named examples of "
         "information that can obscure a material sustainability disclosure and cannot substitute for it. "
-        "Every figure in this export is structured, sourced data - photographic field evidence remains "
+        "Every figure in this export is structured, sourced data — photographic field evidence remains "
         "available separately in LandCheck's CSR Programme Impact Report and is not required to support "
         "the metrics below.",
     ]
-    _draw_box(34, height - 578, width - 68, 100, "Why this export is structured, not narrative", flag_lines, fill=ink_flag_bg, title_color=ink_flag)
+    flag_h = _measure_box_height(flag_lines, full_w)
+    _draw_box(34, cursor_y - flag_h, full_w, flag_h, "Why this export is structured, not narrative", flag_lines, fill=ink_flag_bg, title_color=ink_flag)
 
     _draw_footer(c.getPageNumber())
     c.showPage()
@@ -4124,38 +4161,41 @@ def render_green_sustainability_disclosure_pdf(
     _draw_metric(34, metric_y, metric_w, 66, f"{_fmt_num(current_co2_t)} t", "GHG removals - current")
     _draw_metric(34 + metric_w + 8, metric_y, metric_w, 66, f"{_fmt_num(annual_co2_t)} t/yr", "GHG removals - annual rate")
     _draw_metric(34 + (metric_w + 8) * 2, metric_y, metric_w, 66, f"{_fmt_num(lifetime_co2_t)} t", "Projected removals (40yr)")
-    _draw_metric(34 + (metric_w + 8) * 3, metric_y, metric_w, 66, str(total_trees), "Verified trees (climate opportunity)")
+    _draw_metric(34 + (metric_w + 8) * 3, metric_y, metric_w, 66, str(total_trees), "Verified Trees")
 
+    cursor_y = metric_y - 14
     removal_lines = [
         "These figures represent carbon dioxide removals from verified tree growth, calculated using IPCC Tier 1 "
         "defaults with Chave et al. (2014) pantropical allometric equations. Under the GHG Protocol, a removal is "
-        "reported separately from Scope 1/2/3 emissions and is distinct from a purchased carbon offset - no "
+        "reported separately from Scope 1/2/3 emissions and is distinct from a purchased carbon offset — no "
         "offset or credit claim is made or implied by this figure.",
         f"Data quality: {missing_age} record(s) missing planting-age data, {fallback_age} using a modeled age "
         "fallback. Disclose alongside the removal figures above per IFRS S2.29(a)(ii) (measurement approach, "
         "inputs, and assumptions).",
     ]
-    _draw_box(34, metric_y - 128, width - 68, 112, "GHG Removals - Classification & Data Quality", removal_lines, fill="#fffdf8")
+    removal_h = _measure_box_height(removal_lines, full_w)
+    _draw_box(34, cursor_y - removal_h, full_w, removal_h, "GHG Removals — Classification & Data Quality", removal_lines, fill="#fffdf8")
+    cursor_y -= removal_h + 14
 
-    deploy_y = metric_y - 254
     deploy_lines = [
         f"Restored / implementation area: {_fmt_num(area_ha, 3)} ha",
         f"Verified custodians / care partners: {custodian_count}",
         f"Maintenance actions logged: {maintenance_total} (done: {maintenance_done})",
         f"Survival / healthy rate: {survival_pct:.1f}%",
     ]
-    _draw_box(34, deploy_y, (width - 68 - 16) / 2, 110, "Capital Deployment / Climate Opportunity Scope", deploy_lines, fill=ink_panel_alt)
-
     assurance_lines = [
         f"Records with mapped (GPS/geospatial) evidence: {_fmt_num(map_pct, 1)}%",
         f"Records with completed review/approval workflow: {_fmt_num(review_pct, 1)}%",
         "Assurance providers: see Governance & Internal Controls (next page) for the audit-trail evidence "
         "supporting these figures.",
     ]
-    _draw_box(34 + (width - 68 - 16) / 2 + 16, deploy_y, (width - 68 - 16) / 2, 110, "Verification Coverage", assurance_lines, fill="#fffdf8")
+    deploy_row_h = max(_measure_box_height(deploy_lines, half_w), _measure_box_height(assurance_lines, half_w))
+    _draw_box(34, cursor_y - deploy_row_h, half_w, deploy_row_h, "Capital Deployment / Climate Opportunity Scope", deploy_lines, fill=ink_panel_alt)
+    _draw_box(34 + half_w + 16, cursor_y - deploy_row_h, half_w, deploy_row_h, "Verification Coverage", assurance_lines, fill="#fffdf8")
+    cursor_y -= deploy_row_h + 14
 
-    species_y = 80
-    species_h = max(int(deploy_y - species_y - 12), 140)
+    species_h = max(min(int(cursor_y - 60), 230), 150)
+    species_y = cursor_y - species_h
     if top_species:
         chart_data = []
         colors = ["#1f7a3d", "#2f9e44", "#52b788", "#74c69d", "#0ea5e9", "#f97316"]
@@ -4187,7 +4227,7 @@ def render_green_sustainability_disclosure_pdf(
     # ---------------- Page 3: Governance, ICSR, materiality, and methodology ----------------
     _draw_header_bar(
         "Governance, Internal Controls & Methodology",
-        "SRG1 SS17 Internal Control over Sustainability Reporting (ICSR) evidence mapping",
+        "SRG1 §17 Internal Control over Sustainability Reporting (ICSR) evidence mapping",
         bar_height=68,
     )
 
@@ -4198,43 +4238,50 @@ def render_green_sustainability_disclosure_pdf(
         ("Data validation and reconciliation checks", f"{missing_age} record(s) flagged for missing age data and {fallback_age} for fallback-age use are surfaced explicitly, not silently estimated."),
         ("Audit trails and evidence retention", "Every record retains its full task/maintenance/review history with timestamps, independent of this export."),
     ]
+    icsr_table_content_w = width - 92
+    table_content_h = 0.0
+    for requirement, evidence in icsr_rows:
+        evidence_lines = simpleSplit(str(evidence), "Times-Roman", 7.8, icsr_table_content_w)[:3]
+        table_content_h += 10 + 2 + len(evidence_lines) * 9.6 + 8
+    table_h = 40 + table_content_h + 10
+
     table_y = height - 108
-    _draw_rounded_box(c, 34, table_y - 230, width - 68, 230, 6, fill_color=ink_panel, stroke_color=ink_border)
+    _draw_rounded_box(c, 34, table_y - table_h, width - 68, table_h, 6, fill_color=ink_panel, stroke_color=ink_border)
     c.setFillColor(ink_forest)
     c.setFont("Times-Bold", 11)
-    c.drawString(46, table_y - 18, "ICSR Evidence Mapping (FRC SRG1 SS17)")
+    c.drawString(46, table_y - 18, "ICSR Evidence Mapping (FRC SRG1 §17)")
     row_y = table_y - 40
     for requirement, evidence in icsr_rows:
         c.setFillColor(ink_gold)
         c.setFont("Times-Bold", 8.0)
-        row_y = _draw_wrapped_text(c, requirement, 46, row_y, width - 92, line_height=10, font_name="Times-Bold", font_size=8.0, color=ink_gold, max_lines=1)
+        row_y = _draw_wrapped_text(c, requirement, 46, row_y, icsr_table_content_w, line_height=10, font_name="Times-Bold", font_size=8.0, color=ink_gold, max_lines=1)
         c.setFillColor(ink_text)
-        row_y = _draw_wrapped_text(c, evidence, 46, row_y - 2, width - 92, line_height=9.6, font_name="Times-Roman", font_size=7.8, color=ink_text, max_lines=3)
+        row_y = _draw_wrapped_text(c, evidence, 46, row_y - 2, icsr_table_content_w, line_height=9.6, font_name="Times-Roman", font_size=7.8, color=ink_text, max_lines=3)
         row_y -= 8
 
-    materiality_y = table_y - 260
+    cursor_y = table_y - table_h - 14
     materiality_lines = material_topics[:] or ["Material topics have not been configured for this programme yet."]
     if sdg_focus:
         materiality_lines.append(f"SDG focus: {', '.join(sdg_focus)}")
-    _draw_box(34, materiality_y - 130, (width - 68 - 16) / 2, 130, "Materiality & SDG Focus", materiality_lines, fill=ink_panel_alt)
-
     stakeholder_lines = stakeholder_priorities[:] or ["Stakeholder priorities have not been configured for this programme yet."]
-    _draw_box(34 + (width - 68 - 16) / 2 + 16, materiality_y - 130, (width - 68 - 16) / 2, 130, "Stakeholder Priorities", stakeholder_lines, fill="#fffdf8")
+    materiality_row_h = max(_measure_box_height(materiality_lines, half_w), _measure_box_height(stakeholder_lines, half_w))
+    _draw_box(34, cursor_y - materiality_row_h, half_w, materiality_row_h, "Materiality & SDG Focus", materiality_lines, fill=ink_panel_alt)
+    _draw_box(34 + half_w + 16, cursor_y - materiality_row_h, half_w, materiality_row_h, "Stakeholder Priorities", stakeholder_lines, fill="#fffdf8")
+    cursor_y -= materiality_row_h + 14
 
-    sources_y = 80
-    sources_h = max(int(materiality_y - 130 - sources_y - 12), 128)
     sources_lines = [
         "Carbon methodology: IPCC Tier 1 default values; Chave, J. et al. (2014), \"Improved allometric models to "
         "estimate the aboveground biomass of tropical trees,\" Global Change Biology.",
         "Emissions/removals framing: GHG Protocol Corporate Value Chain (Scope 3) Accounting and Reporting "
         "Standard; removals disclosed separately from Scope 1/2/3 emissions.",
         "Disclosure standards: IFRS S1 (General Requirements), IFRS S2 (Climate-related Disclosures), issued by "
-        "the ISSB; GRI 304 (Biodiversity) and GRI 305 (Emissions) as interoperable sources per IFRS S1 SS56-58.",
+        "the ISSB; GRI 304 (Biodiversity) and GRI 305 (Emissions) as interoperable sources per IFRS S1 §56-58.",
         "Nigerian regulatory basis: FRC Nigeria, \"Roadmap Report for the Adoption of IFRS Sustainability "
         "Disclosure Standards in Nigeria\" (Amended 2026); FRC Sustainability Reporting Guideline 1 (SRG1), "
         "effective 16 Feb 2026.",
     ]
-    _draw_box(34, sources_y, width - 68, sources_h, "Methodology & Sources", sources_lines, fill="#fffdf8")
+    sources_h = _measure_box_height(sources_lines, full_w)
+    _draw_box(34, cursor_y - sources_h, full_w, sources_h, "Methodology & Sources", sources_lines, fill="#fffdf8")
 
     _draw_footer(c.getPageNumber())
     c.save()
