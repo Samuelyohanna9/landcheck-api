@@ -3934,8 +3934,6 @@ def render_green_sustainability_disclosure_pdf(
     ink_text = HexColor("#23312a")
     ink_muted = HexColor("#6a756d")
     ink_soft = HexColor("#dce7de")
-    ink_flag = HexColor("#8a4b23")
-    ink_flag_bg = HexColor("#f6e9dd")
 
     def _fmt_num(value, digits=2):
         try:
@@ -4110,7 +4108,10 @@ def render_green_sustainability_disclosure_pdf(
         "(SRG1) §2 and §15, that statement, and the disclosure it appears in, must be made and signed by "
         "the reporting entity's own management team.",
         "All figures below are drawn directly from LandCheck's field records, task-review workflow, and carbon "
-        "model — see the Methodology & Sources note on the final page for full citations.",
+        "model — see the Methodology & Sources note on the final page for full citations. Per SRG1 §5, this "
+        "export is structured, sourced data rather than photographs or narrative, which the guideline notes "
+        "cannot substitute for a material disclosure; field-evidence photography remains available separately "
+        "in LandCheck's CSR Programme Impact Report.",
     ]
     cursor_y = height - 136
     purpose_h = _measure_box_height(purpose_lines, full_w)
@@ -4135,16 +4136,6 @@ def render_green_sustainability_disclosure_pdf(
     _draw_box(34, cursor_y - row_h, half_w, row_h, "Disclosure Scope", scope_lines, fill=ink_panel_alt)
     _draw_box(34 + half_w + 16, cursor_y - row_h, half_w, row_h, "Regulatory Context", context_lines, fill="#fffdf8")
     cursor_y -= row_h + 14
-
-    flag_lines = [
-        "Per SRG1 §5, images, award photos, and narrative interviews are explicitly named examples of "
-        "information that can obscure a material sustainability disclosure and cannot substitute for it. "
-        "Every figure in this export is structured, sourced data — photographic field evidence remains "
-        "available separately in LandCheck's CSR Programme Impact Report and is not required to support "
-        "the metrics below.",
-    ]
-    flag_h = _measure_box_height(flag_lines, full_w)
-    _draw_box(34, cursor_y - flag_h, full_w, flag_h, "Why this export is structured, not narrative", flag_lines, fill=ink_flag_bg, title_color=ink_flag)
 
     _draw_footer(c.getPageNumber())
     c.showPage()
