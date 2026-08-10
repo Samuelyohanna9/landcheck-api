@@ -1985,7 +1985,23 @@ def _render_subdivision_clean_copy_pdf(
     beacon_style: str,
     road_width_m: float | None,
     area_overrides: dict[str, str] | None = None,
+    boundary_color: str | None = None,
+    grid_color: str | None = None,
+    text_color: str | None = None,
+    road_color: str | None = None,
+    river_color: str | None = None,
+    building_color: str | None = None,
+    building_hatch_type: str | None = None,
 ):
+    # None means "not overridden" - fall back to this clean-copy template's own established
+    # look so omitting these params leaves existing exports unchanged. grid_color is unused
+    # here (this template has no coordinate grid), kept only for signature symmetry.
+    boundary_color = boundary_color or "black"
+    text_color = text_color or "black"
+    road_color = road_color or "#f97316"
+    river_color = river_color or "#1d4ed8"
+    building_color = building_color or "black"
+    building_hatch_type = building_hatch_type or "horizontal"
     paper_name = str(paper_size or "A4").upper()
     if paper_name not in {"A4", "A3", "A2", "A1", "A0"}:
         paper_name = "A4"
@@ -2300,11 +2316,11 @@ def _render_subdivision_clean_copy_pdf(
 
         if rivers_wgs:
             gpd.GeoDataFrame(geometry=rivers_wgs, crs="EPSG:4326").to_crs(epsg=display_epsg).plot(
-                ax=ax, color="#1d4ed8", lw=max(0.8, 1.0 * font_scale), zorder=5
+                ax=ax, color=river_color, lw=max(0.8, 1.0 * font_scale), zorder=5
             )
 
         road_edge_lw = max(0.75, 0.9 * font_scale)
-        road_edge_color = "#f97316"
+        road_edge_color = road_color
         road_label_size = max(7, int(7.2 * font_scale))
         road_snap_tol = max(1.0, (5.0 / 1000.0) * scale_ratio)
         road_label_features: list[tuple[Any, str]] = []
@@ -2442,7 +2458,7 @@ def _render_subdivision_clean_copy_pdf(
                     mid.y,
                     road_name.upper(),
                     fontsize=fitted_size,
-                    color="black",
+                    color=road_color,
                     ha="center",
                     va="center",
                     rotation=angle,
@@ -2460,10 +2476,12 @@ def _render_subdivision_clean_copy_pdf(
                 display_epsg,
                 scale_ratio=scale_ratio,
                 font_scale=font_scale,
+                color=building_color,
+                hatch_type=building_hatch_type,
             )
             try:
                 gpd.GeoDataFrame(geometry=all_buildings, crs="EPSG:4326").to_crs(epsg=display_epsg).plot(
-                    ax=ax, facecolor="none", edgecolor="black", lw=max(0.8, 0.9 * font_scale), zorder=8
+                    ax=ax, facecolor="none", edgecolor=building_color, lw=max(0.8, 0.9 * font_scale), zorder=8
                 )
             except Exception:
                 pass
@@ -2485,14 +2503,14 @@ def _render_subdivision_clean_copy_pdf(
                 continue
             try:
                 x_vals, y_vals = geom_metric.exterior.xy
-                ax.plot(x_vals, y_vals, color="black", linewidth=max(0.85, 0.95 * font_scale), zorder=17)
+                ax.plot(x_vals, y_vals, color=boundary_color, linewidth=max(0.85, 0.95 * font_scale), zorder=17)
             except Exception:
                 continue
 
         boundary_mm = 0.7 if paper_name in ["A0"] else 0.5 if paper_name in ["A1"] else 0.35
         boundary_lw_pts = boundary_mm * 72.0 / 25.4
         gpd.GeoDataFrame(geometry=[parent_metric], crs=f"EPSG:{display_epsg}").plot(
-            ax=ax, facecolor="none", edgecolor="black", lw=boundary_lw_pts, zorder=20
+            ax=ax, facecolor="none", edgecolor=boundary_color, lw=boundary_lw_pts, zorder=20
         )
         ax.set_xlim(target_xlim)
         ax.set_ylim(target_ylim)
@@ -2512,6 +2530,8 @@ def _render_subdivision_clean_copy_pdf(
             beacon_style=beacon_style,
             show_station_names=False,
             show_beacons=False,
+            text_color=text_color,
+            boundary_color=boundary_color,
         )
 
         for row in child_metric_rows:
@@ -2530,7 +2550,7 @@ def _render_subdivision_clean_copy_pdf(
                 ha="center",
                 va="center",
                 fontsize=max(7, int(6.8 * font_scale)),
-                color="black",
+                color=text_color,
                 zorder=22,
                 fontfamily="DejaVu Serif",
                 weight="bold",
@@ -3312,6 +3332,13 @@ def _get_subdivision_batch_clean_copy_context(
     north_arrow_color: str = "blue",
     beacon_style: str = "cross",
     road_width_m: float | None = None,
+    boundary_color: str | None = None,
+    grid_color: str | None = None,
+    text_color: str | None = None,
+    road_color: str | None = None,
+    river_color: str | None = None,
+    building_color: str | None = None,
+    building_hatch_type: str | None = None,
 ) -> dict[str, Any]:
     batch_row = db.execute(
         text(
@@ -3375,6 +3402,13 @@ def _get_subdivision_batch_clean_copy_context(
         "north_arrow_color": str(north_arrow_color or "blue"),
         "beacon_style": str(beacon_style or "cross"),
         "road_width_m": float(road_width_m or 0.0),
+        "boundary_color": boundary_color or "",
+        "grid_color": grid_color or "",
+        "text_color": text_color or "",
+        "road_color": road_color or "",
+        "river_color": river_color or "",
+        "building_color": building_color or "",
+        "building_hatch_type": building_hatch_type or "",
         "area_overrides": sorted(area_override_map.items()),
     }
     cache_hash = hashlib.sha1(json.dumps(cache_key_payload, sort_keys=True).encode("utf-8")).hexdigest()[:12]
@@ -3399,6 +3433,13 @@ def _get_subdivision_batch_clean_copy_context(
         "north_arrow_color": str(north_arrow_color or "blue"),
         "beacon_style": str(beacon_style or "cross"),
         "road_width_m": road_width_m,
+        "boundary_color": boundary_color,
+        "grid_color": grid_color,
+        "text_color": text_color,
+        "road_color": road_color,
+        "river_color": river_color,
+        "building_color": building_color,
+        "building_hatch_type": building_hatch_type,
         "area_overrides": area_override_map,
     }
 
@@ -3433,6 +3474,13 @@ def _generate_subdivision_batch_clean_copy_pdf(
             north_arrow_color=str(context.get("north_arrow_color") or "blue"),
             beacon_style=str(context.get("beacon_style") or "cross"),
             road_width_m=context.get("road_width_m"),
+            boundary_color=context.get("boundary_color") or None,
+            grid_color=context.get("grid_color") or None,
+            text_color=context.get("text_color") or None,
+            road_color=context.get("road_color") or None,
+            river_color=context.get("river_color") or None,
+            building_color=context.get("building_color") or None,
+            building_hatch_type=context.get("building_hatch_type") or None,
             area_overrides=dict(context.get("area_overrides") or {}),
         )
     except HTTPException:
@@ -3505,6 +3553,13 @@ def _run_subdivision_batch_clean_copy_export_job(job_id: str):
             north_arrow_color=str(payload.get("north_arrow_color") or "blue"),
             beacon_style=str(payload.get("beacon_style") or "cross"),
             road_width_m=float(payload.get("road_width_m") or 0.0) if payload.get("road_width_m") is not None else None,
+            boundary_color=payload.get("boundary_color") or None,
+            grid_color=payload.get("grid_color") or None,
+            text_color=payload.get("text_color") or None,
+            road_color=payload.get("road_color") or None,
+            river_color=payload.get("river_color") or None,
+            building_color=payload.get("building_color") or None,
+            building_hatch_type=payload.get("building_hatch_type") or None,
         )
         export_path = _generate_subdivision_batch_clean_copy_pdf(db, context=context)
         _set_plot_export_job_status(
@@ -3885,6 +3940,13 @@ def create_plot_survey_report_export_job(
     beacon_style: str = Body("cross"),
     road_width_m: float | None = Body(None),
     road_width_override_m: float | None = Body(None),
+    boundary_color: str | None = Body(None),
+    grid_color: str | None = Body(None),
+    text_color: str | None = Body(None),
+    road_color: str | None = Body(None),
+    river_color: str | None = Body(None),
+    building_color: str | None = Body(None),
+    building_hatch_type: str | None = Body(None),
     template_name: str = Body(DEFAULT_TEMPLATE_NAME),
     adamawa_rof_no: str = Body(""),
     adamawa_owner_name: str = Body(""),
@@ -3919,6 +3981,13 @@ def create_plot_survey_report_export_job(
         "beacon_style": beacon_style,
         "road_width_m": road_width_m,
         "road_width_override_m": road_width_override_m,
+        "boundary_color": boundary_color,
+        "grid_color": grid_color,
+        "text_color": text_color,
+        "road_color": road_color,
+        "river_color": river_color,
+        "building_color": building_color,
+        "building_hatch_type": building_hatch_type,
         "template_name": template_name,
         "adamawa_rof_no": adamawa_rof_no,
         "adamawa_owner_name": adamawa_owner_name,
@@ -4155,6 +4224,13 @@ def create_subdivision_batch_clean_copy_export_job(
     north_arrow_color: str = Body("blue"),
     beacon_style: str = Body("cross"),
     road_width_m: float | None = Body(None),
+    boundary_color: str | None = Body(None),
+    grid_color: str | None = Body(None),
+    text_color: str | None = Body(None),
+    road_color: str | None = Body(None),
+    river_color: str | None = Body(None),
+    building_color: str | None = Body(None),
+    building_hatch_type: str | None = Body(None),
 ):
     payload = {
         "title_text": str(title_text or ""),
@@ -4167,6 +4243,13 @@ def create_subdivision_batch_clean_copy_export_job(
         "north_arrow_color": str(north_arrow_color or "blue"),
         "beacon_style": str(beacon_style or "cross"),
         "road_width_m": road_width_m,
+        "boundary_color": boundary_color,
+        "grid_color": grid_color,
+        "text_color": text_color,
+        "road_color": road_color,
+        "river_color": river_color,
+        "building_color": building_color,
+        "building_hatch_type": building_hatch_type,
     }
     context = _get_subdivision_batch_clean_copy_context(
         db,
@@ -4181,6 +4264,13 @@ def create_subdivision_batch_clean_copy_export_job(
         north_arrow_color=str(payload.get("north_arrow_color") or "blue"),
         beacon_style=str(payload.get("beacon_style") or "cross"),
         road_width_m=road_width_m,
+        boundary_color=boundary_color,
+        grid_color=grid_color,
+        text_color=text_color,
+        road_color=road_color,
+        river_color=river_color,
+        building_color=building_color,
+        building_hatch_type=building_hatch_type,
     )
     existing = db.execute(
         text(
@@ -4316,6 +4406,13 @@ def export_subdivision_batch_clean_copy_pdf(
     north_arrow_color: str = Body("blue"),
     beacon_style: str = Body("cross"),
     road_width_m: float | None = Body(None),
+    boundary_color: str | None = Body(None),
+    grid_color: str | None = Body(None),
+    text_color: str | None = Body(None),
+    road_color: str | None = Body(None),
+    river_color: str | None = Body(None),
+    building_color: str | None = Body(None),
+    building_hatch_type: str | None = Body(None),
 ):
     context = _get_subdivision_batch_clean_copy_context(
         db,
@@ -4330,6 +4427,13 @@ def export_subdivision_batch_clean_copy_pdf(
         north_arrow_color=north_arrow_color,
         beacon_style=beacon_style,
         road_width_m=road_width_m,
+        boundary_color=boundary_color,
+        grid_color=grid_color,
+        text_color=text_color,
+        road_color=road_color,
+        river_color=river_color,
+        building_color=building_color,
+        building_hatch_type=building_hatch_type,
     )
     cached_pdf_path = _generate_subdivision_batch_clean_copy_pdf(db, context=context)
     return _pdf_response_with_r2(
@@ -4899,6 +5003,13 @@ def download_plot_report_pdf(plot_id: int, db: Session = Depends(get_db), backgr
     beacon_style: str = Body("cross"),
     road_width_m: float | None = Body(None),
     road_width_override_m: float | None = Body(None),
+    boundary_color: str | None = Body(None),
+    grid_color: str | None = Body(None),
+    text_color: str | None = Body(None),
+    road_color: str | None = Body(None),
+    river_color: str | None = Body(None),
+    building_color: str | None = Body(None),
+    building_hatch_type: str | None = Body(None),
     template_name: str = Body(DEFAULT_TEMPLATE_NAME),
     adamawa_rof_no: str = Body(""),
     adamawa_owner_name: str = Body(""),
@@ -4985,6 +5096,13 @@ def download_plot_report_pdf(plot_id: int, db: Session = Depends(get_db), backgr
         beacon_style=beacon_style,
         road_width_m=road_width_m,
         road_width_override_m=road_width_override_m,
+        boundary_color=boundary_color,
+        grid_color=grid_color,
+        text_color=text_color,
+        road_color=road_color,
+        river_color=river_color,
+        building_color=building_color,
+        building_hatch_type=building_hatch_type,
         template_name=template_name,
         adamawa_rof_no=adamawa_rof_no,
         adamawa_owner_name=adamawa_owner_name,
@@ -5244,6 +5362,13 @@ def preview_plot_map(plot_id: int, db: Session = Depends(get_db), background_tas
     beacon_style: str = Body("cross"),
     road_width_m: float | None = Body(None),
     road_width_override_m: float | None = Body(None),
+    boundary_color: str | None = Body(None),
+    grid_color: str | None = Body(None),
+    text_color: str | None = Body(None),
+    road_color: str | None = Body(None),
+    river_color: str | None = Body(None),
+    building_color: str | None = Body(None),
+    building_hatch_type: str | None = Body(None),
     template_name: str = Body(DEFAULT_TEMPLATE_NAME),
     adamawa_rof_no: str = Body(""),
     adamawa_owner_name: str = Body(""),
@@ -5279,6 +5404,13 @@ def preview_plot_map(plot_id: int, db: Session = Depends(get_db), background_tas
         "beacon_style": beacon_style,
         "road_width_m": road_width_m,
         "road_width_override_m": road_width_override_m,
+        "boundary_color": boundary_color,
+        "grid_color": grid_color,
+        "text_color": text_color,
+        "road_color": road_color,
+        "river_color": river_color,
+        "building_color": building_color,
+        "building_hatch_type": building_hatch_type,
         "template_name": template_name,
         "adamawa_rof_no": adamawa_rof_no,
         "adamawa_owner_name": adamawa_owner_name,
@@ -5370,6 +5502,13 @@ def preview_plot_map(plot_id: int, db: Session = Depends(get_db), background_tas
         beacon_style=beacon_style,
         road_width_m=road_width_m,
         road_width_override_m=road_width_override_m,
+        boundary_color=boundary_color,
+        grid_color=grid_color,
+        text_color=text_color,
+        road_color=road_color,
+        river_color=river_color,
+        building_color=building_color,
+        building_hatch_type=building_hatch_type,
         preview_mode=True,
         template_name=template_name,
         adamawa_rof_no=adamawa_rof_no,

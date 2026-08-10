@@ -855,20 +855,21 @@ def _load_session_subject_mfa_row(db: Session, session) -> dict | None:
 def _update_session_mfa_flag(db: Session, session, *, verified: bool) -> None:
     metadata = dict(session.metadata or {})
     metadata["mfa_verified"] = bool(verified)
+    idle_minutes = auth_session_idle_minutes()
     db.execute(
         text(
             """
             UPDATE green_auth_sessions
             SET metadata = CAST(:metadata AS JSONB),
                 last_seen_at = NOW(),
-                idle_timeout_at = NOW() + (:idle_minutes * INTERVAL '1 minute')
+                idle_timeout_at = :idle_timeout_at
             WHERE session_uid = :session_uid
             """
         ),
         {
             "session_uid": session.session_uid,
             "metadata": json.dumps(metadata, default=str),
-            "idle_minutes": auth_session_idle_minutes(),
+            "idle_timeout_at": datetime.utcnow() + timedelta(minutes=idle_minutes) if idle_minutes else None,
         },
     )
     session.metadata = metadata

@@ -831,6 +831,7 @@ def draw_grid(
     font_scale=1.0,
     full_grid: bool = False,
     edge_ticks: bool = True,
+    color: str = "blue",
 ):
     xmin, xmax = ax.get_xlim()
     ymin, ymax = ax.get_ylim()
@@ -848,7 +849,7 @@ def draw_grid(
                     [xf, xf],
                     [0.0, 1.0],
                     transform=ax.transAxes,
-                    color="#5a78ff",
+                    color=color,
                     lw=0.52 * font_scale,
                     alpha=0.62,
                     zorder=1,
@@ -862,7 +863,7 @@ def draw_grid(
                     [0.0, 1.0],
                     [yf, yf],
                     transform=ax.transAxes,
-                    color="#5a78ff",
+                    color=color,
                     lw=0.52 * font_scale,
                     alpha=0.62,
                     zorder=1,
@@ -878,17 +879,17 @@ def draw_grid(
         for x in xs:
             if x < xmin or x > xmax:
                 continue
-            ax.plot([x, x], [ymax, ymax - tick_len], color="blue", lw=0.6*font_scale, alpha=0.5)
-            ax.plot([x, x], [ymin, ymin + tick_len], color="blue", lw=0.6*font_scale, alpha=0.5)
+            ax.plot([x, x], [ymax, ymax - tick_len], color=color, lw=0.6*font_scale, alpha=0.5)
+            ax.plot([x, x], [ymin, ymin + tick_len], color=color, lw=0.6*font_scale, alpha=0.5)
 
         for y in ys:
             if y < ymin or y > ymax:
                 continue
-            ax.plot([xmin, xmin + tick_len], [y, y], color="blue", lw=0.6*font_scale, alpha=0.5)
-            ax.plot([xmax, xmax - tick_len], [y, y], color="blue", lw=0.6*font_scale, alpha=0.5)
+            ax.plot([xmin, xmin + tick_len], [y, y], color=color, lw=0.6*font_scale, alpha=0.5)
+            ax.plot([xmax, xmax - tick_len], [y, y], color=color, lw=0.6*font_scale, alpha=0.5)
 
 
-def draw_coordinate_frame(ax, spacing: float, font_scale=1.0, first_point_info=None):
+def draw_coordinate_frame(ax, spacing: float, font_scale=1.0, first_point_info=None, color: str = "blue"):
     """
     Draw coordinate frame with grid labels.
     first_point_info: tuple (station_name, easting, northing) to display below the grid
@@ -924,7 +925,7 @@ def draw_coordinate_frame(ax, spacing: float, font_scale=1.0, first_point_info=N
     # Draw easting labels at the top - filter to only show labels within bounds
     for x in xs:
         if x >= xmin and x <= xmax:
-            ax.text(x, ymax + pad * 0.45, f"{int(round(x))}", ha="center", fontsize=int(7*font_scale), color="blue")
+            ax.text(x, ymax + pad * 0.45, f"{int(round(x))}", ha="center", fontsize=int(7*font_scale), color=color)
 
     # Draw northing labels on both sides - include ALL grid lines including the first one
     for y in ys:
@@ -936,7 +937,7 @@ def draw_coordinate_frame(ax, spacing: float, font_scale=1.0, first_point_info=N
                 va="center",
                 ha="right",
                 fontsize=int(7*font_scale),
-                color="blue",
+                color=color,
                 rotation=90,
             )
             ax.text(
@@ -946,7 +947,7 @@ def draw_coordinate_frame(ax, spacing: float, font_scale=1.0, first_point_info=N
                 va="center",
                 ha="left",
                 fontsize=int(7*font_scale),
-                color="blue",
+                color=color,
                 rotation=90,
             )
 
@@ -961,7 +962,7 @@ def draw_coordinate_frame(ax, spacing: float, font_scale=1.0, first_point_info=N
             ha="left",
             va="top",
             fontsize=int(8*font_scale),
-            color="black",
+            color=color,
             weight="normal",
             clip_on=False,
         )
@@ -981,6 +982,8 @@ def annotate_vertices(
     beacon_style: str = "cross",
     show_station_names: bool = True,
     show_beacons: bool = True,
+    text_color: str = "black",
+    boundary_color: str = "red",
 ):
     """
     Annotate vertices with station names and bearing/distance in RED.
@@ -1169,7 +1172,7 @@ def annotate_vertices(
                 p1.y + ny * station_offset,
                 label,
                 font_size=int(8 * font_scale),
-                color="black",
+                color=text_color,
                 rotation=0,
                 weight="normal",
                 scale_w=0.010,
@@ -1241,7 +1244,7 @@ def annotate_vertices(
             my,
             f"{format_bearing_dms(bearing)}\n{dist:.2f}m",
             font_size=int(7.0 * font_scale),
-            color="red",
+            color=boundary_color,
             rotation=ang,
             weight="normal",
             scale_w=0.02,
@@ -1317,13 +1320,73 @@ def _iter_polygons(geom):
             yield from _iter_polygons(part)
 
 
-def draw_building_hatch(ax, building_geoms, display_epsg: int, scale_ratio: int, font_scale=1.0):
+def _hatch_pass(ax, poly, minx, miny, maxx, maxy, spacing, direction, color, font_scale):
+    """Draw one set of parallel scan lines (horizontal/vertical/diagonal) clipped to poly."""
+    if direction == "vertical":
+        x = minx + spacing
+        while x < maxx:
+            scan = LineString([(x, miny - spacing), (x, maxy + spacing)])
+            clipped = poly.intersection(scan)
+            for segment in _iter_line_geometries(clipped):
+                try:
+                    x_vals, y_vals = segment.xy
+                    ax.plot(x_vals, y_vals, color=color, lw=0.7 * font_scale, zorder=7.5)
+                except Exception:
+                    continue
+            x += spacing
+    elif direction == "diagonal":
+        # 45-degree lines of the form y = x + c; perpendicular spacing between
+        # adjacent lines is spacing, so c must step by spacing * sqrt(2).
+        pad = max(maxx - minx, maxy - miny) + spacing
+        c_min = (miny - pad) - (maxx + pad)
+        c_max = (maxy + pad) - (minx - pad)
+        step = spacing * math.sqrt(2)
+        c = c_min
+        while c < c_max:
+            t0, t1 = minx - pad, maxx + pad
+            scan = LineString([(t0, t0 + c), (t1, t1 + c)])
+            clipped = poly.intersection(scan)
+            for segment in _iter_line_geometries(clipped):
+                try:
+                    x_vals, y_vals = segment.xy
+                    ax.plot(x_vals, y_vals, color=color, lw=0.7 * font_scale, zorder=7.5)
+                except Exception:
+                    continue
+            c += step
+    else:  # horizontal (default)
+        y = miny + spacing
+        while y < maxy:
+            scan = LineString([(minx - spacing, y), (maxx + spacing, y)])
+            clipped = poly.intersection(scan)
+            for segment in _iter_line_geometries(clipped):
+                try:
+                    x_vals, y_vals = segment.xy
+                    ax.plot(x_vals, y_vals, color=color, lw=0.7 * font_scale, zorder=7.5)
+                except Exception:
+                    continue
+            y += spacing
+
+
+def draw_building_hatch(
+    ax,
+    building_geoms,
+    display_epsg: int,
+    scale_ratio: int,
+    font_scale=1.0,
+    color: str = "black",
+    hatch_type: str = "horizontal",
+):
     """
-    Draw sparse horizontal hatch lines clipped to building polygons,
-    similar to common survey-plan building symbols.
+    Draw sparse hatch lines clipped to building polygons, similar to common
+    survey-plan building symbols. `hatch_type` is one of "horizontal" (default),
+    "vertical", "diagonal", or "cross" (horizontal + vertical passes combined).
     """
     if not building_geoms:
         return
+    normalized_hatch_type = str(hatch_type or "horizontal").strip().lower()
+    if normalized_hatch_type not in ("horizontal", "vertical", "diagonal", "cross"):
+        normalized_hatch_type = "horizontal"
+    directions = ["horizontal", "vertical"] if normalized_hatch_type == "cross" else [normalized_hatch_type]
     # Hatch spacing in map units derived from paper mm and scale ratio.
     # Example: 3.5 mm on paper => 3.5m at 1:1000, 7m at 1:2000.
     hatch_spacing_mm = 3.5
@@ -1341,17 +1404,8 @@ def draw_building_hatch(ax, building_geoms, display_epsg: int, scale_ratio: int,
                 height = maxy - miny
                 # Keep spacing scale-driven, but shrink for very small buildings so hatch is still visible.
                 spacing = min(base_spacing, max(0.4, height / 4.0))
-                y = miny + spacing
-                while y < maxy:
-                    scan = LineString([(minx - spacing, y), (maxx + spacing, y)])
-                    clipped = poly.intersection(scan)
-                    for segment in _iter_line_geometries(clipped):
-                        try:
-                            x_vals, y_vals = segment.xy
-                            ax.plot(x_vals, y_vals, color="black", lw=0.7 * font_scale, zorder=7.5)
-                        except Exception:
-                            continue
-                    y += spacing
+                for direction in directions:
+                    _hatch_pass(ax, poly, minx, miny, maxx, maxy, spacing, direction, color, font_scale)
             except Exception:
                 continue
 
@@ -1645,7 +1699,7 @@ def _collect_connected_road_edge_lines(road_geoms_with_width, snap_tol_m: float 
     return edge_lines
 
 
-def _draw_road_edges(ax, edge_lines, font_scale=1.0):
+def _draw_road_edges(ax, edge_lines, font_scale=1.0, color: str = "black"):
     if not edge_lines:
         return
     lw = 0.85 * font_scale
@@ -1666,7 +1720,7 @@ def _draw_road_edges(ax, edge_lines, font_scale=1.0):
             ax.plot(
                 x_vals,
                 y_vals,
-                color="black",
+                color=color,
                 lw=lw,
                 zorder=6,
                 solid_joinstyle="round",
@@ -1900,7 +1954,7 @@ def _draw_adamawa_header(
     )
 
 
-def _draw_adamawa_coordinate_labels(ax, font_scale=1.0):
+def _draw_adamawa_coordinate_labels(ax, font_scale=1.0, color: str = ADAMAWA_BLUE):
     xmin, xmax = ax.get_xlim()
     ymin, ymax = ax.get_ylim()
     left_e = f"{int(round(xmin))}mE"
@@ -1909,15 +1963,15 @@ def _draw_adamawa_coordinate_labels(ax, font_scale=1.0):
     bottom_n = f"{int(round(ymin))}mN"
     fs = max(6, int(6 * font_scale))
 
-    ax.text(0.0, 1.012, left_e, color=ADAMAWA_BLUE, fontsize=fs, ha="left", va="bottom", transform=ax.transAxes, fontfamily=ADAMAWA_FONT_FAMILY)
-    ax.text(1.0, 1.012, right_e, color=ADAMAWA_BLUE, fontsize=fs, ha="right", va="bottom", transform=ax.transAxes, fontfamily=ADAMAWA_FONT_FAMILY)
-    ax.text(0.0, -0.018, left_e, color=ADAMAWA_BLUE, fontsize=fs, ha="left", va="top", transform=ax.transAxes, fontfamily=ADAMAWA_FONT_FAMILY)
-    ax.text(1.0, -0.018, right_e, color=ADAMAWA_BLUE, fontsize=fs, ha="right", va="top", transform=ax.transAxes, fontfamily=ADAMAWA_FONT_FAMILY)
+    ax.text(0.0, 1.012, left_e, color=color, fontsize=fs, ha="left", va="bottom", transform=ax.transAxes, fontfamily=ADAMAWA_FONT_FAMILY)
+    ax.text(1.0, 1.012, right_e, color=color, fontsize=fs, ha="right", va="bottom", transform=ax.transAxes, fontfamily=ADAMAWA_FONT_FAMILY)
+    ax.text(0.0, -0.018, left_e, color=color, fontsize=fs, ha="left", va="top", transform=ax.transAxes, fontfamily=ADAMAWA_FONT_FAMILY)
+    ax.text(1.0, -0.018, right_e, color=color, fontsize=fs, ha="right", va="top", transform=ax.transAxes, fontfamily=ADAMAWA_FONT_FAMILY)
 
-    ax.text(-0.018, 1.0, top_n, color=ADAMAWA_BLUE, fontsize=fs, ha="right", va="top", rotation=90, transform=ax.transAxes, fontfamily=ADAMAWA_FONT_FAMILY)
-    ax.text(1.018, 1.0, top_n, color=ADAMAWA_BLUE, fontsize=fs, ha="left", va="top", rotation=90, transform=ax.transAxes, fontfamily=ADAMAWA_FONT_FAMILY)
-    ax.text(-0.018, 0.0, bottom_n, color=ADAMAWA_BLUE, fontsize=fs, ha="right", va="bottom", rotation=90, transform=ax.transAxes, fontfamily=ADAMAWA_FONT_FAMILY)
-    ax.text(1.018, 0.0, bottom_n, color=ADAMAWA_BLUE, fontsize=fs, ha="left", va="bottom", rotation=90, transform=ax.transAxes, fontfamily=ADAMAWA_FONT_FAMILY)
+    ax.text(-0.018, 1.0, top_n, color=color, fontsize=fs, ha="right", va="top", rotation=90, transform=ax.transAxes, fontfamily=ADAMAWA_FONT_FAMILY)
+    ax.text(1.018, 1.0, top_n, color=color, fontsize=fs, ha="left", va="top", rotation=90, transform=ax.transAxes, fontfamily=ADAMAWA_FONT_FAMILY)
+    ax.text(-0.018, 0.0, bottom_n, color=color, fontsize=fs, ha="right", va="bottom", rotation=90, transform=ax.transAxes, fontfamily=ADAMAWA_FONT_FAMILY)
+    ax.text(1.018, 0.0, bottom_n, color=color, fontsize=fs, ha="left", va="bottom", rotation=90, transform=ax.transAxes, fontfamily=ADAMAWA_FONT_FAMILY)
 
 
 def _draw_adamawa_map_frame(ax, font_scale=1.0):
@@ -2171,7 +2225,24 @@ def _render_plot_map_layout_adamawa(
     adamawa_surveyed_by_text: str = "",
     adamawa_disclaimer_text: str = DEFAULT_ADAMAWA_DISCLAIMER_TEXT,
     preview_mode: bool = False,
+    boundary_color: str | None = None,
+    grid_color: str | None = None,
+    text_color: str | None = None,
+    road_color: str | None = None,
+    river_color: str | None = None,
+    building_color: str | None = None,
+    building_hatch_type: str | None = None,
 ):
+    # None means "not overridden" - fall back to this template's own established defaults
+    # (which differ slightly from the general template's, e.g. its navy grid/coordinate color)
+    # so omitting these params leaves existing renders looking exactly as they do today.
+    boundary_color = boundary_color or "red"
+    grid_color = grid_color or ADAMAWA_BLUE
+    text_color = text_color or "black"
+    road_color = road_color or "black"
+    river_color = river_color or "#10a3df"
+    building_color = building_color or "black"
+    building_hatch_type = building_hatch_type or "horizontal"
     plot_wkb = db.execute(text("SELECT geom FROM plots WHERE id=:id"), {"id": plot_id}).scalar()
     if not plot_wkb:
         raise ValueError("Plot not found")
@@ -2308,7 +2379,7 @@ def _render_plot_map_layout_adamawa(
 
     if rivers:
         gpd.GeoDataFrame(geometry=rivers, crs="EPSG:4326").to_crs(epsg=display_epsg).plot(
-            ax=ax, color="#10a3df", lw=1.0 * font_scale, zorder=5
+            ax=ax, color=river_color, lw=1.0 * font_scale, zorder=5
         )
 
     road_edge_lines = []
@@ -2353,7 +2424,7 @@ def _render_plot_map_layout_adamawa(
         road_label_features.append((snapped_clipped, name))
 
     road_edge_lines = _collect_connected_road_edge_lines(road_geom_width, snap_tol_m=road_snap_tol)
-    _draw_road_edges(ax, road_edge_lines, font_scale=font_scale)
+    _draw_road_edges(ax, road_edge_lines, font_scale=font_scale, color=road_color)
 
     if road_label_features:
         seen_names = set()
@@ -2380,7 +2451,7 @@ def _render_plot_map_layout_adamawa(
                     mid.y,
                     label,
                     fontsize=max(5, int(6.0 * font_scale)),
-                    color="black",
+                    color=road_color,
                     ha="center",
                     va="center",
                     rotation=angle,
@@ -2396,20 +2467,23 @@ def _render_plot_map_layout_adamawa(
     if added_buildings:
         all_buildings.extend(added_buildings)
     if all_buildings:
-        draw_building_hatch(ax, all_buildings, display_epsg, scale_ratio=scale_ratio, font_scale=font_scale)
+        draw_building_hatch(
+            ax, all_buildings, display_epsg, scale_ratio=scale_ratio, font_scale=font_scale,
+            color=building_color, hatch_type=building_hatch_type,
+        )
         gpd.GeoDataFrame(geometry=all_buildings, crs="EPSG:4326").to_crs(epsg=display_epsg).plot(
-            ax=ax, facecolor="none", edgecolor="black", lw=0.9 * font_scale, zorder=8
+            ax=ax, facecolor="none", edgecolor=building_color, lw=0.9 * font_scale, zorder=8
         )
     if fences:
         draw_fences(ax, fences, display_epsg, scale_ratio=scale_ratio, font_scale=font_scale)
     fence_avoid_geom = build_fence_avoid_geom(fences, display_epsg=display_epsg, scale_ratio=scale_ratio)
 
-    gdf_plot.plot(ax=ax, facecolor="none", edgecolor="red", lw=1.1 * font_scale, zorder=20)
+    gdf_plot.plot(ax=ax, facecolor="none", edgecolor=boundary_color, lw=1.1 * font_scale, zorder=20)
     ax.set_xlim(target_xlim)
     ax.set_ylim(target_ylim)
 
     major = nice_grid_step(max(ax.get_xlim()[1] - ax.get_xlim()[0], ax.get_ylim()[1] - ax.get_ylim()[0]))
-    draw_grid(ax, poly, major / 5.0, major, font_scale, full_grid=False, edge_ticks=False)
+    draw_grid(ax, poly, major / 5.0, major, font_scale, full_grid=False, edge_ticks=False, color=grid_color)
 
     annotate_vertices(
         ax,
@@ -2422,6 +2496,8 @@ def _render_plot_map_layout_adamawa(
         scale_ratio=scale_ratio,
         boundary_poly=poly,
         beacon_style=beacon_style,
+        text_color=text_color,
+        boundary_color=boundary_color,
     )
     area_label_point = None
     try:
@@ -2449,7 +2525,7 @@ def _render_plot_map_layout_adamawa(
     )
 
     _draw_adamawa_map_frame(ax, font_scale=font_scale)
-    _draw_adamawa_coordinate_labels(ax, font_scale=font_scale)
+    _draw_adamawa_coordinate_labels(ax, font_scale=font_scale, color=grid_color)
     _draw_adamawa_north_arrow(
         ax,
         font_scale=font_scale,
@@ -2539,6 +2615,13 @@ def render_plot_map_layout(
     adamawa_plan_no: str = "",
     adamawa_surveyed_by_text: str = "",
     adamawa_disclaimer_text: str = DEFAULT_ADAMAWA_DISCLAIMER_TEXT,
+    boundary_color: str | None = None,
+    grid_color: str | None = None,
+    text_color: str | None = None,
+    road_color: str | None = None,
+    river_color: str | None = None,
+    building_color: str | None = None,
+    building_hatch_type: str | None = None,
 ):
     if str(template_name or "general").strip().lower() == "adamawa_osg":
         _render_plot_map_layout_adamawa(
@@ -2576,8 +2659,25 @@ def render_plot_map_layout(
             adamawa_surveyed_by_text=adamawa_surveyed_by_text,
             adamawa_disclaimer_text=adamawa_disclaimer_text,
             preview_mode=preview_mode,
+            boundary_color=boundary_color,
+            grid_color=grid_color,
+            text_color=text_color,
+            road_color=road_color,
+            river_color=river_color,
+            building_color=building_color,
+            building_hatch_type=building_hatch_type,
         )
         return
+
+    # None means "not overridden" - fall back to the general template's own established
+    # defaults so omitting these params leaves existing renders looking exactly as they do today.
+    boundary_color = boundary_color or "red"
+    grid_color = grid_color or "blue"
+    text_color = text_color or "black"
+    road_color = road_color or "black"
+    river_color = river_color or "blue"
+    building_color = building_color or "black"
+    building_hatch_type = building_hatch_type or "horizontal"
 
     plot_wkb = db.execute(text("SELECT geom FROM plots WHERE id=:id"), {"id": plot_id}).scalar()
     rows = db.execute(
@@ -2719,7 +2819,7 @@ def render_plot_map_layout(
 
     if rivers:
         gpd.GeoDataFrame(geometry=rivers, crs="EPSG:4326").to_crs(epsg=display_epsg).plot(
-            ax=ax, color="blue", lw=1.2*font_scale, zorder=5
+            ax=ax, color=river_color, lw=1.2*font_scale, zorder=5
         )
 
     from shapely.geometry import box
@@ -2858,7 +2958,7 @@ def render_plot_map_layout(
         font_scale=font_scale,
     )
 
-    _draw_road_edges(ax, road_edge_lines, font_scale=font_scale)
+    _draw_road_edges(ax, road_edge_lines, font_scale=font_scale, color=road_color)
 
     all_buildings = []
     if buildings:
@@ -2866,15 +2966,18 @@ def render_plot_map_layout(
     if added_buildings:
         all_buildings.extend(added_buildings)
     if all_buildings:
-        draw_building_hatch(ax, all_buildings, display_epsg, scale_ratio=scale_ratio, font_scale=font_scale)
+        draw_building_hatch(
+            ax, all_buildings, display_epsg, scale_ratio=scale_ratio, font_scale=font_scale,
+            color=building_color, hatch_type=building_hatch_type,
+        )
 
     if buildings:
         gpd.GeoDataFrame(geometry=buildings, crs="EPSG:4326").to_crs(epsg=display_epsg).plot(
-            ax=ax, facecolor="none", edgecolor="black", lw=1*font_scale, zorder=8
+            ax=ax, facecolor="none", edgecolor=building_color, lw=1*font_scale, zorder=8
         )
     if added_buildings:
         gpd.GeoDataFrame(geometry=added_buildings, crs="EPSG:4326").to_crs(epsg=display_epsg).plot(
-            ax=ax, facecolor="none", edgecolor="black", lw=1*font_scale, zorder=9
+            ax=ax, facecolor="none", edgecolor=building_color, lw=1*font_scale, zorder=9
         )
     if fences or added_fences:
         draw_fences(
@@ -2894,19 +2997,19 @@ def render_plot_map_layout(
     paper_name = paper_config["name"]
     boundary_mm = 0.7 if paper_name in ["A0"] else 0.5 if paper_name in ["A1"] else 0.35
     boundary_lw_pts = boundary_mm * 72.0 / 25.4
-    gdf_plot.plot(ax=ax, facecolor="none", edgecolor="red", lw=boundary_lw_pts, zorder=20)
+    gdf_plot.plot(ax=ax, facecolor="none", edgecolor=boundary_color, lw=boundary_lw_pts, zorder=20)
     ax.set_xlim(target_xlim)
     ax.set_ylim(target_ylim)
 
     major = nice_grid_step(max(ax.get_xlim()[1] - ax.get_xlim()[0], ax.get_ylim()[1] - ax.get_ylim()[0]))
-    draw_grid(ax, poly, major / 5.0, major, font_scale)
+    draw_grid(ax, poly, major / 5.0, major, font_scale, color=grid_color)
 
     # Get first point coordinates for display
     first_coords = list(poly.exterior.coords)[0]
     first_station = station_names[0] if station_names and len(station_names) > 0 else "A"
     first_point_info = (first_station, first_coords[0], first_coords[1])
 
-    draw_coordinate_frame(ax, major, font_scale, first_point_info)
+    draw_coordinate_frame(ax, major, font_scale, first_point_info, color=grid_color)
     skipped_entries, boundary_label_boxes = annotate_vertices(
         ax,
         poly,
@@ -2918,6 +3021,8 @@ def render_plot_map_layout(
         scale_ratio=scale_ratio,
         boundary_poly=poly,
         beacon_style=beacon_style,
+        text_color=text_color,
+        boundary_color=boundary_color,
     )
     draw_skipped_table(ax, skipped_entries, font_scale)
 
@@ -2971,7 +3076,7 @@ def render_plot_map_layout(
                     mid.y,
                     name,
                     fontsize=road_label_size,
-                    color="black",
+                    color=road_color,
                     ha="center",
                     va="center",
                     rotation=angle,

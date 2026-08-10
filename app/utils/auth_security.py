@@ -73,8 +73,10 @@ def auth_session_ttl_hours() -> int:
     return max(_env_int("LANDCHECK_AUTH_SESSION_TTL_HOURS", 24), 1)
 
 
-def auth_session_idle_minutes() -> int:
-    return max(_env_int("LANDCHECK_AUTH_SESSION_IDLE_MINUTES", 240), 15)
+def auth_session_idle_minutes() -> int | None:
+    # Idle-expiry logout is intentionally disabled. Sessions now rely on explicit logout,
+    # revocation, and the hard expiry window only.
+    return None
 
 
 def activity_log_retention_days() -> int:
@@ -357,7 +359,8 @@ def issue_auth_session(
     ensure_auth_security_schema()
     issued_at = _utcnow()
     expires_at = issued_at + timedelta(hours=auth_session_ttl_hours())
-    idle_timeout_at = issued_at + timedelta(minutes=auth_session_idle_minutes())
+    idle_minutes = auth_session_idle_minutes()
+    idle_timeout_at = issued_at + timedelta(minutes=idle_minutes) if idle_minutes else None
     access_token = secrets.token_urlsafe(48)
     session_uid = f"SES-{secrets.token_hex(12).upper()}"
     request_metadata = dict(metadata or {})
@@ -447,7 +450,7 @@ def issue_auth_session(
         "access_token": access_token,
         "session_uid": session_uid,
         "expires_at": expires_at.replace(microsecond=0).isoformat() + "Z",
-        "idle_timeout_at": idle_timeout_at.replace(microsecond=0).isoformat() + "Z",
+        "idle_timeout_at": idle_timeout_at.replace(microsecond=0).isoformat() + "Z" if idle_timeout_at else None,
         "mfa_enabled": bool(mfa_enabled),
         "mfa_verified": bool(mfa_verified),
     }
@@ -630,7 +633,7 @@ def resolve_request_session(db: Session, request: Request, *, touch: bool = True
         mfa_verified = not mfa_enabled or bool(metadata.get("mfa_verified"))
 
     if touch:
-        next_idle_timeout_at = now + timedelta(minutes=auth_session_idle_minutes())
+        next_idle_timeout_at = None
         db.execute(
             text(
                 """
