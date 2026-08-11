@@ -1992,6 +1992,10 @@ def _render_subdivision_clean_copy_pdf(
     river_color: str | None = None,
     building_color: str | None = None,
     building_hatch_type: str | None = None,
+    station_font: str | None = None,
+    station_size: int | None = None,
+    bearing_font: str | None = None,
+    bearing_size: int | None = None,
 ):
     # None means "not overridden" - fall back to this clean-copy template's own established
     # look so omitting these params leaves existing exports unchanged. grid_color is unused
@@ -2001,7 +2005,7 @@ def _render_subdivision_clean_copy_pdf(
     road_color = road_color or "#f97316"
     river_color = river_color or "#1d4ed8"
     building_color = building_color or "black"
-    building_hatch_type = building_hatch_type or "horizontal"
+    building_hatch_type = building_hatch_type or "diagonal"
     paper_name = str(paper_size or "A4").upper()
     if paper_name not in {"A4", "A3", "A2", "A1", "A0"}:
         paper_name = "A4"
@@ -2532,6 +2536,10 @@ def _render_subdivision_clean_copy_pdf(
             show_beacons=False,
             text_color=text_color,
             boundary_color=boundary_color,
+            station_font=station_font,
+            station_size=station_size,
+            bearing_font=bearing_font,
+            bearing_size=bearing_size,
         )
 
         for row in child_metric_rows:
@@ -3339,6 +3347,10 @@ def _get_subdivision_batch_clean_copy_context(
     river_color: str | None = None,
     building_color: str | None = None,
     building_hatch_type: str | None = None,
+    station_font: str | None = None,
+    station_size: int | None = None,
+    bearing_font: str | None = None,
+    bearing_size: int | None = None,
 ) -> dict[str, Any]:
     batch_row = db.execute(
         text(
@@ -3409,6 +3421,10 @@ def _get_subdivision_batch_clean_copy_context(
         "river_color": river_color or "",
         "building_color": building_color or "",
         "building_hatch_type": building_hatch_type or "",
+        "station_font": station_font or "",
+        "station_size": station_size or 0,
+        "bearing_font": bearing_font or "",
+        "bearing_size": bearing_size or 0,
         "area_overrides": sorted(area_override_map.items()),
     }
     cache_hash = hashlib.sha1(json.dumps(cache_key_payload, sort_keys=True).encode("utf-8")).hexdigest()[:12]
@@ -3440,6 +3456,10 @@ def _get_subdivision_batch_clean_copy_context(
         "river_color": river_color,
         "building_color": building_color,
         "building_hatch_type": building_hatch_type,
+        "station_font": station_font,
+        "station_size": station_size,
+        "bearing_font": bearing_font,
+        "bearing_size": bearing_size,
         "area_overrides": area_override_map,
     }
 
@@ -3481,6 +3501,10 @@ def _generate_subdivision_batch_clean_copy_pdf(
             river_color=context.get("river_color") or None,
             building_color=context.get("building_color") or None,
             building_hatch_type=context.get("building_hatch_type") or None,
+            station_font=context.get("station_font") or None,
+            station_size=context.get("station_size") or None,
+            bearing_font=context.get("bearing_font") or None,
+            bearing_size=context.get("bearing_size") or None,
             area_overrides=dict(context.get("area_overrides") or {}),
         )
     except HTTPException:
@@ -3560,6 +3584,10 @@ def _run_subdivision_batch_clean_copy_export_job(job_id: str):
             river_color=payload.get("river_color") or None,
             building_color=payload.get("building_color") or None,
             building_hatch_type=payload.get("building_hatch_type") or None,
+            station_font=payload.get("station_font") or None,
+            station_size=payload.get("station_size") or None,
+            bearing_font=payload.get("bearing_font") or None,
+            bearing_size=payload.get("bearing_size") or None,
         )
         export_path = _generate_subdivision_batch_clean_copy_pdf(db, context=context)
         _set_plot_export_job_status(
@@ -3947,6 +3975,16 @@ def create_plot_survey_report_export_job(
     river_color: str | None = Body(None),
     building_color: str | None = Body(None),
     building_hatch_type: str | None = Body(None),
+    title_font: str | None = Body(None),
+    title_size: int | None = Body(None),
+    grid_font: str | None = Body(None),
+    grid_size: int | None = Body(None),
+    station_font: str | None = Body(None),
+    station_size: int | None = Body(None),
+    bearing_font: str | None = Body(None),
+    bearing_size: int | None = Body(None),
+    area_font: str | None = Body(None),
+    area_size: int | None = Body(None),
     template_name: str = Body(DEFAULT_TEMPLATE_NAME),
     adamawa_rof_no: str = Body(""),
     adamawa_owner_name: str = Body(""),
@@ -3988,6 +4026,16 @@ def create_plot_survey_report_export_job(
         "river_color": river_color,
         "building_color": building_color,
         "building_hatch_type": building_hatch_type,
+        "title_font": title_font,
+        "title_size": title_size,
+        "grid_font": grid_font,
+        "grid_size": grid_size,
+        "station_font": station_font,
+        "station_size": station_size,
+        "bearing_font": bearing_font,
+        "bearing_size": bearing_size,
+        "area_font": area_font,
+        "area_size": area_size,
         "template_name": template_name,
         "adamawa_rof_no": adamawa_rof_no,
         "adamawa_owner_name": adamawa_owner_name,
@@ -4231,6 +4279,10 @@ def create_subdivision_batch_clean_copy_export_job(
     river_color: str | None = Body(None),
     building_color: str | None = Body(None),
     building_hatch_type: str | None = Body(None),
+    station_font: str | None = Body(None),
+    station_size: int | None = Body(None),
+    bearing_font: str | None = Body(None),
+    bearing_size: int | None = Body(None),
 ):
     payload = {
         "title_text": str(title_text or ""),
@@ -4250,6 +4302,10 @@ def create_subdivision_batch_clean_copy_export_job(
         "river_color": river_color,
         "building_color": building_color,
         "building_hatch_type": building_hatch_type,
+        "station_font": station_font,
+        "station_size": station_size,
+        "bearing_font": bearing_font,
+        "bearing_size": bearing_size,
     }
     context = _get_subdivision_batch_clean_copy_context(
         db,
@@ -4271,6 +4327,10 @@ def create_subdivision_batch_clean_copy_export_job(
         river_color=river_color,
         building_color=building_color,
         building_hatch_type=building_hatch_type,
+        station_font=station_font,
+        station_size=station_size,
+        bearing_font=bearing_font,
+        bearing_size=bearing_size,
     )
     existing = db.execute(
         text(
@@ -4413,6 +4473,10 @@ def export_subdivision_batch_clean_copy_pdf(
     river_color: str | None = Body(None),
     building_color: str | None = Body(None),
     building_hatch_type: str | None = Body(None),
+    station_font: str | None = Body(None),
+    station_size: int | None = Body(None),
+    bearing_font: str | None = Body(None),
+    bearing_size: int | None = Body(None),
 ):
     context = _get_subdivision_batch_clean_copy_context(
         db,
@@ -4434,6 +4498,10 @@ def export_subdivision_batch_clean_copy_pdf(
         river_color=river_color,
         building_color=building_color,
         building_hatch_type=building_hatch_type,
+        station_font=station_font,
+        station_size=station_size,
+        bearing_font=bearing_font,
+        bearing_size=bearing_size,
     )
     cached_pdf_path = _generate_subdivision_batch_clean_copy_pdf(db, context=context)
     return _pdf_response_with_r2(
@@ -5010,6 +5078,16 @@ def download_plot_report_pdf(plot_id: int, db: Session = Depends(get_db), backgr
     river_color: str | None = Body(None),
     building_color: str | None = Body(None),
     building_hatch_type: str | None = Body(None),
+    title_font: str | None = Body(None),
+    title_size: int | None = Body(None),
+    grid_font: str | None = Body(None),
+    grid_size: int | None = Body(None),
+    station_font: str | None = Body(None),
+    station_size: int | None = Body(None),
+    bearing_font: str | None = Body(None),
+    bearing_size: int | None = Body(None),
+    area_font: str | None = Body(None),
+    area_size: int | None = Body(None),
     template_name: str = Body(DEFAULT_TEMPLATE_NAME),
     adamawa_rof_no: str = Body(""),
     adamawa_owner_name: str = Body(""),
@@ -5103,6 +5181,16 @@ def download_plot_report_pdf(plot_id: int, db: Session = Depends(get_db), backgr
         river_color=river_color,
         building_color=building_color,
         building_hatch_type=building_hatch_type,
+        title_font=title_font,
+        title_size=title_size,
+        grid_font=grid_font,
+        grid_size=grid_size,
+        station_font=station_font,
+        station_size=station_size,
+        bearing_font=bearing_font,
+        bearing_size=bearing_size,
+        area_font=area_font,
+        area_size=area_size,
         template_name=template_name,
         adamawa_rof_no=adamawa_rof_no,
         adamawa_owner_name=adamawa_owner_name,
@@ -5369,6 +5457,16 @@ def preview_plot_map(plot_id: int, db: Session = Depends(get_db), background_tas
     river_color: str | None = Body(None),
     building_color: str | None = Body(None),
     building_hatch_type: str | None = Body(None),
+    title_font: str | None = Body(None),
+    title_size: int | None = Body(None),
+    grid_font: str | None = Body(None),
+    grid_size: int | None = Body(None),
+    station_font: str | None = Body(None),
+    station_size: int | None = Body(None),
+    bearing_font: str | None = Body(None),
+    bearing_size: int | None = Body(None),
+    area_font: str | None = Body(None),
+    area_size: int | None = Body(None),
     template_name: str = Body(DEFAULT_TEMPLATE_NAME),
     adamawa_rof_no: str = Body(""),
     adamawa_owner_name: str = Body(""),
@@ -5411,6 +5509,16 @@ def preview_plot_map(plot_id: int, db: Session = Depends(get_db), background_tas
         "river_color": river_color,
         "building_color": building_color,
         "building_hatch_type": building_hatch_type,
+        "title_font": title_font,
+        "title_size": title_size,
+        "grid_font": grid_font,
+        "grid_size": grid_size,
+        "station_font": station_font,
+        "station_size": station_size,
+        "bearing_font": bearing_font,
+        "bearing_size": bearing_size,
+        "area_font": area_font,
+        "area_size": area_size,
         "template_name": template_name,
         "adamawa_rof_no": adamawa_rof_no,
         "adamawa_owner_name": adamawa_owner_name,
@@ -5509,6 +5617,16 @@ def preview_plot_map(plot_id: int, db: Session = Depends(get_db), background_tas
         river_color=river_color,
         building_color=building_color,
         building_hatch_type=building_hatch_type,
+        title_font=title_font,
+        title_size=title_size,
+        grid_font=grid_font,
+        grid_size=grid_size,
+        station_font=station_font,
+        station_size=station_size,
+        bearing_font=bearing_font,
+        bearing_size=bearing_size,
+        area_font=area_font,
+        area_size=area_size,
         preview_mode=True,
         template_name=template_name,
         adamawa_rof_no=adamawa_rof_no,

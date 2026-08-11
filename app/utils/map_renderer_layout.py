@@ -185,16 +185,27 @@ def draw_sheet_frame(fig):
     )
 
 
-def draw_title_block(fig, title_text, plot_id, area_m2, scale_text, location_text, lga_text, state_text, font_scale=1.0):
+def draw_title_block(
+    fig, title_text, plot_id, area_m2, scale_text, location_text, lga_text, state_text, font_scale=1.0,
+    title_font: str | None = None, title_size: int | None = None,
+    area_font: str | None = None, area_size: int | None = None,
+):
     # Plot number at top right corner for identification
     fig.text(0.94, 0.95, f"Plot #{plot_id}", ha="right", fontsize=int(8*font_scale), weight="bold",)
 
     y = 0.955
-    fig.text(0.5, y, str(title_text), ha="center", fontsize=int(12*font_scale), weight="bold")
+    fig.text(
+        0.5, y, str(title_text), ha="center", fontsize=title_size if title_size else int(12*font_scale), weight="bold",
+        **({"fontfamily": title_font} if title_font else {}),
+    )
     fig.text(0.5, y - 0.030, f"LOCATED AT: {location_text}", ha="center", fontsize=int(9*font_scale))
     fig.text(0.5, y - 0.050, str(lga_text), ha="center", fontsize=int(9*font_scale))
     fig.text(0.5, y - 0.070, str(state_text), ha="center", fontsize=int(9*font_scale))
-    fig.text(0.5, y - 0.100, f"AREA = {area_m2/10000:.4f} HA.", ha="center", fontsize=int(9*font_scale), color="red")
+    fig.text(
+        0.5, y - 0.100, f"AREA = {area_m2/10000:.4f} HA.", ha="center",
+        fontsize=area_size if area_size else int(9*font_scale), color="red",
+        **({"fontfamily": area_font} if area_font else {}),
+    )
     fig.text(0.5, y - 0.120, f"SCALE  {scale_text}", ha="center", fontsize=int(9*font_scale))
 
 
@@ -889,11 +900,16 @@ def draw_grid(
             ax.plot([xmax, xmax - tick_len], [y, y], color=color, lw=0.6*font_scale, alpha=0.5)
 
 
-def draw_coordinate_frame(ax, spacing: float, font_scale=1.0, first_point_info=None, color: str = "blue"):
+def draw_coordinate_frame(
+    ax, spacing: float, font_scale=1.0, first_point_info=None, color: str = "blue",
+    grid_font: str | None = None, grid_size: int | None = None,
+):
     """
     Draw coordinate frame with grid labels.
     first_point_info: tuple (station_name, easting, northing) to display below the grid
     """
+    text_kwargs = {"fontfamily": grid_font} if grid_font else {}
+    label_fontsize = grid_size if grid_size else int(7*font_scale)
     xmin, xmax = ax.get_xlim()
     ymin, ymax = ax.get_ylim()
     pad = (xmax - xmin) * 0.035
@@ -925,7 +941,7 @@ def draw_coordinate_frame(ax, spacing: float, font_scale=1.0, first_point_info=N
     # Draw easting labels at the top - filter to only show labels within bounds
     for x in xs:
         if x >= xmin and x <= xmax:
-            ax.text(x, ymax + pad * 0.45, f"{int(round(x))}", ha="center", fontsize=int(7*font_scale), color=color)
+            ax.text(x, ymax + pad * 0.45, f"{int(round(x))}", ha="center", fontsize=label_fontsize, color=color, **text_kwargs)
 
     # Draw northing labels on both sides - include ALL grid lines including the first one
     for y in ys:
@@ -936,9 +952,10 @@ def draw_coordinate_frame(ax, spacing: float, font_scale=1.0, first_point_info=N
                 f"{int(round(y))}",
                 va="center",
                 ha="right",
-                fontsize=int(7*font_scale),
+                fontsize=label_fontsize,
                 color=color,
                 rotation=90,
+                **text_kwargs,
             )
             ax.text(
                 xmax + pad * 0.45,
@@ -946,9 +963,10 @@ def draw_coordinate_frame(ax, spacing: float, font_scale=1.0, first_point_info=N
                 f"{int(round(y))}",
                 va="center",
                 ha="left",
-                fontsize=int(7*font_scale),
+                fontsize=label_fontsize,
                 color=color,
                 rotation=90,
+                **text_kwargs,
             )
 
     # Add first point coordinates text to the LEFT of the grid frame (to avoid scale bar overlap)
@@ -961,10 +979,11 @@ def draw_coordinate_frame(ax, spacing: float, font_scale=1.0, first_point_info=N
             coord_text,
             ha="left",
             va="top",
-            fontsize=int(8*font_scale),
+            fontsize=grid_size if grid_size else int(8*font_scale),
             color=color,
             weight="normal",
             clip_on=False,
+            **text_kwargs,
         )
 
 
@@ -984,6 +1003,10 @@ def annotate_vertices(
     show_beacons: bool = True,
     text_color: str = "black",
     boundary_color: str = "red",
+    station_font: str | None = None,
+    station_size: int | None = None,
+    bearing_font: str | None = None,
+    bearing_size: int | None = None,
 ):
     """
     Annotate vertices with station names and bearing/distance in RED.
@@ -1027,6 +1050,7 @@ def annotate_vertices(
         normal_offset_mult: float = 1.0,
         line_spacing: float = 0.95,
         allow_center: bool = True,
+        font_family=None,
     ):
         offset_m = max(2.0, (6.0 / 1000.0) * scale_ratio) * max(0.6, normal_offset_mult)
         candidates = [(x, y)]
@@ -1088,6 +1112,7 @@ def annotate_vertices(
                     multialignment="center",
                     linespacing=line_spacing,
                     zorder=25,
+                    **({"fontfamily": font_family} if font_family else {}),
                 )
                 placed_boxes.append(bx)
                 return True
@@ -1171,13 +1196,14 @@ def annotate_vertices(
                 p1.x + nx * station_offset,
                 p1.y + ny * station_offset,
                 label,
-                font_size=int(8 * font_scale),
+                font_size=station_size if station_size else int(8 * font_scale),
                 color=text_color,
                 rotation=0,
                 weight="normal",
                 scale_w=0.010,
                 scale_h=0.016,
                 normal=None,
+                font_family=station_font,
             )
 
         bearing, dist = calculate_bearing_deg(p1, p2), p1.distance(p2)
@@ -1243,7 +1269,7 @@ def annotate_vertices(
             mx,
             my,
             f"{format_bearing_dms(bearing)}\n{dist:.2f}m",
-            font_size=int(7.0 * font_scale),
+            font_size=bearing_size if bearing_size else int(7.0 * font_scale),
             color=boundary_color,
             rotation=ang,
             weight="normal",
@@ -1253,6 +1279,7 @@ def annotate_vertices(
             normal_offset_mult=label_offset_mult,
             line_spacing=label_line_spacing,
             allow_center=not fence_edge,
+            font_family=bearing_font,
         )
 
     return skipped, placed_boxes
@@ -1374,7 +1401,7 @@ def draw_building_hatch(
     scale_ratio: int,
     font_scale=1.0,
     color: str = "black",
-    hatch_type: str = "horizontal",
+    hatch_type: str = "diagonal",
 ):
     """
     Draw sparse hatch lines clipped to building polygons, similar to common
@@ -1383,9 +1410,9 @@ def draw_building_hatch(
     """
     if not building_geoms:
         return
-    normalized_hatch_type = str(hatch_type or "horizontal").strip().lower()
+    normalized_hatch_type = str(hatch_type or "diagonal").strip().lower()
     if normalized_hatch_type not in ("horizontal", "vertical", "diagonal", "cross"):
-        normalized_hatch_type = "horizontal"
+        normalized_hatch_type = "diagonal"
     directions = ["horizontal", "vertical"] if normalized_hatch_type == "cross" else [normalized_hatch_type]
     # Hatch spacing in map units derived from paper mm and scale ratio.
     # Example: 3.5 mm on paper => 3.5m at 1:1000, 7m at 1:2000.
@@ -1954,24 +1981,28 @@ def _draw_adamawa_header(
     )
 
 
-def _draw_adamawa_coordinate_labels(ax, font_scale=1.0, color: str = ADAMAWA_BLUE):
+def _draw_adamawa_coordinate_labels(
+    ax, font_scale=1.0, color: str = ADAMAWA_BLUE,
+    grid_font: str | None = None, grid_size: int | None = None,
+):
     xmin, xmax = ax.get_xlim()
     ymin, ymax = ax.get_ylim()
     left_e = f"{int(round(xmin))}mE"
     right_e = f"{int(round(xmax))}mE"
     top_n = f"{int(round(ymax))}mN"
     bottom_n = f"{int(round(ymin))}mN"
-    fs = max(6, int(6 * font_scale))
+    fs = grid_size if grid_size else max(6, int(6 * font_scale))
+    family = grid_font or ADAMAWA_FONT_FAMILY
 
-    ax.text(0.0, 1.012, left_e, color=color, fontsize=fs, ha="left", va="bottom", transform=ax.transAxes, fontfamily=ADAMAWA_FONT_FAMILY)
-    ax.text(1.0, 1.012, right_e, color=color, fontsize=fs, ha="right", va="bottom", transform=ax.transAxes, fontfamily=ADAMAWA_FONT_FAMILY)
-    ax.text(0.0, -0.018, left_e, color=color, fontsize=fs, ha="left", va="top", transform=ax.transAxes, fontfamily=ADAMAWA_FONT_FAMILY)
-    ax.text(1.0, -0.018, right_e, color=color, fontsize=fs, ha="right", va="top", transform=ax.transAxes, fontfamily=ADAMAWA_FONT_FAMILY)
+    ax.text(0.0, 1.012, left_e, color=color, fontsize=fs, ha="left", va="bottom", transform=ax.transAxes, fontfamily=family)
+    ax.text(1.0, 1.012, right_e, color=color, fontsize=fs, ha="right", va="bottom", transform=ax.transAxes, fontfamily=family)
+    ax.text(0.0, -0.018, left_e, color=color, fontsize=fs, ha="left", va="top", transform=ax.transAxes, fontfamily=family)
+    ax.text(1.0, -0.018, right_e, color=color, fontsize=fs, ha="right", va="top", transform=ax.transAxes, fontfamily=family)
 
-    ax.text(-0.018, 1.0, top_n, color=color, fontsize=fs, ha="right", va="top", rotation=90, transform=ax.transAxes, fontfamily=ADAMAWA_FONT_FAMILY)
-    ax.text(1.018, 1.0, top_n, color=color, fontsize=fs, ha="left", va="top", rotation=90, transform=ax.transAxes, fontfamily=ADAMAWA_FONT_FAMILY)
-    ax.text(-0.018, 0.0, bottom_n, color=color, fontsize=fs, ha="right", va="bottom", rotation=90, transform=ax.transAxes, fontfamily=ADAMAWA_FONT_FAMILY)
-    ax.text(1.018, 0.0, bottom_n, color=color, fontsize=fs, ha="left", va="bottom", rotation=90, transform=ax.transAxes, fontfamily=ADAMAWA_FONT_FAMILY)
+    ax.text(-0.018, 1.0, top_n, color=color, fontsize=fs, ha="right", va="top", rotation=90, transform=ax.transAxes, fontfamily=family)
+    ax.text(1.018, 1.0, top_n, color=color, fontsize=fs, ha="left", va="top", rotation=90, transform=ax.transAxes, fontfamily=family)
+    ax.text(-0.018, 0.0, bottom_n, color=color, fontsize=fs, ha="right", va="bottom", rotation=90, transform=ax.transAxes, fontfamily=family)
+    ax.text(1.018, 0.0, bottom_n, color=color, fontsize=fs, ha="left", va="bottom", rotation=90, transform=ax.transAxes, fontfamily=family)
 
 
 def _draw_adamawa_map_frame(ax, font_scale=1.0):
@@ -2232,6 +2263,16 @@ def _render_plot_map_layout_adamawa(
     river_color: str | None = None,
     building_color: str | None = None,
     building_hatch_type: str | None = None,
+    title_font: str | None = None,
+    title_size: int | None = None,
+    grid_font: str | None = None,
+    grid_size: int | None = None,
+    station_font: str | None = None,
+    station_size: int | None = None,
+    bearing_font: str | None = None,
+    bearing_size: int | None = None,
+    area_font: str | None = None,
+    area_size: int | None = None,
 ):
     # None means "not overridden" - fall back to this template's own established defaults
     # (which differ slightly from the general template's, e.g. its navy grid/coordinate color)
@@ -2242,7 +2283,7 @@ def _render_plot_map_layout_adamawa(
     road_color = road_color or "black"
     river_color = river_color or "#10a3df"
     building_color = building_color or "black"
-    building_hatch_type = building_hatch_type or "horizontal"
+    building_hatch_type = building_hatch_type or "diagonal"
     plot_wkb = db.execute(text("SELECT geom FROM plots WHERE id=:id"), {"id": plot_id}).scalar()
     if not plot_wkb:
         raise ValueError("Plot not found")
@@ -2498,6 +2539,10 @@ def _render_plot_map_layout_adamawa(
         beacon_style=beacon_style,
         text_color=text_color,
         boundary_color=boundary_color,
+        station_font=station_font,
+        station_size=station_size,
+        bearing_font=bearing_font,
+        bearing_size=bearing_size,
     )
     area_label_point = None
     try:
@@ -2518,14 +2563,15 @@ def _render_plot_map_layout_adamawa(
         area_label_point.y,
         f"{area_m2 / 10000:.2f}Hectares",
         color="red",
-        fontsize=max(7, int(7 * font_scale)),
+        fontsize=area_size if area_size else max(7, int(7 * font_scale)),
         ha="center",
         va="center",
         zorder=26,
+        **({"fontfamily": area_font} if area_font else {}),
     )
 
     _draw_adamawa_map_frame(ax, font_scale=font_scale)
-    _draw_adamawa_coordinate_labels(ax, font_scale=font_scale, color=grid_color)
+    _draw_adamawa_coordinate_labels(ax, font_scale=font_scale, color=grid_color, grid_font=grid_font, grid_size=grid_size)
     _draw_adamawa_north_arrow(
         ax,
         font_scale=font_scale,
@@ -2622,6 +2668,16 @@ def render_plot_map_layout(
     river_color: str | None = None,
     building_color: str | None = None,
     building_hatch_type: str | None = None,
+    title_font: str | None = None,
+    title_size: int | None = None,
+    grid_font: str | None = None,
+    grid_size: int | None = None,
+    station_font: str | None = None,
+    station_size: int | None = None,
+    bearing_font: str | None = None,
+    bearing_size: int | None = None,
+    area_font: str | None = None,
+    area_size: int | None = None,
 ):
     if str(template_name or "general").strip().lower() == "adamawa_osg":
         _render_plot_map_layout_adamawa(
@@ -2666,6 +2722,16 @@ def render_plot_map_layout(
             river_color=river_color,
             building_color=building_color,
             building_hatch_type=building_hatch_type,
+            title_font=title_font,
+            title_size=title_size,
+            grid_font=grid_font,
+            grid_size=grid_size,
+            station_font=station_font,
+            station_size=station_size,
+            bearing_font=bearing_font,
+            bearing_size=bearing_size,
+            area_font=area_font,
+            area_size=area_size,
         )
         return
 
@@ -2677,7 +2743,7 @@ def render_plot_map_layout(
     road_color = road_color or "black"
     river_color = river_color or "blue"
     building_color = building_color or "black"
-    building_hatch_type = building_hatch_type or "horizontal"
+    building_hatch_type = building_hatch_type or "diagonal"
 
     plot_wkb = db.execute(text("SELECT geom FROM plots WHERE id=:id"), {"id": plot_id}).scalar()
     rows = db.execute(
@@ -2801,7 +2867,10 @@ def render_plot_map_layout(
     ax = fig.add_axes([map_left, map_bottom, map_width, map_height])
 
     draw_sheet_frame(fig)
-    draw_title_block(fig, title_text, plot_id, area_m2, scale_text, location_text, lga_text, state_text, font_scale)
+    draw_title_block(
+        fig, title_text, plot_id, area_m2, scale_text, location_text, lga_text, state_text, font_scale,
+        title_font=title_font, title_size=title_size, area_font=area_font, area_size=area_size,
+    )
     draw_footer(fig, crs_footer_text, source_footer_text, surveyor_name, surveyor_rank, font_scale)
 
     scale_ratio = parse_scale_ratio(scale_text)
@@ -3009,7 +3078,7 @@ def render_plot_map_layout(
     first_station = station_names[0] if station_names and len(station_names) > 0 else "A"
     first_point_info = (first_station, first_coords[0], first_coords[1])
 
-    draw_coordinate_frame(ax, major, font_scale, first_point_info, color=grid_color)
+    draw_coordinate_frame(ax, major, font_scale, first_point_info, color=grid_color, grid_font=grid_font, grid_size=grid_size)
     skipped_entries, boundary_label_boxes = annotate_vertices(
         ax,
         poly,
@@ -3023,6 +3092,10 @@ def render_plot_map_layout(
         beacon_style=beacon_style,
         text_color=text_color,
         boundary_color=boundary_color,
+        station_font=station_font,
+        station_size=station_size,
+        bearing_font=bearing_font,
+        bearing_size=bearing_size,
     )
     draw_skipped_table(ax, skipped_entries, font_scale)
 
