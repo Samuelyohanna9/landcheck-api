@@ -1815,6 +1815,7 @@ def _draw_center_text_with_bold_suffix(
     suffix: str,
     fontsize: float,
     fontfamily: str = ADAMAWA_FONT_FAMILY,
+    color: str = "black",
 ):
     prefix = str(prefix or "")
     suffix = str(suffix or "")
@@ -1827,6 +1828,7 @@ def _draw_center_text_with_bold_suffix(
             va="center",
             fontsize=fontsize,
             fontfamily=fontfamily,
+            color=color,
         )
         return
 
@@ -1861,6 +1863,7 @@ def _draw_center_text_with_bold_suffix(
         fontsize=fontsize,
         fontfamily=fontfamily,
         weight="normal",
+        color=color,
     )
     fig.text(
         x_suffix,
@@ -1871,6 +1874,7 @@ def _draw_center_text_with_bold_suffix(
         fontsize=fontsize,
         fontfamily=fontfamily,
         weight="bold",
+        color=color,
     )
 
 
@@ -1904,6 +1908,7 @@ def _draw_adamawa_header(
     authority_title: str,
     authority_date_text: str,
     font_scale=1.0,
+    text_color: str = "black",
 ):
     fig.add_artist(patches.Rectangle((0.03, 0.03), 0.94, 0.94, transform=fig.transFigure, fill=False, lw=1.2))
     y = 0.945
@@ -1917,6 +1922,7 @@ def _draw_adamawa_header(
         suffix=_safe_text(rof_no, "-"),
         fontsize=max(8, int(9 * font_scale)),
         fontfamily=ADAMAWA_FONT_FAMILY,
+        color=text_color,
     )
     _draw_center_text_with_bold_suffix(
         fig,
@@ -1925,6 +1931,7 @@ def _draw_adamawa_header(
         suffix=_safe_text(owner_name).upper(),
         fontsize=max(8, int(8 * font_scale)),
         fontfamily=ADAMAWA_FONT_FAMILY,
+        color=text_color,
     )
     fig.text(
         0.5,
@@ -1934,6 +1941,7 @@ def _draw_adamawa_header(
         va="center",
         fontsize=max(8, int(8 * font_scale)),
         fontfamily=ADAMAWA_FONT_FAMILY,
+        color=text_color,
     )
     fig.text(
         0.5,
@@ -1943,6 +1951,7 @@ def _draw_adamawa_header(
         va="center",
         fontsize=max(8, int(8 * font_scale)),
         fontfamily=ADAMAWA_FONT_FAMILY,
+        color=text_color,
     )
     fig.text(
         0.5,
@@ -1952,6 +1961,7 @@ def _draw_adamawa_header(
         va="center",
         fontsize=max(8, int(8 * font_scale)),
         fontfamily=ADAMAWA_FONT_FAMILY,
+        color=text_color,
     )
     fig.text(
         0.5,
@@ -1961,6 +1971,7 @@ def _draw_adamawa_header(
         va="center",
         fontsize=max(8, int(8 * font_scale)),
         fontfamily=ADAMAWA_FONT_FAMILY,
+        color=text_color,
     )
     fig.text(
         0.5,
@@ -1970,6 +1981,7 @@ def _draw_adamawa_header(
         va="center",
         fontsize=max(8, int(8 * font_scale)),
         fontfamily=ADAMAWA_FONT_FAMILY,
+        color=text_color,
     )
     fig.text(
         0.5,
@@ -1979,6 +1991,7 @@ def _draw_adamawa_header(
         va="center",
         fontsize=max(7, int(7 * font_scale)),
         fontfamily=ADAMAWA_FONT_FAMILY,
+        color=text_color,
     )
 
 
@@ -2069,7 +2082,10 @@ def _draw_adamawa_bottom_blocks(
     surveyed_by_text: str,
     disclaimer_text: str,
     font_scale=1.0,
+    text_color: str = "black",
+    grid_color: str | None = None,
 ):
+    grid_color = grid_color or ADAMAWA_BLUE
     # Match Adamawa sample: compact footer with uniform text size.
     footer_font = max(5, int(round(5.2 * font_scale)))
     line_gap = 0.0095
@@ -2097,31 +2113,31 @@ def _draw_adamawa_bottom_blocks(
             return f"{prefix} {raw[len(prefix):].strip()}"
         return f"{prefix} {raw}"
 
-    fig.text(left_x, y, f"UTM CO-ORDINATE OF {cp_name}", fontsize=footer_font, color=ADAMAWA_BLUE, fontfamily=ADAMAWA_FONT_FAMILY, weight="normal")
+    fig.text(left_x, y, f"UTM CO-ORDINATE OF {cp_name}", fontsize=footer_font, color=grid_color, fontfamily=ADAMAWA_FONT_FAMILY, weight="normal")
     y -= line_gap
-    fig.text(left_x, y, _with_prefix("N", northing_text), fontsize=footer_font, color=ADAMAWA_BLUE, fontfamily=ADAMAWA_FONT_FAMILY)
+    fig.text(left_x, y, _with_prefix("N", northing_text), fontsize=footer_font, color=grid_color, fontfamily=ADAMAWA_FONT_FAMILY)
     y -= line_gap
-    fig.text(left_x, y, _with_prefix("E", easting_text), fontsize=footer_font, color=ADAMAWA_BLUE, fontfamily=ADAMAWA_FONT_FAMILY)
+    fig.text(left_x, y, _with_prefix("E", easting_text), fontsize=footer_font, color=grid_color, fontfamily=ADAMAWA_FONT_FAMILY)
     y -= line_gap
-    fig.text(left_x, y, _with_prefix("Z", elevation_text), fontsize=footer_font, color=ADAMAWA_BLUE, fontfamily=ADAMAWA_FONT_FAMILY)
+    fig.text(left_x, y, _with_prefix("Z", elevation_text), fontsize=footer_font, color=grid_color, fontfamily=ADAMAWA_FONT_FAMILY)
     y -= line_gap
-    fig.text(left_x, y, origin_display, fontsize=footer_font, color=ADAMAWA_BLUE, fontfamily=ADAMAWA_FONT_FAMILY)
+    fig.text(left_x, y, origin_display, fontsize=footer_font, color=grid_color, fontfamily=ADAMAWA_FONT_FAMILY)
     y -= line_gap
-    fig.text(left_x, y, _safe_text(topo_sheet_text, DEFAULT_ADAMAWA_TOPO_SHEET_TEXT).upper(), fontsize=footer_font, fontfamily=ADAMAWA_FONT_FAMILY)
+    fig.text(left_x, y, _safe_text(topo_sheet_text, DEFAULT_ADAMAWA_TOPO_SHEET_TEXT).upper(), fontsize=footer_font, color=text_color, fontfamily=ADAMAWA_FONT_FAMILY)
     y -= (line_gap + 0.002)
-    fig.text(left_x, y, DEFAULT_ADAMAWA_CHECKED_BY_TEXT, fontsize=footer_font, fontfamily=ADAMAWA_FONT_FAMILY)
+    fig.text(left_x, y, DEFAULT_ADAMAWA_CHECKED_BY_TEXT, fontsize=footer_font, color=text_color, fontfamily=ADAMAWA_FONT_FAMILY)
     y -= (line_gap + 0.002)
-    fig.text(left_x, y, DEFAULT_ADAMAWA_PASSED_BY_TEXT, fontsize=footer_font, fontfamily=ADAMAWA_FONT_FAMILY)
+    fig.text(left_x, y, DEFAULT_ADAMAWA_PASSED_BY_TEXT, fontsize=footer_font, color=text_color, fontfamily=ADAMAWA_FONT_FAMILY)
     y -= line_gap
-    fig.text(left_x, y, DEFAULT_ADAMAWA_COPYRIGHT_TEXT, fontsize=footer_font, fontfamily=ADAMAWA_FONT_FAMILY)
+    fig.text(left_x, y, DEFAULT_ADAMAWA_COPYRIGHT_TEXT, fontsize=footer_font, color=text_color, fontfamily=ADAMAWA_FONT_FAMILY)
 
     # Computation/plan block with angular curly style like the Adamawa sample.
     comp_label_y = 0.079
     plan_label_y = 0.063
-    fig.text(0.06, comp_label_y, "COMPUTATION", fontsize=footer_font, fontfamily=ADAMAWA_FONT_FAMILY)
-    fig.text(0.195, comp_label_y, "NO", fontsize=footer_font, fontfamily=ADAMAWA_FONT_FAMILY)
-    fig.text(0.06, plan_label_y, "PLAN", fontsize=footer_font, fontfamily=ADAMAWA_FONT_FAMILY)
-    fig.text(0.195, plan_label_y, "NO", fontsize=footer_font, fontfamily=ADAMAWA_FONT_FAMILY)
+    fig.text(0.06, comp_label_y, "COMPUTATION", fontsize=footer_font, color=text_color, fontfamily=ADAMAWA_FONT_FAMILY)
+    fig.text(0.195, comp_label_y, "NO", fontsize=footer_font, color=text_color, fontfamily=ADAMAWA_FONT_FAMILY)
+    fig.text(0.06, plan_label_y, "PLAN", fontsize=footer_font, color=text_color, fontfamily=ADAMAWA_FONT_FAMILY)
+    fig.text(0.195, plan_label_y, "NO", fontsize=footer_font, color=text_color, fontfamily=ADAMAWA_FONT_FAMILY)
 
     top_y = comp_label_y + 0.002
     bottom_y = plan_label_y + 0.002
@@ -2141,9 +2157,9 @@ def _draw_adamawa_bottom_blocks(
 
     comp_display = _safe_text(computation_no, _safe_text(plan_no, "-"))
     comp_mid_y = (top_y + bottom_y) / 2.0
-    fig.text(0.292, comp_mid_y, comp_display, fontsize=footer_font, fontfamily=ADAMAWA_FONT_FAMILY, va="center")
-    fig.text(0.40, comp_mid_y, f"CADASTRAL SHEET NO. {_safe_text(cadastral_sheet_no, '-')}", fontsize=footer_font, fontfamily=ADAMAWA_FONT_FAMILY, va="center")
-    fig.text(0.50, 0.053, DEFAULT_ADAMAWA_PREPARED_BY_TEXT, fontsize=footer_font, fontfamily=ADAMAWA_FONT_FAMILY, ha="center", va="center")
+    fig.text(0.292, comp_mid_y, comp_display, fontsize=footer_font, color=text_color, fontfamily=ADAMAWA_FONT_FAMILY, va="center")
+    fig.text(0.40, comp_mid_y, f"CADASTRAL SHEET NO. {_safe_text(cadastral_sheet_no, '-')}", fontsize=footer_font, color=text_color, fontfamily=ADAMAWA_FONT_FAMILY, va="center")
+    fig.text(0.50, 0.053, DEFAULT_ADAMAWA_PREPARED_BY_TEXT, fontsize=footer_font, color=text_color, fontfamily=ADAMAWA_FONT_FAMILY, ha="center", va="center")
 
     table_ax = fig.add_axes([0.58, 0.110, 0.36, 0.090])
     table_ax.axis("off")
@@ -2173,9 +2189,9 @@ def _draw_adamawa_bottom_blocks(
     for (row_idx, col_idx), cell in table.get_celld().items():
         cell.set_linewidth(0.8 if row_idx == 0 else 0.5)
         if row_idx == 0:
-            cell.set_text_props(weight="normal", fontfamily=ADAMAWA_FONT_FAMILY)
+            cell.set_text_props(weight="normal", fontfamily=ADAMAWA_FONT_FAMILY, color=text_color)
         else:
-            cell.set_text_props(fontfamily=ADAMAWA_FONT_FAMILY)
+            cell.set_text_props(fontfamily=ADAMAWA_FONT_FAMILY, color=text_color)
     # Enforce even row height to prevent any accidental text clipping/overlap.
     total_rows = len(rows) + 1  # include header
     row_height = 1.0 / max(1, total_rows)
@@ -2215,6 +2231,7 @@ def _draw_adamawa_bottom_blocks(
         note_text,
         fontsize=note_font,
         fontfamily=ADAMAWA_FONT_FAMILY,
+        color=text_color,
         ha="left",
         va="top",
         linespacing=1.18,
@@ -2410,6 +2427,7 @@ def _render_plot_map_layout_adamawa(
         authority_title=_safe_text(adamawa_authority_title, DEFAULT_ADAMAWA_AUTHORITY_TITLE),
         authority_date_text=_safe_text(adamawa_authority_date_text, DEFAULT_ADAMAWA_AUTHORITY_DATE),
         font_scale=font_scale,
+        text_color=text_color,
     )
 
     scale_ratio = parse_scale_ratio(scale_text)
@@ -2610,6 +2628,8 @@ def _render_plot_map_layout_adamawa(
         surveyed_by_text=surveyed_line,
         disclaimer_text=_safe_text(adamawa_disclaimer_text, DEFAULT_ADAMAWA_DISCLAIMER_TEXT),
         font_scale=font_scale,
+        text_color=text_color,
+        grid_color=grid_color,
     )
 
     ax.set_aspect("equal")

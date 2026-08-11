@@ -27,6 +27,21 @@ from matplotlib.backends.backend_agg import FigureCanvasAgg as FigureCanvas
 # the full-export path below, which chains up to 3 providers sequentially.
 _BASEMAP_FETCH_TIMEOUT = (5, 20)
 
+# Same public Mapbox token already used by the frontend map (mapboxLoader.ts / VITE_MAPBOX_TOKEN) -
+# Mapbox public (pk.*) tokens are meant to be shared between client and server use, so the Hetzner
+# deployment just needs this env var set to that same value.
+MAPBOX_ACCESS_TOKEN = os.getenv("MAPBOX_ACCESS_TOKEN", "").strip()
+
+
+def _mapbox_satellite_url() -> str:
+    # @2x = retina tiles (512px instead of 256px per tile) - sharper render at the same zoom level
+    # than Esri's default 256px tiles, on top of Mapbox's imagery having denser high-res (30-50cm)
+    # coverage in Nigeria's larger cities than Esri's default World Imagery layer.
+    return (
+        "https://api.mapbox.com/v4/mapbox.satellite/{z}/{x}/{y}@2x.jpg90"
+        f"?access_token={MAPBOX_ACCESS_TOKEN}"
+    )
+
 # Paper size mapping (ReportLab points)
 PAPER_SIZES_REPORTLAB = {
     "A4": A4,
@@ -610,18 +625,35 @@ def render_orthophoto_png(
         sat_zoom = 16 if preview_mode else 17
         if preview_mode:
             # Fast path for previews: no long fallback chain.
-            try:
-                ctx.add_basemap(
-                    ax,
-                    source=ctx.providers.Esri.WorldImagery,
-                    crs=axis_crs,
-                    attribution=False,
-                    zoom=sat_zoom,
-                    reset_extent=True,
-                    timeout=_BASEMAP_FETCH_TIMEOUT,
-                )
-                basemap_loaded = True
-            except Exception:
+            if MAPBOX_ACCESS_TOKEN:
+                try:
+                    ctx.add_basemap(
+                        ax,
+                        source=_mapbox_satellite_url(),
+                        crs=axis_crs,
+                        attribution=False,
+                        zoom=sat_zoom + 1,
+                        reset_extent=True,
+                        timeout=_BASEMAP_FETCH_TIMEOUT,
+                    )
+                    basemap_loaded = True
+                except Exception as e:
+                    print(f"Mapbox Satellite failed: {e}")
+            if not basemap_loaded:
+                try:
+                    ctx.add_basemap(
+                        ax,
+                        source=ctx.providers.Esri.WorldImagery,
+                        crs=axis_crs,
+                        attribution=False,
+                        zoom=sat_zoom,
+                        reset_extent=True,
+                        timeout=_BASEMAP_FETCH_TIMEOUT,
+                    )
+                    basemap_loaded = True
+                except Exception:
+                    pass
+            if not basemap_loaded:
                 try:
                     ctx.add_basemap(
                         ax,
@@ -643,20 +675,38 @@ def render_orthophoto_png(
                 ("CartoDB Light", "https://basemaps.cartocdn.com/light_all/{z}/{x}/{y}.png"),
             ]
 
-            # First try the contextily providers
-            try:
-                ctx.add_basemap(
-                    ax,
-                    source=ctx.providers.Esri.WorldImagery,
-                    crs=axis_crs,
-                    attribution=False,
-                    zoom=sat_zoom,
-                    reset_extent=True,
-                    timeout=_BASEMAP_FETCH_TIMEOUT,
-                )
-                basemap_loaded = True
-            except Exception as e:
-                print(f"Esri WorldImagery failed: {e}")
+            # Mapbox Satellite first when configured - denser high-res (30-50cm) coverage in
+            # Nigeria's larger cities than Esri's default World Imagery layer, plus @2x retina tiles.
+            if MAPBOX_ACCESS_TOKEN:
+                try:
+                    ctx.add_basemap(
+                        ax,
+                        source=_mapbox_satellite_url(),
+                        crs=axis_crs,
+                        attribution=False,
+                        zoom=sat_zoom + 1,
+                        reset_extent=True,
+                        timeout=_BASEMAP_FETCH_TIMEOUT,
+                    )
+                    basemap_loaded = True
+                except Exception as e:
+                    print(f"Mapbox Satellite failed: {e}")
+
+            # Then the contextily providers
+            if not basemap_loaded:
+                try:
+                    ctx.add_basemap(
+                        ax,
+                        source=ctx.providers.Esri.WorldImagery,
+                        crs=axis_crs,
+                        attribution=False,
+                        zoom=sat_zoom,
+                        reset_extent=True,
+                        timeout=_BASEMAP_FETCH_TIMEOUT,
+                    )
+                    basemap_loaded = True
+                except Exception as e:
+                    print(f"Esri WorldImagery failed: {e}")
 
             if not basemap_loaded:
                 try:
