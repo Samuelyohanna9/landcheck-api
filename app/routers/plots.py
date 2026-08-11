@@ -239,6 +239,7 @@ def _ensure_plot_meta_table_impl(db: Session):
             technical_report_computation_software_text TEXT,
             technical_report_plotting_software_text TEXT,
             technical_report_general_observation_text TEXT,
+            elevation_points JSONB DEFAULT '[]',
             created_at TIMESTAMP DEFAULT NOW(),
             updated_at TIMESTAMP DEFAULT NOW()
         )
@@ -281,6 +282,7 @@ def _ensure_plot_meta_table_impl(db: Session):
         ("technical_report_computation_software_text", "TEXT"),
         ("technical_report_plotting_software_text", "TEXT"),
         ("technical_report_general_observation_text", "TEXT"),
+        ("elevation_points", "JSONB DEFAULT '[]'"),
         ("created_at", "TIMESTAMP DEFAULT NOW()"),
         ("updated_at", "TIMESTAMP DEFAULT NOW()"),
     ]
@@ -513,6 +515,7 @@ def upsert_plot_meta(
     technical_report_computation_software_text: Optional[str] = None,
     technical_report_plotting_software_text: Optional[str] = None,
     technical_report_general_observation_text: Optional[str] = None,
+    elevation_points: Optional[list] = None,
     commit: bool = True,
 ):
     ensure_plot_meta_table(db)
@@ -520,6 +523,7 @@ def upsert_plot_meta(
     technical_report_instruments_json = (
         json.dumps(technical_report_instruments) if technical_report_instruments is not None else None
     )
+    elevation_points_json = json.dumps(elevation_points) if elevation_points is not None else None
 
     db.execute(text("""
         INSERT INTO plot_meta (
@@ -533,7 +537,8 @@ def upsert_plot_meta(
             technical_report_num_surveyors, technical_report_num_technical_officers,
             technical_report_num_labourers, technical_report_recce_text,
             technical_report_demarcation_text, technical_report_computation_software_text,
-            technical_report_plotting_software_text, technical_report_general_observation_text
+            technical_report_plotting_software_text, technical_report_general_observation_text,
+            elevation_points
         )
         VALUES (
             :plot_id, :title_text, :location_text, :lga_text, :state_text,
@@ -546,7 +551,8 @@ def upsert_plot_meta(
             :technical_report_num_surveyors, :technical_report_num_technical_officers,
             :technical_report_num_labourers, :technical_report_recce_text,
             :technical_report_demarcation_text, :technical_report_computation_software_text,
-            :technical_report_plotting_software_text, :technical_report_general_observation_text
+            :technical_report_plotting_software_text, :technical_report_general_observation_text,
+            CAST(COALESCE(:elevation_points, '[]') AS JSONB)
         )
         ON CONFLICT (plot_id) DO UPDATE SET
             title_text = COALESCE(NULLIF(EXCLUDED.title_text, ''), plot_meta.title_text),
@@ -585,6 +591,7 @@ def upsert_plot_meta(
             technical_report_computation_software_text = COALESCE(NULLIF(EXCLUDED.technical_report_computation_software_text, ''), plot_meta.technical_report_computation_software_text),
             technical_report_plotting_software_text = COALESCE(NULLIF(EXCLUDED.technical_report_plotting_software_text, ''), plot_meta.technical_report_plotting_software_text),
             technical_report_general_observation_text = COALESCE(NULLIF(EXCLUDED.technical_report_general_observation_text, ''), plot_meta.technical_report_general_observation_text),
+            elevation_points = COALESCE(CAST(:elevation_points AS JSONB), plot_meta.elevation_points),
             updated_at = NOW()
     """), {
         "plot_id": plot_id,
@@ -624,6 +631,7 @@ def upsert_plot_meta(
         "technical_report_computation_software_text": technical_report_computation_software_text,
         "technical_report_plotting_software_text": technical_report_plotting_software_text,
         "technical_report_general_observation_text": technical_report_general_observation_text,
+        "elevation_points": elevation_points_json,
     })
     if commit:
         db.commit()
@@ -642,7 +650,8 @@ def get_plot_meta(db: Session, plot_id: int) -> dict:
                technical_report_num_surveyors, technical_report_num_technical_officers,
                technical_report_num_labourers, technical_report_recce_text,
                technical_report_demarcation_text, technical_report_computation_software_text,
-               technical_report_plotting_software_text, technical_report_general_observation_text
+               technical_report_plotting_software_text, technical_report_general_observation_text,
+               elevation_points
         FROM plot_meta
         WHERE plot_id = :plot_id
     """), {"plot_id": plot_id}).mappings().first()
@@ -688,6 +697,7 @@ def get_plot_meta(db: Session, plot_id: int) -> dict:
             "technical_report_computation_software_text": DEFAULT_TECHNICAL_REPORT_COMPUTATION_SOFTWARE,
             "technical_report_plotting_software_text": DEFAULT_TECHNICAL_REPORT_PLOTTING_SOFTWARE,
             "technical_report_general_observation_text": DEFAULT_TECHNICAL_REPORT_GENERAL_OBSERVATION,
+            "elevation_points": [],
         }
     raw_instruments = row.get("technical_report_instruments")
     if isinstance(raw_instruments, str):
@@ -697,6 +707,14 @@ def get_plot_meta(db: Session, plot_id: int) -> dict:
             raw_instruments = []
     if not isinstance(raw_instruments, list):
         raw_instruments = []
+    raw_elevation_points = row.get("elevation_points")
+    if isinstance(raw_elevation_points, str):
+        try:
+            raw_elevation_points = json.loads(raw_elevation_points)
+        except Exception:
+            raw_elevation_points = []
+    if not isinstance(raw_elevation_points, list):
+        raw_elevation_points = []
     return {
         "title_text": row.get("title_text") or "SURVEY PLAN",
         "location_text": row.get("location_text") or "",
@@ -738,6 +756,7 @@ def get_plot_meta(db: Session, plot_id: int) -> dict:
         "technical_report_computation_software_text": row.get("technical_report_computation_software_text") or DEFAULT_TECHNICAL_REPORT_COMPUTATION_SOFTWARE,
         "technical_report_plotting_software_text": row.get("technical_report_plotting_software_text") or DEFAULT_TECHNICAL_REPORT_PLOTTING_SOFTWARE,
         "technical_report_general_observation_text": row.get("technical_report_general_observation_text") or DEFAULT_TECHNICAL_REPORT_GENERAL_OBSERVATION,
+        "elevation_points": raw_elevation_points,
     }
 
 
@@ -4152,6 +4171,7 @@ def create_plot_topomap_export_job(
     station_names: list[str] = Body(default=[]),
     coordinate_system: str = Body("wgs84"),
     paper_size: str = Body("A4"),
+    topo_source: str = Body("opentopomap"),
     north_arrow_style: str = Body("one_side_stem"),
     north_arrow_color: str = Body("blue"),
 ):
@@ -4167,6 +4187,7 @@ def create_plot_topomap_export_job(
         "coordinate_system": coordinate_system,
         "paper_size": paper_size,
         "use_topo_map": True,
+        "topo_source": topo_source or "opentopomap",
         "north_arrow_style": north_arrow_style,
         "north_arrow_color": north_arrow_color,
     }
@@ -5736,16 +5757,19 @@ def orthophoto_preview(plot_id: int, db: Session = Depends(get_db), background_t
     paper_size: str = Body("A4"),
     use_topo_map: bool = Body(False),
     topo_source: str = Body("opentopomap"),
+    elevation_points: list = Body(default=[]),
     north_arrow_style: str = Body("one_side_stem"),
     north_arrow_color: str = Body("blue")):
 
+    topo_source = topo_source or "opentopomap"
     payload_for_cache = {
         "scale_text": scale_text,
         "station_names": station_names or [],
         "coordinate_system": coordinate_system,
         "paper_size": paper_size,
         "use_topo_map": bool(use_topo_map),
-        "topo_source": topo_source or "opentopomap",
+        "topo_source": topo_source,
+        "elevation_points": elevation_points if topo_source == "userdata" else [],
         "north_arrow_style": north_arrow_style,
         "north_arrow_color": north_arrow_color,
     }
@@ -5766,18 +5790,31 @@ def orthophoto_preview(plot_id: int, db: Session = Depends(get_db), background_t
     png_path = tmp_png.name
     tmp_png.close()
 
-    # Save/refresh plot metadata (scale, paper size, coord system)
+    # Save/refresh plot metadata (scale, paper size, coord system). Elevation points are only
+    # persisted when the caller actually sent some - an empty/omitted list must never overwrite
+    # previously-uploaded height data (same NULL-means-"don't touch" convention as every other
+    # plot_meta field here).
     upsert_plot_meta(
         db=db,
         plot_id=plot_id,
         scale_text=scale_text,
         paper_size=paper_size,
         coordinate_system=coordinate_system,
+        elevation_points=elevation_points if (topo_source == "userdata" and elevation_points) else None,
     )
 
     # Get EPSG code for selected coordinate system
     epsg_code = COORDINATE_SYSTEMS.get(coordinate_system, 4326)
     crs_name = COORDINATE_SYSTEM_NAMES.get(coordinate_system, "WGS84")
+
+    persisted_elevation_points = elevation_points
+    if use_topo_map and topo_source == "userdata" and not persisted_elevation_points:
+        persisted_elevation_points = get_plot_meta(db, plot_id).get("elevation_points") or []
+
+    if use_topo_map:
+        topo_source_footer = "SOURCE: Your uploaded elevation data" if topo_source == "userdata" else "SOURCE: Global elevation model (contours)"
+    else:
+        topo_source_footer = "SOURCE: Satellite Imagery"
 
     render_orthophoto_png(
         db=db,
@@ -5789,8 +5826,10 @@ def orthophoto_preview(plot_id: int, db: Session = Depends(get_db), background_t
         coordinate_system=coordinate_system,
         epsg_code=epsg_code,
         crs_footer_text=f"COORDINATE SYSTEM: {crs_name}",
-        source_footer_text="SOURCE: OpenTopoMap" if use_topo_map else "SOURCE: Satellite Imagery",
+        source_footer_text=topo_source_footer,
         use_topo_map=use_topo_map,
+        topo_source=topo_source,
+        elevation_points=persisted_elevation_points,
         paper_size=paper_size,
         north_arrow_style=north_arrow_style,
         north_arrow_color=north_arrow_color,
@@ -5834,9 +5873,11 @@ def orthophoto_pdf(plot_id: int, db: Session = Depends(get_db), background_tasks
     coordinate_system: str = Body("wgs84"),
     paper_size: str = Body("A4"),
     use_topo_map: bool = Body(False),
+    topo_source: str = Body("opentopomap"),
     north_arrow_style: str = Body("one_side_stem"),
     north_arrow_color: str = Body("blue")):
 
+    topo_source = topo_source or "opentopomap"
     out_dir = os.path.join(REPORTS_DIR, "orthophoto")
     os.makedirs(out_dir, exist_ok=True)
 
@@ -5867,6 +5908,10 @@ def orthophoto_pdf(plot_id: int, db: Session = Depends(get_db), background_tasks
     epsg_code = COORDINATE_SYSTEMS.get(coordinate_system, 4326)
     crs_name = COORDINATE_SYSTEM_NAMES.get(coordinate_system, "WGS84")
 
+    elevation_points = None
+    if use_topo_map and topo_source == "userdata":
+        elevation_points = get_plot_meta(db, plot_id).get("elevation_points") or None
+
     render_orthophoto_png(
         db=db,
         plot_id=plot_id,
@@ -5883,6 +5928,8 @@ def orthophoto_pdf(plot_id: int, db: Session = Depends(get_db), background_tasks
         epsg_code=epsg_code,
         crs_footer_text=f"COORDINATE SYSTEM: {crs_name}",
         use_topo_map=use_topo_map,
+        topo_source=topo_source,
+        elevation_points=elevation_points,
         paper_size=paper_size,
         north_arrow_style=north_arrow_style,
         north_arrow_color=north_arrow_color,
@@ -6144,8 +6191,14 @@ def get_saved_orthophoto_pdf(plot_id: int, map_type: str = "satellite", refresh:
             coordinate_system=meta["coordinate_system"],
             epsg_code=epsg_code,
             crs_footer_text=f"COORDINATE SYSTEM: {crs_name}",
-            source_footer_text="SOURCE: OpenTopoMap" if safe_type == "topo" else "SOURCE: Satellite Imagery",
+            source_footer_text=(
+                "SOURCE: Your uploaded elevation data" if safe_type == "topo" and meta.get("elevation_points")
+                else "SOURCE: Global elevation model (contours)" if safe_type == "topo"
+                else "SOURCE: Satellite Imagery"
+            ),
             use_topo_map=(safe_type == "topo"),
+            topo_source="userdata" if meta.get("elevation_points") else "opentopomap",
+            elevation_points=meta.get("elevation_points"),
             paper_size=meta["paper_size"],
             north_arrow_style="one_side_stem",
             north_arrow_color="blue",

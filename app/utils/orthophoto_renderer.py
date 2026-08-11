@@ -12,12 +12,15 @@ import geopandas as gpd
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 import matplotlib.lines as mlines
+import matplotlib.tri as mtri
 import requests
 from sqlalchemy import text
 from shapely import wkb
 from datetime import datetime
 import contextily as ctx
 from PIL import Image
+
+from app.utils.elevation import fetch_dem_elevation_points
 
 from reportlab.lib.pagesizes import A4, A3, A2, A1, A0
 from reportlab.pdfgen import canvas
@@ -171,6 +174,101 @@ def _choose_imagery_scale_ratio(
     min_scale_height = int(math.ceil(min_ground_height / max(paper_ground_height, 1e-6)))
     recommended_scale = max(requested_scale_ratio, min_scale_width, min_scale_height)
     return recommended_scale, recommended_scale != requested_scale_ratio
+
+
+def _nice_contour_step(elevation_span_m: float) -> float:
+    # Picks a round contour interval scaled to how much relief is actually in the sampled area -
+    # a flat 2m plot and a hillside 200m plot need very different intervals to read as a real map
+    # instead of either one flat blob or an unreadable tangle of lines.
+    for span_ceiling, step in (
+        (2, 0.25), (5, 0.5), (10, 1), (25, 2), (50, 5), (100, 10), (250, 20), (500, 50),
+    ):
+        if elevation_span_m <= span_ceiling:
+            return step
+    return 100
+
+
+def _draw_topo_contours(
+    ax,
+    plot_geom_wgs84,
+    display_epsg: int,
+    target_xlim: tuple,
+    target_ylim: tuple,
+    elevation_points,
+    font_scale: float = 1.0,
+    is_user_data: bool = False,
+) -> bool:
+    """Draws real contour lines derived from sampled elevation points - either the surveyor's own
+    uploaded heights (is_user_data=True) or a free global DEM fetched for the plot's footprint.
+    Returns False (leaving the axes untouched) when there isn't enough usable elevation data,
+    so the caller can fall back to the "elevation data unavailable" message.
+    """
+    points = elevation_points if elevation_points and len(elevation_points) >= 3 else None
+    if points is None:
+        try:
+            boundary_geojson = plot_geom_wgs84.__geo_interface__
+        except Exception:
+            boundary_geojson = None
+        points = fetch_dem_elevation_points(boundary_geojson) if boundary_geojson else None
+        is_user_data = False
+    if not points or len(points) < 3:
+        return False
+
+    try:
+        points_gdf = gpd.GeoDataFrame(
+            {"elevation_m": [float(p["elevation_m"]) for p in points]},
+            geometry=gpd.points_from_xy([float(p["lng"]) for p in points], [float(p["lat"]) for p in points]),
+            crs="EPSG:4326",
+        ).to_crs(epsg=display_epsg)
+    except Exception:
+        return False
+
+    xs = points_gdf.geometry.x.to_numpy()
+    ys = points_gdf.geometry.y.to_numpy()
+    elevations = points_gdf["elevation_m"].to_numpy()
+    finite_mask = np.isfinite(xs) & np.isfinite(ys) & np.isfinite(elevations)
+    xs, ys, elevations = xs[finite_mask], ys[finite_mask], elevations[finite_mask]
+    if len(xs) < 3:
+        return False
+
+    elev_min, elev_max = float(np.min(elevations)), float(np.max(elevations))
+    span = elev_max - elev_min
+    if span < 0.05:
+        # Dead-flat sampled area - a contour map of it is just noise, not useful terrain info.
+        return False
+
+    try:
+        triang = mtri.Triangulation(xs, ys)
+    except Exception:
+        return False
+
+    step = _nice_contour_step(span)
+    levels = np.arange(math.floor(elev_min / step) * step, math.ceil(elev_max / step) * step + step, step)
+    if len(levels) < 2:
+        return False
+
+    try:
+        ax.tricontourf(triang, elevations, levels=levels, cmap="terrain", alpha=0.5, zorder=0)
+        minor_contours = ax.tricontour(
+            triang, elevations, levels=levels, colors="#5b3a1a", linewidths=0.65 * font_scale, zorder=1,
+        )
+        ax.clabel(minor_contours, inline=True, fontsize=max(5, 6 * font_scale), fmt="%g m")
+        index_levels = levels[::5] if len(levels) > 6 else levels[::2] if len(levels) > 3 else levels
+        if len(index_levels) >= 2:
+            ax.tricontour(
+                triang, elevations, levels=index_levels, colors="#3f2a12", linewidths=1.5 * font_scale, zorder=2,
+            )
+        if is_user_data:
+            ax.scatter(
+                xs, ys, s=(10 * font_scale) ** 2, c="#1d4ed8", marker="+", linewidths=1.1 * font_scale, zorder=3,
+            )
+    except Exception:
+        return False
+
+    ax.set_xlim(target_xlim)
+    ax.set_ylim(target_ylim)
+    return True
+
 
 # Paper size mapping (ReportLab points)
 PAPER_SIZES_REPORTLAB = {
@@ -646,6 +744,8 @@ def render_orthophoto_png(
     tile_source="esri", station_names=None,
     coordinate_system="wgs84", epsg_code=4326,
     use_topo_map=False,
+    topo_source="opentopomap",
+    elevation_points=None,
     paper_size="A4",
     north_arrow_style="one_side_stem",
     north_arrow_color="black",
@@ -708,62 +808,20 @@ def render_orthophoto_png(
     axis_crs = f"EPSG:{display_epsg}"
 
     if use_topo_map:
-        topo_zoom = 14 if preview_mode else 15
-        if preview_mode:
-            # Fast path for previews: single provider attempt to avoid stacked network timeouts.
-            try:
-                ctx.add_basemap(
-                    ax,
-                    source=ctx.providers.OpenTopoMap,
-                    crs=axis_crs,
-                    attribution=False,
-                    zoom=topo_zoom,
-                    reset_extent=True,
-                    timeout=_BASEMAP_FETCH_TIMEOUT,
-                )
-                basemap_loaded = True
-            except Exception:
-                basemap_loaded = False
-        else:
-        # Use OpenTopoMap for terrain/elevation visualization
-            topo_sources = [
-                ("OpenTopoMap", "https://tile.opentopomap.org/{z}/{x}/{y}.png"),
-                ("Stamen Terrain", "https://stamen-tiles.a.ssl.fastly.net/terrain/{z}/{x}/{y}.png"),
-            ]
-
-            for name, url in topo_sources:
-                try:
-                    ctx.add_basemap(
-                        ax,
-                        source=url,
-                        crs=axis_crs,
-                        attribution=False,
-                        zoom=topo_zoom,
-                        reset_extent=True,
-                        timeout=_BASEMAP_FETCH_TIMEOUT,
-                    )
-                    basemap_loaded = True
-                    print(f"Loaded topo basemap from {name}")
-                    break
-                except Exception as e:
-                    print(f"{name} failed: {e}")
-                    continue
-
-            if not basemap_loaded:
-                # Fallback to contextily OpenTopoMap provider
-                try:
-                    ctx.add_basemap(
-                        ax,
-                        source=ctx.providers.OpenTopoMap,
-                        crs=axis_crs,
-                        attribution=False,
-                        zoom=topo_zoom,
-                        reset_extent=True,
-                        timeout=_BASEMAP_FETCH_TIMEOUT,
-                    )
-                    basemap_loaded = True
-                except Exception as e:
-                    print(f"OpenTopoMap provider failed: {e}")
+        # Real contour lines from sampled elevation points, not a draped basemap image - see
+        # _draw_topo_contours. "userdata" uses the surveyor's own uploaded heights when there are
+        # enough of them; otherwise (or as a fallback) it samples a free global DEM for the plot.
+        want_user_data = topo_source == "userdata" and elevation_points
+        basemap_loaded = _draw_topo_contours(
+            ax,
+            plot_geom,
+            display_epsg,
+            target_xlim,
+            target_ylim,
+            elevation_points if want_user_data else None,
+            font_scale=font_scale,
+            is_user_data=bool(want_user_data),
+        )
     else:
         sat_zoom = 16 if preview_mode else 17
         basemap_loaded = _try_add_arcgis_world_imagery(
@@ -899,10 +957,13 @@ def render_orthophoto_png(
                         continue
 
     if not basemap_loaded:
-        # Add a light green background to represent land if no basemap loads
+        # Add a light green background to represent land if no basemap/contours loaded
         ax.set_facecolor('#e8f4e8')
-        map_type = "Topo" if use_topo_map else "Satellite"
-        ax.text(0.5, 0.5, f"{map_type} imagery temporarily unavailable\nShowing plot boundary",
+        if use_topo_map:
+            message = "No elevation data available for this plot\nShowing plot boundary"
+        else:
+            message = "Satellite imagery temporarily unavailable\nShowing plot boundary"
+        ax.text(0.5, 0.5, message,
                 transform=ax.transAxes, ha="center", va="center", fontsize=10, color="#555", alpha=0.8)
 
     # Restore target extent after basemap
