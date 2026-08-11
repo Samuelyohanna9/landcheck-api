@@ -8,6 +8,7 @@ import ee
 import requests
 
 from app.utils.gee_client import init_gee
+from app.utils.hazard_common import classify_risk
 
 
 def compute_flood_risk(
@@ -99,16 +100,10 @@ def compute_flood_risk(
             + breakdown["river_proximity_score"] * 0.15
         )
     risk_value = float(risk_value)
-
     if breakdown["data_available"] is False:
-        risk_class = "No Data"
         risk_value = 0.0
-    elif risk_value < 0.3:
-        risk_class = "Low"
-    elif risk_value < 0.6:
-        risk_class = "Moderate"
-    else:
-        risk_class = "High"
+
+    risk_class, class_color = classify_risk(risk_value, breakdown["data_available"])
 
     palette = ["#e0f2fe", "#7dd3fc", "#0ea5e9", "#1d4ed8"]
     depth_for_vis = depth.unmask(0)
@@ -116,13 +111,6 @@ def compute_flood_risk(
     risk_vis = depth_for_vis.visualize(min=0.1, max=3, palette=palette, opacity=0.6)
     boundary = ee.Image().paint(geom, 1, 2).visualize(palette=["#0f172a"])
 
-    class_colors = {
-        "Low": "#22c55e",
-        "Moderate": "#f59e0b",
-        "High": "#ef4444",
-        "No Data": "#94a3b8",
-    }
-    class_color = class_colors.get(risk_class, "#22c55e")
     class_fill = ee.Image().paint(geom, 1).visualize(palette=[class_color], opacity=0.25)
     class_outline = ee.Image().paint(geom, 1, 3).visualize(palette=[class_color])
 
