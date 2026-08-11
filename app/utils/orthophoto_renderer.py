@@ -36,6 +36,8 @@ _ARCGIS_WORLD_IMAGERY_EXPORT_URL = os.getenv(
 ).strip()
 _ARCGIS_ORTHO_PREVIEW_MAX_EDGE = max(1024, int(os.getenv("ARCGIS_ORTHO_PREVIEW_MAX_EDGE", "1600")))
 _ARCGIS_ORTHO_EXPORT_MAX_EDGE = max(1600, int(os.getenv("ARCGIS_ORTHO_EXPORT_MAX_EDGE", "4096")))
+_ORTHOPHOTO_SOURCE_GSD_METERS = max(0.1, float(os.getenv("ORTHOPHOTO_SOURCE_GSD_METERS", "0.4")))
+_ORTHOPHOTO_MAX_UPSCALE_FACTOR = max(1.0, float(os.getenv("ORTHOPHOTO_MAX_UPSCALE_FACTOR", "2.0")))
 
 # Same public Mapbox token already used by the frontend map (mapboxLoader.ts / VITE_MAPBOX_TOKEN) -
 # Mapbox public (pk.*) tokens are meant to be shared between client and server use, so the Hetzner
@@ -148,6 +150,27 @@ def _try_add_arcgis_world_imagery(
     except Exception as e:
         print(f"ArcGIS World Imagery exportImage failed: {e}")
         return False
+
+
+def _choose_imagery_scale_ratio(
+    requested_scale_ratio: int,
+    *,
+    fig_width: float,
+    fig_height: float,
+    map_width_frac: float,
+    map_height_frac: float,
+    dpi: int,
+) -> tuple[int, bool]:
+    paper_ground_width = fig_width * map_width_frac * 0.0254
+    paper_ground_height = fig_height * map_height_frac * 0.0254
+    map_pixel_width = max(1.0, fig_width * map_width_frac * dpi)
+    map_pixel_height = max(1.0, fig_height * map_height_frac * dpi)
+    min_ground_width = (map_pixel_width * _ORTHOPHOTO_SOURCE_GSD_METERS) / _ORTHOPHOTO_MAX_UPSCALE_FACTOR
+    min_ground_height = (map_pixel_height * _ORTHOPHOTO_SOURCE_GSD_METERS) / _ORTHOPHOTO_MAX_UPSCALE_FACTOR
+    min_scale_width = int(math.ceil(min_ground_width / max(paper_ground_width, 1e-6)))
+    min_scale_height = int(math.ceil(min_ground_height / max(paper_ground_height, 1e-6)))
+    recommended_scale = max(requested_scale_ratio, min_scale_width, min_scale_height)
+    return recommended_scale, recommended_scale != requested_scale_ratio
 
 # Paper size mapping (ReportLab points)
 PAPER_SIZES_REPORTLAB = {
@@ -653,7 +676,7 @@ def render_orthophoto_png(
     if preview_mode:
         dpi = 120
     else:
-        dpi = 240 if paper_config["name"] in ["A4", "A3"] else 180 if paper_config["name"] == "A2" else 140
+        dpi = 300 if paper_config["name"] in ["A4", "A3"] else 220 if paper_config["name"] == "A2" else 160
 
     fig = plt.figure(figsize=(fig_width, fig_height), dpi=dpi)
     canvas_agg = FigureCanvas(fig)
@@ -662,8 +685,21 @@ def render_orthophoto_png(
     map_left, map_bottom, map_width, map_height = 0.10, 0.30, 0.80, 0.45
     ax = fig.add_axes([map_left, map_bottom, map_width, map_height])
 
-    scale_ratio = parse_scale_ratio(scale_text)
-    apply_true_scale(ax, poly, scale_ratio, fig_width * map_width, fig_height * map_height)
+    requested_scale_ratio = parse_scale_ratio(scale_text)
+    effective_scale_ratio = requested_scale_ratio
+    scale_text_for_layout = scale_text
+    if not use_topo_map:
+        effective_scale_ratio, imagery_scaled = _choose_imagery_scale_ratio(
+            requested_scale_ratio,
+            fig_width=fig_width,
+            fig_height=fig_height,
+            map_width_frac=map_width,
+            map_height_frac=map_height,
+            dpi=dpi,
+        )
+        if imagery_scaled:
+            scale_text_for_layout = f"1 : {effective_scale_ratio:,} (imagery view)"
+    apply_true_scale(ax, poly, effective_scale_ratio, fig_width * map_width, fig_height * map_height)
     target_xlim = ax.get_xlim()
     target_ylim = ax.get_ylim()
 
@@ -887,10 +923,10 @@ def render_orthophoto_png(
     draw_coordinate_frame(ax, major, axis_epsg=display_epsg, label_epsg=display_epsg, font_scale=font_scale)
 
     # Add station name labels to vertices
-    annotate_vertices_orthophoto(ax, poly, station_names, font_scale, scale_ratio=scale_ratio)
+    annotate_vertices_orthophoto(ax, poly, station_names, font_scale, scale_ratio=effective_scale_ratio)
 
     draw_sheet_frame(fig, font_scale)
-    draw_title_block(fig, title_text, plot_id, scale_text, location_text, lga_text, state_text, font_scale)
+    draw_title_block(fig, title_text, plot_id, scale_text_for_layout, location_text, lga_text, state_text, font_scale)
     draw_footer(fig, crs_footer_text, source_footer_text, surveyor_name, surveyor_rank, font_scale)
     add_north_arrow(ax, font_scale, style=north_arrow_style, color=north_arrow_color)
     add_scalebar(ax, choose_scalebar_length(scale_ratio), font_scale=font_scale)
