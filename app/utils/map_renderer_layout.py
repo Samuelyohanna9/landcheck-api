@@ -189,39 +189,40 @@ def draw_title_block(
     fig, title_text, plot_id, area_m2, scale_text, location_text, lga_text, state_text, font_scale=1.0,
     title_font: str | None = None, title_size: int | None = None,
     area_font: str | None = None, area_size: int | None = None,
+    text_color: str = "black",
 ):
     # Plot number at top right corner for identification
-    fig.text(0.94, 0.95, f"Plot #{plot_id}", ha="right", fontsize=int(8*font_scale), weight="bold",)
+    fig.text(0.94, 0.95, f"Plot #{plot_id}", ha="right", fontsize=int(8*font_scale), weight="bold", color=text_color)
 
     y = 0.955
     fig.text(
         0.5, y, str(title_text), ha="center", fontsize=title_size if title_size else int(12*font_scale), weight="bold",
         **({"fontfamily": title_font} if title_font else {}),
     )
-    fig.text(0.5, y - 0.030, f"LOCATED AT: {location_text}", ha="center", fontsize=int(9*font_scale))
-    fig.text(0.5, y - 0.050, str(lga_text), ha="center", fontsize=int(9*font_scale))
-    fig.text(0.5, y - 0.070, str(state_text), ha="center", fontsize=int(9*font_scale))
+    fig.text(0.5, y - 0.030, f"LOCATED AT: {location_text}", ha="center", fontsize=int(9*font_scale), color=text_color)
+    fig.text(0.5, y - 0.050, str(lga_text), ha="center", fontsize=int(9*font_scale), color=text_color)
+    fig.text(0.5, y - 0.070, str(state_text), ha="center", fontsize=int(9*font_scale), color=text_color)
     fig.text(
         0.5, y - 0.100, f"AREA = {area_m2/10000:.4f} HA.", ha="center",
         fontsize=area_size if area_size else int(9*font_scale), color="red",
         **({"fontfamily": area_font} if area_font else {}),
     )
-    fig.text(0.5, y - 0.120, f"SCALE  {scale_text}", ha="center", fontsize=int(9*font_scale))
+    fig.text(0.5, y - 0.120, f"SCALE  {scale_text}", ha="center", fontsize=int(9*font_scale), color=text_color)
 
 
-def draw_footer(fig, crs_text, source_text, surveyor, rank, font_scale=1.0):
+def draw_footer(fig, crs_text, source_text, surveyor, rank, font_scale=1.0, text_color: str = "black"):
     y_top = 0.155
     y_bot = 0.055
     y_bot_source = 0.045
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
 
-    fig.text(0.06, y_top, f"SURVEYOR: {surveyor}", fontsize=int(9*font_scale))
-    fig.text(0.06, y_top - 0.025, f"RANK: {rank}", fontsize=int(9*font_scale))
-    fig.text(0.06, y_top - 0.050, "SIGNATURE: ____________________", fontsize=int(9*font_scale))
-    fig.text(0.06, y_top - 0.075, f"DATE PRINTED: {now}", fontsize=int(9*font_scale))
+    fig.text(0.06, y_top, f"SURVEYOR: {surveyor}", fontsize=int(9*font_scale), color=text_color)
+    fig.text(0.06, y_top - 0.025, f"RANK: {rank}", fontsize=int(9*font_scale), color=text_color)
+    fig.text(0.06, y_top - 0.050, "SIGNATURE: ____________________", fontsize=int(9*font_scale), color=text_color)
+    fig.text(0.06, y_top - 0.075, f"DATE PRINTED: {now}", fontsize=int(9*font_scale), color=text_color)
 
     fig.text(0.06, y_bot, str(crs_text), fontsize=int(8*font_scale), color="blue")
-    fig.text(0.94, y_bot_source, str(source_text), fontsize=int(8*font_scale), ha="right")
+    fig.text(0.94, y_bot_source, str(source_text), fontsize=int(8*font_scale), ha="right", color=text_color)
 
 
 def _draw_figure_text_justified(fig, x, y, text, width_fig, fontsize, fontweight="normal"):
@@ -2870,8 +2871,9 @@ def render_plot_map_layout(
     draw_title_block(
         fig, title_text, plot_id, area_m2, scale_text, location_text, lga_text, state_text, font_scale,
         title_font=title_font, title_size=title_size, area_font=area_font, area_size=area_size,
+        text_color=text_color,
     )
-    draw_footer(fig, crs_footer_text, source_footer_text, surveyor_name, surveyor_rank, font_scale)
+    draw_footer(fig, crs_footer_text, source_footer_text, surveyor_name, surveyor_rank, font_scale, text_color=text_color)
 
     scale_ratio = parse_scale_ratio(scale_text)
     apply_true_scale(ax, poly, scale_ratio, fig_width * map_width, fig_height * map_height)
