@@ -6,15 +6,18 @@ matplotlib.use("Agg")
 import os
 import math
 import re
+from io import BytesIO
 import numpy as np
 import geopandas as gpd
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 import matplotlib.lines as mlines
+import requests
 from sqlalchemy import text
 from shapely import wkb
 from datetime import datetime
 import contextily as ctx
+from PIL import Image
 
 from reportlab.lib.pagesizes import A4, A3, A2, A1, A0
 from reportlab.pdfgen import canvas
@@ -26,6 +29,13 @@ from matplotlib.backends.backend_agg import FigureCanvasAgg as FigureCanvas
 # can hang well past the point where a retry/fallback would actually help - this matters most for
 # the full-export path below, which chains up to 3 providers sequentially.
 _BASEMAP_FETCH_TIMEOUT = (5, 20)
+_ARCGIS_EXPORT_TIMEOUT = (6, 30)
+_ARCGIS_WORLD_IMAGERY_EXPORT_URL = os.getenv(
+    "ARCGIS_WORLD_IMAGERY_EXPORT_URL",
+    "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/export",
+).strip()
+_ARCGIS_ORTHO_PREVIEW_MAX_EDGE = max(1024, int(os.getenv("ARCGIS_ORTHO_PREVIEW_MAX_EDGE", "1600")))
+_ARCGIS_ORTHO_EXPORT_MAX_EDGE = max(1600, int(os.getenv("ARCGIS_ORTHO_EXPORT_MAX_EDGE", "4096")))
 
 # Same public Mapbox token already used by the frontend map (mapboxLoader.ts / VITE_MAPBOX_TOKEN) -
 # Mapbox public (pk.*) tokens are meant to be shared between client and server use, so the Hetzner
@@ -41,6 +51,103 @@ def _mapbox_satellite_url() -> str:
         "https://api.mapbox.com/v4/mapbox.satellite/{z}/{x}/{y}@2x.jpg90"
         f"?access_token={MAPBOX_ACCESS_TOKEN}"
     )
+
+
+def _compute_arcgis_export_size(
+    fig_width: float,
+    fig_height: float,
+    map_width_frac: float,
+    map_height_frac: float,
+    dpi: int,
+    preview_mode: bool,
+) -> tuple[int, int]:
+    max_edge = _ARCGIS_ORTHO_PREVIEW_MAX_EDGE if preview_mode else _ARCGIS_ORTHO_EXPORT_MAX_EDGE
+    base_width = max(640, int(round(fig_width * map_width_frac * dpi)))
+    base_height = max(640, int(round(fig_height * map_height_frac * dpi)))
+    upscale_factor = 1.0 if preview_mode else 1.5
+    width = max(640, int(round(base_width * upscale_factor)))
+    height = max(640, int(round(base_height * upscale_factor)))
+    scale = min(max_edge / max(width, 1), max_edge / max(height, 1), 1.0)
+    return max(640, int(round(width * scale))), max(640, int(round(height * scale)))
+
+
+def _load_arcgis_export_image(
+    *,
+    xmin: float,
+    ymin: float,
+    xmax: float,
+    ymax: float,
+    axis_epsg: int,
+    pixel_width: int,
+    pixel_height: int,
+    preview_mode: bool,
+) -> np.ndarray:
+    params = {
+        "bbox": f"{xmin},{ymin},{xmax},{ymax}",
+        "bboxSR": axis_epsg,
+        "imageSR": axis_epsg,
+        "size": f"{pixel_width},{pixel_height}",
+        "format": "jpg" if preview_mode else "png32",
+        "transparent": "false",
+        "f": "image",
+    }
+    response = requests.get(
+        _ARCGIS_WORLD_IMAGERY_EXPORT_URL,
+        params=params,
+        timeout=_ARCGIS_EXPORT_TIMEOUT,
+        headers={"User-Agent": "LandCheck-Orthophoto/1.0"},
+    )
+    response.raise_for_status()
+    content_type = (response.headers.get("Content-Type") or "").lower()
+    if "json" in content_type:
+        raise RuntimeError(f"ArcGIS exportImage returned JSON instead of imagery: {response.text[:240]}")
+    image = Image.open(BytesIO(response.content)).convert("RGB")
+    return np.asarray(image)
+
+
+def _try_add_arcgis_world_imagery(
+    ax,
+    *,
+    target_xlim: tuple[float, float],
+    target_ylim: tuple[float, float],
+    axis_epsg: int,
+    fig_width: float,
+    fig_height: float,
+    map_width_frac: float,
+    map_height_frac: float,
+    dpi: int,
+    preview_mode: bool,
+) -> bool:
+    try:
+        pixel_width, pixel_height = _compute_arcgis_export_size(
+            fig_width,
+            fig_height,
+            map_width_frac,
+            map_height_frac,
+            dpi,
+            preview_mode,
+        )
+        image = _load_arcgis_export_image(
+            xmin=target_xlim[0],
+            ymin=target_ylim[0],
+            xmax=target_xlim[1],
+            ymax=target_ylim[1],
+            axis_epsg=axis_epsg,
+            pixel_width=pixel_width,
+            pixel_height=pixel_height,
+            preview_mode=preview_mode,
+        )
+        ax.imshow(
+            image,
+            extent=(target_xlim[0], target_xlim[1], target_ylim[0], target_ylim[1]),
+            origin="upper",
+            interpolation="none",
+            zorder=0,
+        )
+        return True
+    except Exception as e:
+        print(f"ArcGIS World Imagery exportImage failed: {e}")
+        return False
 
 # Paper size mapping (ReportLab points)
 PAPER_SIZES_REPORTLAB = {
@@ -546,7 +653,7 @@ def render_orthophoto_png(
     if preview_mode:
         dpi = 120
     else:
-        dpi = 200 if paper_config["name"] in ["A4", "A3"] else 150 if paper_config["name"] == "A2" else 100
+        dpi = 240 if paper_config["name"] in ["A4", "A3"] else 180 if paper_config["name"] == "A2" else 140
 
     fig = plt.figure(figsize=(fig_width, fig_height), dpi=dpi)
     canvas_agg = FigureCanvas(fig)
@@ -623,9 +730,21 @@ def render_orthophoto_png(
                     print(f"OpenTopoMap provider failed: {e}")
     else:
         sat_zoom = 16 if preview_mode else 17
+        basemap_loaded = _try_add_arcgis_world_imagery(
+            ax,
+            target_xlim=target_xlim,
+            target_ylim=target_ylim,
+            axis_epsg=display_epsg,
+            fig_width=fig_width,
+            fig_height=fig_height,
+            map_width_frac=map_width,
+            map_height_frac=map_height,
+            dpi=dpi,
+            preview_mode=preview_mode,
+        )
         if preview_mode:
             # Fast path for previews: no long fallback chain.
-            if MAPBOX_ACCESS_TOKEN:
+            if not basemap_loaded and MAPBOX_ACCESS_TOKEN:
                 try:
                     ctx.add_basemap(
                         ax,
@@ -677,7 +796,7 @@ def render_orthophoto_png(
 
             # Mapbox Satellite first when configured - denser high-res (30-50cm) coverage in
             # Nigeria's larger cities than Esri's default World Imagery layer, plus @2x retina tiles.
-            if MAPBOX_ACCESS_TOKEN:
+            if not basemap_loaded and MAPBOX_ACCESS_TOKEN:
                 try:
                     ctx.add_basemap(
                         ax,

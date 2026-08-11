@@ -5844,7 +5844,7 @@ def orthophoto_pdf(plot_id: int, db: Session = Depends(get_db), background_tasks
     map_type = "topo" if use_topo_map else "satellite"
     pdf_path = f"{out_dir}/plot_{plot_id}_orthophoto_{map_type}.pdf"
 
-    tmp_png = tempfile.NamedTemporaryFile(suffix=f"_{map_type}.jpg", delete=False)
+    tmp_png = tempfile.NamedTemporaryFile(suffix=f"_{map_type}.png", delete=False)
     png_path = tmp_png.name
     tmp_png.close()
 
@@ -6124,7 +6124,7 @@ def get_saved_orthophoto_pdf(plot_id: int, map_type: str = "satellite", refresh:
         out_dir = os.path.join(REPORTS_DIR, "orthophoto")
         os.makedirs(out_dir, exist_ok=True)
         pdf_path = os.path.join(out_dir, f"plot_{plot_id}_orthophoto_{safe_type}.pdf")
-        tmp_png = tempfile.NamedTemporaryFile(suffix=f"_{safe_type}.jpg", delete=False)
+        tmp_png = tempfile.NamedTemporaryFile(suffix=f"_{safe_type}.png", delete=False)
         png_path = tmp_png.name
         tmp_png.close()
         epsg_code = COORDINATE_SYSTEMS.get(meta["coordinate_system"], 4326)
