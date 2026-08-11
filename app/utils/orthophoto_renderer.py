@@ -929,7 +929,7 @@ def render_orthophoto_png(
     draw_title_block(fig, title_text, plot_id, scale_text_for_layout, location_text, lga_text, state_text, font_scale)
     draw_footer(fig, crs_footer_text, source_footer_text, surveyor_name, surveyor_rank, font_scale)
     add_north_arrow(ax, font_scale, style=north_arrow_style, color=north_arrow_color)
-    add_scalebar(ax, choose_scalebar_length(scale_ratio), font_scale=font_scale)
+    add_scalebar(ax, choose_scalebar_length(effective_scale_ratio), font_scale=font_scale)
 
     ax.set_aspect("equal")
     ax.axis("off")
