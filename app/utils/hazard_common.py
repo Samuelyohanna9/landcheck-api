@@ -1,6 +1,12 @@
 from __future__ import annotations
 
-from typing import Tuple
+import json
+from typing import Any, Dict, List, Tuple
+
+from shapely import wkb
+from shapely.geometry.base import BaseGeometry
+from sqlalchemy import text
+from sqlalchemy.orm import Session
 
 # Shared 4-tier risk scale used by every hazard module (flood, erosion, ...) so a client sees
 # one consistent vocabulary and palette across the whole hazard report suite, not a different
@@ -37,3 +43,36 @@ def risk_tier_legend() -> list[dict]:
         labels_seen.add(label)
         legend.append({"label": label, "color": color})
     return legend
+
+
+def fetch_buildings_near(db: Session, boundary_geojson: Dict[str, Any], buffer_m: float = 500) -> List[BaseGeometry]:
+    """Real OSM building footprint polygons (EPSG:4326) intersecting a metric buffer around a
+    hazard boundary - the same `multipolygons` table Survey Plan's Auto Feature Detection already
+    reads from (see plots.py's _run_plot_feature_detection), just queried directly against an
+    arbitrary boundary instead of a saved plot row.
+    """
+    rows = db.execute(
+        text(
+            """
+            SELECT m.geom
+            FROM multipolygons m
+            WHERE m.building IS NOT NULL
+              AND ST_Intersects(
+                  m.geom,
+                  ST_Buffer(
+                      ST_SetSRID(ST_GeomFromGeoJSON(:boundary_geojson), 4326)::geography,
+                      :buffer_m
+                  )::geometry
+              )
+            LIMIT 5000
+            """
+        ),
+        {"boundary_geojson": json.dumps(boundary_geojson), "buffer_m": buffer_m},
+    ).fetchall()
+    geometries = []
+    for row in rows:
+        try:
+            geometries.append(wkb.loads(row[0]))
+        except Exception:
+            continue
+    return geometries

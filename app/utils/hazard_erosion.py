@@ -2,10 +2,14 @@ from __future__ import annotations
 
 import base64
 import io
+import math
 from datetime import date, timedelta
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import ee
+import geopandas as gpd
+import matplotlib.tri as mtri
+import numpy as np
 import requests
 
 from app.utils.gee_client import init_gee
@@ -20,15 +24,94 @@ def _mask_sentinel_clouds(image: ee.Image) -> ee.Image:
     return image.updateMask(cloud_mask.And(cirrus_mask)).copyProperties(image, image.propertyNames())
 
 
+def _compute_local_slope_from_points(points: List[Dict[str, float]]) -> Optional[Tuple[float, float]]:
+    """Builds a TIN (triangulated surface) directly from the surveyor's own elevation points and
+    measures the slope of every triangle - a global 30m DEM only spans a handful of pixels across
+    a typical plot, so a surveyor's own points (even a modest handful) resolve local terrain far
+    more accurately. Returns (area-weighted mean slope deg, max slope deg), or None if there
+    aren't enough usable points to triangulate.
+    """
+    if not points or len(points) < 3:
+        return None
+    try:
+        lons = [float(p["lng"]) for p in points]
+        lats = [float(p["lat"]) for p in points]
+        elevations = [float(p["elevation_m"]) for p in points]
+    except (KeyError, TypeError, ValueError):
+        return None
+
+    try:
+        gdf = gpd.GeoDataFrame(
+            {"elevation_m": elevations},
+            geometry=gpd.points_from_xy(lons, lats),
+            crs="EPSG:4326",
+        )
+        centroid = gdf.geometry.unary_union.centroid
+        utm_zone = int((centroid.x + 180) / 6) + 1
+        epsg = 32600 + utm_zone if centroid.y >= 0 else 32700 + utm_zone
+        projected = gdf.to_crs(epsg=epsg)
+        xs = projected.geometry.x.to_numpy()
+        ys = projected.geometry.y.to_numpy()
+        zs = projected["elevation_m"].to_numpy()
+        triang = mtri.Triangulation(xs, ys)
+    except Exception:
+        return None
+
+    # Horizontal (map-view) footprint area per triangle, used both as the mean-slope weight and
+    # to discard slivers: a triangle whose 2D footprint is nearly zero (e.g. from near-collinear
+    # points, common at the edges of a small/regular point set) can report a near-vertical slope
+    # purely from floating-point noise, even though the real terrain is gentle - that's a
+    # triangulation artifact, not a real cliff, so it must not be allowed to dominate max_slope.
+    horizontal_areas = []
+    for tri_indices in triang.triangles:
+        x0, y0 = xs[tri_indices[0]], ys[tri_indices[0]]
+        x1, y1 = xs[tri_indices[1]], ys[tri_indices[1]]
+        x2, y2 = xs[tri_indices[2]], ys[tri_indices[2]]
+        horizontal_areas.append(abs((x1 - x0) * (y2 - y0) - (x2 - x0) * (y1 - y0)) / 2.0)
+
+    if not horizontal_areas:
+        return None
+    min_area = max(float(np.median(horizontal_areas)) * 0.05, 1e-6)
+
+    slopes: List[float] = []
+    weights: List[float] = []
+    for tri_indices, horizontal_area in zip(triang.triangles, horizontal_areas):
+        if horizontal_area < min_area:
+            continue
+        p0 = np.array([xs[tri_indices[0]], ys[tri_indices[0]], zs[tri_indices[0]]])
+        p1 = np.array([xs[tri_indices[1]], ys[tri_indices[1]], zs[tri_indices[1]]])
+        p2 = np.array([xs[tri_indices[2]], ys[tri_indices[2]], zs[tri_indices[2]]])
+        normal = np.cross(p1 - p0, p2 - p0)
+        normal_len = float(np.linalg.norm(normal))
+        if normal_len < 1e-9:
+            continue
+        cos_angle = max(-1.0, min(1.0, abs(normal[2]) / normal_len))
+        slopes.append(math.degrees(math.acos(cos_angle)))
+        weights.append(horizontal_area)
+
+    if not slopes:
+        return None
+    slopes_arr = np.array(slopes)
+    weights_arr = np.array(weights)
+    mean_slope = float(np.average(slopes_arr, weights=weights_arr)) if weights_arr.sum() > 0 else float(np.mean(slopes_arr))
+    return mean_slope, float(np.max(slopes_arr))
+
+
 def compute_erosion_risk(
     boundary_geojson: Dict[str, Any],
     show_raster: bool = False,
+    local_elevation_points: Optional[List[Dict[str, float]]] = None,
 ) -> Tuple[float, str, Dict[str, float], bytes]:
-    """A pragmatic susceptibility index, not a full RUSLE soil-loss model: slope (from a global
-    30m DEM) is the dominant driver of water erosion, vegetation cover (NDVI) protects soil from
-    being stripped, and proximity to a natural drainage channel concentrates erosive flow. This
-    mirrors compute_flood_risk's weighted-composite approach rather than pulling in rainfall
+    """A pragmatic susceptibility index, not a full RUSLE soil-loss model: slope is the dominant
+    driver of water erosion, vegetation cover (NDVI) protects soil from being stripped, and
+    proximity to a natural drainage channel concentrates erosive flow. This mirrors
+    compute_flood_risk's weighted-composite approach rather than pulling in rainfall
     erosivity/soil-erodibility datasets, which would need per-region calibration to be trustworthy.
+
+    When the caller supplies the surveyor's own elevation points, slope is computed directly from
+    those (see _compute_local_slope_from_points) instead of the global 30m DEM - noticeably more
+    accurate for a single plot. Vegetation and drainage still come from satellite data either way,
+    since a handful of elevation points can't tell us anything about ground cover or drainage.
     """
     init_gee()
 
@@ -43,21 +126,32 @@ def compute_erosion_risk(
     slope_count = slope.reduceRegion(
         reducer=ee.Reducer.count(), geometry=geom, scale=30, maxPixels=1e9,
     ).get("slope_deg")
-    has_data = bool(ee.Number(slope_count).getInfo() or 0)
+    has_dem_data = bool(ee.Number(slope_count).getInfo() or 0)
 
+    local_slope = _compute_local_slope_from_points(local_elevation_points or [])
+    slope_source = "unavailable"
     mean_slope_val = 0.0
     max_slope_val = 0.0
     mean_ndvi_val = 0.3  # neutral fallback if no clear-sky imagery is available
     mean_dist_val = 5000.0
 
-    if has_data:
+    if local_slope is not None:
+        mean_slope_val, max_slope_val = local_slope
+        slope_source = "local_survey"
+    elif has_dem_data:
         mean_slope_val = float(slope.reduceRegion(
             reducer=ee.Reducer.mean(), geometry=geom, scale=30, maxPixels=1e9,
         ).get("slope_deg").getInfo() or 0.0)
         max_slope_val = float(slope.reduceRegion(
             reducer=ee.Reducer.max(), geometry=geom, scale=30, maxPixels=1e9,
         ).get("slope_deg").getInfo() or 0.0)
+        slope_source = "global_dem"
 
+    has_data = bool(local_slope is not None or has_dem_data)
+
+    if has_dem_data:
+        # Vegetation and drainage concentration still need satellite coverage regardless of
+        # where the slope number came from.
         end = date.today()
         start = end - timedelta(days=180)
         collection = (
@@ -105,6 +199,7 @@ def compute_erosion_risk(
         "vegetation_score": round(vegetation_score, 3),
         "drainage_score": round(drainage_score, 3),
         "data_available": has_data,
+        "slope_source": slope_source,
     }
 
     risk_class, class_color = classify_risk(risk_value, has_data)

@@ -91,6 +91,8 @@ def _render_hazard_report_pdf(
     footnotes: List[str],
     legend: List[Dict[str, str]],
     note: str = "",
+    insight: str = "",
+    map_has_own_legend: bool = False,
 ) -> None:
     c = canvas.Canvas(output_path, pagesize=A4)
     width, height = A4
@@ -103,13 +105,22 @@ def _render_hazard_report_pdf(
     c.setFillColor(HexColor("#111827"))
     c.setFont("Helvetica-Bold", 11)
     c.drawString(200, y - 6, headline)
+    content_bottom = y - 22
     if note:
         c.setFont("Helvetica", 8.5)
         c.setFillColor(HexColor("#4b5563"))
-        _draw_wrapped(c, note, 200, y - 22, width - 236, 11)
+        content_bottom = _draw_wrapped(c, note, 200, y - 22, width - 236, 11)
+
+    if insight:
+        insight_box_y = content_bottom - 4
+        _draw_rounded_box(c, 200, insight_box_y - 18, width - 236, 22, 5, fill_color=HexColor("#eff6ff"), stroke_color=HexColor("#bfdbfe"))
+        c.setFillColor(HexColor("#1d4ed8"))
+        c.setFont("Helvetica-Bold", 7.8)
+        _draw_wrapped(c, insight, 208, insight_box_y - 6, width - 252, 9)
+        content_bottom = insight_box_y - 22
 
     # Stat card row - up to 4 cards, evenly spaced.
-    cards_top = y - 60
+    cards_top = min(y - 60, content_bottom - 8)
     card_h = 52
     card_gap = 10
     card_w = (width - 72 - card_gap * (len(stat_cards) - 1)) / max(len(stat_cards), 1)
@@ -138,26 +149,29 @@ def _render_hazard_report_pdf(
             title="Score components (% contribution to risk)",
         )
 
-    # Legend, right-aligned above the map.
+    # Legend, right-aligned above the map - skipped when the map image already has its own
+    # legend/scale bar/north arrow baked in (the local matplotlib-rendered flood map), so the
+    # report doesn't show two conflicting legends for the same image.
     legend_top = chart_top - chart_h - 20
     map_top = legend_top - 14
     legend_x = width - 190
     ly = map_top
-    c.setFont("Helvetica-Bold", 9)
-    c.setFillColor(HexColor("#111827"))
-    c.drawString(legend_x, ly, "Risk scale")
-    ly -= 14
-    c.setFont("Helvetica", 8)
-    for item in legend:
-        try:
-            swatch = colors.HexColor(item["color"])
-        except Exception:
-            swatch = colors.black
-        c.setFillColor(swatch)
-        c.rect(legend_x, ly - 7, 9, 9, fill=1, stroke=0)
-        c.setFillColor(HexColor("#374151"))
-        c.drawString(legend_x + 13, ly - 6, str(item.get("label", "")))
-        ly -= 13
+    if not map_has_own_legend:
+        c.setFont("Helvetica-Bold", 9)
+        c.setFillColor(HexColor("#111827"))
+        c.drawString(legend_x, ly, "Risk scale")
+        ly -= 14
+        c.setFont("Helvetica", 8)
+        for item in legend:
+            try:
+                swatch = colors.HexColor(item["color"])
+            except Exception:
+                swatch = colors.black
+            c.setFillColor(swatch)
+            c.rect(legend_x, ly - 7, 9, 9, fill=1, stroke=0)
+            c.setFillColor(HexColor("#374151"))
+            c.drawString(legend_x + 13, ly - 6, str(item.get("label", "")))
+            ly -= 13
 
     # Map image.
     img = ImageReader(io.BytesIO(overlay_png))
@@ -170,17 +184,18 @@ def _render_hazard_report_pdf(
     c.rect(img_x, img_y, img_w, img_h, fill=0, stroke=1)
     c.drawImage(img, img_x + 2, img_y + 2, img_w - 4, img_h - 4, preserveAspectRatio=True, anchor="c")
 
-    arrow_x = img_x + img_w - 20
-    arrow_y = img_y + img_h - 20
-    c.setFillColor(colors.black)
-    path = c.beginPath()
-    path.moveTo(arrow_x, arrow_y)
-    path.lineTo(arrow_x - 5, arrow_y - 10)
-    path.lineTo(arrow_x + 5, arrow_y - 10)
-    path.close()
-    c.drawPath(path, fill=1, stroke=0)
-    c.setFont("Helvetica-Bold", 7)
-    c.drawCentredString(arrow_x, arrow_y - 20, "N")
+    if not map_has_own_legend:
+        arrow_x = img_x + img_w - 20
+        arrow_y = img_y + img_h - 20
+        c.setFillColor(colors.black)
+        path = c.beginPath()
+        path.moveTo(arrow_x, arrow_y)
+        path.lineTo(arrow_x - 5, arrow_y - 10)
+        path.lineTo(arrow_x + 5, arrow_y - 10)
+        path.close()
+        c.drawPath(path, fill=1, stroke=0)
+        c.setFont("Helvetica-Bold", 7)
+        c.drawCentredString(arrow_x, arrow_y - 20, "N")
 
     # Method box, right column beneath legend.
     method_x = width - 190
@@ -215,6 +230,29 @@ def render_flood_report_pdf(output_path: str, overlay_png: bytes, summary: Dict[
     risk_class = str(summary.get("risk_class", "Low"))
     class_color = str(summary.get("class_color") or "#22c55e")
     return_period = summary.get("return_period", "100")
+    buildings_total = int(summary.get("buildings_total", 0) or 0)
+    buildings_threatened = int(summary.get("buildings_threatened", 0) or 0)
+
+    headline = f"{risk_class} flood risk at the {return_period}-year return period"
+    if buildings_total > 0:
+        headline = f"{buildings_threatened} of {buildings_total} buildings sit in the flood zone at the {return_period}-year return period"
+
+    insight = ""
+    if summary.get("local_elevation_used") and summary.get("relative_elevation_m") is not None:
+        rel = float(summary["relative_elevation_m"])
+        if rel < -0.3:
+            insight = (
+                f"Site elevation note: your surveyed points average {abs(rel):.1f} m BELOW the "
+                "surrounding terrain - low-lying sites are more prone to ponding and slow drainage "
+                "during heavy rainfall, independent of the river-based score above."
+            )
+        elif rel > 0.3:
+            insight = (
+                f"Site elevation note: your surveyed points average {rel:.1f} m ABOVE the "
+                "surrounding terrain, which is generally favorable for drainage."
+            )
+        else:
+            insight = "Site elevation note: your surveyed points are close to the surrounding terrain average."
 
     _render_hazard_report_pdf(
         output_path,
@@ -224,12 +262,12 @@ def render_flood_report_pdf(output_path: str, overlay_png: bytes, summary: Dict[
         risk_score=str(summary.get("risk_score", "0")),
         risk_class=risk_class,
         class_color=class_color,
-        headline=f"{risk_class} flood risk at the {return_period}-year return period",
+        headline=headline,
         stat_cards=[
             ("Mean Depth (m)", str(summary.get("mean_depth_m", "-"))),
             ("Max Depth (m)", str(summary.get("max_depth_m", "-"))),
             ("Inundation (%)", str(summary.get("inundation_percent", "-"))),
-            ("Dist. to River (m)", str(summary.get("distance_to_river_m", "-"))),
+            ("Buildings Threatened", f"{buildings_threatened} / {buildings_total}" if buildings_total else "-"),
         ],
         component_bars=[
             ("Depth", float(summary.get("depth_score", 0) or 0), "#1d4ed8"),
@@ -238,22 +276,31 @@ def render_flood_report_pdf(output_path: str, overlay_png: bytes, summary: Dict[
         ],
         method=(
             "Flood depth is sampled from the JRC/CEMS GloFAS global hazard model at the chosen "
-            "return period, inside a 1km buffer around the plot.\n"
+            "return period, inside a 1km buffer around the plot. Buildings are real OpenStreetMap "
+            "footprints, flagged as threatened where the interpolated depth surface exceeds 5cm.\n"
             "Score = 60% mean depth (normalized to 3m) + 25% inundated area fraction "
             "+ 15% proximity to a major river channel."
         ),
         footnotes=[
             f"Return period: {return_period} years - analysis buffer: {summary.get('buffer_m', '1000')} m around plot.",
-            "Source: JRC/CEMS GloFAS Flood Hazard v2.1, WWF HydroSHEDS. For screening only, not a legal flood determination.",
+            "Source: JRC/CEMS GloFAS Flood Hazard v2.1, WWF HydroSHEDS, OpenStreetMap. For screening only, not a legal flood determination.",
         ],
         legend=summary.get("legend") or [],
         note=str(summary.get("note", "")),
+        insight=insight,
+        map_has_own_legend=True,
     )
 
 
 def render_erosion_report_pdf(output_path: str, overlay_png: bytes, summary: Dict[str, object]) -> None:
     risk_class = str(summary.get("risk_class", "Low"))
     class_color = str(summary.get("class_color") or "#22c55e")
+    slope_source = str(summary.get("slope_source") or "unavailable")
+    insight = ""
+    if slope_source == "local_survey":
+        insight = "Slope is computed directly from your uploaded survey points, not the global 30m elevation model - a more accurate local measurement."
+    elif slope_source == "global_dem":
+        insight = "Slope is estimated from a global 30m elevation model. Upload your own surveyed elevation points for a more precise local measurement."
 
     _render_hazard_report_pdf(
         output_path,
@@ -288,4 +335,5 @@ def render_erosion_report_pdf(output_path: str, overlay_png: bytes, summary: Dic
         ],
         legend=summary.get("legend") or [],
         note=str(summary.get("note", "")),
+        insight=insight,
     )

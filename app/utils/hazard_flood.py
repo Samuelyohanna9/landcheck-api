@@ -2,19 +2,53 @@ from __future__ import annotations
 
 import base64
 import io
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import ee
-import requests
+from sqlalchemy.orm import Session
 
+from app.utils.elevation import fetch_dem_elevation_points
 from app.utils.gee_client import init_gee
-from app.utils.hazard_common import classify_risk
+from app.utils.hazard_common import classify_risk, fetch_buildings_near
+from app.utils.hazard_map_renderer import render_flood_hazard_map
+
+
+def _fetch_depth_points(depth_image: "ee.Image", region: "ee.Geometry", scale_m: int = 90) -> Optional[List[Dict[str, float]]]:
+    """Samples the flood depth band as a {lng, lat, depth_m} point cloud over the analysis
+    region, the same pixelLonLat + toList idiom used by elevation.py's DEM sampler - this is
+    what lets the map show a real graduated depth surface instead of a single flat risk color.
+    """
+    try:
+        sampled = depth_image.addBands(ee.Image.pixelLonLat())
+        reduced = sampled.reduceRegion(
+            reducer=ee.Reducer.toList(),
+            geometry=region,
+            scale=scale_m,
+            maxPixels=int(1e9),
+            bestEffort=True,
+        )
+        info = reduced.getInfo() or {}
+        lons = info.get("longitude") or []
+        lats = info.get("latitude") or []
+        depths = info.get("depth_m") or []
+        if len(lons) < 3 or len(lons) != len(lats) or len(lons) != len(depths):
+            return None
+        points = [
+            {"lng": float(lo), "lat": float(la), "depth_m": float(d)}
+            for lo, la, d in zip(lons, lats, depths)
+            if d is not None
+        ]
+        return points if len(points) >= 3 else None
+    except Exception:
+        return None
 
 
 def compute_flood_risk(
+    db: Session,
     boundary_geojson: Dict[str, Any],
     show_raster: bool = False,
     return_period: int = 100,
+    local_elevation_points: Optional[List[Dict[str, float]]] = None,
 ) -> Tuple[float, str, Dict[str, float], bytes]:
     init_gee()
 
@@ -105,38 +139,56 @@ def compute_flood_risk(
 
     risk_class, class_color = classify_risk(risk_value, breakdown["data_available"])
 
-    palette = ["#e0f2fe", "#7dd3fc", "#0ea5e9", "#1d4ed8"]
-    depth_for_vis = depth.unmask(0)
-    hillshade = depth_for_vis.visualize(min=0, max=3, palette=["#0b1220", "#64748b", "#e2e8f0"])
-    risk_vis = depth_for_vis.visualize(min=0.1, max=3, palette=palette, opacity=0.6)
-    boundary = ee.Image().paint(geom, 1, 2).visualize(palette=["#0f172a"])
+    # Informational only - deliberately NOT folded into risk_value/risk_class. A single relative-
+    # elevation comparison isn't rigorous enough to justify re-weighting a screening score, but a
+    # site sitting notably below its surroundings is a genuine, well-established ponding/drainage
+    # risk signal worth surfacing to a surveyor who supplied their own elevation data.
+    breakdown["local_elevation_used"] = False
+    breakdown["relative_elevation_m"] = None
+    valid_points = [
+        p for p in (local_elevation_points or [])
+        if isinstance(p, dict) and p.get("elevation_m") is not None
+    ]
+    if valid_points:
+        try:
+            local_mean_elevation = sum(float(p["elevation_m"]) for p in valid_points) / len(valid_points)
+            dem = ee.ImageCollection("COPERNICUS/DEM/GLO30_2024_1").select("DEM").mosaic()
+            regional_mean = dem.reduceRegion(
+                reducer=ee.Reducer.mean(), geometry=analysis_region, scale=30, maxPixels=1e9,
+            ).get("DEM").getInfo()
+            if regional_mean is not None:
+                breakdown["local_elevation_used"] = True
+                breakdown["local_mean_elevation_m"] = round(local_mean_elevation, 2)
+                breakdown["regional_mean_elevation_m"] = round(float(regional_mean), 2)
+                breakdown["relative_elevation_m"] = round(local_mean_elevation - float(regional_mean), 2)
+        except Exception:
+            pass
 
-    class_fill = ee.Image().paint(geom, 1).visualize(palette=[class_color], opacity=0.25)
-    class_outline = ee.Image().paint(geom, 1, 3).visualize(palette=[class_color])
+    # Real depth surface (for the graduated map) and real building footprints (to flag which
+    # specific structures sit in the flood zone) - both fetched only when there's flood coverage
+    # here at all, since there's nothing meaningful to overlay otherwise.
+    # unmask(0) turns the "no flood here" NoData pixels into explicit 0.0 depth points - without
+    # this, reduceRegion's toList reducer silently drops dry pixels entirely, leaving nothing to
+    # anchor the triangulated surface to "dry ground" and letting wet-area depths bleed outward
+    # across the whole buffer instead of tapering off at the real flood extent.
+    depth_points = _fetch_depth_points(depth.unmask(0), analysis_region) if breakdown["data_available"] else None
+    contour_points = local_elevation_points if valid_points else fetch_dem_elevation_points(boundary_geojson, buffer_m=1000)
+    buildings = fetch_buildings_near(db, boundary_geojson, buffer_m=1000)
 
-    # Simple hatch pattern for plot class overlay (diagonal stripes)
-    stripe_x = ee.Image.pixelCoordinates(analysis_region.projection()).select("x")
-    hatch = stripe_x.mod(20).lt(2)
-    hatch_overlay = hatch.updateMask(hatch).visualize(palette=[class_color], opacity=0.6)
-    hatch_overlay = hatch_overlay.clip(geom)
-
-    layers = [hillshade, class_fill, hatch_overlay, class_outline, boundary]
-    if show_raster:
-        layers.insert(1, risk_vis)
-
-    overlay = ee.ImageCollection(layers).mosaic().clip(analysis_region)
-
-    thumb_url = overlay.getThumbURL(
-        {
-            "region": analysis_region,
-            "dimensions": 1024,
-            "format": "png",
-        }
+    png_bytes, map_stats = render_flood_hazard_map(
+        boundary_geojson=boundary_geojson,
+        depth_points=depth_points,
+        contour_points=contour_points,
+        buildings=buildings,
+        risk_class=risk_class,
+        class_color=class_color,
+        return_period=return_period,
+        buffer_m=1000,
     )
+    breakdown["buildings_total"] = map_stats.get("buildings_total", 0)
+    breakdown["buildings_threatened"] = map_stats.get("buildings_threatened", 0)
 
-    resp = requests.get(thumb_url, timeout=30)
-    resp.raise_for_status()
-    return risk_value, risk_class, breakdown, resp.content
+    return risk_value, risk_class, breakdown, png_bytes
 
 
 def overlay_to_data_url(png_bytes: bytes) -> str:

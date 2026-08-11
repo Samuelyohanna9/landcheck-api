@@ -1,9 +1,11 @@
-from fastapi import APIRouter, Body, HTTPException
+from fastapi import APIRouter, Body, Depends, HTTPException
 from fastapi.responses import FileResponse
+from sqlalchemy.orm import Session
 import os
 import tempfile
 import logging
 
+from app.db import SessionLocal
 from app.utils.hazard_common import classify_risk, risk_tier_legend
 from app.utils.hazard_flood import compute_flood_risk, overlay_to_data_url as flood_overlay_to_data_url
 from app.utils.hazard_erosion import compute_erosion_risk, overlay_to_data_url as erosion_overlay_to_data_url
@@ -16,6 +18,14 @@ logger = logging.getLogger("hazards")
 
 BASE_DIR = os.path.dirname(os.path.dirname(__file__))
 REPORTS_DIR = os.path.join(BASE_DIR, "reports")
+
+
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
 
 RASTER_LEGEND_FLOOD = [
     {"label": "Flood Depth (Raster) - Low", "color": "#e0f2fe"},
@@ -57,6 +67,25 @@ def _extract_boundary(payload: dict) -> dict:
     return payload
 
 
+def _extract_local_elevation_points(payload: dict) -> list:
+    points = payload.get("local_elevation_points") or payload.get("elevation_points") or []
+    if not isinstance(points, list):
+        return []
+    valid = []
+    for p in points:
+        if not isinstance(p, dict):
+            continue
+        try:
+            valid.append({
+                "lng": float(p["lng"]),
+                "lat": float(p["lat"]),
+                "elevation_m": float(p["elevation_m"]),
+            })
+        except (KeyError, TypeError, ValueError):
+            continue
+    return valid
+
+
 def _build_legend(risk_class: str, class_color: str, plot_label: str, show_raster: bool, raster_legend: list) -> list:
     legend = [{"label": f"{plot_label} - {risk_class}", "color": class_color}]
     legend.extend(risk_tier_legend())
@@ -68,13 +97,14 @@ def _build_legend(risk_class: str, class_color: str, plot_label: str, show_raste
 # ---------------- FLOOD ----------------
 
 @router.post("/flood/preview")
-def flood_preview(payload: dict = Body(...)):
+def flood_preview(payload: dict = Body(...), db: Session = Depends(get_db)):
     boundary = _extract_boundary(payload)
     show_raster = bool(payload.get("show_raster", False))
     return_period = int(payload.get("return_period", 100))
+    local_elevation_points = _extract_local_elevation_points(payload)
     try:
         risk_value, risk_class, breakdown, overlay_png = compute_flood_risk(
-            boundary, show_raster, return_period
+            db, boundary, show_raster, return_period, local_elevation_points
         )
     except Exception as exc:
         logger.exception("Flood preview failed")
@@ -101,6 +131,8 @@ def flood_preview(payload: dict = Body(...)):
         "depth_score": round(breakdown["depth_score"], 3),
         "inundation_score": round(breakdown["inundation_score"], 3),
         "river_proximity_score": round(breakdown["river_proximity_score"], 3),
+        "buildings_total": breakdown.get("buildings_total", 0),
+        "buildings_threatened": breakdown.get("buildings_threatened", 0),
         "overlay": flood_overlay_to_data_url(overlay_png),
         "note": note,
         "buffer_m": 1000,
@@ -115,18 +147,23 @@ def flood_preview(payload: dict = Body(...)):
         "data_available": bool(breakdown.get("data_available", True)),
         "legend": legend,
         "show_raster": show_raster,
+        "local_elevation_used": bool(breakdown.get("local_elevation_used")),
+        "relative_elevation_m": breakdown.get("relative_elevation_m"),
+        "local_mean_elevation_m": breakdown.get("local_mean_elevation_m"),
+        "regional_mean_elevation_m": breakdown.get("regional_mean_elevation_m"),
     }
     return response
 
 
 @router.post("/flood/pdf")
-def flood_pdf(payload: dict = Body(...)):
+def flood_pdf(payload: dict = Body(...), db: Session = Depends(get_db)):
     boundary = _extract_boundary(payload)
     show_raster = bool(payload.get("show_raster", False))
     return_period = int(payload.get("return_period", 100))
+    local_elevation_points = _extract_local_elevation_points(payload)
     try:
         risk_value, risk_class, breakdown, overlay_png = compute_flood_risk(
-            boundary, show_raster, return_period
+            db, boundary, show_raster, return_period, local_elevation_points
         )
     except Exception as exc:
         logger.exception("Flood PDF failed")
@@ -158,11 +195,15 @@ def flood_pdf(payload: dict = Body(...)):
         "depth_score": breakdown["depth_score"],
         "inundation_score": breakdown["inundation_score"],
         "river_proximity_score": breakdown["river_proximity_score"],
+        "buildings_total": breakdown.get("buildings_total", 0),
+        "buildings_threatened": breakdown.get("buildings_threatened", 0),
         "buffer_m": "1000",
         "note": note,
         "legend": legend,
         "return_period": str(return_period),
         "show_raster": str(show_raster),
+        "local_elevation_used": bool(breakdown.get("local_elevation_used")),
+        "relative_elevation_m": breakdown.get("relative_elevation_m"),
     }
     render_flood_report_pdf(pdf_path, overlay_png, summary)
     return _pdf_response_with_r2(pdf_path, "flood_risk_report.pdf", "hazard-flood")
@@ -174,8 +215,11 @@ def flood_pdf(payload: dict = Body(...)):
 def erosion_preview(payload: dict = Body(...)):
     boundary = _extract_boundary(payload)
     show_raster = bool(payload.get("show_raster", False))
+    local_elevation_points = _extract_local_elevation_points(payload)
     try:
-        risk_value, risk_class, breakdown, overlay_png = compute_erosion_risk(boundary, show_raster)
+        risk_value, risk_class, breakdown, overlay_png = compute_erosion_risk(
+            boundary, show_raster, local_elevation_points
+        )
     except Exception as exc:
         logger.exception("Erosion preview failed")
         raise HTTPException(status_code=500, detail=str(exc)) from exc
@@ -211,6 +255,7 @@ def erosion_preview(payload: dict = Body(...)):
         "data_available": bool(breakdown.get("data_available", True)),
         "legend": legend,
         "show_raster": show_raster,
+        "slope_source": breakdown.get("slope_source", "unavailable"),
     }
     return response
 
@@ -219,8 +264,11 @@ def erosion_preview(payload: dict = Body(...)):
 def erosion_pdf(payload: dict = Body(...)):
     boundary = _extract_boundary(payload)
     show_raster = bool(payload.get("show_raster", False))
+    local_elevation_points = _extract_local_elevation_points(payload)
     try:
-        risk_value, risk_class, breakdown, overlay_png = compute_erosion_risk(boundary, show_raster)
+        risk_value, risk_class, breakdown, overlay_png = compute_erosion_risk(
+            boundary, show_raster, local_elevation_points
+        )
     except Exception as exc:
         logger.exception("Erosion PDF failed")
         raise HTTPException(status_code=500, detail=str(exc)) from exc
@@ -251,6 +299,7 @@ def erosion_pdf(payload: dict = Body(...)):
         "note": note,
         "legend": legend,
         "show_raster": str(show_raster),
+        "slope_source": breakdown.get("slope_source", "unavailable"),
     }
     render_erosion_report_pdf(pdf_path, overlay_png, summary)
     return _pdf_response_with_r2(pdf_path, "erosion_risk_report.pdf", "hazard-erosion")
