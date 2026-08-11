@@ -10,10 +10,12 @@ import ee
 import geopandas as gpd
 import matplotlib.tri as mtri
 import numpy as np
-import requests
+from sqlalchemy.orm import Session
 
+from app.utils.elevation import fetch_dem_elevation_points
 from app.utils.gee_client import init_gee
-from app.utils.hazard_common import classify_risk
+from app.utils.hazard_common import classify_risk, fetch_buildings_near
+from app.utils.hazard_map_renderer import render_erosion_hazard_map
 
 # Same cloud-mask idiom used for the Green module's NDVI work (green_remote_monitoring.py) -
 # QA60 bits 10/11 flag cloud and cirrus pixels.
@@ -22,6 +24,37 @@ def _mask_sentinel_clouds(image: ee.Image) -> ee.Image:
     cloud_mask = qa.bitwiseAnd(1 << 10).eq(0)
     cirrus_mask = qa.bitwiseAnd(1 << 11).eq(0)
     return image.updateMask(cloud_mask.And(cirrus_mask)).copyProperties(image, image.propertyNames())
+
+
+def _fetch_slope_points(dem: "ee.Image", region: "ee.Geometry", scale_m: int = 30) -> Optional[List[Dict[str, float]]]:
+    """Samples ee.Terrain.slope(dem) as a {lng, lat, slope_deg} point cloud - the same
+    pixelLonLat + toList idiom used for flood depth and DEM elevation sampling elsewhere in this
+    module, so the erosion map can show a real graduated slope surface instead of a flat fill.
+    """
+    try:
+        slope = ee.Terrain.slope(dem).rename("slope_deg")
+        sampled = slope.addBands(ee.Image.pixelLonLat())
+        reduced = sampled.reduceRegion(
+            reducer=ee.Reducer.toList(),
+            geometry=region,
+            scale=scale_m,
+            maxPixels=int(1e9),
+            bestEffort=True,
+        )
+        info = reduced.getInfo() or {}
+        lons = info.get("longitude") or []
+        lats = info.get("latitude") or []
+        slopes = info.get("slope_deg") or []
+        if len(lons) < 3 or len(lons) != len(lats) or len(lons) != len(slopes):
+            return None
+        points = [
+            {"lng": float(lo), "lat": float(la), "slope_deg": float(s)}
+            for lo, la, s in zip(lons, lats, slopes)
+            if s is not None
+        ]
+        return points if len(points) >= 3 else None
+    except Exception:
+        return None
 
 
 def _compute_local_slope_from_points(points: List[Dict[str, float]]) -> Optional[Tuple[float, float]]:
@@ -98,6 +131,7 @@ def _compute_local_slope_from_points(points: List[Dict[str, float]]) -> Optional
 
 
 def compute_erosion_risk(
+    db: Session,
     boundary_geojson: Dict[str, Any],
     show_raster: bool = False,
     local_elevation_points: Optional[List[Dict[str, float]]] = None,
@@ -204,34 +238,27 @@ def compute_erosion_risk(
 
     risk_class, class_color = classify_risk(risk_value, has_data)
 
-    hillshade = ee.Terrain.hillshade(dem).visualize(min=0, max=255, palette=["#0b1220", "#64748b", "#e2e8f0"])
-    slope_vis = slope.visualize(min=0, max=30, palette=["#fef9c3", "#f97316", "#7c2d12"], opacity=0.6)
-    boundary = ee.Image().paint(geom, 1, 2).visualize(palette=["#0f172a"])
+    # Real graduated slope surface + real buildings, mirroring compute_flood_risk's map upgrade.
+    # When slope came from the surveyor's own points, the map is built from that same local TIN
+    # (per-triangle facets) rather than the coarser global DEM point cloud.
+    dem_slope_points = None if local_slope is not None else (_fetch_slope_points(dem, analysis_region) if has_dem_data else None)
+    contour_points = local_elevation_points if local_slope is not None else fetch_dem_elevation_points(boundary_geojson, buffer_m=500)
+    buildings = fetch_buildings_near(db, boundary_geojson, buffer_m=500)
 
-    class_fill = ee.Image().paint(geom, 1).visualize(palette=[class_color], opacity=0.25)
-    class_outline = ee.Image().paint(geom, 1, 3).visualize(palette=[class_color])
+    png_bytes, map_stats = render_erosion_hazard_map(
+        boundary_geojson=boundary_geojson,
+        local_elevation_points=local_elevation_points if local_slope is not None else None,
+        dem_slope_points=dem_slope_points,
+        contour_points=contour_points,
+        buildings=buildings,
+        risk_class=risk_class,
+        class_color=class_color,
+        buffer_m=500,
+    )
+    breakdown["buildings_total"] = map_stats.get("buildings_total", 0)
+    breakdown["buildings_threatened"] = map_stats.get("buildings_threatened", 0)
 
-    # Diagonal hatch overlay for the plot class, matching compute_flood_risk's treatment so both
-    # hazard maps read as one consistent product family.
-    stripe_x = ee.Image.pixelCoordinates(analysis_region.projection()).select("x")
-    hatch = stripe_x.mod(20).lt(2)
-    hatch_overlay = hatch.updateMask(hatch).visualize(palette=[class_color], opacity=0.6)
-    hatch_overlay = hatch_overlay.clip(geom)
-
-    layers = [hillshade, class_fill, hatch_overlay, class_outline, boundary]
-    if show_raster:
-        layers.insert(1, slope_vis)
-
-    overlay = ee.ImageCollection(layers).mosaic().clip(analysis_region)
-    thumb_url = overlay.getThumbURL({
-        "region": analysis_region,
-        "dimensions": 1024,
-        "format": "png",
-    })
-
-    resp = requests.get(thumb_url, timeout=30)
-    resp.raise_for_status()
-    return risk_value, risk_class, breakdown, resp.content
+    return risk_value, risk_class, breakdown, png_bytes
 
 
 def overlay_to_data_url(png_bytes: bytes) -> str:

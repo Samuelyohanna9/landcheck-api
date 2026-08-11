@@ -296,11 +296,18 @@ def render_erosion_report_pdf(output_path: str, overlay_png: bytes, summary: Dic
     risk_class = str(summary.get("risk_class", "Low"))
     class_color = str(summary.get("class_color") or "#22c55e")
     slope_source = str(summary.get("slope_source") or "unavailable")
+    buildings_total = int(summary.get("buildings_total", 0) or 0)
+    buildings_threatened = int(summary.get("buildings_threatened", 0) or 0)
+
     insight = ""
     if slope_source == "local_survey":
         insight = "Slope is computed directly from your uploaded survey points, not the global 30m elevation model - a more accurate local measurement."
     elif slope_source == "global_dem":
         insight = "Slope is estimated from a global 30m elevation model. Upload your own surveyed elevation points for a more precise local measurement."
+
+    headline = f"{risk_class} erosion susceptibility for this site"
+    if buildings_total > 0:
+        headline = f"{buildings_threatened} of {buildings_total} buildings sit on erosion-prone slopes"
 
     _render_hazard_report_pdf(
         output_path,
@@ -310,12 +317,12 @@ def render_erosion_report_pdf(output_path: str, overlay_png: bytes, summary: Dic
         risk_score=str(summary.get("risk_score", "0")),
         risk_class=risk_class,
         class_color=class_color,
-        headline=f"{risk_class} erosion susceptibility for this site",
+        headline=headline,
         stat_cards=[
             ("Mean Slope (deg)", str(summary.get("mean_slope_deg", "-"))),
             ("Max Slope (deg)", str(summary.get("max_slope_deg", "-"))),
             ("Vegetation (NDVI)", str(summary.get("mean_ndvi", "-"))),
-            ("Dist. to Drainage (m)", str(summary.get("distance_to_drainage_m", "-"))),
+            ("Buildings At Risk", f"{buildings_threatened} / {buildings_total}" if buildings_total else "-"),
         ],
         component_bars=[
             ("Slope", float(summary.get("slope_score", 0) or 0), "#f97316"),
@@ -336,4 +343,5 @@ def render_erosion_report_pdf(output_path: str, overlay_png: bytes, summary: Dic
         legend=summary.get("legend") or [],
         note=str(summary.get("note", "")),
         insight=insight,
+        map_has_own_legend=True,
     )

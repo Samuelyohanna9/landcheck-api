@@ -212,13 +212,13 @@ def flood_pdf(payload: dict = Body(...), db: Session = Depends(get_db)):
 # ---------------- EROSION ----------------
 
 @router.post("/erosion/preview")
-def erosion_preview(payload: dict = Body(...)):
+def erosion_preview(payload: dict = Body(...), db: Session = Depends(get_db)):
     boundary = _extract_boundary(payload)
     show_raster = bool(payload.get("show_raster", False))
     local_elevation_points = _extract_local_elevation_points(payload)
     try:
         risk_value, risk_class, breakdown, overlay_png = compute_erosion_risk(
-            boundary, show_raster, local_elevation_points
+            db, boundary, show_raster, local_elevation_points
         )
     except Exception as exc:
         logger.exception("Erosion preview failed")
@@ -256,18 +256,20 @@ def erosion_preview(payload: dict = Body(...)):
         "legend": legend,
         "show_raster": show_raster,
         "slope_source": breakdown.get("slope_source", "unavailable"),
+        "buildings_total": breakdown.get("buildings_total", 0),
+        "buildings_threatened": breakdown.get("buildings_threatened", 0),
     }
     return response
 
 
 @router.post("/erosion/pdf")
-def erosion_pdf(payload: dict = Body(...)):
+def erosion_pdf(payload: dict = Body(...), db: Session = Depends(get_db)):
     boundary = _extract_boundary(payload)
     show_raster = bool(payload.get("show_raster", False))
     local_elevation_points = _extract_local_elevation_points(payload)
     try:
         risk_value, risk_class, breakdown, overlay_png = compute_erosion_risk(
-            boundary, show_raster, local_elevation_points
+            db, boundary, show_raster, local_elevation_points
         )
     except Exception as exc:
         logger.exception("Erosion PDF failed")
@@ -300,6 +302,8 @@ def erosion_pdf(payload: dict = Body(...)):
         "legend": legend,
         "show_raster": str(show_raster),
         "slope_source": breakdown.get("slope_source", "unavailable"),
+        "buildings_total": breakdown.get("buildings_total", 0),
+        "buildings_threatened": breakdown.get("buildings_threatened", 0),
     }
     render_erosion_report_pdf(pdf_path, overlay_png, summary)
     return _pdf_response_with_r2(pdf_path, "erosion_risk_report.pdf", "hazard-erosion")
