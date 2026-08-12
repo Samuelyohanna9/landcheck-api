@@ -1760,6 +1760,85 @@ def _draw_road_edges(ax, edge_lines, font_scale=1.0, color: str = "black", lines
             continue
 
 
+def _draw_names_along_path(
+    ax,
+    name_geom_pairs,
+    color: str = "black",
+    font_scale: float = 1.0,
+    base_fontsize: float = 6.5,
+    repeat_spacing_factor: float = 12.0,
+    zorder: int = 10,
+    halo: bool = True,
+    skip_point_fn=None,
+) -> None:
+    """Draws each (geometry, name) pair's name text following the geometry's own direction,
+    matching how road/river names read on real cadastral plans. A short line gets one centered
+    label; a long or curved one gets the label repeated at intervals, each instance locally
+    rotated to the path's tangent there, so the name reads naturally along bends instead of being
+    confined to a single point. Placement always uses a sub-segment long enough to hold the whole
+    label so it never spills past a junction or a line's end. A white halo keeps the text legible
+    when a road/river crosses building hatch or another line.
+    """
+    if not name_geom_pairs:
+        return
+    fig = ax.figure
+    try:
+        fig_w_in, _ = fig.get_size_inches()
+        axes_w_frac = max(1e-6, ax.get_position().width)
+        xlim = ax.get_xlim()
+        data_per_in = abs(xlim[1] - xlim[0]) / max(1e-6, (fig_w_in * axes_w_frac))
+    except Exception:
+        data_per_in = 1.0
+
+    seen = set()
+    for geom, name in name_geom_pairs:
+        label = str(name or "").strip()
+        if not label or label in seen:
+            continue
+        try:
+            merged = linemerge(geom) if geom.geom_type == "MultiLineString" else geom
+        except Exception:
+            merged = geom
+        parts = [seg for seg in _iter_line_geometries(merged) if seg is not None and not getattr(seg, "is_empty", True)]
+        if not parts:
+            continue
+        parts.sort(key=lambda s: s.length, reverse=True)
+
+        fontsize = max(5, int(base_fontsize * font_scale))
+        char_w_m = (fontsize / 72.0) * 0.62 * data_per_in
+        text_w_m = max(2.0, char_w_m * len(label))
+        min_len_for_label = text_w_m * 1.4
+        spacing = max(text_w_m * repeat_spacing_factor, min_len_for_label * 1.5)
+
+        placed_any = False
+        for seg in parts:
+            seg_len = seg.length
+            if seg_len < min_len_for_label:
+                continue
+            n_labels = max(1, int(seg_len // spacing))
+            half_pad = min(0.45, (min_len_for_label / 2.0) / seg_len)
+            for i in range(n_labels):
+                frac = min(max((i + 0.5) / n_labels, half_pad), 1 - half_pad)
+                mid = seg.interpolate(frac, normalized=True)
+                p1 = seg.interpolate(max(0.0, frac - 0.02), normalized=True)
+                p2 = seg.interpolate(min(1.0, frac + 0.02), normalized=True)
+                angle = math.degrees(math.atan2(p2.y - p1.y, p2.x - p1.x))
+                if angle < -90 or angle > 90:
+                    angle += 180
+                if skip_point_fn is not None and skip_point_fn(mid.x, mid.y, label):
+                    continue
+                text_kwargs = dict(
+                    fontsize=fontsize, color=color, ha="center", va="center",
+                    rotation=angle, weight="normal", zorder=zorder,
+                )
+                if halo:
+                    text_kwargs["path_effects"] = [patheffects.withStroke(linewidth=2.0 * font_scale, foreground="white")]
+                ax.text(mid.x, mid.y, label, **text_kwargs)
+                placed_any = True
+        if placed_any:
+            seen.add(label)
+
+
 def _safe_text(value, fallback=""):
     text_value = str(value).strip() if value is not None else ""
     return text_value if text_value else fallback
@@ -2391,6 +2470,13 @@ def _render_plot_map_layout_adamawa(
         and ov["geom"] is not None
         and str(ov.get("name") or "").strip()
     ]
+    river_add_named_overrides = [
+        ov for ov in overrides
+        if ov["feature_type"] == "river"
+        and ov["action"] in ("add", "update")
+        and ov["geom"] is not None
+        and str(ov.get("name") or "").strip()
+    ]
 
     display_epsg = epsg_code
     if coordinate_system == "wgs84" or epsg_code == 4326:
@@ -2485,43 +2571,38 @@ def _render_plot_map_layout_adamawa(
         snapped_clipped = snap(clipped, extent_poly.boundary, road_snap_tol)
         road_label_features.append((snapped_clipped, name))
 
+    river_label_features = []
+    for ov in river_add_named_overrides:
+        geom = ov.get("geom")
+        name = str(ov.get("name") or "").strip()
+        if geom is None or not name:
+            continue
+        try:
+            gdf_line = gpd.GeoSeries([geom], crs="EPSG:4326").to_crs(epsg=display_epsg)
+            line_proj = gdf_line.iloc[0]
+        except Exception:
+            continue
+        expanded_frame = extent_poly.buffer(road_snap_tol)
+        clipped = line_proj.intersection(expanded_frame)
+        if clipped.is_empty:
+            continue
+        snapped_clipped = snap(clipped, extent_poly.boundary, road_snap_tol)
+        river_label_features.append((snapped_clipped, name))
+
     road_edge_lines = _collect_connected_road_edge_lines(road_geom_width, snap_tol_m=road_snap_tol)
     _draw_road_edges(ax, road_edge_lines, font_scale=font_scale, color=road_color)
 
-    if road_label_features:
-        seen_names = set()
-        for geom, name in road_label_features:
-            label = str(name or "").strip()
-            if not label or label in seen_names:
-                continue
-            seen_names.add(label)
-            try:
-                if geom.length <= max(2.0, (10.0 / 1000.0) * scale_ratio):
-                    continue
-                mid = geom.interpolate(0.5, normalized=True)
-                angle = 0.0
-                try:
-                    p1 = geom.interpolate(0.45, normalized=True)
-                    p2 = geom.interpolate(0.55, normalized=True)
-                    angle = math.degrees(math.atan2(p2.y - p1.y, p2.x - p1.x))
-                    if angle < -90 or angle > 90:
-                        angle += 180
-                except Exception:
-                    pass
-                ax.text(
-                    mid.x,
-                    mid.y,
-                    label,
-                    fontsize=max(5, int(6.0 * font_scale)),
-                    color=road_color,
-                    ha="center",
-                    va="center",
-                    rotation=angle,
-                    weight="normal",
-                    zorder=10,
-                )
-            except Exception:
-                continue
+    min_road_label_len = max(2.0, (10.0 / 1000.0) * scale_ratio)
+    _draw_names_along_path(
+        ax,
+        [(g, n) for g, n in road_label_features if g.length > min_road_label_len],
+        color=road_color, font_scale=font_scale, base_fontsize=6.0,
+    )
+    _draw_names_along_path(
+        ax,
+        [(g, n) for g, n in river_label_features if g.length > min_road_label_len],
+        color=river_color, font_scale=font_scale, base_fontsize=6.0,
+    )
 
     all_buildings = []
     if buildings:
@@ -3068,6 +3149,20 @@ def _render_plot_map_layout_cadastral(
     rivers, _ = apply_overrides(rivers, "river")
     fences, _ = apply_overrides(fences, "fence")
     roads_for_draw, _ = apply_overrides(detected_roads, "road")
+    road_add_named_overrides = [
+        ov for ov in overrides
+        if ov["feature_type"] == "road"
+        and ov["action"] in ("add", "update")
+        and ov["geom"] is not None
+        and str(ov.get("name") or "").strip()
+    ]
+    river_add_named_overrides = [
+        ov for ov in overrides
+        if ov["feature_type"] == "river"
+        and ov["action"] in ("add", "update")
+        and ov["geom"] is not None
+        and str(ov.get("name") or "").strip()
+    ]
 
     display_epsg = epsg_code
     if coordinate_system == "wgs84" or epsg_code == 4326:
@@ -3156,6 +3251,28 @@ def _render_plot_map_layout_cadastral(
             _draw_cadastral_frontage_road(ax, poly, location_text, font_scale=font_scale, color=road_color)
         except Exception:
             pass
+
+    def _project_clip_named(ov):
+        geom = ov.get("geom")
+        name = str(ov.get("name") or "").strip()
+        if geom is None or not name:
+            return None
+        try:
+            gdf_line = gpd.GeoSeries([geom], crs="EPSG:4326").to_crs(epsg=display_epsg)
+            line_proj = gdf_line.iloc[0]
+        except Exception:
+            return None
+        expanded_frame = extent_poly.buffer(road_snap_tol)
+        clipped = line_proj.intersection(expanded_frame)
+        if clipped.is_empty:
+            return None
+        return snap(clipped, extent_poly.boundary, road_snap_tol), name
+
+    min_named_len = max(2.0, (10.0 / 1000.0) * scale_ratio)
+    road_label_features = [r for r in (_project_clip_named(ov) for ov in road_add_named_overrides) if r and r[0].length > min_named_len]
+    river_label_features = [r for r in (_project_clip_named(ov) for ov in river_add_named_overrides) if r and r[0].length > min_named_len]
+    _draw_names_along_path(ax, road_label_features, color=road_color, font_scale=font_scale, base_fontsize=6.0)
+    _draw_names_along_path(ax, river_label_features, color=river_color, font_scale=font_scale, base_fontsize=6.0)
 
     all_buildings = []
     if buildings:
@@ -3701,6 +3818,30 @@ def render_plot_map_layout(
 
         road_edge_lines = _collect_connected_road_edge_lines(road_geom_width, snap_tol_m=road_snap_tol)
         has_roads = len(road_rows) > 0 or len(road_add_geoms) > 0
+
+    # River names come from user-provided overrides (rivers have no name in detected_features/OSM
+    # here) - named the same way as manually-added road overrides above.
+    river_label_features = []
+    river_add_geoms = [
+        ov for ov in overrides
+        if ov["feature_type"] == "river" and ov["action"] in ("add", "update")
+        and ov["geom"] is not None and str(ov.get("name") or "").strip()
+    ]
+    for ov in river_add_geoms:
+        geom = ov["geom"]
+        name = ov["name"]
+        try:
+            gdf_line = gpd.GeoSeries([geom], crs="EPSG:4326").to_crs(epsg=display_epsg)
+            line_proj = gdf_line.iloc[0]
+        except Exception:
+            continue
+        expanded_frame = extent_poly.buffer(road_snap_tol)
+        clipped = line_proj.intersection(expanded_frame)
+        if clipped.is_empty:
+            continue
+        snapped_clipped = snap(clipped, extent_poly.boundary, road_snap_tol)
+        river_label_features.append((snapped_clipped, name))
+
     key_bounds = draw_key_box(
         fig,
         has_buildings=has_buildings,
@@ -3789,65 +3930,43 @@ def render_plot_map_layout(
     )
     draw_skipped_table(ax, skipped_entries, font_scale)
 
-    # Road names (optional). Keep small and never overlap boundary labels.
-    if road_label_features:
-        seen_names = set()
-        boundary_buffer = poly.buffer((12.0 / 1000.0) * scale_ratio)
-        major_classes = {
-            "trunk", "trunk_link", "motorway", "motorway_link",
-            "primary", "primary_link", "secondary", "secondary_link",
-            "tertiary", "tertiary_link",
-        }
-        span_x = max(abs(target_xlim[1] - target_xlim[0]), 1.0)
-        span_y = max(abs(target_ylim[1] - target_ylim[0]), 1.0)
+    # Road/river names (optional). Follow the path's own direction; keep clear of boundary labels.
+    major_classes = {
+        "trunk", "trunk_link", "motorway", "motorway_link",
+        "primary", "primary_link", "secondary", "secondary_link",
+        "tertiary", "tertiary_link",
+    }
+    span_x = max(abs(target_xlim[1] - target_xlim[0]), 1.0)
+    span_y = max(abs(target_ylim[1] - target_ylim[0]), 1.0)
 
-        def intersects(a, b):
-            return not (a[2] < b[0] or a[0] > b[2] or a[3] < b[1] or a[1] > b[3])
+    def intersects(a, b):
+        return not (a[2] < b[0] or a[0] > b[2] or a[3] < b[1] or a[1] > b[3])
 
-        def label_overlaps_boundary(box):
-            return any(intersects(box, other) for other in boundary_label_boxes)
+    def label_overlaps_boundary(box):
+        return any(intersects(box, other) for other in boundary_label_boxes)
 
-        def estimate_box(x, y, text_len, scale_w=0.018, scale_h=0.018):
-            w = span_x * scale_w * max(1.0, text_len / 10.0)
-            h = span_y * scale_h
-            return (x - w / 2.0, y - h / 2.0, x + w / 2.0, y + h / 2.0)
+    def estimate_box(x, y, text_len, scale_w=0.018, scale_h=0.018):
+        w = span_x * scale_w * max(1.0, text_len / 10.0)
+        h = span_y * scale_h
+        return (x - w / 2.0, y - h / 2.0, x + w / 2.0, y + h / 2.0)
 
-        for geom, name, highway in road_label_features:
-            name = str(name or "").strip()
-            if not name or name in seen_names:
-                continue
-            if highway and highway.lower() not in major_classes and highway != "override":
-                continue
-            seen_names.add(name)
-            try:
-                if geom.length <= min_label_length_m * 1.5:
-                    continue
-                mid = geom.interpolate(0.5, normalized=True)
-                angle = 0.0
-                try:
-                    p1 = geom.interpolate(0.45, normalized=True)
-                    p2 = geom.interpolate(0.55, normalized=True)
-                    angle = math.degrees(math.atan2(p2.y - p1.y, p2.x - p1.x))
-                    if angle < -90 or angle > 90:
-                        angle += 180
-                except Exception:
-                    pass
-                # Keep road label anchored at the road midpoint.
-                road_label_size = int(6.5 * font_scale)
-                ax.text(
-                    mid.x,
-                    mid.y,
-                    name,
-                    fontsize=road_label_size,
-                    color=road_color,
-                    ha="center",
-                    va="center",
-                    rotation=angle,
-                    weight="normal",
-                    zorder=10,
-                )
-            except Exception:
-                continue
+    def boundary_skip(x, y, label):
+        return label_overlaps_boundary(estimate_box(x, y, len(label)))
+
+    qualifying_road_pairs = [
+        (geom, name) for geom, name, highway in road_label_features
+        if str(name or "").strip()
+        and geom.length > min_label_length_m * 1.5
+        and (not highway or highway.lower() in major_classes or highway == "override")
+    ]
+    _draw_names_along_path(
+        ax, qualifying_road_pairs, color=road_color, font_scale=font_scale,
+        skip_point_fn=boundary_skip,
+    )
+    _draw_names_along_path(
+        ax, river_label_features, color=river_color, font_scale=font_scale,
+        skip_point_fn=boundary_skip,
+    )
 
     add_north_arrow(ax, font_scale, style=north_arrow_style, color=north_arrow_color)
     add_scalebar(ax, 100 if scale_ratio <= 1000 else 500, font_scale=font_scale)
