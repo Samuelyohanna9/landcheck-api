@@ -2847,30 +2847,48 @@ def _draw_cadastral_footer(
         y -= line_h
 
 
-def _draw_cadastral_origin_marker(ax, font_scale: float = 1.0, color: str = CADASTRAL_BLUE, label: str = "U.N.") -> None:
-    """A small grid-origin indicator (vertical stem + loop) above the map - the same convention
-    seen on South-South Nigeria cadastral plans, distinct from (and drawn alongside) the north
-    arrow rather than replacing it.
+def _draw_cadastral_origin_marker(
+    ax, anchor_x_data: float, font_scale: float = 1.0, color: str = CADASTRAL_BLUE, label: str = "U. N.",
+) -> float:
+    """Grid-north indicator: a vertical blue stem topped with a loop, sitting directly above the
+    plot's reference vertex - on the reference template this same stem continues straight down
+    through the map as the Easting grid drop-line (see _draw_cadastral_coordinate_labels), so its
+    figure-space x must line up exactly with that vertex's data-space x. Returns the figure-x used,
+    so the caller can align the drop-line/label to the same vertical.
     """
+    fig = ax.figure
     box = ax.get_position()
-    x = float(box.x0) + (float(box.x1) - float(box.x0)) * 0.16
+    disp_x = ax.transData.transform((anchor_x_data, 0))[0]
+    x = float(fig.transFigure.inverted().transform((disp_x, 0))[0])
+    x = min(max(x, float(box.x0) + 0.02), float(box.x1) - 0.02)
     y_base = float(box.y1) + 0.01
     y_top = y_base + 0.06
-    fig = ax.figure
     fig.add_artist(mlines.Line2D([x, x], [y_base, y_top], transform=fig.transFigure, color=color, lw=1.1 * font_scale))
     loop_r = 0.012
     fig.add_artist(patches.Circle((x, y_top + loop_r * 0.7), loop_r, transform=fig.transFigure,
                                    fill=False, edgecolor=color, lw=1.0 * font_scale))
     fig.text(x, y_base - 0.014, label, ha="center", va="top", fontsize=max(6, int(7 * font_scale)),
               color=color, fontfamily=CADASTRAL_FONT_FAMILY, weight="bold")
+    return x
 
 
 def _draw_cadastral_coordinate_labels(
-    ax, easting_m: float, northing_m: float, font_scale: float = 1.0, color: str = CADASTRAL_BLUE,
+    ax, anchor_x: float, anchor_y: float, easting_m: float, northing_m: float,
+    font_scale: float = 1.0, color: str = CADASTRAL_BLUE,
 ) -> None:
+    """Draws the Northing label at the map's lower-left corner, and drops a vertical grid line
+    from the top of the map straight down to the reference vertex - continuing the north-arrow
+    stem drawn above the axes - with the Easting label running alongside that same line, matching
+    the reference template's convention of tying the north arrow to the Easting grid reference.
+    """
     fs = max(6, int(6.5 * font_scale))
-    ax.text(-0.022, 0.5, f"{easting_m:.3f}m E.", color=color, fontsize=fs, ha="right", va="center",
-             rotation=90, transform=ax.transAxes, fontfamily=CADASTRAL_FONT_FAMILY)
+    top_y = ax.get_ylim()[1]
+    ax.plot([anchor_x, anchor_x], [top_y, anchor_y], color=color, lw=0.9 * font_scale,
+             zorder=2, solid_capstyle="butt")
+    x_span = ax.get_xlim()[1] - ax.get_xlim()[0]
+    label_y = anchor_y + (top_y - anchor_y) * 0.4
+    ax.text(anchor_x - x_span * 0.01, label_y, f"{easting_m:.3f}m E.", color=color, fontsize=fs,
+             ha="right", va="center", rotation=90, fontfamily=CADASTRAL_FONT_FAMILY, zorder=2)
     ax.text(0.06, -0.03, f"{northing_m:.3f}m N.", color=color, fontsize=fs, ha="left", va="top",
              transform=ax.transAxes, fontfamily=CADASTRAL_FONT_FAMILY)
 
@@ -3209,9 +3227,12 @@ def _render_plot_map_layout_cadastral(
     first_coords = list(poly.exterior.coords)[0]
     # The grid-origin stem doubles as the sheet's sole north indicator on these plans (its
     # vertical "up" line is Grid North) - no separate compass-rose icon is drawn alongside it.
-    _draw_cadastral_origin_marker(ax, font_scale=font_scale, color=grid_color)
+    # Its stem is dropped straight down through the map to the reference vertex, doubling as
+    # that vertex's Easting grid line, matching the reference template's convention.
+    _draw_cadastral_origin_marker(ax, anchor_x_data=first_coords[0], font_scale=font_scale, color=grid_color)
     _draw_cadastral_coordinate_labels(
-        ax, easting_m=first_coords[0], northing_m=first_coords[1], font_scale=font_scale, color=grid_color,
+        ax, anchor_x=first_coords[0], anchor_y=first_coords[1],
+        easting_m=first_coords[0], northing_m=first_coords[1], font_scale=font_scale, color=grid_color,
     )
 
     certification_date = datetime.now().strftime("%d / %m / %Y")
