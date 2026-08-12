@@ -285,6 +285,7 @@ def compute_erosion_risk(
         "value_points": map_stats.get("value_points"),
         "value_key": map_stats.get("value_key", "slope_deg"),
     }
+    breakdown["_interactive"] = map_stats.get("interactive")
 
     report("Finalizing report...", 95)
     return risk_value, risk_class, breakdown, png_bytes

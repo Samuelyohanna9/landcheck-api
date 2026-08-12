@@ -143,6 +143,7 @@ def _flood_preview_payload(risk_value, risk_class, class_color, breakdown, overl
         "relative_elevation_m": breakdown.get("relative_elevation_m"),
         "local_mean_elevation_m": breakdown.get("local_mean_elevation_m"),
         "regional_mean_elevation_m": breakdown.get("regional_mean_elevation_m"),
+        "interactive": breakdown.get("_interactive"),
     }
 
 
@@ -255,6 +256,7 @@ def _erosion_preview_payload(risk_value, risk_class, class_color, breakdown, ove
         "slope_source": breakdown.get("slope_source", "unavailable"),
         "buildings_total": breakdown.get("buildings_total", 0),
         "buildings_threatened": breakdown.get("buildings_threatened", 0),
+        "interactive": breakdown.get("_interactive"),
     }
 
 

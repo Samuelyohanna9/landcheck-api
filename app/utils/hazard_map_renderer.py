@@ -13,6 +13,7 @@ import matplotlib.pyplot as plt
 import matplotlib.tri as mtri
 import numpy as np
 from matplotlib.collections import PolyCollection
+from pyproj import Transformer
 from shapely.geometry import shape
 from shapely.geometry.base import BaseGeometry
 
@@ -208,6 +209,80 @@ def _draw_buildings(ax, buildings: List[BaseGeometry], display_epsg: int, threat
         return 0, 0, None
 
 
+def _finalize_hazard_map(
+    fig, ax, legend_handles: List, minx: float, miny: float, maxx: float, maxy: float,
+    display_epsg: int, value_points: Optional[List[Dict[str, float]]], value_key: str, dpi: int = 150,
+) -> Tuple[bytes, Dict[str, Any]]:
+    """Places the legend fully outside the axes (anchored to the right of the map) so it can never
+    overlap plot content regardless of the boundary's shape or position, then renders to PNG using
+    a fixed (non "tight") layout - the whitespace margins are set explicitly via subplots_adjust
+    rather than auto-cropped, which is what makes the axes' exact pixel position on the final image
+    knowable ahead of time. That pixel position, together with the WGS84 bounds of what the axes
+    actually shows, is what lets the frontend translate a mouse position on the rendered image back
+    into a real geographic coordinate for the interactive hover/click value lookup.
+    """
+    if legend_handles:
+        ax.legend(
+            handles=legend_handles, loc="upper left", bbox_to_anchor=(1.03, 1.0),
+            borderaxespad=0.0, fontsize=7.5, framealpha=0.95,
+            edgecolor="#d1d5db", handlelength=1.4, handleheight=1.4, borderpad=0.7,
+        )
+
+    # get_window_extent() (after a draw) reflects the axes' true rendered box, including any
+    # letterboxing set_aspect("equal") introduces when the box isn't the same aspect ratio as the
+    # data - reading position from subplots_adjust alone would miss that and misalign the mapping.
+    fig.canvas.draw()
+    renderer = fig.canvas.get_renderer()
+    axes_px = ax.get_window_extent(renderer=renderer)
+    fig_width_px, fig_height_px = fig.canvas.get_width_height()
+
+    # (x0, y0, x1, y1) in PNG pixel space (origin top-left, y down) - matplotlib's own window
+    # extent uses origin bottom-left, y up, so the y values are flipped here.
+    axes_pixel_bbox = [
+        float(axes_px.x0),
+        float(fig_height_px - axes_px.y1),
+        float(axes_px.x1),
+        float(fig_height_px - axes_px.y0),
+    ]
+
+    transformer = Transformer.from_crs(f"EPSG:{display_epsg}", "EPSG:4326", always_xy=True)
+    west, south = transformer.transform(minx, miny)
+    east, north = transformer.transform(maxx, maxy)
+
+    # How far (in metres) a hovered point may sit from its nearest sample before we treat it as
+    # "no data there" rather than showing a misleadingly confident number - derived from the
+    # points' own average spacing instead of a single hardcoded constant, since flood (90m grid),
+    # erosion DEM (30m grid) and a surveyor's own sparse elevation points all have very different
+    # densities.
+    snap_threshold_m = 150.0
+    if value_points and len(value_points) >= 3:
+        try:
+            xs, ys, _ = _points_to_projected_xyz(value_points, value_key, display_epsg)
+            if len(xs) >= 2:
+                span_x = float(np.ptp(xs)) or 1.0
+                span_y = float(np.ptp(ys)) or 1.0
+                avg_spacing = math.sqrt((span_x * span_y) / max(len(xs), 1))
+                snap_threshold_m = float(np.clip(avg_spacing * 1.8, 50.0, 400.0))
+        except Exception:
+            pass
+
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=dpi)
+    plt.close(fig)
+    buf.seek(0)
+
+    interactive_meta = {
+        "image_width": fig_width_px,
+        "image_height": fig_height_px,
+        "axes_pixel_bbox": axes_pixel_bbox,
+        "bounds_wgs84": {"west": west, "south": south, "east": east, "north": north},
+        "value_points": value_points or [],
+        "value_key": value_key,
+        "snap_threshold_m": snap_threshold_m,
+    }
+    return buf.getvalue(), interactive_meta
+
+
 def render_flood_hazard_map(
     boundary_geojson: Dict[str, Any],
     depth_points: Optional[List[Dict[str, float]]],
@@ -231,7 +306,12 @@ def render_flood_hazard_map(
     minx, miny, maxx, maxy = boundary_proj.buffer(buffer_m).bounds
     span_m = max(maxx - minx, maxy - miny)
 
-    fig, ax = plt.subplots(figsize=(9.2, 8.4), dpi=150)
+    fig, ax = plt.subplots(figsize=(10.0, 8.4), dpi=150)
+    # Fixed (not "tight") margins - the legend now lives entirely outside the axes to the right,
+    # in the reserved space between right=0.738 and the figure edge, so it can never sit on top of
+    # the map itself. A fixed layout also makes the axes' final pixel position on the saved image
+    # predictable, which the interactive hover/click feature depends on.
+    fig.subplots_adjust(left=0.025, right=0.738, top=0.91, bottom=0.045)
     ax.set_aspect("equal")
     ax.set_facecolor(LAND_COLOR)
     ax.set_xlim(minx, maxx)
@@ -318,12 +398,6 @@ def render_flood_hazard_map(
         legend_handles.append(mpatches.Patch(facecolor=BUILDING_SAFE_COLOR, edgecolor="#4b5563", label="Other building"))
     legend_handles.append(mpatches.Patch(facecolor="none", edgecolor=BOUNDARY_COLOR, linewidth=2, label="Plot boundary"))
 
-    if legend_handles:
-        ax.legend(
-            handles=legend_handles, loc="upper left", fontsize=7.5, framealpha=0.92,
-            edgecolor="#d1d5db", handlelength=1.4, handleheight=1.4, borderpad=0.7,
-        )
-
     if not depth_available:
         ax.text(
             0.98, 0.02,
@@ -333,17 +407,19 @@ def render_flood_hazard_map(
             zorder=15,
         )
 
-    buf = io.BytesIO()
-    fig.savefig(buf, format="png", bbox_inches="tight", dpi=150)
-    plt.close(fig)
-    buf.seek(0)
+    final_value_points = depth_points if depth_available else None
+    png_bytes, interactive_meta = _finalize_hazard_map(
+        fig, ax, legend_handles, minx, miny, maxx, maxy, display_epsg,
+        value_points=final_value_points, value_key="depth_m",
+    )
 
-    return buf.getvalue(), {
+    return png_bytes, {
         "buildings_total": buildings_total,
         "buildings_threatened": buildings_threatened,
         "buildings_gdf": buildings_gdf_wgs84,
-        "value_points": depth_points if depth_available else None,
+        "value_points": final_value_points,
         "value_key": "depth_m",
+        "interactive": interactive_meta,
     }
 
 
@@ -371,7 +447,8 @@ def render_erosion_hazard_map(
     minx, miny, maxx, maxy = boundary_proj.buffer(buffer_m).bounds
     span_m = max(maxx - minx, maxy - miny)
 
-    fig, ax = plt.subplots(figsize=(9.2, 8.4), dpi=150)
+    fig, ax = plt.subplots(figsize=(10.0, 8.4), dpi=150)
+    fig.subplots_adjust(left=0.025, right=0.738, top=0.91, bottom=0.045)
     ax.set_aspect("equal")
     ax.set_facecolor(LAND_COLOR)
     ax.set_xlim(minx, maxx)
@@ -484,12 +561,6 @@ def render_erosion_hazard_map(
         legend_handles.append(mpatches.Patch(facecolor=BUILDING_SAFE_COLOR, edgecolor="#4b5563", label="Other building"))
     legend_handles.append(mpatches.Patch(facecolor="none", edgecolor=BOUNDARY_COLOR, linewidth=2, label="Plot boundary"))
 
-    if legend_handles:
-        ax.legend(
-            handles=legend_handles, loc="upper left", fontsize=7.5, framealpha=0.92,
-            edgecolor="#d1d5db", handlelength=1.4, handleheight=1.4, borderpad=0.7,
-        )
-
     if not slope_available:
         ax.text(
             0.98, 0.02, "No elevation data available for this location\nShowing plot boundary and buildings only",
@@ -505,15 +576,16 @@ def render_erosion_hazard_map(
     else:
         export_points, export_value_key = None, "slope_deg"
 
-    buf = io.BytesIO()
-    fig.savefig(buf, format="png", bbox_inches="tight", dpi=150)
-    plt.close(fig)
-    buf.seek(0)
+    png_bytes, interactive_meta = _finalize_hazard_map(
+        fig, ax, legend_handles, minx, miny, maxx, maxy, display_epsg,
+        value_points=export_points, value_key=export_value_key,
+    )
 
-    return buf.getvalue(), {
+    return png_bytes, {
         "buildings_total": buildings_total,
         "buildings_threatened": buildings_threatened,
         "buildings_gdf": buildings_gdf_wgs84,
         "value_points": export_points,
         "value_key": export_value_key,
+        "interactive": interactive_meta,
     }

@@ -231,6 +231,9 @@ def compute_flood_risk(
         "value_points": map_stats.get("value_points"),
         "value_key": map_stats.get("value_key", "depth_m"),
     }
+    # Pixel<->geo mapping metadata for the frontend's hover/click "identify" tool - lets it turn a
+    # mouse position on the rendered PNG back into a real depth value, not just a pretty picture.
+    breakdown["_interactive"] = map_stats.get("interactive")
 
     report("Finalizing report...", 95)
     return risk_value, risk_class, breakdown, png_bytes
