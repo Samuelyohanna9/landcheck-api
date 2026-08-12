@@ -749,6 +749,40 @@ def add_north_arrow(
                  fontsize=int(10 * font_scale), color=col, weight="bold")
         return
 
+    if style in ("un_marker", "un", "un_grid", "u_n", "grid_marker"):
+        # "U.N." grid-north marker used on South-South Nigeria cadastral plans (design supplied
+        # as north_arrow_UN.svg): a long stem topped with a narrow pennant and an open loop,
+        # labeled "U. N." On the cadastral templates this stem is anchored at (and continues
+        # down through the map as) the reference vertex's Easting grid line - see the un_marker
+        # anchor_x handling in _render_plot_map_layout_cadastral.
+        line_lw = max(1.0, 1.1 * font_scale)
+        stem_top = y + size * 1.7
+        flag_low_x = x - size * 0.42
+        flag_low_y = y + size * 0.55
+        flag_mid_y = flag_low_y + size * 0.06
+        loop_r = size * 0.30
+        loop_cy = flag_low_y - loop_r * 0.85
+        stem_bottom = y - size * 0.15
+
+        fig.add_artist(mlines.Line2D(
+            [x, x], [stem_bottom, stem_top], transform=fig.transFigure,
+            color=col, lw=line_lw, zorder=20, solid_capstyle="butt",
+        ))
+        fig.add_artist(mlines.Line2D(
+            [x, flag_low_x, x], [stem_top, flag_low_y, flag_mid_y], transform=fig.transFigure,
+            color=col, lw=line_lw, zorder=21, solid_capstyle="round", solid_joinstyle="round",
+        ))
+        fig.add_artist(patches.Circle(
+            (x, loop_cy), loop_r, transform=fig.transFigure,
+            fill=False, edgecolor=col, lw=line_lw, zorder=21,
+        ))
+        fig.text(
+            x, y - size * 0.32, "U. N.", ha="center", va="top",
+            fontsize=max(6, int(9 * font_scale)), color=col, weight="bold",
+            fontfamily="DejaVu Serif", zorder=22,
+        )
+        return x
+
     # default: classic arrow
     ax.annotate(
         "N",
@@ -2928,31 +2962,6 @@ def _draw_cadastral_footer(
         y -= line_h
 
 
-def _draw_cadastral_origin_marker(
-    ax, anchor_x_data: float, font_scale: float = 1.0, color: str = CADASTRAL_BLUE, label: str = "U. N.",
-) -> float:
-    """Grid-north indicator: a vertical blue stem topped with a loop, sitting directly above the
-    plot's reference vertex - on the reference template this same stem continues straight down
-    through the map as the Easting grid drop-line (see _draw_cadastral_coordinate_labels), so its
-    figure-space x must line up exactly with that vertex's data-space x. Returns the figure-x used,
-    so the caller can align the drop-line/label to the same vertical.
-    """
-    fig = ax.figure
-    box = ax.get_position()
-    disp_x = ax.transData.transform((anchor_x_data, 0))[0]
-    x = float(fig.transFigure.inverted().transform((disp_x, 0))[0])
-    x = min(max(x, float(box.x0) + 0.02), float(box.x1) - 0.02)
-    y_base = float(box.y1) + 0.01
-    y_top = y_base + 0.06
-    fig.add_artist(mlines.Line2D([x, x], [y_base, y_top], transform=fig.transFigure, color=color, lw=1.1 * font_scale))
-    loop_r = 0.012
-    fig.add_artist(patches.Circle((x, y_top + loop_r * 0.7), loop_r, transform=fig.transFigure,
-                                   fill=False, edgecolor=color, lw=1.0 * font_scale))
-    fig.text(x, y_base - 0.014, label, ha="center", va="top", fontsize=max(6, int(7 * font_scale)),
-              color=color, fontfamily=CADASTRAL_FONT_FAMILY, weight="bold")
-    return x
-
-
 def _draw_cadastral_coordinate_labels(
     ax, anchor_x: float, anchor_y: float, easting_m: float, northing_m: float,
     font_scale: float = 1.0, color: str = CADASTRAL_BLUE,
@@ -3342,11 +3351,21 @@ def _render_plot_map_layout_cadastral(
     )
 
     first_coords = list(poly.exterior.coords)[0]
-    # The grid-origin stem doubles as the sheet's sole north indicator on these plans (its
-    # vertical "up" line is Grid North) - no separate compass-rose icon is drawn alongside it.
-    # Its stem is dropped straight down through the map to the reference vertex, doubling as
-    # that vertex's Easting grid line, matching the reference template's convention.
-    _draw_cadastral_origin_marker(ax, anchor_x_data=first_coords[0], font_scale=font_scale, color=grid_color)
+    # The "U.N." grid-marker style's stem doubles as this vertex's Easting grid drop-line, so when
+    # it's selected, anchor it at the vertex's own x instead of the usual top-right corner - for
+    # any other north arrow style, it stays in its normal position (the drop-line below is drawn
+    # independently either way).
+    normalized_arrow_style = str(north_arrow_style or "").strip().lower()
+    un_marker_anchor_x = None
+    if normalized_arrow_style in ("un_marker", "un", "un_grid", "u_n", "grid_marker"):
+        box = ax.get_position()
+        disp_x = ax.transData.transform((first_coords[0], 0))[0]
+        fig_x = float(fig.transFigure.inverted().transform((disp_x, 0))[0])
+        un_marker_anchor_x = min(max(fig_x, float(box.x0) + 0.02), float(box.x1) - 0.02)
+    add_north_arrow(
+        ax, font_scale=font_scale, style=north_arrow_style, color=north_arrow_color,
+        blue_hex=grid_color, anchor_x=un_marker_anchor_x,
+    )
     _draw_cadastral_coordinate_labels(
         ax, anchor_x=first_coords[0], anchor_y=first_coords[1],
         easting_m=first_coords[0], northing_m=first_coords[1], font_scale=font_scale, color=grid_color,
