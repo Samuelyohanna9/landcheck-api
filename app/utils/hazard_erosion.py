@@ -5,7 +5,7 @@ import io
 import math
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, timedelta
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import ee
 import geopandas as gpd
@@ -136,6 +136,7 @@ def compute_erosion_risk(
     boundary_geojson: Dict[str, Any],
     show_raster: bool = False,
     local_elevation_points: Optional[List[Dict[str, float]]] = None,
+    progress_cb: Optional[Callable[[str, int], None]] = None,
 ) -> Tuple[float, str, Dict[str, float], bytes]:
     """A pragmatic susceptibility index, not a full RUSLE soil-loss model: slope is the dominant
     driver of water erosion, vegetation cover (NDVI) protects soil from being stripped, and
@@ -148,6 +149,8 @@ def compute_erosion_risk(
     accurate for a single plot. Vegetation and drainage still come from satellite data either way,
     since a handful of elevation points can't tell us anything about ground cover or drainage.
     """
+    report = progress_cb or (lambda stage, pct: None)
+    report("Connecting to Earth Engine...", 5)
     init_gee()
 
     geom = ee.Geometry(boundary_geojson)
@@ -158,6 +161,7 @@ def compute_erosion_risk(
     dem = ee.ImageCollection("COPERNICUS/DEM/GLO30_2024_1").select("DEM").mosaic()
     slope = ee.Terrain.slope(dem).rename("slope_deg")
 
+    report("Checking elevation data coverage...", 15)
     slope_count = slope.reduceRegion(
         reducer=ee.Reducer.count(), geometry=geom, scale=30, maxPixels=1e9,
     ).get("slope_deg")
@@ -185,9 +189,11 @@ def compute_erosion_risk(
 
     has_data = bool(local_slope is not None or has_dem_data)
 
+    report("Computing slope from terrain data...", 30)
     if has_dem_data:
         # Vegetation and drainage concentration still need satellite coverage regardless of
         # where the slope number came from.
+        report("Analyzing vegetation and drainage...", 45)
         end = date.today()
         start = end - timedelta(days=180)
         collection = (
@@ -247,6 +253,7 @@ def compute_erosion_risk(
     # (per-triangle facets) rather than the coarser global DEM point cloud. These three fetches
     # are independent (two Earth Engine calls plus one Postgres query) - run them concurrently
     # rather than serially, for the same reason as compute_flood_risk.
+    report("Locating nearby buildings...", 65)
     with ThreadPoolExecutor(max_workers=3) as pool:
         slope_points_future = pool.submit(
             lambda: None if local_slope is not None else (_fetch_slope_points(dem, analysis_region) if has_dem_data else None)
@@ -259,6 +266,7 @@ def compute_erosion_risk(
         contour_points = contour_future.result()
         buildings = buildings_future.result()
 
+    report("Rendering hazard map...", 85)
     png_bytes, map_stats = render_erosion_hazard_map(
         boundary_geojson=boundary_geojson,
         local_elevation_points=local_elevation_points if local_slope is not None else None,
@@ -278,6 +286,7 @@ def compute_erosion_risk(
         "value_key": map_stats.get("value_key", "slope_deg"),
     }
 
+    report("Finalizing report...", 95)
     return risk_value, risk_class, breakdown, png_bytes
 
 

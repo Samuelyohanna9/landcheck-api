@@ -3,7 +3,7 @@ from __future__ import annotations
 import base64
 import io
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import ee
 from sqlalchemy.orm import Session
@@ -50,7 +50,10 @@ def compute_flood_risk(
     show_raster: bool = False,
     return_period: int = 100,
     local_elevation_points: Optional[List[Dict[str, float]]] = None,
+    progress_cb: Optional[Callable[[str, int], None]] = None,
 ) -> Tuple[float, str, Dict[str, float], bytes]:
+    report = progress_cb or (lambda stage, pct: None)
+    report("Connecting to Earth Engine...", 5)
     init_gee()
 
     geom = ee.Geometry(boundary_geojson)
@@ -119,6 +122,7 @@ def compute_flood_risk(
     # A single combined round-trip instead of 8 separate .getInfo() calls - each one is its own
     # network request to Earth Engine, and on a slower link those add up fast enough to blow past
     # a client-side request timeout even though every individual call is fine on its own.
+    report("Downloading satellite flood data...", 25)
     combined = ee.Dictionary({
         "risk_value": risk_value_ee,
         "mean_depth_m": mean_depth_val,
@@ -192,6 +196,7 @@ def compute_flood_risk(
     # Postgres query) - run them concurrently rather than one after another, since each is I/O
     # bound and waiting on them serially is what was pushing total request time past the client's
     # timeout.
+    report("Analyzing terrain and locating nearby buildings...", 50)
     with ThreadPoolExecutor(max_workers=3) as pool:
         depth_future = pool.submit(
             lambda: _fetch_depth_points(depth.unmask(0), analysis_region) if breakdown["data_available"] else None
@@ -204,6 +209,7 @@ def compute_flood_risk(
         contour_points = contour_future.result()
         buildings = buildings_future.result()
 
+    report("Rendering hazard map...", 80)
     png_bytes, map_stats = render_flood_hazard_map(
         boundary_geojson=boundary_geojson,
         depth_points=depth_points,
@@ -226,6 +232,7 @@ def compute_flood_risk(
         "value_key": map_stats.get("value_key", "depth_m"),
     }
 
+    report("Finalizing report...", 95)
     return risk_value, risk_class, breakdown, png_bytes
 
 
