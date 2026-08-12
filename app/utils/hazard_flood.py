@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import io
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, Optional, Tuple
 
 import ee
@@ -109,24 +110,39 @@ def compute_flood_risk(
     inundation_score_val = inundation_val.min(1).max(0)
     river_proximity_score_val = ee.Number(1).subtract(mean_dist_val.divide(5000)).min(1).max(0)
 
-    risk_value = (
+    risk_value_ee = (
         depth_score_val.multiply(0.6)
         .add(inundation_score_val.multiply(0.25))
         .add(river_proximity_score_val.multiply(0.15))
-        .getInfo()
     )
 
+    # A single combined round-trip instead of 8 separate .getInfo() calls - each one is its own
+    # network request to Earth Engine, and on a slower link those add up fast enough to blow past
+    # a client-side request timeout even though every individual call is fine on its own.
+    combined = ee.Dictionary({
+        "risk_value": risk_value_ee,
+        "mean_depth_m": mean_depth_val,
+        "max_depth_m": max_depth_val,
+        "inundation_fraction": inundation_val,
+        "depth_score": depth_score_val,
+        "inundation_score": inundation_score_val,
+        "distance_to_river_m": mean_dist_val,
+        "river_proximity_score": river_proximity_score_val,
+        "data_available": has_data,
+    }).getInfo()
+
     breakdown = {
-        "mean_depth_m": float(mean_depth_val.getInfo() or 0.0),
-        "max_depth_m": float(max_depth_val.getInfo() or 0.0),
-        "inundation_fraction": float(inundation_val.getInfo() or 0.0),
-        "depth_score": float(depth_score_val.getInfo() or 0.0),
-        "inundation_score": float(inundation_score_val.getInfo() or 0.0),
-        "distance_to_river_m": float(mean_dist_val.getInfo() or 0.0),
-        "river_proximity_score": float(river_proximity_score_val.getInfo() or 0.0),
-        "data_available": bool(has_data.getInfo()),
+        "mean_depth_m": float(combined.get("mean_depth_m") or 0.0),
+        "max_depth_m": float(combined.get("max_depth_m") or 0.0),
+        "inundation_fraction": float(combined.get("inundation_fraction") or 0.0),
+        "depth_score": float(combined.get("depth_score") or 0.0),
+        "inundation_score": float(combined.get("inundation_score") or 0.0),
+        "distance_to_river_m": float(combined.get("distance_to_river_m") or 0.0),
+        "river_proximity_score": float(combined.get("river_proximity_score") or 0.0),
+        "data_available": bool(combined.get("data_available")),
     }
 
+    risk_value = combined.get("risk_value")
     if risk_value is None:
         risk_value = (
             breakdown["depth_score"] * 0.6
@@ -171,9 +187,22 @@ def compute_flood_risk(
     # this, reduceRegion's toList reducer silently drops dry pixels entirely, leaving nothing to
     # anchor the triangulated surface to "dry ground" and letting wet-area depths bleed outward
     # across the whole buffer instead of tapering off at the real flood extent.
-    depth_points = _fetch_depth_points(depth.unmask(0), analysis_region) if breakdown["data_available"] else None
-    contour_points = local_elevation_points if valid_points else fetch_dem_elevation_points(boundary_geojson, buffer_m=1000)
-    buildings = fetch_buildings_near(db, boundary_geojson, buffer_m=1000)
+    #
+    # These three fetches are independent of each other (two separate Earth Engine calls plus one
+    # Postgres query) - run them concurrently rather than one after another, since each is I/O
+    # bound and waiting on them serially is what was pushing total request time past the client's
+    # timeout.
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        depth_future = pool.submit(
+            lambda: _fetch_depth_points(depth.unmask(0), analysis_region) if breakdown["data_available"] else None
+        )
+        contour_future = pool.submit(
+            lambda: local_elevation_points if valid_points else fetch_dem_elevation_points(boundary_geojson, buffer_m=1000)
+        )
+        buildings_future = pool.submit(fetch_buildings_near, db, boundary_geojson, 600)
+        depth_points = depth_future.result()
+        contour_points = contour_future.result()
+        buildings = buildings_future.result()
 
     png_bytes, map_stats = render_flood_hazard_map(
         boundary_geojson=boundary_geojson,

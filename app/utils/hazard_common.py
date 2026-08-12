@@ -45,11 +45,15 @@ def risk_tier_legend() -> list[dict]:
     return legend
 
 
-def fetch_buildings_near(db: Session, boundary_geojson: Dict[str, Any], buffer_m: float = 500) -> List[BaseGeometry]:
+def fetch_buildings_near(db: Session, boundary_geojson: Dict[str, Any], buffer_m: float = 500, limit: int = 1500) -> List[BaseGeometry]:
     """Real OSM building footprint polygons (EPSG:4326) intersecting a metric buffer around a
     hazard boundary - the same `multipolygons` table Survey Plan's Auto Feature Detection already
     reads from (see plots.py's _run_plot_feature_detection), just queried directly against an
     arbitrary boundary instead of a saved plot row.
+
+    The row limit exists so a plot dropped in the middle of a dense city center can't turn a
+    single hazard request into a multi-thousand-polygon query-and-plot that blows past a client
+    timeout - 1500 buildings is already far more than fit legibly on the rendered map anyway.
     """
     rows = db.execute(
         text(
@@ -64,10 +68,10 @@ def fetch_buildings_near(db: Session, boundary_geojson: Dict[str, Any], buffer_m
                       :buffer_m
                   )::geometry
               )
-            LIMIT 5000
+            LIMIT :limit
             """
         ),
-        {"boundary_geojson": json.dumps(boundary_geojson), "buffer_m": buffer_m},
+        {"boundary_geojson": json.dumps(boundary_geojson), "buffer_m": buffer_m, "limit": limit},
     ).fetchall()
     geometries = []
     for row in rows:

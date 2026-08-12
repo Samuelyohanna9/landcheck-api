@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import io
 import math
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -173,12 +174,13 @@ def compute_erosion_risk(
         mean_slope_val, max_slope_val = local_slope
         slope_source = "local_survey"
     elif has_dem_data:
-        mean_slope_val = float(slope.reduceRegion(
-            reducer=ee.Reducer.mean(), geometry=geom, scale=30, maxPixels=1e9,
-        ).get("slope_deg").getInfo() or 0.0)
-        max_slope_val = float(slope.reduceRegion(
-            reducer=ee.Reducer.max(), geometry=geom, scale=30, maxPixels=1e9,
-        ).get("slope_deg").getInfo() or 0.0)
+        # One combined round-trip instead of two separate .getInfo() calls.
+        slope_stats = ee.Dictionary({
+            "mean": slope.reduceRegion(reducer=ee.Reducer.mean(), geometry=geom, scale=30, maxPixels=1e9).get("slope_deg"),
+            "max": slope.reduceRegion(reducer=ee.Reducer.max(), geometry=geom, scale=30, maxPixels=1e9).get("slope_deg"),
+        }).getInfo()
+        mean_slope_val = float(slope_stats.get("mean") or 0.0)
+        max_slope_val = float(slope_stats.get("max") or 0.0)
         slope_source = "global_dem"
 
     has_data = bool(local_slope is not None or has_dem_data)
@@ -195,8 +197,20 @@ def compute_erosion_risk(
             .filter(ee.Filter.lt("CLOUDY_PIXEL_PERCENTAGE", 80))
             .map(_mask_sentinel_clouds)
         )
-        image_count = int(collection.size().getInfo() or 0)
-        if image_count > 0:
+        flow_acc = ee.Image("WWF/HydroSHEDS/15ACC").select("b1")
+        channels = flow_acc.gt(1000)
+        channel_dist = channels.fastDistanceTransform(30).sqrt()
+        distance_m = channel_dist.multiply(flow_acc.projection().nominalScale()).rename("distance_m")
+
+        # Same one-round-trip approach: NDVI's image_count gate and the drainage-distance mean
+        # don't depend on each other, so fetch both in a single combined call.
+        veg_drainage = ee.Dictionary({
+            "image_count": collection.size(),
+            "mean_dist": distance_m.reduceRegion(reducer=ee.Reducer.mean(), geometry=geom, scale=463, maxPixels=1e9).get("distance_m"),
+        }).getInfo()
+        if veg_drainage.get("mean_dist") is not None:
+            mean_dist_val = float(veg_drainage["mean_dist"])
+        if int(veg_drainage.get("image_count") or 0) > 0:
             composite = collection.median()
             ndvi = composite.normalizedDifference(["B8", "B4"]).rename("ndvi")
             sampled_ndvi = ndvi.reduceRegion(
@@ -204,16 +218,6 @@ def compute_erosion_risk(
             ).get("ndvi").getInfo()
             if sampled_ndvi is not None:
                 mean_ndvi_val = float(sampled_ndvi)
-
-        flow_acc = ee.Image("WWF/HydroSHEDS/15ACC").select("b1")
-        channels = flow_acc.gt(1000)
-        channel_dist = channels.fastDistanceTransform(30).sqrt()
-        distance_m = channel_dist.multiply(flow_acc.projection().nominalScale()).rename("distance_m")
-        sampled_dist = distance_m.reduceRegion(
-            reducer=ee.Reducer.mean(), geometry=geom, scale=463, maxPixels=1e9,
-        ).get("distance_m").getInfo()
-        if sampled_dist is not None:
-            mean_dist_val = float(sampled_dist)
 
     # Normalize each factor to 0..1, where 1 = maximum contribution to erosion risk.
     slope_score = max(0.0, min(1.0, mean_slope_val / 25.0))
@@ -240,10 +244,20 @@ def compute_erosion_risk(
 
     # Real graduated slope surface + real buildings, mirroring compute_flood_risk's map upgrade.
     # When slope came from the surveyor's own points, the map is built from that same local TIN
-    # (per-triangle facets) rather than the coarser global DEM point cloud.
-    dem_slope_points = None if local_slope is not None else (_fetch_slope_points(dem, analysis_region) if has_dem_data else None)
-    contour_points = local_elevation_points if local_slope is not None else fetch_dem_elevation_points(boundary_geojson, buffer_m=500)
-    buildings = fetch_buildings_near(db, boundary_geojson, buffer_m=500)
+    # (per-triangle facets) rather than the coarser global DEM point cloud. These three fetches
+    # are independent (two Earth Engine calls plus one Postgres query) - run them concurrently
+    # rather than serially, for the same reason as compute_flood_risk.
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        slope_points_future = pool.submit(
+            lambda: None if local_slope is not None else (_fetch_slope_points(dem, analysis_region) if has_dem_data else None)
+        )
+        contour_future = pool.submit(
+            lambda: local_elevation_points if local_slope is not None else fetch_dem_elevation_points(boundary_geojson, buffer_m=500)
+        )
+        buildings_future = pool.submit(fetch_buildings_near, db, boundary_geojson, 500)
+        dem_slope_points = slope_points_future.result()
+        contour_points = contour_future.result()
+        buildings = buildings_future.result()
 
     png_bytes, map_stats = render_erosion_hazard_map(
         boundary_geojson=boundary_geojson,
