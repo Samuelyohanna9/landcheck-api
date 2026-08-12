@@ -879,27 +879,9 @@ def draw_grid(
     full_grid: bool = False,
     edge_ticks: bool = True,
     color: str = "blue",
-    coord_grid: bool = False,
 ):
     xmin, xmax = ax.get_xlim()
     ymin, ymax = ax.get_ylim()
-
-    # Reference grid lines at round Easting/Northing values (the cadastral template's convention)
-    # - however many major-interval lines actually fall within the printed extent, typically just
-    # a handful for a single-parcel plot, rather than a dense mesh.
-    if coord_grid:
-        coord_xs = np.arange(math.floor(xmin / major) * major, xmax + 0.1, major)
-        coord_ys = np.arange(math.floor(ymin / major) * major, ymax + 0.1, major)
-        for x in coord_xs:
-            if xmin <= x <= xmax:
-                ax.add_line(mlines.Line2D(
-                    [x, x], [ymin, ymax], color=color, lw=0.5 * font_scale, alpha=0.55, zorder=1,
-                ))
-        for y in coord_ys:
-            if ymin <= y <= ymax:
-                ax.add_line(mlines.Line2D(
-                    [xmin, xmax], [y, y], color=color, lw=0.5 * font_scale, alpha=0.55, zorder=1,
-                ))
 
     # Optional interior grid lines (used by Adamawa template).
     if full_grid:
@@ -1617,6 +1599,28 @@ def build_fence_avoid_geom(fence_geoms, display_epsg: int, scale_ratio: int):
         except Exception:
             continue
     return merged
+
+
+def _resolve_override_names(overrides, feature_type: str):
+    """Returns [(geom, name)] for named `feature_type` overrides (roads/rivers), resolved with
+    the same last-override-wins-by-intersecting-geometry semantics apply_overrides already uses
+    for the geometry itself: each override in turn drops any earlier entry whose geometry it
+    intersects before adding its own. Without this, a later override that clears or renames a
+    road (e.g. from the Road Names panel) would leave the earlier, now-stale name still drawn,
+    since a naive "collect every override with a name" pass has no notion of supersession.
+    """
+    resolved: list = []
+    for ov in overrides:
+        if ov.get("feature_type") != feature_type:
+            continue
+        geom = ov.get("geom")
+        action = ov.get("action")
+        if geom is None or action not in ("add", "update", "delete"):
+            continue
+        resolved = [(g, n) for (g, n) in resolved if not g.intersects(geom)]
+        if action in ("add", "update"):
+            resolved.append((geom, str(ov.get("name") or "").strip()))
+    return [(g, n) for (g, n) in resolved if n]
 
 
 def _fetch_live_road_geoms(db, plot_id: int) -> list:
@@ -2550,20 +2554,8 @@ def _render_plot_map_layout_adamawa(
     rivers, _ = apply_overrides(rivers, "river")
     fences, _ = apply_overrides(fences, "fence")
     roads_for_draw, _road_added_overrides = apply_overrides(detected_roads, "road")
-    road_add_named_overrides = [
-        ov for ov in overrides
-        if ov["feature_type"] == "road"
-        and ov["action"] in ("add", "update")
-        and ov["geom"] is not None
-        and str(ov.get("name") or "").strip()
-    ]
-    river_add_named_overrides = [
-        ov for ov in overrides
-        if ov["feature_type"] == "river"
-        and ov["action"] in ("add", "update")
-        and ov["geom"] is not None
-        and str(ov.get("name") or "").strip()
-    ]
+    road_add_named_overrides = _resolve_override_names(overrides, "road")
+    river_add_named_overrides = _resolve_override_names(overrides, "river")
 
     display_epsg = epsg_code
     if coordinate_system == "wgs84" or epsg_code == 4326:
@@ -2641,11 +2633,7 @@ def _render_plot_map_layout_adamawa(
             continue
 
     # Label manually-added roads in Adamawa template too.
-    for ov in road_add_named_overrides:
-        geom = ov.get("geom")
-        name = str(ov.get("name") or "").strip()
-        if geom is None or not name:
-            continue
+    for geom, name in road_add_named_overrides:
         try:
             gdf_line = gpd.GeoSeries([geom], crs="EPSG:4326").to_crs(epsg=display_epsg)
             line_proj = gdf_line.iloc[0]
@@ -2659,11 +2647,7 @@ def _render_plot_map_layout_adamawa(
         road_label_features.append((snapped_clipped, name))
 
     river_label_features = []
-    for ov in river_add_named_overrides:
-        geom = ov.get("geom")
-        name = str(ov.get("name") or "").strip()
-        if geom is None or not name:
-            continue
+    for geom, name in river_add_named_overrides:
         try:
             gdf_line = gpd.GeoSeries([geom], crs="EPSG:4326").to_crs(epsg=display_epsg)
             line_proj = gdf_line.iloc[0]
@@ -3213,20 +3197,8 @@ def _render_plot_map_layout_cadastral(
     rivers, _ = apply_overrides(rivers, "river")
     fences, _ = apply_overrides(fences, "fence")
     roads_for_draw, _ = apply_overrides(detected_roads, "road")
-    road_add_named_overrides = [
-        ov for ov in overrides
-        if ov["feature_type"] == "road"
-        and ov["action"] in ("add", "update")
-        and ov["geom"] is not None
-        and str(ov.get("name") or "").strip()
-    ]
-    river_add_named_overrides = [
-        ov for ov in overrides
-        if ov["feature_type"] == "river"
-        and ov["action"] in ("add", "update")
-        and ov["geom"] is not None
-        and str(ov.get("name") or "").strip()
-    ]
+    road_add_named_overrides = _resolve_override_names(overrides, "road")
+    river_add_named_overrides = _resolve_override_names(overrides, "river")
 
     display_epsg = epsg_code
     if coordinate_system == "wgs84" or epsg_code == 4326:
@@ -3316,11 +3288,7 @@ def _render_plot_map_layout_cadastral(
         except Exception:
             pass
 
-    def _project_clip_named(ov):
-        geom = ov.get("geom")
-        name = str(ov.get("name") or "").strip()
-        if geom is None or not name:
-            return None
+    def _project_clip_named(geom, name):
         try:
             gdf_line = gpd.GeoSeries([geom], crs="EPSG:4326").to_crs(epsg=display_epsg)
             line_proj = gdf_line.iloc[0]
@@ -3333,8 +3301,8 @@ def _render_plot_map_layout_cadastral(
         return snap(clipped, extent_poly.boundary, road_snap_tol), name
 
     min_named_len = max(2.0, (10.0 / 1000.0) * scale_ratio)
-    road_label_features = [r for r in (_project_clip_named(ov) for ov in road_add_named_overrides) if r and r[0].length > min_named_len]
-    river_label_features = [r for r in (_project_clip_named(ov) for ov in river_add_named_overrides) if r and r[0].length > min_named_len]
+    road_label_features = [r for r in (_project_clip_named(g, n) for g, n in road_add_named_overrides) if r and r[0].length > min_named_len]
+    river_label_features = [r for r in (_project_clip_named(g, n) for g, n in river_add_named_overrides) if r and r[0].length > min_named_len]
     _draw_names_along_path(ax, road_label_features, color=road_color, font_scale=font_scale, base_fontsize=6.0)
     _draw_names_along_path(ax, river_label_features, color=river_color, font_scale=font_scale, base_fontsize=6.0)
 
@@ -3384,7 +3352,7 @@ def _render_plot_map_layout_cadastral(
     ax.set_ylim(target_ylim)
 
     major = nice_grid_step(max(ax.get_xlim()[1] - ax.get_xlim()[0], ax.get_ylim()[1] - ax.get_ylim()[0]))
-    draw_grid(ax, poly, major / 5.0, major, font_scale, full_grid=False, edge_ticks=False, color=grid_color, coord_grid=True)
+    draw_grid(ax, poly, major / 5.0, major, font_scale, full_grid=False, edge_ticks=False, color=grid_color)
 
     annotate_vertices(
         ax,

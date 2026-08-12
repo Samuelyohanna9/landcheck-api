@@ -5031,8 +5031,27 @@ def add_feature_override(
         if not geom_geojson:
             raise HTTPException(status_code=400, detail="Geometry is required")
 
+    if action == "update":
+        # An "update" replaces whatever's at this geometry - without this, repeated edits (e.g.
+        # renaming a road more than once from the Road Names panel) pile up as separate override
+        # rows that all intersect the same road. At render time those stale rows could still
+        # contribute their own (now-superseded) name, or their slightly-different geometry could
+        # linger alongside the new one and corrupt the road's shape - deleting them here keeps
+        # exactly one override per logical feature.
+        if geom_geojson:
+            db.execute(text("""
+                DELETE FROM plot_feature_overrides
+                WHERE plot_id = :plot_id AND feature_type = :feature_type
+                  AND ST_Intersects(geom, ST_SetSRID(ST_GeomFromGeoJSON(:geojson), 4326))
+            """), {"plot_id": plot_id, "feature_type": feature_type, "geojson": json.dumps(geom_geojson)})
+        elif geom_wkt:
+            db.execute(text("""
+                DELETE FROM plot_feature_overrides
+                WHERE plot_id = :plot_id AND feature_type = :feature_type
+                  AND ST_Intersects(geom, ST_SetSRID(ST_GeomFromText(:wkt), 4326))
+            """), {"plot_id": plot_id, "feature_type": feature_type, "wkt": geom_wkt})
+
     if geom_geojson:
-        import json
         db.execute(text("""
             INSERT INTO plot_feature_overrides (plot_id, feature_type, action, name, width_m, geom, client_request_id)
             VALUES (:plot_id, :feature_type, :action, :name, :width_m, ST_SetSRID(ST_GeomFromGeoJSON(:geojson), 4326), :client_request_id)
