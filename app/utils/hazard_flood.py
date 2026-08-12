@@ -187,6 +187,15 @@ def compute_flood_risk(
     )
     breakdown["buildings_total"] = map_stats.get("buildings_total", 0)
     breakdown["buildings_threatened"] = map_stats.get("buildings_threatened", 0)
+    # Not part of the JSON response (the router only whitelists specific breakdown fields into
+    # its response body) - carried here purely so the GIS export endpoint can reuse the exact
+    # same buildings/points the map was drawn from, instead of re-fetching and risking drift.
+    breakdown["_gis_export"] = {
+        "boundary_geojson": boundary_geojson,
+        "buildings_gdf": map_stats.get("buildings_gdf"),
+        "value_points": map_stats.get("value_points"),
+        "value_key": map_stats.get("value_key", "depth_m"),
+    }
 
     return risk_value, risk_class, breakdown, png_bytes
 

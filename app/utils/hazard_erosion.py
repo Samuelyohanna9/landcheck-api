@@ -257,6 +257,12 @@ def compute_erosion_risk(
     )
     breakdown["buildings_total"] = map_stats.get("buildings_total", 0)
     breakdown["buildings_threatened"] = map_stats.get("buildings_threatened", 0)
+    breakdown["_gis_export"] = {
+        "boundary_geojson": boundary_geojson,
+        "buildings_gdf": map_stats.get("buildings_gdf"),
+        "value_points": map_stats.get("value_points"),
+        "value_key": map_stats.get("value_key", "slope_deg"),
+    }
 
     return risk_value, risk_class, breakdown, png_bytes
 

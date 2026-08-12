@@ -166,23 +166,29 @@ def _slope_band_colors_for(slopes: np.ndarray) -> np.ndarray:
     return np.array(SLOPE_COLORS)[indices]
 
 
-def _draw_buildings(ax, buildings: List[BaseGeometry], display_epsg: int, threatened_fn) -> Tuple[int, int]:
+def _draw_buildings(ax, buildings: List[BaseGeometry], display_epsg: int, threatened_fn):
     """Plots real building footprints, red where threatened_fn(centroid_x, centroid_y) says so.
-    threatened_fn returns a boolean array given projected centroid coordinate arrays.
+    threatened_fn returns a boolean array given projected centroid coordinate arrays. Returns
+    (buildings_total, buildings_threatened, buildings_gdf_wgs84) - the third value is the same
+    filtered building set actually drawn, in WGS84 with a `threatened` column, reused by the GIS
+    export so the exported buildings match the map exactly rather than being re-derived separately.
     """
     if not buildings:
-        return 0, 0
+        return 0, 0, None
     try:
-        gdf_buildings = gpd.GeoDataFrame(geometry=buildings, crs="EPSG:4326").to_crs(epsg=display_epsg)
-        gdf_buildings = gdf_buildings[gdf_buildings.geometry.is_valid & ~gdf_buildings.geometry.is_empty]
+        gdf_buildings_wgs84 = gpd.GeoDataFrame(geometry=buildings, crs="EPSG:4326")
+        gdf_buildings_wgs84 = gdf_buildings_wgs84[gdf_buildings_wgs84.geometry.is_valid & ~gdf_buildings_wgs84.geometry.is_empty]
+        gdf_buildings = gdf_buildings_wgs84.to_crs(epsg=display_epsg)
         buildings_total = len(gdf_buildings)
         if buildings_total == 0:
-            return 0, 0
+            return 0, 0, None
         centroids = gdf_buildings.geometry.centroid
         cx = centroids.x.to_numpy()
         cy = centroids.y.to_numpy()
         threatened_mask = threatened_fn(cx, cy)
         gdf_buildings["threatened"] = threatened_mask
+        gdf_buildings_wgs84 = gdf_buildings_wgs84.reset_index(drop=True)
+        gdf_buildings_wgs84["threatened"] = threatened_mask
         buildings_threatened = int(np.asarray(threatened_mask).sum())
         safe_gdf = gdf_buildings[~gdf_buildings["threatened"]]
         if len(safe_gdf):
@@ -190,9 +196,9 @@ def _draw_buildings(ax, buildings: List[BaseGeometry], display_epsg: int, threat
         threatened_gdf = gdf_buildings[gdf_buildings["threatened"]]
         if len(threatened_gdf):
             threatened_gdf.plot(ax=ax, facecolor=BUILDING_THREATENED_COLOR, edgecolor="#7f1d1d", linewidth=0.4, zorder=5)
-        return buildings_total, buildings_threatened
+        return buildings_total, buildings_threatened, gdf_buildings_wgs84
     except Exception:
-        return 0, 0
+        return 0, 0, None
 
 
 def render_flood_hazard_map(
@@ -265,7 +271,7 @@ def render_flood_hazard_map(
         mask_invalid = np.ma.getmaskarray(interpolated) if np.ma.is_masked(interpolated) else np.zeros(len(cx), dtype=bool)
         return (~mask_invalid) & (values > 0.05)
 
-    buildings_total, buildings_threatened = _draw_buildings(ax, buildings, display_epsg, _flood_threatened)
+    buildings_total, buildings_threatened, buildings_gdf_wgs84 = _draw_buildings(ax, buildings, display_epsg, _flood_threatened)
 
     # Plot boundary outline, always on top.
     gdf_boundary.plot(ax=ax, facecolor="none", edgecolor=BOUNDARY_COLOR, linewidth=2.4, zorder=10)
@@ -311,7 +317,13 @@ def render_flood_hazard_map(
     plt.close(fig)
     buf.seek(0)
 
-    return buf.getvalue(), {"buildings_total": buildings_total, "buildings_threatened": buildings_threatened}
+    return buf.getvalue(), {
+        "buildings_total": buildings_total,
+        "buildings_threatened": buildings_threatened,
+        "buildings_gdf": buildings_gdf_wgs84,
+        "value_points": depth_points if depth_available else None,
+        "value_key": "depth_m",
+    }
 
 
 def render_erosion_hazard_map(
@@ -417,7 +429,7 @@ def render_erosion_hazard_map(
             return (~mask_invalid) & (values >= BUILDING_SLOPE_THREATENED_DEG)
         return np.zeros(n, dtype=bool)
 
-    buildings_total, buildings_threatened = _draw_buildings(ax, buildings, display_epsg, _erosion_threatened)
+    buildings_total, buildings_threatened, buildings_gdf_wgs84 = _draw_buildings(ax, buildings, display_epsg, _erosion_threatened)
 
     gdf_boundary.plot(ax=ax, facecolor="none", edgecolor=BOUNDARY_COLOR, linewidth=2.4, zorder=10)
 
@@ -453,9 +465,22 @@ def render_erosion_hazard_map(
             transform=ax.transAxes, ha="center", va="center", fontsize=10, color="#6b7280",
         )
 
+    if slope_available and slope_from_local:
+        export_points, export_value_key = local_elevation_points, "elevation_m"
+    elif slope_available:
+        export_points, export_value_key = dem_slope_points, "slope_deg"
+    else:
+        export_points, export_value_key = None, "slope_deg"
+
     buf = io.BytesIO()
     fig.savefig(buf, format="png", bbox_inches="tight", dpi=150)
     plt.close(fig)
     buf.seek(0)
 
-    return buf.getvalue(), {"buildings_total": buildings_total, "buildings_threatened": buildings_threatened}
+    return buf.getvalue(), {
+        "buildings_total": buildings_total,
+        "buildings_threatened": buildings_threatened,
+        "buildings_gdf": buildings_gdf_wgs84,
+        "value_points": export_points,
+        "value_key": export_value_key,
+    }

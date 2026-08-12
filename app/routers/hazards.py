@@ -1,5 +1,5 @@
 from fastapi import APIRouter, Body, Depends, HTTPException
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from sqlalchemy.orm import Session
 import os
 import tempfile
@@ -10,6 +10,7 @@ from app.utils.hazard_common import classify_risk, risk_tier_legend
 from app.utils.hazard_flood import compute_flood_risk, overlay_to_data_url as flood_overlay_to_data_url
 from app.utils.hazard_erosion import compute_erosion_risk, overlay_to_data_url as erosion_overlay_to_data_url
 from app.utils.hazard_pdf import render_flood_report_pdf, render_erosion_report_pdf
+from app.utils.hazard_gis_export import build_hazard_gis_export_zip
 from app.utils.r2_exports import upload_export_file_best_effort
 
 
@@ -307,3 +308,77 @@ def erosion_pdf(payload: dict = Body(...), db: Session = Depends(get_db)):
     }
     render_erosion_report_pdf(pdf_path, overlay_png, summary)
     return _pdf_response_with_r2(pdf_path, "erosion_risk_report.pdf", "hazard-erosion")
+
+
+# ---------------- GIS EXPORT ----------------
+
+def _gis_export_response(zip_bytes: bytes, filename: str) -> Response:
+    return Response(
+        content=zip_bytes,
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@router.post("/flood/gis-export")
+def flood_gis_export(payload: dict = Body(...), db: Session = Depends(get_db)):
+    boundary = _extract_boundary(payload)
+    return_period = int(payload.get("return_period", 100))
+    local_elevation_points = _extract_local_elevation_points(payload)
+    try:
+        risk_value, risk_class, breakdown, _overlay_png = compute_flood_risk(
+            db, boundary, False, return_period, local_elevation_points
+        )
+    except Exception as exc:
+        logger.exception("Flood GIS export failed")
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    export_data = breakdown.get("_gis_export") or {}
+    zip_bytes = build_hazard_gis_export_zip(
+        hazard_type="flood",
+        boundary_geojson=export_data.get("boundary_geojson", boundary),
+        buildings_gdf=export_data.get("buildings_gdf"),
+        value_points=export_data.get("value_points"),
+        value_key=export_data.get("value_key", "depth_m"),
+        risk_class=risk_class,
+        risk_score=round(risk_value * 100, 1),
+        method_text=(
+            f"Flood depth sampled from JRC/CEMS GloFAS Flood Hazard v2.1 at the "
+            f"{return_period}-year return period. Buildings are OpenStreetMap footprints, "
+            "flagged as threatened where interpolated depth exceeds 5cm."
+        ),
+    )
+    return _gis_export_response(zip_bytes, "flood_hazard_gis_export.zip")
+
+
+@router.post("/erosion/gis-export")
+def erosion_gis_export(payload: dict = Body(...), db: Session = Depends(get_db)):
+    boundary = _extract_boundary(payload)
+    local_elevation_points = _extract_local_elevation_points(payload)
+    try:
+        risk_value, risk_class, breakdown, _overlay_png = compute_erosion_risk(
+            db, boundary, False, local_elevation_points
+        )
+    except Exception as exc:
+        logger.exception("Erosion GIS export failed")
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    export_data = breakdown.get("_gis_export") or {}
+    slope_source = breakdown.get("slope_source", "unavailable")
+    zip_bytes = build_hazard_gis_export_zip(
+        hazard_type="erosion",
+        boundary_geojson=export_data.get("boundary_geojson", boundary),
+        buildings_gdf=export_data.get("buildings_gdf"),
+        value_points=export_data.get("value_points"),
+        value_key=export_data.get("value_key", "slope_deg"),
+        risk_class=risk_class,
+        risk_score=round(risk_value * 100, 1),
+        method_text=(
+            "Slope susceptibility screening. "
+            + ("Slope points are from the surveyor's own uploaded elevation data."
+               if slope_source == "local_survey"
+               else "Slope points are sampled from a global 30m Copernicus DEM.")
+            + " Buildings are OpenStreetMap footprints, flagged as threatened where on slope > 15 degrees."
+        ),
+    )
+    return _gis_export_response(zip_bytes, "erosion_hazard_gis_export.zip")
