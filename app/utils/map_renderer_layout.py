@@ -3000,22 +3000,15 @@ def _draw_cadastral_footer(
 
 
 def _draw_cadastral_coordinate_labels(
-    ax, anchor_x: float, anchor_y: float, easting_m: float, northing_m: float,
-    font_scale: float = 1.0, color: str = CADASTRAL_BLUE,
+    ax, easting_m: float, northing_m: float, font_scale: float = 1.0, color: str = CADASTRAL_BLUE,
 ) -> None:
-    """Draws the Northing label at the map's lower-left corner, and drops a vertical grid line
-    from the top of the map straight down to the reference vertex - continuing the north-arrow
-    stem drawn above the axes - with the Easting label running alongside that same line, matching
-    the reference template's convention of tying the north arrow to the Easting grid reference.
+    """Draws the Easting label along the map's left edge and the Northing label at the lower-left
+    corner - standalone reference text, not tied to any station point or the north arrow, so it
+    never overlaps a beacon marker regardless of where that vertex happens to sit.
     """
     fs = max(6, int(6.5 * font_scale))
-    top_y = ax.get_ylim()[1]
-    ax.plot([anchor_x, anchor_x], [top_y, anchor_y], color=color, lw=0.9 * font_scale,
-             zorder=2, solid_capstyle="butt")
-    x_span = ax.get_xlim()[1] - ax.get_xlim()[0]
-    label_y = anchor_y + (top_y - anchor_y) * 0.4
-    ax.text(anchor_x - x_span * 0.01, label_y, f"{easting_m:.3f}m E.", color=color, fontsize=fs,
-             ha="right", va="center", rotation=90, fontfamily=CADASTRAL_FONT_FAMILY, zorder=2)
+    ax.text(-0.022, 0.5, f"{easting_m:.3f}m E.", color=color, fontsize=fs, ha="right", va="center",
+             rotation=90, transform=ax.transAxes, fontfamily=CADASTRAL_FONT_FAMILY)
     ax.text(0.06, -0.03, f"{northing_m:.3f}m N.", color=color, fontsize=fs, ha="left", va="top",
              transform=ax.transAxes, fontfamily=CADASTRAL_FONT_FAMILY)
 
@@ -3374,26 +3367,15 @@ def _render_plot_map_layout_cadastral(
     )
 
     first_coords = list(poly.exterior.coords)[0]
-    # The "U.N." grid-marker style's stem doubles as this vertex's Easting grid drop-line, so when
-    # it's selected, anchor it at the vertex's own x instead of the usual top-right corner - for
-    # any other north arrow style, it stays in its normal position (the drop-line below is drawn
-    # independently either way).
-    normalized_arrow_style = str(north_arrow_style or "").strip().lower()
-    un_marker_anchor_x = None
-    if normalized_arrow_style in ("un_marker", "un", "un_grid", "u_n", "grid_marker"):
-        # No clamping here - the drop-line below (_draw_cadastral_coordinate_labels) uses this
-        # same vertex's raw x in data space, unclamped. Clamping only the icon's anchor here
-        # would shift it sideways relative to that line whenever the vertex sits near the map's
-        # edge, breaking the stem into two misaligned segments.
-        disp_x = ax.transData.transform((first_coords[0], 0))[0]
-        un_marker_anchor_x = float(fig.transFigure.inverted().transform((disp_x, 0))[0])
+    # The north arrow icon sits in its normal position (like every other template/style) rather
+    # than being anchored to a station point - tying its stem to a vertex kept overlapping the
+    # beacon marker there and breaking whenever that vertex sat near the map's edge.
     add_north_arrow(
         ax, font_scale=font_scale, style=north_arrow_style, color=north_arrow_color,
-        blue_hex=grid_color, anchor_x=un_marker_anchor_x,
+        blue_hex=grid_color,
     )
     _draw_cadastral_coordinate_labels(
-        ax, anchor_x=first_coords[0], anchor_y=first_coords[1],
-        easting_m=first_coords[0], northing_m=first_coords[1], font_scale=font_scale, color=grid_color,
+        ax, easting_m=first_coords[0], northing_m=first_coords[1], font_scale=font_scale, color=grid_color,
     )
 
     certification_date = datetime.now().strftime("%d / %m / %Y")
