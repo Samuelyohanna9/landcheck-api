@@ -229,6 +229,10 @@ def _ensure_plot_meta_table_impl(db: Session):
             adamawa_plan_no TEXT,
             adamawa_surveyed_by_text TEXT,
             adamawa_disclaimer_text TEXT,
+            cadastral_plan_no TEXT,
+            cadastral_area_name TEXT,
+            cadastral_datum_text TEXT,
+            cadastral_firm_block_text TEXT,
             technical_report_instruments JSONB DEFAULT '[]',
             technical_report_dgps_type TEXT,
             technical_report_num_surveyors INTEGER,
@@ -272,6 +276,10 @@ def _ensure_plot_meta_table_impl(db: Session):
         ("adamawa_plan_no", "TEXT"),
         ("adamawa_surveyed_by_text", "TEXT"),
         ("adamawa_disclaimer_text", "TEXT"),
+        ("cadastral_plan_no", "TEXT"),
+        ("cadastral_area_name", "TEXT"),
+        ("cadastral_datum_text", "TEXT"),
+        ("cadastral_firm_block_text", "TEXT"),
         ("technical_report_instruments", "JSONB DEFAULT '[]'"),
         ("technical_report_dgps_type", "TEXT"),
         ("technical_report_num_surveyors", "INTEGER"),
@@ -505,6 +513,10 @@ def upsert_plot_meta(
     adamawa_plan_no: Optional[str] = None,
     adamawa_surveyed_by_text: Optional[str] = None,
     adamawa_disclaimer_text: Optional[str] = None,
+    cadastral_plan_no: Optional[str] = None,
+    cadastral_area_name: Optional[str] = None,
+    cadastral_datum_text: Optional[str] = None,
+    cadastral_firm_block_text: Optional[str] = None,
     technical_report_instruments: Optional[list] = None,
     technical_report_dgps_type: Optional[str] = None,
     technical_report_num_surveyors: Optional[int] = None,
@@ -533,6 +545,7 @@ def upsert_plot_meta(
             adamawa_control_point_name, adamawa_northing, adamawa_easting, adamawa_elevation, adamawa_origin_text,
             adamawa_topo_sheet_text, adamawa_computation_no, adamawa_cadastral_sheet_no, adamawa_plan_no,
             adamawa_surveyed_by_text, adamawa_disclaimer_text,
+            cadastral_plan_no, cadastral_area_name, cadastral_datum_text, cadastral_firm_block_text,
             technical_report_instruments, technical_report_dgps_type,
             technical_report_num_surveyors, technical_report_num_technical_officers,
             technical_report_num_labourers, technical_report_recce_text,
@@ -547,6 +560,7 @@ def upsert_plot_meta(
             :adamawa_control_point_name, :adamawa_northing, :adamawa_easting, :adamawa_elevation, :adamawa_origin_text,
             :adamawa_topo_sheet_text, :adamawa_computation_no, :adamawa_cadastral_sheet_no, :adamawa_plan_no,
             :adamawa_surveyed_by_text, :adamawa_disclaimer_text,
+            :cadastral_plan_no, :cadastral_area_name, :cadastral_datum_text, :cadastral_firm_block_text,
             CAST(COALESCE(:technical_report_instruments, '[]') AS JSONB), :technical_report_dgps_type,
             :technical_report_num_surveyors, :technical_report_num_technical_officers,
             :technical_report_num_labourers, :technical_report_recce_text,
@@ -581,6 +595,10 @@ def upsert_plot_meta(
             adamawa_plan_no = COALESCE(NULLIF(EXCLUDED.adamawa_plan_no, ''), plot_meta.adamawa_plan_no),
             adamawa_surveyed_by_text = COALESCE(NULLIF(EXCLUDED.adamawa_surveyed_by_text, ''), plot_meta.adamawa_surveyed_by_text),
             adamawa_disclaimer_text = COALESCE(NULLIF(EXCLUDED.adamawa_disclaimer_text, ''), plot_meta.adamawa_disclaimer_text),
+            cadastral_plan_no = COALESCE(NULLIF(EXCLUDED.cadastral_plan_no, ''), plot_meta.cadastral_plan_no),
+            cadastral_area_name = COALESCE(NULLIF(EXCLUDED.cadastral_area_name, ''), plot_meta.cadastral_area_name),
+            cadastral_datum_text = COALESCE(NULLIF(EXCLUDED.cadastral_datum_text, ''), plot_meta.cadastral_datum_text),
+            cadastral_firm_block_text = COALESCE(NULLIF(EXCLUDED.cadastral_firm_block_text, ''), plot_meta.cadastral_firm_block_text),
             technical_report_instruments = COALESCE(CAST(:technical_report_instruments AS JSONB), plot_meta.technical_report_instruments),
             technical_report_dgps_type = COALESCE(NULLIF(EXCLUDED.technical_report_dgps_type, ''), plot_meta.technical_report_dgps_type),
             technical_report_num_surveyors = COALESCE(EXCLUDED.technical_report_num_surveyors, plot_meta.technical_report_num_surveyors),
@@ -621,6 +639,10 @@ def upsert_plot_meta(
         "adamawa_plan_no": adamawa_plan_no,
         "adamawa_surveyed_by_text": adamawa_surveyed_by_text,
         "adamawa_disclaimer_text": adamawa_disclaimer_text,
+        "cadastral_plan_no": cadastral_plan_no,
+        "cadastral_area_name": cadastral_area_name,
+        "cadastral_datum_text": cadastral_datum_text,
+        "cadastral_firm_block_text": cadastral_firm_block_text,
         "technical_report_instruments": technical_report_instruments_json,
         "technical_report_dgps_type": technical_report_dgps_type,
         "technical_report_num_surveyors": technical_report_num_surveyors,
@@ -645,6 +667,7 @@ def get_plot_meta(db: Session, plot_id: int) -> dict:
                adamawa_control_point_name, adamawa_northing, adamawa_easting, adamawa_elevation, adamawa_origin_text,
                adamawa_topo_sheet_text, adamawa_computation_no, adamawa_cadastral_sheet_no, adamawa_plan_no,
                adamawa_surveyed_by_text, adamawa_disclaimer_text,
+               cadastral_plan_no, cadastral_area_name, cadastral_datum_text, cadastral_firm_block_text,
                parent_plot_id, subdivision_batch_id, subdivision_lot_no, estate_name,
                technical_report_instruments, technical_report_dgps_type,
                technical_report_num_surveyors, technical_report_num_technical_officers,
@@ -683,6 +706,10 @@ def get_plot_meta(db: Session, plot_id: int) -> dict:
             "adamawa_plan_no": "",
             "adamawa_surveyed_by_text": "",
             "adamawa_disclaimer_text": DEFAULT_ADAMAWA_DISCLAIMER_TEXT,
+            "cadastral_plan_no": "",
+            "cadastral_area_name": "",
+            "cadastral_datum_text": "",
+            "cadastral_firm_block_text": "",
             "parent_plot_id": None,
             "subdivision_batch_id": None,
             "subdivision_lot_no": "",
@@ -742,6 +769,10 @@ def get_plot_meta(db: Session, plot_id: int) -> dict:
         "adamawa_plan_no": row.get("adamawa_plan_no") or "",
         "adamawa_surveyed_by_text": row.get("adamawa_surveyed_by_text") or "",
         "adamawa_disclaimer_text": row.get("adamawa_disclaimer_text") or DEFAULT_ADAMAWA_DISCLAIMER_TEXT,
+        "cadastral_plan_no": row.get("cadastral_plan_no") or "",
+        "cadastral_area_name": row.get("cadastral_area_name") or "",
+        "cadastral_datum_text": row.get("cadastral_datum_text") or "",
+        "cadastral_firm_block_text": row.get("cadastral_firm_block_text") or "",
         "parent_plot_id": row.get("parent_plot_id"),
         "subdivision_batch_id": row.get("subdivision_batch_id"),
         "subdivision_lot_no": row.get("subdivision_lot_no") or "",
@@ -1710,6 +1741,10 @@ def _apply_child_plot_meta(
                 adamawa_plan_no = :adamawa_plan_no,
                 adamawa_surveyed_by_text = :adamawa_surveyed_by_text,
                 adamawa_disclaimer_text = :adamawa_disclaimer_text,
+                cadastral_plan_no = :cadastral_plan_no,
+                cadastral_area_name = :cadastral_area_name,
+                cadastral_datum_text = :cadastral_datum_text,
+                cadastral_firm_block_text = :cadastral_firm_block_text,
                 updated_at = NOW()
             WHERE plot_id = :plot_id
             """
@@ -1746,6 +1781,12 @@ def _apply_child_plot_meta(
             "adamawa_plan_no": parent_meta.get("adamawa_plan_no") or "",
             "adamawa_surveyed_by_text": parent_meta.get("adamawa_surveyed_by_text") or "",
             "adamawa_disclaimer_text": parent_meta.get("adamawa_disclaimer_text") or DEFAULT_ADAMAWA_DISCLAIMER_TEXT,
+            # Plan number is per-lot (left blank for the surveyor to fill in individually);
+            # locality, datum, and firm details are shared across the whole subdivision.
+            "cadastral_plan_no": "",
+            "cadastral_area_name": parent_meta.get("cadastral_area_name") or "",
+            "cadastral_datum_text": parent_meta.get("cadastral_datum_text") or "",
+            "cadastral_firm_block_text": parent_meta.get("cadastral_firm_block_text") or "",
         },
     )
 
@@ -2662,6 +2703,10 @@ def _render_survey_plan_pdf_for_plot(db: Session, plot_id: int, output_pdf_path:
         adamawa_plan_no=meta.get("adamawa_plan_no") or "",
         adamawa_surveyed_by_text=meta.get("adamawa_surveyed_by_text") or "",
         adamawa_disclaimer_text=meta.get("adamawa_disclaimer_text") or DEFAULT_ADAMAWA_DISCLAIMER_TEXT,
+        cadastral_plan_no=meta.get("cadastral_plan_no") or "",
+        cadastral_area_name=meta.get("cadastral_area_name") or "",
+        cadastral_datum_text=meta.get("cadastral_datum_text") or "",
+        cadastral_firm_block_text=meta.get("cadastral_firm_block_text") or "",
     )
     report = get_plot_report(plot_id, db)
     generate_plot_report_pdf(report, output_pdf_path, map_path, paper_size=meta["paper_size"])
@@ -4020,6 +4065,10 @@ def create_plot_survey_report_export_job(
     adamawa_plan_no: str = Body(""),
     adamawa_surveyed_by_text: str = Body(""),
     adamawa_disclaimer_text: str = Body(DEFAULT_ADAMAWA_DISCLAIMER_TEXT),
+    cadastral_plan_no: str = Body(""),
+    cadastral_area_name: str = Body(""),
+    cadastral_datum_text: str = Body(""),
+    cadastral_firm_block_text: str = Body(""),
 ):
     request_payload = {
         "title_text": title_text,
@@ -4071,6 +4120,10 @@ def create_plot_survey_report_export_job(
         "adamawa_plan_no": adamawa_plan_no,
         "adamawa_surveyed_by_text": adamawa_surveyed_by_text,
         "adamawa_disclaimer_text": adamawa_disclaimer_text,
+        "cadastral_plan_no": cadastral_plan_no,
+        "cadastral_area_name": cadastral_area_name,
+        "cadastral_datum_text": cadastral_datum_text,
+        "cadastral_firm_block_text": cadastral_firm_block_text,
     }
     cache_key = _build_plot_export_cache_key(
         db,
@@ -5040,6 +5093,10 @@ def save_plot_metadata(
     adamawa_plan_no: str = Body(""),
     adamawa_surveyed_by_text: str = Body(""),
     adamawa_disclaimer_text: str = Body(DEFAULT_ADAMAWA_DISCLAIMER_TEXT),
+    cadastral_plan_no: str = Body(""),
+    cadastral_area_name: str = Body(""),
+    cadastral_datum_text: str = Body(""),
+    cadastral_firm_block_text: str = Body(""),
 ):
     upsert_plot_meta(
         db=db,
@@ -5070,6 +5127,10 @@ def save_plot_metadata(
         adamawa_plan_no=adamawa_plan_no,
         adamawa_surveyed_by_text=adamawa_surveyed_by_text,
         adamawa_disclaimer_text=adamawa_disclaimer_text,
+        cadastral_plan_no=cadastral_plan_no,
+        cadastral_area_name=cadastral_area_name,
+        cadastral_datum_text=cadastral_datum_text,
+        cadastral_firm_block_text=cadastral_firm_block_text,
     )
     return {"ok": True, "plot_id": int(plot_id)}
 
@@ -5124,7 +5185,11 @@ def download_plot_report_pdf(plot_id: int, db: Session = Depends(get_db), backgr
     adamawa_cadastral_sheet_no: str = Body(""),
     adamawa_plan_no: str = Body(""),
     adamawa_surveyed_by_text: str = Body(""),
-    adamawa_disclaimer_text: str = Body(DEFAULT_ADAMAWA_DISCLAIMER_TEXT)):
+    adamawa_disclaimer_text: str = Body(DEFAULT_ADAMAWA_DISCLAIMER_TEXT),
+    cadastral_plan_no: str = Body(""),
+    cadastral_area_name: str = Body(""),
+    cadastral_datum_text: str = Body(""),
+    cadastral_firm_block_text: str = Body("")):
 
     reports_dir = REPORTS_DIR
     maps_dir = os.path.join(REPORTS_DIR, "maps")
@@ -5167,6 +5232,10 @@ def download_plot_report_pdf(plot_id: int, db: Session = Depends(get_db), backgr
         adamawa_plan_no=adamawa_plan_no,
         adamawa_surveyed_by_text=adamawa_surveyed_by_text,
         adamawa_disclaimer_text=adamawa_disclaimer_text,
+        cadastral_plan_no=cadastral_plan_no,
+        cadastral_area_name=cadastral_area_name,
+        cadastral_datum_text=cadastral_datum_text,
+        cadastral_firm_block_text=cadastral_firm_block_text,
     )
 
     # Get EPSG code for selected coordinate system
@@ -5228,6 +5297,10 @@ def download_plot_report_pdf(plot_id: int, db: Session = Depends(get_db), backgr
         adamawa_plan_no=adamawa_plan_no,
         adamawa_surveyed_by_text=adamawa_surveyed_by_text,
         adamawa_disclaimer_text=adamawa_disclaimer_text,
+        cadastral_plan_no=cadastral_plan_no,
+        cadastral_area_name=cadastral_area_name,
+        cadastral_datum_text=cadastral_datum_text,
+        cadastral_firm_block_text=cadastral_firm_block_text,
     )
 
     report = get_plot_report(plot_id, db)
@@ -5503,7 +5576,11 @@ def preview_plot_map(plot_id: int, db: Session = Depends(get_db), background_tas
     adamawa_cadastral_sheet_no: str = Body(""),
     adamawa_plan_no: str = Body(""),
     adamawa_surveyed_by_text: str = Body(""),
-    adamawa_disclaimer_text: str = Body(DEFAULT_ADAMAWA_DISCLAIMER_TEXT)):
+    adamawa_disclaimer_text: str = Body(DEFAULT_ADAMAWA_DISCLAIMER_TEXT),
+    cadastral_plan_no: str = Body(""),
+    cadastral_area_name: str = Body(""),
+    cadastral_datum_text: str = Body(""),
+    cadastral_firm_block_text: str = Body("")):
 
     payload_for_cache = {
         "_layout_version": PREVIEW_LAYOUT_VERSION,
@@ -5556,6 +5633,10 @@ def preview_plot_map(plot_id: int, db: Session = Depends(get_db), background_tas
         "adamawa_plan_no": adamawa_plan_no,
         "adamawa_surveyed_by_text": adamawa_surveyed_by_text,
         "adamawa_disclaimer_text": adamawa_disclaimer_text,
+        "cadastral_plan_no": cadastral_plan_no,
+        "cadastral_area_name": cadastral_area_name,
+        "cadastral_datum_text": cadastral_datum_text,
+        "cadastral_firm_block_text": cadastral_firm_block_text,
     }
     revision_token = build_preview_revision_token(db, plot_id)
     cache_key = build_preview_cache_key(plot_id, payload_for_cache, revision_token)
@@ -5603,6 +5684,10 @@ def preview_plot_map(plot_id: int, db: Session = Depends(get_db), background_tas
         adamawa_plan_no=adamawa_plan_no,
         adamawa_surveyed_by_text=adamawa_surveyed_by_text,
         adamawa_disclaimer_text=adamawa_disclaimer_text,
+        cadastral_plan_no=cadastral_plan_no,
+        cadastral_area_name=cadastral_area_name,
+        cadastral_datum_text=cadastral_datum_text,
+        cadastral_firm_block_text=cadastral_firm_block_text,
     )
 
     # Get EPSG code for selected coordinate system
@@ -5665,6 +5750,10 @@ def preview_plot_map(plot_id: int, db: Session = Depends(get_db), background_tas
         adamawa_plan_no=adamawa_plan_no,
         adamawa_surveyed_by_text=adamawa_surveyed_by_text,
         adamawa_disclaimer_text=adamawa_disclaimer_text,
+        cadastral_plan_no=cadastral_plan_no,
+        cadastral_area_name=cadastral_area_name,
+        cadastral_datum_text=cadastral_datum_text,
+        cadastral_firm_block_text=cadastral_firm_block_text,
     )
 
     cache_path = preview_cache_path(plot_id, cache_key, variant="survey")
@@ -6144,6 +6233,10 @@ def get_saved_survey_plan_pdf(plot_id: int, refresh: bool = False, db: Session =
             adamawa_plan_no=meta.get("adamawa_plan_no") or "",
             adamawa_surveyed_by_text=meta.get("adamawa_surveyed_by_text") or "",
             adamawa_disclaimer_text=meta.get("adamawa_disclaimer_text") or DEFAULT_ADAMAWA_DISCLAIMER_TEXT,
+            cadastral_plan_no=meta.get("cadastral_plan_no") or "",
+            cadastral_area_name=meta.get("cadastral_area_name") or "",
+            cadastral_datum_text=meta.get("cadastral_datum_text") or "",
+            cadastral_firm_block_text=meta.get("cadastral_firm_block_text") or "",
         )
         report = get_plot_report(plot_id, db)
         generate_plot_report_pdf(report, pdf_path, map_path, paper_size=meta["paper_size"])

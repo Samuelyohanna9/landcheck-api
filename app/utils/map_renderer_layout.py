@@ -2639,6 +2639,563 @@ def _render_plot_map_layout_adamawa(
     plt.close(fig)
 
 # ======================
+# South-South Nigeria cadastral template (Akwa Ibom / Rivers / Cross River)
+# ======================
+# One shared renderer used by all three states - "same template, separate selectable identity"
+# per state, matching a real licensed-surveyor plan format common to that region: a formal
+# title block (applicant/road/locality/LGA/state), a subdivided bar scale, blue coordinate-system
+# and datum text, a red boundary with per-corner beacon references and bearing/distance labels,
+# and a three-column certified-true-copy footer with the surveying firm's details.
+
+CADASTRAL_FONT_FAMILY = "DejaVu Serif"
+CADASTRAL_BLUE = "#1a3fa0"
+DEFAULT_CADASTRAL_DATUM_TEXT = "MINNA DATUM"
+CADASTRAL_STATE_LABELS = {
+    "akwa_ibom_osg": "AKWA IBOM STATE",
+    "rivers_osg": "RIVERS STATE",
+    "cross_river_osg": "CROSS RIVER STATE",
+}
+
+
+def _resolve_cadastral_coordinate_system_text(coordinate_system: str, display_epsg: int) -> str:
+    epsg = int(display_epsg or 0)
+    if 32600 < epsg < 32700:
+        return f"UTM ( ZONE {epsg - 32600} )"
+    if 32700 < epsg < 32800:
+        return f"UTM ( ZONE {epsg - 32700} )"
+    return "UTM"
+
+
+def _draw_cadastral_scale_bar(fig, cx: float, top_y: float, scale_text: str, font_scale: float = 1.0) -> float:
+    """A center-zero bar scale with a subdivided left extension (e.g. "5  2.5  0     5      10m"),
+    matching the convention used on real Nigerian cadastral plans. Returns the y-coordinate just
+    below the bar's number labels so callers can keep stacking header content beneath it.
+    """
+    ratio = parse_scale_ratio(scale_text)
+    candidates = [1, 2, 2.5, 5, 10, 20, 25, 50, 100, 200, 250, 500, 1000, 2000, 2500, 5000]
+    target_m = max(1.0, ratio * 0.018)
+    unit = min(candidates, key=lambda c: abs(c - target_m))
+    half_unit = unit / 2.0
+    half_w = 0.085
+    bar_h = 0.007
+    y0 = top_y - bar_h
+    lw = 0.8 * font_scale
+
+    def seg(x0, w, face):
+        fig.add_artist(patches.Rectangle(
+            (x0, y0), w, bar_h, transform=fig.transFigure,
+            facecolor=face, edgecolor="black", lw=lw,
+        ))
+
+    seg(cx - half_w, half_w / 2.0, "white")
+    seg(cx - half_w / 2.0, half_w / 2.0, "black")
+    seg(cx, half_w, "black")
+    seg(cx + half_w, half_w, "white")
+
+    label_y = y0 - 0.011
+    fs = max(5, int(6 * font_scale))
+    for x, label in (
+        (cx - half_w, f"{unit:g}"),
+        (cx - half_w / 2.0, f"{half_unit:g}"),
+        (cx, "0"),
+        (cx + half_w, f"{unit:g}"),
+        (cx + 2 * half_w, f"{2 * unit:g}m"),
+    ):
+        fig.text(x, label_y, label, ha="center", va="top", fontsize=fs, fontfamily=CADASTRAL_FONT_FAMILY)
+    return label_y - 0.012
+
+
+def _draw_cadastral_header(
+    fig,
+    plan_no: str,
+    applicant_name: str,
+    road_name: str,
+    area_name: str,
+    lga_text: str,
+    state_label: str,
+    scale_text: str,
+    coordinate_system_text: str,
+    datum_text: str,
+    area_m2: float,
+    font_scale: float = 1.0,
+    text_color: str = "black",
+) -> None:
+    fig.add_artist(patches.Rectangle((0.03, 0.03), 0.94, 0.94, transform=fig.transFigure, fill=False, lw=1.2))
+
+    box_w, box_h = 0.30, 0.05
+    box_x, box_y = 0.045, 0.965 - box_h
+    fig.add_artist(patches.Rectangle((box_x, box_y), box_w, box_h, transform=fig.transFigure, fill=False, lw=0.9))
+    fig.text(
+        box_x + box_w / 2.0, box_y + box_h / 2.0, f"PLAN NO: {_safe_text(plan_no, '-')}",
+        ha="center", va="center", fontsize=max(7, int(7.5 * font_scale)), weight="bold",
+        fontfamily=CADASTRAL_FONT_FAMILY, color=text_color,
+    )
+
+    cx = 0.685
+    y = 0.965
+    fs = max(6, int(7.6 * font_scale))
+    line_h = 0.0165
+
+    def line(text_value, bold=False, gap=1.0, size_mult=1.0, color=None):
+        nonlocal y
+        fig.text(
+            cx, y, text_value, ha="center", va="center",
+            fontsize=max(6, int(fs * size_mult)), weight=("bold" if bold else "normal"),
+            fontfamily=CADASTRAL_FONT_FAMILY, color=color or text_color,
+        )
+        y -= line_h * gap
+
+    line("PLAN SHEWING LANDED PROPERTY", bold=True)
+    line("OF", gap=0.85)
+    line(_safe_text(applicant_name, "-").upper(), bold=True, size_mult=1.05)
+    line("ALONG", gap=0.85)
+    line(_safe_text(road_name, "-").upper())
+    area_name_clean = _safe_text(area_name)
+    if area_name_clean:
+        line(area_name_clean.upper())
+    line(_safe_text(lga_text, "-").upper())
+    line(_safe_text(state_label, "-").upper())
+    y -= line_h * 0.35
+    line(f"SCALE:  {_normalize_scale_label_adamawa(scale_text)}")
+    y -= line_h * 0.55
+
+    y = _draw_cadastral_scale_bar(fig, cx, y, scale_text, font_scale=font_scale)
+    y -= line_h * 0.35
+
+    line(f"COORDINATE SYSTEM : {_safe_text(coordinate_system_text, '-').upper()}", color=CADASTRAL_BLUE)
+    line(f"DATUM / ORIGIN : {_safe_text(datum_text, DEFAULT_CADASTRAL_DATUM_TEXT).upper()}", color=CADASTRAL_BLUE)
+    line(f"AREA: {area_m2:.3f}SQ. MTRS.", color="red")
+
+
+def _draw_cadastral_footer(
+    fig,
+    plan_no: str,
+    certification_date: str,
+    surveyor_name: str,
+    surveyor_credential: str,
+    firm_block_text: str,
+    state_label: str,
+    font_scale: float = 1.0,
+    text_color: str = "black",
+) -> None:
+    footer_top = 0.195
+    footer_bottom = 0.035
+    col1_x0, col1_x1 = 0.045, 0.30
+    col2_x1 = 0.55
+    col3_x1 = 0.965
+
+    for x in (col1_x0, col1_x1, col2_x1, col3_x1):
+        fig.add_artist(mlines.Line2D(
+            [x, x], [footer_bottom, footer_top], transform=fig.transFigure,
+            color="black", lw=0.9 * font_scale,
+        ))
+    for y_line in (footer_top, footer_bottom):
+        fig.add_artist(mlines.Line2D(
+            [col1_x0, col3_x1], [y_line, y_line], transform=fig.transFigure,
+            color="black", lw=0.9 * font_scale,
+        ))
+
+    fs = max(6, int(7 * font_scale))
+    mid_y = (footer_top + footer_bottom) / 2.0
+    fig.text((col1_x0 + col1_x1) / 2.0, mid_y + 0.018, "PLAN NO:", ha="center", va="center",
+              fontsize=fs, weight="bold", fontfamily=CADASTRAL_FONT_FAMILY, color=text_color)
+    fig.text((col1_x0 + col1_x1) / 2.0, mid_y - 0.018, _safe_text(plan_no, "-"), ha="center", va="center",
+              fontsize=fs, weight="bold", fontfamily=CADASTRAL_FONT_FAMILY, color=text_color)
+
+    credential = _safe_text(surveyor_credential)
+    surveyor_line = _safe_text(surveyor_name, "-").upper() + (f", {credential}" if credential else "")
+    firm_lines = [ln.strip() for ln in _safe_text(firm_block_text).splitlines() if ln.strip()]
+
+    right_lines = [
+        ("CERTIFIED TRUE COPY OF ORIGINAL PLAN", True),
+        (f"MADE BY ME ON {_safe_text(certification_date, '-')}", True),
+        ("", False),
+        (surveyor_line, True),
+        ("SURVEYOR", False),
+    ]
+    for fl in firm_lines:
+        right_lines.append((fl.upper(), False))
+    state_clean = _safe_text(state_label)
+    if state_clean:
+        right_lines.append((f"{state_clean.upper()}.", False))
+
+    right_cx = (col2_x1 + col3_x1) / 2.0
+    # Line height adapts to how many lines the firm block actually needs (it's free text, so a
+    # long address/contact block shouldn't be allowed to run past the sheet's outer frame) -
+    # capped so a short block still looks properly spaced rather than oddly sparse.
+    content_top = footer_top - 0.018
+    content_bottom = footer_bottom + 0.012
+    line_h = min(0.0155, (content_top - content_bottom) / max(1, len(right_lines)))
+    line_h = max(0.009, line_h)
+    y = content_top
+    for txt, bold in right_lines:
+        if not txt:
+            y -= line_h * 0.85
+            continue
+        line_fs = fs if line_h >= 0.012 else max(5, int(fs * 0.85))
+        fig.text(right_cx, y, txt, ha="center", va="center", fontsize=line_fs,
+                  weight=("bold" if bold else "normal"), fontfamily=CADASTRAL_FONT_FAMILY, color=text_color)
+        y -= line_h
+
+
+def _draw_cadastral_origin_marker(ax, font_scale: float = 1.0, color: str = CADASTRAL_BLUE, label: str = "U.N.") -> None:
+    """A small grid-origin indicator (vertical stem + loop) above the map - the same convention
+    seen on South-South Nigeria cadastral plans, distinct from (and drawn alongside) the north
+    arrow rather than replacing it.
+    """
+    box = ax.get_position()
+    x = float(box.x0) + (float(box.x1) - float(box.x0)) * 0.16
+    y_base = float(box.y1) + 0.01
+    y_top = y_base + 0.06
+    fig = ax.figure
+    fig.add_artist(mlines.Line2D([x, x], [y_base, y_top], transform=fig.transFigure, color=color, lw=1.1 * font_scale))
+    loop_r = 0.012
+    fig.add_artist(patches.Circle((x, y_top + loop_r * 0.7), loop_r, transform=fig.transFigure,
+                                   fill=False, edgecolor=color, lw=1.0 * font_scale))
+    fig.text(x, y_base - 0.014, label, ha="center", va="top", fontsize=max(6, int(7 * font_scale)),
+              color=color, fontfamily=CADASTRAL_FONT_FAMILY, weight="bold")
+
+
+def _draw_cadastral_coordinate_labels(
+    ax, easting_m: float, northing_m: float, font_scale: float = 1.0, color: str = CADASTRAL_BLUE,
+) -> None:
+    fs = max(6, int(6.5 * font_scale))
+    ax.text(-0.022, 0.5, f"{easting_m:.3f}m E.", color=color, fontsize=fs, ha="right", va="center",
+             rotation=90, transform=ax.transAxes, fontfamily=CADASTRAL_FONT_FAMILY)
+    ax.text(0.06, -0.03, f"{northing_m:.3f}m N.", color=color, fontsize=fs, ha="left", va="top",
+             transform=ax.transAxes, fontfamily=CADASTRAL_FONT_FAMILY)
+
+
+def _draw_cadastral_frontage_road(ax, poly, road_name: str, font_scale: float = 1.0, color: str = "black") -> None:
+    """Dashed frontage-road reference line just outside the boundary's lowest edge, labeled with
+    the applicant's road/street name - the same "OLD ORON ROAD"-style annotation seen on the
+    reference template, for the common case where the actual road isn't in OSM/detected road data.
+    """
+    coords = list(poly.exterior.coords)
+    if len(coords) < 2:
+        return
+    best_edge = None
+    best_mid_y = None
+    for i in range(len(coords) - 1):
+        p1, p2 = coords[i], coords[i + 1]
+        mid_y = (p1[1] + p2[1]) / 2.0
+        if best_mid_y is None or mid_y < best_mid_y:
+            best_mid_y = mid_y
+            best_edge = (p1, p2)
+    if best_edge is None:
+        return
+    (x1, y1), (x2, y2) = best_edge
+    seg_len = math.hypot(x2 - x1, y2 - y1) or 1.0
+    nx, ny = -(y2 - y1) / seg_len, (x2 - x1) / seg_len
+    cx, cy = poly.centroid.x, poly.centroid.y
+    mx, my = (x1 + x2) / 2.0, (y1 + y2) / 2.0
+    dist_pos = (mx + nx * 10 - cx) ** 2 + (my + ny * 10 - cy) ** 2
+    dist_neg = (mx - nx * 10 - cx) ** 2 + (my - ny * 10 - cy) ** 2
+    if dist_pos < dist_neg:
+        nx, ny = -nx, -ny
+    offset = max(3.0, seg_len * 0.06)
+    dx, dy = (x2 - x1) / seg_len, (y2 - y1) / seg_len
+    ext = seg_len * 0.15
+    ox1, oy1 = x1 + nx * offset - dx * ext, y1 + ny * offset - dy * ext
+    ox2, oy2 = x2 + nx * offset + dx * ext, y2 + ny * offset + dy * ext
+    ax.add_line(mlines.Line2D([ox1, ox2], [oy1, oy2], color=color, lw=1.0 * font_scale, linestyle=(0, (6, 4)), zorder=6))
+    label_x, label_y = (ox1 + ox2) / 2.0, (oy1 + oy2) / 2.0 + ny * (offset * 0.5)
+    ax.text(
+        label_x, label_y, _safe_text(road_name).upper(), color=color, fontsize=max(6, int(7 * font_scale)),
+        ha="center", va="center", weight="bold", zorder=6,
+    )
+
+
+def _render_plot_map_layout_cadastral(
+    db,
+    plot_id: int,
+    output_path: str,
+    title_text: str,
+    location_text: str,
+    lga_text: str,
+    state_text: str,
+    scale_text: str,
+    surveyor_name: str,
+    surveyor_rank: str,
+    paper_size: str = "A4",
+    station_names=None,
+    coordinate_system: str = "wgs84",
+    epsg_code: int = 4326,
+    north_arrow_style: str = "one_side_stem",
+    north_arrow_color: str = "black",
+    beacon_style: str = "cross",
+    road_width_m: float | None = None,
+    road_width_override_m: float | None = None,
+    cadastral_plan_no: str = "",
+    cadastral_area_name: str = "",
+    cadastral_datum_text: str = "",
+    cadastral_firm_block_text: str = "",
+    state_label: str = "STATE",
+    preview_mode: bool = False,
+    boundary_color: str | None = None,
+    grid_color: str | None = None,
+    text_color: str | None = None,
+    road_color: str | None = None,
+    river_color: str | None = None,
+    building_color: str | None = None,
+    building_hatch_type: str | None = None,
+    title_font: str | None = None,
+    title_size: int | None = None,
+    grid_font: str | None = None,
+    grid_size: int | None = None,
+    station_font: str | None = None,
+    station_size: int | None = None,
+    bearing_font: str | None = None,
+    bearing_size: int | None = None,
+    area_font: str | None = None,
+    area_size: int | None = None,
+):
+    boundary_color = boundary_color or "red"
+    grid_color = grid_color or CADASTRAL_BLUE
+    text_color = text_color or "black"
+    road_color = road_color or "black"
+    river_color = river_color or "#10a3df"
+    building_color = building_color or "black"
+    building_hatch_type = building_hatch_type or "diagonal"
+
+    plot_wkb = db.execute(text("SELECT geom FROM plots WHERE id=:id"), {"id": plot_id}).scalar()
+    if not plot_wkb:
+        raise ValueError("Plot not found")
+
+    rows = db.execute(
+        text("SELECT geom, feature_type FROM detected_features WHERE plot_id=:id"),
+        {"id": plot_id},
+    ).fetchall()
+    override_rows = db.execute(
+        text("""
+            SELECT feature_type, action, name, width_m, ST_AsGeoJSON(geom) AS geojson
+            FROM plot_feature_overrides
+            WHERE plot_id = :id
+        """),
+        {"id": plot_id},
+    ).fetchall()
+    area_m2 = db.execute(
+        text("SELECT ST_Area(geom::geography) FROM plots WHERE id=:id"),
+        {"id": plot_id}
+    ).scalar() or 0
+
+    plot_geom = wkb.loads(plot_wkb)
+    buildings, rivers, fences, detected_roads = [], [], [], []
+    for r in rows:
+        g = wkb.loads(r.geom)
+        if r.feature_type == "building":
+            buildings.append(g)
+        elif r.feature_type == "river":
+            rivers.append(g)
+        elif r.feature_type == "fence":
+            fences.append(g)
+        elif r.feature_type == "road":
+            detected_roads.append(g)
+
+    overrides = []
+    import json
+    for r in override_rows:
+        geom = None
+        if r.geojson:
+            try:
+                geom = shape(json.loads(r.geojson))
+            except Exception:
+                geom = None
+        overrides.append({
+            "feature_type": r.feature_type,
+            "action": r.action,
+            "name": r.name,
+            "geom": geom,
+        })
+
+    def apply_overrides(base_list, feature_type: str):
+        result = list(base_list)
+        added = []
+        delete_geoms = []
+        for ov in overrides:
+            if ov["feature_type"] != feature_type:
+                continue
+            geom = ov["geom"]
+            if geom is None:
+                continue
+            try:
+                if hasattr(geom, "is_valid") and not geom.is_valid:
+                    geom = geom.buffer(0)
+            except Exception:
+                pass
+            if ov["action"] in ("delete", "update"):
+                result = [g for g in result if not g.intersects(geom)]
+                delete_geoms.append(geom)
+            if ov["action"] in ("add", "update"):
+                result.append(geom)
+                added.append(geom)
+        if delete_geoms:
+            added = [g for g in added if not any(g.intersects(dg) for dg in delete_geoms)]
+        return result, added
+
+    buildings, added_buildings = apply_overrides(buildings, "building")
+    rivers, _ = apply_overrides(rivers, "river")
+    fences, _ = apply_overrides(fences, "fence")
+    roads_for_draw, _ = apply_overrides(detected_roads, "road")
+
+    display_epsg = epsg_code
+    if coordinate_system == "wgs84" or epsg_code == 4326:
+        centroid = plot_geom.centroid
+        utm_zone = int((centroid.x + 180) / 6) + 1
+        hemisphere = "north" if centroid.y >= 0 else "south"
+        display_epsg = 32600 + utm_zone if hemisphere == "north" else 32700 + utm_zone
+
+    gdf_plot = gpd.GeoDataFrame(geometry=[plot_geom], crs="EPSG:4326").to_crs(epsg=display_epsg)
+    poly = gdf_plot.geometry.iloc[0]
+    if not poly.is_valid:
+        poly = poly.buffer(0)
+        gdf_plot = gpd.GeoDataFrame(geometry=[poly], crs=f"EPSG:{display_epsg}")
+
+    paper_config = get_paper_config(paper_size)
+    fig_width = paper_config["width"]
+    fig_height = paper_config["height"]
+    font_scale = paper_config["scale"]
+    dpi = 150 if preview_mode else 200
+
+    fig = plt.figure(figsize=(fig_width, fig_height), dpi=dpi)
+    _ = FigureCanvas(fig)
+    # Extra clearance above the footer (vs. Adamawa's margins) - vertex/bearing labels near the
+    # bottom edge of a busy plot can get pushed outward by annotate_vertices' collision-avoidance
+    # placement, and this template's footer is denser (3 columns) so there's less room to spare.
+    map_left, map_bottom, map_width, map_height = 0.08, 0.27, 0.84, 0.495
+    ax = fig.add_axes([map_left, map_bottom, map_width, map_height])
+
+    plan_no_value = _safe_text(cadastral_plan_no, f"{plot_id}")
+    resolved_state_label = _safe_text(state_text) or state_label
+    coordinate_system_text = _resolve_cadastral_coordinate_system_text(coordinate_system, display_epsg)
+
+    _draw_cadastral_header(
+        fig,
+        plan_no=plan_no_value,
+        applicant_name=title_text,
+        road_name=location_text,
+        area_name=cadastral_area_name,
+        lga_text=lga_text,
+        state_label=resolved_state_label,
+        scale_text=scale_text,
+        coordinate_system_text=coordinate_system_text,
+        datum_text=cadastral_datum_text,
+        area_m2=float(area_m2 or 0),
+        font_scale=font_scale,
+        text_color=text_color,
+    )
+
+    scale_ratio = parse_scale_ratio(scale_text)
+    apply_true_scale(ax, poly, scale_ratio, fig_width * map_width, fig_height * map_height)
+    target_xlim = ax.get_xlim()
+    target_ylim = ax.get_ylim()
+    from shapely.geometry import box
+    extent_poly = box(target_xlim[0], target_ylim[0], target_xlim[1], target_ylim[1])
+
+    if rivers:
+        gpd.GeoDataFrame(geometry=rivers, crs="EPSG:4326").to_crs(epsg=display_epsg).plot(
+            ax=ax, color=river_color, lw=1.0 * font_scale, zorder=5
+        )
+
+    road_geom_width = []
+    road_snap_tol = max(1.0, (5.0 / 1000.0) * scale_ratio)
+    for geom in roads_for_draw:
+        if geom is None:
+            continue
+        try:
+            gdf_line = gpd.GeoSeries([geom], crs="EPSG:4326").to_crs(epsg=display_epsg)
+            line_proj = gdf_line.iloc[0]
+        except Exception:
+            continue
+        expanded_frame = extent_poly.buffer(road_snap_tol)
+        clipped = line_proj.intersection(expanded_frame)
+        if clipped.is_empty:
+            continue
+        snapped_clipped = snap(clipped, extent_poly.boundary, road_snap_tol)
+        try:
+            half_w = max(1.0, (road_width_m or 3.0) / 2.0)
+            road_geom_width.append((snapped_clipped, half_w))
+        except Exception:
+            continue
+    road_edge_lines = _collect_connected_road_edge_lines(road_geom_width, snap_tol_m=road_snap_tol)
+    _draw_road_edges(ax, road_edge_lines, font_scale=font_scale, color=road_color)
+
+    if _safe_text(location_text):
+        try:
+            _draw_cadastral_frontage_road(ax, poly, location_text, font_scale=font_scale, color=road_color)
+        except Exception:
+            pass
+
+    all_buildings = []
+    if buildings:
+        all_buildings.extend(buildings)
+    if added_buildings:
+        all_buildings.extend(added_buildings)
+    if all_buildings:
+        draw_building_hatch(
+            ax, all_buildings, display_epsg, scale_ratio=scale_ratio, font_scale=font_scale,
+            color=building_color, hatch_type=building_hatch_type,
+        )
+        gpd.GeoDataFrame(geometry=all_buildings, crs="EPSG:4326").to_crs(epsg=display_epsg).plot(
+            ax=ax, facecolor="none", edgecolor=building_color, lw=0.9 * font_scale, zorder=8
+        )
+    if fences:
+        draw_fences(ax, fences, display_epsg, scale_ratio=scale_ratio, font_scale=font_scale)
+    fence_avoid_geom = build_fence_avoid_geom(fences, display_epsg=display_epsg, scale_ratio=scale_ratio)
+
+    gdf_plot.plot(ax=ax, facecolor="none", edgecolor=boundary_color, lw=1.1 * font_scale, zorder=20)
+    ax.set_xlim(target_xlim)
+    ax.set_ylim(target_ylim)
+
+    major = nice_grid_step(max(ax.get_xlim()[1] - ax.get_xlim()[0], ax.get_ylim()[1] - ax.get_ylim()[0]))
+    draw_grid(ax, poly, major / 5.0, major, font_scale, full_grid=False, edge_ticks=False, color=grid_color)
+
+    annotate_vertices(
+        ax,
+        poly,
+        plot_id,
+        station_names=station_names,
+        font_scale=font_scale,
+        min_label_length_m=0.0,
+        avoid_geom=fence_avoid_geom,
+        scale_ratio=scale_ratio,
+        boundary_poly=poly,
+        beacon_style=beacon_style,
+        text_color=text_color,
+        boundary_color=boundary_color,
+        station_font=station_font,
+        station_size=station_size,
+        bearing_font=bearing_font,
+        bearing_size=bearing_size,
+    )
+
+    first_coords = list(poly.exterior.coords)[0]
+    _draw_cadastral_origin_marker(ax, font_scale=font_scale, color=grid_color)
+    _draw_cadastral_coordinate_labels(
+        ax, easting_m=first_coords[0], northing_m=first_coords[1], font_scale=font_scale, color=grid_color,
+    )
+    add_north_arrow(ax, font_scale=font_scale, style=north_arrow_style, color=north_arrow_color, blue_hex=grid_color)
+
+    certification_date = datetime.now().strftime("%d / %m / %Y")
+    _draw_cadastral_footer(
+        fig,
+        plan_no=plan_no_value,
+        certification_date=certification_date,
+        surveyor_name=surveyor_name,
+        surveyor_credential=surveyor_rank,
+        firm_block_text=cadastral_firm_block_text,
+        state_label=resolved_state_label,
+        font_scale=font_scale,
+        text_color=text_color,
+    )
+
+    ax.set_aspect("equal")
+    ax.axis("off")
+    fig.canvas.draw()
+    fig.savefig(output_path, dpi=dpi)
+    plt.close(fig)
+
+# ======================
 # Main Renderer Function
 # ======================
 
@@ -2682,6 +3239,10 @@ def render_plot_map_layout(
     adamawa_plan_no: str = "",
     adamawa_surveyed_by_text: str = "",
     adamawa_disclaimer_text: str = DEFAULT_ADAMAWA_DISCLAIMER_TEXT,
+    cadastral_plan_no: str = "",
+    cadastral_area_name: str = "",
+    cadastral_datum_text: str = "",
+    cadastral_firm_block_text: str = "",
     boundary_color: str | None = None,
     grid_color: str | None = None,
     text_color: str | None = None,
@@ -2700,7 +3261,55 @@ def render_plot_map_layout(
     area_font: str | None = None,
     area_size: int | None = None,
 ):
-    if str(template_name or "general").strip().lower() == "adamawa_osg":
+    normalized_template = str(template_name or "general").strip().lower()
+    if normalized_template in CADASTRAL_STATE_LABELS:
+        _render_plot_map_layout_cadastral(
+            db=db,
+            plot_id=plot_id,
+            output_path=output_path,
+            title_text=title_text,
+            location_text=location_text,
+            lga_text=lga_text,
+            state_text=state_text,
+            scale_text=scale_text,
+            surveyor_name=surveyor_name,
+            surveyor_rank=surveyor_rank,
+            paper_size=paper_size,
+            station_names=station_names,
+            coordinate_system=coordinate_system,
+            epsg_code=epsg_code,
+            north_arrow_style=north_arrow_style,
+            north_arrow_color=north_arrow_color,
+            beacon_style=beacon_style,
+            road_width_m=road_width_m,
+            road_width_override_m=road_width_override_m,
+            cadastral_plan_no=cadastral_plan_no,
+            cadastral_area_name=cadastral_area_name,
+            cadastral_datum_text=cadastral_datum_text,
+            cadastral_firm_block_text=cadastral_firm_block_text,
+            state_label=CADASTRAL_STATE_LABELS[normalized_template],
+            preview_mode=preview_mode,
+            boundary_color=boundary_color,
+            grid_color=grid_color,
+            text_color=text_color,
+            road_color=road_color,
+            river_color=river_color,
+            building_color=building_color,
+            building_hatch_type=building_hatch_type,
+            title_font=title_font,
+            title_size=title_size,
+            grid_font=grid_font,
+            grid_size=grid_size,
+            station_font=station_font,
+            station_size=station_size,
+            bearing_font=bearing_font,
+            bearing_size=bearing_size,
+            area_font=area_font,
+            area_size=area_size,
+        )
+        return
+
+    if normalized_template == "adamawa_osg":
         _render_plot_map_layout_adamawa(
             db=db,
             plot_id=plot_id,
