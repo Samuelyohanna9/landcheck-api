@@ -9,6 +9,7 @@ import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.patches as mpatches
+import matplotlib.patheffects as pe
 import matplotlib.pyplot as plt
 import matplotlib.tri as mtri
 import numpy as np
@@ -175,12 +176,18 @@ def _draw_contours(ax, contour_points: Optional[List[Dict[str, float]]], display
         step = next((s for ceiling, s in ((2, 0.25), (5, 0.5), (10, 1), (25, 2), (50, 5), (100, 10), (250, 20)) if span <= ceiling), 50)
         levels = np.arange(math.floor(float(np.min(elevations)) / step) * step, float(np.max(elevations)) + step, step)
         if len(levels) >= 2:
-            cs = ax.tricontour(triang, elevations, levels=levels, colors=CONTOUR_COLOR, linewidths=0.5, alpha=0.65, zorder=1)
+            # zorder=3 - deliberately ABOVE the graduated hazard-surface fill (tricontourf, drawn
+            # later at zorder=2 with alpha=0.88), which otherwise paints right over these lines and
+            # washes them out almost to invisibility. Drawing on top instead means the fill's
+            # transparency, not the contour's, is what determines how much shows through.
+            cs = ax.tricontour(triang, elevations, levels=levels, colors=CONTOUR_COLOR, linewidths=0.9, alpha=0.95, zorder=3)
             try:
-                # Elevation labels directly on the lines, like a real topo sheet - only every
-                # other level so a dense contour set doesn't turn into an unreadable smear of text.
-                label_levels = levels[::2] if len(levels) > 4 else levels
-                ax.clabel(cs, levels=label_levels, inline=True, fontsize=5.5, fmt="%d m", colors=CONTOUR_COLOR)
+                # Every level gets a number, like a real topo sheet.
+                labels = ax.clabel(cs, levels=levels, inline=True, fontsize=6.5, fmt="%d m", colors=CONTOUR_COLOR)
+                for txt in labels:
+                    txt.set_zorder(3.5)
+                    txt.set_fontweight("bold")
+                    txt.set_path_effects([pe.withStroke(linewidth=2, foreground="white")])
             except Exception:
                 pass
     except Exception:
