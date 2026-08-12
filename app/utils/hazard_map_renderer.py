@@ -175,7 +175,14 @@ def _draw_contours(ax, contour_points: Optional[List[Dict[str, float]]], display
         step = next((s for ceiling, s in ((2, 0.25), (5, 0.5), (10, 1), (25, 2), (50, 5), (100, 10), (250, 20)) if span <= ceiling), 50)
         levels = np.arange(math.floor(float(np.min(elevations)) / step) * step, float(np.max(elevations)) + step, step)
         if len(levels) >= 2:
-            ax.tricontour(triang, elevations, levels=levels, colors=CONTOUR_COLOR, linewidths=0.5, alpha=0.55, zorder=1)
+            cs = ax.tricontour(triang, elevations, levels=levels, colors=CONTOUR_COLOR, linewidths=0.5, alpha=0.65, zorder=1)
+            try:
+                # Elevation labels directly on the lines, like a real topo sheet - only every
+                # other level so a dense contour set doesn't turn into an unreadable smear of text.
+                label_levels = levels[::2] if len(levels) > 4 else levels
+                ax.clabel(cs, levels=label_levels, inline=True, fontsize=5.5, fmt="%d m", colors=CONTOUR_COLOR)
+            except Exception:
+                pass
     except Exception:
         pass
 
@@ -221,9 +228,80 @@ def _draw_buildings(ax, buildings: List[BaseGeometry], display_epsg: int, threat
         return 0, 0, None
 
 
+def _estimate_snap_threshold_m(points: Optional[List[Dict[str, float]]], value_key: str, display_epsg: int) -> float:
+    """How far (in metres) a hovered point may sit from its nearest sample before the frontend
+    treats it as "no data there" rather than showing a misleadingly confident number - derived
+    from the points' own average spacing instead of a single hardcoded constant, since flood (90m
+    grid), erosion DEM (30m grid), contour points, and a surveyor's own sparse elevation points all
+    have very different densities.
+    """
+    if not points or len(points) < 3:
+        return 150.0
+    try:
+        xs, ys, _ = _points_to_projected_xyz(points, value_key, display_epsg)
+        if len(xs) < 2:
+            return 150.0
+        span_x = float(np.ptp(xs)) or 1.0
+        span_y = float(np.ptp(ys)) or 1.0
+        avg_spacing = math.sqrt((span_x * span_y) / max(len(xs), 1))
+        return float(np.clip(avg_spacing * 1.8, 50.0, 400.0))
+    except Exception:
+        return 150.0
+
+
+# Server-side rendering wants every sample point for a smooth triangulated surface, but shipping
+# all of them to the browser (a whole-town analysis can have 30,000+) turns the JSON response into
+# several megabytes for no real benefit - the hover/click tool only ever needs "close enough". This
+# caps what actually goes over the wire, independent of render quality, and rounds coordinates -
+# full float64 precision (~17 significant digits) is wasted text for a sub-metre-scale lookup.
+MAX_INTERACTIVE_POINTS = 2000
+
+
+def _thin_points_for_interactive(
+    points: Optional[List[Dict[str, float]]], value_key: str, max_points: int = MAX_INTERACTIVE_POINTS,
+) -> List[Dict[str, float]]:
+    if not points:
+        return []
+    stride = max(1, len(points) // max_points)
+    thinned = points[::stride]
+    result = []
+    for p in thinned:
+        value = p.get(value_key)
+        if value is None:
+            continue
+        result.append({"lng": round(float(p["lng"]), 6), "lat": round(float(p["lat"]), 6), value_key: round(float(value), 3)})
+    return result
+
+
+def _buildings_for_interactive(buildings_gdf) -> List[Dict[str, Any]]:
+    """Lightweight {threatened, rings} footprints (WGS84 exterior rings only, no holes) for the
+    frontend's hover/click "identify" tool to do exact point-in-polygon hit testing - much smaller
+    than shipping full GeoJSON geometries, which is all the tooltip needs.
+    """
+    if buildings_gdf is None or len(buildings_gdf) == 0:
+        return []
+    payload = []
+    for _, row in buildings_gdf.iterrows():
+        geom = row.geometry
+        if geom is None or geom.is_empty:
+            continue
+        try:
+            polys = list(geom.geoms) if geom.geom_type == "MultiPolygon" else [geom]
+            rings = [
+                [[round(float(x), 6), round(float(y), 6)] for x, y in poly.exterior.coords]
+                for poly in polys if poly.exterior is not None
+            ]
+            if rings:
+                payload.append({"threatened": bool(row.get("threatened", False)), "rings": rings})
+        except Exception:
+            continue
+    return payload
+
+
 def _finalize_hazard_map(
     fig, ax, legend_handles: List, minx: float, miny: float, maxx: float, maxy: float,
-    display_epsg: int, value_points: Optional[List[Dict[str, float]]], value_key: str, dpi: int = 150,
+    display_epsg: int, value_points: Optional[List[Dict[str, float]]], value_key: str,
+    contour_points: Optional[List[Dict[str, float]]] = None, buildings_gdf=None, dpi: int = 150,
 ) -> Tuple[bytes, Dict[str, Any]]:
     """Places the legend fully outside the axes (anchored to the right of the map) so it can never
     overlap plot content regardless of the boundary's shape or position, then renders to PNG using
@@ -261,22 +339,13 @@ def _finalize_hazard_map(
     west, south = transformer.transform(minx, miny)
     east, north = transformer.transform(maxx, maxy)
 
-    # How far (in metres) a hovered point may sit from its nearest sample before we treat it as
-    # "no data there" rather than showing a misleadingly confident number - derived from the
-    # points' own average spacing instead of a single hardcoded constant, since flood (90m grid),
-    # erosion DEM (30m grid) and a surveyor's own sparse elevation points all have very different
-    # densities.
-    snap_threshold_m = 150.0
-    if value_points and len(value_points) >= 3:
-        try:
-            xs, ys, _ = _points_to_projected_xyz(value_points, value_key, display_epsg)
-            if len(xs) >= 2:
-                span_x = float(np.ptp(xs)) or 1.0
-                span_y = float(np.ptp(ys)) or 1.0
-                avg_spacing = math.sqrt((span_x * span_y) / max(len(xs), 1))
-                snap_threshold_m = float(np.clip(avg_spacing * 1.8, 50.0, 400.0))
-        except Exception:
-            pass
+    # Snap thresholds are derived from the thinned (shipped) point set, not the full render-quality
+    # one, since they need to reflect the density the frontend actually receives.
+    thinned_value_points = _thin_points_for_interactive(value_points, value_key)
+    thinned_contour_points = _thin_points_for_interactive(contour_points, "elevation_m")
+    snap_threshold_m = _estimate_snap_threshold_m(thinned_value_points, value_key, display_epsg)
+    contour_snap_threshold_m = _estimate_snap_threshold_m(thinned_contour_points, "elevation_m", display_epsg)
+    buildings_payload = _buildings_for_interactive(buildings_gdf)
 
     buf = io.BytesIO()
     fig.savefig(buf, format="png", dpi=dpi)
@@ -288,9 +357,12 @@ def _finalize_hazard_map(
         "image_height": fig_height_px,
         "axes_pixel_bbox": axes_pixel_bbox,
         "bounds_wgs84": {"west": west, "south": south, "east": east, "north": north},
-        "value_points": value_points or [],
+        "value_points": thinned_value_points,
         "value_key": value_key,
         "snap_threshold_m": snap_threshold_m,
+        "contour_points": thinned_contour_points,
+        "contour_snap_threshold_m": contour_snap_threshold_m,
+        "buildings": buildings_payload,
     }
     return buf.getvalue(), interactive_meta
 
@@ -445,6 +517,7 @@ def render_flood_hazard_map(
     png_bytes, interactive_meta = _finalize_hazard_map(
         fig, ax, legend_handles, minx, miny, maxx, maxy, display_epsg,
         value_points=final_value_points, value_key=active_value_key,
+        contour_points=contour_points, buildings_gdf=buildings_gdf_wgs84,
     )
 
     return png_bytes, {
@@ -614,6 +687,7 @@ def render_erosion_hazard_map(
     png_bytes, interactive_meta = _finalize_hazard_map(
         fig, ax, legend_handles, minx, miny, maxx, maxy, display_epsg,
         value_points=export_points, value_key=export_value_key,
+        contour_points=contour_points, buildings_gdf=buildings_gdf_wgs84,
     )
 
     return png_bytes, {
