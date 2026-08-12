@@ -45,15 +45,20 @@ def risk_tier_legend() -> list[dict]:
     return legend
 
 
-def fetch_buildings_near(db: Session, boundary_geojson: Dict[str, Any], buffer_m: float = 500, limit: int = 1500) -> List[BaseGeometry]:
+def fetch_buildings_near(db: Session, boundary_geojson: Dict[str, Any], buffer_m: float = 500, limit: int = 4000) -> List[BaseGeometry]:
     """Real OSM building footprint polygons (EPSG:4326) intersecting a metric buffer around a
     hazard boundary - the same `multipolygons` table Survey Plan's Auto Feature Detection already
     reads from (see plots.py's _run_plot_feature_detection), just queried directly against an
     arbitrary boundary instead of a saved plot row.
 
-    The row limit exists so a plot dropped in the middle of a dense city center can't turn a
-    single hazard request into a multi-thousand-polygon query-and-plot that blows past a client
-    timeout - 1500 buildings is already far more than fit legibly on the rendered map anyway.
+    The row limit exists so a plot covering a whole dense town can't turn a single hazard request
+    into an unbounded-size query-and-plot. ORDER BY random() matters as much as the limit itself:
+    without it, Postgres returns whichever rows its index scan happens to visit first, which is
+    NOT spatially representative - for a large area that meant the truncated set could visually
+    look like only one corner of the whole plot had any buildings at all, when in reality they
+    were spread everywhere. Random ordering makes the truncated sample statistically match the
+    real spatial density everywhere, at the cost of a full sort of the matched rows (still fast -
+    the GiST index on geom already does the heavy filtering before this sort ever runs).
     """
     rows = db.execute(
         text(
@@ -68,6 +73,7 @@ def fetch_buildings_near(db: Session, boundary_geojson: Dict[str, Any], buffer_m
                       :buffer_m
                   )::geometry
               )
+            ORDER BY random()
             LIMIT :limit
             """
         ),
