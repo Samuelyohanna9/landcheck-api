@@ -15,7 +15,7 @@ from sqlalchemy.orm import Session
 
 from app.utils.elevation import fetch_dem_elevation_points
 from app.utils.gee_client import init_gee
-from app.utils.hazard_common import classify_risk, fetch_buildings_near
+from app.utils.hazard_common import EROSION_REFERENCES, classify_risk, fetch_buildings_near
 from app.utils.hazard_map_renderer import render_erosion_hazard_map
 
 # Same cloud-mask idiom used for the Green module's NDVI work (green_remote_monitoring.py) -
@@ -244,6 +244,7 @@ def compute_erosion_risk(
         "drainage_score": round(drainage_score, 3),
         "data_available": has_data,
         "slope_source": slope_source,
+        "_references": EROSION_REFERENCES,
     }
 
     risk_class, class_color = classify_risk(risk_value, has_data)

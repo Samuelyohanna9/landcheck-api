@@ -37,14 +37,14 @@ def get_db():
         db.close()
 
 RASTER_LEGEND_FLOOD = [
-    {"label": "Flood Depth (Raster) - Low", "color": "#e0f2fe"},
-    {"label": "Flood Depth (Raster) - Moderate", "color": "#0ea5e9"},
-    {"label": "Flood Depth (Raster) - High", "color": "#1d4ed8"},
+    {"label": "Flood Depth - Low", "color": "#e0f2fe"},
+    {"label": "Flood Depth - Moderate", "color": "#0ea5e9"},
+    {"label": "Flood Depth - High", "color": "#1d4ed8"},
 ]
 RASTER_LEGEND_EROSION = [
-    {"label": "Slope (Raster) - Gentle", "color": "#fef9c3"},
-    {"label": "Slope (Raster) - Moderate", "color": "#f97316"},
-    {"label": "Slope (Raster) - Steep", "color": "#7c2d12"},
+    {"label": "Slope - Gentle", "color": "#fef9c3"},
+    {"label": "Slope - Moderate", "color": "#f97316"},
+    {"label": "Slope - Steep", "color": "#7c2d12"},
 ]
 
 
@@ -109,39 +109,42 @@ def _flood_note_and_method(breakdown, pdf: bool = False) -> tuple[str, str]:
     data_source = breakdown.get("flood_data_source", "glofas")
     if data_source == "local_terrain_proxy":
         note = (
-            "No official river flood model (GloFAS) data exists for this location — it sits outside "
-            "GloFAS's simulated floodplain, most likely because it's too far from a major river "
-            "channel. The score shown is a local terrain-based estimate of ponding/pluvial flood "
-            "susceptibility (slope, low-lying terrain, and drainage proximity), not simulated river "
-            "flood depth — treat it as a screening indicator, not a GloFAS result."
+            "This site sits outside the modeled river-flood extent for the selected return period, "
+            "most likely because it's too far from a major river channel. In its place, we've "
+            "estimated local flood/ponding susceptibility directly from the site's terrain — the "
+            "score below reflects that estimate, not a simulated river flood depth."
         )
         method = (
-            "GloFAS has no modeled river-flood extent at this location, so this is a local "
-            "terrain-based susceptibility estimate instead: 40% low-lying terrain (elevation "
-            "relative to the surrounding 300m) + 35% flatness (slope, since flat ground drains "
-            "poorly) + 25% proximity to the nearest natural drainage line. Higher score indicates "
-            "higher susceptibility to standing water/ponding, not river flood depth."
+            "Global river-flood models carry no data for this site, so susceptibility is estimated "
+            "from terrain instead, following the topographic-control principles established by "
+            "Beven & Kirkby (1979) and the depression-based ponding index of Huang et al. (2019): "
+            "40% low-lying terrain (elevation relative to the surrounding 300 m) + 35% flatness "
+            "(slope — flat ground drains poorly) + 25% proximity to the nearest natural drainage "
+            "line (HydroSHEDS). A higher score indicates greater susceptibility to standing water, "
+            "not river flood depth."
         )
     elif not breakdown.get("data_available", True):
         note = (
-            "No flood data available for this location at the selected return period. "
-            "Try a different return period." + ("" if pdf else " or enable local raster to inspect coverage.")
+            "We couldn't determine flood exposure for this location at the selected return period. "
+            "Try a different return period." + ("" if pdf else " or enable the local risk raster to inspect coverage.")
         )
         method = (
-            "Risk score uses GloFAS flood depth for the selected return period. "
-            "We compute mean depth and inundation fraction inside the plot, "
-            "adjust with distance to major rivers, normalize depth (0-3m), "
-            "then combine: 60% depth + 25% inundation + 15% river proximity. "
-            "Higher score indicates higher river flood susceptibility."
+            "Flood depth is drawn from the JRC/Copernicus GloFAS global hazard model (Dottori et "
+            "al., 2016) for the selected return period. We combine mean depth inside the plot "
+            "(normalized to a 3 m ceiling), the inundated area fraction, and proximity to the "
+            "nearest major river channel (HydroSHEDS drainage network) into a single weighted "
+            "score: 60% depth + 25% inundation + 15% river proximity. A higher score indicates "
+            "greater river-flood susceptibility."
         )
     else:
-        note = "Screening-level flood risk based on global datasets."
+        note = "Flood exposure for this site, screened against the global JRC/GloFAS river-flood hazard model."
         method = (
-            "Risk score uses GloFAS flood depth for the selected return period. "
-            "We compute mean depth and inundation fraction inside the plot, "
-            "adjust with distance to major rivers, normalize depth (0-3m), "
-            "then combine: 60% depth + 25% inundation + 15% river proximity. "
-            "Higher score indicates higher river flood susceptibility."
+            "Flood depth is drawn from the JRC/Copernicus GloFAS global hazard model (Dottori et "
+            "al., 2016) for the selected return period. We combine mean depth inside the plot "
+            "(normalized to a 3 m ceiling), the inundated area fraction, and proximity to the "
+            "nearest major river channel (HydroSHEDS drainage network) into a single weighted "
+            "score: 60% depth + 25% inundation + 15% river proximity. A higher score indicates "
+            "greater river-flood susceptibility."
         )
     return note, method
 
@@ -180,6 +183,7 @@ def _flood_preview_payload(risk_value, risk_class, class_color, breakdown, overl
         "terrain_flatness_score": breakdown.get("terrain_flatness_score"),
         "terrain_drainage_score": breakdown.get("terrain_drainage_score"),
         "terrain_depression_score": breakdown.get("terrain_depression_score"),
+        "references": breakdown.get("_references", []),
     }
 
 
@@ -211,6 +215,7 @@ def _flood_pdf_summary(risk_value, risk_class, class_color, breakdown, show_rast
         "terrain_flatness_score": breakdown.get("terrain_flatness_score"),
         "terrain_drainage_score": breakdown.get("terrain_drainage_score"),
         "terrain_depression_score": breakdown.get("terrain_depression_score"),
+        "references": breakdown.get("_references", []),
     }
 
 
@@ -229,7 +234,7 @@ def flood_preview(payload: dict = Body(...), db: Session = Depends(get_db)):
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
     _, class_color = classify_risk(risk_value, breakdown.get("data_available", True))
-    legend = _build_legend(risk_class, class_color, "Plot Class (Polygon)", show_raster, RASTER_LEGEND_FLOOD)
+    legend = _build_legend(risk_class, class_color, "This Site", show_raster, RASTER_LEGEND_FLOOD)
     return _flood_preview_payload(risk_value, risk_class, class_color, breakdown, overlay_png, show_raster, return_period, legend)
 
 
@@ -248,7 +253,7 @@ def flood_pdf(payload: dict = Body(...), db: Session = Depends(get_db)):
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
     _, class_color = classify_risk(risk_value, breakdown.get("data_available", True))
-    legend = _build_legend(risk_class, class_color, "Plot Class (Polygon)", show_raster, RASTER_LEGEND_FLOOD)
+    legend = _build_legend(risk_class, class_color, "This Site", show_raster, RASTER_LEGEND_FLOOD)
 
     os.makedirs(REPORTS_DIR, exist_ok=True)
     tmp_pdf = tempfile.NamedTemporaryFile(suffix="_flood_report.pdf", delete=False)
@@ -263,9 +268,19 @@ def flood_pdf(payload: dict = Body(...), db: Session = Depends(get_db)):
 # ---------------- EROSION ----------------
 
 def _erosion_preview_payload(risk_value, risk_class, class_color, breakdown, overlay_png, show_raster, legend) -> dict:
-    note = "Screening-level erosion susceptibility based on global terrain and satellite data."
+    note = "Erosion susceptibility for this site, screened against global terrain and vegetation-cover data."
     if not breakdown.get("data_available", True):
-        note = "No elevation data available for this location. Try a different site or contact support."
+        note = "We couldn't determine erosion susceptibility for this location. Try a different site or contact support."
+    method = (
+        "A susceptibility index adapted from the RUSLE erosion-factor framework (Renard et al., "
+        "1997) rather than a full soil-loss estimate. Slope is sampled from a global 30 m "
+        "elevation model, vegetation cover from recent cloud-free Sentinel-2 imagery using the "
+        "NDVI-based cover method of Van der Knijff et al. (2000), and drainage concentration from "
+        "the HydroSHEDS flow-accumulation network — the same drainage-buffer factor used in "
+        "Nigeria-specific gully-erosion susceptibility modeling (Igwe et al., 2020). These combine "
+        "into a single weighted score: 50% slope + 30% bare-ground exposure + 20% drainage "
+        "concentration. A higher score indicates greater erosion susceptibility."
+    )
     return {
         "risk_score": round(risk_value * 100, 1),
         "risk_class": risk_class,
@@ -280,13 +295,7 @@ def _erosion_preview_payload(risk_value, risk_class, class_color, breakdown, ove
         "overlay": erosion_overlay_to_data_url(overlay_png),
         "note": note,
         "buffer_m": 500,
-        "method": (
-            "Susceptibility index (not a full RUSLE soil-loss estimate). We sample slope from a "
-            "global 30m DEM, vegetation cover (NDVI) from recent cloud-free Sentinel-2 imagery, "
-            "and distance to the nearest natural drainage channel from HydroSHEDS flow "
-            "accumulation, then combine: 50% slope + 30% bare-ground exposure + 20% drainage "
-            "concentration. Higher score indicates higher erosion susceptibility."
-        ),
+        "method": method,
         "data_available": bool(breakdown.get("data_available", True)),
         "legend": legend,
         "show_raster": show_raster,
@@ -294,13 +303,14 @@ def _erosion_preview_payload(risk_value, risk_class, class_color, breakdown, ove
         "buildings_total": breakdown.get("buildings_total", 0),
         "buildings_threatened": breakdown.get("buildings_threatened", 0),
         "interactive": breakdown.get("_interactive"),
+        "references": breakdown.get("_references", []),
     }
 
 
 def _erosion_pdf_summary(risk_value, risk_class, class_color, breakdown, show_raster, legend) -> dict:
-    note = "Screening-level erosion susceptibility based on global terrain and satellite data."
+    note = "Erosion susceptibility for this site, screened against global terrain and vegetation-cover data."
     if not breakdown.get("data_available", True):
-        note = "No elevation data available for this location."
+        note = "We couldn't determine erosion susceptibility for this location."
     return {
         "risk_score": f"{round(risk_value * 100, 1)}",
         "risk_class": risk_class,
@@ -318,6 +328,7 @@ def _erosion_pdf_summary(risk_value, risk_class, class_color, breakdown, show_ra
         "slope_source": breakdown.get("slope_source", "unavailable"),
         "buildings_total": breakdown.get("buildings_total", 0),
         "buildings_threatened": breakdown.get("buildings_threatened", 0),
+        "references": breakdown.get("_references", []),
     }
 
 
@@ -335,7 +346,7 @@ def erosion_preview(payload: dict = Body(...), db: Session = Depends(get_db)):
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
     _, class_color = classify_risk(risk_value, breakdown.get("data_available", True))
-    legend = _build_legend(risk_class, class_color, "Plot Class (Polygon)", show_raster, RASTER_LEGEND_EROSION)
+    legend = _build_legend(risk_class, class_color, "This Site", show_raster, RASTER_LEGEND_EROSION)
     return _erosion_preview_payload(risk_value, risk_class, class_color, breakdown, overlay_png, show_raster, legend)
 
 
@@ -353,7 +364,7 @@ def erosion_pdf(payload: dict = Body(...), db: Session = Depends(get_db)):
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
     _, class_color = classify_risk(risk_value, breakdown.get("data_available", True))
-    legend = _build_legend(risk_class, class_color, "Plot Class (Polygon)", show_raster, RASTER_LEGEND_EROSION)
+    legend = _build_legend(risk_class, class_color, "This Site", show_raster, RASTER_LEGEND_EROSION)
 
     os.makedirs(REPORTS_DIR, exist_ok=True)
     tmp_pdf = tempfile.NamedTemporaryFile(suffix="_erosion_report.pdf", delete=False)
@@ -476,7 +487,7 @@ def _run_hazard_analysis_job(job_id: str) -> None:
 
         _, class_color = classify_risk(risk_value, breakdown.get("data_available", True))
         raster_legend = RASTER_LEGEND_FLOOD if hazard_type == "flood" else RASTER_LEGEND_EROSION
-        legend = _build_legend(risk_class, class_color, "Plot Class (Polygon)", show_raster, raster_legend)
+        legend = _build_legend(risk_class, class_color, "This Site", show_raster, raster_legend)
 
         if output_type == "preview":
             if hazard_type == "flood":

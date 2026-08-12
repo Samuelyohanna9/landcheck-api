@@ -11,8 +11,8 @@ from reportlab.pdfbase.pdfmetrics import stringWidth
 
 from app.utils.green_pdf import _draw_rounded_box, _draw_stat_card, _draw_bar_chart
 
-BRAND_BAR_COLOR = "#0b1120"
-BRAND_ACCENT = "#38bdf8"
+BRAND_BAR_COLOR = "#050b24"
+BRAND_ACCENT = "#fb923c"
 
 
 def _draw_wrapped(c: canvas.Canvas, text: str, x: float, y: float, max_width: float, line_height: float) -> float:
@@ -93,6 +93,7 @@ def _render_hazard_report_pdf(
     note: str = "",
     insight: str = "",
     map_has_own_legend: bool = False,
+    references: List[Dict[str, str]] = None,
 ) -> None:
     c = canvas.Canvas(output_path, pagesize=A4)
     width, height = A4
@@ -113,8 +114,8 @@ def _render_hazard_report_pdf(
 
     if insight:
         insight_box_y = content_bottom - 4
-        _draw_rounded_box(c, 200, insight_box_y - 18, width - 236, 22, 5, fill_color=HexColor("#eff6ff"), stroke_color=HexColor("#bfdbfe"))
-        c.setFillColor(HexColor("#1d4ed8"))
+        _draw_rounded_box(c, 200, insight_box_y - 18, width - 236, 22, 5, fill_color=HexColor("#fff7ed"), stroke_color=HexColor("#fdba74"))
+        c.setFillColor(HexColor("#c2410c"))
         c.setFont("Helvetica-Bold", 7.8)
         _draw_wrapped(c, insight, 208, insight_box_y - 6, width - 252, 9)
         content_bottom = insight_box_y - 22
@@ -209,15 +210,23 @@ def _render_hazard_report_pdf(
     for line in method.split("\n"):
         method_y = _draw_wrapped(c, line, method_x, method_y, 154, 9)
 
-    # Footer.
+    # Footer - footnotes, then a compact one-line "References" citation strip so the methodology
+    # is independently verifiable, not just asserted.
     footer_y = 46
     c.setStrokeColor(HexColor("#e5e7eb"))
     c.setLineWidth(0.5)
     c.line(36, footer_y + 12, width - 36, footer_y + 12)
     c.setFont("Helvetica", 7.5)
     c.setFillColor(HexColor("#6b7280"))
-    for i, line in enumerate(footnotes):
-        c.drawString(36, footer_y - (i * 10), line)
+    line_i = 0
+    for line in footnotes:
+        c.drawString(36, footer_y - (line_i * 10), line)
+        line_i += 1
+    if references:
+        short_names = [ref.get("short") for ref in references if ref.get("short")]
+        if short_names:
+            c.setFont("Helvetica-Oblique", 7.5)
+            c.drawString(36, footer_y - (line_i * 10), f"References: {', '.join(short_names)}.")
     c.setFont("Helvetica-Bold", 8)
     c.setFillColor(HexColor("#111827"))
     c.drawRightString(width - 36, footer_y, "LandCheck")
@@ -273,11 +282,11 @@ def render_flood_report_pdf(output_path: str, overlay_png: bytes, summary: Dict[
             ("Drainage prox.", float(summary.get("terrain_drainage_score", 0) or 0), "#fbbf24"),
         ]
         method = (
-            "GloFAS has no modeled river-flood extent at this location, so this is a local "
-            "terrain-based susceptibility estimate instead - NOT official GloFAS river flood "
-            "modeling. Buildings are real OpenStreetMap footprints, flagged where the local "
-            "susceptibility surface exceeds 60%.\n"
-            "Score = 40% low-lying terrain (elevation relative to the surrounding 300m) "
+            "GloFAS carries no modeled river-flood extent at this location, so susceptibility is "
+            "estimated from terrain instead - not official GloFAS river-flood modeling. Buildings "
+            "are real OpenStreetMap footprints, flagged where the local susceptibility surface "
+            "exceeds 60%.\n"
+            "Score = 40% low-lying terrain (elevation relative to the surrounding 300 m) "
             "+ 35% flatness (slope) + 25% proximity to the nearest natural drainage line."
         )
     else:
@@ -293,10 +302,11 @@ def render_flood_report_pdf(output_path: str, overlay_png: bytes, summary: Dict[
             ("River prox.", float(summary.get("river_proximity_score", 0) or 0), "#38bdf8"),
         ]
         method = (
-            "Flood depth is sampled from the JRC/CEMS GloFAS global hazard model at the chosen "
-            "return period, inside a 1km buffer around the plot. Buildings are real OpenStreetMap "
-            "footprints, flagged as threatened where the interpolated depth surface exceeds 5cm.\n"
-            "Score = 60% mean depth (normalized to 3m) + 25% inundated area fraction "
+            "Flood depth is sampled from the JRC/Copernicus GloFAS global hazard model at the "
+            "chosen return period, inside a 1 km buffer around the plot. Buildings are real "
+            "OpenStreetMap footprints, flagged as threatened where the interpolated depth surface "
+            "exceeds 5 cm.\n"
+            "Score = 60% mean depth (normalized to 3 m) + 25% inundated area fraction "
             "+ 15% proximity to a major river channel."
         )
 
@@ -313,13 +323,14 @@ def render_flood_report_pdf(output_path: str, overlay_png: bytes, summary: Dict[
         component_bars=component_bars,
         method=method,
         footnotes=[
-            f"Return period: {return_period} years - analysis buffer: {summary.get('buffer_m', '1000')} m around plot.",
-            "Source: JRC/CEMS GloFAS Flood Hazard v2.1, WWF HydroSHEDS, OpenStreetMap. For screening only, not a legal flood determination.",
+            f"Return period: {return_period} years  |  analysis buffer: {summary.get('buffer_m', '1000')} m around the plot.",
+            "Screening-level assessment only - not a legal flood determination or substitute for a licensed hydrological survey.",
         ],
         legend=summary.get("legend") or [],
         note=str(summary.get("note", "")),
         insight=insight,
         map_has_own_legend=True,
+        references=summary.get("references") or [],
     )
 
 
@@ -332,9 +343,9 @@ def render_erosion_report_pdf(output_path: str, overlay_png: bytes, summary: Dic
 
     insight = ""
     if slope_source == "local_survey":
-        insight = "Slope is computed directly from your uploaded survey points, not the global 30m elevation model - a more accurate local measurement."
+        insight = "Slope is computed directly from your uploaded survey points, not the global 30 m elevation model - a more accurate local measurement."
     elif slope_source == "global_dem":
-        insight = "Slope is estimated from a global 30m elevation model. Upload your own surveyed elevation points for a more precise local measurement."
+        insight = "Slope is estimated from a global 30 m elevation model. Upload your own surveyed elevation points for a more precise local measurement."
 
     headline = f"{risk_class} erosion susceptibility for this site"
     if buildings_total > 0:
@@ -350,8 +361,8 @@ def render_erosion_report_pdf(output_path: str, overlay_png: bytes, summary: Dic
         class_color=class_color,
         headline=headline,
         stat_cards=[
-            ("Mean Slope (deg)", str(summary.get("mean_slope_deg", "-"))),
-            ("Max Slope (deg)", str(summary.get("max_slope_deg", "-"))),
+            ("Mean Slope (°)", str(summary.get("mean_slope_deg", "-"))),
+            ("Max Slope (°)", str(summary.get("max_slope_deg", "-"))),
             ("Vegetation (NDVI)", str(summary.get("mean_ndvi", "-"))),
             ("Buildings At Risk", f"{buildings_threatened} / {buildings_total}" if buildings_total else "-"),
         ],
@@ -361,18 +372,20 @@ def render_erosion_report_pdf(output_path: str, overlay_png: bytes, summary: Dic
             ("Drainage conc.", float(summary.get("drainage_score", 0) or 0), "#dc2626"),
         ],
         method=(
-            "A susceptibility index (not a full RUSLE soil-loss estimate): slope is sampled from "
-            "a global 30m DEM, vegetation cover from a recent cloud-free Sentinel-2 NDVI "
-            "composite, and drainage concentration from HydroSHEDS flow accumulation.\n"
-            "Score = 50% slope (normalized to 25deg) + 30% bare-ground exposure (low NDVI) "
+            "A susceptibility index adapted from the RUSLE erosion-factor framework, not a full "
+            "soil-loss estimate: slope is sampled from a global 30 m DEM, vegetation cover from a "
+            "recent cloud-free Sentinel-2 NDVI composite, and drainage concentration from the "
+            "HydroSHEDS flow-accumulation network.\n"
+            "Score = 50% slope (normalized to 25°) + 30% bare-ground exposure (low NDVI) "
             "+ 20% proximity to a natural drainage channel."
         ),
         footnotes=[
-            "Analysis buffer: 500 m around plot. Vegetation sampled from imagery in the last 180 days.",
-            "Source: Copernicus DEM GLO-30, Sentinel-2 SR, WWF HydroSHEDS. Screening level only, not a geotechnical survey.",
+            "Analysis buffer: 500 m around the plot  |  vegetation sampled from imagery in the last 180 days.",
+            "Screening-level assessment only - not a substitute for a licensed geotechnical survey.",
         ],
         legend=summary.get("legend") or [],
         note=str(summary.get("note", "")),
         insight=insight,
         map_has_own_legend=True,
+        references=summary.get("references") or [],
     )

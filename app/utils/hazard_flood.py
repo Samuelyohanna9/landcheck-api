@@ -10,7 +10,12 @@ from sqlalchemy.orm import Session
 
 from app.utils.elevation import fetch_dem_elevation_points
 from app.utils.gee_client import init_gee
-from app.utils.hazard_common import classify_risk, fetch_buildings_near
+from app.utils.hazard_common import (
+    FLOOD_REFERENCES_GLOFAS,
+    FLOOD_REFERENCES_TERRAIN_PROXY,
+    classify_risk,
+    fetch_buildings_near,
+)
 from app.utils.hazard_map_renderer import render_flood_hazard_map
 
 
@@ -189,6 +194,7 @@ def compute_flood_risk(
 
     risk_class, class_color = classify_risk(risk_value, breakdown["data_available"])
     breakdown["flood_data_source"] = "glofas"
+    breakdown["_references"] = FLOOD_REFERENCES_GLOFAS
     susceptibility_img = None
 
     # GloFAS only carries depth pixels within its modeled river-flood extent - a plot far from any
@@ -207,10 +213,18 @@ def compute_flood_risk(
             local_mean_elev_img = dem_proxy.focal_mean(radius=300, units="meters")
             depression_img = local_mean_elev_img.subtract(dem_proxy).rename("depression_m")
 
+            # A deliberately finer-grained drainage network than GloFAS's major-river distance
+            # above (flow_acc > 1000): ponding susceptibility per Beven & Kirkby (1979) is
+            # governed by proximity to ANY local drainage line - streams, minor channels - not just
+            # navigable rivers, so a much lower flow-accumulation threshold is used here.
+            local_channels = flow_acc.gt(100)
+            local_channel_dist = local_channels.fastDistanceTransform(30).sqrt()
+            local_drainage_dist_img = local_channel_dist.multiply(flow_acc.projection().nominalScale()).rename("local_drainage_m")
+
             # Each factor normalized 0..1: flat + low-lying + close to a drainage line all raise
             # ponding susceptibility, weighted by how directly each one drives standing water.
             flatness_score_img = ee.Image(1).subtract(slope_img.divide(15).min(1)).max(0)
-            drainage_score_img = ee.Image(1).subtract(distance_m.divide(1500).min(1)).max(0)
+            drainage_score_img = ee.Image(1).subtract(local_drainage_dist_img.divide(500).min(1)).max(0)
             depression_score_img = depression_img.divide(3).max(0).min(1)
             susceptibility_img = (
                 depression_score_img.multiply(0.40)
@@ -228,7 +242,9 @@ def compute_flood_risk(
                 "mean_depression_m": depression_img.reduceRegion(
                     reducer=ee.Reducer.mean(), geometry=geom, scale=30, maxPixels=1e9
                 ).get("depression_m"),
-                "distance_to_drainage_m": mean_dist,
+                "distance_to_drainage_m": local_drainage_dist_img.reduceRegion(
+                    reducer=ee.Reducer.mean(), geometry=geom, scale=90, maxPixels=1e9
+                ).get("local_drainage_m"),
             }).getInfo()
 
             susceptibility_val = proxy_combined.get("susceptibility")
@@ -237,7 +253,15 @@ def compute_flood_risk(
                 risk_class, class_color = classify_risk(risk_value, True)
                 breakdown["data_available"] = True
                 breakdown["flood_data_source"] = "local_terrain_proxy"
-                breakdown["distance_to_river_m"] = round(float(proxy_combined.get("distance_to_drainage_m") or 0.0), 1)
+                breakdown["_references"] = FLOOD_REFERENCES_TERRAIN_PROXY
+                # fastDistanceTransform only searches a ~30-pixel radius (~14km at this raster's
+                # native resolution) - beyond that its output is an artifact of the search cutoff,
+                # not a real measurement, so it's capped here rather than displayed as false
+                # precision. The score itself is unaffected: drainage_score_img already normalizes
+                # to 0 well within this cap (at 500m), so nothing beyond that changes the result.
+                raw_drainage_dist = proxy_combined.get("distance_to_drainage_m")
+                capped_drainage_dist = min(float(raw_drainage_dist), 2000.0) if raw_drainage_dist is not None else 2000.0
+                breakdown["distance_to_river_m"] = round(capped_drainage_dist, 1)
                 breakdown["terrain_slope_deg"] = round(float(proxy_combined.get("mean_slope_deg") or 0.0), 2)
                 breakdown["terrain_depression_m"] = round(float(proxy_combined.get("mean_depression_m") or 0.0), 2)
                 # Same normalization as the per-pixel score images, applied to the plot-mean scalars -

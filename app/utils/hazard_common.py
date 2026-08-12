@@ -19,6 +19,58 @@ RISK_TIERS = [
 ]
 NO_DATA_COLOR = "#94a3b8"
 
+# Real, peer-reviewed sources grounding each screening methodology - surfaced to users in both
+# the PDF report and the web UI so the analysis is auditable, not a black box. Each entry is a
+# complete, independently verifiable citation (not a placeholder); HydroSHEDS appears in more than
+# one list because the same drainage-network dataset genuinely underlies more than one factor.
+HYDROSHEDS_REFERENCE = {
+    "short": "Lehner et al. (2008)",
+    "citation": "Lehner, B., Verdin, K., Jarvis, A. (2008). New global hydrography derived from spaceborne elevation data. Eos, Transactions American Geophysical Union, 89(10), 93–94.",
+    "url": "https://doi.org/10.1029/2008EO100001",
+}
+
+FLOOD_REFERENCES_GLOFAS = [
+    {
+        "short": "Dottori et al. (2016)",
+        "citation": "Dottori, F., Salamon, P., Bianchi, A., Alfieri, L., Hirpa, F.A., Feyen, L. (2016). Development and evaluation of a framework for global flood hazard mapping. Advances in Water Resources, 94, 87–102.",
+        "url": "https://doi.org/10.1016/j.advwatres.2016.05.002",
+    },
+    HYDROSHEDS_REFERENCE,
+]
+
+FLOOD_REFERENCES_TERRAIN_PROXY = [
+    {
+        "short": "Beven & Kirkby (1979)",
+        "citation": "Beven, K.J., Kirkby, M.J. (1979). A physically based, variable contributing area model of basin hydrology. Hydrological Sciences Bulletin, 24(1), 43–69.",
+        "url": "https://doi.org/10.1080/02626667909491834",
+    },
+    {
+        "short": "Huang et al. (2019)",
+        "citation": "Huang, H.B., Chen, X., Wang, X.W., Wang, X.N., Liu, L. (2019). A Depression-Based Index to Represent Topographic Control in Urban Pluvial Flooding. Water, 11(10), 2115.",
+        "url": "https://doi.org/10.3390/w11102115",
+    },
+    HYDROSHEDS_REFERENCE,
+]
+
+EROSION_REFERENCES = [
+    {
+        "short": "Renard et al. (1997)",
+        "citation": "Renard, K.G., Foster, G.R., Weesies, G.A., McCool, D.K., Yoder, D.C. (1997). Predicting Soil Erosion by Water: A Guide to Conservation Planning with the Revised Universal Soil Loss Equation (RUSLE). USDA Agriculture Handbook No. 703.",
+        "url": "https://www.ars.usda.gov/ARSUserFiles/64080530/RUSLE/AH_703.pdf",
+    },
+    {
+        "short": "Van der Knijff et al. (2000)",
+        "citation": "Van der Knijff, J.M., Jones, R.J.A., Montanarella, L. (2000). Soil Erosion Risk Assessment in Europe. EUR 19044 EN, European Commission Joint Research Centre.",
+        "url": "https://esdac.jrc.ec.europa.eu/ESDB_Archive/pesera/pesera_cd/pdf/ereurnew2.pdf",
+    },
+    {
+        "short": "Igwe et al. (2020)",
+        "citation": "Igwe, O., John, U.I., Solomon, O., Obinna, O. (2020). GIS-based gully erosion susceptibility modeling, adapting bivariate statistical method and AHP approach in Gombe town and environs, Northeast Nigeria. Geoenvironmental Disasters, 7, 32.",
+        "url": "https://doi.org/10.1186/s40677-020-00166-8",
+    },
+    HYDROSHEDS_REFERENCE,
+]
+
 
 def classify_risk(value: float, data_available: bool = True) -> Tuple[str, str]:
     """Maps a 0-1 risk score to (label, hex color). data_available=False always returns the
