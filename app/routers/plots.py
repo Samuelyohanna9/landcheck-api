@@ -4857,6 +4857,23 @@ def get_plot_features_geojson(
             continue
         roads.append((geom, to_feature(r.geojson, {"source": "detected", "name": r.name})))
 
+    # The live `lines` query above depends on a plot_buffers row existing for this plot (created
+    # by _run_plot_feature_detection). Some plots never got one - e.g. older plots, or subdivision
+    # child lots that inherit detected_features straight from the parent without re-running full
+    # detection - so it can come back empty even though this plot's roads were captured into
+    # detected_features at creation time (which is exactly what the survey plan preview/render
+    # falls back to in preview mode). Without this fallback the CAD editor would show no roads at
+    # all for such a plot while the preview still does.
+    if not roads:
+        for r in feature_rows:
+            if r.feature_type != "road" or not r.geojson:
+                continue
+            try:
+                geom = shape(json.loads(r.geojson))
+            except Exception:
+                continue
+            roads.append((geom, to_feature(r.geojson, {"source": "detected", "name": None})))
+
     overrides: list[dict[str, Any]] = []
     for r in override_rows:
         if not r.geojson:

@@ -1653,6 +1653,21 @@ def _fetch_live_road_geoms(db, plot_id: int) -> list:
             geoms.append(wkb.loads(row.geom))
         except Exception:
             continue
+
+    # This depends on a plot_buffers row existing for the plot (written by
+    # _run_plot_feature_detection). Some plots never got one - older plots, or subdivision child
+    # lots that inherit detected_features straight from the parent without re-running full
+    # detection - so fall back to whatever was captured into detected_features at creation time
+    # rather than silently rendering with no roads at all.
+    if not geoms:
+        fallback_rows = db.execute(text("""
+            SELECT geom FROM detected_features WHERE plot_id = :plot_id AND feature_type = 'road'
+        """), {"plot_id": plot_id}).fetchall()
+        for row in fallback_rows:
+            try:
+                geoms.append(wkb.loads(row.geom))
+            except Exception:
+                continue
     return geoms
 
 
