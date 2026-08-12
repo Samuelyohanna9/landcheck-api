@@ -3809,12 +3809,21 @@ def render_plot_map_layout(
             WHERE ST_Intersects(roads.geom, b.geom)
         """), {"plot_id": plot_id}).fetchall()
 
-        road_delete_geoms = [ov["geom"] for ov in overrides if ov["feature_type"] == "road" and ov["action"] == "delete" and ov["geom"] is not None]
+        # A road covered by an "update" override must be skipped here too, not just "delete" -
+        # otherwise the override's replacement geometry gets drawn ON TOP OF the original
+        # live-queried segment instead of replacing it, and the two overlapping-but-not-identical
+        # buffered outlines union into a visibly thicker/blobbier road than the selected width
+        # (this is what made a road look oversized right after naming it from the Road Names
+        # panel, since naming saves an "update" override with the same road's geometry).
+        road_replaced_geoms = [
+            ov["geom"] for ov in overrides
+            if ov["feature_type"] == "road" and ov["action"] in ("delete", "update") and ov["geom"] is not None
+        ]
         for row in road_rows:
             geom = wkb.loads(row.geom)
             highway = row.highway
             name = row.name
-            if road_delete_geoms and any(geom.intersects(dg) for dg in road_delete_geoms):
+            if road_replaced_geoms and any(geom.intersects(dg) for dg in road_replaced_geoms):
                 continue
             try:
                 gdf_line = gpd.GeoSeries([geom], crs="EPSG:4326").to_crs(epsg=display_epsg)
