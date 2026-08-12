@@ -29,6 +29,13 @@ BOUNDARY_COLOR = "#0f172a"
 CONTOUR_COLOR = "#78350f"
 LAND_COLOR = "#f4f1e6"
 
+# A deliberately neutral (not alarming, not "empty-looking") wash used when the underlying hazard
+# raster has no data for this plot - e.g. GloFAS only carries depth pixels within its modeled
+# flood extent, so a site far from any river legitimately has none. This reads as "we checked and
+# there's nothing here" rather than a blank/broken map.
+NO_DATA_WASH_COLOR = "#e6ebf1"
+NO_DATA_WASH_EDGE_COLOR = "#cbd5e1"
+
 # Slope steepness bands - a green-to-red earth-tone ramp is the standard cartographic convention
 # for terrain/erosion hazard (vs. flood's blue), so the two hazard types read as visually distinct
 # products at a glance even before a viewer reads either legend.
@@ -261,6 +268,12 @@ def render_flood_hazard_map(
         except Exception:
             depth_available = False
 
+    if not depth_available:
+        ax.add_patch(mpatches.Rectangle(
+            (minx, miny), maxx - minx, maxy - miny,
+            facecolor=NO_DATA_WASH_COLOR, edgecolor="none", zorder=0.5,
+        ))
+
     # Buildings - the headline upgrade: real footprints, colored by whether they actually sit in
     # the flood zone, rather than an abstract polygon-level score.
     def _flood_threatened(cx, cy):
@@ -295,6 +308,11 @@ def render_flood_hazard_map(
                 hi = drawn_band_labels[i + 1] if not is_last else lo + 0.5
                 label = f"{lo:.1f} - {hi:.1f} m"
             legend_handles.append(mpatches.Patch(facecolor=drawn_band_colors[i], edgecolor="none", label=label))
+    if not depth_available:
+        legend_handles.append(mpatches.Patch(
+            facecolor=NO_DATA_WASH_COLOR, edgecolor=NO_DATA_WASH_EDGE_COLOR,
+            label=f"Outside modeled floodplain (RP{return_period})",
+        ))
     if buildings_total:
         legend_handles.append(mpatches.Patch(facecolor=BUILDING_THREATENED_COLOR, edgecolor="#7f1d1d", label="Threatened building"))
         legend_handles.append(mpatches.Patch(facecolor=BUILDING_SAFE_COLOR, edgecolor="#4b5563", label="Other building"))
@@ -308,8 +326,11 @@ def render_flood_hazard_map(
 
     if not depth_available:
         ax.text(
-            0.5, 0.5, "No flood depth data available for this location\nShowing plot boundary and buildings only",
-            transform=ax.transAxes, ha="center", va="center", fontsize=10, color="#6b7280",
+            0.98, 0.02,
+            f"No river flood extent modeled here for RP{return_period}\n(too far from the nearest major river channel)",
+            transform=ax.transAxes, ha="right", va="bottom", fontsize=7.5, color="#475569",
+            bbox=dict(boxstyle="round,pad=0.45", facecolor="white", edgecolor="#d1d5db", alpha=0.92),
+            zorder=15,
         )
 
     buf = io.BytesIO()
@@ -411,6 +432,12 @@ def render_erosion_hazard_map(
         except Exception:
             slope_available = False
 
+    if not slope_available:
+        ax.add_patch(mpatches.Rectangle(
+            (minx, miny), maxx - minx, maxy - miny,
+            facecolor=NO_DATA_WASH_COLOR, edgecolor="none", zorder=0.5,
+        ))
+
     def _erosion_threatened(cx, cy):
         n = len(cx)
         if not slope_available:
@@ -448,6 +475,10 @@ def render_erosion_hazard_map(
             hi = band_edges[idx + 1] if idx + 1 < len(band_edges) else None
             label = f"{lo:.0f} - {hi:.0f}°" if hi is not None else f"> {lo:.0f}°"
             legend_handles.append(mpatches.Patch(facecolor=SLOPE_COLORS[idx], edgecolor="none", label=label))
+    if not slope_available:
+        legend_handles.append(mpatches.Patch(
+            facecolor=NO_DATA_WASH_COLOR, edgecolor=NO_DATA_WASH_EDGE_COLOR, label="No elevation data available",
+        ))
     if buildings_total:
         legend_handles.append(mpatches.Patch(facecolor=BUILDING_THREATENED_COLOR, edgecolor="#7f1d1d", label=f"On slope > {BUILDING_SLOPE_THREATENED_DEG:.0f}°"))
         legend_handles.append(mpatches.Patch(facecolor=BUILDING_SAFE_COLOR, edgecolor="#4b5563", label="Other building"))
@@ -461,8 +492,10 @@ def render_erosion_hazard_map(
 
     if not slope_available:
         ax.text(
-            0.5, 0.5, "No slope data available for this location\nShowing plot boundary and buildings only",
-            transform=ax.transAxes, ha="center", va="center", fontsize=10, color="#6b7280",
+            0.98, 0.02, "No elevation data available for this location\nShowing plot boundary and buildings only",
+            transform=ax.transAxes, ha="right", va="bottom", fontsize=7.5, color="#475569",
+            bbox=dict(boxstyle="round,pad=0.45", facecolor="white", edgecolor="#d1d5db", alpha=0.92),
+            zorder=15,
         )
 
     if slope_available and slope_from_local:
