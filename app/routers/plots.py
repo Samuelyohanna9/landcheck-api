@@ -4891,8 +4891,26 @@ def get_plot_features_geojson(
             "geojson": r.geojson,
         })
 
+    def _line_replaced_by(geom, override_geom, tol_deg: float = 0.00001) -> bool:
+        # A plain intersects() can't tell "this is the segment the override replaces" apart from
+        # "this is a different road/river that merely touches it at a junction" - two distinct
+        # roads meeting at a junction legitimately intersect at that single point. This checks how
+        # much of `geom`'s own length lies within a small buffer of the override instead: a
+        # segment actually being replaced is covered almost along its whole length, while a
+        # merely-crossing/touching one only has a single point (~0 length) inside the buffer.
+        # Without this, naming one road (an "update" override) could make an unrelated road it
+        # happens to join vanish from the CAD editor entirely.
+        try:
+            total_len = max(getattr(geom, "length", 0.0), 1e-9)
+            uncovered = geom.difference(override_geom.buffer(tol_deg))
+            uncovered_len = getattr(uncovered, "length", 0.0)
+            return uncovered_len < total_len * 0.1
+        except Exception:
+            return geom.intersects(override_geom)
+
     def apply_overrides(base_pairs: list[tuple[Any, dict]], feature_type: str) -> list[tuple[Any, dict]]:
         result = list(base_pairs)
+        use_line_test = feature_type in ("road", "river")
         for ov in overrides:
             if ov["feature_type"] != feature_type:
                 continue
@@ -4903,7 +4921,10 @@ def get_plot_features_geojson(
             except Exception:
                 pass
             if ov["action"] in ("delete", "update"):
-                result = [(g, f) for (g, f) in result if not g.intersects(geom)]
+                if use_line_test:
+                    result = [(g, f) for (g, f) in result if not _line_replaced_by(g, geom)]
+                else:
+                    result = [(g, f) for (g, f) in result if not g.intersects(geom)]
             if ov["action"] in ("add", "update"):
                 feat = to_feature(ov["geojson"], {"source": "override", "name": ov["name"], "width_m": ov["width_m"]})
                 result.append((geom, feat))
