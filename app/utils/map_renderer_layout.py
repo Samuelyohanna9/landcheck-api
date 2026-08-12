@@ -879,9 +879,27 @@ def draw_grid(
     full_grid: bool = False,
     edge_ticks: bool = True,
     color: str = "blue",
+    coord_grid: bool = False,
 ):
     xmin, xmax = ax.get_xlim()
     ymin, ymax = ax.get_ylim()
+
+    # Reference grid lines at round Easting/Northing values (the cadastral template's convention)
+    # - however many major-interval lines actually fall within the printed extent, typically just
+    # a handful for a single-parcel plot, rather than a dense mesh.
+    if coord_grid:
+        coord_xs = np.arange(math.floor(xmin / major) * major, xmax + 0.1, major)
+        coord_ys = np.arange(math.floor(ymin / major) * major, ymax + 0.1, major)
+        for x in coord_xs:
+            if xmin <= x <= xmax:
+                ax.add_line(mlines.Line2D(
+                    [x, x], [ymin, ymax], color=color, lw=0.5 * font_scale, alpha=0.55, zorder=1,
+                ))
+        for y in coord_ys:
+            if ymin <= y <= ymax:
+                ax.add_line(mlines.Line2D(
+                    [xmin, xmax], [y, y], color=color, lw=0.5 * font_scale, alpha=0.55, zorder=1,
+                ))
 
     # Optional interior grid lines (used by Adamawa template).
     if full_grid:
@@ -3366,7 +3384,7 @@ def _render_plot_map_layout_cadastral(
     ax.set_ylim(target_ylim)
 
     major = nice_grid_step(max(ax.get_xlim()[1] - ax.get_xlim()[0], ax.get_ylim()[1] - ax.get_ylim()[0]))
-    draw_grid(ax, poly, major / 5.0, major, font_scale, full_grid=False, edge_ticks=False, color=grid_color)
+    draw_grid(ax, poly, major / 5.0, major, font_scale, full_grid=False, edge_ticks=False, color=grid_color, coord_grid=True)
 
     annotate_vertices(
         ax,
@@ -3395,10 +3413,12 @@ def _render_plot_map_layout_cadastral(
     normalized_arrow_style = str(north_arrow_style or "").strip().lower()
     un_marker_anchor_x = None
     if normalized_arrow_style in ("un_marker", "un", "un_grid", "u_n", "grid_marker"):
-        box = ax.get_position()
+        # No clamping here - the drop-line below (_draw_cadastral_coordinate_labels) uses this
+        # same vertex's raw x in data space, unclamped. Clamping only the icon's anchor here
+        # would shift it sideways relative to that line whenever the vertex sits near the map's
+        # edge, breaking the stem into two misaligned segments.
         disp_x = ax.transData.transform((first_coords[0], 0))[0]
-        fig_x = float(fig.transFigure.inverted().transform((disp_x, 0))[0])
-        un_marker_anchor_x = min(max(fig_x, float(box.x0) + 0.02), float(box.x1) - 0.02)
+        un_marker_anchor_x = float(fig.transFigure.inverted().transform((disp_x, 0))[0])
     add_north_arrow(
         ax, font_scale=font_scale, style=north_arrow_style, color=north_arrow_color,
         blue_hex=grid_color, anchor_x=un_marker_anchor_x,
