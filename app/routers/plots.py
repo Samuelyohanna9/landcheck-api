@@ -4764,7 +4764,13 @@ def get_plot_features(plot_id: int, db: Session = Depends(get_db)):
 
 
 @router.get("/{plot_id}/features/geojson")
-def get_plot_features_geojson(plot_id: int, db: Session = Depends(get_db)):
+def get_plot_features_geojson(
+    plot_id: int,
+    db: Session = Depends(get_db),
+    scale_text: str | None = Query(default=None),
+    paper_size: str | None = Query(default=None),
+    template_name: str | None = Query(default=None),
+):
     # Buildings and rivers from detected_features
     feature_rows = db.execute(text("""
         SELECT feature_type, ST_AsGeoJSON(geom) AS geojson
@@ -4890,6 +4896,43 @@ def get_plot_features_geojson(plot_id: int, db: Session = Depends(get_db)):
     rivers = apply_overrides(rivers, "river")
     fences = apply_overrides(fences, "fence")
     roads = apply_overrides(roads, "road")
+
+    # When the caller (the Road Names panel) knows the current scale/paper size, only surface
+    # roads/rivers that will actually print on the sheet at that scale - the plot_buffers-clipped
+    # data above can extend well beyond what a given scale + paper size will actually show.
+    if scale_text:
+        try:
+            plot_wkb = db.execute(text("SELECT geom FROM plots WHERE id=:id"), {"id": plot_id}).scalar()
+            if plot_wkb:
+                plot_geom = wkb.loads(plot_wkb)
+                centroid = plot_geom.centroid
+                utm_zone = int((centroid.x + 180) / 6) + 1
+                display_epsg = (32600 if centroid.y >= 0 else 32700) + utm_zone
+
+                proj_geom = gpd.GeoSeries([plot_geom], crs="EPSG:4326").to_crs(epsg=display_epsg).iloc[0]
+
+                paper_config = get_paper_config(paper_size or "A4")
+                normalized_template = str(template_name or "").strip().lower()
+                if normalized_template in ("akwa_ibom_osg", "rivers_osg", "cross_river_osg"):
+                    map_width_frac, map_height_frac = 0.84, 0.455
+                elif normalized_template == "adamawa_osg":
+                    map_width_frac, map_height_frac = 0.84, 0.555
+                else:
+                    map_width_frac, map_height_frac = 0.80, 0.45
+
+                scale_ratio = parse_scale_ratio(scale_text)
+                minx, miny, maxx, maxy = proj_geom.bounds
+                cx, cy = (minx + maxx) / 2.0, (miny + maxy) / 2.0
+                inch_to_m = 0.0254
+                real_w = paper_config["width"] * map_width_frac * inch_to_m * scale_ratio
+                real_h = paper_config["height"] * map_height_frac * inch_to_m * scale_ratio
+                extent_proj = box(cx - real_w / 2.0, cy - real_h / 2.0, cx + real_w / 2.0, cy + real_h / 2.0)
+                extent_wgs84 = gpd.GeoSeries([extent_proj], crs=f"EPSG:{display_epsg}").to_crs(epsg=4326).iloc[0]
+
+                roads = [(g, f) for (g, f) in roads if g.intersects(extent_wgs84)]
+                rivers = [(g, f) for (g, f) in rivers if g.intersects(extent_wgs84)]
+        except Exception:
+            pass
 
     return {
         "roads": {"type": "FeatureCollection", "features": [f for _, f in roads]},

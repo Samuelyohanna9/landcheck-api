@@ -1601,6 +1601,39 @@ def build_fence_avoid_geom(fence_geoms, display_epsg: int, scale_ratio: int):
     return merged
 
 
+def _fetch_live_road_geoms(db, plot_id: int) -> list:
+    """Roads from the live `lines` table, using the same query the general template's final
+    render and the /plots/{id}/features/geojson endpoint (used by the Road Names panel) already
+    use. Keeping road geometry sourced from one place across the naming panel, feature overrides,
+    and every template's render avoids seam/gap artifacts where a named override's geometry
+    (built from this same live query) doesn't line up with a differently-sourced base road
+    segment (e.g. the older, separately-snapshotted `detected_features` rows).
+    """
+    rows = db.execute(text("""
+        WITH roads AS (
+            SELECT
+                CASE
+                    WHEN ST_SRID(r.geom) = 4326 THEN r.geom
+                    WHEN ST_SRID(r.geom) = 0 THEN ST_SetSRID(r.geom, 4326)
+                    ELSE ST_Transform(r.geom, 4326)
+                END AS geom
+            FROM lines r
+            WHERE r.highway IS NOT NULL
+        )
+        SELECT roads.geom AS geom
+        FROM roads
+        JOIN plot_buffers b ON b.plot_id = :plot_id
+        WHERE ST_Intersects(roads.geom, b.geom)
+    """), {"plot_id": plot_id}).fetchall()
+    geoms = []
+    for row in rows:
+        try:
+            geoms.append(wkb.loads(row.geom))
+        except Exception:
+            continue
+    return geoms
+
+
 def _collect_road_edge_lines(centerline_geom, half_width_m: float):
     """
     Build open road edges (left/right offsets) from a centerline geometry.
@@ -2439,7 +2472,7 @@ def _render_plot_map_layout_adamawa(
     ).scalar() or 0
 
     plot_geom = wkb.loads(plot_wkb)
-    buildings, rivers, fences, detected_roads = [], [], [], []
+    buildings, rivers, fences = [], [], []
     for r in rows:
         g = wkb.loads(r.geom)
         if r.feature_type == "building":
@@ -2448,8 +2481,10 @@ def _render_plot_map_layout_adamawa(
             rivers.append(g)
         elif r.feature_type == "fence":
             fences.append(g)
-        elif r.feature_type == "road":
-            detected_roads.append(g)
+    # Roads come from the live `lines` table (same query the naming panel and general template
+    # use) rather than the detected_features snapshot, so a named override's geometry always
+    # lines up with the base road drawn here - no seam where a name was added.
+    detected_roads = _fetch_live_road_geoms(db, plot_id)
 
     overrides = []
     import json
@@ -3101,7 +3136,7 @@ def _render_plot_map_layout_cadastral(
     ).scalar() or 0
 
     plot_geom = wkb.loads(plot_wkb)
-    buildings, rivers, fences, detected_roads = [], [], [], []
+    buildings, rivers, fences = [], [], []
     for r in rows:
         g = wkb.loads(r.geom)
         if r.feature_type == "building":
@@ -3110,8 +3145,10 @@ def _render_plot_map_layout_cadastral(
             rivers.append(g)
         elif r.feature_type == "fence":
             fences.append(g)
-        elif r.feature_type == "road":
-            detected_roads.append(g)
+    # Roads come from the live `lines` table (same query the naming panel and general template
+    # use) rather than the detected_features snapshot, so a named override's geometry always
+    # lines up with the base road drawn here - no seam where a name was added.
+    detected_roads = _fetch_live_road_geoms(db, plot_id)
 
     overrides = []
     import json
