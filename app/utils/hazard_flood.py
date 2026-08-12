@@ -44,6 +44,36 @@ def _fetch_depth_points(depth_image: "ee.Image", region: "ee.Geometry", scale_m:
         return None
 
 
+def _fetch_susceptibility_points(image: "ee.Image", region: "ee.Geometry", scale_m: int = 90) -> Optional[List[Dict[str, float]]]:
+    """Samples the local terrain-based flood susceptibility composite (0-100) as a
+    {lng, lat, flood_susceptibility_pct} point cloud - the same pixelLonLat + toList idiom as
+    _fetch_depth_points, used only for the fallback map when GloFAS has no modeled extent here.
+    """
+    try:
+        sampled = image.multiply(100).rename("flood_susceptibility_pct").addBands(ee.Image.pixelLonLat())
+        reduced = sampled.reduceRegion(
+            reducer=ee.Reducer.toList(),
+            geometry=region,
+            scale=scale_m,
+            maxPixels=int(1e9),
+            bestEffort=True,
+        )
+        info = reduced.getInfo() or {}
+        lons = info.get("longitude") or []
+        lats = info.get("latitude") or []
+        values = info.get("flood_susceptibility_pct") or []
+        if len(lons) < 3 or len(lons) != len(lats) or len(lons) != len(values):
+            return None
+        points = [
+            {"lng": float(lo), "lat": float(la), "flood_susceptibility_pct": float(v)}
+            for lo, la, v in zip(lons, lats, values)
+            if v is not None
+        ]
+        return points if len(points) >= 3 else None
+    except Exception:
+        return None
+
+
 def compute_flood_risk(
     db: Session,
     boundary_geojson: Dict[str, Any],
@@ -158,6 +188,68 @@ def compute_flood_risk(
         risk_value = 0.0
 
     risk_class, class_color = classify_risk(risk_value, breakdown["data_available"])
+    breakdown["flood_data_source"] = "glofas"
+    susceptibility_img = None
+
+    # GloFAS only carries depth pixels within its modeled river-flood extent - a plot far from any
+    # major river channel legitimately has zero coverage there, which used to just surface as
+    # "No Data". Rather than leaving the user with nothing, fall back to a local terrain-based
+    # ponding/pluvial susceptibility estimate: flatter, lower-lying ground near a drainage line is
+    # more prone to standing water even when no river ever reaches it. This is a genuinely
+    # different methodology from GloFAS's river-routing simulation, so it's always labeled as an
+    # estimate (both in the API response and baked into the map itself), never presented as if it
+    # were GloFAS data.
+    if not breakdown["data_available"]:
+        report("No river flood extent modeled here — estimating local terrain-based susceptibility...", 35)
+        try:
+            dem_proxy = ee.ImageCollection("COPERNICUS/DEM/GLO30_2024_1").select("DEM").mosaic()
+            slope_img = ee.Terrain.slope(dem_proxy).rename("slope_deg")
+            local_mean_elev_img = dem_proxy.focal_mean(radius=300, units="meters")
+            depression_img = local_mean_elev_img.subtract(dem_proxy).rename("depression_m")
+
+            # Each factor normalized 0..1: flat + low-lying + close to a drainage line all raise
+            # ponding susceptibility, weighted by how directly each one drives standing water.
+            flatness_score_img = ee.Image(1).subtract(slope_img.divide(15).min(1)).max(0)
+            drainage_score_img = ee.Image(1).subtract(distance_m.divide(1500).min(1)).max(0)
+            depression_score_img = depression_img.divide(3).max(0).min(1)
+            susceptibility_img = (
+                depression_score_img.multiply(0.40)
+                .add(flatness_score_img.multiply(0.35))
+                .add(drainage_score_img.multiply(0.25))
+            ).rename("susceptibility")
+
+            proxy_combined = ee.Dictionary({
+                "susceptibility": susceptibility_img.reduceRegion(
+                    reducer=ee.Reducer.mean(), geometry=geom, scale=30, maxPixels=1e9
+                ).get("susceptibility"),
+                "mean_slope_deg": slope_img.reduceRegion(
+                    reducer=ee.Reducer.mean(), geometry=geom, scale=30, maxPixels=1e9
+                ).get("slope_deg"),
+                "mean_depression_m": depression_img.reduceRegion(
+                    reducer=ee.Reducer.mean(), geometry=geom, scale=30, maxPixels=1e9
+                ).get("depression_m"),
+                "distance_to_drainage_m": mean_dist,
+            }).getInfo()
+
+            susceptibility_val = proxy_combined.get("susceptibility")
+            if susceptibility_val is not None:
+                risk_value = max(0.0, min(1.0, float(susceptibility_val)))
+                risk_class, class_color = classify_risk(risk_value, True)
+                breakdown["data_available"] = True
+                breakdown["flood_data_source"] = "local_terrain_proxy"
+                breakdown["distance_to_river_m"] = round(float(proxy_combined.get("distance_to_drainage_m") or 0.0), 1)
+                breakdown["terrain_slope_deg"] = round(float(proxy_combined.get("mean_slope_deg") or 0.0), 2)
+                breakdown["terrain_depression_m"] = round(float(proxy_combined.get("mean_depression_m") or 0.0), 2)
+                # Same normalization as the per-pixel score images, applied to the plot-mean scalars -
+                # lets the frontend show component bars for the proxy score the same way it already
+                # does for GloFAS's depth/inundation/river-proximity breakdown.
+                breakdown["terrain_flatness_score"] = round(max(0.0, min(1.0, 1 - (breakdown["terrain_slope_deg"] / 15))), 3)
+                breakdown["terrain_drainage_score"] = round(max(0.0, min(1.0, 1 - (breakdown["distance_to_river_m"] / 1500))), 3)
+                breakdown["terrain_depression_score"] = round(max(0.0, min(1.0, breakdown["terrain_depression_m"] / 3)), 3)
+            else:
+                susceptibility_img = None
+        except Exception:
+            susceptibility_img = None
 
     # Informational only - deliberately NOT folded into risk_value/risk_class. A single relative-
     # elevation comparison isn't rigorous enough to justify re-weighting a screening score, but a
@@ -196,29 +288,35 @@ def compute_flood_risk(
     # Postgres query) - run them concurrently rather than one after another, since each is I/O
     # bound and waiting on them serially is what was pushing total request time past the client's
     # timeout.
+    flood_data_source = breakdown.get("flood_data_source", "glofas")
     report("Analyzing terrain and locating nearby buildings...", 50)
     with ThreadPoolExecutor(max_workers=3) as pool:
-        depth_future = pool.submit(
-            lambda: _fetch_depth_points(depth.unmask(0), analysis_region) if breakdown["data_available"] else None
-        )
+        if flood_data_source == "local_terrain_proxy" and susceptibility_img is not None:
+            surface_future = pool.submit(_fetch_susceptibility_points, susceptibility_img, analysis_region)
+        else:
+            surface_future = pool.submit(
+                lambda: _fetch_depth_points(depth.unmask(0), analysis_region) if flood_data_source == "glofas" else None
+            )
         contour_future = pool.submit(
             lambda: local_elevation_points if valid_points else fetch_dem_elevation_points(boundary_geojson, buffer_m=1000)
         )
         buildings_future = pool.submit(fetch_buildings_near, db, boundary_geojson, 600)
-        depth_points = depth_future.result()
+        surface_points = surface_future.result()
         contour_points = contour_future.result()
         buildings = buildings_future.result()
 
     report("Rendering hazard map...", 80)
     png_bytes, map_stats = render_flood_hazard_map(
         boundary_geojson=boundary_geojson,
-        depth_points=depth_points,
+        depth_points=surface_points if flood_data_source == "glofas" else None,
+        susceptibility_points=surface_points if flood_data_source == "local_terrain_proxy" else None,
         contour_points=contour_points,
         buildings=buildings,
         risk_class=risk_class,
         class_color=class_color,
         return_period=return_period,
         buffer_m=1000,
+        value_source=flood_data_source if flood_data_source == "local_terrain_proxy" else "glofas",
     )
     breakdown["buildings_total"] = map_stats.get("buildings_total", 0)
     breakdown["buildings_threatened"] = map_stats.get("buildings_threatened", 0)

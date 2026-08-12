@@ -105,13 +105,49 @@ def _build_legend(risk_class: str, class_color: str, plot_label: str, show_raste
 
 # ---------------- FLOOD ----------------
 
-def _flood_preview_payload(risk_value, risk_class, class_color, breakdown, overlay_png, show_raster, return_period, legend) -> dict:
-    note = "Screening-level flood risk based on global datasets."
-    if not breakdown.get("data_available", True):
+def _flood_note_and_method(breakdown, pdf: bool = False) -> tuple[str, str]:
+    data_source = breakdown.get("flood_data_source", "glofas")
+    if data_source == "local_terrain_proxy":
         note = (
-            "No flood depth data available for this location at the selected return period. "
-            "Try a different return period or enable local raster to inspect coverage."
+            "No official river flood model (GloFAS) data exists for this location — it sits outside "
+            "GloFAS's simulated floodplain, most likely because it's too far from a major river "
+            "channel. The score shown is a local terrain-based estimate of ponding/pluvial flood "
+            "susceptibility (slope, low-lying terrain, and drainage proximity), not simulated river "
+            "flood depth — treat it as a screening indicator, not a GloFAS result."
         )
+        method = (
+            "GloFAS has no modeled river-flood extent at this location, so this is a local "
+            "terrain-based susceptibility estimate instead: 40% low-lying terrain (elevation "
+            "relative to the surrounding 300m) + 35% flatness (slope, since flat ground drains "
+            "poorly) + 25% proximity to the nearest natural drainage line. Higher score indicates "
+            "higher susceptibility to standing water/ponding, not river flood depth."
+        )
+    elif not breakdown.get("data_available", True):
+        note = (
+            "No flood data available for this location at the selected return period. "
+            "Try a different return period." + ("" if pdf else " or enable local raster to inspect coverage.")
+        )
+        method = (
+            "Risk score uses GloFAS flood depth for the selected return period. "
+            "We compute mean depth and inundation fraction inside the plot, "
+            "adjust with distance to major rivers, normalize depth (0-3m), "
+            "then combine: 60% depth + 25% inundation + 15% river proximity. "
+            "Higher score indicates higher river flood susceptibility."
+        )
+    else:
+        note = "Screening-level flood risk based on global datasets."
+        method = (
+            "Risk score uses GloFAS flood depth for the selected return period. "
+            "We compute mean depth and inundation fraction inside the plot, "
+            "adjust with distance to major rivers, normalize depth (0-3m), "
+            "then combine: 60% depth + 25% inundation + 15% river proximity. "
+            "Higher score indicates higher river flood susceptibility."
+        )
+    return note, method
+
+
+def _flood_preview_payload(risk_value, risk_class, class_color, breakdown, overlay_png, show_raster, return_period, legend) -> dict:
+    note, method = _flood_note_and_method(breakdown)
     return {
         "risk_score": round(risk_value * 100, 1),
         "risk_class": risk_class,
@@ -128,13 +164,7 @@ def _flood_preview_payload(risk_value, risk_class, class_color, breakdown, overl
         "overlay": flood_overlay_to_data_url(overlay_png),
         "note": note,
         "buffer_m": 1000,
-        "method": (
-            "Risk score uses GloFAS flood depth for the selected return period. "
-            "We compute mean depth and inundation fraction inside the plot, "
-            "adjust with distance to major rivers, normalize depth (0-3m), "
-            "then combine: 60% depth + 25% inundation + 15% river proximity. "
-            "Higher score indicates higher river flood susceptibility."
-        ),
+        "method": method,
         "return_period": return_period,
         "data_available": bool(breakdown.get("data_available", True)),
         "legend": legend,
@@ -144,16 +174,17 @@ def _flood_preview_payload(risk_value, risk_class, class_color, breakdown, overl
         "local_mean_elevation_m": breakdown.get("local_mean_elevation_m"),
         "regional_mean_elevation_m": breakdown.get("regional_mean_elevation_m"),
         "interactive": breakdown.get("_interactive"),
+        "flood_data_source": breakdown.get("flood_data_source", "glofas"),
+        "terrain_slope_deg": breakdown.get("terrain_slope_deg"),
+        "terrain_depression_m": breakdown.get("terrain_depression_m"),
+        "terrain_flatness_score": breakdown.get("terrain_flatness_score"),
+        "terrain_drainage_score": breakdown.get("terrain_drainage_score"),
+        "terrain_depression_score": breakdown.get("terrain_depression_score"),
     }
 
 
 def _flood_pdf_summary(risk_value, risk_class, class_color, breakdown, show_raster, return_period, legend) -> dict:
-    note = "Screening-level flood risk based on global datasets."
-    if not breakdown.get("data_available", True):
-        note = (
-            "No flood depth data available for this location at the selected return period. "
-            "Try a different return period."
-        )
+    note, _ = _flood_note_and_method(breakdown, pdf=True)
     return {
         "risk_score": f"{round(risk_value * 100, 1)}",
         "risk_class": risk_class,
@@ -174,6 +205,12 @@ def _flood_pdf_summary(risk_value, risk_class, class_color, breakdown, show_rast
         "show_raster": str(show_raster),
         "local_elevation_used": bool(breakdown.get("local_elevation_used")),
         "relative_elevation_m": breakdown.get("relative_elevation_m"),
+        "flood_data_source": breakdown.get("flood_data_source", "glofas"),
+        "terrain_slope_deg": breakdown.get("terrain_slope_deg"),
+        "terrain_depression_m": breakdown.get("terrain_depression_m"),
+        "terrain_flatness_score": breakdown.get("terrain_flatness_score"),
+        "terrain_drainage_score": breakdown.get("terrain_drainage_score"),
+        "terrain_depression_score": breakdown.get("terrain_depression_score"),
     }
 
 

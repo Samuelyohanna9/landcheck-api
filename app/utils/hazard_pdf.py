@@ -232,10 +232,16 @@ def render_flood_report_pdf(output_path: str, overlay_png: bytes, summary: Dict[
     return_period = summary.get("return_period", "100")
     buildings_total = int(summary.get("buildings_total", 0) or 0)
     buildings_threatened = int(summary.get("buildings_threatened", 0) or 0)
+    is_proxy = str(summary.get("flood_data_source") or "glofas") == "local_terrain_proxy"
 
-    headline = f"{risk_class} flood risk at the {return_period}-year return period"
-    if buildings_total > 0:
-        headline = f"{buildings_threatened} of {buildings_total} buildings sit in the flood zone at the {return_period}-year return period"
+    if is_proxy:
+        headline = f"{risk_class} local flood/ponding susceptibility (terrain-based estimate)"
+        if buildings_total > 0:
+            headline = f"{buildings_threatened} of {buildings_total} buildings sit on susceptible ground (terrain-based estimate)"
+    else:
+        headline = f"{risk_class} flood risk at the {return_period}-year return period"
+        if buildings_total > 0:
+            headline = f"{buildings_threatened} of {buildings_total} buildings sit in the flood zone at the {return_period}-year return period"
 
     insight = ""
     if summary.get("local_elevation_used") and summary.get("relative_elevation_m") is not None:
@@ -254,6 +260,46 @@ def render_flood_report_pdf(output_path: str, overlay_png: bytes, summary: Dict[
         else:
             insight = "Site elevation note: your surveyed points are close to the surrounding terrain average."
 
+    if is_proxy:
+        stat_cards = [
+            ("Slope (deg)", str(summary.get("terrain_slope_deg", "-"))),
+            ("Rel. Elevation (m)", str(summary.get("terrain_depression_m", "-"))),
+            ("Dist. to Drainage (m)", str(summary.get("distance_to_river_m", "-"))),
+            ("Buildings Flagged", f"{buildings_threatened} / {buildings_total}" if buildings_total else "-"),
+        ]
+        component_bars = [
+            ("Low-lying terrain", float(summary.get("terrain_depression_score", 0) or 0), "#b45309"),
+            ("Flatness", float(summary.get("terrain_flatness_score", 0) or 0), "#f59e0b"),
+            ("Drainage prox.", float(summary.get("terrain_drainage_score", 0) or 0), "#fbbf24"),
+        ]
+        method = (
+            "GloFAS has no modeled river-flood extent at this location, so this is a local "
+            "terrain-based susceptibility estimate instead - NOT official GloFAS river flood "
+            "modeling. Buildings are real OpenStreetMap footprints, flagged where the local "
+            "susceptibility surface exceeds 60%.\n"
+            "Score = 40% low-lying terrain (elevation relative to the surrounding 300m) "
+            "+ 35% flatness (slope) + 25% proximity to the nearest natural drainage line."
+        )
+    else:
+        stat_cards = [
+            ("Mean Depth (m)", str(summary.get("mean_depth_m", "-"))),
+            ("Max Depth (m)", str(summary.get("max_depth_m", "-"))),
+            ("Inundation (%)", str(summary.get("inundation_percent", "-"))),
+            ("Buildings Threatened", f"{buildings_threatened} / {buildings_total}" if buildings_total else "-"),
+        ]
+        component_bars = [
+            ("Depth", float(summary.get("depth_score", 0) or 0), "#1d4ed8"),
+            ("Inundation", float(summary.get("inundation_score", 0) or 0), "#0ea5e9"),
+            ("River prox.", float(summary.get("river_proximity_score", 0) or 0), "#38bdf8"),
+        ]
+        method = (
+            "Flood depth is sampled from the JRC/CEMS GloFAS global hazard model at the chosen "
+            "return period, inside a 1km buffer around the plot. Buildings are real OpenStreetMap "
+            "footprints, flagged as threatened where the interpolated depth surface exceeds 5cm.\n"
+            "Score = 60% mean depth (normalized to 3m) + 25% inundated area fraction "
+            "+ 15% proximity to a major river channel."
+        )
+
     _render_hazard_report_pdf(
         output_path,
         overlay_png,
@@ -263,24 +309,9 @@ def render_flood_report_pdf(output_path: str, overlay_png: bytes, summary: Dict[
         risk_class=risk_class,
         class_color=class_color,
         headline=headline,
-        stat_cards=[
-            ("Mean Depth (m)", str(summary.get("mean_depth_m", "-"))),
-            ("Max Depth (m)", str(summary.get("max_depth_m", "-"))),
-            ("Inundation (%)", str(summary.get("inundation_percent", "-"))),
-            ("Buildings Threatened", f"{buildings_threatened} / {buildings_total}" if buildings_total else "-"),
-        ],
-        component_bars=[
-            ("Depth", float(summary.get("depth_score", 0) or 0), "#1d4ed8"),
-            ("Inundation", float(summary.get("inundation_score", 0) or 0), "#0ea5e9"),
-            ("River prox.", float(summary.get("river_proximity_score", 0) or 0), "#38bdf8"),
-        ],
-        method=(
-            "Flood depth is sampled from the JRC/CEMS GloFAS global hazard model at the chosen "
-            "return period, inside a 1km buffer around the plot. Buildings are real OpenStreetMap "
-            "footprints, flagged as threatened where the interpolated depth surface exceeds 5cm.\n"
-            "Score = 60% mean depth (normalized to 3m) + 25% inundated area fraction "
-            "+ 15% proximity to a major river channel."
-        ),
+        stat_cards=stat_cards,
+        component_bars=component_bars,
+        method=method,
         footnotes=[
             f"Return period: {return_period} years - analysis buffer: {summary.get('buffer_m', '1000')} m around plot.",
             "Source: JRC/CEMS GloFAS Flood Hazard v2.1, WWF HydroSHEDS, OpenStreetMap. For screening only, not a legal flood determination.",
