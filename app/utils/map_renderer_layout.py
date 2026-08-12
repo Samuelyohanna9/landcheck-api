@@ -17,6 +17,7 @@ from shapely.geometry import LineString, Point, shape
 from shapely.ops import snap, linemerge, unary_union
 import matplotlib.patches as patches
 import matplotlib.lines as mlines
+import matplotlib.patheffects as patheffects
 from matplotlib.font_manager import FontProperties
 from datetime import datetime
 from matplotlib.backends.backend_agg import FigureCanvasAgg as FigureCanvas
@@ -1727,7 +1728,7 @@ def _collect_connected_road_edge_lines(road_geoms_with_width, snap_tol_m: float 
     return edge_lines
 
 
-def _draw_road_edges(ax, edge_lines, font_scale=1.0, color: str = "black"):
+def _draw_road_edges(ax, edge_lines, font_scale=1.0, color: str = "black", linestyle="-"):
     if not edge_lines:
         return
     lw = 0.85 * font_scale
@@ -1750,6 +1751,7 @@ def _draw_road_edges(ax, edge_lines, font_scale=1.0, color: str = "black"):
                 y_vals,
                 color=color,
                 lw=lw,
+                linestyle=linestyle,
                 zorder=6,
                 solid_joinstyle="round",
                 solid_capstyle="round",
@@ -2692,7 +2694,14 @@ def _draw_cadastral_scale_bar(fig, cx: float, top_y: float, scale_text: str, fon
     seg(cx, half_w, "black")
     seg(cx + half_w, half_w, "white")
 
-    label_y = y0 - 0.011
+    tick_h = 0.0045
+    for tx in (cx - half_w, cx - half_w / 2.0, cx, cx + half_w, cx + 2 * half_w):
+        fig.add_artist(mlines.Line2D(
+            [tx, tx], [y0, y0 + bar_h + tick_h], transform=fig.transFigure,
+            color="black", lw=lw,
+        ))
+
+    label_y = y0 - 0.009
     fs = max(5, int(6 * font_scale))
     for x, label in (
         (cx - half_w, f"{unit:g}"),
@@ -2702,7 +2711,7 @@ def _draw_cadastral_scale_bar(fig, cx: float, top_y: float, scale_text: str, fon
         (cx + 2 * half_w, f"{2 * unit:g}m"),
     ):
         fig.text(x, label_y, label, ha="center", va="top", fontsize=fs, fontfamily=CADASTRAL_FONT_FAMILY)
-    return label_y - 0.012
+    return label_y - 0.008
 
 
 def _draw_cadastral_header(
@@ -2732,9 +2741,9 @@ def _draw_cadastral_header(
     )
 
     cx = 0.685
-    y = 0.965
+    y = 0.94
     fs = max(6, int(7.6 * font_scale))
-    line_h = 0.0165
+    line_h = 0.0145
 
     def line(text_value, bold=False, gap=1.0, size_mult=1.0, color=None):
         nonlocal y
@@ -2755,12 +2764,12 @@ def _draw_cadastral_header(
         line(area_name_clean.upper())
     line(_safe_text(lga_text, "-").upper())
     line(_safe_text(state_label, "-").upper())
-    y -= line_h * 0.35
+    y -= line_h * 0.2
     line(f"SCALE:  {_normalize_scale_label_adamawa(scale_text)}")
-    y -= line_h * 0.55
+    y -= line_h * 0.3
 
     y = _draw_cadastral_scale_bar(fig, cx, y, scale_text, font_scale=font_scale)
-    y -= line_h * 0.35
+    y -= line_h * 0.2
 
     line(f"COORDINATE SYSTEM : {_safe_text(coordinate_system_text, '-').upper()}", color=CADASTRAL_BLUE)
     line(f"DATUM / ORIGIN : {_safe_text(datum_text, DEFAULT_CADASTRAL_DATUM_TEXT).upper()}", color=CADASTRAL_BLUE)
@@ -2898,11 +2907,15 @@ def _draw_cadastral_frontage_road(ax, poly, road_name: str, font_scale: float = 
     ext = seg_len * 0.15
     ox1, oy1 = x1 + nx * offset - dx * ext, y1 + ny * offset - dy * ext
     ox2, oy2 = x2 + nx * offset + dx * ext, y2 + ny * offset + dy * ext
-    ax.add_line(mlines.Line2D([ox1, ox2], [oy1, oy2], color=color, lw=1.0 * font_scale, linestyle=(0, (6, 4)), zorder=6))
+    ax.add_line(mlines.Line2D(
+        [ox1, ox2], [oy1, oy2], color=color, lw=1.0 * font_scale, linestyle=(0, (6, 4)), zorder=9,
+        path_effects=[patheffects.withStroke(linewidth=2.2 * font_scale, foreground="white")],
+    ))
     label_x, label_y = (ox1 + ox2) / 2.0, (oy1 + oy2) / 2.0 + ny * (offset * 0.5)
     ax.text(
         label_x, label_y, _safe_text(road_name).upper(), color=color, fontsize=max(6, int(7 * font_scale)),
-        ha="center", va="center", weight="bold", zorder=6,
+        ha="center", va="center", weight="bold", zorder=10,
+        path_effects=[patheffects.withStroke(linewidth=2.5, foreground="white")],
     )
 
 
@@ -3062,7 +3075,7 @@ def _render_plot_map_layout_cadastral(
     # Extra clearance above the footer (vs. Adamawa's margins) - vertex/bearing labels near the
     # bottom edge of a busy plot can get pushed outward by annotate_vertices' collision-avoidance
     # placement, and this template's footer is denser (3 columns) so there's less room to spare.
-    map_left, map_bottom, map_width, map_height = 0.08, 0.27, 0.84, 0.495
+    map_left, map_bottom, map_width, map_height = 0.08, 0.27, 0.84, 0.455
     ax = fig.add_axes([map_left, map_bottom, map_width, map_height])
 
     plan_no_value = _safe_text(cadastral_plan_no, f"{plot_id}")
@@ -3118,7 +3131,7 @@ def _render_plot_map_layout_cadastral(
         except Exception:
             continue
     road_edge_lines = _collect_connected_road_edge_lines(road_geom_width, snap_tol_m=road_snap_tol)
-    _draw_road_edges(ax, road_edge_lines, font_scale=font_scale, color=road_color)
+    _draw_road_edges(ax, road_edge_lines, font_scale=font_scale, color=road_color, linestyle=(0, (6, 4)))
 
     if _safe_text(location_text):
         try:
@@ -3143,6 +3156,30 @@ def _render_plot_map_layout_cadastral(
         draw_fences(ax, fences, display_epsg, scale_ratio=scale_ratio, font_scale=font_scale)
     fence_avoid_geom = build_fence_avoid_geom(fences, display_epsg=display_epsg, scale_ratio=scale_ratio)
 
+    # Beacon/bearing labels should steer clear of building hatch and road lines too, not just
+    # fences - a label placed directly on top of dense building hatching reads as cluttered even
+    # though it still renders above it, so fold buffered buildings/roads into the same
+    # collision-avoidance geometry annotate_vertices already uses for fences.
+    label_avoid_parts = [g for g in (fence_avoid_geom,) if g is not None]
+    if all_buildings:
+        try:
+            buildings_buffer_m = max(1.0, (2.0 / 1000.0) * scale_ratio)
+            buildings_proj = gpd.GeoSeries(all_buildings, crs="EPSG:4326").to_crs(epsg=display_epsg)
+            buildings_avoid = unary_union(list(buildings_proj.buffer(buildings_buffer_m)))
+            if buildings_avoid is not None and not buildings_avoid.is_empty:
+                label_avoid_parts.append(buildings_avoid)
+        except Exception:
+            pass
+    if road_edge_lines:
+        try:
+            road_buffer_m = max(1.0, (3.0 / 1000.0) * scale_ratio)
+            roads_avoid = unary_union([seg.buffer(road_buffer_m) for seg in road_edge_lines])
+            if roads_avoid is not None and not roads_avoid.is_empty:
+                label_avoid_parts.append(roads_avoid)
+        except Exception:
+            pass
+    label_avoid_geom = unary_union(label_avoid_parts) if label_avoid_parts else None
+
     gdf_plot.plot(ax=ax, facecolor="none", edgecolor=boundary_color, lw=1.1 * font_scale, zorder=20)
     ax.set_xlim(target_xlim)
     ax.set_ylim(target_ylim)
@@ -3157,7 +3194,7 @@ def _render_plot_map_layout_cadastral(
         station_names=station_names,
         font_scale=font_scale,
         min_label_length_m=0.0,
-        avoid_geom=fence_avoid_geom,
+        avoid_geom=label_avoid_geom,
         scale_ratio=scale_ratio,
         boundary_poly=poly,
         beacon_style=beacon_style,
@@ -3170,11 +3207,12 @@ def _render_plot_map_layout_cadastral(
     )
 
     first_coords = list(poly.exterior.coords)[0]
+    # The grid-origin stem doubles as the sheet's sole north indicator on these plans (its
+    # vertical "up" line is Grid North) - no separate compass-rose icon is drawn alongside it.
     _draw_cadastral_origin_marker(ax, font_scale=font_scale, color=grid_color)
     _draw_cadastral_coordinate_labels(
         ax, easting_m=first_coords[0], northing_m=first_coords[1], font_scale=font_scale, color=grid_color,
     )
-    add_north_arrow(ax, font_scale=font_scale, style=north_arrow_style, color=north_arrow_color, blue_hex=grid_color)
 
     certification_date = datetime.now().strftime("%d / %m / %Y")
     _draw_cadastral_footer(
