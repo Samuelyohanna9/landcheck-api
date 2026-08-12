@@ -19,6 +19,7 @@ import matplotlib.patches as patches
 import matplotlib.lines as mlines
 import matplotlib.patheffects as patheffects
 from matplotlib.font_manager import FontProperties
+from matplotlib.path import Path
 from datetime import datetime
 from matplotlib.backends.backend_agg import FigureCanvasAgg as FigureCanvas
 
@@ -755,31 +756,93 @@ def add_north_arrow(
         # labeled "U. N." On the cadastral templates this stem is anchored at (and continues
         # down through the map as) the reference vertex's Easting grid line - see the un_marker
         # anchor_x handling in _render_plot_map_layout_cadastral.
+        #
+        # Keep the same anchor behavior as the existing layout code, but draw the real supplied
+        # SVG geometry instead of the old compressed approximation. The source file uses a
+        # 420 x 1400 viewBox, a stem centered at x=210, and the "U." / "N." text baseline at
+        # y=855. We therefore treat the incoming (x, y) as the stem center and text baseline.
+        svg_stem_x = 210.0
+        svg_text_baseline_y = 855.0
+        svg_top_y = 25.0
+        svg_bottom_y = 1365.0
+        svg_text_size = 78.0
+        # Preserve the current top clearance in templates, while keeping the original SVG aspect.
+        unit = (size * 1.70) / (svg_text_baseline_y - svg_top_y)
         line_lw = max(1.0, 1.1 * font_scale)
-        stem_top = y + size * 1.7
-        flag_low_x = x - size * 0.42
-        flag_low_y = y + size * 0.55
-        flag_mid_y = flag_low_y + size * 0.06
-        loop_r = size * 0.30
-        loop_cy = flag_low_y - loop_r * 0.85
-        stem_bottom = y - size * 0.15
+        text_font = FontProperties(family=["Times New Roman", "Times", "DejaVu Serif"])
+
+        def sx(px: float) -> float:
+            return x + (float(px) - svg_stem_x) * unit
+
+        def sy(py: float) -> float:
+            return y - (float(py) - svg_text_baseline_y) * unit
 
         fig.add_artist(mlines.Line2D(
-            [x, x], [stem_bottom, stem_top], transform=fig.transFigure,
+            [sx(svg_stem_x), sx(svg_stem_x)],
+            [sy(svg_bottom_y), sy(svg_top_y)],
+            transform=fig.transFigure,
             color=col, lw=line_lw, zorder=20, solid_capstyle="butt",
         ))
         fig.add_artist(mlines.Line2D(
-            [x, flag_low_x, x], [stem_top, flag_low_y, flag_mid_y], transform=fig.transFigure,
+            [sx(210), sx(162), sx(210)],
+            [sy(25), sy(585), sy(565)],
+            transform=fig.transFigure,
             color=col, lw=line_lw, zorder=21, solid_capstyle="round", solid_joinstyle="round",
         ))
-        fig.add_artist(patches.Circle(
-            (x, loop_cy), loop_r, transform=fig.transFigure,
-            fill=False, edgecolor=col, lw=line_lw, zorder=21,
-        ))
+        loop_vertices = [
+            (sx(162), sy(585)),
+            (sx(185), sy(568)),
+            (sx(222), sy(562)),
+            (sx(252), sy(575)),
+            (sx(292), sy(592)),
+            (sx(313), sy(627)),
+            (sx(313), sy(665)),
+            (sx(313), sy(720)),
+            (sx(268), sy(765)),
+            (sx(212), sy(765)),
+            (sx(158), sy(765)),
+            (sx(116), sy(729)),
+            (sx(116), sy(680)),
+        ]
+        loop_codes = [
+            Path.MOVETO,
+            Path.CURVE4,
+            Path.CURVE4,
+            Path.CURVE4,
+            Path.CURVE4,
+            Path.CURVE4,
+            Path.CURVE4,
+            Path.CURVE4,
+            Path.CURVE4,
+            Path.CURVE4,
+            Path.CURVE4,
+            Path.CURVE4,
+            Path.CURVE4,
+        ]
+        fig.add_artist(
+            patches.PathPatch(
+                Path(loop_vertices, loop_codes),
+                transform=fig.transFigure,
+                fill=False,
+                edgecolor=col,
+                lw=line_lw,
+                zorder=21,
+                capstyle="round",
+                joinstyle="round",
+            )
+        )
+        font_size = max(6, svg_text_size * unit * fig.get_figheight() * 72.0)
         fig.text(
-            x, y - size * 0.32, "U. N.", ha="center", va="top",
-            fontsize=max(6, int(9 * font_scale)), color=col, weight="bold",
-            fontfamily="DejaVu Serif", zorder=22,
+            sx(98), sy(855), "U.",
+            ha="left", va="baseline",
+            fontsize=font_size, color=col, weight="normal",
+            fontproperties=text_font, zorder=22,
+        )
+        fig.text(
+            sx(228), sy(855), "N.",
+            ha="left", va="baseline",
+            fontsize=font_size, color=col, weight="normal",
+            fontproperties=text_font, zorder=22,
         )
         return x
 
@@ -1621,6 +1684,36 @@ def _resolve_override_names(overrides, feature_type: str):
         if action in ("add", "update"):
             resolved.append((geom, str(ov.get("name") or "").strip()))
     return [(g, n) for (g, n) in resolved if n]
+
+
+def _road_segment_replaced(geom_wgs84, override_geoms_wgs84, display_epsg: int, tol_m: float = 0.75) -> bool:
+    """Whether `geom_wgs84` (a base road row) is one of the segments a "delete"/"update" override
+    actually replaces, rather than just a different, neighboring road that happens to touch or
+    cross it at a junction. A plain `.intersects()` test can't tell those apart - two distinct
+    roads meeting at a junction legitimately intersect at that single point, so using intersects
+    alone would wrongly drop the *other* road too whenever a named road happened to join one.
+    Instead this checks how much of the row's own length lies within a small buffer of the
+    override geometry: a segment the override actually replaces is buffer-covered almost along its
+    whole length, while a merely-crossing road only has a single point (~0 length) inside it.
+    """
+    if not override_geoms_wgs84:
+        return False
+    try:
+        row_proj = gpd.GeoSeries([geom_wgs84], crs="EPSG:4326").to_crs(epsg=display_epsg).iloc[0]
+        total_len = max(row_proj.length, 1e-6)
+    except Exception:
+        return any(geom_wgs84.intersects(dg) for dg in override_geoms_wgs84)
+    for dg in override_geoms_wgs84:
+        try:
+            dg_proj = gpd.GeoSeries([dg], crs="EPSG:4326").to_crs(epsg=display_epsg).iloc[0]
+            uncovered = row_proj.difference(dg_proj.buffer(tol_m))
+            uncovered_len = getattr(uncovered, "length", 0.0)
+            if uncovered_len < total_len * 0.1:
+                return True
+        except Exception:
+            if geom_wgs84.intersects(dg):
+                return True
+    return False
 
 
 def _fetch_live_road_geoms(db, plot_id: int) -> list:
@@ -3823,7 +3916,7 @@ def render_plot_map_layout(
             geom = wkb.loads(row.geom)
             highway = row.highway
             name = row.name
-            if road_replaced_geoms and any(geom.intersects(dg) for dg in road_replaced_geoms):
+            if _road_segment_replaced(geom, road_replaced_geoms, display_epsg):
                 continue
             try:
                 gdf_line = gpd.GeoSeries([geom], crs="EPSG:4326").to_crs(epsg=display_epsg)
