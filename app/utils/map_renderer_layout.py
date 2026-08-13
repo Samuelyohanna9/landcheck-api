@@ -1076,22 +1076,23 @@ def draw_grid(
                 )
             )
 
-    # Optional edge ticks: a single pair of short dashed reference ticks - one projecting outward
-    # above the top edge, one projecting outward below the bottom edge, both at the major grid
-    # line nearest the plot's horizontal center - marking where that Easting line would cross the
-    # frame, without ticking every interval on every side.
+    # Optional edge ticks: 4 short dashed reference ticks, one at each end of the grid - top-left,
+    # top-right, bottom-left, bottom-right - each projecting outward from the frame at the
+    # leftmost/rightmost major grid line within bounds. No long guide lines, no per-interval
+    # ticking along the sides - just these 4 corner marks.
     if edge_ticks:
         xs = np.arange(math.floor(xmin / major) * major, xmax + 0.1, major)
         xs_in_bounds = [x for x in xs if xmin <= x <= xmax]
         if xs_in_bounds:
-            center_x = (xmin + xmax) / 2.0
-            tick_x = min(xs_in_bounds, key=lambda x: abs(x - center_x))
+            left_x, right_x = xs_in_bounds[0], xs_in_bounds[-1]
+            tick_xs = [left_x] if left_x == right_x else [left_x, right_x]
             tick_len = (ymax - ymin) * 0.035
-            for y_edge, y_end in ((ymax, ymax + tick_len), (ymin, ymin - tick_len)):
-                ax.plot(
-                    [tick_x, tick_x], [y_edge, y_end], color=color, lw=0.9 * font_scale,
-                    linestyle=(0, (4, 3)), alpha=0.85, clip_on=False, zorder=6,
-                )
+            for tick_x in tick_xs:
+                for y_edge, y_end in ((ymax, ymax + tick_len), (ymin, ymin - tick_len)):
+                    ax.plot(
+                        [tick_x, tick_x], [y_edge, y_end], color=color, lw=0.9 * font_scale,
+                        linestyle=(0, (4, 3)), alpha=0.85, clip_on=False, zorder=6,
+                    )
 
 
 def draw_coordinate_frame(
@@ -3254,92 +3255,6 @@ def _draw_cadastral_coordinate_labels(
              transform=ax.transAxes, fontfamily=CADASTRAL_FONT_FAMILY)
 
 
-def _draw_cadastral_reference_guides(
-    fig,
-    ax,
-    guide_easting_m: float,
-    bottom_northing_m: float,
-    top_northing_m: float,
-    arrow_meta: dict | None = None,
-    top_line_end_easting_m: float | None = None,
-    bottom_line_end_easting_m: float | None = None,
-    font_scale: float = 1.0,
-    color: str = CADASTRAL_BLUE,
-) -> None:
-    """Draw the single blue guide frame used by South-South cadastral templates.
-
-    The reference sheets use a single vertical guide tied to the U.N. north-arrow stem, with one
-    top horizontal guide and one bottom horizontal guide. These are page-level cues, so draw them
-    in figure coordinates after projecting the selected map guide coordinates through the active
-    axes transform.
-    """
-    xmin, xmax = ax.get_xlim()
-    ymin, ymax = ax.get_ylim()
-    span_x = max(abs(xmax - xmin), 1.0)
-    span_y = max(abs(ymax - ymin), 1.0)
-
-    top_line_end_x = min(
-        xmax,
-        max(
-            guide_easting_m + max(span_x * 0.22, span_x * 0.10),
-            float(top_line_end_easting_m if top_line_end_easting_m is not None else guide_easting_m) + span_x * 0.035,
-        ),
-    )
-    bottom_line_end_x = min(
-        xmax,
-        max(
-            guide_easting_m + max(span_x * 0.42, span_x * 0.16),
-            float(bottom_line_end_easting_m if bottom_line_end_easting_m is not None else guide_easting_m) + span_x * 0.045,
-        ),
-    )
-
-    guide_top_data_y = min(ymax, top_northing_m)
-    guide_bottom_data_y = max(ymin, bottom_northing_m)
-
-    guide_fig_x, top_fig_y = fig.transFigure.inverted().transform(
-        ax.transData.transform((guide_easting_m, guide_top_data_y))
-    )
-    _, bottom_fig_y = fig.transFigure.inverted().transform(
-        ax.transData.transform((guide_easting_m, guide_bottom_data_y))
-    )
-    top_end_fig_x, _ = fig.transFigure.inverted().transform(
-        ax.transData.transform((top_line_end_x, guide_top_data_y))
-    )
-    bottom_end_fig_x, _ = fig.transFigure.inverted().transform(
-        ax.transData.transform((bottom_line_end_x, guide_bottom_data_y))
-    )
-
-    stem_bottom_y = (arrow_meta or {}).get("stem_bottom")
-    if stem_bottom_y is None:
-        stem_bottom_y = min(0.93, float(ax.get_position().y1) + 0.008)
-    stem_x = (arrow_meta or {}).get("stem_x", guide_fig_x)
-
-    line_lw = max(0.9, 1.0 * font_scale)
-    common = {
-        "transform": fig.transFigure,
-        "color": color,
-        "lw": line_lw,
-        "zorder": 18,
-        "solid_capstyle": "butt",
-    }
-
-    fig.add_artist(mlines.Line2D(
-        [stem_x, stem_x],
-        [bottom_fig_y - 0.002, stem_bottom_y],
-        **common,
-    ))
-    fig.add_artist(mlines.Line2D(
-        [stem_x, max(stem_x, top_end_fig_x)],
-        [top_fig_y, top_fig_y],
-        **common,
-    ))
-    fig.add_artist(mlines.Line2D(
-        [stem_x, max(stem_x, bottom_end_fig_x)],
-        [bottom_fig_y, bottom_fig_y],
-        **common,
-    ))
-
-
 def _draw_cadastral_frontage_road(ax, poly, road_name: str, font_scale: float = 1.0, color: str = "black") -> None:
     """Dashed frontage-road reference line just outside the boundary's lowest edge, labeled with
     the applicant's road/street name - the same "OLD ORON ROAD"-style annotation seen on the
@@ -3705,14 +3620,6 @@ def _render_plot_map_layout_cadastral(
         bearing_size=bearing_size,
     )
 
-    ring_coords = list(poly.exterior.coords)
-    first_coords = ring_coords[0]
-    all_x = [pt[0] for pt in ring_coords[:-1]] if len(ring_coords) > 1 else [first_coords[0]]
-    all_y = [pt[1] for pt in ring_coords[:-1]] if len(ring_coords) > 1 else [first_coords[1]]
-    plot_min_x = min(all_x) if all_x else first_coords[0]
-    plot_max_x = max(all_x) if all_x else first_coords[0]
-    plot_min_y = min(all_y) if all_y else first_coords[1]
-    plot_max_y = max(all_y) if all_y else first_coords[1]
     span_x = max(abs(target_xlim[1] - target_xlim[0]), 1.0)
     span_y = max(abs(target_ylim[1] - target_ylim[0]), 1.0)
 
@@ -3723,17 +3630,16 @@ def _render_plot_map_layout_cadastral(
     guide_easting = target_xlim[0] + span_x * 0.035
     bottom_northing = target_ylim[0] + span_y * 0.032
     top_northing = target_ylim[1] - span_y * 0.035
-    top_line_end_easting = max(plot_min_x - span_x * 0.015, guide_easting + span_x * 0.20)
-    bottom_line_end_easting = min(
-        target_xlim[1] - span_x * 0.025,
-        max(plot_max_x + span_x * 0.085, guide_easting + span_x * 0.40),
-    )
 
     guide_fig_x, _ = fig.transFigure.inverted().transform(
         ax.transData.transform((guide_easting, top_northing))
     )
 
-    north_arrow_meta = add_north_arrow(
+    # The long blue vertical/horizontal reference-guide lines that used to connect the U.N. marker
+    # stem to the grid were removed at the user's request - the corner dash ticks drawn by
+    # draw_grid() above are now the only grid-reference marks on this template. The U.N. marker
+    # itself (the actual north indicator) still draws normally below.
+    add_north_arrow(
         ax,
         font_scale=max(font_scale * 1.62, font_scale + 0.30),
         style="un_marker",
@@ -3743,18 +3649,6 @@ def _render_plot_map_layout_cadastral(
         # arrow's own height doesn't reach up into/behind it.
         anchor_y=min(0.86, ax.get_position().y1 + 0.06),
         blue_hex=grid_color,
-    )
-    _draw_cadastral_reference_guides(
-        fig,
-        ax,
-        guide_easting_m=guide_easting,
-        bottom_northing_m=bottom_northing,
-        top_northing_m=top_northing,
-        top_line_end_easting_m=top_line_end_easting,
-        bottom_line_end_easting_m=bottom_line_end_easting,
-        arrow_meta=north_arrow_meta,
-        font_scale=font_scale,
-        color=grid_color,
     )
 
     _draw_cadastral_coordinate_labels(
