@@ -1213,22 +1213,41 @@ def draw_grid(
             )
 
     if edge_ticks and edge_tick_style == "corners":
-        # Akwa Ibom/Rivers/Cross River cadastral style: 4 short dashed reference ticks, one at
-        # each end of the grid - top-left, top-right, bottom-left, bottom-right - each projecting
-        # outward from the frame at the leftmost/rightmost major grid line within bounds. No long
-        # guide lines, no per-interval ticking along the sides - just these 4 corner marks.
-        xs = np.arange(math.floor(xmin / major) * major, xmax + 0.1, major)
-        xs_in_bounds = [x for x in xs if xmin <= x <= xmax]
-        if xs_in_bounds:
-            left_x, right_x = xs_in_bounds[0], xs_in_bounds[-1]
-            tick_xs = [left_x] if left_x == right_x else [left_x, right_x]
-            tick_len = (ymax - ymin) * 0.035
-            for tick_x in tick_xs:
-                for y_edge, y_end in ((ymax, ymax + tick_len), (ymin, ymin - tick_len)):
-                    ax.plot(
-                        [tick_x, tick_x], [y_edge, y_end], color=color, lw=0.9 * font_scale,
-                        linestyle=(0, (4, 3)), alpha=0.85, clip_on=False, zorder=6,
-                    )
+        # Akwa Ibom / Rivers / Cross River cadastral style: only 4 survey reference crosses, one
+        # at each map-frame corner. No repeated side ticks or full grid lines across the map.
+        cross_span_x = 0.018
+        cross_span_y = 0.018
+        corner_specs = (
+            (0.0, 0.0),
+            (1.0, 0.0),
+            (0.0, 1.0),
+            (1.0, 1.0),
+        )
+        for xf, yf in corner_specs:
+            ax.add_line(
+                mlines.Line2D(
+                    [xf - cross_span_x, xf + cross_span_x],
+                    [yf, yf],
+                    transform=ax.transAxes,
+                    color=color,
+                    lw=0.95 * font_scale,
+                    alpha=0.95,
+                    clip_on=False,
+                    zorder=6,
+                )
+            )
+            ax.add_line(
+                mlines.Line2D(
+                    [xf, xf],
+                    [yf - cross_span_y, yf + cross_span_y],
+                    transform=ax.transAxes,
+                    color=color,
+                    lw=0.95 * font_scale,
+                    alpha=0.95,
+                    clip_on=False,
+                    zorder=6,
+                )
+            )
     elif edge_ticks:
         # Original general-template style: a short inward tick at every major grid crossing along
         # all 4 sides.
@@ -3472,6 +3491,62 @@ def _draw_cadastral_coordinate_labels(
              transform=ax.transAxes, fontfamily=CADASTRAL_FONT_FAMILY)
 
 
+def _draw_cadastral_corner_reference_labels(
+    ax,
+    font_scale: float = 1.0,
+    color: str = CADASTRAL_BLUE,
+    grid_font: str | None = None,
+    grid_size: int | None = None,
+) -> None:
+    """Draw 4 corner reference crosses with their Easting / Northing values.
+
+    The South-South state templates use only corner reference crosses. Each corner gets:
+    - an Easting label above/below the frame
+    - a Northing label beside the frame
+    """
+    xmin, xmax = ax.get_xlim()
+    ymin, ymax = ax.get_ylim()
+    family = grid_font or CADASTRAL_FONT_FAMILY
+    fs = grid_size if grid_size else max(6, int(6.2 * font_scale))
+    e_offset = 0.032
+    n_offset = 0.038
+
+    corners = (
+        {"xf": 0.0, "yf": 1.0, "x": xmin, "y": ymax, "e_va": "bottom", "e_y": 1.0 + e_offset, "n_ha": "right", "n_x": 0.0 - n_offset},
+        {"xf": 1.0, "yf": 1.0, "x": xmax, "y": ymax, "e_va": "bottom", "e_y": 1.0 + e_offset, "n_ha": "left", "n_x": 1.0 + n_offset},
+        {"xf": 0.0, "yf": 0.0, "x": xmin, "y": ymin, "e_va": "top", "e_y": 0.0 - e_offset, "n_ha": "right", "n_x": 0.0 - n_offset},
+        {"xf": 1.0, "yf": 0.0, "x": xmax, "y": ymin, "e_va": "top", "e_y": 0.0 - e_offset, "n_ha": "left", "n_x": 1.0 + n_offset},
+    )
+    for corner in corners:
+        ax.text(
+            corner["xf"],
+            corner["e_y"],
+            f"{corner['x']:.3f}m E.",
+            transform=ax.transAxes,
+            ha="center",
+            va=corner["e_va"],
+            fontsize=fs,
+            color=color,
+            fontfamily=family,
+            clip_on=False,
+            zorder=7,
+        )
+        ax.text(
+            corner["n_x"],
+            corner["yf"],
+            f"{corner['y']:.3f}m N.",
+            transform=ax.transAxes,
+            ha=corner["n_ha"],
+            va="center",
+            rotation=90,
+            fontsize=fs,
+            color=color,
+            fontfamily=family,
+            clip_on=False,
+            zorder=7,
+        )
+
+
 def _draw_cadastral_frontage_road(ax, poly, road_name: str, font_scale: float = 1.0, color: str = "black") -> None:
     """Dashed frontage-road reference line just outside the boundary's lowest edge, labeled with
     the applicant's road/street name - the same "OLD ORON ROAD"-style annotation seen on the
@@ -3880,12 +3955,12 @@ def _render_plot_map_layout_cadastral(
         blue_hex=grid_color,
     )
 
-    _draw_cadastral_coordinate_labels(
+    _draw_cadastral_corner_reference_labels(
         ax,
-        easting_m=guide_easting,
-        northing_m=bottom_northing,
         font_scale=font_scale,
         color=grid_color,
+        grid_font=grid_font,
+        grid_size=grid_size,
     )
 
     certification_date = datetime.now().strftime("%d / %m / %Y")
