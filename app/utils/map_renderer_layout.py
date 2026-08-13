@@ -4068,7 +4068,7 @@ def _draw_fct_note_box(
 
 
 def _draw_fct_footer(
-    fig, y: float, surveyor_name: str, surveyor_rank: str, prepared_by: str,
+    fig, y: float, surveyor_name: str, surveyor_rank: str,
     font_scale: float = 1.0, text_color: str = "black",
 ) -> None:
     fs = max(6, int(7 * font_scale))
@@ -4077,7 +4077,7 @@ def _draw_fct_footer(
     date_text = datetime.now().strftime("%d %B %Y")
     fig.text(0.05, y, surveyor_line, fontsize=fs, fontfamily=FCT_FONT_FAMILY, color=text_color, ha="left", va="top")
     fig.text(
-        0.05, y - 0.02, f"PREPARED BY: {_safe_text(prepared_by, 'LANDCHECK').upper()}   {date_text}",
+        0.05, y - 0.02, f"PREPARED ON {date_text}",
         fontsize=fs, fontfamily=FCT_FONT_FAMILY, color=text_color, ha="left", va="top",
     )
 
@@ -4469,7 +4469,7 @@ def _render_plot_map_layout_fct(
     )
     _draw_fct_footer(
         fig, 0.075, surveyor_name=surveyor_name, surveyor_rank=surveyor_rank,
-        prepared_by="LandCheck", font_scale=font_scale, text_color=text_color,
+        font_scale=font_scale, text_color=text_color,
     )
 
     fig.savefig(output_path, dpi=dpi)
