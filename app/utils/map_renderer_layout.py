@@ -223,7 +223,15 @@ def draw_footer(fig, crs_text, source_text, surveyor, rank, font_scale=1.0, text
     fig.text(0.06, y_top - 0.050, "SIGNATURE: ____________________", fontsize=int(9*font_scale), color=text_color)
     fig.text(0.06, y_top - 0.075, f"DATE PRINTED: {now}", fontsize=int(9*font_scale), color=text_color)
 
-    fig.text(0.06, y_bot, str(crs_text), fontsize=int(8*font_scale), color="blue")
+    # Wrapped to a width that stays clear of the KEY box's left edge (x=0.35) - a long CRS
+    # description drawn as one line at a fixed x/y can otherwise run far enough right to visually
+    # intrude into the legend box sitting above/beside it.
+    crs_fontsize = int(8*font_scale)
+    crs_lines = _wrap_figure_text(fig, str(crs_text), width_fig=0.27, fontsize=crs_fontsize) or [str(crs_text)]
+    crs_line_step = 0.014
+    for idx, line in enumerate(crs_lines):
+        fig.text(0.06, y_bot - idx * crs_line_step, line, fontsize=crs_fontsize, color="blue")
+
     fig.text(0.94, y_bot_source, str(source_text), fontsize=int(8*font_scale), ha="right", color=text_color)
 
 
@@ -1038,6 +1046,7 @@ def draw_grid(
     full_grid: bool = False,
     edge_ticks: bool = True,
     color: str = "blue",
+    edge_tick_style: str = "multi",
 ):
     xmin, xmax = ax.get_xlim()
     ymin, ymax = ax.get_ylim()
@@ -1076,11 +1085,11 @@ def draw_grid(
                 )
             )
 
-    # Optional edge ticks: 4 short dashed reference ticks, one at each end of the grid - top-left,
-    # top-right, bottom-left, bottom-right - each projecting outward from the frame at the
-    # leftmost/rightmost major grid line within bounds. No long guide lines, no per-interval
-    # ticking along the sides - just these 4 corner marks.
-    if edge_ticks:
+    if edge_ticks and edge_tick_style == "corners":
+        # Akwa Ibom/Rivers/Cross River cadastral style: 4 short dashed reference ticks, one at
+        # each end of the grid - top-left, top-right, bottom-left, bottom-right - each projecting
+        # outward from the frame at the leftmost/rightmost major grid line within bounds. No long
+        # guide lines, no per-interval ticking along the sides - just these 4 corner marks.
         xs = np.arange(math.floor(xmin / major) * major, xmax + 0.1, major)
         xs_in_bounds = [x for x in xs if xmin <= x <= xmax]
         if xs_in_bounds:
@@ -1093,6 +1102,24 @@ def draw_grid(
                         [tick_x, tick_x], [y_edge, y_end], color=color, lw=0.9 * font_scale,
                         linestyle=(0, (4, 3)), alpha=0.85, clip_on=False, zorder=6,
                     )
+    elif edge_ticks:
+        # Original general-template style: a short inward tick at every major grid crossing along
+        # all 4 sides.
+        tick_len = (xmax - xmin) * 0.01
+        xs = np.arange(math.floor(xmin / major) * major, xmax + 0.1, major)
+        ys = np.arange(math.floor(ymin / major) * major, ymax + 0.1, major)
+
+        for x in xs:
+            if x < xmin or x > xmax:
+                continue
+            ax.plot([x, x], [ymax, ymax - tick_len], color=color, lw=0.6*font_scale, alpha=0.5)
+            ax.plot([x, x], [ymin, ymin + tick_len], color=color, lw=0.6*font_scale, alpha=0.5)
+
+        for y in ys:
+            if y < ymin or y > ymax:
+                continue
+            ax.plot([xmin, xmin + tick_len], [y, y], color=color, lw=0.6*font_scale, alpha=0.5)
+            ax.plot([xmax, xmax - tick_len], [y, y], color=color, lw=0.6*font_scale, alpha=0.5)
 
 
 def draw_coordinate_frame(
@@ -1480,7 +1507,7 @@ def annotate_vertices(
     return skipped, placed_boxes
 
 
-def draw_skipped_table(ax, entries, font_scale=1.0):
+def draw_skipped_table(ax, entries, font_scale=1.0, poly=None):
     if not entries:
         return
 
@@ -1498,12 +1525,42 @@ def draw_skipped_table(ax, entries, font_scale=1.0):
         for e in entries
     ]
 
+    table_w, table_h = 0.36, 0.18
+    # A fixed corner can land right on top of the boundary/points depending on the plot's shape
+    # and orientation - so pick whichever of the 4 axes corners has the least (ideally zero)
+    # overlap with the plot's own footprint, rather than always defaulting to bottom-right.
+    candidates = [
+        (0.62, 0.02), (0.02, 0.02), (0.62, 0.80), (0.02, 0.80),
+    ]
+    bbox_xy = candidates[0]
+    if poly is not None:
+        try:
+            xmin, xmax = ax.get_xlim()
+            ymin, ymax = ax.get_ylim()
+            x_span = max(xmax - xmin, 1e-9)
+            y_span = max(ymax - ymin, 1e-9)
+            poly_minx, poly_miny, poly_maxx, poly_maxy = poly.bounds
+            frac_minx = (poly_minx - xmin) / x_span
+            frac_maxx = (poly_maxx - xmin) / x_span
+            frac_miny = (poly_miny - ymin) / y_span
+            frac_maxy = (poly_maxy - ymin) / y_span
+            margin = 0.02
+
+            def overlap_area(cx, cy):
+                ox0, ox1 = max(cx, frac_minx - margin), min(cx + table_w, frac_maxx + margin)
+                oy0, oy1 = max(cy, frac_miny - margin), min(cy + table_h, frac_maxy + margin)
+                return max(0.0, ox1 - ox0) * max(0.0, oy1 - oy0)
+
+            bbox_xy = min(candidates, key=lambda c: overlap_area(*c))
+        except Exception:
+            bbox_xy = candidates[0]
+
     table = ax.table(
         cellText=cell_text,
         colLabels=header,
         cellLoc="center",
         colLoc="center",
-        bbox=[0.62, 0.02, 0.36, 0.18],
+        bbox=[bbox_xy[0], bbox_xy[1], table_w, table_h],
     )
     table.auto_set_font_size(False)
     table.set_fontsize(max(5, int(6 * font_scale)))
@@ -3599,7 +3656,7 @@ def _render_plot_map_layout_cadastral(
     major = nice_grid_step(max(ax.get_xlim()[1] - ax.get_xlim()[0], ax.get_ylim()[1] - ax.get_ylim()[0]))
     # Small grid-crossing tick marks at the frame edges (no crossing lines through the map
     # itself) - the reference template's convention for marking round Easting/Northing values.
-    draw_grid(ax, poly, major / 5.0, major, font_scale, full_grid=False, edge_ticks=True, color=grid_color)
+    draw_grid(ax, poly, major / 5.0, major, font_scale, full_grid=False, edge_ticks=True, color=grid_color, edge_tick_style="corners")
 
     annotate_vertices(
         ax,
@@ -4860,7 +4917,7 @@ def render_plot_map_layout(
         bearing_font=bearing_font,
         bearing_size=bearing_size,
     )
-    draw_skipped_table(ax, skipped_entries, font_scale)
+    draw_skipped_table(ax, skipped_entries, font_scale, poly=poly)
 
     # Road/river names (optional). Follow the path's own direction; keep clear of boundary labels.
     major_classes = {
@@ -4900,7 +4957,19 @@ def render_plot_map_layout(
         skip_point_fn=boundary_skip,
     )
 
-    add_north_arrow(ax, font_scale, style=north_arrow_style, color=north_arrow_color)
+    # draw_coordinate_frame's outer border sits at data-y = ax.get_ylim()[1] + grid_pad, above the
+    # map itself - the north arrow's default anchor doesn't know about that extra padding, so
+    # without this it can end up landing on/inside the grid frame instead of clearing it. Compute
+    # the frame's actual top edge in figure coordinates and anchor the arrow safely above it.
+    _grid_xlim = ax.get_xlim()
+    _grid_pad = (_grid_xlim[1] - _grid_xlim[0]) * 0.035
+    _, _grid_top_fig_y = fig.transFigure.inverted().transform(
+        ax.transData.transform((_grid_xlim[0], ax.get_ylim()[1] + _grid_pad))
+    )
+    add_north_arrow(
+        ax, font_scale, style=north_arrow_style, color=north_arrow_color,
+        anchor_y=min(0.93, _grid_top_fig_y + 0.045),
+    )
     add_scalebar(ax, 100 if scale_ratio <= 1000 else 500, font_scale=font_scale)
 
     ax.set_aspect("equal")
