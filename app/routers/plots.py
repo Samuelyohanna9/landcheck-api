@@ -4858,6 +4858,10 @@ def get_plot_features_geojson(
     paper_size: str | None = Query(default=None),
     template_name: str | None = Query(default=None),
 ):
+    plot_geom = None
+    display_epsg: int | None = None
+    extent_wgs84 = None
+
     # Buildings and rivers from detected_features
     feature_rows = db.execute(text("""
         SELECT feature_type, ST_AsGeoJSON(geom) AS geojson
@@ -4910,6 +4914,122 @@ def get_plot_features_geojson(
             "geometry": json.loads(geojson_str) if geojson_str else None,
             "properties": props,
         }
+
+    def _iter_line_parts(geom):
+        if geom is None:
+            return []
+        geom_type = getattr(geom, "geom_type", "")
+        if geom_type == "LineString":
+            return [geom] if getattr(geom, "length", 0.0) > 0 else []
+        if geom_type == "MultiLineString":
+            return [part for part in getattr(geom, "geoms", []) if getattr(part, "length", 0.0) > 0]
+        parts = []
+        for part in getattr(geom, "geoms", []):
+            part_type = getattr(part, "geom_type", "")
+            if part_type == "LineString" and getattr(part, "length", 0.0) > 0:
+                parts.append(part)
+            elif part_type == "MultiLineString":
+                parts.extend([sub for sub in getattr(part, "geoms", []) if getattr(sub, "length", 0.0) > 0])
+        return parts
+
+    def _metric_length_m(geom):
+        if geom is None:
+            return None
+        try:
+            metric_epsg = display_epsg or (_metric_epsg_for_wgs84_polygon(plot_geom) if plot_geom is not None else None)
+            if not metric_epsg:
+                return None
+            projected = gpd.GeoSeries([geom], crs="EPSG:4326").to_crs(epsg=metric_epsg).iloc[0]
+            return float(projected.length)
+        except Exception:
+            return None
+
+    def _line_anchor_point(geom):
+        candidate = geom
+        if extent_wgs84 is not None:
+            try:
+                clipped = geom.intersection(extent_wgs84)
+                clipped_parts = _iter_line_parts(clipped)
+                if clipped_parts:
+                    candidate = max(clipped_parts, key=lambda part: getattr(part, "length", 0.0))
+            except Exception:
+                pass
+        parts = _iter_line_parts(candidate)
+        if not parts:
+            parts = _iter_line_parts(geom)
+        if not parts:
+            return None
+        line = max(parts, key=lambda part: getattr(part, "length", 0.0))
+        try:
+            return line.interpolate(line.length / 2.0)
+        except Exception:
+            try:
+                return line.representative_point()
+            except Exception:
+                return None
+
+    def _position_hint(geom):
+        if extent_wgs84 is None:
+            return ""
+        anchor = _line_anchor_point(geom)
+        if anchor is None:
+            return ""
+        minx, miny, maxx, maxy = extent_wgs84.bounds
+        width = max(maxx - minx, 1e-9)
+        height = max(maxy - miny, 1e-9)
+        x_rel = (anchor.x - minx) / width
+        y_rel = (anchor.y - miny) / height
+
+        if x_rel < 0.33:
+            horiz = "west"
+        elif x_rel > 0.67:
+            horiz = "east"
+        else:
+            horiz = "center"
+
+        if y_rel < 0.33:
+            vert = "south"
+        elif y_rel > 0.67:
+            vert = "north"
+        else:
+            vert = "center"
+
+        if vert == "center" and horiz == "center":
+            return "center"
+        if vert == "center":
+            return horiz
+        if horiz == "center":
+            return vert
+        return f"{vert} {horiz}"
+
+    def _segment_key(kind: str, geom) -> str:
+        try:
+            digest = hashlib.sha1(bytes(geom.wkb)).hexdigest()[:12]
+        except Exception:
+            digest = hashlib.sha1(str(geom).encode("utf-8")).hexdigest()[:12]
+        return f"{kind}-{digest}"
+
+    def _line_sort_key(pair):
+        geom = pair[0]
+        anchor = _line_anchor_point(geom)
+        if anchor is None:
+            return (999.0, 999.0)
+        return (-float(anchor.y), float(anchor.x))
+
+    def _decorate_line_pairs(pairs: list[tuple[Any, dict]], kind: str) -> list[tuple[Any, dict]]:
+        sorted_pairs = sorted(pairs, key=_line_sort_key)
+        out: list[tuple[Any, dict]] = []
+        for idx, (geom, feature) in enumerate(sorted_pairs, start=1):
+            props = dict((feature or {}).get("properties") or {})
+            props["segment_key"] = _segment_key(kind, geom)
+            props["segment_index"] = idx
+            props["position_hint"] = _position_hint(geom)
+            length_m = _metric_length_m(geom)
+            if length_m is not None:
+                props["length_m"] = round(length_m, 2)
+            feature["properties"] = props
+            out.append((geom, feature))
+        return out
 
     # Each entry is (shapely geometry, feature dict) so overrides can be applied by spatial
     # intersection - same proven pattern already used in map_renderer_layout.py's apply_overrides
@@ -5030,20 +5150,12 @@ def get_plot_features_geojson(
             plot_wkb = db.execute(text("SELECT geom FROM plots WHERE id=:id"), {"id": plot_id}).scalar()
             if plot_wkb:
                 plot_geom = wkb.loads(plot_wkb)
-                centroid = plot_geom.centroid
-                utm_zone = int((centroid.x + 180) / 6) + 1
-                display_epsg = (32600 if centroid.y >= 0 else 32700) + utm_zone
+                display_epsg = _metric_epsg_for_wgs84_polygon(plot_geom)
 
                 proj_geom = gpd.GeoSeries([plot_geom], crs="EPSG:4326").to_crs(epsg=display_epsg).iloc[0]
 
                 paper_config = get_paper_config(paper_size or "A4")
-                normalized_template = str(template_name or "").strip().lower()
-                if normalized_template in ("akwa_ibom_osg", "rivers_osg", "cross_river_osg"):
-                    map_width_frac, map_height_frac = 0.84, 0.455
-                elif normalized_template == "adamawa_osg":
-                    map_width_frac, map_height_frac = 0.84, 0.555
-                else:
-                    map_width_frac, map_height_frac = 0.80, 0.45
+                map_width_frac, map_height_frac = _survey_template_map_frame(template_name)
 
                 scale_ratio = parse_scale_ratio(scale_text)
                 minx, miny, maxx, maxy = proj_geom.bounds
@@ -5058,6 +5170,18 @@ def get_plot_features_geojson(
                 rivers = [(g, f) for (g, f) in rivers if g.intersects(extent_wgs84)]
         except Exception:
             pass
+
+    if plot_geom is None:
+        try:
+            plot_wkb = db.execute(text("SELECT geom FROM plots WHERE id=:id"), {"id": plot_id}).scalar()
+            if plot_wkb:
+                plot_geom = wkb.loads(plot_wkb)
+                display_epsg = display_epsg or _metric_epsg_for_wgs84_polygon(plot_geom)
+        except Exception:
+            plot_geom = None
+
+    roads = _decorate_line_pairs(roads, "road")
+    rivers = _decorate_line_pairs(rivers, "river")
 
     return {
         "roads": {"type": "FeatureCollection", "features": [f for _, f in roads]},

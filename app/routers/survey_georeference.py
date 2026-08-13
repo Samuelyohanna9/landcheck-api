@@ -678,6 +678,7 @@ def _build_staking_rows(features: list[dict[str, Any]], target_coordinate_system
                     "northing": round(float(target_point[1]), 4),
                     "longitude": round(float(lng), 8),
                     "latitude": round(float(lat), 8),
+                    "point_type": "Digitized",
                 }
             )
         return rows
@@ -697,11 +698,54 @@ def _build_staking_rows(features: list[dict[str, Any]], target_coordinate_system
                 "northing": round(float(target_point[1]), 4),
                 "longitude": round(float(wgs_point[0]), 8),
                 "latitude": round(float(wgs_point[1]), 8),
+                "point_type": "Digitized",
             }
         )
         point_index += 1
     if not rows:
         raise HTTPException(status_code=400, detail="Add a primary polygon or point features before exporting CSV.")
+    return rows
+
+
+def _build_gcp_rows(gcps_raw: list[dict[str, Any]], target_coordinate_system: str) -> list[dict[str, Any]]:
+    """The ground control points the surveyor input to establish the georeferencing transform -
+    exported alongside the digitized/staked points (same row shape as _build_staking_rows) so a
+    DGPS crew has the tie points too, not just the derived output. Reuses the same
+    projected-vs-lng/lat detection _solve_affine already applies to these same raw points.
+    """
+    if not gcps_raw:
+        return []
+    target_epsg = _coordinate_system_to_epsg(target_coordinate_system)
+    forward_transformer, reverse_transformer = _make_transformers(target_epsg)
+
+    rows: list[dict[str, Any]] = []
+    for idx, gcp in enumerate(gcps_raw):
+        try:
+            raw_x = float(gcp.get("ground_x"))
+            raw_y = float(gcp.get("ground_y"))
+        except (TypeError, ValueError):
+            continue
+        if forward_transformer is None:
+            lng, lat = raw_x, raw_y
+            easting, northing = raw_x, raw_y
+        elif _looks_like_projected_coordinates(raw_x, raw_y):
+            easting, northing = raw_x, raw_y
+            lng, lat = reverse_transformer.transform(raw_x, raw_y)
+        else:
+            lng, lat = raw_x, raw_y
+            easting, northing = forward_transformer.transform(raw_x, raw_y)
+        rows.append(
+            {
+                "station": f"GCP{idx + 1}",
+                "feature": str(gcp.get("label") or f"GCP {idx + 1}"),
+                "coordinate_system": target_coordinate_system,
+                "easting": round(float(easting), 4),
+                "northing": round(float(northing), 4),
+                "longitude": round(float(lng), 8),
+                "latitude": round(float(lat), 8),
+                "point_type": "GCP",
+            }
+        )
     return rows
 
 
@@ -1316,17 +1360,30 @@ def _format_coordinate_number(value: float, decimals: int) -> str:
 @router.get("/sessions/{session_id}/exports/staking.csv")
 def export_georeference_staking_csv(session_id: str, db: Session = Depends(get_db)):
     row = _load_session_row(db, session_id)
+    target_coordinate_system = str(row.get("target_coordinate_system") or "wgs84")
     features = _safe_json_load(row.get("features_json"), [])
-    rows = _build_staking_rows(features, str(row.get("target_coordinate_system") or "wgs84"))
+    gcps_raw = _safe_json_load(row.get("gcps_json"), [])
+
+    gcp_rows = _build_gcp_rows(gcps_raw, target_coordinate_system)
+    try:
+        staking_rows = _build_staking_rows(features, target_coordinate_system)
+    except HTTPException:
+        # No digitized features yet isn't fatal here - the GCPs entered during georeferencing are
+        # still worth exporting on their own; only error out if there's genuinely nothing at all.
+        staking_rows = []
+    rows = gcp_rows + staking_rows
+    if not rows:
+        raise HTTPException(status_code=400, detail="Add ground control points or digitized features before exporting CSV.")
 
     csv_buffer = io.StringIO(newline="")
     # No "sep=," Excel hint line - GIS/DGPS CSV readers treat it as a malformed data row (wrong
     # column count) rather than the delimiter directive Excel understands it as.
     writer = csv.writer(csv_buffer, lineterminator="\r\n")
-    writer.writerow(["Station", "Feature", "Coordinate System", "Easting (m)", "Northing (m)", "Longitude", "Latitude"])
+    writer.writerow(["Type", "Station", "Feature", "Coordinate System", "Easting (m)", "Northing (m)", "Longitude", "Latitude"])
     for item in rows:
         writer.writerow(
             [
+                item.get("point_type", ""),
                 item["station"],
                 item["feature"],
                 str(item["coordinate_system"]).upper(),
