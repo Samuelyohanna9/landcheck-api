@@ -1076,23 +1076,22 @@ def draw_grid(
                 )
             )
 
-    # Optional edge ticks.
+    # Optional edge ticks: a single pair of short dashed reference ticks - one projecting outward
+    # above the top edge, one projecting outward below the bottom edge, both at the major grid
+    # line nearest the plot's horizontal center - marking where that Easting line would cross the
+    # frame, without ticking every interval on every side.
     if edge_ticks:
-        tick_len = (xmax - xmin) * 0.01
         xs = np.arange(math.floor(xmin / major) * major, xmax + 0.1, major)
-        ys = np.arange(math.floor(ymin / major) * major, ymax + 0.1, major)
-
-        for x in xs:
-            if x < xmin or x > xmax:
-                continue
-            ax.plot([x, x], [ymax, ymax - tick_len], color=color, lw=0.6*font_scale, alpha=0.5)
-            ax.plot([x, x], [ymin, ymin + tick_len], color=color, lw=0.6*font_scale, alpha=0.5)
-
-        for y in ys:
-            if y < ymin or y > ymax:
-                continue
-            ax.plot([xmin, xmin + tick_len], [y, y], color=color, lw=0.6*font_scale, alpha=0.5)
-            ax.plot([xmax, xmax - tick_len], [y, y], color=color, lw=0.6*font_scale, alpha=0.5)
+        xs_in_bounds = [x for x in xs if xmin <= x <= xmax]
+        if xs_in_bounds:
+            center_x = (xmin + xmax) / 2.0
+            tick_x = min(xs_in_bounds, key=lambda x: abs(x - center_x))
+            tick_len = (ymax - ymin) * 0.035
+            for y_edge, y_end in ((ymax, ymax + tick_len), (ymin, ymin - tick_len)):
+                ax.plot(
+                    [tick_x, tick_x], [y_edge, y_end], color=color, lw=0.9 * font_scale,
+                    linestyle=(0, (4, 3)), alpha=0.85, clip_on=False, zorder=6,
+                )
 
 
 def draw_coordinate_frame(
@@ -3740,7 +3739,9 @@ def _render_plot_map_layout_cadastral(
         style="un_marker",
         color=north_arrow_color,
         anchor_x=guide_fig_x,
-        anchor_y=min(0.95, ax.get_position().y1 + 0.11),
+        # Capped below the "PLAN NO" header box (its bottom edge sits at figure-y ~0.915) so the
+        # arrow's own height doesn't reach up into/behind it.
+        anchor_y=min(0.86, ax.get_position().y1 + 0.06),
         blue_hex=grid_color,
     )
     _draw_cadastral_reference_guides(
