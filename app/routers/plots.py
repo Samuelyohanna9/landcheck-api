@@ -5879,10 +5879,13 @@ def preview_plot_map(plot_id: int, db: Session = Depends(get_db), background_tas
     effective_scale_text = str(scale_text or "").strip() or "auto"
     resolved_scale_text = effective_scale_text
 
-    plot_row = db.execute(text("SELECT ST_AsBinary(geom) FROM plots WHERE id=:id"), {"id": plot_id}).fetchone()
-    if not plot_row or not plot_row[0]:
+    plot_geom_hex = db.execute(
+        text("SELECT encode(ST_AsBinary(geom), 'hex') FROM plots WHERE id=:id"),
+        {"id": plot_id},
+    ).scalar()
+    if not plot_geom_hex:
         raise HTTPException(status_code=404, detail="Plot not found")
-    plot_geom_wgs84 = wkb.loads(plot_row[0])
+    plot_geom_wgs84 = wkb.loads(plot_geom_hex, hex=True)
     if plot_geom_wgs84 is None or plot_geom_wgs84.is_empty:
         raise HTTPException(status_code=400, detail="Plot geometry is empty.")
 
