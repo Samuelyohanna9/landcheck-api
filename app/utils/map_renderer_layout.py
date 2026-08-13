@@ -174,6 +174,80 @@ def apply_true_scale(ax, geom_for_extent, scale_ratio: int, map_width_in: float,
     ax.set_ylim(cy - real_h / 2.0, cy + real_h / 2.0)
 
 
+# Reference scale a "normal" pen weight is calibrated against - 1:2000 is a typical single-plot
+# survey plan scale. Feature strokes get thinner at larger scales (small ratios, e.g. 1:500,
+# where there's more graphic room per real-world metre) and heavier at smaller scales (large
+# ratios, e.g. 1:10000, so a line doesn't vanish once that much ground is compressed onto the
+# page) - the same principle real cartographic drafting standards use, just applied continuously
+# instead of in fixed scale bands.
+_REFERENCE_SCALE_RATIO = 2000.0
+
+
+def mm_to_pt(mm: float) -> float:
+    return (mm / 25.4) * 72.0
+
+
+def scaled_line_weight(base_mm: float, font_scale: float = 1.0, scale_ratio: float | None = None) -> float:
+    """A feature-class pen weight (matplotlib `lw`, in points) derived from a real drafting weight
+    in millimetres, adjusted for paper size (font_scale, already tied to paper_config) and for the
+    plan's scale_ratio. `base_mm` should be the desired weight at the reference scale on an A4
+    sheet (font_scale ~1.0) - e.g. ~0.25mm for a building outline, ~0.3mm for a road/river line.
+    """
+    ratio = float(scale_ratio) if scale_ratio else _REFERENCE_SCALE_RATIO
+    scale_factor = max(0.70, min(1.60, ratio / _REFERENCE_SCALE_RATIO))
+    mm = max(0.12, float(base_mm) * max(0.75, font_scale) * scale_factor)
+    return mm_to_pt(mm)
+
+
+def feature_visible_at_scale(size_m: float, scale_ratio: float | None, min_paper_mm: float = 1.4) -> bool:
+    """Whether a real-world feature of the given size (its longest dimension, in metres) would
+    still render at least `min_paper_mm` on the printed page at this scale - the same
+    generalization principle real cartographic products use to omit clutter (a tiny shed, a
+    dangling road stub, a short stream segment) that would be illegible once compressed to the
+    plan's scale, rather than drawing every feature at every scale regardless of legibility.
+    """
+    ratio = float(scale_ratio) if scale_ratio else _REFERENCE_SCALE_RATIO
+    if ratio <= 0 or size_m is None:
+        return True
+    paper_mm = (float(size_m) * 1000.0) / ratio
+    return paper_mm >= min_paper_mm
+
+
+def _real_world_extent_m(geom_wgs84, display_epsg: int) -> float | None:
+    """Real-world size of a WGS84 geometry once projected: length for a line, bounding-box
+    diagonal for a polygon - a practical proxy for "how big does this actually read on the page".
+    """
+    try:
+        projected = gpd.GeoSeries([geom_wgs84], crs="EPSG:4326").to_crs(epsg=display_epsg).iloc[0]
+    except Exception:
+        return None
+    gtype = getattr(projected, "geom_type", "")
+    if gtype in ("LineString", "MultiLineString", "LinearRing"):
+        return float(projected.length)
+    try:
+        minx, miny, maxx, maxy = projected.bounds
+    except Exception:
+        return None
+    return math.hypot(maxx - minx, maxy - miny)
+
+
+def filter_features_by_scale(geoms_wgs84, display_epsg: int, scale_ratio, min_paper_mm: float = 1.6) -> list:
+    """Drops real-world-tiny features (a small shed, a short stream stub) that wouldn't render
+    legibly at this plan's scale - the same generalization real cartographic products apply,
+    rather than drawing every detected feature identically at every scale. Falls back to keeping a
+    feature if its size can't be determined, so a projection hiccup never silently drops data.
+    """
+    geoms = list(geoms_wgs84 or [])
+    if not geoms or not scale_ratio:
+        return geoms
+    kept = []
+    for geom in geoms:
+        size_m = _real_world_extent_m(geom, display_epsg)
+        if size_m is None or feature_visible_at_scale(size_m, scale_ratio, min_paper_mm=min_paper_mm):
+            kept.append(geom)
+    return kept
+
+
 # ======================
 # Page Layout Elements
 # ======================
@@ -1599,7 +1673,7 @@ def _iter_polygons(geom):
             yield from _iter_polygons(part)
 
 
-def _hatch_pass(ax, poly, minx, miny, maxx, maxy, spacing, direction, color, font_scale):
+def _hatch_pass(ax, poly, minx, miny, maxx, maxy, spacing, direction, color, font_scale, hatch_lw=None):
     """Draw one set of parallel scan lines (horizontal/vertical/diagonal) clipped to poly."""
     if direction == "vertical":
         x = minx + spacing
@@ -1609,7 +1683,7 @@ def _hatch_pass(ax, poly, minx, miny, maxx, maxy, spacing, direction, color, fon
             for segment in _iter_line_geometries(clipped):
                 try:
                     x_vals, y_vals = segment.xy
-                    ax.plot(x_vals, y_vals, color=color, lw=0.7 * font_scale, zorder=7.5)
+                    ax.plot(x_vals, y_vals, color=color, lw=hatch_lw if hatch_lw is not None else 0.7 * font_scale, zorder=7.5)
                 except Exception:
                     continue
             x += spacing
@@ -1628,7 +1702,7 @@ def _hatch_pass(ax, poly, minx, miny, maxx, maxy, spacing, direction, color, fon
             for segment in _iter_line_geometries(clipped):
                 try:
                     x_vals, y_vals = segment.xy
-                    ax.plot(x_vals, y_vals, color=color, lw=0.7 * font_scale, zorder=7.5)
+                    ax.plot(x_vals, y_vals, color=color, lw=hatch_lw if hatch_lw is not None else 0.7 * font_scale, zorder=7.5)
                 except Exception:
                     continue
             c += step
@@ -1640,7 +1714,7 @@ def _hatch_pass(ax, poly, minx, miny, maxx, maxy, spacing, direction, color, fon
             for segment in _iter_line_geometries(clipped):
                 try:
                     x_vals, y_vals = segment.xy
-                    ax.plot(x_vals, y_vals, color=color, lw=0.7 * font_scale, zorder=7.5)
+                    ax.plot(x_vals, y_vals, color=color, lw=hatch_lw if hatch_lw is not None else 0.7 * font_scale, zorder=7.5)
                 except Exception:
                     continue
             y += spacing
@@ -1670,6 +1744,7 @@ def draw_building_hatch(
     # Example: 3.5 mm on paper => 3.5m at 1:1000, 7m at 1:2000.
     hatch_spacing_mm = 3.5
     base_spacing = max(0.6, (hatch_spacing_mm / 1000.0) * max(scale_ratio, 100))
+    hatch_lw = scaled_line_weight(0.15, font_scale, scale_ratio)
     for geom in building_geoms:
         try:
             projected = gpd.GeoSeries([geom], crs="EPSG:4326").to_crs(epsg=display_epsg).iloc[0]
@@ -1684,7 +1759,7 @@ def draw_building_hatch(
                 # Keep spacing scale-driven, but shrink for very small buildings so hatch is still visible.
                 spacing = min(base_spacing, max(0.4, height / 4.0))
                 for direction in directions:
-                    _hatch_pass(ax, poly, minx, miny, maxx, maxy, spacing, direction, color, font_scale)
+                    _hatch_pass(ax, poly, minx, miny, maxx, maxy, spacing, direction, color, font_scale, hatch_lw=hatch_lw)
             except Exception:
                 continue
 
@@ -2106,10 +2181,21 @@ def _collect_connected_road_edge_lines(road_geoms_with_width, snap_tol_m: float 
     return edge_lines
 
 
-def _draw_road_edges(ax, edge_lines, font_scale=1.0, color: str = "black", linestyle="-"):
+def _draw_road_edges(ax, edge_lines, font_scale=1.0, color: str = "black", linestyle="-", scale_ratio=None):
     if not edge_lines:
         return
-    lw = 0.85 * font_scale
+    if scale_ratio:
+        # Drop dangling stub segments too short to read as anything but a stray mark at this
+        # plan's scale (e.g. a 3m sliver on a 1:5000 plan) - the same generalization real
+        # cartographic products apply, rather than drawing every geometric fragment identically
+        # regardless of scale.
+        edge_lines = [
+            seg for seg in edge_lines
+            if feature_visible_at_scale(getattr(seg, "length", 0.0), scale_ratio, min_paper_mm=1.5)
+        ]
+        if not edge_lines:
+            return
+    lw = scaled_line_weight(0.3, font_scale, scale_ratio)
     draw_lines = edge_lines
     try:
         network = unary_union(edge_lines)
@@ -2903,9 +2989,11 @@ def _render_plot_map_layout_adamawa(
     from shapely.geometry import box
     extent_poly = box(target_xlim[0], target_ylim[0], target_xlim[1], target_ylim[1])
 
-    if rivers:
-        gpd.GeoDataFrame(geometry=rivers, crs="EPSG:4326").to_crs(epsg=display_epsg).plot(
-            ax=ax, color=river_color, lw=1.0 * font_scale, zorder=5
+    # Drop river segments too short to read as anything but a stray mark at this plan's scale.
+    visible_rivers = filter_features_by_scale(rivers, display_epsg, scale_ratio, min_paper_mm=2.0)
+    if visible_rivers:
+        gpd.GeoDataFrame(geometry=visible_rivers, crs="EPSG:4326").to_crs(epsg=display_epsg).plot(
+            ax=ax, color=river_color, lw=scaled_line_weight(0.3, font_scale, scale_ratio), zorder=5
         )
 
     road_edge_lines = []
@@ -2960,7 +3048,7 @@ def _render_plot_map_layout_adamawa(
         river_label_features.append((snapped_clipped, name))
 
     road_edge_lines = _collect_connected_road_edge_lines(road_geom_width, snap_tol_m=road_snap_tol)
-    _draw_road_edges(ax, road_edge_lines, font_scale=font_scale, color=road_color)
+    _draw_road_edges(ax, road_edge_lines, font_scale=font_scale, color=road_color, scale_ratio=scale_ratio)
 
     min_road_label_len = max(2.0, (10.0 / 1000.0) * scale_ratio)
     _draw_names_along_path(
@@ -2979,13 +3067,17 @@ def _render_plot_map_layout_adamawa(
         all_buildings.extend(buildings)
     if added_buildings:
         all_buildings.extend(added_buildings)
-    if all_buildings:
+    # Skip real-world-tiny structures (a shed, a kiosk) that wouldn't render legibly at this
+    # plan's scale - drawing every detected speck identically at 1:500 and 1:10000 alike isn't
+    # how an accurate survey plan generalizes.
+    visible_buildings = filter_features_by_scale(all_buildings, display_epsg, scale_ratio, min_paper_mm=2.0)
+    if visible_buildings:
         draw_building_hatch(
-            ax, all_buildings, display_epsg, scale_ratio=scale_ratio, font_scale=font_scale,
+            ax, visible_buildings, display_epsg, scale_ratio=scale_ratio, font_scale=font_scale,
             color=building_color, hatch_type=building_hatch_type,
         )
-        gpd.GeoDataFrame(geometry=all_buildings, crs="EPSG:4326").to_crs(epsg=display_epsg).plot(
-            ax=ax, facecolor="none", edgecolor=building_color, lw=0.9 * font_scale, zorder=8
+        gpd.GeoDataFrame(geometry=visible_buildings, crs="EPSG:4326").to_crs(epsg=display_epsg).plot(
+            ax=ax, facecolor="none", edgecolor=building_color, lw=scaled_line_weight(0.2, font_scale, scale_ratio), zorder=8
         )
     if fences:
         draw_fences(ax, fences, display_epsg, scale_ratio=scale_ratio, font_scale=font_scale)
@@ -3556,9 +3648,11 @@ def _render_plot_map_layout_cadastral(
     from shapely.geometry import box
     extent_poly = box(target_xlim[0], target_ylim[0], target_xlim[1], target_ylim[1])
 
-    if rivers:
-        gpd.GeoDataFrame(geometry=rivers, crs="EPSG:4326").to_crs(epsg=display_epsg).plot(
-            ax=ax, color=river_color, lw=1.0 * font_scale, zorder=5
+    # Drop river segments too short to read as anything but a stray mark at this plan's scale.
+    visible_rivers = filter_features_by_scale(rivers, display_epsg, scale_ratio, min_paper_mm=2.0)
+    if visible_rivers:
+        gpd.GeoDataFrame(geometry=visible_rivers, crs="EPSG:4326").to_crs(epsg=display_epsg).plot(
+            ax=ax, color=river_color, lw=scaled_line_weight(0.3, font_scale, scale_ratio), zorder=5
         )
 
     road_geom_width = []
@@ -3582,7 +3676,7 @@ def _render_plot_map_layout_cadastral(
         except Exception:
             continue
     road_edge_lines = _collect_connected_road_edge_lines(road_geom_width, snap_tol_m=road_snap_tol)
-    _draw_road_edges(ax, road_edge_lines, font_scale=font_scale, color=road_color, linestyle=(0, (6, 4)))
+    _draw_road_edges(ax, road_edge_lines, font_scale=font_scale, color=road_color, linestyle=(0, (6, 4)), scale_ratio=scale_ratio)
 
     if _safe_text(location_text):
         try:
@@ -3613,13 +3707,17 @@ def _render_plot_map_layout_cadastral(
         all_buildings.extend(buildings)
     if added_buildings:
         all_buildings.extend(added_buildings)
-    if all_buildings:
+    # Skip real-world-tiny structures (a shed, a kiosk) that wouldn't render legibly at this
+    # plan's scale - drawing every detected speck identically at 1:500 and 1:10000 alike isn't
+    # how an accurate survey plan generalizes.
+    visible_buildings = filter_features_by_scale(all_buildings, display_epsg, scale_ratio, min_paper_mm=2.0)
+    if visible_buildings:
         draw_building_hatch(
-            ax, all_buildings, display_epsg, scale_ratio=scale_ratio, font_scale=font_scale,
+            ax, visible_buildings, display_epsg, scale_ratio=scale_ratio, font_scale=font_scale,
             color=building_color, hatch_type=building_hatch_type,
         )
-        gpd.GeoDataFrame(geometry=all_buildings, crs="EPSG:4326").to_crs(epsg=display_epsg).plot(
-            ax=ax, facecolor="none", edgecolor=building_color, lw=0.9 * font_scale, zorder=8
+        gpd.GeoDataFrame(geometry=visible_buildings, crs="EPSG:4326").to_crs(epsg=display_epsg).plot(
+            ax=ax, facecolor="none", edgecolor=building_color, lw=scaled_line_weight(0.2, font_scale, scale_ratio), zorder=8
         )
     if fences:
         draw_fences(ax, fences, display_epsg, scale_ratio=scale_ratio, font_scale=font_scale)
@@ -4106,9 +4204,11 @@ def _render_plot_map_layout_fct(
     from shapely.geometry import box
     extent_poly = box(target_xlim[0], target_ylim[0], target_xlim[1], target_ylim[1])
 
-    if rivers:
-        gpd.GeoDataFrame(geometry=rivers, crs="EPSG:4326").to_crs(epsg=display_epsg).plot(
-            ax=ax, color=river_color, lw=1.0 * font_scale, zorder=5
+    # Drop river segments too short to read as anything but a stray mark at this plan's scale.
+    visible_rivers = filter_features_by_scale(rivers, display_epsg, scale_ratio, min_paper_mm=2.0)
+    if visible_rivers:
+        gpd.GeoDataFrame(geometry=visible_rivers, crs="EPSG:4326").to_crs(epsg=display_epsg).plot(
+            ax=ax, color=river_color, lw=scaled_line_weight(0.3, font_scale, scale_ratio), zorder=5
         )
 
     road_geom_width = []
@@ -4150,7 +4250,7 @@ def _render_plot_map_layout_fct(
         road_edge_lines = clipped_edge_lines
     # The reference plan shows nearby roads as plain dashed reference lines, not solid double
     # lines - matching that convention here (Akwa Ibom/Rivers/Cross River do the same).
-    _draw_road_edges(ax, road_edge_lines, font_scale=font_scale, color=road_color, linestyle=(0, (6, 4)))
+    _draw_road_edges(ax, road_edge_lines, font_scale=font_scale, color=road_color, linestyle=(0, (6, 4)), scale_ratio=scale_ratio)
 
     def _project_clip_named(geom, name):
         try:
@@ -4175,13 +4275,17 @@ def _render_plot_map_layout_fct(
         all_buildings.extend(buildings)
     if added_buildings:
         all_buildings.extend(added_buildings)
-    if all_buildings:
+    # Skip real-world-tiny structures (a shed, a kiosk) that wouldn't render legibly at this
+    # plan's scale - drawing every detected speck identically at 1:500 and 1:10000 alike isn't
+    # how an accurate survey plan generalizes.
+    visible_buildings = filter_features_by_scale(all_buildings, display_epsg, scale_ratio, min_paper_mm=2.0)
+    if visible_buildings:
         draw_building_hatch(
-            ax, all_buildings, display_epsg, scale_ratio=scale_ratio, font_scale=font_scale,
+            ax, visible_buildings, display_epsg, scale_ratio=scale_ratio, font_scale=font_scale,
             color=building_color, hatch_type=building_hatch_type,
         )
-        gpd.GeoDataFrame(geometry=all_buildings, crs="EPSG:4326").to_crs(epsg=display_epsg).plot(
-            ax=ax, facecolor="none", edgecolor=building_color, lw=0.9 * font_scale, zorder=8
+        gpd.GeoDataFrame(geometry=visible_buildings, crs="EPSG:4326").to_crs(epsg=display_epsg).plot(
+            ax=ax, facecolor="none", edgecolor=building_color, lw=scaled_line_weight(0.2, font_scale, scale_ratio), zorder=8
         )
     if fences:
         draw_fences(ax, fences, display_epsg, scale_ratio=scale_ratio, font_scale=font_scale)
@@ -4673,9 +4777,11 @@ def render_plot_map_layout(
     has_rivers = len(rivers) > 0
     has_fences = len(fences) > 0
 
-    if rivers:
-        gpd.GeoDataFrame(geometry=rivers, crs="EPSG:4326").to_crs(epsg=display_epsg).plot(
-            ax=ax, color=river_color, lw=1.2*font_scale, zorder=5
+    # Drop river segments too short to read as anything but a stray mark at this plan's scale.
+    visible_rivers = filter_features_by_scale(rivers, display_epsg, scale_ratio, min_paper_mm=2.0)
+    if visible_rivers:
+        gpd.GeoDataFrame(geometry=visible_rivers, crs="EPSG:4326").to_crs(epsg=display_epsg).plot(
+            ax=ax, color=river_color, lw=scaled_line_weight(0.3, font_scale, scale_ratio), zorder=5
         )
 
     from shapely.geometry import box
@@ -4847,26 +4953,28 @@ def render_plot_map_layout(
         font_scale=font_scale,
     )
 
-    _draw_road_edges(ax, road_edge_lines, font_scale=font_scale, color=road_color)
+    _draw_road_edges(ax, road_edge_lines, font_scale=font_scale, color=road_color, scale_ratio=scale_ratio)
 
-    all_buildings = []
-    if buildings:
-        all_buildings.extend(buildings)
-    if added_buildings:
-        all_buildings.extend(added_buildings)
-    if all_buildings:
+    # Skip real-world-tiny structures (a shed, a kiosk) that wouldn't render legibly at this
+    # plan's scale - drawing every detected speck identically at 1:500 and 1:10000 alike isn't
+    # how an accurate survey plan generalizes.
+    visible_buildings = filter_features_by_scale(buildings, display_epsg, scale_ratio, min_paper_mm=2.0)
+    visible_added_buildings = filter_features_by_scale(added_buildings, display_epsg, scale_ratio, min_paper_mm=2.0)
+    all_visible_buildings = visible_buildings + visible_added_buildings
+    if all_visible_buildings:
         draw_building_hatch(
-            ax, all_buildings, display_epsg, scale_ratio=scale_ratio, font_scale=font_scale,
+            ax, all_visible_buildings, display_epsg, scale_ratio=scale_ratio, font_scale=font_scale,
             color=building_color, hatch_type=building_hatch_type,
         )
 
-    if buildings:
-        gpd.GeoDataFrame(geometry=buildings, crs="EPSG:4326").to_crs(epsg=display_epsg).plot(
-            ax=ax, facecolor="none", edgecolor=building_color, lw=1*font_scale, zorder=8
+    building_lw = scaled_line_weight(0.2, font_scale, scale_ratio)
+    if visible_buildings:
+        gpd.GeoDataFrame(geometry=visible_buildings, crs="EPSG:4326").to_crs(epsg=display_epsg).plot(
+            ax=ax, facecolor="none", edgecolor=building_color, lw=building_lw, zorder=8
         )
-    if added_buildings:
-        gpd.GeoDataFrame(geometry=added_buildings, crs="EPSG:4326").to_crs(epsg=display_epsg).plot(
-            ax=ax, facecolor="none", edgecolor=building_color, lw=1*font_scale, zorder=9
+    if visible_added_buildings:
+        gpd.GeoDataFrame(geometry=visible_added_buildings, crs="EPSG:4326").to_crs(epsg=display_epsg).plot(
+            ax=ax, facecolor="none", edgecolor=building_color, lw=building_lw, zorder=9
         )
     if fences or added_fences:
         draw_fences(
