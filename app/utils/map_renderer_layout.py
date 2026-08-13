@@ -2307,10 +2307,20 @@ def _draw_names_along_path(
     except Exception:
         data_per_in = 1.0
 
-    seen = set()
+    seen_pairs = set()
     for geom, name in name_geom_pairs:
         label = str(name or "").strip()
-        if not label or label in seen:
+        if not label:
+            continue
+        try:
+            geom_key = geom.wkb_hex
+        except Exception:
+            try:
+                geom_key = geom.wkt
+            except Exception:
+                geom_key = f"{getattr(geom, 'geom_type', 'geom')}:{round(float(getattr(geom, 'length', 0.0) or 0.0), 3)}"
+        pair_key = (label.casefold(), geom_key)
+        if pair_key in seen_pairs:
             continue
         try:
             merged = linemerge(geom) if geom.geom_type == "MultiLineString" else geom
@@ -2353,7 +2363,7 @@ def _draw_names_along_path(
                 ax.text(mid.x, mid.y, label, **text_kwargs)
                 placed_any = True
         if placed_any:
-            seen.add(label)
+            seen_pairs.add(pair_key)
 
 
 def _safe_text(value, fallback=""):
