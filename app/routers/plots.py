@@ -698,6 +698,13 @@ def upsert_plot_meta(
 
 
 def get_plot_meta(db: Session, plot_id: int) -> dict:
+    # Guards against a freshly-deployed process whose first plot_meta-touching request is a
+    # read (e.g. report/preview) rather than a save - without this, a column added in code but
+    # not yet migrated onto the live table (ensure_plot_meta_table is otherwise only called from
+    # upsert_plot_meta/create_plot) crashes this SELECT with "column does not exist", which surfaces
+    # to the browser as an opaque CORS/network error since the response never gets CORS headers.
+    # Cheap after the first call in a process's lifetime (see ensure_plot_meta_table's cached flag).
+    ensure_plot_meta_table(db)
     row = db.execute(text("""
         SELECT title_text, location_text, lga_text, state_text,
                surveyor_name, surveyor_rank, certification_statement, scale_text, paper_size, coordinate_system,
