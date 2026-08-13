@@ -42,6 +42,8 @@ from app.utils.map_renderer_layout import (
     render_plot_map_layout,
     get_paper_config,
     parse_scale_ratio,
+    is_auto_scale_text,
+    compute_fit_scale_ratio,
     apply_true_scale,
     annotate_vertices,
     draw_building_hatch,
@@ -70,7 +72,7 @@ REPORTS_DIR = os.path.join(BASE_DIR, "reports")
 PREVIEW_CACHE_DIR = os.path.join(REPORTS_DIR, "previews_cache")
 PREVIEW_CACHE_TTL_SECONDS = max(30, int(os.getenv("PLOT_PREVIEW_CACHE_TTL_SECONDS", "180")))
 PREVIEW_CACHE_MAX_FILES_PER_PLOT = max(5, int(os.getenv("PLOT_PREVIEW_CACHE_MAX_FILES_PER_PLOT", "24")))
-PREVIEW_LAYOUT_VERSION = "survey_layout_2026_08_13_road_name_fix_v85"
+PREVIEW_LAYOUT_VERSION = "survey_layout_2026_08_13_autofit_preview_v86"
 SURVEY_REPORT_RENDER_VERSION = "survey_report_2026_03_23_clockwise_v1"
 CLEAN_COPY_RENDER_VERSION = "clean_copy_2026_03_20_layout_v14"
 PLOT_EXPORT_JOB_STATUS_VALUES = {"queued", "running", "completed", "failed"}
@@ -239,6 +241,7 @@ def _ensure_plot_meta_table_impl(db: Session):
             fct_cadastral_zone TEXT,
             fct_origin_beacon_text TEXT,
             fct_cadastral_map_ref TEXT,
+            fct_title_prefix TEXT,
             technical_report_instruments JSONB DEFAULT '[]',
             technical_report_dgps_type TEXT,
             technical_report_num_surveyors INTEGER,
@@ -291,6 +294,7 @@ def _ensure_plot_meta_table_impl(db: Session):
         ("fct_cadastral_zone", "TEXT"),
         ("fct_origin_beacon_text", "TEXT"),
         ("fct_cadastral_map_ref", "TEXT"),
+        ("fct_title_prefix", "TEXT"),
         ("technical_report_instruments", "JSONB DEFAULT '[]'"),
         ("technical_report_dgps_type", "TEXT"),
         ("technical_report_num_surveyors", "INTEGER"),
@@ -533,6 +537,7 @@ def upsert_plot_meta(
     fct_cadastral_zone: Optional[str] = None,
     fct_origin_beacon_text: Optional[str] = None,
     fct_cadastral_map_ref: Optional[str] = None,
+    fct_title_prefix: Optional[str] = None,
     technical_report_instruments: Optional[list] = None,
     technical_report_dgps_type: Optional[str] = None,
     technical_report_num_surveyors: Optional[int] = None,
@@ -563,6 +568,7 @@ def upsert_plot_meta(
             adamawa_surveyed_by_text, adamawa_disclaimer_text,
             cadastral_plan_no, cadastral_area_name, cadastral_datum_text, cadastral_firm_block_text,
             fct_file_no, fct_district, fct_cadastral_zone, fct_origin_beacon_text, fct_cadastral_map_ref,
+            fct_title_prefix,
             technical_report_instruments, technical_report_dgps_type,
             technical_report_num_surveyors, technical_report_num_technical_officers,
             technical_report_num_labourers, technical_report_recce_text,
@@ -579,6 +585,7 @@ def upsert_plot_meta(
             :adamawa_surveyed_by_text, :adamawa_disclaimer_text,
             :cadastral_plan_no, :cadastral_area_name, :cadastral_datum_text, :cadastral_firm_block_text,
             :fct_file_no, :fct_district, :fct_cadastral_zone, :fct_origin_beacon_text, :fct_cadastral_map_ref,
+            :fct_title_prefix,
             CAST(COALESCE(:technical_report_instruments, '[]') AS JSONB), :technical_report_dgps_type,
             :technical_report_num_surveyors, :technical_report_num_technical_officers,
             :technical_report_num_labourers, :technical_report_recce_text,
@@ -622,6 +629,7 @@ def upsert_plot_meta(
             fct_cadastral_zone = COALESCE(NULLIF(EXCLUDED.fct_cadastral_zone, ''), plot_meta.fct_cadastral_zone),
             fct_origin_beacon_text = COALESCE(NULLIF(EXCLUDED.fct_origin_beacon_text, ''), plot_meta.fct_origin_beacon_text),
             fct_cadastral_map_ref = COALESCE(NULLIF(EXCLUDED.fct_cadastral_map_ref, ''), plot_meta.fct_cadastral_map_ref),
+            fct_title_prefix = COALESCE(NULLIF(EXCLUDED.fct_title_prefix, ''), plot_meta.fct_title_prefix),
             technical_report_instruments = COALESCE(CAST(:technical_report_instruments AS JSONB), plot_meta.technical_report_instruments),
             technical_report_dgps_type = COALESCE(NULLIF(EXCLUDED.technical_report_dgps_type, ''), plot_meta.technical_report_dgps_type),
             technical_report_num_surveyors = COALESCE(EXCLUDED.technical_report_num_surveyors, plot_meta.technical_report_num_surveyors),
@@ -671,6 +679,8 @@ def upsert_plot_meta(
         "fct_cadastral_zone": fct_cadastral_zone,
         "fct_origin_beacon_text": fct_origin_beacon_text,
         "fct_cadastral_map_ref": fct_cadastral_map_ref,
+        "fct_title_prefix": fct_title_prefix,
+        "fct_title_prefix": fct_title_prefix,
         "technical_report_instruments": technical_report_instruments_json,
         "technical_report_dgps_type": technical_report_dgps_type,
         "technical_report_num_surveyors": technical_report_num_surveyors,
@@ -697,6 +707,7 @@ def get_plot_meta(db: Session, plot_id: int) -> dict:
                adamawa_surveyed_by_text, adamawa_disclaimer_text,
                cadastral_plan_no, cadastral_area_name, cadastral_datum_text, cadastral_firm_block_text,
                fct_file_no, fct_district, fct_cadastral_zone, fct_origin_beacon_text, fct_cadastral_map_ref,
+               fct_title_prefix,
                parent_plot_id, subdivision_batch_id, subdivision_lot_no, estate_name,
                technical_report_instruments, technical_report_dgps_type,
                technical_report_num_surveyors, technical_report_num_technical_officers,
@@ -744,6 +755,7 @@ def get_plot_meta(db: Session, plot_id: int) -> dict:
             "fct_cadastral_zone": "",
             "fct_origin_beacon_text": "",
             "fct_cadastral_map_ref": "",
+            "fct_title_prefix": "",
             "parent_plot_id": None,
             "subdivision_batch_id": None,
             "subdivision_lot_no": "",
@@ -812,6 +824,7 @@ def get_plot_meta(db: Session, plot_id: int) -> dict:
         "fct_cadastral_zone": row.get("fct_cadastral_zone") or "",
         "fct_origin_beacon_text": row.get("fct_origin_beacon_text") or "",
         "fct_cadastral_map_ref": row.get("fct_cadastral_map_ref") or "",
+        "fct_title_prefix": row.get("fct_title_prefix") or "",
         "parent_plot_id": row.get("parent_plot_id"),
         "subdivision_batch_id": row.get("subdivision_batch_id"),
         "subdivision_lot_no": row.get("subdivision_lot_no") or "",
@@ -1358,6 +1371,17 @@ def _metric_epsg_for_wgs84_polygon(poly_wgs84: Polygon) -> int:
     return (32600 + zone) if centroid.y >= 0 else (32700 + zone)
 
 
+def _survey_template_map_frame(template_name: str | None) -> tuple[float, float]:
+    template = str(template_name or DEFAULT_TEMPLATE_NAME).strip().lower()
+    if template == "adamawa_osg":
+        return 0.84, 0.555
+    if template in {"akwa_ibom_osg", "cross_river_osg", "rivers_osg"}:
+        return 0.84, 0.455
+    if template == "fct_abuja_osg":
+        return 0.66, 0.48
+    return 0.80, 0.45
+
+
 def _split_polygon_once_by_area(poly_metric: Polygon, target_area: float) -> tuple[Polygon, Polygon]:
     poly = _clean_single_polygon(poly_metric)
     if poly is None:
@@ -1789,6 +1813,7 @@ def _apply_child_plot_meta(
                 fct_cadastral_zone = :fct_cadastral_zone,
                 fct_origin_beacon_text = :fct_origin_beacon_text,
                 fct_cadastral_map_ref = :fct_cadastral_map_ref,
+                fct_title_prefix = :fct_title_prefix,
                 updated_at = NOW()
             WHERE plot_id = :plot_id
             """
@@ -1838,6 +1863,7 @@ def _apply_child_plot_meta(
             "fct_cadastral_zone": parent_meta.get("fct_cadastral_zone") or "",
             "fct_origin_beacon_text": parent_meta.get("fct_origin_beacon_text") or "",
             "fct_cadastral_map_ref": parent_meta.get("fct_cadastral_map_ref") or "",
+            "fct_title_prefix": parent_meta.get("fct_title_prefix") or "",
         },
     )
 
@@ -2779,6 +2805,7 @@ def _render_survey_plan_pdf_for_plot(db: Session, plot_id: int, output_pdf_path:
         fct_cadastral_zone=meta.get("fct_cadastral_zone") or "",
         fct_origin_beacon_text=meta.get("fct_origin_beacon_text") or "",
         fct_cadastral_map_ref=meta.get("fct_cadastral_map_ref") or "",
+        fct_title_prefix=meta.get("fct_title_prefix") or "",
     )
     report = get_plot_report(plot_id, db)
     generate_plot_report_pdf(report, output_pdf_path, map_path, paper_size=meta["paper_size"])
@@ -4114,6 +4141,7 @@ def create_plot_survey_report_export_job(
     fct_cadastral_zone: str = Body(""),
     fct_origin_beacon_text: str = Body(""),
     fct_cadastral_map_ref: str = Body(""),
+    fct_title_prefix: str = Body(""),
 ):
     request_payload = {
         "title_text": title_text,
@@ -4174,6 +4202,7 @@ def create_plot_survey_report_export_job(
         "fct_cadastral_zone": fct_cadastral_zone,
         "fct_origin_beacon_text": fct_origin_beacon_text,
         "fct_cadastral_map_ref": fct_cadastral_map_ref,
+        "fct_title_prefix": fct_title_prefix,
     }
     cache_key = _build_plot_export_cache_key(
         db,
@@ -5324,6 +5353,7 @@ def save_plot_metadata(
     fct_cadastral_zone: str = Body(""),
     fct_origin_beacon_text: str = Body(""),
     fct_cadastral_map_ref: str = Body(""),
+    fct_title_prefix: str = Body(""),
 ):
     upsert_plot_meta(
         db=db,
@@ -5363,6 +5393,7 @@ def save_plot_metadata(
         fct_cadastral_zone=fct_cadastral_zone,
         fct_origin_beacon_text=fct_origin_beacon_text,
         fct_cadastral_map_ref=fct_cadastral_map_ref,
+        fct_title_prefix=fct_title_prefix,
     )
     return {"ok": True, "plot_id": int(plot_id)}
 
@@ -5426,7 +5457,8 @@ def download_plot_report_pdf(plot_id: int, db: Session = Depends(get_db), backgr
     fct_district: str = Body(""),
     fct_cadastral_zone: str = Body(""),
     fct_origin_beacon_text: str = Body(""),
-    fct_cadastral_map_ref: str = Body("")):
+    fct_cadastral_map_ref: str = Body(""),
+    fct_title_prefix: str = Body("")):
 
     reports_dir = REPORTS_DIR
     maps_dir = os.path.join(REPORTS_DIR, "maps")
@@ -5478,6 +5510,7 @@ def download_plot_report_pdf(plot_id: int, db: Session = Depends(get_db), backgr
         fct_cadastral_zone=fct_cadastral_zone,
         fct_origin_beacon_text=fct_origin_beacon_text,
         fct_cadastral_map_ref=fct_cadastral_map_ref,
+        fct_title_prefix=fct_title_prefix,
     )
 
     # Get EPSG code for selected coordinate system
@@ -5548,6 +5581,7 @@ def download_plot_report_pdf(plot_id: int, db: Session = Depends(get_db), backgr
         fct_cadastral_zone=fct_cadastral_zone,
         fct_origin_beacon_text=fct_origin_beacon_text,
         fct_cadastral_map_ref=fct_cadastral_map_ref,
+        fct_title_prefix=fct_title_prefix,
     )
 
     report = get_plot_report(plot_id, db)
@@ -5779,7 +5813,7 @@ def preview_plot_map(plot_id: int, db: Session = Depends(get_db), background_tas
     location_text: str = Body(""),
     lga_text: str = Body(""),
     state_text: str = Body(""),
-    scale_text: str = Body("1 : 1000"),
+    scale_text: str = Body("auto"),
     surveyor_name: str = Body(""),
     surveyor_rank: str = Body(""),
     certification_statement: str = Body(DEFAULT_CERTIFICATION_STATEMENT),
@@ -5832,7 +5866,35 @@ def preview_plot_map(plot_id: int, db: Session = Depends(get_db), background_tas
     fct_district: str = Body(""),
     fct_cadastral_zone: str = Body(""),
     fct_origin_beacon_text: str = Body(""),
-    fct_cadastral_map_ref: str = Body("")):
+    fct_cadastral_map_ref: str = Body(""),
+    fct_title_prefix: str = Body("")):
+
+    effective_scale_text = str(scale_text or "").strip() or "auto"
+    resolved_scale_text = effective_scale_text
+
+    plot_row = db.execute(text("SELECT ST_AsBinary(geom) FROM plots WHERE id=:id"), {"id": plot_id}).fetchone()
+    if not plot_row or not plot_row[0]:
+        raise HTTPException(status_code=404, detail="Plot not found")
+    plot_geom_wgs84 = wkb.loads(plot_row[0])
+    if plot_geom_wgs84 is None or plot_geom_wgs84.is_empty:
+        raise HTTPException(status_code=400, detail="Plot geometry is empty.")
+
+    effective_epsg = COORDINATE_SYSTEMS.get(coordinate_system, 4326)
+    if coordinate_system == "wgs84" or effective_epsg == 4326:
+        effective_epsg = _metric_epsg_for_wgs84_polygon(plot_geom_wgs84)
+    plot_metric = gpd.GeoSeries([plot_geom_wgs84], crs="EPSG:4326").to_crs(epsg=effective_epsg).iloc[0]
+
+    paper_config = get_paper_config(paper_size)
+    map_width_fraction, map_height_fraction = _survey_template_map_frame(template_name)
+    if is_auto_scale_text(effective_scale_text):
+        fitted_ratio = compute_fit_scale_ratio(
+            plot_metric,
+            paper_config.fig_width * map_width_fraction,
+            paper_config.fig_height * map_height_fraction,
+        )
+        resolved_scale_text = f"1 : {fitted_ratio}"
+    else:
+        resolved_scale_text = f"1 : {parse_scale_ratio(effective_scale_text)}"
 
     payload_for_cache = {
         "_layout_version": PREVIEW_LAYOUT_VERSION,
@@ -5840,7 +5902,7 @@ def preview_plot_map(plot_id: int, db: Session = Depends(get_db), background_tas
         "location_text": location_text,
         "lga_text": lga_text,
         "state_text": state_text,
-        "scale_text": scale_text,
+        "scale_text": resolved_scale_text,
         "surveyor_name": surveyor_name,
         "surveyor_rank": surveyor_rank,
         "certification_statement": certification_statement,
@@ -5894,6 +5956,7 @@ def preview_plot_map(plot_id: int, db: Session = Depends(get_db), background_tas
         "fct_cadastral_zone": fct_cadastral_zone,
         "fct_origin_beacon_text": fct_origin_beacon_text,
         "fct_cadastral_map_ref": fct_cadastral_map_ref,
+        "fct_title_prefix": fct_title_prefix,
     }
     revision_token = build_preview_revision_token(db, plot_id)
     cache_key = build_preview_cache_key(plot_id, payload_for_cache, revision_token)
@@ -5903,7 +5966,10 @@ def preview_plot_map(plot_id: int, db: Session = Depends(get_db), background_tas
         return FileResponse(
             cached_path,
             media_type="image/png",
-            headers={"Cache-Control": "no-store"},
+            headers={
+                "Cache-Control": "no-store",
+                "X-LandCheck-Resolved-Scale": resolved_scale_text,
+            },
         )
 
     cleanup_preview_files(plot_id)
@@ -5922,7 +5988,7 @@ def preview_plot_map(plot_id: int, db: Session = Depends(get_db), background_tas
         surveyor_name=surveyor_name,
         surveyor_rank=surveyor_rank,
         certification_statement=certification_statement,
-        scale_text=scale_text,
+        scale_text=resolved_scale_text,
         paper_size=paper_size,
         coordinate_system=coordinate_system,
         template_name=template_name,
@@ -5950,6 +6016,7 @@ def preview_plot_map(plot_id: int, db: Session = Depends(get_db), background_tas
         fct_cadastral_zone=fct_cadastral_zone,
         fct_origin_beacon_text=fct_origin_beacon_text,
         fct_cadastral_map_ref=fct_cadastral_map_ref,
+        fct_title_prefix=fct_title_prefix,
     )
 
     # Get EPSG code for selected coordinate system
@@ -5964,7 +6031,7 @@ def preview_plot_map(plot_id: int, db: Session = Depends(get_db), background_tas
         location_text=location_text,
         lga_text=lga_text,
         state_text=state_text,
-        scale_text=scale_text,
+        scale_text=resolved_scale_text,
         surveyor_name=surveyor_name,
         surveyor_rank=surveyor_rank,
         certification_statement=certification_statement,
@@ -6021,6 +6088,7 @@ def preview_plot_map(plot_id: int, db: Session = Depends(get_db), background_tas
         fct_cadastral_zone=fct_cadastral_zone,
         fct_origin_beacon_text=fct_origin_beacon_text,
         fct_cadastral_map_ref=fct_cadastral_map_ref,
+        fct_title_prefix=fct_title_prefix,
     )
 
     cache_path = preview_cache_path(plot_id, cache_key, variant="survey")
@@ -6042,7 +6110,10 @@ def preview_plot_map(plot_id: int, db: Session = Depends(get_db), background_tas
     return FileResponse(
         served_path,
         media_type="image/png",
-        headers={"Cache-Control": "no-store"},
+        headers={
+            "Cache-Control": "no-store",
+            "X-LandCheck-Resolved-Scale": resolved_scale_text,
+        },
         background=served_background,
     )
 
@@ -6509,6 +6580,7 @@ def get_saved_survey_plan_pdf(plot_id: int, refresh: bool = False, db: Session =
         fct_cadastral_zone=meta.get("fct_cadastral_zone") or "",
         fct_origin_beacon_text=meta.get("fct_origin_beacon_text") or "",
         fct_cadastral_map_ref=meta.get("fct_cadastral_map_ref") or "",
+        fct_title_prefix=meta.get("fct_title_prefix") or "",
         )
         report = get_plot_report(plot_id, db)
         generate_plot_report_pdf(report, pdf_path, map_path, paper_size=meta["paper_size"])

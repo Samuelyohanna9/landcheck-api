@@ -159,6 +159,59 @@ def parse_scale_ratio(scale_text: str) -> int:
         return 1000
 
 
+def is_auto_scale_text(scale_text: str | None) -> bool:
+    raw = str(scale_text or "").strip().lower()
+    if not raw:
+        return True
+    normalized = raw.replace(" ", "")
+    return normalized in {"auto", "fit", "autofit", "1:auto", "1:fit", "1:autofit"}
+
+
+def compute_fit_scale_ratio(
+    geom_for_extent,
+    map_width_in: float,
+    map_height_in: float,
+    *,
+    min_scale_ratio: int = 100,
+    max_scale_ratio: int = 50000,
+    padding_factor: float = 1.18,
+) -> int:
+    minx, miny, maxx, maxy = geom_for_extent.bounds
+    width_m = max(float(maxx - minx), 0.01)
+    height_m = max(float(maxy - miny), 0.01)
+    inch_to_m = 0.0254
+    usable_width_m = max(float(map_width_in) * inch_to_m, 0.001)
+    usable_height_m = max(float(map_height_in) * inch_to_m, 0.001)
+    ratio_w = width_m / usable_width_m
+    ratio_h = height_m / usable_height_m
+    fitted = math.ceil(max(ratio_w, ratio_h) * max(padding_factor, 1.0))
+    return max(min_scale_ratio, min(max_scale_ratio, int(fitted or min_scale_ratio)))
+
+
+def resolve_scale_text_and_ratio(
+    scale_text: str | None,
+    geom_for_extent,
+    map_width_in: float,
+    map_height_in: float,
+    *,
+    min_scale_ratio: int = 100,
+    max_scale_ratio: int = 50000,
+    padding_factor: float = 1.18,
+) -> tuple[str, int]:
+    if is_auto_scale_text(scale_text):
+        ratio = compute_fit_scale_ratio(
+            geom_for_extent,
+            map_width_in,
+            map_height_in,
+            min_scale_ratio=min_scale_ratio,
+            max_scale_ratio=max_scale_ratio,
+            padding_factor=padding_factor,
+        )
+        return f"1 : {ratio}", ratio
+    ratio = parse_scale_ratio(str(scale_text or "1 : 1000"))
+    return f"1 : {ratio}", ratio
+
+
 def road_half_width_m(highway: str) -> float:
     # Use a fixed, reasonable cartographic width for all roads
     return 3.0
@@ -2967,6 +3020,12 @@ def _render_plot_map_layout_adamawa(
     map_left, map_bottom, map_width, map_height = 0.08, 0.225, 0.84, 0.555
     ax = fig.add_axes([map_left, map_bottom, map_width, map_height])
 
+    resolved_scale_text, scale_ratio = resolve_scale_text_and_ratio(
+        scale_text,
+        poly,
+        fig_width * map_width,
+        fig_height * map_height,
+    )
     rof_no = _safe_text(adamawa_rof_no, f"{plot_id}")
     owner_text = _safe_text(adamawa_owner_name, title_text)
     _draw_adamawa_header(
@@ -2975,14 +3034,13 @@ def _render_plot_map_layout_adamawa(
         owner_name=owner_text,
         location_text=location_text,
         lga_text=lga_text,
-        scale_text=scale_text,
+        scale_text=resolved_scale_text,
         authority_title=_safe_text(adamawa_authority_title, DEFAULT_ADAMAWA_AUTHORITY_TITLE),
         authority_date_text=_safe_text(adamawa_authority_date_text, DEFAULT_ADAMAWA_AUTHORITY_DATE),
         font_scale=font_scale,
         text_color=text_color,
     )
 
-    scale_ratio = parse_scale_ratio(scale_text)
     apply_true_scale(ax, poly, scale_ratio, fig_width * map_width, fig_height * map_height)
     target_xlim = ax.get_xlim()
     target_ylim = ax.get_ylim()
@@ -3625,6 +3683,13 @@ def _render_plot_map_layout_cadastral(
     resolved_state_label = _safe_text(state_text) or state_label
     coordinate_system_text = _resolve_cadastral_coordinate_system_text(coordinate_system, display_epsg)
 
+    resolved_scale_text, scale_ratio = resolve_scale_text_and_ratio(
+        scale_text,
+        poly,
+        fig_width * map_width,
+        fig_height * map_height,
+    )
+
     _draw_cadastral_header(
         fig,
         plan_no=plan_no_value,
@@ -3633,7 +3698,7 @@ def _render_plot_map_layout_cadastral(
         area_name=cadastral_area_name,
         lga_text=lga_text,
         state_label=resolved_state_label,
-        scale_text=scale_text,
+        scale_text=resolved_scale_text,
         coordinate_system_text=coordinate_system_text,
         datum_text=cadastral_datum_text,
         area_m2=float(area_m2 or 0),
@@ -3641,7 +3706,6 @@ def _render_plot_map_layout_cadastral(
         text_color=text_color,
     )
 
-    scale_ratio = parse_scale_ratio(scale_text)
     apply_true_scale(ax, poly, scale_ratio, fig_width * map_width, fig_height * map_height)
     target_xlim = ax.get_xlim()
     target_ylim = ax.get_ylim()
@@ -3847,7 +3911,7 @@ FCT_FONT_FAMILY = "DejaVu Sans"
 
 def _draw_fct_header(
     fig, applicant_name: str, file_no: str, district: str, cadastral_zone: str, plot_no: str,
-    font_scale: float = 1.0, text_color: str = "black",
+    font_scale: float = 1.0, text_color: str = "black", title_prefix: str = "SURVEY PLAN FOR",
 ) -> None:
     fig.add_artist(patches.Rectangle((0.03, 0.03), 0.94, 0.94, transform=fig.transFigure, fill=False, lw=1.2))
 
@@ -3864,7 +3928,7 @@ def _draw_fct_header(
         )
         y -= line_h * gap
 
-    line(f"LAND GRANTED TO {_safe_text(applicant_name, '-').upper()}", size_mult=1.05)
+    line(f"{_safe_text(title_prefix, 'SURVEY PLAN FOR').upper()} {_safe_text(applicant_name, '-').upper()}", size_mult=1.05)
     line(f"FILE NO: {_safe_text(file_no, '-').upper()}", bold=False)
     line(f"DISTRICT: {_safe_text(district, '-').upper()}", bold=False)
     line(f"CADASTRAL ZONE: {_safe_text(cadastral_zone, '-').upper()}", bold=False)
@@ -4043,6 +4107,7 @@ def _render_plot_map_layout_fct(
     fct_cadastral_zone: str = "",
     fct_origin_beacon_text: str = "",
     fct_cadastral_map_ref: str = "",
+    fct_title_prefix: str = "",
     preview_mode: bool = False,
     boundary_color: str | None = None,
     grid_color: str | None = None,
@@ -4068,10 +4133,10 @@ def _render_plot_map_layout_fct(
     river_color = river_color or "#10a3df"
     building_color = building_color or "black"
     building_hatch_type = building_hatch_type or "diagonal"
-    # The reference plan draws bearing/distance labels in black even though the boundary itself
-    # is red - annotate_vertices' boundary_color param drives that text color independently of
-    # the actual boundary line, which is drawn separately below.
-    bearing_text_color = "black"
+    # Bearing/distance labels follow the same boundary_color the Appearance panel's color picker
+    # sets for the boundary line itself (red by default) - annotate_vertices' boundary_color param
+    # drives text color independently of the actual boundary line, which is drawn separately below.
+    bearing_text_color = boundary_color
 
     plot_wkb = db.execute(text("SELECT geom FROM plots WHERE id=:id"), {"id": plot_id}).scalar()
     if not plot_wkb:
@@ -4191,13 +4256,19 @@ def _render_plot_map_layout_fct(
     map_left, map_bottom, map_width, map_height = 0.08, 0.30, 0.66, 0.48
     ax = fig.add_axes([map_left, map_bottom, map_width, map_height])
 
+    resolved_scale_text, scale_ratio = resolve_scale_text_and_ratio(
+        scale_text,
+        poly,
+        fig_width * map_width,
+        fig_height * map_height,
+    )
     plot_no_value = _safe_text(cadastral_plan_no, f"{plot_id}")
     _draw_fct_header(
         fig, applicant_name=title_text, file_no=fct_file_no, district=fct_district,
         cadastral_zone=fct_cadastral_zone, plot_no=plot_no_value, font_scale=font_scale, text_color=text_color,
+        title_prefix=fct_title_prefix or "SURVEY PLAN FOR",
     )
 
-    scale_ratio = parse_scale_ratio(scale_text)
     apply_true_scale(ax, poly, scale_ratio, fig_width * map_width, fig_height * map_height)
     target_xlim = ax.get_xlim()
     target_ylim = ax.get_ylim()
@@ -4240,6 +4311,17 @@ def _render_plot_map_layout_fct(
         boundary_exclusion = poly.buffer(max(1.0, (2.0 / 1000.0) * scale_ratio))
         clipped_edge_lines = []
         for line in road_edge_lines:
+            # A road that actually crosses into/through the plot (not just running alongside or
+            # near the boundary) is a genuine road crossing, not the "frontage duplicate line"
+            # artifact this clip exists to fix - preserve it in full so real crossings still show,
+            # rather than clipping every road edge that comes near the boundary indiscriminately.
+            try:
+                crosses_boundary = line.intersects(poly)
+            except Exception:
+                crosses_boundary = False
+            if crosses_boundary:
+                clipped_edge_lines.append(line)
+                continue
             try:
                 diff = line.difference(boundary_exclusion)
             except Exception:
@@ -4374,7 +4456,7 @@ def _render_plot_map_layout_fct(
 
     first_coords = list(poly.exterior.coords)[0]
     first_station_name = str(station_names[0]).strip() if station_names and len(station_names) > 0 else "A"
-    schedule_y = _draw_fct_scale_schedule(fig, 0.285, scale_text, font_scale=font_scale, text_color=text_color)
+    schedule_y = _draw_fct_scale_schedule(fig, 0.285, resolved_scale_text, font_scale=font_scale, text_color=text_color)
 
     beacon_rows = _compute_fct_beacon_schedule(poly, station_names=station_names)
     _draw_fct_beacon_table(fig, 0.05, schedule_y, 0.075, beacon_rows, font_scale=font_scale, text_color=text_color)
@@ -4382,7 +4464,7 @@ def _render_plot_map_layout_fct(
         fig, 0.55, schedule_y,
         first_station_name=first_station_name, fct_cadastral_zone=fct_cadastral_zone,
         easting_m=first_coords[0], northing_m=first_coords[1], display_epsg=display_epsg,
-        scale_text=scale_text, cadastral_map_ref=fct_cadastral_map_ref,
+        scale_text=resolved_scale_text, cadastral_map_ref=fct_cadastral_map_ref,
         font_scale=font_scale, text_color=text_color,
     )
     _draw_fct_footer(
@@ -4446,6 +4528,7 @@ def render_plot_map_layout(
     fct_cadastral_zone: str = "",
     fct_origin_beacon_text: str = "",
     fct_cadastral_map_ref: str = "",
+    fct_title_prefix: str = "",
     boundary_color: str | None = None,
     grid_color: str | None = None,
     text_color: str | None = None,
@@ -4538,6 +4621,7 @@ def render_plot_map_layout(
             fct_cadastral_zone=fct_cadastral_zone,
             fct_origin_beacon_text=fct_origin_beacon_text,
             fct_cadastral_map_ref=fct_cadastral_map_ref,
+            fct_title_prefix=fct_title_prefix,
             preview_mode=preview_mode,
             boundary_color=boundary_color,
             grid_color=grid_color,
@@ -4756,15 +4840,21 @@ def render_plot_map_layout(
     map_left, map_bottom, map_width, map_height = 0.10, 0.30, 0.80, 0.45
     ax = fig.add_axes([map_left, map_bottom, map_width, map_height])
 
+    resolved_scale_text, scale_ratio = resolve_scale_text_and_ratio(
+        scale_text,
+        poly,
+        fig_width * map_width,
+        fig_height * map_height,
+    )
+
     draw_sheet_frame(fig)
     draw_title_block(
-        fig, title_text, plot_id, area_m2, scale_text, location_text, lga_text, state_text, font_scale,
+        fig, title_text, plot_id, area_m2, resolved_scale_text, location_text, lga_text, state_text, font_scale,
         title_font=title_font, title_size=title_size, area_font=area_font, area_size=area_size,
         text_color=text_color,
     )
     draw_footer(fig, crs_footer_text, source_footer_text, surveyor_name, surveyor_rank, font_scale, text_color=text_color)
 
-    scale_ratio = parse_scale_ratio(scale_text)
     apply_true_scale(ax, poly, scale_ratio, fig_width * map_width, fig_height * map_height)
     target_xlim = ax.get_xlim()
     target_ylim = ax.get_ylim()
