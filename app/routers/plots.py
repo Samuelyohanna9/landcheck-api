@@ -70,7 +70,7 @@ REPORTS_DIR = os.path.join(BASE_DIR, "reports")
 PREVIEW_CACHE_DIR = os.path.join(REPORTS_DIR, "previews_cache")
 PREVIEW_CACHE_TTL_SECONDS = max(30, int(os.getenv("PLOT_PREVIEW_CACHE_TTL_SECONDS", "180")))
 PREVIEW_CACHE_MAX_FILES_PER_PLOT = max(5, int(os.getenv("PLOT_PREVIEW_CACHE_MAX_FILES_PER_PLOT", "24")))
-PREVIEW_LAYOUT_VERSION = "survey_layout_2026_03_23_clockwise_v84"
+PREVIEW_LAYOUT_VERSION = "survey_layout_2026_08_13_road_name_fix_v85"
 SURVEY_REPORT_RENDER_VERSION = "survey_report_2026_03_23_clockwise_v1"
 CLEAN_COPY_RENDER_VERSION = "clean_copy_2026_03_20_layout_v14"
 PLOT_EXPORT_JOB_STATUS_VALUES = {"queued", "running", "completed", "failed"}
@@ -2231,6 +2231,7 @@ def _render_subdivision_clean_copy_pdf(
         result = list(base_list)
         added: list[Any] = []
         delete_geoms: list[Any] = []
+        use_coverage_match = feature_type in ("road", "river", "fence")
         for ov in overrides:
             if ov.get("feature_type") != feature_type:
                 continue
@@ -2243,13 +2244,22 @@ def _render_subdivision_clean_copy_pdf(
             except Exception:
                 pass
             if ov.get("action") in ("delete", "update"):
-                result = [g for g in result if not g.intersects(geom)]
+                if use_coverage_match:
+                    result = [g for g in result if not _feature_geom_replaced_by_type(g, geom, feature_type)]
+                else:
+                    result = [g for g in result if not g.intersects(geom)]
                 delete_geoms.append(geom)
             if ov.get("action") in ("add", "update"):
                 result.append(geom)
                 added.append(geom)
         if delete_geoms:
-            added = [g for g in added if not any(g.intersects(dg) for dg in delete_geoms)]
+            if use_coverage_match:
+                added = [
+                    g for g in added
+                    if not any(_feature_geom_replaced_by_type(g, dg, feature_type) for dg in delete_geoms)
+                ]
+            else:
+                added = [g for g in added if not any(g.intersects(dg) for dg in delete_geoms)]
         return result, added, delete_geoms
 
     buildings_wgs, added_buildings_wgs, _ = apply_overrides(buildings_wgs, "building")
@@ -2309,7 +2319,11 @@ def _render_subdivision_clean_copy_pdf(
 
     roads_wgs = [
         r for r in roads_wgs
-        if not any(getattr(r.get("geom"), "intersects", lambda *_: False)(dg) for dg in road_delete_geoms)
+        if not any(
+            _feature_geom_replaced_by_type(r.get("geom"), dg, "road")
+            for dg in road_delete_geoms
+            if r.get("geom") is not None
+        )
     ]
     roads_wgs.extend(added_roads_wgs)
 
@@ -5085,6 +5099,23 @@ def _feature_geom_replaced_by(candidate_geom, new_geom, tol_deg: float = 0.00001
             uncovered = candidate_geom.difference(buffered)
             return getattr(uncovered, "length", 0.0) < total * 0.1
         if geom_type in ("Polygon", "MultiPolygon"):
+            total = max(getattr(candidate_geom, "area", 0.0), 1e-12)
+            uncovered = candidate_geom.difference(buffered)
+            return getattr(uncovered, "area", 0.0) < total * 0.1
+        return candidate_geom.distance(new_geom) < tol_deg
+    except Exception:
+        return candidate_geom.intersects(new_geom)
+
+
+def _feature_geom_replaced_by_type(candidate_geom, new_geom, feature_type: str, tol_deg: float = 0.00001) -> bool:
+    normalized = str(feature_type or "").strip().lower()
+    try:
+        buffered = new_geom.buffer(tol_deg)
+        if normalized in ("road", "river", "fence"):
+            total = max(getattr(candidate_geom, "length", 0.0), 1e-9)
+            uncovered = candidate_geom.difference(buffered)
+            return getattr(uncovered, "length", 0.0) < total * 0.1
+        if normalized in ("building",):
             total = max(getattr(candidate_geom, "area", 0.0), 1e-12)
             uncovered = candidate_geom.difference(buffered)
             return getattr(uncovered, "area", 0.0) < total * 0.1

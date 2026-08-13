@@ -16,6 +16,13 @@ from sqlalchemy.orm import Session
 from app.utils.elevation import fetch_dem_elevation_points
 from app.utils.gee_client import init_gee
 from app.utils.hazard_common import EROSION_REFERENCES, classify_risk, fetch_buildings_near
+from app.utils.hazard_local_data import (
+    LOCAL_DATA_REFERENCES,
+    compute_confidence_score,
+    compute_gully_susceptibility_index,
+    compute_k_factor,
+    summarize_local_soil_points,
+)
 from app.utils.hazard_map_renderer import render_erosion_hazard_map
 
 # Same cloud-mask idiom used for the Green module's NDVI work (green_remote_monitoring.py) -
@@ -136,9 +143,21 @@ def compute_erosion_risk(
     boundary_geojson: Dict[str, Any],
     show_raster: bool = False,
     local_elevation_points: Optional[List[Dict[str, float]]] = None,
+    analysis_mode: str = "hybrid",
     progress_cb: Optional[Callable[[str, int], None]] = None,
 ) -> Tuple[float, str, Dict[str, float], bytes]:
-    """A pragmatic susceptibility index, not a full RUSLE soil-loss model: slope is the dominant
+    """`analysis_mode` selects one of three distinct pipelines:
+    - "satellite": ignores any uploaded local_elevation_points entirely - pure satellite/DEM, the
+      same result this function produced before local-data support existed.
+    - "local": trusts the surveyor's own data more heavily wherever it's present (a bigger share
+      of risk_value goes to the gully-susceptibility factor when geotechnical data was supplied)
+      and explicitly reports which required factors had no local equivalent and fell back to
+      satellite/DEM (breakdown["local_data_gaps"]).
+    - "hybrid" (default, and the same behavior as before this parameter existed): every factor
+      blends in local data wherever present and falls back to satellite/DEM automatically and
+      silently wherever it's missing, at fixed weights.
+
+    A pragmatic susceptibility index, not a full RUSLE soil-loss model: slope is the dominant
     driver of water erosion, vegetation cover (NDVI) protects soil from being stripped, and
     proximity to a natural drainage channel concentrates erosive flow. This mirrors
     compute_flood_risk's weighted-composite approach rather than pulling in rainfall
@@ -148,10 +167,26 @@ def compute_erosion_risk(
     those (see _compute_local_slope_from_points) instead of the global 30m DEM - noticeably more
     accurate for a single plot. Vegetation and drainage still come from satellite data either way,
     since a handful of elevation points can't tell us anything about ground cover or drainage.
+
+    `local_elevation_points` entries may also carry optional geotechnical/soil fields (cohesion_kpa,
+    friction_angle_deg, plasticity_index, silt_vfs_pct, clay_pct, organic_matter_pct,
+    soil_structure_code, soil_permeability_code) from an uploaded geotechnical survey. When present,
+    these blend a Nigeria-calibrated gully-susceptibility factor into risk_value (see
+    hazard_local_data.compute_gully_susceptibility_index) and, if a texture/organic-matter/
+    structure/permeability reading is complete, add an informational RUSLE K-factor (soil
+    erodibility) to the breakdown. An absolute soil-loss figure (t/ha/yr) would additionally need a
+    rainfall-erosivity R-factor, which needs either a sub-daily rainfall-intensity record or a
+    region-calibrated regression on monthly rainfall (Arnoldus, 1980) - neither of which this app
+    can currently source reliably, so only K-factor is exposed rather than risk an unreliable
+    absolute number.
     """
     report = progress_cb or (lambda stage, pct: None)
     report("Connecting to Earth Engine...", 5)
     init_gee()
+
+    analysis_mode = analysis_mode if analysis_mode in ("satellite", "local", "hybrid") else "hybrid"
+    if analysis_mode == "satellite":
+        local_elevation_points = None
 
     geom = ee.Geometry(boundary_geojson)
     # Erosion susceptibility is driven by on-site/near-site terrain and cover, not a distant
@@ -167,7 +202,11 @@ def compute_erosion_risk(
     ).get("slope_deg")
     has_dem_data = bool(ee.Number(slope_count).getInfo() or 0)
 
-    local_slope = _compute_local_slope_from_points(local_elevation_points or [])
+    # Only points that actually carry an elevation reading feed the local-slope TIN - a mixed
+    # upload (some points with elevation, some soil-only) must not silently disable local slope
+    # just because one entry has no "elevation_m" key.
+    elevation_only_points = [p for p in (local_elevation_points or []) if p.get("elevation_m") is not None]
+    local_slope = _compute_local_slope_from_points(elevation_only_points)
     slope_source = "unavailable"
     mean_slope_val = 0.0
     max_slope_val = 0.0
@@ -230,9 +269,78 @@ def compute_erosion_risk(
     vegetation_score = max(0.0, min(1.0, 1.0 - (mean_ndvi_val / 0.6)))
     drainage_score = max(0.0, min(1.0, 1.0 - (mean_dist_val / 500.0)))
 
-    risk_value = (slope_score * 0.5) + (vegetation_score * 0.3) + (drainage_score * 0.2)
+    # An uploaded geotechnical survey (cohesion/friction angle/plasticity index) lets us fold in a
+    # Nigeria-calibrated gully-susceptibility factor. When present, it takes a real share of the
+    # composite (reweighted below) rather than just being tacked on informationally, since it's a
+    # genuine independent risk driver the satellite-only composite can't see.
+    soil_summary = summarize_local_soil_points(local_elevation_points or []) or {}
+    gully_index = compute_gully_susceptibility_index(
+        soil_summary.get("cohesion_kpa"),
+        soil_summary.get("friction_angle_deg"),
+        soil_summary.get("plasticity_index"),
+        mean_slope_val,
+    )
+
+    if gully_index is not None:
+        # "local" mode trusts the surveyor's own geotechnical reading more than the fixed hybrid
+        # split - it's meant to run primarily off the uploaded data, not treat it as one input
+        # among several weighted the same way regardless of mode.
+        factor_weights = (
+            {"slope": 0.30, "vegetation": 0.20, "drainage": 0.10, "gully": 0.40}
+            if analysis_mode == "local"
+            else {"slope": 0.40, "vegetation": 0.25, "drainage": 0.15, "gully": 0.20}
+        )
+    else:
+        factor_weights = {"slope": 0.5, "vegetation": 0.3, "drainage": 0.2}
+
+    risk_value = (
+        slope_score * factor_weights["slope"]
+        + vegetation_score * factor_weights["vegetation"]
+        + drainage_score * factor_weights["drainage"]
+        + (gully_index * factor_weights["gully"] if gully_index is not None else 0.0)
+    )
     if not has_data:
         risk_value = 0.0
+
+    # K-factor (RUSLE soil erodibility, informational) - only computable when the survey gives a
+    # complete soil-texture/organic-matter/structure/permeability reading; otherwise omitted rather
+    # than guessed. Deliberately not extended into an absolute soil-loss (t/ha/yr) figure - that
+    # would additionally need a rainfall-erosivity R-factor this app has no reliable way to source.
+    k_factor = None
+    texture_fields = ("silt_vfs_pct", "clay_pct", "organic_matter_pct", "soil_structure_code", "soil_permeability_code")
+    if all(f in soil_summary for f in texture_fields):
+        k_factor = compute_k_factor(
+            soil_summary["silt_vfs_pct"], soil_summary["clay_pct"], soil_summary["organic_matter_pct"],
+            soil_summary["soil_structure_code"], soil_summary["soil_permeability_code"],
+        )
+
+    # Transparency + confidence: exactly which source fed each factor in risk_value, and a
+    # 0-100 "input data confidence" score derived from that mix (see compute_confidence_score's
+    # docstring for what it does and doesn't claim).
+    factor_sources = {
+        "slope": slope_source if slope_source != "unavailable" else "not_available",
+        "vegetation": "satellite_ndvi" if has_dem_data else "not_available",
+        "drainage": "satellite_hydrosheds" if has_dem_data else "not_available",
+    }
+    if gully_index is not None:
+        factor_sources["gully"] = "user_input"
+
+    try:
+        plot_area_ha = float(geom.area(1).getInfo()) / 10000.0
+    except Exception:
+        plot_area_ha = 0.0
+    confidence = compute_confidence_score(
+        factor_sources, factor_weights, local_point_count=len(elevation_only_points), plot_area_ha=plot_area_ha,
+    )
+
+    local_data_gaps: List[str] = []
+    if analysis_mode == "local":
+        if factor_sources["slope"] != "local_survey":
+            local_data_gaps.append("Slope — no local elevation survey provided, used the global 30m DEM instead.")
+        if gully_index is None:
+            local_data_gaps.append("Gully susceptibility — no geotechnical survey (cohesion/friction angle/plasticity) provided.")
+        local_data_gaps.append("Vegetation cover — always estimated from satellite imagery; there's no local equivalent to collect.")
+        local_data_gaps.append("Drainage proximity — always estimated from the satellite-derived stream network.")
 
     breakdown = {
         "mean_slope_deg": round(mean_slope_val, 2),
@@ -244,7 +352,14 @@ def compute_erosion_risk(
         "drainage_score": round(drainage_score, 3),
         "data_available": has_data,
         "slope_source": slope_source,
-        "_references": EROSION_REFERENCES,
+        "local_soil_data_available": bool(soil_summary),
+        "gully_susceptibility_index": gully_index,
+        "k_factor": k_factor,
+        "analysis_mode": analysis_mode,
+        "data_sources": factor_sources,
+        "confidence": confidence,
+        "local_data_gaps": local_data_gaps,
+        "_references": EROSION_REFERENCES + LOCAL_DATA_REFERENCES if soil_summary else EROSION_REFERENCES,
     }
 
     risk_class, class_color = classify_risk(risk_value, has_data)
@@ -260,7 +375,7 @@ def compute_erosion_risk(
             lambda: None if local_slope is not None else (_fetch_slope_points(dem, analysis_region) if has_dem_data else None)
         )
         contour_future = pool.submit(
-            lambda: local_elevation_points if local_slope is not None else fetch_dem_elevation_points(boundary_geojson, buffer_m=500)
+            lambda: elevation_only_points if local_slope is not None else fetch_dem_elevation_points(boundary_geojson, buffer_m=500)
         )
         buildings_future = pool.submit(fetch_buildings_near, db, boundary_geojson, 500)
         dem_slope_points = slope_points_future.result()
@@ -270,7 +385,7 @@ def compute_erosion_risk(
     report("Rendering hazard map...", 85)
     png_bytes, map_stats = render_erosion_hazard_map(
         boundary_geojson=boundary_geojson,
-        local_elevation_points=local_elevation_points if local_slope is not None else None,
+        local_elevation_points=elevation_only_points if local_slope is not None else None,
         dem_slope_points=dem_slope_points,
         contour_points=contour_points,
         buildings=buildings,

@@ -852,52 +852,95 @@ def add_north_arrow(
         }
 
     if style in ("nn_arrow", "split_triangle", "nn"):
-        # Half-black/half-white "N N" arrow (design supplied as north_arrow_NN.svg) - the classic
-        # surveyor's compass-rose split triangle, with a long stem and a tick line + "N N" labels
-        # partway down. Incoming (x, y) is the stem's BOTTOM end, with the whole icon extending
-        # upward from there (unlike "un_marker", which anchors at its text baseline) - this keeps
-        # placement predictable for callers that want the icon to grow up from a fixed spot.
-        svg_bottom_y = 405.0
+        # Exact "N.N." survey north arrow based on the supplied north_arrow_NN.svg asset.
+        # The caller-provided anchor remains the bottom of the stem so FCT placement is predictable.
+        svg_stem_bottom_y = 405.0
         svg_apex_y = 24.0
         svg_base_y = 168.0
         svg_tick_y = 285.5
+        svg_text_baseline_y = 285.0
         svg_left_x = 8.0
         svg_right_x = 59.0
         svg_stem_x = 33.5
+        svg_font_size = 20.0
         k = (size * 1.55) / (svg_base_y - svg_apex_y)
         line_lw = max(1.0, 1.0 * font_scale)
+        text_font = FontProperties(family=["Arial", "Helvetica", "DejaVu Sans"])
+
+        def sx2(px: float) -> float:
+            return x + (float(px) - svg_stem_x) * k
 
         def sy2(py: float) -> float:
-            return y + (svg_bottom_y - float(py)) * k
-
-        apex_y = sy2(svg_apex_y)
-        base_y = sy2(svg_base_y)
-        tick_y = sy2(svg_tick_y)
-        left_hw = (svg_stem_x - svg_left_x) * k
-        right_hw = (svg_right_x - svg_stem_x) * k
+            return y + (svg_stem_bottom_y - float(py)) * k
 
         fig.add_artist(mlines.Line2D(
-            [x, x], [y, base_y], transform=fig.transFigure, color=col, lw=line_lw,
-            zorder=20, solid_capstyle="butt",
+            [sx2(svg_stem_x), sx2(svg_stem_x)],
+            [sy2(svg_stem_bottom_y), sy2(svg_base_y)],
+            transform=fig.transFigure,
+            color=col,
+            lw=line_lw,
+            zorder=20,
+            solid_capstyle="butt",
         ))
         fig.add_artist(patches.Polygon(
-            [(x, apex_y), (x - left_hw, base_y), (x, base_y)], closed=True,
-            facecolor="white", edgecolor=col, lw=line_lw, transform=fig.transFigure, zorder=21,
+            [(sx2(34), sy2(24)), (sx2(8), sy2(168)), (sx2(34), sy2(168))],
+            closed=True,
+            facecolor="white",
+            edgecolor=col,
+            lw=line_lw,
+            transform=fig.transFigure,
+            zorder=21,
+            joinstyle="miter",
         ))
         fig.add_artist(patches.Polygon(
-            [(x, apex_y), (x + right_hw, base_y), (x, base_y)], closed=True,
-            facecolor=col, edgecolor=col, lw=line_lw, transform=fig.transFigure, zorder=21,
+            [(sx2(34), sy2(24)), (sx2(59), sy2(168)), (sx2(34), sy2(168))],
+            closed=True,
+            facecolor=col,
+            edgecolor=col,
+            lw=line_lw,
+            transform=fig.transFigure,
+            zorder=21,
+            joinstyle="miter",
         ))
         fig.add_artist(mlines.Line2D(
-            [x - left_hw, x + right_hw], [tick_y, tick_y], transform=fig.transFigure,
-            color=col, lw=line_lw * 0.85, zorder=22,
+            [sx2(svg_left_x), sx2(58)],
+            [sy2(svg_tick_y), sy2(svg_tick_y)],
+            transform=fig.transFigure,
+            color=col,
+            lw=line_lw * 0.85,
+            zorder=22,
         ))
-        label_fs = max(6, int(11 * font_scale))
-        fig.text(x - left_hw * 0.5, tick_y, "N", ha="center", va="center", fontsize=label_fs,
-                  color=col, weight="bold", fontfamily="DejaVu Sans", zorder=23)
-        fig.text(x + right_hw * 0.5, tick_y, "N", ha="center", va="center", fontsize=label_fs,
-                  color=col, weight="bold", fontfamily="DejaVu Sans", zorder=23)
-        return x
+        font_size = max(6, svg_font_size * k * fig.get_figheight() * 72.0)
+        fig.text(
+            sx2(9),
+            sy2(svg_text_baseline_y),
+            "N",
+            ha="left",
+            va="baseline",
+            fontsize=font_size,
+            color=col,
+            weight="bold",
+            fontproperties=text_font,
+            zorder=23,
+        )
+        fig.text(
+            sx2(42),
+            sy2(svg_text_baseline_y),
+            "N",
+            ha="left",
+            va="baseline",
+            fontsize=font_size,
+            color=col,
+            weight="bold",
+            fontproperties=text_font,
+            zorder=23,
+        )
+        return {
+            "stem_x": sx2(svg_stem_x),
+            "stem_top": sy2(svg_apex_y),
+            "stem_bottom": sy2(svg_stem_bottom_y),
+            "text_baseline_y": sy2(svg_text_baseline_y),
+        }
 
     # default: classic arrow
     ax.annotate(
@@ -1717,6 +1760,30 @@ def build_fence_avoid_geom(fence_geoms, display_epsg: int, scale_ratio: int):
     return merged
 
 
+def _feature_override_replaces_native(candidate_geom, override_geom, feature_type: str, tol_deg: float = 0.00001) -> bool:
+    """Whether an override truly replaces an existing feature in WGS84 geometry space.
+
+    This is intentionally stricter than a plain ``intersects`` test. Roads, rivers, and fences
+    frequently touch or cross at junctions, and a name-only override must not erase neighboring
+    segments that merely share one point. Coverage is measured against the candidate feature's own
+    size, so only a near-total overlap counts as a replacement.
+    """
+    normalized = str(feature_type or "").strip().lower()
+    try:
+        buffered = override_geom.buffer(tol_deg)
+        if normalized in ("road", "river", "fence"):
+            total = max(getattr(candidate_geom, "length", 0.0), 1e-9)
+            uncovered = candidate_geom.difference(buffered)
+            return getattr(uncovered, "length", 0.0) < total * 0.1
+        if normalized in ("building",):
+            total = max(getattr(candidate_geom, "area", 0.0), 1e-12)
+            uncovered = candidate_geom.difference(buffered)
+            return getattr(uncovered, "area", 0.0) < total * 0.1
+        return candidate_geom.distance(override_geom) < tol_deg
+    except Exception:
+        return candidate_geom.intersects(override_geom)
+
+
 def _resolve_override_names(overrides, feature_type: str):
     """Returns [(geom, name)] for named `feature_type` overrides (roads/rivers), resolved with
     the same last-override-wins-by-intersecting-geometry semantics apply_overrides already uses
@@ -1733,7 +1800,11 @@ def _resolve_override_names(overrides, feature_type: str):
         action = ov.get("action")
         if geom is None or action not in ("add", "update", "delete"):
             continue
-        resolved = [(g, n) for (g, n) in resolved if not g.intersects(geom)]
+        resolved = [
+            (g, n)
+            for (g, n) in resolved
+            if not _feature_override_replaces_native(g, geom, feature_type)
+        ]
         if action in ("add", "update"):
             resolved.append((geom, str(ov.get("name") or "").strip()))
     return [(g, n) for (g, n) in resolved if n]
@@ -2690,6 +2761,7 @@ def _render_plot_map_layout_adamawa(
         result = list(base_list)
         added = []
         delete_geoms = []
+        use_coverage_match = feature_type in ("road", "river", "fence")
         for ov in overrides:
             if ov["feature_type"] != feature_type:
                 continue
@@ -2702,13 +2774,22 @@ def _render_plot_map_layout_adamawa(
             except Exception:
                 pass
             if ov["action"] in ("delete", "update"):
-                result = [g for g in result if not g.intersects(geom)]
+                if use_coverage_match:
+                    result = [g for g in result if not _feature_override_replaces_native(g, geom, feature_type)]
+                else:
+                    result = [g for g in result if not g.intersects(geom)]
                 delete_geoms.append(geom)
             if ov["action"] in ("add", "update"):
                 result.append(geom)
                 added.append(geom)
         if delete_geoms:
-            added = [g for g in added if not any(g.intersects(dg) for dg in delete_geoms)]
+            if use_coverage_match:
+                added = [
+                    g for g in added
+                    if not any(_feature_override_replaces_native(g, dg, feature_type) for dg in delete_geoms)
+                ]
+            else:
+                added = [g for g in added if not any(g.intersects(dg) for dg in delete_geoms)]
         return result, added
 
     buildings, added_buildings = apply_overrides(buildings, "building")
@@ -3412,6 +3493,7 @@ def _render_plot_map_layout_cadastral(
         result = list(base_list)
         added = []
         delete_geoms = []
+        use_coverage_match = feature_type in ("road", "river", "fence")
         for ov in overrides:
             if ov["feature_type"] != feature_type:
                 continue
@@ -3424,13 +3506,22 @@ def _render_plot_map_layout_cadastral(
             except Exception:
                 pass
             if ov["action"] in ("delete", "update"):
-                result = [g for g in result if not g.intersects(geom)]
+                if use_coverage_match:
+                    result = [g for g in result if not _feature_override_replaces_native(g, geom, feature_type)]
+                else:
+                    result = [g for g in result if not g.intersects(geom)]
                 delete_geoms.append(geom)
             if ov["action"] in ("add", "update"):
                 result.append(geom)
                 added.append(geom)
         if delete_geoms:
-            added = [g for g in added if not any(g.intersects(dg) for dg in delete_geoms)]
+            if use_coverage_match:
+                added = [
+                    g for g in added
+                    if not any(_feature_override_replaces_native(g, dg, feature_type) for dg in delete_geoms)
+                ]
+            else:
+                added = [g for g in added if not any(g.intersects(dg) for dg in delete_geoms)]
         return result, added
 
     buildings, added_buildings = apply_overrides(buildings, "building")
@@ -3592,7 +3683,9 @@ def _render_plot_map_layout_cadastral(
     ax.set_ylim(target_ylim)
 
     major = nice_grid_step(max(ax.get_xlim()[1] - ax.get_xlim()[0], ax.get_ylim()[1] - ax.get_ylim()[0]))
-    draw_grid(ax, poly, major / 5.0, major, font_scale, full_grid=False, edge_ticks=False, color=grid_color)
+    # Small grid-crossing tick marks at the frame edges (no crossing lines through the map
+    # itself) - the reference template's convention for marking round Easting/Northing values.
+    draw_grid(ax, poly, major / 5.0, major, font_scale, full_grid=False, edge_ticks=True, color=grid_color)
 
     annotate_vertices(
         ax,
@@ -3647,7 +3740,7 @@ def _render_plot_map_layout_cadastral(
         style="un_marker",
         color=north_arrow_color,
         anchor_x=guide_fig_x,
-        anchor_y=min(0.92, ax.get_position().y1 + 0.028),
+        anchor_y=min(0.95, ax.get_position().y1 + 0.11),
         blue_hex=grid_color,
     )
     _draw_cadastral_reference_guides(
@@ -3890,7 +3983,7 @@ def _render_plot_map_layout_fct(
     station_names=None,
     coordinate_system: str = "wgs84",
     epsg_code: int = 4326,
-    north_arrow_style: str = "triangle",
+    north_arrow_style: str = "nn_arrow",
     north_arrow_color: str = "black",
     beacon_style: str = "cross",
     road_width_m: float | None = None,
@@ -3984,6 +4077,7 @@ def _render_plot_map_layout_fct(
         result = list(base_list)
         added = []
         delete_geoms = []
+        use_coverage_match = feature_type in ("road", "river", "fence")
         for ov in overrides:
             if ov["feature_type"] != feature_type:
                 continue
@@ -3996,13 +4090,22 @@ def _render_plot_map_layout_fct(
             except Exception:
                 pass
             if ov["action"] in ("delete", "update"):
-                result = [g for g in result if not g.intersects(geom)]
+                if use_coverage_match:
+                    result = [g for g in result if not _feature_override_replaces_native(g, geom, feature_type)]
+                else:
+                    result = [g for g in result if not g.intersects(geom)]
                 delete_geoms.append(geom)
             if ov["action"] in ("add", "update"):
                 result.append(geom)
                 added.append(geom)
         if delete_geoms:
-            added = [g for g in added if not any(g.intersects(dg) for dg in delete_geoms)]
+            if use_coverage_match:
+                added = [
+                    g for g in added
+                    if not any(_feature_override_replaces_native(g, dg, feature_type) for dg in delete_geoms)
+                ]
+            else:
+                added = [g for g in added if not any(g.intersects(dg) for dg in delete_geoms)]
         return result, added
 
     buildings, added_buildings = apply_overrides(buildings, "building")
@@ -4187,7 +4290,7 @@ def _render_plot_map_layout_fct(
     # The north arrow stands in the reserved right margin, beside the parcel, notably larger than
     # the other templates' arrows - matching the reference plan.
     axes_box = ax.get_position()
-    arrow_x = axes_box.x1 + (0.965 - axes_box.x1) * 0.5
+    arrow_x = min(0.92, axes_box.x1 + (0.985 - axes_box.x1) * 0.72)
     arrow_y = axes_box.y0 + axes_box.height * 0.30
     add_north_arrow(
         ax, font_scale=font_scale * 1.55, style=north_arrow_style, color=north_arrow_color,
@@ -4508,6 +4611,7 @@ def render_plot_map_layout(
         result = list(base_list)
         added = []
         delete_geoms = []
+        use_coverage_match = feature_type in ("road", "river", "fence")
         for ov in overrides:
             if ov["feature_type"] != feature_type:
                 continue
@@ -4521,13 +4625,22 @@ def render_plot_map_layout(
             except Exception:
                 pass
             if ov["action"] in ("delete", "update"):
-                result = [g for g in result if not g.intersects(geom)]
+                if use_coverage_match:
+                    result = [g for g in result if not _feature_override_replaces_native(g, geom, feature_type)]
+                else:
+                    result = [g for g in result if not g.intersects(geom)]
                 delete_geoms.append(geom)
             if ov["action"] in ("add", "update"):
                 result.append(geom)
                 added.append(geom)
         if delete_geoms:
-            added = [g for g in added if not any(g.intersects(dg) for dg in delete_geoms)]
+            if use_coverage_match:
+                added = [
+                    g for g in added
+                    if not any(_feature_override_replaces_native(g, dg, feature_type) for dg in delete_geoms)
+                ]
+            else:
+                added = [g for g in added if not any(g.intersects(dg) for dg in delete_geoms)]
         return result, added
 
     buildings, added_buildings = apply_overrides(buildings, "building")

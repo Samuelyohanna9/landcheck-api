@@ -1,7 +1,10 @@
-from fastapi import APIRouter, Body, Depends, HTTPException
+from fastapi import APIRouter, Body, Depends, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse, Response
 from sqlalchemy.orm import Session
+import geopandas as gpd
+import json
 import os
+import shutil
 import tempfile
 import logging
 
@@ -76,7 +79,21 @@ def _extract_boundary(payload: dict) -> dict:
     return payload
 
 
+# Optional per-point fields from an uploaded geotechnical/soil survey - none are required, and any
+# missing/invalid value on a given point is simply omitted from that point rather than rejecting the
+# whole point, since a real field survey rarely has every reading on every station.
+_OPTIONAL_SOIL_FIELDS = (
+    "silt_vfs_pct", "clay_pct", "sand_pct", "organic_matter_pct",
+    "soil_structure_code", "soil_permeability_code",
+    "cohesion_kpa", "friction_angle_deg", "plasticity_index",
+)
+
+
 def _extract_local_elevation_points(payload: dict) -> list:
+    # elevation_m is intentionally optional here (unlike lng/lat): a point carrying only
+    # geotechnical/soil fields - no surveyed elevation - is still valid input for the
+    # gully-susceptibility/K-factor/HSG calculations, which don't need elevation at all. Points
+    # that do have elevation_m keep driving the existing local-slope/relative-elevation features.
     points = payload.get("local_elevation_points") or payload.get("elevation_points") or []
     if not isinstance(points, list):
         return []
@@ -85,14 +102,43 @@ def _extract_local_elevation_points(payload: dict) -> list:
         if not isinstance(p, dict):
             continue
         try:
-            valid.append({
+            entry = {
                 "lng": float(p["lng"]),
                 "lat": float(p["lat"]),
-                "elevation_m": float(p["elevation_m"]),
-            })
+            }
         except (KeyError, TypeError, ValueError):
             continue
+        if p.get("elevation_m") is not None:
+            try:
+                entry["elevation_m"] = float(p["elevation_m"])
+            except (TypeError, ValueError):
+                pass
+        for field in _OPTIONAL_SOIL_FIELDS:
+            if p.get(field) is None:
+                continue
+            try:
+                entry[field] = float(p[field])
+            except (TypeError, ValueError):
+                pass
+        valid.append(entry)
     return valid
+
+
+def _extract_site_params(payload: dict) -> dict:
+    site_type = payload.get("site_type")
+    design_rainfall_mm = payload.get("design_rainfall_mm")
+    try:
+        design_rainfall_mm = float(design_rainfall_mm) if design_rainfall_mm is not None else None
+    except (TypeError, ValueError):
+        design_rainfall_mm = None
+    analysis_mode = str(payload.get("analysis_mode") or "hybrid")
+    if analysis_mode not in ("satellite", "local", "hybrid"):
+        analysis_mode = "hybrid"
+    return {
+        "site_type": str(site_type) if site_type else None,
+        "design_rainfall_mm": design_rainfall_mm,
+        "analysis_mode": analysis_mode,
+    }
 
 
 def _build_legend(risk_class: str, class_color: str, plot_label: str, show_raster: bool, raster_legend: list) -> list:
@@ -183,6 +229,11 @@ def _flood_preview_payload(risk_value, risk_class, class_color, breakdown, overl
         "terrain_flatness_score": breakdown.get("terrain_flatness_score"),
         "terrain_drainage_score": breakdown.get("terrain_drainage_score"),
         "terrain_depression_score": breakdown.get("terrain_depression_score"),
+        "scs_runoff": breakdown.get("scs_runoff"),
+        "analysis_mode": breakdown.get("analysis_mode", "hybrid"),
+        "data_sources": breakdown.get("data_sources"),
+        "confidence": breakdown.get("confidence"),
+        "local_data_gaps": breakdown.get("local_data_gaps", []),
         "references": breakdown.get("_references", []),
     }
 
@@ -215,6 +266,11 @@ def _flood_pdf_summary(risk_value, risk_class, class_color, breakdown, show_rast
         "terrain_flatness_score": breakdown.get("terrain_flatness_score"),
         "terrain_drainage_score": breakdown.get("terrain_drainage_score"),
         "terrain_depression_score": breakdown.get("terrain_depression_score"),
+        "scs_runoff": breakdown.get("scs_runoff"),
+        "analysis_mode": breakdown.get("analysis_mode", "hybrid"),
+        "data_sources": breakdown.get("data_sources"),
+        "confidence": breakdown.get("confidence"),
+        "local_data_gaps": breakdown.get("local_data_gaps", []),
         "references": breakdown.get("_references", []),
     }
 
@@ -225,9 +281,12 @@ def flood_preview(payload: dict = Body(...), db: Session = Depends(get_db)):
     show_raster = bool(payload.get("show_raster", False))
     return_period = int(payload.get("return_period", 100))
     local_elevation_points = _extract_local_elevation_points(payload)
+    site_params = _extract_site_params(payload)
     try:
         risk_value, risk_class, breakdown, overlay_png = compute_flood_risk(
-            db, boundary, show_raster, return_period, local_elevation_points
+            db, boundary, show_raster, return_period, local_elevation_points,
+            site_type=site_params["site_type"], design_rainfall_mm=site_params["design_rainfall_mm"],
+            analysis_mode=site_params["analysis_mode"],
         )
     except Exception as exc:
         logger.exception("Flood preview failed")
@@ -244,9 +303,12 @@ def flood_pdf(payload: dict = Body(...), db: Session = Depends(get_db)):
     show_raster = bool(payload.get("show_raster", False))
     return_period = int(payload.get("return_period", 100))
     local_elevation_points = _extract_local_elevation_points(payload)
+    site_params = _extract_site_params(payload)
     try:
         risk_value, risk_class, breakdown, overlay_png = compute_flood_risk(
-            db, boundary, show_raster, return_period, local_elevation_points
+            db, boundary, show_raster, return_period, local_elevation_points,
+            site_type=site_params["site_type"], design_rainfall_mm=site_params["design_rainfall_mm"],
+            analysis_mode=site_params["analysis_mode"],
         )
     except Exception as exc:
         logger.exception("Flood PDF failed")
@@ -303,6 +365,13 @@ def _erosion_preview_payload(risk_value, risk_class, class_color, breakdown, ove
         "buildings_total": breakdown.get("buildings_total", 0),
         "buildings_threatened": breakdown.get("buildings_threatened", 0),
         "interactive": breakdown.get("_interactive"),
+        "local_soil_data_available": bool(breakdown.get("local_soil_data_available")),
+        "gully_susceptibility_index": breakdown.get("gully_susceptibility_index"),
+        "k_factor": breakdown.get("k_factor"),
+        "analysis_mode": breakdown.get("analysis_mode", "hybrid"),
+        "data_sources": breakdown.get("data_sources"),
+        "confidence": breakdown.get("confidence"),
+        "local_data_gaps": breakdown.get("local_data_gaps", []),
         "references": breakdown.get("_references", []),
     }
 
@@ -328,6 +397,13 @@ def _erosion_pdf_summary(risk_value, risk_class, class_color, breakdown, show_ra
         "slope_source": breakdown.get("slope_source", "unavailable"),
         "buildings_total": breakdown.get("buildings_total", 0),
         "buildings_threatened": breakdown.get("buildings_threatened", 0),
+        "local_soil_data_available": bool(breakdown.get("local_soil_data_available")),
+        "gully_susceptibility_index": breakdown.get("gully_susceptibility_index"),
+        "k_factor": breakdown.get("k_factor"),
+        "analysis_mode": breakdown.get("analysis_mode", "hybrid"),
+        "data_sources": breakdown.get("data_sources"),
+        "confidence": breakdown.get("confidence"),
+        "local_data_gaps": breakdown.get("local_data_gaps", []),
         "references": breakdown.get("_references", []),
     }
 
@@ -337,9 +413,11 @@ def erosion_preview(payload: dict = Body(...), db: Session = Depends(get_db)):
     boundary = _extract_boundary(payload)
     show_raster = bool(payload.get("show_raster", False))
     local_elevation_points = _extract_local_elevation_points(payload)
+    site_params = _extract_site_params(payload)
     try:
         risk_value, risk_class, breakdown, overlay_png = compute_erosion_risk(
-            db, boundary, show_raster, local_elevation_points
+            db, boundary, show_raster, local_elevation_points,
+            analysis_mode=site_params["analysis_mode"],
         )
     except Exception as exc:
         logger.exception("Erosion preview failed")
@@ -355,9 +433,11 @@ def erosion_pdf(payload: dict = Body(...), db: Session = Depends(get_db)):
     boundary = _extract_boundary(payload)
     show_raster = bool(payload.get("show_raster", False))
     local_elevation_points = _extract_local_elevation_points(payload)
+    site_params = _extract_site_params(payload)
     try:
         risk_value, risk_class, breakdown, overlay_png = compute_erosion_risk(
-            db, boundary, show_raster, local_elevation_points
+            db, boundary, show_raster, local_elevation_points,
+            analysis_mode=site_params["analysis_mode"],
         )
     except Exception as exc:
         logger.exception("Erosion PDF failed")
@@ -391,9 +471,12 @@ def flood_gis_export(payload: dict = Body(...), db: Session = Depends(get_db)):
     boundary = _extract_boundary(payload)
     return_period = int(payload.get("return_period", 100))
     local_elevation_points = _extract_local_elevation_points(payload)
+    site_params = _extract_site_params(payload)
     try:
         risk_value, risk_class, breakdown, _overlay_png = compute_flood_risk(
-            db, boundary, False, return_period, local_elevation_points
+            db, boundary, False, return_period, local_elevation_points,
+            site_type=site_params["site_type"], design_rainfall_mm=site_params["design_rainfall_mm"],
+            analysis_mode=site_params["analysis_mode"],
         )
     except Exception as exc:
         logger.exception("Flood GIS export failed")
@@ -421,9 +504,11 @@ def flood_gis_export(payload: dict = Body(...), db: Session = Depends(get_db)):
 def erosion_gis_export(payload: dict = Body(...), db: Session = Depends(get_db)):
     boundary = _extract_boundary(payload)
     local_elevation_points = _extract_local_elevation_points(payload)
+    site_params = _extract_site_params(payload)
     try:
         risk_value, risk_class, breakdown, _overlay_png = compute_erosion_risk(
-            db, boundary, False, local_elevation_points
+            db, boundary, False, local_elevation_points,
+            analysis_mode=site_params["analysis_mode"],
         )
     except Exception as exc:
         logger.exception("Erosion GIS export failed")
@@ -450,6 +535,53 @@ def erosion_gis_export(payload: dict = Body(...), db: Session = Depends(get_db))
     return _gis_export_response(zip_bytes, "erosion_hazard_gis_export.zip")
 
 
+# ---------------- BOUNDARY UPLOAD ----------------
+
+MAX_BOUNDARY_UPLOAD_BYTES = 20 * 1024 * 1024  # a boundary file is inherently tiny; this just guards against an unrelated large upload
+
+
+@router.post("/upload-boundary")
+async def upload_hazard_boundary(file: UploadFile = File(...)):
+    """Accepts a zipped Shapefile (.zip), GeoJSON (.geojson/.json), or KML (.kml) and returns the
+    parsed area as a single WGS84 GeoJSON geometry - the same shape _extract_boundary already
+    expects from a manually drawn/coordinate-entered boundary, so an uploaded file feeds the exact
+    same flood/erosion analysis pipeline as any other boundary source.
+    """
+    filename = str(file.filename or "boundary")
+    suffix = os.path.splitext(filename)[1].lower()
+    if suffix not in (".zip", ".geojson", ".json", ".kml"):
+        raise HTTPException(status_code=400, detail="Upload a zipped Shapefile (.zip), GeoJSON (.geojson/.json), or KML (.kml) file.")
+
+    payload = await file.read()
+    if not payload:
+        raise HTTPException(status_code=400, detail="The uploaded file is empty.")
+    if len(payload) > MAX_BOUNDARY_UPLOAD_BYTES:
+        raise HTTPException(status_code=400, detail=f"File exceeds the {MAX_BOUNDARY_UPLOAD_BYTES // (1024 * 1024)} MB upload limit.")
+
+    tmp_dir = tempfile.mkdtemp(prefix="hazard_boundary_")
+    try:
+        tmp_path = os.path.join(tmp_dir, f"boundary{suffix}")
+        with open(tmp_path, "wb") as f:
+            f.write(payload)
+        try:
+            gdf = gpd.read_file(tmp_path)
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=f"Couldn't parse this file as a boundary: {exc}") from exc
+        if gdf.empty:
+            raise HTTPException(status_code=400, detail="No geometry found in the uploaded file.")
+        if gdf.crs is None:
+            gdf = gdf.set_crs(epsg=4326)
+        elif str(gdf.crs) != "EPSG:4326":
+            gdf = gdf.to_crs(epsg=4326)
+        union_geom = gdf.geometry.union_all() if hasattr(gdf.geometry, "union_all") else gdf.geometry.unary_union
+        if union_geom is None or union_geom.is_empty:
+            raise HTTPException(status_code=400, detail="No usable geometry found in the uploaded file.")
+        boundary_geojson = json.loads(gpd.GeoSeries([union_geom], crs="EPSG:4326").to_json())["features"][0]["geometry"]
+        return {"boundary": boundary_geojson}
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
 # ---------------- ASYNC JOBS ----------------
 # A single request that runs several Earth Engine calls plus local rendering can take longer than
 # a client's request timeout allows, especially on a slower server - these endpoints hand the work
@@ -472,17 +604,21 @@ def _run_hazard_analysis_job(job_id: str) -> None:
         show_raster = bool(payload.get("show_raster", False))
         return_period = int(payload.get("return_period", 100))
         local_elevation_points = _extract_local_elevation_points(payload)
+        site_params = _extract_site_params(payload)
 
         set_hazard_job_status(db, job_id, status="running", stage="Starting analysis...", progress_pct=1, started=True)
         report = make_progress_reporter(db, job_id)
 
         if hazard_type == "flood":
             risk_value, risk_class, breakdown, overlay_png = compute_flood_risk(
-                db, boundary, show_raster, return_period, local_elevation_points, progress_cb=report
+                db, boundary, show_raster, return_period, local_elevation_points,
+                site_type=site_params["site_type"], design_rainfall_mm=site_params["design_rainfall_mm"],
+                analysis_mode=site_params["analysis_mode"], progress_cb=report,
             )
         else:
             risk_value, risk_class, breakdown, overlay_png = compute_erosion_risk(
-                db, boundary, show_raster, local_elevation_points, progress_cb=report
+                db, boundary, show_raster, local_elevation_points,
+                analysis_mode=site_params["analysis_mode"], progress_cb=report,
             )
 
         _, class_color = classify_risk(risk_value, breakdown.get("data_available", True))
@@ -585,6 +721,7 @@ def create_hazard_analysis_job(hazard_type: str, payload: dict = Body(...), db: 
         "show_raster": bool(payload.get("show_raster", False)),
         "return_period": int(payload.get("return_period", 100)),
         "local_elevation_points": _extract_local_elevation_points(payload),
+        **_extract_site_params(payload),
     }
     job = insert_hazard_job(
         db,

@@ -16,6 +16,14 @@ from app.utils.hazard_common import (
     classify_risk,
     fetch_buildings_near,
 )
+from app.utils.hazard_local_data import (
+    LOCAL_DATA_REFERENCES,
+    DEFAULT_SITE_TYPE,
+    compute_confidence_score,
+    compute_scs_runoff,
+    derive_hydrologic_soil_group,
+    summarize_local_soil_points,
+)
 from app.utils.hazard_map_renderer import render_flood_hazard_map
 
 
@@ -85,14 +93,51 @@ def compute_flood_risk(
     show_raster: bool = False,
     return_period: int = 100,
     local_elevation_points: Optional[List[Dict[str, float]]] = None,
+    site_type: Optional[str] = None,
+    design_rainfall_mm: Optional[float] = None,
+    analysis_mode: str = "hybrid",
     progress_cb: Optional[Callable[[str, int], None]] = None,
 ) -> Tuple[float, str, Dict[str, float], bytes]:
+    """`site_type`/`design_rainfall_mm` (plus any sand_pct/clay_pct on local_elevation_points, used
+    to derive a Hydrologic Soil Group) enable an SCS/NRCS Curve-Number runoff estimate. It's folded
+    into risk_value only for the local_terrain_proxy path - a pluvial-ponding estimate this app is
+    already producing from first principles, where a genuine local runoff figure is a real
+    improvement. For the glofas path, depth is a routed river-flood simulation that already accounts
+    for the whole upstream catchment's rainfall-runoff response, so a single site's runoff coefficient
+    isn't commensurable with it and is surfaced as informational-only instead.
+
+    `analysis_mode` selects one of three distinct pipelines:
+    - "satellite": ignores local_elevation_points/site_type/design_rainfall_mm entirely - the pure
+      GloFAS/terrain-proxy result this function produced before local-data support existed.
+    - "local": runs the local-terrain-proxy pipeline unconditionally (even when GloFAS has real
+      river-flood coverage here), since it's DEM+drainage-network-driven and treats GloFAS's
+      river-routing simulation as itself a "satellite" data source, not a local one. Also weights
+      a supplied SCS-CN runoff coefficient more heavily into risk_value.
+    - "hybrid" (default, and the same behavior as before this parameter existed): GloFAS is used
+      whenever it has coverage, local-terrain-proxy is the automatic fallback when it doesn't, and
+      SCS-CN runoff blends in at a fixed, smaller weight.
+    """
     report = progress_cb or (lambda stage, pct: None)
     report("Connecting to Earth Engine...", 5)
     init_gee()
 
+    analysis_mode = analysis_mode if analysis_mode in ("satellite", "local", "hybrid") else "hybrid"
+    if analysis_mode == "satellite":
+        local_elevation_points = None
+        site_type = None
+        design_rainfall_mm = None
+
     geom = ee.Geometry(boundary_geojson)
     analysis_region = geom.buffer(1000)
+
+    soil_summary = summarize_local_soil_points(local_elevation_points or []) or {}
+    scs_runoff = None
+    if design_rainfall_mm:
+        if "sand_pct" in soil_summary and "clay_pct" in soil_summary:
+            hsg = derive_hydrologic_soil_group(soil_summary["sand_pct"], soil_summary["clay_pct"])
+        else:
+            hsg = "B"
+        scs_runoff = compute_scs_runoff(hsg, site_type or DEFAULT_SITE_TYPE, design_rainfall_mm)
 
     # JRC/CEMS GloFAS Flood Hazard depth (meters) for selected return period
     rp_band = f"RP{return_period}_depth"
@@ -195,6 +240,9 @@ def compute_flood_risk(
     risk_class, class_color = classify_risk(risk_value, breakdown["data_available"])
     breakdown["flood_data_source"] = "glofas"
     breakdown["_references"] = FLOOD_REFERENCES_GLOFAS
+    if scs_runoff:
+        breakdown["scs_runoff"] = scs_runoff
+        breakdown["_references"] = FLOOD_REFERENCES_GLOFAS + LOCAL_DATA_REFERENCES
     susceptibility_img = None
 
     # GloFAS only carries depth pixels within its modeled river-flood extent - a plot far from any
@@ -205,8 +253,13 @@ def compute_flood_risk(
     # different methodology from GloFAS's river-routing simulation, so it's always labeled as an
     # estimate (both in the API response and baked into the map itself), never presented as if it
     # were GloFAS data.
-    if not breakdown["data_available"]:
-        report("No river flood extent modeled here — estimating local terrain-based susceptibility...", 35)
+    if analysis_mode == "local" or not breakdown["data_available"]:
+        report(
+            "Estimating local terrain-based susceptibility..."
+            if analysis_mode == "local"
+            else "No river flood extent modeled here — estimating local terrain-based susceptibility...",
+            35,
+        )
         try:
             dem_proxy = ee.ImageCollection("COPERNICUS/DEM/GLO30_2024_1").select("DEM").mosaic()
             slope_img = ee.Terrain.slope(dem_proxy).rename("slope_deg")
@@ -250,10 +303,22 @@ def compute_flood_risk(
             susceptibility_val = proxy_combined.get("susceptibility")
             if susceptibility_val is not None:
                 risk_value = max(0.0, min(1.0, float(susceptibility_val)))
+                if scs_runoff:
+                    # Blend the terrain-proxy susceptibility with a real site runoff coefficient -
+                    # weighted toward the terrain proxy since it already integrates depression
+                    # storage, flatness and drainage proximity, while runoff coefficient adds the
+                    # missing "how much of a given storm actually becomes surface water here" signal.
+                    # "local" mode trusts the surveyor-supplied runoff figure more heavily, matching
+                    # that pipeline's "run primarily off the uploaded data" intent.
+                    runoff_weight = 0.5 if analysis_mode == "local" else 0.3
+                    risk_value = max(0.0, min(1.0, risk_value * (1 - runoff_weight) + scs_runoff["runoff_coefficient"] * runoff_weight))
+                    breakdown["scs_runoff"] = scs_runoff
                 risk_class, class_color = classify_risk(risk_value, True)
                 breakdown["data_available"] = True
                 breakdown["flood_data_source"] = "local_terrain_proxy"
-                breakdown["_references"] = FLOOD_REFERENCES_TERRAIN_PROXY
+                breakdown["_references"] = (
+                    FLOOD_REFERENCES_TERRAIN_PROXY + LOCAL_DATA_REFERENCES if scs_runoff else FLOOD_REFERENCES_TERRAIN_PROXY
+                )
                 # fastDistanceTransform only searches a ~30-pixel radius (~14km at this raster's
                 # native resolution) - beyond that its output is an artifact of the search cutoff,
                 # not a real measurement, so it's capped here rather than displayed as false
@@ -300,6 +365,46 @@ def compute_flood_risk(
         except Exception:
             pass
 
+    # Transparency + confidence: exactly which source fed each factor in risk_value, and a 0-100
+    # "input data confidence" score derived from that mix (see compute_confidence_score's
+    # docstring for what it does and doesn't claim).
+    runoff_blended = bool(breakdown.get("scs_runoff")) and breakdown.get("flood_data_source") == "local_terrain_proxy"
+    runoff_weight = (0.5 if analysis_mode == "local" else 0.3) if runoff_blended else 0.0
+    if breakdown.get("flood_data_source") == "local_terrain_proxy":
+        base_weight = 1.0 - runoff_weight
+        factor_weights = {
+            "depression": 0.40 * base_weight, "flatness": 0.35 * base_weight, "drainage": 0.25 * base_weight,
+        }
+        factor_sources = {"depression": "global_dem", "flatness": "global_dem", "drainage": "satellite_hydrosheds"}
+        if runoff_blended:
+            factor_weights["runoff"] = runoff_weight
+            factor_sources["runoff"] = "user_input"
+    else:
+        factor_weights = {"depth": 0.6, "inundation": 0.25, "river_proximity": 0.15}
+        source = "glofas" if breakdown.get("data_available") else "not_available"
+        factor_sources = {"depth": source, "inundation": source, "river_proximity": source}
+
+    try:
+        plot_area_ha = float(geom.area(1).getInfo()) / 10000.0
+    except Exception:
+        plot_area_ha = 0.0
+    confidence = compute_confidence_score(
+        factor_sources, factor_weights, local_point_count=len(valid_points), plot_area_ha=plot_area_ha,
+    )
+
+    local_data_gaps: List[str] = []
+    if analysis_mode == "local":
+        if not runoff_blended:
+            local_data_gaps.append("Runoff estimate — no site rainfall figure and/or site type was provided.")
+        if not breakdown["local_elevation_used"]:
+            local_data_gaps.append("Relative elevation comparison — no elevation survey provided.")
+        local_data_gaps.append("Terrain slope/depression/drainage — always derived from the global 30m DEM; there's no way to survey these locally at plot scale.")
+
+    breakdown["analysis_mode"] = analysis_mode
+    breakdown["data_sources"] = factor_sources
+    breakdown["confidence"] = confidence
+    breakdown["local_data_gaps"] = local_data_gaps
+
     # Real depth surface (for the graduated map) and real building footprints (to flag which
     # specific structures sit in the flood zone) - both fetched only when there's flood coverage
     # here at all, since there's nothing meaningful to overlay otherwise.
@@ -322,7 +427,7 @@ def compute_flood_risk(
                 lambda: _fetch_depth_points(depth.unmask(0), analysis_region) if flood_data_source == "glofas" else None
             )
         contour_future = pool.submit(
-            lambda: local_elevation_points if valid_points else fetch_dem_elevation_points(boundary_geojson, buffer_m=1000)
+            lambda: valid_points if valid_points else fetch_dem_elevation_points(boundary_geojson, buffer_m=1000)
         )
         buildings_future = pool.submit(fetch_buildings_near, db, boundary_geojson, 600)
         surface_points = surface_future.result()
