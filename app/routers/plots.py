@@ -5896,8 +5896,8 @@ def preview_plot_map(plot_id: int, db: Session = Depends(get_db), background_tas
     if is_auto_scale_text(effective_scale_text):
         fitted_ratio = compute_fit_scale_ratio(
             plot_metric,
-            paper_config.fig_width * map_width_fraction,
-            paper_config.fig_height * map_height_fraction,
+            paper_config["width"] * map_width_fraction,
+            paper_config["height"] * map_height_fraction,
         )
         resolved_scale_text = f"1 : {fitted_ratio}"
     else:
