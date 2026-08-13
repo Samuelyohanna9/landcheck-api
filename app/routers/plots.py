@@ -55,6 +55,7 @@ from app.utils.map_renderer_layout import (
 from app.utils.back_computation import compute_back_computation
 from app.utils.back_computation_pdf import render_back_computation_pdf
 from shapely import wkb
+from shapely.errors import GEOSException
 import geopandas as gpd
 from app.utils.dwg_exporter import export_survey_plan_to_dxf
 from app.utils.r2_exports import upload_export_file_best_effort
@@ -5885,7 +5886,13 @@ def preview_plot_map(plot_id: int, db: Session = Depends(get_db), background_tas
     ).scalar()
     if not plot_geom_hex:
         raise HTTPException(status_code=404, detail="Plot not found")
-    plot_geom_wgs84 = wkb.loads(plot_geom_hex, hex=True)
+    try:
+        plot_geom_wgs84 = wkb.loads(plot_geom_hex, hex=True)
+    except GEOSException:
+        raise HTTPException(
+            status_code=400,
+            detail="Plot geometry is invalid. Re-save the parcel boundary and try preview again.",
+        )
     if plot_geom_wgs84 is None or plot_geom_wgs84.is_empty:
         raise HTTPException(status_code=400, detail="Plot geometry is empty.")
 
