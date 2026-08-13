@@ -2,7 +2,7 @@
 
 from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session
-from sqlalchemy import text, func
+from sqlalchemy import text, func, bindparam
 from datetime import datetime, timedelta
 import json
 import os
@@ -37,6 +37,7 @@ def ensure_plot_meta_table(db: Session):
             scale_text VARCHAR(50),
             paper_size VARCHAR(10),
             coordinate_system VARCHAR(20),
+            template_name VARCHAR(40) DEFAULT 'general',
             created_at TIMESTAMP DEFAULT NOW(),
             updated_at TIMESTAMP DEFAULT NOW()
         )
@@ -52,6 +53,7 @@ def ensure_plot_meta_table(db: Session):
         ("scale_text", "VARCHAR(50)"),
         ("paper_size", "VARCHAR(10)"),
         ("coordinate_system", "VARCHAR(20)"),
+        ("template_name", "VARCHAR(40) DEFAULT 'general'"),
         ("created_at", "TIMESTAMP DEFAULT NOW()"),
         ("updated_at", "TIMESTAMP DEFAULT NOW()"),
     ]
@@ -60,6 +62,45 @@ def ensure_plot_meta_table(db: Session):
             db.execute(text(f"ALTER TABLE plot_meta ADD COLUMN IF NOT EXISTS {col_name} {col_type}"))
         except Exception:
             # Ignore for databases that don't support IF NOT EXISTS or already have column
+            pass
+    db.commit()
+
+
+def ensure_plot_export_jobs_table(db: Session):
+    db.execute(text("""
+        CREATE TABLE IF NOT EXISTS plot_export_jobs (
+            id TEXT PRIMARY KEY,
+            export_type TEXT NOT NULL,
+            plot_id INTEGER REFERENCES plots(id) ON DELETE CASCADE,
+            subdivision_batch_id INTEGER REFERENCES plot_subdivision_batches(id) ON DELETE CASCADE,
+            cache_key TEXT,
+            status TEXT NOT NULL DEFAULT 'queued',
+            file_name TEXT,
+            local_path TEXT,
+            request_payload JSONB,
+            error_text TEXT,
+            started_at TIMESTAMP,
+            completed_at TIMESTAMP,
+            created_at TIMESTAMP DEFAULT NOW(),
+            updated_at TIMESTAMP DEFAULT NOW()
+        )
+    """))
+    columns_to_add = [
+        ("cache_key", "TEXT"),
+        ("status", "TEXT NOT NULL DEFAULT 'queued'"),
+        ("file_name", "TEXT"),
+        ("local_path", "TEXT"),
+        ("request_payload", "JSONB"),
+        ("error_text", "TEXT"),
+        ("started_at", "TIMESTAMP"),
+        ("completed_at", "TIMESTAMP"),
+        ("created_at", "TIMESTAMP DEFAULT NOW()"),
+        ("updated_at", "TIMESTAMP DEFAULT NOW()"),
+    ]
+    for col_name, col_type in columns_to_add:
+        try:
+            db.execute(text(f"ALTER TABLE plot_export_jobs ADD COLUMN IF NOT EXISTS {col_name} {col_type}"))
+        except Exception:
             pass
     db.commit()
 
@@ -310,6 +351,7 @@ def get_plot_details(db: Session = Depends(get_db)):
     """Get full plot details for admin view."""
     ensure_plots_created_at(db)
     ensure_plot_meta_table(db)
+    ensure_plot_export_jobs_table(db)
 
     # Check if created_at exists on plots table
     has_created_at = True
@@ -324,7 +366,7 @@ def get_plot_details(db: Session = Depends(get_db)):
     try:
         rows = db.execute(text(f"""
             SELECT
-                p.id,
+                p.id AS plot_id,
                 ST_AsGeoJSON(p.geom) AS geojson,
                 {created_at_col} AS created_at,
                 m.title_text,
@@ -336,19 +378,20 @@ def get_plot_details(db: Session = Depends(get_db)):
                 m.scale_text,
                 m.paper_size,
                 m.coordinate_system,
+                m.template_name,
                 m.created_at AS meta_created_at,
                 m.updated_at AS meta_updated_at
             FROM plots p
             LEFT JOIN plot_meta m ON m.plot_id = p.id
             ORDER BY p.id DESC
-        """)).fetchall()
+        """)).mappings().all()
     except Exception as e:
         print(f"Plot details query failed: {e}")
         # Fallback without plot_meta join
         try:
             rows = db.execute(text(f"""
                 SELECT
-                    p.id,
+                    p.id AS plot_id,
                     NULL AS geojson,
                     {created_at_col} AS created_at,
                     NULL AS title_text,
@@ -360,11 +403,12 @@ def get_plot_details(db: Session = Depends(get_db)):
                     NULL AS scale_text,
                     NULL AS paper_size,
                     NULL AS coordinate_system,
+                    NULL AS template_name,
                     NULL AS meta_created_at,
                     NULL AS meta_updated_at
                 FROM plots p
                 ORDER BY p.id DESC
-            """)).fetchall()
+            """)).mappings().all()
         except Exception as inner_e:
             print(f"Fallback plot query failed: {inner_e}")
             rows = []
@@ -392,15 +436,80 @@ def get_plot_details(db: Session = Depends(get_db)):
     except Exception:
         pass
 
+    export_summary_by_plot = {}
+    plot_ids = [int(row["plot_id"]) for row in rows if row.get("plot_id") is not None]
+    if plot_ids:
+        try:
+            summary_stmt = text("""
+                SELECT
+                    plot_id,
+                    COUNT(*) AS total_jobs,
+                    COUNT(*) FILTER (WHERE status = 'completed') AS completed_jobs,
+                    COUNT(*) FILTER (WHERE status = 'failed') AS failed_jobs,
+                    COUNT(*) FILTER (WHERE status = 'queued') AS queued_jobs,
+                    COUNT(*) FILTER (WHERE status = 'running') AS running_jobs,
+                    MAX(COALESCE(completed_at, updated_at, created_at)) AS last_export_at,
+                    ARRAY_REMOVE(ARRAY_AGG(DISTINCT export_type), NULL) AS export_types
+                FROM plot_export_jobs
+                WHERE plot_id IN :plot_ids
+                GROUP BY plot_id
+            """).bindparams(bindparam("plot_ids", expanding=True))
+            summary_rows = db.execute(summary_stmt, {"plot_ids": plot_ids}).mappings().all()
+            for row in summary_rows:
+                export_summary_by_plot[int(row["plot_id"])] = {
+                    "total_jobs": int(row["total_jobs"] or 0),
+                    "completed_jobs": int(row["completed_jobs"] or 0),
+                    "failed_jobs": int(row["failed_jobs"] or 0),
+                    "queued_jobs": int(row["queued_jobs"] or 0),
+                    "running_jobs": int(row["running_jobs"] or 0),
+                    "last_export_at": row["last_export_at"].isoformat() if row.get("last_export_at") else None,
+                    "export_types": list(row.get("export_types") or []),
+                }
+
+            latest_stmt = text("""
+                SELECT DISTINCT ON (plot_id)
+                    plot_id,
+                    export_type,
+                    status,
+                    COALESCE(completed_at, updated_at, created_at) AS activity_at
+                FROM plot_export_jobs
+                WHERE plot_id IN :plot_ids
+                ORDER BY plot_id,
+                         COALESCE(completed_at, updated_at, created_at) DESC,
+                         updated_at DESC NULLS LAST,
+                         created_at DESC NULLS LAST
+            """).bindparams(bindparam("plot_ids", expanding=True))
+            latest_rows = db.execute(latest_stmt, {"plot_ids": plot_ids}).mappings().all()
+            for row in latest_rows:
+                plot_id = int(row["plot_id"])
+                export_summary = export_summary_by_plot.setdefault(
+                    plot_id,
+                    {
+                        "total_jobs": 0,
+                        "completed_jobs": 0,
+                        "failed_jobs": 0,
+                        "queued_jobs": 0,
+                        "running_jobs": 0,
+                        "last_export_at": row["activity_at"].isoformat() if row.get("activity_at") else None,
+                        "export_types": [],
+                    },
+                )
+                export_summary["last_export_type"] = row.get("export_type")
+                export_summary["last_export_status"] = row.get("status")
+                if row.get("activity_at"):
+                    export_summary["last_export_at"] = row["activity_at"].isoformat()
+        except Exception as exc:
+            print(f"Failed to load plot export summaries: {exc}")
+
     plot_list = []
     for row in rows:
         geojson = None
-        if row[1]:
-            if isinstance(row[1], dict):
-                geojson = row[1]
+        if row.get("geojson"):
+            if isinstance(row["geojson"], dict):
+                geojson = row["geojson"]
             else:
                 try:
-                    geojson = json.loads(row[1])
+                    geojson = json.loads(row["geojson"])
                 except Exception:
                     geojson = None
         coords = []
@@ -408,25 +517,43 @@ def get_plot_details(db: Session = Depends(get_db)):
             rings = geojson.get("coordinates", [])
             coords = rings[0] if rings else []
 
-        created_at = row[2] or row[12]
+        plot_id = int(row["plot_id"])
+        created_at = row.get("created_at") or row.get("meta_created_at")
+        export_summary = export_summary_by_plot.get(
+            plot_id,
+            {
+                "total_jobs": 0,
+                "completed_jobs": 0,
+                "failed_jobs": 0,
+                "queued_jobs": 0,
+                "running_jobs": 0,
+                "last_export_type": None,
+                "last_export_status": None,
+                "last_export_at": None,
+                "export_types": [],
+            },
+        )
 
         plot_list.append({
-            "plot_id": row[0],
+            "plot_id": plot_id,
             "created_at": created_at.isoformat() if created_at else None,
-            "title_text": row[3],
-            "location_text": row[4],
-            "lga_text": row[5],
-            "state_text": row[6],
-            "surveyor_name": row[7],
-            "surveyor_rank": row[8],
-            "scale_text": row[9],
-            "paper_size": row[10],
-            "coordinate_system": row[11],
+            "title_text": row.get("title_text"),
+            "location_text": row.get("location_text"),
+            "lga_text": row.get("lga_text"),
+            "state_text": row.get("state_text"),
+            "surveyor_name": row.get("surveyor_name"),
+            "surveyor_rank": row.get("surveyor_rank"),
+            "scale_text": row.get("scale_text"),
+            "paper_size": row.get("paper_size"),
+            "coordinate_system": row.get("coordinate_system"),
+            "template_name": row.get("template_name"),
             "geometry": geojson,
             "coords": coords,
-            "detected_features": features_by_plot.get(row[0], {"inside": {}, "buffer": {}}),
-            "reports_generated": build_report_flags(row[0]),
-            "meta_updated_at": row[13].isoformat() if row[13] else None
+            "detected_features": features_by_plot.get(plot_id, {"inside": {}, "buffer": {}}),
+            "reports_generated": build_report_flags(plot_id),
+            "meta_created_at": row["meta_created_at"].isoformat() if row.get("meta_created_at") else None,
+            "meta_updated_at": row["meta_updated_at"].isoformat() if row.get("meta_updated_at") else None,
+            "export_summary": export_summary,
         })
 
     return plot_list

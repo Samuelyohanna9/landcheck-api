@@ -1303,16 +1303,14 @@ def save_georeference_features(session_id: str, payload: SaveDigitizedFeaturesRe
     return {"ok": True, "session": _session_to_payload(updated)}
 
 
-def _excel_text_number(value: float, decimals: int) -> str:
-    # A plain "211213.126" is only unambiguous on a "." decimal / "," thousands locale. On a
-    # system configured the other way around (comma decimal, period thousands - common outside
-    # the US/UK), Excel's CSV import silently reparses "." as a thousands separator instead of a
-    # decimal point, turning 211213.126 into the integer 211213126 and displaying it grouped as
-    # "211.213.126" - the data itself gets corrupted, not just the formatting. Wrapping the
-    # formatted string in ="..." forces Excel to treat the cell as literal text (a formula whose
-    # result is exactly this string), which is immune to regional number reparsing either way.
-    formatted = f"{float(value):,.{decimals}f}"
-    return f'="{formatted}"'
+def _format_coordinate_number(value: float, decimals: int) -> str:
+    # Plain "." decimal formatting, no thousands separator and no Excel formula-forcing wrapper -
+    # this file's whole purpose is DGPS/GIS ingestion (QGIS, AutoCAD Civil 3D, DGPS receivers,
+    # etc.), and every one of those expects a bare numeric token like "211213.1260". A
+    # comma-grouped "211,213.1260" or an ="..." formula string is not a valid number to any of
+    # them - it would only ever have helped Excel specifically, at the cost of breaking the export
+    # for the software it's actually meant for.
+    return f"{float(value):.{decimals}f}"
 
 
 @router.get("/sessions/{session_id}/exports/staking.csv")
@@ -1322,7 +1320,8 @@ def export_georeference_staking_csv(session_id: str, db: Session = Depends(get_d
     rows = _build_staking_rows(features, str(row.get("target_coordinate_system") or "wgs84"))
 
     csv_buffer = io.StringIO(newline="")
-    csv_buffer.write("sep=,\r\n")
+    # No "sep=," Excel hint line - GIS/DGPS CSV readers treat it as a malformed data row (wrong
+    # column count) rather than the delimiter directive Excel understands it as.
     writer = csv.writer(csv_buffer, lineterminator="\r\n")
     writer.writerow(["Station", "Feature", "Coordinate System", "Easting (m)", "Northing (m)", "Longitude", "Latitude"])
     for item in rows:
@@ -1331,10 +1330,10 @@ def export_georeference_staking_csv(session_id: str, db: Session = Depends(get_d
                 item["station"],
                 item["feature"],
                 str(item["coordinate_system"]).upper(),
-                _excel_text_number(item["easting"], 4),
-                _excel_text_number(item["northing"], 4),
-                _excel_text_number(item["longitude"], 8),
-                _excel_text_number(item["latitude"], 8),
+                _format_coordinate_number(item["easting"], 4),
+                _format_coordinate_number(item["northing"], 4),
+                _format_coordinate_number(item["longitude"], 8),
+                _format_coordinate_number(item["latitude"], 8),
             ]
         )
     _touch_session(db, session_id)

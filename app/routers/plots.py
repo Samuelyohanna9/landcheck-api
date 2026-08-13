@@ -1993,13 +1993,15 @@ def _safe_filename_fragment(value: str, fallback: str) -> str:
     return cleaned or fallback
 
 
-def _format_nigerian_number(value: float, decimals: int) -> str:
+def _format_coordinate_number(value: float, decimals: int) -> str:
     try:
         numeric = float(value)
     except Exception:
         numeric = 0.0
-    # Prefix apostrophe keeps exact display in Excel while preserving dot-decimal style.
-    return f"'{numeric:,.{decimals}f}"
+    # Plain "." decimal, no thousands separator and no Excel apostrophe/formula wrapper - this
+    # file is named for DGPS/GIS ingestion, and every consumer of that kind (QGIS, Civil 3D, DGPS
+    # receivers) expects a bare numeric token, not an Excel-only display trick.
+    return f"{numeric:.{decimals}f}"
 
 
 def _normalize_lot_key(value: Any) -> str:
@@ -3091,19 +3093,10 @@ def _generate_subdivision_batch_zip(
         return cached_zip_path, None
 
     tmp_dir = tempfile.mkdtemp(prefix=f"subdivision_batch_{batch_id}_")
-    export_rows: list[list[str]] = [["sep=,"], ["lot_no", "child_plot_id", "area_m2"]]
-    setting_out_rows: list[list[str]] = [["sep=,"], [
-        "lot_no",
-        "child_plot_id",
-        "point_index",
-        "station",
-        "longitude",
-        "latitude",
-        "easting",
-        "northing",
-        "utm_epsg",
-    ]]
-    setting_out_rows_raw: list[list[str]] = [[
+    # No "sep=," Excel hint line here - GIS/DGPS CSV readers treat it as a malformed data row
+    # (wrong column count) rather than the delimiter directive Excel understands it as.
+    export_rows: list[list[str]] = [["lot_no", "child_plot_id", "area_m2"]]
+    setting_out_rows: list[list[str]] = [[
         "lot_no",
         "child_plot_id",
         "point_index",
@@ -3157,21 +3150,10 @@ def _generate_subdivision_batch_zip(
                                 str(child_plot_id),
                                 str(idx),
                                 _station_name(idx - 1),
-                                _format_nigerian_number(lng_val, 8),
-                                _format_nigerian_number(lat_val, 8),
-                                _format_nigerian_number(easting_val, 3),
-                                _format_nigerian_number(northing_val, 3),
-                                str(int(utm_epsg)),
-                            ])
-                            setting_out_rows_raw.append([
-                                lot_no,
-                                str(child_plot_id),
-                                str(idx),
-                                _station_name(idx - 1),
-                                f"{lng_val:.8f}",
-                                f"{lat_val:.8f}",
-                                f"{easting_val:.3f}",
-                                f"{northing_val:.3f}",
+                                _format_coordinate_number(lng_val, 8),
+                                _format_coordinate_number(lat_val, 8),
+                                _format_coordinate_number(easting_val, 3),
+                                _format_coordinate_number(northing_val, 3),
                                 str(int(utm_epsg)),
                             ])
             except Exception:
@@ -3199,22 +3181,10 @@ def _generate_subdivision_batch_zip(
             )
             writer.writerows(setting_out_rows)
 
-        setting_out_raw_path = os.path.join(tmp_dir, "setting_out_points_dgps_raw.csv")
-        with open(setting_out_raw_path, "w", encoding="utf-8", newline="") as f:
-            writer = csv.writer(
-                f,
-                delimiter=",",
-                quotechar='"',
-                quoting=csv.QUOTE_MINIMAL,
-                lineterminator="\n",
-            )
-            writer.writerows(setting_out_rows_raw)
-
         zip_path = os.path.join(tmp_dir, zip_name)
         with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
             zf.write(manifest_path, arcname="batch_manifest.csv")
             zf.write(setting_out_path, arcname="setting_out_points_dgps.csv")
-            zf.write(setting_out_raw_path, arcname="setting_out_points_dgps_raw.csv")
             for fp in pdf_files:
                 if os.path.isfile(fp):
                     zf.write(fp, arcname=os.path.basename(fp))
