@@ -3688,7 +3688,6 @@ def _render_plot_map_layout_cadastral(
 # cadastral layout.
 
 FCT_FONT_FAMILY = "DejaVu Sans"
-FCT_FILL_COLOR = "#c9c9c9"
 
 
 def _draw_fct_header(
@@ -4153,7 +4152,7 @@ def _render_plot_map_layout_fct(
 
     # Gray-filled parcel (the reference plan's parcels are shaded, not left white) with the red
     # boundary outline on top - one draw call handles both.
-    gdf_plot.plot(ax=ax, facecolor=FCT_FILL_COLOR, edgecolor=boundary_color, lw=1.1 * font_scale, zorder=20)
+    gdf_plot.plot(ax=ax, facecolor="none", edgecolor=boundary_color, lw=1.1 * font_scale, zorder=20)
     ax.set_xlim(target_xlim)
     ax.set_ylim(target_ylim)
 
