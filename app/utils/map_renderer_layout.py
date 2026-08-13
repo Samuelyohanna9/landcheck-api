@@ -4181,6 +4181,22 @@ def _render_plot_map_layout_fct(
         except Exception:
             continue
     road_edge_lines = _collect_connected_road_edge_lines(road_geom_width, snap_tol_m=road_snap_tol)
+    # A road running right along the frontage would otherwise draw its near-side edge inside or
+    # immediately alongside the actual property line - a near-duplicate dashed line right next to
+    # the solid red boundary that reads as the boundary itself being broken/doubled. Only the
+    # portion of a nearby road clearly outside the parcel (and a small buffer around it) is drawn.
+    if road_edge_lines:
+        boundary_exclusion = poly.buffer(max(1.0, (2.0 / 1000.0) * scale_ratio))
+        clipped_edge_lines = []
+        for line in road_edge_lines:
+            try:
+                diff = line.difference(boundary_exclusion)
+            except Exception:
+                diff = line
+            for part in _iter_line_geometries(diff):
+                if part is not None and not getattr(part, "is_empty", True) and getattr(part, "length", 0.0) > 1.0:
+                    clipped_edge_lines.append(part)
+        road_edge_lines = clipped_edge_lines
     # The reference plan shows nearby roads as plain dashed reference lines, not solid double
     # lines - matching that convention here (Akwa Ibom/Rivers/Cross River do the same).
     _draw_road_edges(ax, road_edge_lines, font_scale=font_scale, color=road_color, linestyle=(0, (6, 4)))
