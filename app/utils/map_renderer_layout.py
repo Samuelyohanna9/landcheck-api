@@ -844,7 +844,12 @@ def add_north_arrow(
             fontsize=font_size, color=col, weight="normal",
             fontproperties=text_font, zorder=22,
         )
-        return x
+        return {
+            "stem_x": sx(svg_stem_x),
+            "stem_top": sy(svg_top_y),
+            "stem_bottom": sy(svg_bottom_y),
+            "text_baseline_y": sy(svg_text_baseline_y),
+        }
 
     # default: classic arrow
     ax.annotate(
@@ -3121,6 +3126,92 @@ def _draw_cadastral_coordinate_labels(
              transform=ax.transAxes, fontfamily=CADASTRAL_FONT_FAMILY)
 
 
+def _draw_cadastral_reference_guides(
+    fig,
+    ax,
+    guide_easting_m: float,
+    bottom_northing_m: float,
+    top_northing_m: float,
+    arrow_meta: dict | None = None,
+    top_line_end_easting_m: float | None = None,
+    bottom_line_end_easting_m: float | None = None,
+    font_scale: float = 1.0,
+    color: str = CADASTRAL_BLUE,
+) -> None:
+    """Draw the single blue guide frame used by South-South cadastral templates.
+
+    The reference sheets use a single vertical guide tied to the U.N. north-arrow stem, with one
+    top horizontal guide and one bottom horizontal guide. These are page-level cues, so draw them
+    in figure coordinates after projecting the selected map guide coordinates through the active
+    axes transform.
+    """
+    xmin, xmax = ax.get_xlim()
+    ymin, ymax = ax.get_ylim()
+    span_x = max(abs(xmax - xmin), 1.0)
+    span_y = max(abs(ymax - ymin), 1.0)
+
+    top_line_end_x = min(
+        xmax,
+        max(
+            guide_easting_m + max(span_x * 0.22, span_x * 0.10),
+            float(top_line_end_easting_m if top_line_end_easting_m is not None else guide_easting_m) + span_x * 0.035,
+        ),
+    )
+    bottom_line_end_x = min(
+        xmax,
+        max(
+            guide_easting_m + max(span_x * 0.42, span_x * 0.16),
+            float(bottom_line_end_easting_m if bottom_line_end_easting_m is not None else guide_easting_m) + span_x * 0.045,
+        ),
+    )
+
+    guide_top_data_y = min(ymax, top_northing_m)
+    guide_bottom_data_y = max(ymin, bottom_northing_m)
+
+    guide_fig_x, top_fig_y = fig.transFigure.inverted().transform(
+        ax.transData.transform((guide_easting_m, guide_top_data_y))
+    )
+    _, bottom_fig_y = fig.transFigure.inverted().transform(
+        ax.transData.transform((guide_easting_m, guide_bottom_data_y))
+    )
+    top_end_fig_x, _ = fig.transFigure.inverted().transform(
+        ax.transData.transform((top_line_end_x, guide_top_data_y))
+    )
+    bottom_end_fig_x, _ = fig.transFigure.inverted().transform(
+        ax.transData.transform((bottom_line_end_x, guide_bottom_data_y))
+    )
+
+    stem_bottom_y = (arrow_meta or {}).get("stem_bottom")
+    if stem_bottom_y is None:
+        stem_bottom_y = min(0.93, float(ax.get_position().y1) + 0.008)
+    stem_x = (arrow_meta or {}).get("stem_x", guide_fig_x)
+
+    line_lw = max(0.9, 1.0 * font_scale)
+    common = {
+        "transform": fig.transFigure,
+        "color": color,
+        "lw": line_lw,
+        "zorder": 18,
+        "solid_capstyle": "butt",
+    }
+
+    fig.add_artist(mlines.Line2D(
+        [stem_x, stem_x],
+        [bottom_fig_y - 0.002, stem_bottom_y],
+        **common,
+    ))
+    fig.add_artist(mlines.Line2D(
+        [stem_x, max(stem_x, top_end_fig_x)],
+        [top_fig_y, top_fig_y],
+        **common,
+    ))
+    fig.add_artist(mlines.Line2D(
+        [stem_x, max(stem_x, bottom_end_fig_x)],
+        [bottom_fig_y, bottom_fig_y],
+        **common,
+    ))
+
+
 def _draw_cadastral_frontage_road(ax, poly, road_name: str, font_scale: float = 1.0, color: str = "black") -> None:
     """Dashed frontage-road reference line just outside the boundary's lowest edge, labeled with
     the applicant's road/street name - the same "OLD ORON ROAD"-style annotation seen on the
@@ -3474,16 +3565,62 @@ def _render_plot_map_layout_cadastral(
         bearing_size=bearing_size,
     )
 
-    first_coords = list(poly.exterior.coords)[0]
-    # The north arrow icon sits in its normal position (like every other template/style) rather
-    # than being anchored to a station point - tying its stem to a vertex kept overlapping the
-    # beacon marker there and breaking whenever that vertex sat near the map's edge.
-    add_north_arrow(
-        ax, font_scale=font_scale, style=north_arrow_style, color=north_arrow_color,
+    ring_coords = list(poly.exterior.coords)
+    first_coords = ring_coords[0]
+    all_x = [pt[0] for pt in ring_coords[:-1]] if len(ring_coords) > 1 else [first_coords[0]]
+    all_y = [pt[1] for pt in ring_coords[:-1]] if len(ring_coords) > 1 else [first_coords[1]]
+    plot_min_x = min(all_x) if all_x else first_coords[0]
+    plot_max_x = max(all_x) if all_x else first_coords[0]
+    plot_min_y = min(all_y) if all_y else first_coords[1]
+    plot_max_y = max(all_y) if all_y else first_coords[1]
+    span_x = max(abs(target_xlim[1] - target_xlim[0]), 1.0)
+    span_y = max(abs(target_ylim[1] - target_ylim[0]), 1.0)
+
+    # The Akwa Ibom / Rivers / Cross River cadastral sheets use a dedicated reference guide that
+    # sits slightly inside the left sheet edge, not on the parcel itself. Older saved drafts may
+    # still carry another arrow style, so force the proper U.N. marker whenever this cadastral
+    # renderer is active.
+    guide_easting = target_xlim[0] + span_x * 0.035
+    bottom_northing = target_ylim[0] + span_y * 0.032
+    top_northing = target_ylim[1] - span_y * 0.035
+    top_line_end_easting = max(plot_min_x - span_x * 0.015, guide_easting + span_x * 0.20)
+    bottom_line_end_easting = min(
+        target_xlim[1] - span_x * 0.025,
+        max(plot_max_x + span_x * 0.085, guide_easting + span_x * 0.40),
+    )
+
+    guide_fig_x, _ = fig.transFigure.inverted().transform(
+        ax.transData.transform((guide_easting, top_northing))
+    )
+
+    north_arrow_meta = add_north_arrow(
+        ax,
+        font_scale=max(font_scale * 1.62, font_scale + 0.30),
+        style="un_marker",
+        color=north_arrow_color,
+        anchor_x=guide_fig_x,
+        anchor_y=min(0.92, ax.get_position().y1 + 0.028),
         blue_hex=grid_color,
     )
+    _draw_cadastral_reference_guides(
+        fig,
+        ax,
+        guide_easting_m=guide_easting,
+        bottom_northing_m=bottom_northing,
+        top_northing_m=top_northing,
+        top_line_end_easting_m=top_line_end_easting,
+        bottom_line_end_easting_m=bottom_line_end_easting,
+        arrow_meta=north_arrow_meta,
+        font_scale=font_scale,
+        color=grid_color,
+    )
+
     _draw_cadastral_coordinate_labels(
-        ax, easting_m=first_coords[0], northing_m=first_coords[1], font_scale=font_scale, color=grid_color,
+        ax,
+        easting_m=guide_easting,
+        northing_m=bottom_northing,
+        font_scale=font_scale,
+        color=grid_color,
     )
 
     certification_date = datetime.now().strftime("%d / %m / %Y")
@@ -3502,6 +3639,470 @@ def _render_plot_map_layout_cadastral(
     ax.set_aspect("equal")
     ax.axis("off")
     fig.canvas.draw()
+    fig.savefig(output_path, dpi=dpi)
+    plt.close(fig)
+
+# ======================
+# FCT Abuja cadastral template
+# ======================
+# A visually distinct government-issue style: gray-filled parcel, black boundary/bearing text
+# (not red), a formal "LAND GRANTED TO" title block with a director's signature line, a
+# beacon-to-beacon distance/bearing schedule table, and a NOTE box with the reference beacon's
+# coordinates - matching a real FCT Abuja land-grant plan rather than the South-South states'
+# cadastral layout.
+
+FCT_FONT_FAMILY = "DejaVu Sans"
+FCT_FILL_COLOR = "#c9c9c9"
+FCT_STATE_LABEL = "FCT ABUJA"
+
+
+def _draw_fct_header(
+    fig, applicant_name: str, file_no: str, district: str, cadastral_zone: str, plot_no: str,
+    font_scale: float = 1.0, text_color: str = "black",
+) -> None:
+    fig.add_artist(patches.Rectangle((0.03, 0.03), 0.94, 0.94, transform=fig.transFigure, fill=False, lw=1.2))
+
+    cx = 0.5
+    y = 0.955
+    fs = max(7, int(9 * font_scale))
+    line_h = 0.021
+
+    def line(text_value: str, bold: bool = True, size_mult: float = 1.0, gap: float = 1.0) -> None:
+        nonlocal y
+        fig.text(
+            cx, y, text_value, ha="center", va="center", fontsize=max(6, int(fs * size_mult)),
+            weight=("bold" if bold else "normal"), fontfamily=FCT_FONT_FAMILY, color=text_color,
+        )
+        y -= line_h * gap
+
+    line(f"LAND GRANTED TO {_safe_text(applicant_name, '-').upper()}", size_mult=1.05)
+    line(f"FILE NO: {_safe_text(file_no, '-').upper()}", bold=False)
+    line(f"DISTRICT: {_safe_text(district, '-').upper()}", bold=False)
+    line(f"CADASTRAL ZONE: {_safe_text(cadastral_zone, '-').upper()}", bold=False)
+    line(f"PLOT NO: {_safe_text(plot_no, '-').upper()}", bold=False)
+
+    y -= line_h * 0.9
+    sig_w = 0.16
+    fig.add_artist(mlines.Line2D(
+        [cx - sig_w / 2, cx + sig_w / 2], [y, y], transform=fig.transFigure,
+        color=text_color, lw=1.0 * font_scale,
+    ))
+    y -= line_h * 0.65
+    fig.text(
+        cx, y, "DIRECTOR OF SURVEYING AND MAPPING", ha="center", va="center",
+        fontsize=max(6, int(fs * 0.72)), fontfamily=FCT_FONT_FAMILY, color=text_color,
+    )
+
+
+def _draw_fct_scale_schedule(fig, y_top: float, scale_text: str, font_scale: float = 1.0, text_color: str = "black") -> float:
+    fs = max(7, int(8.5 * font_scale))
+    fig.text(
+        0.5, y_top, f"SCALE: {_normalize_scale_label_adamawa(scale_text)}", ha="center", va="top",
+        fontsize=fs, weight="bold", fontfamily=FCT_FONT_FAMILY, color=text_color,
+    )
+    y2 = y_top - 0.022
+    fig.text(
+        0.5, y2, "SCHEDULE: AS DESCRIBED IN GRAPHICS ABOVE", ha="center", va="top",
+        fontsize=max(6, int(fs * 0.78)), fontfamily=FCT_FONT_FAMILY, color=text_color,
+    )
+    return y2 - 0.02
+
+
+def _compute_fct_beacon_schedule(poly, station_names=None) -> list:
+    """[(from_label, to_label, distance_m, bearing_deg), ...] for each boundary edge, in the same
+    clockwise order and station labeling annotate_vertices already draws on the map.
+    """
+    coords, labels = _clockwise_ring_coords_and_labels(poly, station_names=station_names)
+    n = len(labels)
+    rows = []
+    for i in range(n):
+        p1 = Point(coords[i])
+        p2 = Point(coords[i + 1])
+        bearing = calculate_bearing_deg(p1, p2)
+        rows.append((labels[i], labels[(i + 1) % n], p1.distance(p2), bearing))
+    return rows
+
+
+def _draw_fct_beacon_table(
+    fig, x0: float, y_top: float, y_bottom: float, rows: list, font_scale: float = 1.0, text_color: str = "black",
+) -> None:
+    fs = max(6, int(7 * font_scale))
+    fig.text(x0, y_top, "BEACON SCHEDULE", weight="bold", fontsize=fs,
+              fontfamily=FCT_FONT_FAMILY, color=text_color, ha="left", va="top")
+    y = y_top - 0.022
+    row_h = max(0.013, min(0.02, (y - y_bottom) / max(1, len(rows))))
+    line_fs = fs if row_h >= 0.016 else max(5, int(fs * 0.85))
+    for frm, to, dist_m, bearing in rows:
+        fig.text(
+            x0, y, f"FROM {frm} TO {to}  =  {dist_m:.2f}m AT {format_bearing_dms(bearing)}",
+            fontsize=line_fs, fontfamily=FCT_FONT_FAMILY, color=text_color, ha="left", va="top",
+        )
+        y -= row_h
+
+
+def _draw_fct_note_box(
+    fig, x0: float, y_top: float, origin_beacon_text: str, easting_m: float, northing_m: float,
+    coordinate_system_text: str, cadastral_map_ref: str, font_scale: float = 1.0, text_color: str = "black",
+) -> None:
+    fs = max(6, int(7 * font_scale))
+    y = y_top
+    fig.text(x0, y, "NOTE:", weight="bold", fontsize=max(7, int(fs * 1.05)),
+              fontfamily=FCT_FONT_FAMILY, color=text_color, ha="left", va="top")
+    y -= 0.022
+    lines = [
+        f"FULL BEACON NUMBER: {_safe_text(origin_beacon_text, '-').upper()}",
+        f"N: {northing_m:,.2f}   E: {easting_m:,.2f}",
+        f"COORDINATE SYSTEM: {_safe_text(coordinate_system_text, '-').upper()}",
+    ]
+    cadastral_map_clean = _safe_text(cadastral_map_ref)
+    if cadastral_map_clean:
+        lines.append(f"CADASTRAL MAP REF: {cadastral_map_clean.upper()}")
+    for ln in lines:
+        fig.text(x0, y, ln, fontsize=fs, fontfamily=FCT_FONT_FAMILY, color=text_color, ha="left", va="top")
+        y -= 0.019
+
+
+def _draw_fct_footer(
+    fig, y: float, surveyor_name: str, surveyor_rank: str, prepared_by: str,
+    font_scale: float = 1.0, text_color: str = "black",
+) -> None:
+    fs = max(6, int(7 * font_scale))
+    credential = _safe_text(surveyor_rank)
+    surveyor_line = f"SURVEYED BY: {_safe_text(surveyor_name, '-').upper()}" + (f", {credential}" if credential else "")
+    date_text = datetime.now().strftime("%d %B %Y")
+    fig.text(0.05, y, surveyor_line, fontsize=fs, fontfamily=FCT_FONT_FAMILY, color=text_color, ha="left", va="top")
+    fig.text(
+        0.05, y - 0.02, f"PREPARED BY: {_safe_text(prepared_by, 'LANDCHECK').upper()}   {date_text}",
+        fontsize=fs, fontfamily=FCT_FONT_FAMILY, color=text_color, ha="left", va="top",
+    )
+
+
+def _render_plot_map_layout_fct(
+    db,
+    plot_id: int,
+    output_path: str,
+    title_text: str,
+    lga_text: str,
+    state_text: str,
+    scale_text: str,
+    surveyor_name: str,
+    surveyor_rank: str,
+    paper_size: str = "A4",
+    station_names=None,
+    coordinate_system: str = "wgs84",
+    epsg_code: int = 4326,
+    north_arrow_style: str = "triangle",
+    north_arrow_color: str = "black",
+    beacon_style: str = "cross",
+    road_width_m: float | None = None,
+    road_width_override_m: float | None = None,
+    cadastral_plan_no: str = "",
+    fct_file_no: str = "",
+    fct_district: str = "",
+    fct_cadastral_zone: str = "",
+    fct_origin_beacon_text: str = "",
+    fct_cadastral_map_ref: str = "",
+    preview_mode: bool = False,
+    boundary_color: str | None = None,
+    grid_color: str | None = None,
+    text_color: str | None = None,
+    road_color: str | None = None,
+    river_color: str | None = None,
+    building_color: str | None = None,
+    building_hatch_type: str | None = None,
+    title_font: str | None = None,
+    title_size: int | None = None,
+    grid_font: str | None = None,
+    grid_size: int | None = None,
+    station_font: str | None = None,
+    station_size: int | None = None,
+    bearing_font: str | None = None,
+    bearing_size: int | None = None,
+    area_font: str | None = None,
+    area_size: int | None = None,
+):
+    boundary_color = boundary_color or "red"
+    text_color = text_color or "black"
+    road_color = road_color or "black"
+    river_color = river_color or "#10a3df"
+    building_color = building_color or "black"
+    building_hatch_type = building_hatch_type or "diagonal"
+    # The reference plan draws bearing/distance labels in black even though the boundary itself
+    # is red - annotate_vertices' boundary_color param drives that text color independently of
+    # the actual boundary line, which is drawn separately below.
+    bearing_text_color = "black"
+
+    plot_wkb = db.execute(text("SELECT geom FROM plots WHERE id=:id"), {"id": plot_id}).scalar()
+    if not plot_wkb:
+        raise ValueError("Plot not found")
+
+    rows = db.execute(
+        text("SELECT geom, feature_type FROM detected_features WHERE plot_id=:id"),
+        {"id": plot_id},
+    ).fetchall()
+    override_rows = db.execute(
+        text("""
+            SELECT feature_type, action, name, width_m, ST_AsGeoJSON(geom) AS geojson
+            FROM plot_feature_overrides
+            WHERE plot_id = :id
+        """),
+        {"id": plot_id},
+    ).fetchall()
+    area_m2 = db.execute(
+        text("SELECT ST_Area(geom::geography) FROM plots WHERE id=:id"),
+        {"id": plot_id}
+    ).scalar() or 0
+
+    plot_geom = wkb.loads(plot_wkb)
+    buildings, rivers, fences = [], [], []
+    for r in rows:
+        g = wkb.loads(r.geom)
+        if r.feature_type == "building":
+            buildings.append(g)
+        elif r.feature_type == "river":
+            rivers.append(g)
+        elif r.feature_type == "fence":
+            fences.append(g)
+    detected_roads = _fetch_live_road_geoms(db, plot_id)
+
+    overrides = []
+    import json
+    for r in override_rows:
+        geom = None
+        if r.geojson:
+            try:
+                geom = shape(json.loads(r.geojson))
+            except Exception:
+                geom = None
+        overrides.append({
+            "feature_type": r.feature_type,
+            "action": r.action,
+            "name": r.name,
+            "geom": geom,
+        })
+
+    def apply_overrides(base_list, feature_type: str):
+        result = list(base_list)
+        added = []
+        delete_geoms = []
+        for ov in overrides:
+            if ov["feature_type"] != feature_type:
+                continue
+            geom = ov["geom"]
+            if geom is None:
+                continue
+            try:
+                if hasattr(geom, "is_valid") and not geom.is_valid:
+                    geom = geom.buffer(0)
+            except Exception:
+                pass
+            if ov["action"] in ("delete", "update"):
+                result = [g for g in result if not g.intersects(geom)]
+                delete_geoms.append(geom)
+            if ov["action"] in ("add", "update"):
+                result.append(geom)
+                added.append(geom)
+        if delete_geoms:
+            added = [g for g in added if not any(g.intersects(dg) for dg in delete_geoms)]
+        return result, added
+
+    buildings, added_buildings = apply_overrides(buildings, "building")
+    rivers, _ = apply_overrides(rivers, "river")
+    fences, _ = apply_overrides(fences, "fence")
+    roads_for_draw, _ = apply_overrides(detected_roads, "road")
+    road_add_named_overrides = _resolve_override_names(overrides, "road")
+    river_add_named_overrides = _resolve_override_names(overrides, "river")
+
+    display_epsg = epsg_code
+    if coordinate_system == "wgs84" or epsg_code == 4326:
+        centroid = plot_geom.centroid
+        utm_zone = int((centroid.x + 180) / 6) + 1
+        hemisphere = "north" if centroid.y >= 0 else "south"
+        display_epsg = 32600 + utm_zone if hemisphere == "north" else 32700 + utm_zone
+
+    gdf_plot = gpd.GeoDataFrame(geometry=[plot_geom], crs="EPSG:4326").to_crs(epsg=display_epsg)
+    poly = gdf_plot.geometry.iloc[0]
+    if not poly.is_valid:
+        poly = poly.buffer(0)
+        gdf_plot = gpd.GeoDataFrame(geometry=[poly], crs=f"EPSG:{display_epsg}")
+
+    paper_config = get_paper_config(paper_size)
+    fig_width = paper_config["width"]
+    fig_height = paper_config["height"]
+    font_scale = paper_config["scale"]
+    dpi = 150 if preview_mode else 200
+
+    fig = plt.figure(figsize=(fig_width, fig_height), dpi=dpi)
+    _ = FigureCanvas(fig)
+    map_left, map_bottom, map_width, map_height = 0.08, 0.30, 0.84, 0.48
+    ax = fig.add_axes([map_left, map_bottom, map_width, map_height])
+
+    plot_no_value = _safe_text(cadastral_plan_no, f"{plot_id}")
+    _draw_fct_header(
+        fig, applicant_name=title_text, file_no=fct_file_no, district=fct_district,
+        cadastral_zone=fct_cadastral_zone, plot_no=plot_no_value, font_scale=font_scale, text_color=text_color,
+    )
+
+    scale_ratio = parse_scale_ratio(scale_text)
+    apply_true_scale(ax, poly, scale_ratio, fig_width * map_width, fig_height * map_height)
+    target_xlim = ax.get_xlim()
+    target_ylim = ax.get_ylim()
+    from shapely.geometry import box
+    extent_poly = box(target_xlim[0], target_ylim[0], target_xlim[1], target_ylim[1])
+
+    if rivers:
+        gpd.GeoDataFrame(geometry=rivers, crs="EPSG:4326").to_crs(epsg=display_epsg).plot(
+            ax=ax, color=river_color, lw=1.0 * font_scale, zorder=5
+        )
+
+    road_geom_width = []
+    road_snap_tol = max(1.0, (5.0 / 1000.0) * scale_ratio)
+    for geom in roads_for_draw:
+        if geom is None:
+            continue
+        try:
+            gdf_line = gpd.GeoSeries([geom], crs="EPSG:4326").to_crs(epsg=display_epsg)
+            line_proj = gdf_line.iloc[0]
+        except Exception:
+            continue
+        expanded_frame = extent_poly.buffer(road_snap_tol)
+        clipped = line_proj.intersection(expanded_frame)
+        if clipped.is_empty:
+            continue
+        snapped_clipped = snap(clipped, extent_poly.boundary, road_snap_tol)
+        try:
+            half_w = max(1.0, (road_width_m or 3.0) / 2.0)
+            road_geom_width.append((snapped_clipped, half_w))
+        except Exception:
+            continue
+    road_edge_lines = _collect_connected_road_edge_lines(road_geom_width, snap_tol_m=road_snap_tol)
+    # The reference plan shows nearby roads as plain dashed reference lines, not solid double
+    # lines - matching that convention here (Akwa Ibom/Rivers/Cross River do the same).
+    _draw_road_edges(ax, road_edge_lines, font_scale=font_scale, color=road_color, linestyle=(0, (6, 4)))
+
+    def _project_clip_named(geom, name):
+        try:
+            gdf_line = gpd.GeoSeries([geom], crs="EPSG:4326").to_crs(epsg=display_epsg)
+            line_proj = gdf_line.iloc[0]
+        except Exception:
+            return None
+        expanded_frame = extent_poly.buffer(road_snap_tol)
+        clipped = line_proj.intersection(expanded_frame)
+        if clipped.is_empty:
+            return None
+        return snap(clipped, extent_poly.boundary, road_snap_tol), name
+
+    min_named_len = max(2.0, (10.0 / 1000.0) * scale_ratio)
+    road_label_features = [r for r in (_project_clip_named(g, n) for g, n in road_add_named_overrides) if r and r[0].length > min_named_len]
+    river_label_features = [r for r in (_project_clip_named(g, n) for g, n in river_add_named_overrides) if r and r[0].length > min_named_len]
+    _draw_names_along_path(ax, road_label_features, color=road_color, font_scale=font_scale, base_fontsize=6.0)
+    _draw_names_along_path(ax, river_label_features, color=river_color, font_scale=font_scale, base_fontsize=6.0)
+
+    all_buildings = []
+    if buildings:
+        all_buildings.extend(buildings)
+    if added_buildings:
+        all_buildings.extend(added_buildings)
+    if all_buildings:
+        draw_building_hatch(
+            ax, all_buildings, display_epsg, scale_ratio=scale_ratio, font_scale=font_scale,
+            color=building_color, hatch_type=building_hatch_type,
+        )
+        gpd.GeoDataFrame(geometry=all_buildings, crs="EPSG:4326").to_crs(epsg=display_epsg).plot(
+            ax=ax, facecolor="none", edgecolor=building_color, lw=0.9 * font_scale, zorder=8
+        )
+    if fences:
+        draw_fences(ax, fences, display_epsg, scale_ratio=scale_ratio, font_scale=font_scale)
+    fence_avoid_geom = build_fence_avoid_geom(fences, display_epsg=display_epsg, scale_ratio=scale_ratio)
+
+    label_avoid_parts = [g for g in (fence_avoid_geom,) if g is not None]
+    if all_buildings:
+        try:
+            buildings_buffer_m = max(1.0, (2.0 / 1000.0) * scale_ratio)
+            buildings_proj = gpd.GeoSeries(all_buildings, crs="EPSG:4326").to_crs(epsg=display_epsg)
+            buildings_avoid = unary_union(list(buildings_proj.buffer(buildings_buffer_m)))
+            if buildings_avoid is not None and not buildings_avoid.is_empty:
+                label_avoid_parts.append(buildings_avoid)
+        except Exception:
+            pass
+    if road_edge_lines:
+        try:
+            road_buffer_m = max(1.0, (3.0 / 1000.0) * scale_ratio)
+            roads_avoid = unary_union([seg.buffer(road_buffer_m) for seg in road_edge_lines])
+            if roads_avoid is not None and not roads_avoid.is_empty:
+                label_avoid_parts.append(roads_avoid)
+        except Exception:
+            pass
+    label_avoid_geom = unary_union(label_avoid_parts) if label_avoid_parts else None
+
+    # Gray-filled parcel (the reference plan's parcels are shaded, not left white) with the red
+    # boundary outline on top - one draw call handles both.
+    gdf_plot.plot(ax=ax, facecolor=FCT_FILL_COLOR, edgecolor=boundary_color, lw=1.1 * font_scale, zorder=20)
+    ax.set_xlim(target_xlim)
+    ax.set_ylim(target_ylim)
+
+    annotate_vertices(
+        ax,
+        poly,
+        plot_id,
+        station_names=station_names,
+        font_scale=font_scale,
+        min_label_length_m=0.0,
+        avoid_geom=label_avoid_geom,
+        scale_ratio=scale_ratio,
+        boundary_poly=poly,
+        beacon_style=beacon_style,
+        text_color=text_color,
+        boundary_color=bearing_text_color,
+        station_font=station_font,
+        station_size=station_size,
+        bearing_font=bearing_font,
+        bearing_size=bearing_size,
+    )
+
+    area_label_point = None
+    try:
+        from shapely.ops import polylabel as _polylabel
+        area_label_point = _polylabel(poly, tolerance=1.0)
+    except Exception:
+        area_label_point = None
+    if area_label_point is None or area_label_point.is_empty:
+        try:
+            area_label_point = poly.centroid
+        except Exception:
+            area_label_point = None
+    if area_label_point is not None and not area_label_point.is_empty:
+        ax.text(
+            area_label_point.x, area_label_point.y - (target_ylim[1] - target_ylim[0]) * 0.02,
+            f"{plot_no_value}\n{area_m2:,.2f} m²", ha="center", va="center",
+            fontsize=max(6, int(8 * font_scale)), weight="bold", color=text_color,
+            fontfamily=FCT_FONT_FAMILY, zorder=21, multialignment="center",
+        )
+
+    add_north_arrow(ax, font_scale=font_scale, style=north_arrow_style, color=north_arrow_color)
+
+    ax.set_aspect("equal")
+    ax.axis("off")
+    fig.canvas.draw()
+
+    first_coords = list(poly.exterior.coords)[0]
+    coordinate_system_text = _resolve_cadastral_coordinate_system_text(coordinate_system, display_epsg)
+    schedule_y = _draw_fct_scale_schedule(fig, 0.285, scale_text, font_scale=font_scale, text_color=text_color)
+
+    beacon_rows = _compute_fct_beacon_schedule(poly, station_names=station_names)
+    _draw_fct_beacon_table(fig, 0.05, schedule_y, 0.075, beacon_rows, font_scale=font_scale, text_color=text_color)
+    _draw_fct_note_box(
+        fig, 0.55, schedule_y,
+        origin_beacon_text=fct_origin_beacon_text or f"{FCT_STATE_LABEL} {fct_cadastral_zone} PB {plot_no_value}",
+        easting_m=first_coords[0], northing_m=first_coords[1],
+        coordinate_system_text=coordinate_system_text, cadastral_map_ref=fct_cadastral_map_ref,
+        font_scale=font_scale, text_color=text_color,
+    )
+    _draw_fct_footer(
+        fig, 0.075, surveyor_name=surveyor_name, surveyor_rank=surveyor_rank,
+        prepared_by="LandCheck", font_scale=font_scale, text_color=text_color,
+    )
+
     fig.savefig(output_path, dpi=dpi)
     plt.close(fig)
 
@@ -3553,6 +4154,11 @@ def render_plot_map_layout(
     cadastral_area_name: str = "",
     cadastral_datum_text: str = "",
     cadastral_firm_block_text: str = "",
+    fct_file_no: str = "",
+    fct_district: str = "",
+    fct_cadastral_zone: str = "",
+    fct_origin_beacon_text: str = "",
+    fct_cadastral_map_ref: str = "",
     boundary_color: str | None = None,
     grid_color: str | None = None,
     text_color: str | None = None,
@@ -3598,6 +4204,53 @@ def render_plot_map_layout(
             cadastral_datum_text=cadastral_datum_text,
             cadastral_firm_block_text=cadastral_firm_block_text,
             state_label=CADASTRAL_STATE_LABELS[normalized_template],
+            preview_mode=preview_mode,
+            boundary_color=boundary_color,
+            grid_color=grid_color,
+            text_color=text_color,
+            road_color=road_color,
+            river_color=river_color,
+            building_color=building_color,
+            building_hatch_type=building_hatch_type,
+            title_font=title_font,
+            title_size=title_size,
+            grid_font=grid_font,
+            grid_size=grid_size,
+            station_font=station_font,
+            station_size=station_size,
+            bearing_font=bearing_font,
+            bearing_size=bearing_size,
+            area_font=area_font,
+            area_size=area_size,
+        )
+        return
+
+    if normalized_template == "fct_abuja_osg":
+        _render_plot_map_layout_fct(
+            db=db,
+            plot_id=plot_id,
+            output_path=output_path,
+            title_text=title_text,
+            lga_text=lga_text,
+            state_text=state_text,
+            scale_text=scale_text,
+            surveyor_name=surveyor_name,
+            surveyor_rank=surveyor_rank,
+            paper_size=paper_size,
+            station_names=station_names,
+            coordinate_system=coordinate_system,
+            epsg_code=epsg_code,
+            north_arrow_style=north_arrow_style,
+            north_arrow_color=north_arrow_color,
+            beacon_style=beacon_style,
+            road_width_m=road_width_m,
+            road_width_override_m=road_width_override_m,
+            cadastral_plan_no=cadastral_plan_no,
+            fct_file_no=fct_file_no,
+            fct_district=fct_district,
+            fct_cadastral_zone=fct_cadastral_zone,
+            fct_origin_beacon_text=fct_origin_beacon_text,
+            fct_cadastral_map_ref=fct_cadastral_map_ref,
             preview_mode=preview_mode,
             boundary_color=boundary_color,
             grid_color=grid_color,

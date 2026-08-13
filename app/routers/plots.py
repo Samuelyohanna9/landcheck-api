@@ -5,6 +5,7 @@ from pydantic import BaseModel
 from sqlalchemy.orm import Session
 from geoalchemy2.shape import from_shape
 from shapely.geometry import Polygon, shape, Point, box
+from shapely import wkt as shapely_wkt
 from shapely.affinity import rotate
 from shapely.ops import unary_union, snap
 from sqlalchemy import text
@@ -233,6 +234,11 @@ def _ensure_plot_meta_table_impl(db: Session):
             cadastral_area_name TEXT,
             cadastral_datum_text TEXT,
             cadastral_firm_block_text TEXT,
+            fct_file_no TEXT,
+            fct_district TEXT,
+            fct_cadastral_zone TEXT,
+            fct_origin_beacon_text TEXT,
+            fct_cadastral_map_ref TEXT,
             technical_report_instruments JSONB DEFAULT '[]',
             technical_report_dgps_type TEXT,
             technical_report_num_surveyors INTEGER,
@@ -280,6 +286,11 @@ def _ensure_plot_meta_table_impl(db: Session):
         ("cadastral_area_name", "TEXT"),
         ("cadastral_datum_text", "TEXT"),
         ("cadastral_firm_block_text", "TEXT"),
+        ("fct_file_no", "TEXT"),
+        ("fct_district", "TEXT"),
+        ("fct_cadastral_zone", "TEXT"),
+        ("fct_origin_beacon_text", "TEXT"),
+        ("fct_cadastral_map_ref", "TEXT"),
         ("technical_report_instruments", "JSONB DEFAULT '[]'"),
         ("technical_report_dgps_type", "TEXT"),
         ("technical_report_num_surveyors", "INTEGER"),
@@ -517,6 +528,11 @@ def upsert_plot_meta(
     cadastral_area_name: Optional[str] = None,
     cadastral_datum_text: Optional[str] = None,
     cadastral_firm_block_text: Optional[str] = None,
+    fct_file_no: Optional[str] = None,
+    fct_district: Optional[str] = None,
+    fct_cadastral_zone: Optional[str] = None,
+    fct_origin_beacon_text: Optional[str] = None,
+    fct_cadastral_map_ref: Optional[str] = None,
     technical_report_instruments: Optional[list] = None,
     technical_report_dgps_type: Optional[str] = None,
     technical_report_num_surveyors: Optional[int] = None,
@@ -546,6 +562,7 @@ def upsert_plot_meta(
             adamawa_topo_sheet_text, adamawa_computation_no, adamawa_cadastral_sheet_no, adamawa_plan_no,
             adamawa_surveyed_by_text, adamawa_disclaimer_text,
             cadastral_plan_no, cadastral_area_name, cadastral_datum_text, cadastral_firm_block_text,
+            fct_file_no, fct_district, fct_cadastral_zone, fct_origin_beacon_text, fct_cadastral_map_ref,
             technical_report_instruments, technical_report_dgps_type,
             technical_report_num_surveyors, technical_report_num_technical_officers,
             technical_report_num_labourers, technical_report_recce_text,
@@ -561,6 +578,7 @@ def upsert_plot_meta(
             :adamawa_topo_sheet_text, :adamawa_computation_no, :adamawa_cadastral_sheet_no, :adamawa_plan_no,
             :adamawa_surveyed_by_text, :adamawa_disclaimer_text,
             :cadastral_plan_no, :cadastral_area_name, :cadastral_datum_text, :cadastral_firm_block_text,
+            :fct_file_no, :fct_district, :fct_cadastral_zone, :fct_origin_beacon_text, :fct_cadastral_map_ref,
             CAST(COALESCE(:technical_report_instruments, '[]') AS JSONB), :technical_report_dgps_type,
             :technical_report_num_surveyors, :technical_report_num_technical_officers,
             :technical_report_num_labourers, :technical_report_recce_text,
@@ -599,6 +617,11 @@ def upsert_plot_meta(
             cadastral_area_name = COALESCE(NULLIF(EXCLUDED.cadastral_area_name, ''), plot_meta.cadastral_area_name),
             cadastral_datum_text = COALESCE(NULLIF(EXCLUDED.cadastral_datum_text, ''), plot_meta.cadastral_datum_text),
             cadastral_firm_block_text = COALESCE(NULLIF(EXCLUDED.cadastral_firm_block_text, ''), plot_meta.cadastral_firm_block_text),
+            fct_file_no = COALESCE(NULLIF(EXCLUDED.fct_file_no, ''), plot_meta.fct_file_no),
+            fct_district = COALESCE(NULLIF(EXCLUDED.fct_district, ''), plot_meta.fct_district),
+            fct_cadastral_zone = COALESCE(NULLIF(EXCLUDED.fct_cadastral_zone, ''), plot_meta.fct_cadastral_zone),
+            fct_origin_beacon_text = COALESCE(NULLIF(EXCLUDED.fct_origin_beacon_text, ''), plot_meta.fct_origin_beacon_text),
+            fct_cadastral_map_ref = COALESCE(NULLIF(EXCLUDED.fct_cadastral_map_ref, ''), plot_meta.fct_cadastral_map_ref),
             technical_report_instruments = COALESCE(CAST(:technical_report_instruments AS JSONB), plot_meta.technical_report_instruments),
             technical_report_dgps_type = COALESCE(NULLIF(EXCLUDED.technical_report_dgps_type, ''), plot_meta.technical_report_dgps_type),
             technical_report_num_surveyors = COALESCE(EXCLUDED.technical_report_num_surveyors, plot_meta.technical_report_num_surveyors),
@@ -643,6 +666,11 @@ def upsert_plot_meta(
         "cadastral_area_name": cadastral_area_name,
         "cadastral_datum_text": cadastral_datum_text,
         "cadastral_firm_block_text": cadastral_firm_block_text,
+        "fct_file_no": fct_file_no,
+        "fct_district": fct_district,
+        "fct_cadastral_zone": fct_cadastral_zone,
+        "fct_origin_beacon_text": fct_origin_beacon_text,
+        "fct_cadastral_map_ref": fct_cadastral_map_ref,
         "technical_report_instruments": technical_report_instruments_json,
         "technical_report_dgps_type": technical_report_dgps_type,
         "technical_report_num_surveyors": technical_report_num_surveyors,
@@ -668,6 +696,7 @@ def get_plot_meta(db: Session, plot_id: int) -> dict:
                adamawa_topo_sheet_text, adamawa_computation_no, adamawa_cadastral_sheet_no, adamawa_plan_no,
                adamawa_surveyed_by_text, adamawa_disclaimer_text,
                cadastral_plan_no, cadastral_area_name, cadastral_datum_text, cadastral_firm_block_text,
+               fct_file_no, fct_district, fct_cadastral_zone, fct_origin_beacon_text, fct_cadastral_map_ref,
                parent_plot_id, subdivision_batch_id, subdivision_lot_no, estate_name,
                technical_report_instruments, technical_report_dgps_type,
                technical_report_num_surveyors, technical_report_num_technical_officers,
@@ -710,6 +739,11 @@ def get_plot_meta(db: Session, plot_id: int) -> dict:
             "cadastral_area_name": "",
             "cadastral_datum_text": "",
             "cadastral_firm_block_text": "",
+            "fct_file_no": "",
+            "fct_district": "",
+            "fct_cadastral_zone": "",
+            "fct_origin_beacon_text": "",
+            "fct_cadastral_map_ref": "",
             "parent_plot_id": None,
             "subdivision_batch_id": None,
             "subdivision_lot_no": "",
@@ -773,6 +807,11 @@ def get_plot_meta(db: Session, plot_id: int) -> dict:
         "cadastral_area_name": row.get("cadastral_area_name") or "",
         "cadastral_datum_text": row.get("cadastral_datum_text") or "",
         "cadastral_firm_block_text": row.get("cadastral_firm_block_text") or "",
+        "fct_file_no": row.get("fct_file_no") or "",
+        "fct_district": row.get("fct_district") or "",
+        "fct_cadastral_zone": row.get("fct_cadastral_zone") or "",
+        "fct_origin_beacon_text": row.get("fct_origin_beacon_text") or "",
+        "fct_cadastral_map_ref": row.get("fct_cadastral_map_ref") or "",
         "parent_plot_id": row.get("parent_plot_id"),
         "subdivision_batch_id": row.get("subdivision_batch_id"),
         "subdivision_lot_no": row.get("subdivision_lot_no") or "",
@@ -1745,6 +1784,11 @@ def _apply_child_plot_meta(
                 cadastral_area_name = :cadastral_area_name,
                 cadastral_datum_text = :cadastral_datum_text,
                 cadastral_firm_block_text = :cadastral_firm_block_text,
+                fct_file_no = :fct_file_no,
+                fct_district = :fct_district,
+                fct_cadastral_zone = :fct_cadastral_zone,
+                fct_origin_beacon_text = :fct_origin_beacon_text,
+                fct_cadastral_map_ref = :fct_cadastral_map_ref,
                 updated_at = NOW()
             WHERE plot_id = :plot_id
             """
@@ -1787,6 +1831,13 @@ def _apply_child_plot_meta(
             "cadastral_area_name": parent_meta.get("cadastral_area_name") or "",
             "cadastral_datum_text": parent_meta.get("cadastral_datum_text") or "",
             "cadastral_firm_block_text": parent_meta.get("cadastral_firm_block_text") or "",
+            # File No is per-lot (left blank for the surveyor to fill in individually); district,
+            # cadastral zone, origin beacon, and map reference are shared across the subdivision.
+            "fct_file_no": "",
+            "fct_district": parent_meta.get("fct_district") or "",
+            "fct_cadastral_zone": parent_meta.get("fct_cadastral_zone") or "",
+            "fct_origin_beacon_text": parent_meta.get("fct_origin_beacon_text") or "",
+            "fct_cadastral_map_ref": parent_meta.get("fct_cadastral_map_ref") or "",
         },
     )
 
@@ -2707,6 +2758,11 @@ def _render_survey_plan_pdf_for_plot(db: Session, plot_id: int, output_pdf_path:
         cadastral_area_name=meta.get("cadastral_area_name") or "",
         cadastral_datum_text=meta.get("cadastral_datum_text") or "",
         cadastral_firm_block_text=meta.get("cadastral_firm_block_text") or "",
+        fct_file_no=meta.get("fct_file_no") or "",
+        fct_district=meta.get("fct_district") or "",
+        fct_cadastral_zone=meta.get("fct_cadastral_zone") or "",
+        fct_origin_beacon_text=meta.get("fct_origin_beacon_text") or "",
+        fct_cadastral_map_ref=meta.get("fct_cadastral_map_ref") or "",
     )
     report = get_plot_report(plot_id, db)
     generate_plot_report_pdf(report, output_pdf_path, map_path, paper_size=meta["paper_size"])
@@ -4069,6 +4125,11 @@ def create_plot_survey_report_export_job(
     cadastral_area_name: str = Body(""),
     cadastral_datum_text: str = Body(""),
     cadastral_firm_block_text: str = Body(""),
+    fct_file_no: str = Body(""),
+    fct_district: str = Body(""),
+    fct_cadastral_zone: str = Body(""),
+    fct_origin_beacon_text: str = Body(""),
+    fct_cadastral_map_ref: str = Body(""),
 ):
     request_payload = {
         "title_text": title_text,
@@ -4124,6 +4185,11 @@ def create_plot_survey_report_export_job(
         "cadastral_area_name": cadastral_area_name,
         "cadastral_datum_text": cadastral_datum_text,
         "cadastral_firm_block_text": cadastral_firm_block_text,
+        "fct_file_no": fct_file_no,
+        "fct_district": fct_district,
+        "fct_cadastral_zone": fct_cadastral_zone,
+        "fct_origin_beacon_text": fct_origin_beacon_text,
+        "fct_cadastral_map_ref": fct_cadastral_map_ref,
     }
     cache_key = _build_plot_export_cache_key(
         db,
@@ -5028,6 +5094,35 @@ def get_feature_overrides(plot_id: int, db: Session = Depends(get_db)):
     ]
 
 
+def _feature_geom_replaced_by(candidate_geom, new_geom, tol_deg: float = 0.00001) -> bool:
+    """Whether `candidate_geom` (an existing override or detected feature) is genuinely the same
+    real-world feature `new_geom` is replacing, rather than a different feature that merely
+    touches or crosses it (e.g. two roads meeting at a junction, or a fence corner grazing a
+    building). A plain ST_Intersects/.intersects() test can't tell those apart - it's true for a
+    single shared point just as much as for two nearly-identical lines - so using it to decide
+    what to delete would destroy unrelated edits (e.g. wiping out a previous "delete this other
+    road" override just because the newly-saved geometry happens to touch it).
+
+    Coverage is measured proportionally to `candidate_geom`'s own size (length for lines, area for
+    polygons): the real match is covered almost entirely by a small buffer around `new_geom`,
+    while a merely-touching feature only has a single point/edge (~0 length or area) inside it.
+    """
+    try:
+        geom_type = candidate_geom.geom_type
+        buffered = new_geom.buffer(tol_deg)
+        if geom_type in ("LineString", "MultiLineString"):
+            total = max(getattr(candidate_geom, "length", 0.0), 1e-9)
+            uncovered = candidate_geom.difference(buffered)
+            return getattr(uncovered, "length", 0.0) < total * 0.1
+        if geom_type in ("Polygon", "MultiPolygon"):
+            total = max(getattr(candidate_geom, "area", 0.0), 1e-12)
+            uncovered = candidate_geom.difference(buffered)
+            return getattr(uncovered, "area", 0.0) < total * 0.1
+        return candidate_geom.distance(new_geom) < tol_deg
+    except Exception:
+        return candidate_geom.intersects(new_geom)
+
+
 @router.post("/{plot_id}/feature-overrides")
 def add_feature_override(
     plot_id: int,
@@ -5076,18 +5171,44 @@ def add_feature_override(
         # contribute their own (now-superseded) name, or their slightly-different geometry could
         # linger alongside the new one and corrupt the road's shape - deleting them here keeps
         # exactly one override per logical feature.
-        if geom_geojson:
-            db.execute(text("""
-                DELETE FROM plot_feature_overrides
-                WHERE plot_id = :plot_id AND feature_type = :feature_type
-                  AND ST_Intersects(geom, ST_SetSRID(ST_GeomFromGeoJSON(:geojson), 4326))
-            """), {"plot_id": plot_id, "feature_type": feature_type, "geojson": json.dumps(geom_geojson)})
-        elif geom_wkt:
-            db.execute(text("""
-                DELETE FROM plot_feature_overrides
-                WHERE plot_id = :plot_id AND feature_type = :feature_type
-                  AND ST_Intersects(geom, ST_SetSRID(ST_GeomFromText(:wkt), 4326))
-            """), {"plot_id": plot_id, "feature_type": feature_type, "wkt": geom_wkt})
+        #
+        # This must only delete overrides that are genuinely the SAME feature, not merely nearby
+        # ones - a coarse ST_Intersects DELETE here was destructive: saving a new "update" (e.g.
+        # naming a road) would wipe out ANY prior override that happened to touch it at even a
+        # single point, including a completely unrelated "delete this other road" edit from
+        # earlier in the session, silently undoing a user's previous work. So candidates are found
+        # with a generous but bounded spatial filter, then only the ones _feature_geom_replaced_by
+        # confirms as the same feature are actually removed.
+        new_geom_obj = shape(geom_geojson) if geom_geojson else shapely_wkt.loads(geom_wkt)
+        new_geom_json = json.dumps(geom_geojson) if geom_geojson else None
+        candidate_rows = db.execute(text(f"""
+            SELECT id, ST_AsGeoJSON(geom) AS geojson
+            FROM plot_feature_overrides
+            WHERE plot_id = :plot_id AND feature_type = :feature_type
+              AND ST_DWithin(
+                    geom::geography,
+                    {"ST_SetSRID(ST_GeomFromGeoJSON(:new_geojson), 4326)" if new_geom_json else "ST_SetSRID(ST_GeomFromText(:new_wkt), 4326)"}::geography,
+                    3
+              )
+        """), {
+            "plot_id": plot_id,
+            "feature_type": feature_type,
+            **({"new_geojson": new_geom_json} if new_geom_json else {"new_wkt": geom_wkt}),
+        }).fetchall()
+
+        ids_to_delete = []
+        for row in candidate_rows:
+            try:
+                candidate_geom = shape(json.loads(row.geojson))
+            except Exception:
+                continue
+            if _feature_geom_replaced_by(candidate_geom, new_geom_obj):
+                ids_to_delete.append(row.id)
+        if ids_to_delete:
+            db.execute(
+                text("DELETE FROM plot_feature_overrides WHERE id = ANY(:ids)"),
+                {"ids": ids_to_delete},
+            )
 
     if geom_geojson:
         db.execute(text("""
@@ -5197,6 +5318,11 @@ def save_plot_metadata(
     cadastral_area_name: str = Body(""),
     cadastral_datum_text: str = Body(""),
     cadastral_firm_block_text: str = Body(""),
+    fct_file_no: str = Body(""),
+    fct_district: str = Body(""),
+    fct_cadastral_zone: str = Body(""),
+    fct_origin_beacon_text: str = Body(""),
+    fct_cadastral_map_ref: str = Body(""),
 ):
     upsert_plot_meta(
         db=db,
@@ -5231,6 +5357,11 @@ def save_plot_metadata(
         cadastral_area_name=cadastral_area_name,
         cadastral_datum_text=cadastral_datum_text,
         cadastral_firm_block_text=cadastral_firm_block_text,
+        fct_file_no=fct_file_no,
+        fct_district=fct_district,
+        fct_cadastral_zone=fct_cadastral_zone,
+        fct_origin_beacon_text=fct_origin_beacon_text,
+        fct_cadastral_map_ref=fct_cadastral_map_ref,
     )
     return {"ok": True, "plot_id": int(plot_id)}
 
@@ -5289,7 +5420,12 @@ def download_plot_report_pdf(plot_id: int, db: Session = Depends(get_db), backgr
     cadastral_plan_no: str = Body(""),
     cadastral_area_name: str = Body(""),
     cadastral_datum_text: str = Body(""),
-    cadastral_firm_block_text: str = Body("")):
+    cadastral_firm_block_text: str = Body(""),
+    fct_file_no: str = Body(""),
+    fct_district: str = Body(""),
+    fct_cadastral_zone: str = Body(""),
+    fct_origin_beacon_text: str = Body(""),
+    fct_cadastral_map_ref: str = Body("")):
 
     reports_dir = REPORTS_DIR
     maps_dir = os.path.join(REPORTS_DIR, "maps")
@@ -5336,6 +5472,11 @@ def download_plot_report_pdf(plot_id: int, db: Session = Depends(get_db), backgr
         cadastral_area_name=cadastral_area_name,
         cadastral_datum_text=cadastral_datum_text,
         cadastral_firm_block_text=cadastral_firm_block_text,
+        fct_file_no=fct_file_no,
+        fct_district=fct_district,
+        fct_cadastral_zone=fct_cadastral_zone,
+        fct_origin_beacon_text=fct_origin_beacon_text,
+        fct_cadastral_map_ref=fct_cadastral_map_ref,
     )
 
     # Get EPSG code for selected coordinate system
@@ -5401,6 +5542,11 @@ def download_plot_report_pdf(plot_id: int, db: Session = Depends(get_db), backgr
         cadastral_area_name=cadastral_area_name,
         cadastral_datum_text=cadastral_datum_text,
         cadastral_firm_block_text=cadastral_firm_block_text,
+        fct_file_no=fct_file_no,
+        fct_district=fct_district,
+        fct_cadastral_zone=fct_cadastral_zone,
+        fct_origin_beacon_text=fct_origin_beacon_text,
+        fct_cadastral_map_ref=fct_cadastral_map_ref,
     )
 
     report = get_plot_report(plot_id, db)
@@ -5680,7 +5826,12 @@ def preview_plot_map(plot_id: int, db: Session = Depends(get_db), background_tas
     cadastral_plan_no: str = Body(""),
     cadastral_area_name: str = Body(""),
     cadastral_datum_text: str = Body(""),
-    cadastral_firm_block_text: str = Body("")):
+    cadastral_firm_block_text: str = Body(""),
+    fct_file_no: str = Body(""),
+    fct_district: str = Body(""),
+    fct_cadastral_zone: str = Body(""),
+    fct_origin_beacon_text: str = Body(""),
+    fct_cadastral_map_ref: str = Body("")):
 
     payload_for_cache = {
         "_layout_version": PREVIEW_LAYOUT_VERSION,
@@ -5737,6 +5888,11 @@ def preview_plot_map(plot_id: int, db: Session = Depends(get_db), background_tas
         "cadastral_area_name": cadastral_area_name,
         "cadastral_datum_text": cadastral_datum_text,
         "cadastral_firm_block_text": cadastral_firm_block_text,
+        "fct_file_no": fct_file_no,
+        "fct_district": fct_district,
+        "fct_cadastral_zone": fct_cadastral_zone,
+        "fct_origin_beacon_text": fct_origin_beacon_text,
+        "fct_cadastral_map_ref": fct_cadastral_map_ref,
     }
     revision_token = build_preview_revision_token(db, plot_id)
     cache_key = build_preview_cache_key(plot_id, payload_for_cache, revision_token)
@@ -5788,6 +5944,11 @@ def preview_plot_map(plot_id: int, db: Session = Depends(get_db), background_tas
         cadastral_area_name=cadastral_area_name,
         cadastral_datum_text=cadastral_datum_text,
         cadastral_firm_block_text=cadastral_firm_block_text,
+        fct_file_no=fct_file_no,
+        fct_district=fct_district,
+        fct_cadastral_zone=fct_cadastral_zone,
+        fct_origin_beacon_text=fct_origin_beacon_text,
+        fct_cadastral_map_ref=fct_cadastral_map_ref,
     )
 
     # Get EPSG code for selected coordinate system
@@ -5854,6 +6015,11 @@ def preview_plot_map(plot_id: int, db: Session = Depends(get_db), background_tas
         cadastral_area_name=cadastral_area_name,
         cadastral_datum_text=cadastral_datum_text,
         cadastral_firm_block_text=cadastral_firm_block_text,
+        fct_file_no=fct_file_no,
+        fct_district=fct_district,
+        fct_cadastral_zone=fct_cadastral_zone,
+        fct_origin_beacon_text=fct_origin_beacon_text,
+        fct_cadastral_map_ref=fct_cadastral_map_ref,
     )
 
     cache_path = preview_cache_path(plot_id, cache_key, variant="survey")
@@ -6337,6 +6503,11 @@ def get_saved_survey_plan_pdf(plot_id: int, refresh: bool = False, db: Session =
             cadastral_area_name=meta.get("cadastral_area_name") or "",
             cadastral_datum_text=meta.get("cadastral_datum_text") or "",
             cadastral_firm_block_text=meta.get("cadastral_firm_block_text") or "",
+        fct_file_no=meta.get("fct_file_no") or "",
+        fct_district=meta.get("fct_district") or "",
+        fct_cadastral_zone=meta.get("fct_cadastral_zone") or "",
+        fct_origin_beacon_text=meta.get("fct_origin_beacon_text") or "",
+        fct_cadastral_map_ref=meta.get("fct_cadastral_map_ref") or "",
         )
         report = get_plot_report(plot_id, db)
         generate_plot_report_pdf(report, pdf_path, map_path, paper_size=meta["paper_size"])
