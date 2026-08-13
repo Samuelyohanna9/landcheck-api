@@ -851,6 +851,54 @@ def add_north_arrow(
             "text_baseline_y": sy(svg_text_baseline_y),
         }
 
+    if style in ("nn_arrow", "split_triangle", "nn"):
+        # Half-black/half-white "N N" arrow (design supplied as north_arrow_NN.svg) - the classic
+        # surveyor's compass-rose split triangle, with a long stem and a tick line + "N N" labels
+        # partway down. Incoming (x, y) is the stem's BOTTOM end, with the whole icon extending
+        # upward from there (unlike "un_marker", which anchors at its text baseline) - this keeps
+        # placement predictable for callers that want the icon to grow up from a fixed spot.
+        svg_bottom_y = 405.0
+        svg_apex_y = 24.0
+        svg_base_y = 168.0
+        svg_tick_y = 285.5
+        svg_left_x = 8.0
+        svg_right_x = 59.0
+        svg_stem_x = 33.5
+        k = (size * 1.55) / (svg_base_y - svg_apex_y)
+        line_lw = max(1.0, 1.0 * font_scale)
+
+        def sy2(py: float) -> float:
+            return y + (svg_bottom_y - float(py)) * k
+
+        apex_y = sy2(svg_apex_y)
+        base_y = sy2(svg_base_y)
+        tick_y = sy2(svg_tick_y)
+        left_hw = (svg_stem_x - svg_left_x) * k
+        right_hw = (svg_right_x - svg_stem_x) * k
+
+        fig.add_artist(mlines.Line2D(
+            [x, x], [y, base_y], transform=fig.transFigure, color=col, lw=line_lw,
+            zorder=20, solid_capstyle="butt",
+        ))
+        fig.add_artist(patches.Polygon(
+            [(x, apex_y), (x - left_hw, base_y), (x, base_y)], closed=True,
+            facecolor="white", edgecolor=col, lw=line_lw, transform=fig.transFigure, zorder=21,
+        ))
+        fig.add_artist(patches.Polygon(
+            [(x, apex_y), (x + right_hw, base_y), (x, base_y)], closed=True,
+            facecolor=col, edgecolor=col, lw=line_lw, transform=fig.transFigure, zorder=21,
+        ))
+        fig.add_artist(mlines.Line2D(
+            [x - left_hw, x + right_hw], [tick_y, tick_y], transform=fig.transFigure,
+            color=col, lw=line_lw * 0.85, zorder=22,
+        ))
+        label_fs = max(6, int(11 * font_scale))
+        fig.text(x - left_hw * 0.5, tick_y, "N", ha="center", va="center", fontsize=label_fs,
+                  color=col, weight="bold", fontfamily="DejaVu Sans", zorder=23)
+        fig.text(x + right_hw * 0.5, tick_y, "N", ha="center", va="center", fontsize=label_fs,
+                  color=col, weight="bold", fontfamily="DejaVu Sans", zorder=23)
+        return x
+
     # default: classic arrow
     ax.annotate(
         "N",
@@ -3653,7 +3701,6 @@ def _render_plot_map_layout_cadastral(
 
 FCT_FONT_FAMILY = "DejaVu Sans"
 FCT_FILL_COLOR = "#c9c9c9"
-FCT_STATE_LABEL = "FCT ABUJA"
 
 
 def _draw_fct_header(
@@ -3727,39 +3774,91 @@ def _draw_fct_beacon_table(
     fig, x0: float, y_top: float, y_bottom: float, rows: list, font_scale: float = 1.0, text_color: str = "black",
 ) -> None:
     fs = max(6, int(7 * font_scale))
-    fig.text(x0, y_top, "BEACON SCHEDULE", weight="bold", fontsize=fs,
-              fontfamily=FCT_FONT_FAMILY, color=text_color, ha="left", va="top")
-    y = y_top - 0.022
+    col1_x, col2_x, col3_x = x0, x0 + 0.21, x0 + 0.30
+    for cx, label in ((col1_x, "BEACON No."), (col2_x, "DIST"), (col3_x, "BEARING")):
+        fig.text(cx, y_top, label, weight="bold", fontsize=fs,
+                  fontfamily=FCT_FONT_FAMILY, color=text_color, ha="left", va="top")
+    y = y_top - 0.02
     row_h = max(0.013, min(0.02, (y - y_bottom) / max(1, len(rows))))
     line_fs = fs if row_h >= 0.016 else max(5, int(fs * 0.85))
     for frm, to, dist_m, bearing in rows:
-        fig.text(
-            x0, y, f"FROM {frm} TO {to}  =  {dist_m:.2f}m AT {format_bearing_dms(bearing)}",
-            fontsize=line_fs, fontfamily=FCT_FONT_FAMILY, color=text_color, ha="left", va="top",
-        )
+        fig.text(col1_x, y, f"FROM {frm} TO {to}  =",
+                  fontsize=line_fs, fontfamily=FCT_FONT_FAMILY, color=text_color, ha="left", va="top")
+        fig.text(col2_x, y, f"{dist_m:.2f}m",
+                  fontsize=line_fs, fontfamily=FCT_FONT_FAMILY, color=text_color, ha="left", va="top")
+        fig.text(col3_x, y, f"AT {format_bearing_dms(bearing)}",
+                  fontsize=line_fs, fontfamily=FCT_FONT_FAMILY, color=text_color, ha="left", va="top")
         y -= row_h
 
 
+def _resolve_fct_coordinate_system_text(display_epsg: int) -> str:
+    epsg = int(display_epsg or 0)
+    if 32600 < epsg < 32700:
+        return f"UTM ZONE {epsg - 32600}N"
+    if 32700 < epsg < 32800:
+        return f"UTM ZONE {epsg - 32700}S"
+    return "UTM"
+
+
+def _draw_fct_cadastral_map_table(
+    fig, x0: float, y_top: float, scale_text: str, cadastral_map_ref: str,
+    font_scale: float = 1.0, text_color: str = "black",
+) -> None:
+    fs = max(6, int(7 * font_scale))
+    fig.text(
+        x0, y_top, f"CADASTRAL MAP {_normalize_scale_label_adamawa(scale_text)}", weight="bold",
+        fontsize=fs, fontfamily=FCT_FONT_FAMILY, color=text_color, ha="left", va="top",
+    )
+    table_top = y_top - 0.02
+    row_h = 0.022
+    col_w = 0.10
+    table_bottom = table_top - row_h * 2
+    for i in range(3):
+        xline = x0 + i * col_w
+        fig.add_artist(mlines.Line2D(
+            [xline, xline], [table_bottom, table_top], transform=fig.transFigure,
+            color=text_color, lw=0.8 * font_scale,
+        ))
+    for j in range(3):
+        yline = table_top - j * row_h
+        fig.add_artist(mlines.Line2D(
+            [x0, x0 + col_w * 2], [yline, yline], transform=fig.transFigure,
+            color=text_color, lw=0.8 * font_scale,
+        ))
+    cell_values = [["---", _safe_text(cadastral_map_ref, "---").upper()], ["---", "---"]]
+    for r in range(2):
+        for c in range(2):
+            cx = x0 + col_w * c + col_w / 2.0
+            cy = table_top - row_h * r - row_h / 2.0
+            fig.text(cx, cy, cell_values[r][c], fontsize=fs, fontfamily=FCT_FONT_FAMILY,
+                      color=text_color, ha="center", va="center")
+
+
 def _draw_fct_note_box(
-    fig, x0: float, y_top: float, origin_beacon_text: str, easting_m: float, northing_m: float,
-    coordinate_system_text: str, cadastral_map_ref: str, font_scale: float = 1.0, text_color: str = "black",
+    fig, x0: float, y_top: float, first_station_name: str, fct_cadastral_zone: str,
+    easting_m: float, northing_m: float, display_epsg: int, scale_text: str, cadastral_map_ref: str,
+    font_scale: float = 1.0, text_color: str = "black",
 ) -> None:
     fs = max(6, int(7 * font_scale))
     y = y_top
     fig.text(x0, y, "NOTE:", weight="bold", fontsize=max(7, int(fs * 1.05)),
               fontfamily=FCT_FONT_FAMILY, color=text_color, ha="left", va="top")
-    y -= 0.022
+    y -= 0.02
+    short_name = _safe_text(first_station_name, "-").upper()
+    zone_clean = _safe_text(fct_cadastral_zone)
+    full_beacon_text = f"FCT {zone_clean} {short_name}".strip() if zone_clean else f"FCT {short_name}"
     lines = [
-        f"FULL BEACON NUMBER: {_safe_text(origin_beacon_text, '-').upper()}",
-        f"N: {northing_m:,.2f}   E: {easting_m:,.2f}",
-        f"COORDINATE SYSTEM: {_safe_text(coordinate_system_text, '-').upper()}",
+        f"FULL BEACON NUMBER {full_beacon_text}",
+        f"COORDINATES OF {short_name}",
+        f"N. {northing_m:,.2f}",
+        f"E. {easting_m:,.2f}",
+        f"COORDINATE SYSTEM {_resolve_fct_coordinate_system_text(display_epsg)}",
     ]
-    cadastral_map_clean = _safe_text(cadastral_map_ref)
-    if cadastral_map_clean:
-        lines.append(f"CADASTRAL MAP REF: {cadastral_map_clean.upper()}")
     for ln in lines:
         fig.text(x0, y, ln, fontsize=fs, fontfamily=FCT_FONT_FAMILY, color=text_color, ha="left", va="top")
         y -= 0.019
+    y -= 0.012
+    _draw_fct_cadastral_map_table(fig, x0, y, scale_text, cadastral_map_ref, font_scale=font_scale, text_color=text_color)
 
 
 def _draw_fct_footer(
@@ -3934,7 +4033,10 @@ def _render_plot_map_layout_fct(
 
     fig = plt.figure(figsize=(fig_width, fig_height), dpi=dpi)
     _ = FigureCanvas(fig)
-    map_left, map_bottom, map_width, map_height = 0.08, 0.30, 0.84, 0.48
+    # Narrower than the other templates' maps - the reference plan reserves the right margin for
+    # a large north arrow standing beside the parcel, not sitting above the header like the other
+    # templates' arrows do.
+    map_left, map_bottom, map_width, map_height = 0.08, 0.30, 0.66, 0.48
     ax = fig.add_axes([map_left, map_bottom, map_width, map_height])
 
     plot_no_value = _safe_text(cadastral_plan_no, f"{plot_id}")
@@ -4072,30 +4174,41 @@ def _render_plot_map_layout_fct(
         except Exception:
             area_label_point = None
     if area_label_point is not None and not area_label_point.is_empty:
+        # Below 1 hectare (10,000 sq m), express the area in square meters; at or above, switch
+        # to hectares - the standard convention on Nigerian cadastral plans.
+        area_text = f"{area_m2:,.2f} m²" if area_m2 < 10000 else f"{area_m2 / 10000.0:,.4f} Ha."
         ax.text(
             area_label_point.x, area_label_point.y - (target_ylim[1] - target_ylim[0]) * 0.02,
-            f"{plot_no_value}\n{area_m2:,.2f} m²", ha="center", va="center",
+            f"{plot_no_value}\n{area_text}", ha="center", va="center",
             fontsize=max(6, int(8 * font_scale)), weight="bold", color=text_color,
             fontfamily=FCT_FONT_FAMILY, zorder=21, multialignment="center",
         )
 
-    add_north_arrow(ax, font_scale=font_scale, style=north_arrow_style, color=north_arrow_color)
+    # The north arrow stands in the reserved right margin, beside the parcel, notably larger than
+    # the other templates' arrows - matching the reference plan.
+    axes_box = ax.get_position()
+    arrow_x = axes_box.x1 + (0.965 - axes_box.x1) * 0.5
+    arrow_y = axes_box.y0 + axes_box.height * 0.30
+    add_north_arrow(
+        ax, font_scale=font_scale * 1.55, style=north_arrow_style, color=north_arrow_color,
+        anchor_x=arrow_x, anchor_y=arrow_y,
+    )
 
     ax.set_aspect("equal")
     ax.axis("off")
     fig.canvas.draw()
 
     first_coords = list(poly.exterior.coords)[0]
-    coordinate_system_text = _resolve_cadastral_coordinate_system_text(coordinate_system, display_epsg)
+    first_station_name = str(station_names[0]).strip() if station_names and len(station_names) > 0 else "A"
     schedule_y = _draw_fct_scale_schedule(fig, 0.285, scale_text, font_scale=font_scale, text_color=text_color)
 
     beacon_rows = _compute_fct_beacon_schedule(poly, station_names=station_names)
     _draw_fct_beacon_table(fig, 0.05, schedule_y, 0.075, beacon_rows, font_scale=font_scale, text_color=text_color)
     _draw_fct_note_box(
         fig, 0.55, schedule_y,
-        origin_beacon_text=fct_origin_beacon_text or f"{FCT_STATE_LABEL} {fct_cadastral_zone} PB {plot_no_value}",
-        easting_m=first_coords[0], northing_m=first_coords[1],
-        coordinate_system_text=coordinate_system_text, cadastral_map_ref=fct_cadastral_map_ref,
+        first_station_name=first_station_name, fct_cadastral_zone=fct_cadastral_zone,
+        easting_m=first_coords[0], northing_m=first_coords[1], display_epsg=display_epsg,
+        scale_text=scale_text, cadastral_map_ref=fct_cadastral_map_ref,
         font_scale=font_scale, text_color=text_color,
     )
     _draw_fct_footer(
