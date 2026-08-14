@@ -3618,18 +3618,20 @@ def _draw_cadastral_reference_guide(
 ) -> None:
     """Draw the South-South single-reference blue guide.
 
-    This matches the sample cadastral sheets used in Akwa Ibom, Cross River, and Rivers:
-    one vertical blue reference line rising from the lower-left plot point, one horizontal line
-    from the left frame to that same point, and one right-side horizontal from the lower-right
-    frontage point to the frame. The guides should read as separate border references, not as one
-    connected crosshair.
+    This matches the sample cadastral sheets used in Akwa Ibom, Cross River, and Rivers: a short
+    vertical blue tick dropping from the top border (not a full-height line down to wherever the
+    lower-left beacon happens to sit - on a tall parcel that read as one long line spanning almost
+    the whole sheet), and a single straight horizontal reference at the lower-left beacon's
+    elevation running the full width of the frame - the left segment (frame to that beacon) and
+    the right/frontage segment (the lower-right beacon to the frame) share that same y so they
+    read as one continuous line rather than two segments at different heights.
     """
     xmin, xmax = ax.get_xlim()
     ymin, ymax = ax.get_ylim()
     span_x = max(abs(xmax - xmin), 1.0)
     span_y = max(abs(ymax - ymin), 1.0)
     lower_left_x, lower_left_y = lower_left_point
-    lower_right_x, lower_right_y = lower_right_point
+    lower_right_x, _lower_right_y = lower_right_point
     vertical_x, vertical_y = lower_left_point
     family = grid_font or CADASTRAL_FONT_FAMILY
     fs = grid_size if grid_size else max(6, int(6.2 * font_scale))
@@ -3649,15 +3651,18 @@ def _draw_cadastral_reference_guide(
             )
         )
 
-    # Border-origin guide segments only. They should terminate at the coordinate reference point
-    # rather than running as one uninterrupted cross through the whole plotting frame.
-    _guide_line([vertical_x, vertical_x], [vertical_y, ymax])
+    # Short top-border tick rather than a full-height line - capped at the beacon's own height so
+    # it still just meets the point on a short/wide parcel instead of overshooting past it.
+    vertical_bottom = max(vertical_y, ymax - span_y * 0.14)
+    _guide_line([vertical_x, vertical_x], [vertical_bottom, ymax])
+    # Both horizontal segments sit on the lower-left beacon's elevation, not each beacon's own -
+    # the reference should read as one straight border line, not two strokes at different heights.
     _guide_line([xmin, lower_left_x], [lower_left_y, lower_left_y])
     if lower_right_x < xmax:
-        _guide_line([lower_right_x, xmax], [lower_right_y, lower_right_y])
+        _guide_line([lower_right_x, xmax], [lower_left_y, lower_left_y])
 
     easting_x = vertical_x - span_x * 0.008
-    easting_y = vertical_y + max(span_y * 0.22, (ymax - vertical_y) * 0.42)
+    easting_y = (vertical_bottom + ymax) / 2.0
     northing_x = xmin + span_x * 0.02
     northing_y = lower_left_y + span_y * 0.004
 
