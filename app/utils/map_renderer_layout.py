@@ -3587,10 +3587,12 @@ def _draw_cadastral_reference_guide(
     span_x = max(abs(xmax - xmin), 1.0)
     span_y = max(abs(ymax - ymin), 1.0)
     ref_x, ref_y = lower_left_point
+    right_x, right_y = lower_right_point
     family = grid_font or CADASTRAL_FONT_FAMILY
     fs = grid_size if grid_size else max(6, int(6.2 * font_scale))
     line_lw = max(0.9, 1.0 * font_scale)
     stroke = [patheffects.withStroke(linewidth=line_lw * 2.1, foreground="white", alpha=0.92)]
+    gap_y = max(0.85, span_y * 0.018)
 
     def _guide_line(x_data: list[float], y_data: list[float]) -> None:
         ax.add_line(
@@ -3607,10 +3609,11 @@ def _draw_cadastral_reference_guide(
 
     # Border-origin guide segments only. They should terminate at the coordinate reference point
     # rather than running as one uninterrupted cross through the whole plotting frame.
-    _guide_line([ref_x, ref_x], [ref_y, ymax])
-    _guide_line([ref_x, ref_x], [ymin, ref_y])
+    _guide_line([ref_x, ref_x], [min(ref_y + gap_y, ymax), ymax])
+    _guide_line([ref_x, ref_x], [ymin, max(ref_y - gap_y, ymin)])
     _guide_line([xmin, ref_x], [ref_y, ref_y])
-    _guide_line([ref_x, xmax], [ref_y, ref_y])
+    if right_x < xmax:
+        _guide_line([right_x, xmax], [right_y, right_y])
 
     easting_x = ref_x - span_x * 0.008
     easting_y = ref_y + max(span_y * 0.22, (ymax - ref_y) * 0.42)
