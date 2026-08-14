@@ -3652,9 +3652,10 @@ def _draw_cadastral_reference_guide(
         )
 
     # Keep every guide segment's near end just short of the beacon it's referencing - a reference
-    # line, not a mark that runs into/through the station point's own symbol and label.
-    station_gap_x = span_x * 0.012
-    station_gap_y = span_y * 0.012
+    # line, not a mark that runs into/through the station point's own symbol and label. 1.2% read
+    # as touching at real plot scale, so this needs to be a clearly visible gap, not a token one.
+    station_gap_x = span_x * 0.035
+    station_gap_y = span_y * 0.035
 
     # Short top-border tick rather than a full-height line - capped at the beacon's own height so
     # it still just meets the point on a short/wide parcel instead of overshooting past it. If the
