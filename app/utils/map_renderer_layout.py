@@ -3651,15 +3651,26 @@ def _draw_cadastral_reference_guide(
             )
         )
 
+    # Keep every guide segment's near end just short of the beacon it's referencing - a reference
+    # line, not a mark that runs into/through the station point's own symbol and label.
+    station_gap_x = span_x * 0.012
+    station_gap_y = span_y * 0.012
+
     # Short top-border tick rather than a full-height line - capped at the beacon's own height so
-    # it still just meets the point on a short/wide parcel instead of overshooting past it.
+    # it still just meets the point on a short/wide parcel instead of overshooting past it. If the
+    # beacon happens to sit inside that short top zone, back off by the same gap instead of
+    # touching it.
     vertical_bottom = max(vertical_y, ymax - span_y * 0.14)
+    if vertical_bottom <= vertical_y:
+        vertical_bottom = vertical_y + station_gap_y
     _guide_line([vertical_x, vertical_x], [vertical_bottom, ymax])
+
     # Both horizontal segments sit on the lower-left beacon's elevation, not each beacon's own -
-    # the reference should read as one straight border line, not two strokes at different heights.
-    _guide_line([xmin, lower_left_x], [lower_left_y, lower_left_y])
+    # the reference should read as one straight border line, not two strokes at different heights -
+    # and each stops short of the beacon it approaches rather than touching its marker.
+    _guide_line([xmin, lower_left_x - station_gap_x], [lower_left_y, lower_left_y])
     if lower_right_x < xmax:
-        _guide_line([lower_right_x, xmax], [lower_left_y, lower_left_y])
+        _guide_line([lower_right_x + station_gap_x, xmax], [lower_left_y, lower_left_y])
 
     easting_x = vertical_x - span_x * 0.008
     easting_y = (vertical_bottom + ymax) / 2.0
