@@ -52,6 +52,7 @@ from app.utils.map_renderer_layout import (
     build_fence_avoid_geom,
     add_north_arrow,
     _collect_connected_road_edge_lines,
+    format_area_display,
 )
 from app.utils.back_computation import compute_back_computation
 from app.utils.back_computation_pdf import render_back_computation_pdf
@@ -2103,7 +2104,7 @@ def _resolve_clean_copy_area_label(
     label = override_map.get(f"child:{int(child_plot_id)}")
     if label:
         return label
-    return f"{(float(area_m2) / 10000.0):.4f} Hectares"
+    return format_area_display(float(area_m2))
 
 
 def _iter_line_geometries_for_clean_copy(geom: Any):
@@ -2449,7 +2450,7 @@ def _render_subdivision_clean_copy_pdf(
             fig.text(
                 0.5,
                 area_y,
-                f"AREA={parent_area_m2 / 10000.0:.2f}Ha",
+                f"AREA={format_area_display(parent_area_m2)}",
                 ha="center",
                 va="top",
                 fontsize=max(8, int(9.4 * font_scale)),

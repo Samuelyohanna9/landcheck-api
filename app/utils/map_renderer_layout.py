@@ -139,6 +139,15 @@ def format_bearing_dms(bearing_deg: float) -> str:
     return f"{deg}\u00B0{minutes:02d}\u2032"
 
 
+def format_area_display(area_m2: float) -> str:
+    """Below 1 hectare (10,000 sq m), express the area in square meters; at or above, switch to
+    hectares - the threshold real Nigerian survey plans use, applied consistently across every
+    template's area display instead of each one hardcoding its own fixed unit."""
+    if area_m2 < 10000:
+        return f"{area_m2:,.3f} SQ. MTRS."
+    return f"{area_m2 / 10000.0:,.4f} HA."
+
+
 def nice_grid_step(span_m: float) -> float:
     if span_m <= 0:
         return 100.0
@@ -332,7 +341,7 @@ def draw_title_block(
     fig.text(0.5, y - 0.050, str(lga_text), ha="center", fontsize=int(9*font_scale), color=text_color)
     fig.text(0.5, y - 0.070, str(state_text), ha="center", fontsize=int(9*font_scale), color=text_color)
     fig.text(
-        0.5, y - 0.100, f"AREA = {area_m2/10000:.4f} HA.", ha="center",
+        0.5, y - 0.100, f"AREA = {format_area_display(area_m2)}", ha="center",
         fontsize=area_size if area_size else int(9*font_scale), color="red",
         **({"fontfamily": area_font} if area_font else {}),
     )
@@ -3286,7 +3295,7 @@ def _render_plot_map_layout_adamawa(
     ax.text(
         area_label_point.x,
         area_label_point.y,
-        f"{area_m2 / 10000:.2f}Hectares",
+        format_area_display(area_m2),
         color="red",
         fontsize=area_size if area_size else max(7, int(7 * font_scale)),
         ha="center",
@@ -3477,7 +3486,7 @@ def _draw_cadastral_header(
 
     line(f"COORDINATE SYSTEM : {_safe_text(coordinate_system_text, '-').upper()}", color=CADASTRAL_BLUE)
     line(f"DATUM / ORIGIN : {_safe_text(datum_text, DEFAULT_CADASTRAL_DATUM_TEXT).upper()}", color=CADASTRAL_BLUE)
-    line(f"AREA: {area_m2:.3f}SQ. MTRS.", color="red")
+    line(f"AREA: {format_area_display(area_m2)}", color="red")
 
 
 def _draw_cadastral_footer(
