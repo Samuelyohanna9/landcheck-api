@@ -1,6 +1,6 @@
 # app/routers/analytics.py
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Request
 from sqlalchemy.orm import Session
 from sqlalchemy import text, func, bindparam
 from datetime import datetime, timedelta
@@ -9,6 +9,8 @@ import os
 import glob
 
 from app.db import SessionLocal
+from app.utils.auth_security import require_super_admin_request
+from app.utils.survey_auth_security import ensure_survey_auth_schema
 
 router = APIRouter(prefix="/analytics", tags=["analytics"])
 
@@ -557,3 +559,38 @@ def get_plot_details(db: Session = Depends(get_db)):
         })
 
     return plot_list
+
+
+@router.get("/survey-users")
+def get_survey_users(request: Request, db: Session = Depends(get_db)):
+    """Registered LandCheck Survey users (for the admin dashboard). Unlike the other endpoints in
+    this file, this one enforces a real server-side auth check - it returns user emails, which
+    unlike plot counts/analytics is real PII, so unauthenticated access isn't acceptable here."""
+    require_super_admin_request(db, request)
+    ensure_survey_auth_schema()
+
+    rows = db.execute(text("""
+        SELECT
+            u.id,
+            u.email,
+            u.full_name,
+            u.created_at,
+            u.last_login_at,
+            COUNT(p.id) AS plot_count
+        FROM survey_users u
+        LEFT JOIN plots p ON p.owner_user_id = u.id
+        GROUP BY u.id
+        ORDER BY u.created_at DESC
+    """)).mappings().all()
+
+    return [
+        {
+            "id": int(row["id"]),
+            "email": row["email"],
+            "full_name": row["full_name"],
+            "created_at": row["created_at"].isoformat() if row["created_at"] else None,
+            "last_login_at": row["last_login_at"].isoformat() if row["last_login_at"] else None,
+            "plot_count": int(row["plot_count"] or 0),
+        }
+        for row in rows
+    ]

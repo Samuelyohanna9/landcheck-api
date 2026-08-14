@@ -3538,31 +3538,70 @@ def _draw_cadastral_corner_reference_labels(
 
 def _pick_cadastral_reference_points(
     poly: Polygon,
+    span_x: float,
     span_y: float,
 ) -> tuple[tuple[float, float], tuple[float, float]]:
-    """Pick the lower-left cadastral reference corner and the bottom-right mate.
+    """Pick the South-South cadastral reference corners.
 
-    The South-South state templates anchor their blue datum guide off the lowest visible plot edge.
-    When the parcel has a nearly horizontal frontage, we use the left and right ends of that low edge.
-    For more irregular parcels, we still favour the left-most point among the lowest band so the
-    guide behaves like a survey sheet rather than chasing whichever vertex is fractionally lower.
+    These templates read best when the blue reference guides are taken from the parcel's visual
+    south-west and south-east corners, not merely from the single absolute-lowest vertex. That
+    keeps the U.N. guide close to the left edge and stops it from slicing through irregular plots.
     """
     coords = list(poly.exterior.coords[:-1])
     if not coords:
         c = (poly.centroid.x, poly.centroid.y)
         return c, c
+    min_x = min(pt[0] for pt in coords)
     min_y = min(pt[1] for pt in coords)
-    low_band_tol = max(0.75, span_y * 0.02)
-    low_band = [pt for pt in coords if pt[1] <= (min_y + low_band_tol)]
-    if not low_band:
-        low_band = coords
-    lower_left = min(low_band, key=lambda pt: (pt[0], pt[1]))
-    bottom_y = lower_left[1]
-    aligned_tol = max(0.75, span_y * 0.015)
-    bottom_band = [pt for pt in coords if abs(pt[1] - bottom_y) <= aligned_tol]
-    if not bottom_band:
-        bottom_band = low_band
-    lower_right = max(bottom_band, key=lambda pt: pt[0])
+    span_x = max(float(span_x), 1.0)
+    span_y = max(float(span_y), 1.0)
+
+    def _norm(pt: tuple[float, float]) -> tuple[float, float]:
+        return (
+            (pt[0] - min_x) / span_x,
+            (pt[1] - min_y) / span_y,
+        )
+
+    south_tol = max(1.0, span_y * 0.34)
+    west_tol = max(1.0, span_x * 0.34)
+    south_west_band = [
+        pt for pt in coords
+        if pt[0] <= (min_x + west_tol) or pt[1] <= (min_y + south_tol)
+    ]
+    if not south_west_band:
+        south_west_band = coords
+
+    lower_left = min(
+        south_west_band,
+        key=lambda pt: (
+            (_norm(pt)[0] * 0.68) + (_norm(pt)[1] * 0.32),
+            _norm(pt)[0],
+            _norm(pt)[1],
+        ),
+    )
+
+    frontage_band = [pt for pt in coords if pt[1] <= (min_y + south_tol)]
+    if not frontage_band:
+        frontage_band = coords
+    lower_right = max(
+        frontage_band,
+        key=lambda pt: (
+            (_norm(pt)[0] * 0.76) - (_norm(pt)[1] * 0.24),
+            pt[0],
+        ),
+    )
+    if lower_right == lower_left and len(coords) > 1:
+        alternatives = [pt for pt in frontage_band if pt != lower_left]
+        if not alternatives:
+            alternatives = [pt for pt in coords if pt != lower_left]
+        if alternatives:
+            lower_right = max(
+                alternatives,
+                key=lambda pt: (
+                    (_norm(pt)[0] * 0.76) - (_norm(pt)[1] * 0.24),
+                    pt[0],
+                ),
+            )
     return lower_left, lower_right
 
 
@@ -3579,8 +3618,9 @@ def _draw_cadastral_reference_guide(
 
     This matches the sample cadastral sheets used in Akwa Ibom, Cross River, and Rivers:
     one vertical blue reference line aligned to the lower-left parcel point, one horizontal
-    line from the left frame to that same point, plus matching border-origin guide segments
-    from the bottom and right edges into that same plotted coordinate.
+    line from the left frame to that same point, and one right-side horizontal from the lower-right
+    frontage point to the frame. The guides should read as short border references, not a full
+    plot-wide crosshair.
     """
     xmin, xmax = ax.get_xlim()
     ymin, ymax = ax.get_ylim()
@@ -3592,7 +3632,6 @@ def _draw_cadastral_reference_guide(
     fs = grid_size if grid_size else max(6, int(6.2 * font_scale))
     line_lw = max(0.9, 1.0 * font_scale)
     stroke = [patheffects.withStroke(linewidth=line_lw * 2.1, foreground="white", alpha=0.92)]
-    gap_y = max(0.85, span_y * 0.018)
 
     def _guide_line(x_data: list[float], y_data: list[float]) -> None:
         ax.add_line(
@@ -3609,10 +3648,9 @@ def _draw_cadastral_reference_guide(
 
     # Border-origin guide segments only. They should terminate at the coordinate reference point
     # rather than running as one uninterrupted cross through the whole plotting frame.
-    _guide_line([ref_x, ref_x], [min(ref_y + gap_y, ymax), ymax])
-    _guide_line([ref_x, ref_x], [ymin, max(ref_y - gap_y, ymin)])
+    _guide_line([ref_x, ref_x], [ref_y, ymax])
     _guide_line([xmin, ref_x], [ref_y, ref_y])
-    if right_x < xmax:
+    if right_x > ref_x and right_x < xmax:
         _guide_line([right_x, xmax], [right_y, right_y])
 
     easting_x = ref_x - span_x * 0.008
@@ -4023,7 +4061,7 @@ def _render_plot_map_layout_cadastral(
 
     span_x = max(abs(target_xlim[1] - target_xlim[0]), 1.0)
     span_y = max(abs(target_ylim[1] - target_ylim[0]), 1.0)
-    lower_left_ref, lower_right_ref = _pick_cadastral_reference_points(poly, span_y)
+    lower_left_ref, lower_right_ref = _pick_cadastral_reference_points(poly, span_x, span_y)
 
     # The Akwa Ibom / Rivers / Cross River cadastral sheets use a dedicated reference guide that
     # sits slightly inside the left sheet edge, not on the parcel itself. Older saved drafts may
