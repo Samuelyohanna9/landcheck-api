@@ -3498,53 +3498,151 @@ def _draw_cadastral_corner_reference_labels(
     grid_font: str | None = None,
     grid_size: int | None = None,
 ) -> None:
-    """Draw 4 corner reference crosses with their Easting / Northing values.
+    """Draw 4 corner reference crosses with compact Easting / Northing callouts.
 
-    The South-South state templates use only corner reference crosses. Each corner gets:
-    - an Easting label above/below the frame
-    - a Northing label beside the frame
+    The South-South state templates use only corner reference crosses. Instead of mixing
+    vertical and horizontal labels at the same anchor point, each corner gets a compact
+    two-line callout placed just inside the frame to keep the coordinates legible.
     """
     xmin, xmax = ax.get_xlim()
     ymin, ymax = ax.get_ylim()
     family = grid_font or CADASTRAL_FONT_FAMILY
-    fs = grid_size if grid_size else max(6, int(6.2 * font_scale))
-    e_offset = 0.032
-    n_offset = 0.038
+    fs = grid_size if grid_size else max(5, int(5.8 * font_scale))
+    inset_x = 0.028
+    inset_y = 0.028
 
     corners = (
-        {"xf": 0.0, "yf": 1.0, "x": xmin, "y": ymax, "e_va": "bottom", "e_y": 1.0 + e_offset, "n_ha": "right", "n_x": 0.0 - n_offset},
-        {"xf": 1.0, "yf": 1.0, "x": xmax, "y": ymax, "e_va": "bottom", "e_y": 1.0 + e_offset, "n_ha": "left", "n_x": 1.0 + n_offset},
-        {"xf": 0.0, "yf": 0.0, "x": xmin, "y": ymin, "e_va": "top", "e_y": 0.0 - e_offset, "n_ha": "right", "n_x": 0.0 - n_offset},
-        {"xf": 1.0, "yf": 0.0, "x": xmax, "y": ymin, "e_va": "top", "e_y": 0.0 - e_offset, "n_ha": "left", "n_x": 1.0 + n_offset},
+        {"x": xmin, "y": ymax, "tx": inset_x, "ty": 1.0 - inset_y, "ha": "left", "va": "top"},
+        {"x": xmax, "y": ymax, "tx": 1.0 - inset_x, "ty": 1.0 - inset_y, "ha": "right", "va": "top"},
+        {"x": xmin, "y": ymin, "tx": inset_x, "ty": inset_y, "ha": "left", "va": "bottom"},
+        {"x": xmax, "y": ymin, "tx": 1.0 - inset_x, "ty": inset_y, "ha": "right", "va": "bottom"},
     )
     for corner in corners:
+        label = f"E {corner['x']:.3f}m\nN {corner['y']:.3f}m"
         ax.text(
-            corner["xf"],
-            corner["e_y"],
-            f"{corner['x']:.3f}m E.",
+            corner["tx"],
+            corner["ty"],
+            label,
             transform=ax.transAxes,
-            ha="center",
-            va=corner["e_va"],
+            ha=corner["ha"],
+            va=corner["va"],
             fontsize=fs,
             color=color,
             fontfamily=family,
+            linespacing=1.1,
             clip_on=False,
             zorder=7,
+            bbox=dict(boxstyle="round,pad=0.12", facecolor="white", edgecolor="none", alpha=0.72),
         )
-        ax.text(
-            corner["n_x"],
-            corner["yf"],
-            f"{corner['y']:.3f}m N.",
-            transform=ax.transAxes,
-            ha=corner["n_ha"],
-            va="center",
-            rotation=90,
-            fontsize=fs,
-            color=color,
-            fontfamily=family,
-            clip_on=False,
-            zorder=7,
+
+
+def _pick_cadastral_reference_points(
+    poly: Polygon,
+    span_y: float,
+) -> tuple[tuple[float, float], tuple[float, float]]:
+    """Pick the lower-left cadastral reference corner and the bottom-right mate.
+
+    The South-South state templates anchor their blue datum guide off the lowest visible plot edge.
+    When the parcel has a nearly horizontal frontage, we use the left and right ends of that low edge.
+    For more irregular parcels, we still favour the left-most point among the lowest band so the
+    guide behaves like a survey sheet rather than chasing whichever vertex is fractionally lower.
+    """
+    coords = list(poly.exterior.coords[:-1])
+    if not coords:
+        c = (poly.centroid.x, poly.centroid.y)
+        return c, c
+    min_y = min(pt[1] for pt in coords)
+    low_band_tol = max(0.75, span_y * 0.02)
+    low_band = [pt for pt in coords if pt[1] <= (min_y + low_band_tol)]
+    if not low_band:
+        low_band = coords
+    lower_left = min(low_band, key=lambda pt: (pt[0], pt[1]))
+    bottom_y = lower_left[1]
+    aligned_tol = max(0.75, span_y * 0.015)
+    bottom_band = [pt for pt in coords if abs(pt[1] - bottom_y) <= aligned_tol]
+    if not bottom_band:
+        bottom_band = low_band
+    lower_right = max(bottom_band, key=lambda pt: pt[0])
+    return lower_left, lower_right
+
+
+def _draw_cadastral_reference_guide(
+    ax,
+    lower_left_point: tuple[float, float],
+    lower_right_point: tuple[float, float],
+    font_scale: float = 1.0,
+    color: str = CADASTRAL_BLUE,
+    grid_font: str | None = None,
+    grid_size: int | None = None,
+) -> None:
+    """Draw the South-South single-reference blue guide.
+
+    This matches the sample cadastral sheets used in Akwa Ibom, Cross River, and Rivers:
+    one vertical blue reference line aligned to the lower-left parcel point, a horizontal
+    line from the left frame to that same point, and a short matching horizontal line from
+    the bottom frontage edge out to the right frame.
+    """
+    xmin, xmax = ax.get_xlim()
+    ymin, ymax = ax.get_ylim()
+    span_x = max(abs(xmax - xmin), 1.0)
+    span_y = max(abs(ymax - ymin), 1.0)
+    ref_x, ref_y = lower_left_point
+    right_x = max(lower_right_point[0], ref_x)
+    family = grid_font or CADASTRAL_FONT_FAMILY
+    fs = grid_size if grid_size else max(6, int(6.2 * font_scale))
+    line_lw = max(0.9, 1.0 * font_scale)
+    stroke = [patheffects.withStroke(linewidth=line_lw * 2.1, foreground="white", alpha=0.92)]
+
+    def _guide_line(x_data: list[float], y_data: list[float]) -> None:
+        ax.add_line(
+            mlines.Line2D(
+                x_data,
+                y_data,
+                color=color,
+                lw=line_lw,
+                zorder=6,
+                clip_on=False,
+                path_effects=stroke,
+            )
         )
+
+    _guide_line([ref_x, ref_x], [ymin, ymax])
+    _guide_line([xmin, ref_x], [ref_y, ref_y])
+    if right_x < xmax:
+        _guide_line([right_x, xmax], [ref_y, ref_y])
+
+    easting_x = ref_x - span_x * 0.008
+    easting_y = ymax - span_y * 0.18
+    northing_x = xmin + span_x * 0.02
+    northing_y = ref_y + span_y * 0.004
+
+    ax.text(
+        easting_x,
+        easting_y,
+        f"{ref_x:.3f}m E.",
+        color=color,
+        fontsize=fs,
+        ha="right",
+        va="center",
+        rotation=90,
+        zorder=7,
+        clip_on=False,
+        fontfamily=family,
+        path_effects=stroke,
+    )
+    ax.text(
+        northing_x,
+        northing_y,
+        f"{ref_y:.3f}m N.",
+        color=color,
+        fontsize=fs,
+        ha="left",
+        va="bottom",
+        zorder=7,
+        clip_on=False,
+        fontfamily=family,
+        path_effects=stroke,
+    )
 
 
 def _draw_cadastral_frontage_road(ax, poly, road_name: str, font_scale: float = 1.0, color: str = "black") -> None:
@@ -3900,11 +3998,6 @@ def _render_plot_map_layout_cadastral(
     ax.set_xlim(target_xlim)
     ax.set_ylim(target_ylim)
 
-    major = nice_grid_step(max(ax.get_xlim()[1] - ax.get_xlim()[0], ax.get_ylim()[1] - ax.get_ylim()[0]))
-    # Small grid-crossing tick marks at the frame edges (no crossing lines through the map
-    # itself) - the reference template's convention for marking round Easting/Northing values.
-    draw_grid(ax, poly, major / 5.0, major, font_scale, full_grid=False, edge_ticks=True, color=grid_color, edge_tick_style="corners")
-
     annotate_vertices(
         ax,
         poly,
@@ -3926,23 +4019,19 @@ def _render_plot_map_layout_cadastral(
 
     span_x = max(abs(target_xlim[1] - target_xlim[0]), 1.0)
     span_y = max(abs(target_ylim[1] - target_ylim[0]), 1.0)
+    lower_left_ref, lower_right_ref = _pick_cadastral_reference_points(poly, span_y)
 
     # The Akwa Ibom / Rivers / Cross River cadastral sheets use a dedicated reference guide that
     # sits slightly inside the left sheet edge, not on the parcel itself. Older saved drafts may
     # still carry another arrow style, so force the proper U.N. marker whenever this cadastral
     # renderer is active.
-    guide_easting = target_xlim[0] + span_x * 0.035
-    bottom_northing = target_ylim[0] + span_y * 0.032
+    guide_easting = lower_left_ref[0]
     top_northing = target_ylim[1] - span_y * 0.035
 
     guide_fig_x, _ = fig.transFigure.inverted().transform(
         ax.transData.transform((guide_easting, top_northing))
     )
 
-    # The long blue vertical/horizontal reference-guide lines that used to connect the U.N. marker
-    # stem to the grid were removed at the user's request - the corner dash ticks drawn by
-    # draw_grid() above are now the only grid-reference marks on this template. The U.N. marker
-    # itself (the actual north indicator) still draws normally below.
     add_north_arrow(
         ax,
         font_scale=max(font_scale * 1.62, font_scale + 0.30),
@@ -3955,8 +4044,10 @@ def _render_plot_map_layout_cadastral(
         blue_hex=grid_color,
     )
 
-    _draw_cadastral_corner_reference_labels(
+    _draw_cadastral_reference_guide(
         ax,
+        lower_left_point=lower_left_ref,
+        lower_right_point=lower_right_ref,
         font_scale=font_scale,
         color=grid_color,
         grid_font=grid_font,
