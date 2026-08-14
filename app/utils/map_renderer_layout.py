@@ -13,7 +13,7 @@ import geopandas as gpd
 import matplotlib.pyplot as plt
 from sqlalchemy import text
 from shapely import wkb
-from shapely.geometry import LineString, Point, shape
+from shapely.geometry import LineString, Point, Polygon, shape
 from shapely.ops import snap, linemerge, unary_union
 import matplotlib.patches as patches
 import matplotlib.lines as mlines
