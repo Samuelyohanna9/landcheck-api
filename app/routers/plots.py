@@ -2154,6 +2154,7 @@ def _render_subdivision_clean_copy_pdf(
     river_color: str | None = None,
     building_color: str | None = None,
     building_hatch_type: str | None = None,
+    road_style: str | None = None,
     station_font: str | None = None,
     station_size: int | None = None,
     bearing_font: str | None = None,
@@ -2501,6 +2502,11 @@ def _render_subdivision_clean_copy_pdf(
 
         road_edge_lw = max(0.75, 0.9 * font_scale)
         road_edge_color = road_color
+        # This clean-copy renderer draws roads with its own hand-rolled ax.plot calls rather than
+        # the shared _draw_road_edges - an explicit "solid" choice is still honored here for
+        # consistency, but the dashed default's tick-symbol embellishment isn't duplicated into
+        # this secondary export path.
+        road_edge_linestyle = "-" if road_style == "solid" else (0, (7, 4))
         road_label_size = max(7, int(7.2 * font_scale))
         road_snap_tol = max(1.0, (5.0 / 1000.0) * scale_ratio)
         road_label_features: list[tuple[Any, str]] = []
@@ -2566,7 +2572,7 @@ def _render_subdivision_clean_copy_pdf(
                                     y_vals,
                                     color=road_edge_color,
                                     lw=road_edge_lw,
-                                    linestyle=(0, (7, 4)),
+                                    linestyle=road_edge_linestyle,
                                     zorder=road_line_zorder,
                                 )
                                 try:
@@ -2584,7 +2590,7 @@ def _render_subdivision_clean_copy_pdf(
                             y_vals,
                             color=road_edge_color,
                             lw=road_edge_lw,
-                            linestyle=(0, (7, 4)),
+                            linestyle=road_edge_linestyle,
                             zorder=road_line_zorder,
                         )
                         drawn_edge_len += float(getattr(seg, "length", 0.0))
@@ -2602,7 +2608,7 @@ def _render_subdivision_clean_copy_pdf(
                             y_vals,
                             color=road_edge_color,
                             lw=max(0.7, 0.85 * road_edge_lw),
-                            linestyle=(0, (7, 4)),
+                            linestyle=road_edge_linestyle,
                             zorder=road_line_zorder,
                         )
                     except Exception:
@@ -3501,6 +3507,7 @@ def _get_subdivision_batch_clean_copy_context(
     river_color: str | None = None,
     building_color: str | None = None,
     building_hatch_type: str | None = None,
+    road_style: str | None = None,
     station_font: str | None = None,
     station_size: int | None = None,
     bearing_font: str | None = None,
@@ -3575,6 +3582,7 @@ def _get_subdivision_batch_clean_copy_context(
         "river_color": river_color or "",
         "building_color": building_color or "",
         "building_hatch_type": building_hatch_type or "",
+        "road_style": road_style or "",
         "station_font": station_font or "",
         "station_size": station_size or 0,
         "bearing_font": bearing_font or "",
@@ -3610,6 +3618,7 @@ def _get_subdivision_batch_clean_copy_context(
         "river_color": river_color,
         "building_color": building_color,
         "building_hatch_type": building_hatch_type,
+        "road_style": road_style,
         "station_font": station_font,
         "station_size": station_size,
         "bearing_font": bearing_font,
@@ -3655,6 +3664,7 @@ def _generate_subdivision_batch_clean_copy_pdf(
             river_color=context.get("river_color") or None,
             building_color=context.get("building_color") or None,
             building_hatch_type=context.get("building_hatch_type") or None,
+            road_style=context.get("road_style") or None,
             station_font=context.get("station_font") or None,
             station_size=context.get("station_size") or None,
             bearing_font=context.get("bearing_font") or None,
@@ -3738,6 +3748,7 @@ def _run_subdivision_batch_clean_copy_export_job(job_id: str):
             river_color=payload.get("river_color") or None,
             building_color=payload.get("building_color") or None,
             building_hatch_type=payload.get("building_hatch_type") or None,
+            road_style=payload.get("road_style") or None,
             station_font=payload.get("station_font") or None,
             station_size=payload.get("station_size") or None,
             bearing_font=payload.get("bearing_font") or None,
@@ -4129,6 +4140,7 @@ def create_plot_survey_report_export_job(
     river_color: str | None = Body(None),
     building_color: str | None = Body(None),
     building_hatch_type: str | None = Body(None),
+    road_style: str | None = Body(None),
     title_font: str | None = Body(None),
     title_size: int | None = Body(None),
     grid_font: str | None = Body(None),
@@ -4190,6 +4202,7 @@ def create_plot_survey_report_export_job(
         "river_color": river_color,
         "building_color": building_color,
         "building_hatch_type": building_hatch_type,
+        "road_style": road_style,
         "title_font": title_font,
         "title_size": title_size,
         "grid_font": grid_font,
@@ -4455,6 +4468,7 @@ def create_subdivision_batch_clean_copy_export_job(
     river_color: str | None = Body(None),
     building_color: str | None = Body(None),
     building_hatch_type: str | None = Body(None),
+    road_style: str | None = Body(None),
     station_font: str | None = Body(None),
     station_size: int | None = Body(None),
     bearing_font: str | None = Body(None),
@@ -4478,6 +4492,7 @@ def create_subdivision_batch_clean_copy_export_job(
         "river_color": river_color,
         "building_color": building_color,
         "building_hatch_type": building_hatch_type,
+        "road_style": road_style,
         "station_font": station_font,
         "station_size": station_size,
         "bearing_font": bearing_font,
@@ -4503,6 +4518,7 @@ def create_subdivision_batch_clean_copy_export_job(
         river_color=river_color,
         building_color=building_color,
         building_hatch_type=building_hatch_type,
+        road_style=road_style,
         station_font=station_font,
         station_size=station_size,
         bearing_font=bearing_font,
@@ -4649,6 +4665,7 @@ def export_subdivision_batch_clean_copy_pdf(
     river_color: str | None = Body(None),
     building_color: str | None = Body(None),
     building_hatch_type: str | None = Body(None),
+    road_style: str | None = Body(None),
     station_font: str | None = Body(None),
     station_size: int | None = Body(None),
     bearing_font: str | None = Body(None),
@@ -4674,6 +4691,7 @@ def export_subdivision_batch_clean_copy_pdf(
         river_color=river_color,
         building_color=building_color,
         building_hatch_type=building_hatch_type,
+        road_style=road_style,
         station_font=station_font,
         station_size=station_size,
         bearing_font=bearing_font,
@@ -5660,6 +5678,7 @@ def download_plot_report_pdf(plot_id: int, db: Session = Depends(get_db), backgr
     river_color: str | None = Body(None),
     building_color: str | None = Body(None),
     building_hatch_type: str | None = Body(None),
+    road_style: str | None = Body(None),
     title_font: str | None = Body(None),
     title_size: int | None = Body(None),
     grid_font: str | None = Body(None),
@@ -5783,6 +5802,7 @@ def download_plot_report_pdf(plot_id: int, db: Session = Depends(get_db), backgr
         river_color=river_color,
         building_color=building_color,
         building_hatch_type=building_hatch_type,
+        road_style=road_style,
         title_font=title_font,
         title_size=title_size,
         grid_font=grid_font,
@@ -6069,6 +6089,7 @@ def preview_plot_map(plot_id: int, db: Session = Depends(get_db), background_tas
     river_color: str | None = Body(None),
     building_color: str | None = Body(None),
     building_hatch_type: str | None = Body(None),
+    road_style: str | None = Body(None),
     title_font: str | None = Body(None),
     title_size: int | None = Body(None),
     grid_font: str | None = Body(None),
@@ -6167,6 +6188,7 @@ def preview_plot_map(plot_id: int, db: Session = Depends(get_db), background_tas
         "river_color": river_color,
         "building_color": building_color,
         "building_hatch_type": building_hatch_type,
+        "road_style": road_style,
         "title_font": title_font,
         "title_size": title_size,
         "grid_font": grid_font,
@@ -6298,6 +6320,7 @@ def preview_plot_map(plot_id: int, db: Session = Depends(get_db), background_tas
         river_color=river_color,
         building_color=building_color,
         building_hatch_type=building_hatch_type,
+        road_style=road_style,
         title_font=title_font,
         title_size=title_size,
         grid_font=grid_font,

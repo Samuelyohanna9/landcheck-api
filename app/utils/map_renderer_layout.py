@@ -2271,7 +2271,47 @@ def _collect_connected_road_edge_lines(road_geoms_with_width, snap_tol_m: float 
     return edge_lines
 
 
-def _draw_road_edges(ax, edge_lines, font_scale=1.0, color: str = "black", linestyle="-", scale_ratio=None):
+def _draw_road_tick_symbols(ax, line_geom, color: str, lw: float, scale_ratio=None) -> None:
+    """Small perpendicular cross-ties at regular intervals along a road line - the "symbols" half
+    of the dashed-with-symbols road style, distinguishing it from a plain dashed line the same way
+    real plans mark an unpaved/proposed road differently from a paved one."""
+    length = getattr(line_geom, "length", 0.0) or 0.0
+    if length <= 0:
+        return
+    ratio = max(scale_ratio or 1000, 100)
+    step = max(2.0, (8.0 / 1000.0) * ratio)
+    tick_len = max(0.6, (1.4 / 1000.0) * ratio)
+    probe = max(0.3, step * 0.15)
+    d = step / 2.0
+    while d < length:
+        try:
+            p = line_geom.interpolate(d)
+            p_prev = line_geom.interpolate(max(0.0, d - probe))
+            p_next = line_geom.interpolate(min(length, d + probe))
+        except Exception:
+            d += step
+            continue
+        tx, ty = p_next.x - p_prev.x, p_next.y - p_prev.y
+        mag = math.hypot(tx, ty)
+        if mag == 0:
+            d += step
+            continue
+        nx, ny = -ty / mag, tx / mag
+        ax.plot(
+            [p.x - nx * tick_len / 2.0, p.x + nx * tick_len / 2.0],
+            [p.y - ny * tick_len / 2.0, p.y + ny * tick_len / 2.0],
+            color=color,
+            lw=max(0.6, lw * 0.9),
+            zorder=6,
+            solid_capstyle="butt",
+        )
+        d += step
+
+
+def _draw_road_edges(
+    ax, edge_lines, font_scale=1.0, color: str = "black", linestyle="-", scale_ratio=None,
+    road_style: str = "",
+):
     if not edge_lines:
         return
     if scale_ratio:
@@ -2297,6 +2337,18 @@ def _draw_road_edges(ax, edge_lines, font_scale=1.0, color: str = "black", lines
             draw_lines = merged_lines
     except Exception:
         draw_lines = edge_lines
+
+    # An explicit road_style choice overrides whichever linestyle this template would otherwise
+    # use by default (solid for general/Adamawa, a plain dash for cadastral/FCT) - leaving
+    # linestyle untouched when road_style is unset keeps every template's existing default intact.
+    resolved_linestyle = linestyle
+    draw_symbols = False
+    if road_style == "solid":
+        resolved_linestyle = "-"
+    elif road_style == "dashed_symbol":
+        resolved_linestyle = (0, (6, 4))
+        draw_symbols = True
+
     for seg in draw_lines:
         try:
             x_vals, y_vals = seg.xy
@@ -2305,11 +2357,13 @@ def _draw_road_edges(ax, edge_lines, font_scale=1.0, color: str = "black", lines
                 y_vals,
                 color=color,
                 lw=lw,
-                linestyle=linestyle,
+                linestyle=resolved_linestyle,
                 zorder=6,
                 solid_joinstyle="round",
                 solid_capstyle="round",
             )
+            if draw_symbols:
+                _draw_road_tick_symbols(ax, seg, color, lw, scale_ratio=scale_ratio)
         except Exception:
             continue
 
@@ -2926,6 +2980,7 @@ def _render_plot_map_layout_adamawa(
     river_color: str | None = None,
     building_color: str | None = None,
     building_hatch_type: str | None = None,
+    road_style: str | None = None,
     title_font: str | None = None,
     title_size: int | None = None,
     grid_font: str | None = None,
@@ -2947,6 +3002,7 @@ def _render_plot_map_layout_adamawa(
     river_color = river_color or "#10a3df"
     building_color = building_color or "black"
     building_hatch_type = building_hatch_type or "diagonal"
+    road_style = road_style or ""
     plot_wkb = db.execute(text("SELECT geom FROM plots WHERE id=:id"), {"id": plot_id}).scalar()
     if not plot_wkb:
         raise ValueError("Plot not found")
@@ -3153,7 +3209,7 @@ def _render_plot_map_layout_adamawa(
         river_label_features.append((snapped_clipped, name))
 
     road_edge_lines = _collect_connected_road_edge_lines(road_geom_width, snap_tol_m=road_snap_tol)
-    _draw_road_edges(ax, road_edge_lines, font_scale=font_scale, color=road_color, scale_ratio=scale_ratio)
+    _draw_road_edges(ax, road_edge_lines, font_scale=font_scale, color=road_color, scale_ratio=scale_ratio, road_style=road_style)
 
     min_road_label_len = max(2.0, (10.0 / 1000.0) * scale_ratio)
     _draw_names_along_path(
@@ -3713,14 +3769,17 @@ def _draw_cadastral_reference_guide(
         vertical_bottom = vertical_y + station_gap_y
     _guide_line([vertical_x, vertical_x], [vertical_bottom, vertical_top])
 
-    # A matching short dash from the bottom border, at the same easting - directly opposite the
-    # top tick, mirroring its "short, capped short of the beacon" treatment rather than reaching
-    # all the way up to it.
-    border_bottom_y = _fig_y_to_data(frame_margin)
-    bottom_dash_top = min(vertical_y, border_bottom_y + span_y * 0.14)
+    # A matching short dash directly opposite the top tick, at the same easting - mirroring its
+    # "short, capped short of the beacon" treatment. Starts just above the footer table's own top
+    # edge (_draw_cadastral_footer's footer_top = 0.195), not the true page border - the footer
+    # box sits between there and the border, so reaching all the way down to the border ran the
+    # line straight through the "PLAN NO" box.
+    footer_top_fig_y = 0.195
+    guide_bottom_y = _fig_y_to_data(footer_top_fig_y + 0.015)
+    bottom_dash_top = min(vertical_y, guide_bottom_y + span_y * 0.14)
     if bottom_dash_top >= vertical_y:
         bottom_dash_top = vertical_y - station_gap_y
-    _guide_line([vertical_x, vertical_x], [border_bottom_y, bottom_dash_top])
+    _guide_line([vertical_x, vertical_x], [guide_bottom_y, bottom_dash_top])
 
     easting_x = vertical_x - span_x * 0.008
     easting_y = (vertical_bottom + vertical_top) / 2.0
@@ -3866,6 +3925,7 @@ def _render_plot_map_layout_cadastral(
     river_color: str | None = None,
     building_color: str | None = None,
     building_hatch_type: str | None = None,
+    road_style: str | None = None,
     title_font: str | None = None,
     title_size: int | None = None,
     grid_font: str | None = None,
@@ -3884,6 +3944,7 @@ def _render_plot_map_layout_cadastral(
     river_color = river_color or "#10a3df"
     building_color = building_color or "black"
     building_hatch_type = building_hatch_type or "diagonal"
+    road_style = road_style or ""
 
     plot_wkb = db.execute(text("SELECT geom FROM plots WHERE id=:id"), {"id": plot_id}).scalar()
     if not plot_wkb:
@@ -4067,7 +4128,7 @@ def _render_plot_map_layout_cadastral(
         except Exception:
             continue
     road_edge_lines = _collect_connected_road_edge_lines(road_geom_width, snap_tol_m=road_snap_tol)
-    _draw_road_edges(ax, road_edge_lines, font_scale=font_scale, color=road_color, linestyle=(0, (6, 4)), scale_ratio=scale_ratio)
+    _draw_road_edges(ax, road_edge_lines, font_scale=font_scale, color=road_color, linestyle=(0, (6, 4)), scale_ratio=scale_ratio, road_style=road_style)
 
     if _safe_text(location_text):
         try:
@@ -4455,6 +4516,7 @@ def _render_plot_map_layout_fct(
     river_color: str | None = None,
     building_color: str | None = None,
     building_hatch_type: str | None = None,
+    road_style: str | None = None,
     title_font: str | None = None,
     title_size: int | None = None,
     grid_font: str | None = None,
@@ -4472,6 +4534,7 @@ def _render_plot_map_layout_fct(
     river_color = river_color or "#10a3df"
     building_color = building_color or "black"
     building_hatch_type = building_hatch_type or "diagonal"
+    road_style = road_style or ""
     # Bearing/distance labels follow the same boundary_color the Appearance panel's color picker
     # sets for the boundary line itself (red by default) - annotate_vertices' boundary_color param
     # drives text color independently of the actual boundary line, which is drawn separately below.
@@ -4671,7 +4734,7 @@ def _render_plot_map_layout_fct(
         road_edge_lines = clipped_edge_lines
     # The reference plan shows nearby roads as plain dashed reference lines, not solid double
     # lines - matching that convention here (Akwa Ibom/Rivers/Cross River do the same).
-    _draw_road_edges(ax, road_edge_lines, font_scale=font_scale, color=road_color, linestyle=(0, (6, 4)), scale_ratio=scale_ratio)
+    _draw_road_edges(ax, road_edge_lines, font_scale=font_scale, color=road_color, linestyle=(0, (6, 4)), scale_ratio=scale_ratio, road_style=road_style)
 
     def _project_clip_named(geom, name):
         try:
@@ -4875,6 +4938,7 @@ def render_plot_map_layout(
     river_color: str | None = None,
     building_color: str | None = None,
     building_hatch_type: str | None = None,
+    road_style: str | None = None,
     title_font: str | None = None,
     title_size: int | None = None,
     grid_font: str | None = None,
@@ -4921,6 +4985,7 @@ def render_plot_map_layout(
             river_color=river_color,
             building_color=building_color,
             building_hatch_type=building_hatch_type,
+            road_style=road_style,
             title_font=title_font,
             title_size=title_size,
             grid_font=grid_font,
@@ -4969,6 +5034,7 @@ def render_plot_map_layout(
             river_color=river_color,
             building_color=building_color,
             building_hatch_type=building_hatch_type,
+            road_style=road_style,
             title_font=title_font,
             title_size=title_size,
             grid_font=grid_font,
@@ -5025,6 +5091,7 @@ def render_plot_map_layout(
             river_color=river_color,
             building_color=building_color,
             building_hatch_type=building_hatch_type,
+            road_style=road_style,
             title_font=title_font,
             title_size=title_size,
             grid_font=grid_font,
@@ -5047,6 +5114,7 @@ def render_plot_map_layout(
     river_color = river_color or "blue"
     building_color = building_color or "black"
     building_hatch_type = building_hatch_type or "diagonal"
+    road_style = road_style or ""
 
     plot_wkb = db.execute(text("SELECT geom FROM plots WHERE id=:id"), {"id": plot_id}).scalar()
     rows = db.execute(
@@ -5382,7 +5450,7 @@ def render_plot_map_layout(
         font_scale=font_scale,
     )
 
-    _draw_road_edges(ax, road_edge_lines, font_scale=font_scale, color=road_color, scale_ratio=scale_ratio)
+    _draw_road_edges(ax, road_edge_lines, font_scale=font_scale, color=road_color, scale_ratio=scale_ratio, road_style=road_style)
 
     # Skip real-world-tiny structures (a shed, a kiosk) that wouldn't render legibly at this
     # plan's scale - drawing every detected speck identically at 1:500 and 1:10000 alike isn't
