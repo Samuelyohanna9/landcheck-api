@@ -1633,10 +1633,28 @@ def annotate_vertices(
             except Exception:
                 pass
 
+        # The text block is vertically centered on an anchor pushed only slightly outside the
+        # polygon (base_offset), which is smaller than the gap between the two stacked lines - so
+        # the first line ends up further from the edge (outside) and the second line crosses back
+        # to the inside. Which line that first slot actually is depends on both the readability
+        # flip on `ang` (keeps text right-side-up) and the interior-avoidance flips on
+        # (label_nx, label_ny) above - two independent flips, so a fixed line order isn't reliably
+        # outside/inside the same way on every edge. Instead, work out which physical direction
+        # the first line's slot actually lands in on THIS edge, and order distance/bearing so
+        # distance always lands inside and bearing always lands outside.
+        first_line_dir = (
+            -math.sin(math.radians(ang)),
+            math.cos(math.radians(ang)),
+        )
+        first_line_is_outside = (first_line_dir[0] * label_nx + first_line_dir[1] * label_ny) > 0
+        bearing_line = format_bearing_dms(bearing)
+        distance_line = f"{dist:.2f}m"
+        label_text = f"{bearing_line}\n{distance_line}" if first_line_is_outside else f"{distance_line}\n{bearing_line}"
+
         place_text(
             mx,
             my,
-            f"{format_bearing_dms(bearing)}\n{dist:.2f}m",
+            label_text,
             font_size=bearing_size if bearing_size else int(7.0 * font_scale),
             color=boundary_color,
             rotation=ang,
