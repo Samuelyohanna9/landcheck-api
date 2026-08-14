@@ -3707,18 +3707,41 @@ def _draw_cadastral_reference_guide(
         vertical_bottom = vertical_y + station_gap_y
     _guide_line([vertical_x, vertical_x], [vertical_bottom, border_top_y])
 
-    # Both horizontal segments sit on the lower-left beacon's elevation, not each beacon's own -
-    # the reference should read as one straight border line, not two strokes at different heights -
-    # each reaching the true printed border on its outer end and stopping short of the beacon it
-    # approaches on its inner end, rather than touching its marker.
-    _guide_line([border_left_x, lower_left_x - station_gap_x], [lower_left_y, lower_left_y])
-    if lower_right_x < xmax:
-        _guide_line([lower_right_x + station_gap_x, border_right_x], [lower_left_y, lower_left_y])
-
     easting_x = vertical_x - span_x * 0.008
     easting_y = (vertical_bottom + border_top_y) / 2.0
     northing_x = border_left_x + span_x * 0.02
     northing_y = lower_left_y + span_y * 0.004
+    northing_label = f"{lower_left_y:.3f}m N."
+
+    # The left guide line should stop right where the northing number's text ends, not keep
+    # running on as a bare line with nothing above it all the way toward the beacon - measure the
+    # label's actual rendered width (real glyph metrics via the renderer, not a length guess) and
+    # cap the line there, still never crossing the beacon-approach gap already established above.
+    try:
+        try:
+            renderer = fig.canvas.get_renderer()
+        except Exception:
+            fig.canvas.draw()
+            renderer = fig.canvas.get_renderer()
+        fp = FontProperties(family=family, size=fs)
+        label_px_width, _label_px_height, _descent = renderer.get_text_width_height_descent(
+            northing_label, fp, ismath=False
+        )
+        anchor_display = ax.transData.transform((northing_x, northing_y))
+        label_end_display = (anchor_display[0] + label_px_width, anchor_display[1])
+        label_end_x = float(ax.transData.inverted().transform(label_end_display)[0])
+        left_line_end_x = min(label_end_x + span_x * 0.006, lower_left_x - station_gap_x)
+    except Exception:
+        left_line_end_x = lower_left_x - station_gap_x
+
+    # Both horizontal segments sit on the lower-left beacon's elevation, not each beacon's own -
+    # the reference should read as one straight border line, not two strokes at different heights -
+    # each reaching the true printed border on its outer end. The left segment stops at the
+    # northing label's end (see above); the right/frontage segment has no label of its own, so it
+    # keeps stopping short of the beacon it approaches instead.
+    _guide_line([border_left_x, left_line_end_x], [lower_left_y, lower_left_y])
+    if lower_right_x < xmax:
+        _guide_line([lower_right_x + station_gap_x, border_right_x], [lower_left_y, lower_left_y])
 
     ax.text(
         easting_x,
