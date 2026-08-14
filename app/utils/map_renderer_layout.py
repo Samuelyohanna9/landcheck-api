@@ -3634,20 +3634,26 @@ def _draw_cadastral_reference_guide(
     color: str = CADASTRAL_BLUE,
     grid_font: str | None = None,
     grid_size: int | None = None,
+    arrow_bottom_fig_y: float | None = None,
 ) -> None:
     """Draw the South-South single-reference blue guide.
 
     This matches the sample cadastral sheets used in Akwa Ibom, Cross River, and Rivers: a short
-    vertical blue tick dropping from the top border (not a full-height line down to wherever the
-    lower-left beacon happens to sit - on a tall parcel that read as one long line spanning almost
-    the whole sheet), and a single straight horizontal reference at the lower-left beacon's
+    vertical blue tick, and a single straight horizontal reference at the lower-left beacon's
     elevation running the full width of the frame - the left segment (frame to that beacon) and
     the right/frontage segment (the lower-right beacon to the frame) share that same y so they
     read as one continuous line rather than two segments at different heights.
 
-    The lines reach all the way to the printed black border rectangle, not just the edge of the
-    plotting area - that rectangle is drawn separately in figure coordinates (see
-    `_draw_cadastral_header`'s `Rectangle((0.03, 0.03), 0.94, 0.94, transform=fig.transFigure)`),
+    The vertical tick starts immediately below the U.N. north arrow marker (`arrow_bottom_fig_y`,
+    the arrow's own stem-bottom in figure coordinates - see its computation in
+    `_render_plot_map_layout_cadastral`) rather than reaching up to the printed border - the arrow
+    marker already reads as the top/north reference, so a second line also touching the border
+    independently of it was redundant. Falls back to the border itself if that figure-y isn't
+    supplied (kept optional so any other future caller without an arrow still gets a sensible top).
+
+    The horizontal segments still reach all the way to the printed black border rectangle, not
+    just the edge of the plotting area - that rectangle is drawn separately in figure coordinates
+    (see `_draw_cadastral_header`'s `Rectangle((0.03, 0.03), 0.94, 0.94, transform=fig.transFigure)`),
     inset further from the page than the axes' own data limits, so reaching it means converting
     those figure-space margins into this axes' current data coordinates rather than using
     `ax.get_xlim()`/`get_ylim()` directly - those only reach the plotting area's edge, which sits
@@ -3665,7 +3671,7 @@ def _draw_cadastral_reference_guide(
 
     border_left_x = _fig_x_to_data(frame_margin)
     border_right_x = _fig_x_to_data(frame_far_edge)
-    border_top_y = _fig_y_to_data(frame_far_edge)
+    vertical_top = _fig_y_to_data(arrow_bottom_fig_y if arrow_bottom_fig_y is not None else frame_far_edge)
 
     xmin, xmax = ax.get_xlim()
     ymin, ymax = ax.get_ylim()
@@ -3698,17 +3704,17 @@ def _draw_cadastral_reference_guide(
     station_gap_x = span_x * 0.035
     station_gap_y = span_y * 0.035
 
-    # Short top-border tick rather than a full-height line - capped at the beacon's own height so
-    # it still just meets the point on a short/wide parcel instead of overshooting past it. If the
-    # beacon happens to sit inside that short top zone, back off by the same gap instead of
-    # touching it. The far end reaches the true printed border, not just the axes' own top limit.
-    vertical_bottom = max(vertical_y, ymax - span_y * 0.14)
+    # Short tick down from the arrow (vertical_top, set above) rather than a full-height line -
+    # capped at the beacon's own height so it still just meets the point on a short/wide parcel
+    # instead of overshooting past it. If the beacon happens to sit inside that short zone, back
+    # off by the same gap instead of touching it.
+    vertical_bottom = max(vertical_y, vertical_top - span_y * 0.14)
     if vertical_bottom <= vertical_y:
         vertical_bottom = vertical_y + station_gap_y
-    _guide_line([vertical_x, vertical_x], [vertical_bottom, border_top_y])
+    _guide_line([vertical_x, vertical_x], [vertical_bottom, vertical_top])
 
     easting_x = vertical_x - span_x * 0.008
-    easting_y = (vertical_bottom + border_top_y) / 2.0
+    easting_y = (vertical_bottom + vertical_top) / 2.0
     northing_x = border_left_x + span_x * 0.02
     northing_y = lower_left_y + span_y * 0.004
     northing_label = f"{lower_left_y:.3f}m N."
@@ -4199,6 +4205,7 @@ def _render_plot_map_layout_cadastral(
         color=grid_color,
         grid_font=grid_font,
         grid_size=grid_size,
+        arrow_bottom_fig_y=arrow_anchor_y - arrow_downward_reach,
     )
 
     certification_date = datetime.now().strftime("%d / %m / %Y")
