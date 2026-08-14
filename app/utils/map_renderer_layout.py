@@ -3735,13 +3735,15 @@ def _draw_cadastral_reference_guide(
         left_line_end_x = lower_left_x - station_gap_x
 
     # Both horizontal segments sit on the lower-left beacon's elevation, not each beacon's own -
-    # the reference should read as one straight border line, not two strokes at different heights -
-    # each reaching the true printed border on its outer end. The left segment stops at the
-    # northing label's end (see above); the right/frontage segment has no label of its own, so it
-    # keeps stopping short of the beacon it approaches instead.
+    # the reference should read as one straight border line, not two strokes at different heights.
+    # The left segment stops at the northing label's end (see above). The right/frontage segment
+    # has no label of its own, so it mirrors the vertical line's treatment instead: a short tick
+    # from the border rather than a long run all the way to the beacon, capped at the beacon's own
+    # position (with the same gap) if that beacon happens to already sit within the short zone.
     _guide_line([border_left_x, left_line_end_x], [lower_left_y, lower_left_y])
     if lower_right_x < xmax:
-        _guide_line([lower_right_x + station_gap_x, border_right_x], [lower_left_y, lower_left_y])
+        right_line_start_x = max(border_right_x - span_x * 0.14, lower_right_x + station_gap_x)
+        _guide_line([right_line_start_x, border_right_x], [lower_left_y, lower_left_y])
 
     ax.text(
         easting_x,
@@ -4159,15 +4161,32 @@ def _render_plot_map_layout_cadastral(
         ax.transData.transform((guide_easting, top_northing))
     )
 
+    # The un_marker's text-baseline anchor is only part of its footprint: the pennant/loop extends
+    # further UP from it by ~1.70x its own "size", and the stem extends further DOWN by ~1.04x
+    # (see add_north_arrow's un_marker branch - unit = size*1.70/830, loop/pennant reach svg_top_y,
+    # stem reaches svg_bottom_y). The old fixed "+0.06 above the plotting area" was applied to the
+    # baseline without accounting for that downward stem reach, leaving well under 1% of the page
+    # between the stem's actual bottom and the plot's own top edge for this template's map-area
+    # size (map_bottom=0.27, map_height=0.455) - reading as the marker crowding straight into the
+    # parcel/road lines near the top. Derive the anchor from the marker's real size so the stem
+    # clears the plot with a real margin, while still keeping the pennant clear of the header above.
+    arrow_font_scale = max(font_scale * 1.62, font_scale + 0.30)
+    arrow_size = 0.032 * max(0.8, arrow_font_scale)
+    arrow_upward_reach = arrow_size * 1.70
+    arrow_downward_reach = arrow_size * 1.045
+    header_bottom_y = 0.915
+    plot_top_y = ax.get_position().y1
+    min_anchor_y = plot_top_y + 0.03 + arrow_downward_reach
+    max_anchor_y = header_bottom_y - 0.015 - arrow_upward_reach
+    arrow_anchor_y = min(min_anchor_y, max_anchor_y)
+
     add_north_arrow(
         ax,
-        font_scale=max(font_scale * 1.62, font_scale + 0.30),
+        font_scale=arrow_font_scale,
         style="un_marker",
         color=north_arrow_color,
         anchor_x=guide_fig_x,
-        # Capped below the "PLAN NO" header box (its bottom edge sits at figure-y ~0.915) so the
-        # arrow's own height doesn't reach up into/behind it.
-        anchor_y=min(0.86, ax.get_position().y1 + 0.06),
+        anchor_y=arrow_anchor_y,
         blue_hex=grid_color,
     )
 
