@@ -3540,17 +3540,20 @@ def _pick_cadastral_reference_points(
     poly: Polygon,
     span_x: float,
     span_y: float,
-) -> tuple[tuple[float, float], tuple[float, float]]:
+) -> tuple[tuple[float, float], tuple[float, float], tuple[float, float]]:
     """Pick the South-South cadastral reference corners.
 
-    These templates read best when the blue reference guides are taken from the parcel's visual
-    south-west and south-east corners, not merely from the single absolute-lowest vertex. That
-    keeps the U.N. guide close to the left edge and stops it from slicing through irregular plots.
+    These templates read best when the blue references are split into:
+    - a west/upper-west point for the U.N. vertical guide,
+    - a south-west point for the left horizontal guide,
+    - a south-east point for the right horizontal guide.
+    This keeps the guides aligned with the sample survey sheets instead of forming one long cross
+    through the plot body.
     """
     coords = list(poly.exterior.coords[:-1])
     if not coords:
         c = (poly.centroid.x, poly.centroid.y)
-        return c, c
+        return c, c, c
     min_x = min(pt[0] for pt in coords)
     min_y = min(pt[1] for pt in coords)
     span_x = max(float(span_x), 1.0)
@@ -3564,6 +3567,19 @@ def _pick_cadastral_reference_points(
 
     south_tol = max(1.0, span_y * 0.34)
     west_tol = max(1.0, span_x * 0.34)
+    west_band = [pt for pt in coords if pt[0] <= (min_x + west_tol)]
+    if not west_band:
+        west_band = coords
+
+    vertical_ref = min(
+        west_band,
+        key=lambda pt: (
+            _norm(pt)[0] * 0.72 - _norm(pt)[1] * 0.28,
+            _norm(pt)[0],
+            -_norm(pt)[1],
+        ),
+    )
+
     south_west_band = [
         pt for pt in coords
         if pt[0] <= (min_x + west_tol) or pt[1] <= (min_y + south_tol)
@@ -3602,11 +3618,12 @@ def _pick_cadastral_reference_points(
                     pt[0],
                 ),
             )
-    return lower_left, lower_right
+    return vertical_ref, lower_left, lower_right
 
 
 def _draw_cadastral_reference_guide(
     ax,
+    vertical_point: tuple[float, float],
     lower_left_point: tuple[float, float],
     lower_right_point: tuple[float, float],
     font_scale: float = 1.0,
@@ -3617,17 +3634,18 @@ def _draw_cadastral_reference_guide(
     """Draw the South-South single-reference blue guide.
 
     This matches the sample cadastral sheets used in Akwa Ibom, Cross River, and Rivers:
-    one vertical blue reference line aligned to the lower-left parcel point, one horizontal
-    line from the left frame to that same point, and one right-side horizontal from the lower-right
-    frontage point to the frame. The guides should read as short border references, not a full
-    plot-wide crosshair.
+    one vertical blue reference line aligned to the west-side plot point, one horizontal
+    line from the left frame to the lower-left plot point, and one right-side horizontal from the
+    lower-right frontage point to the frame. The guides should read as separate border references,
+    not as one connected crosshair.
     """
     xmin, xmax = ax.get_xlim()
     ymin, ymax = ax.get_ylim()
     span_x = max(abs(xmax - xmin), 1.0)
     span_y = max(abs(ymax - ymin), 1.0)
-    ref_x, ref_y = lower_left_point
-    right_x, right_y = lower_right_point
+    vertical_x, vertical_y = vertical_point
+    lower_left_x, lower_left_y = lower_left_point
+    lower_right_x, lower_right_y = lower_right_point
     family = grid_font or CADASTRAL_FONT_FAMILY
     fs = grid_size if grid_size else max(6, int(6.2 * font_scale))
     line_lw = max(0.9, 1.0 * font_scale)
@@ -3648,20 +3666,20 @@ def _draw_cadastral_reference_guide(
 
     # Border-origin guide segments only. They should terminate at the coordinate reference point
     # rather than running as one uninterrupted cross through the whole plotting frame.
-    _guide_line([ref_x, ref_x], [ref_y, ymax])
-    _guide_line([xmin, ref_x], [ref_y, ref_y])
-    if right_x > ref_x and right_x < xmax:
-        _guide_line([right_x, xmax], [right_y, right_y])
+    _guide_line([vertical_x, vertical_x], [vertical_y, ymax])
+    _guide_line([xmin, lower_left_x], [lower_left_y, lower_left_y])
+    if lower_right_x < xmax:
+        _guide_line([lower_right_x, xmax], [lower_right_y, lower_right_y])
 
-    easting_x = ref_x - span_x * 0.008
-    easting_y = ref_y + max(span_y * 0.22, (ymax - ref_y) * 0.42)
+    easting_x = vertical_x - span_x * 0.008
+    easting_y = vertical_y + max(span_y * 0.22, (ymax - vertical_y) * 0.42)
     northing_x = xmin + span_x * 0.02
-    northing_y = ref_y + span_y * 0.004
+    northing_y = lower_left_y + span_y * 0.004
 
     ax.text(
         easting_x,
         easting_y,
-        f"{ref_x:.3f}m E.",
+        f"{vertical_x:.3f}m E.",
         color=color,
         fontsize=fs,
         ha="right",
@@ -3675,7 +3693,7 @@ def _draw_cadastral_reference_guide(
     ax.text(
         northing_x,
         northing_y,
-        f"{ref_y:.3f}m N.",
+        f"{lower_left_y:.3f}m N.",
         color=color,
         fontsize=fs,
         ha="left",
@@ -4061,13 +4079,13 @@ def _render_plot_map_layout_cadastral(
 
     span_x = max(abs(target_xlim[1] - target_xlim[0]), 1.0)
     span_y = max(abs(target_ylim[1] - target_ylim[0]), 1.0)
-    lower_left_ref, lower_right_ref = _pick_cadastral_reference_points(poly, span_x, span_y)
+    vertical_ref, lower_left_ref, lower_right_ref = _pick_cadastral_reference_points(poly, span_x, span_y)
 
     # The Akwa Ibom / Rivers / Cross River cadastral sheets use a dedicated reference guide that
     # sits slightly inside the left sheet edge, not on the parcel itself. Older saved drafts may
     # still carry another arrow style, so force the proper U.N. marker whenever this cadastral
     # renderer is active.
-    guide_easting = lower_left_ref[0]
+    guide_easting = vertical_ref[0]
     top_northing = target_ylim[1] - span_y * 0.035
 
     guide_fig_x, _ = fig.transFigure.inverted().transform(
@@ -4088,6 +4106,7 @@ def _render_plot_map_layout_cadastral(
 
     _draw_cadastral_reference_guide(
         ax,
+        vertical_point=vertical_ref,
         lower_left_point=lower_left_ref,
         lower_right_point=lower_right_ref,
         font_scale=font_scale,
