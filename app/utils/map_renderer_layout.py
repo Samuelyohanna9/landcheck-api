@@ -3608,6 +3608,7 @@ def _pick_cadastral_reference_points(
 
 
 def _draw_cadastral_reference_guide(
+    fig,
     ax,
     lower_left_point: tuple[float, float],
     lower_right_point: tuple[float, float],
@@ -3625,7 +3626,29 @@ def _draw_cadastral_reference_guide(
     elevation running the full width of the frame - the left segment (frame to that beacon) and
     the right/frontage segment (the lower-right beacon to the frame) share that same y so they
     read as one continuous line rather than two segments at different heights.
+
+    The lines reach all the way to the printed black border rectangle, not just the edge of the
+    plotting area - that rectangle is drawn separately in figure coordinates (see
+    `_draw_cadastral_header`'s `Rectangle((0.03, 0.03), 0.94, 0.94, transform=fig.transFigure)`),
+    inset further from the page than the axes' own data limits, so reaching it means converting
+    those figure-space margins into this axes' current data coordinates rather than using
+    `ax.get_xlim()`/`get_ylim()` directly - those only reach the plotting area's edge, which sits
+    visibly short of the actual border line.
     """
+    frame_margin, frame_far_edge = 0.03, 0.97
+
+    def _fig_x_to_data(fig_x: float) -> float:
+        display_pt = fig.transFigure.transform((fig_x, 0.5))
+        return float(ax.transData.inverted().transform(display_pt)[0])
+
+    def _fig_y_to_data(fig_y: float) -> float:
+        display_pt = fig.transFigure.transform((0.5, fig_y))
+        return float(ax.transData.inverted().transform(display_pt)[1])
+
+    border_left_x = _fig_x_to_data(frame_margin)
+    border_right_x = _fig_x_to_data(frame_far_edge)
+    border_top_y = _fig_y_to_data(frame_far_edge)
+
     xmin, xmax = ax.get_xlim()
     ymin, ymax = ax.get_ylim()
     span_x = max(abs(xmax - xmin), 1.0)
@@ -3660,22 +3683,23 @@ def _draw_cadastral_reference_guide(
     # Short top-border tick rather than a full-height line - capped at the beacon's own height so
     # it still just meets the point on a short/wide parcel instead of overshooting past it. If the
     # beacon happens to sit inside that short top zone, back off by the same gap instead of
-    # touching it.
+    # touching it. The far end reaches the true printed border, not just the axes' own top limit.
     vertical_bottom = max(vertical_y, ymax - span_y * 0.14)
     if vertical_bottom <= vertical_y:
         vertical_bottom = vertical_y + station_gap_y
-    _guide_line([vertical_x, vertical_x], [vertical_bottom, ymax])
+    _guide_line([vertical_x, vertical_x], [vertical_bottom, border_top_y])
 
     # Both horizontal segments sit on the lower-left beacon's elevation, not each beacon's own -
     # the reference should read as one straight border line, not two strokes at different heights -
-    # and each stops short of the beacon it approaches rather than touching its marker.
-    _guide_line([xmin, lower_left_x - station_gap_x], [lower_left_y, lower_left_y])
+    # each reaching the true printed border on its outer end and stopping short of the beacon it
+    # approaches on its inner end, rather than touching its marker.
+    _guide_line([border_left_x, lower_left_x - station_gap_x], [lower_left_y, lower_left_y])
     if lower_right_x < xmax:
-        _guide_line([lower_right_x + station_gap_x, xmax], [lower_left_y, lower_left_y])
+        _guide_line([lower_right_x + station_gap_x, border_right_x], [lower_left_y, lower_left_y])
 
     easting_x = vertical_x - span_x * 0.008
-    easting_y = (vertical_bottom + ymax) / 2.0
-    northing_x = xmin + span_x * 0.02
+    easting_y = (vertical_bottom + border_top_y) / 2.0
+    northing_x = border_left_x + span_x * 0.02
     northing_y = lower_left_y + span_y * 0.004
 
     ax.text(
@@ -4107,6 +4131,7 @@ def _render_plot_map_layout_cadastral(
     )
 
     _draw_cadastral_reference_guide(
+        fig,
         ax,
         lower_left_point=lower_left_ref,
         lower_right_point=lower_right_ref,

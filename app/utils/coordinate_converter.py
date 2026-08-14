@@ -1,8 +1,10 @@
 # app/utils/coordinate_converter.py
 # Coordinate conversion utility for Nigerian survey systems
 
-from pyproj import Transformer, CRS
+import math
 from typing import List, Tuple
+
+from pyproj import Transformer, CRS
 
 # Define common coordinate systems used in Nigeria
 COORDINATE_SYSTEMS = {
@@ -10,6 +12,11 @@ COORDINATE_SYSTEMS = {
         "name": "WGS84 (Lat/Lon)",
         "epsg": 4326,
         "description": "Global GPS coordinates (Latitude, Longitude)"
+    },
+    "wgs84_nigeria_meters": {
+        "name": "WGS84 Nigeria Metres",
+        "epsg": 32632,
+        "description": "Auto-select WGS84 / UTM zone 31N, 32N, or 33N for Nigeria"
     },
     "utm_31n": {
         "name": "UTM Zone 31N",
@@ -43,13 +50,74 @@ COORDINATE_SYSTEMS = {
     }
 }
 
+WGS84_NIGERIA_METERS = "wgs84_nigeria_meters"
+NIGERIA_UTM_ZONES = ("utm_31n", "utm_32n", "utm_33n")
+
+
+def is_nigeria_auto_utm_coordinate_system(system: str) -> bool:
+    return str(system or "").strip().lower() == WGS84_NIGERIA_METERS
+
+
+def _looks_like_projected_coordinates(x: float, y: float) -> bool:
+    return abs(float(x)) > 180 or abs(float(y)) > 90
+
+
+def resolve_nigeria_wgs84_meters_zone(lng: float) -> str:
+    if not math.isfinite(float(lng)):
+        return "utm_32n"
+    if lng < 6:
+        return "utm_31n"
+    if lng < 12:
+        return "utm_32n"
+    return "utm_33n"
+
+
+def infer_nigeria_wgs84_meters_zone_from_projected(x: float, y: float) -> str:
+    if not math.isfinite(float(x)) or not math.isfinite(float(y)):
+        return "utm_32n"
+
+    candidates: list[tuple[str, float, float]] = []
+    for zone in NIGERIA_UTM_ZONES:
+        epsg = int(COORDINATE_SYSTEMS[zone]["epsg"])
+        try:
+            transformer = Transformer.from_crs(f"EPSG:{epsg}", "EPSG:4326", always_xy=True)
+            lng, lat = transformer.transform(float(x), float(y))
+        except Exception:
+            continue
+        if validate_nigeria_bounds(float(lng), float(lat)):
+            candidates.append((zone, float(lng), float(lat)))
+
+    if len(candidates) == 1:
+        return candidates[0][0]
+
+    if len(candidates) > 1:
+        for zone, lng, _lat in candidates:
+            if resolve_nigeria_wgs84_meters_zone(lng) == zone:
+                return zone
+        return candidates[0][0]
+
+    return "utm_32n"
+
+
+def resolve_coordinate_system_key(system: str, x: float | None = None, y: float | None = None) -> str:
+    clean = str(system or "wgs84").strip().lower()
+    if clean == WGS84_NIGERIA_METERS:
+        if x is not None and y is not None and math.isfinite(float(x)) and math.isfinite(float(y)) and _looks_like_projected_coordinates(float(x), float(y)):
+            return infer_nigeria_wgs84_meters_zone_from_projected(float(x), float(y))
+        if x is not None and math.isfinite(float(x)):
+            return resolve_nigeria_wgs84_meters_zone(float(x))
+        return "utm_32n"
+    return clean
+
 
 def get_transformer(source_crs: str, target_crs: str = "wgs84") -> Transformer:
     """
     Get a pyproj Transformer for converting between coordinate systems.
     """
-    source_epsg = COORDINATE_SYSTEMS.get(source_crs, {}).get("epsg", 4326)
-    target_epsg = COORDINATE_SYSTEMS.get(target_crs, {}).get("epsg", 4326)
+    resolved_source_crs = resolve_coordinate_system_key(source_crs)
+    resolved_target_crs = resolve_coordinate_system_key(target_crs)
+    source_epsg = COORDINATE_SYSTEMS.get(resolved_source_crs, {}).get("epsg", 4326)
+    target_epsg = COORDINATE_SYSTEMS.get(resolved_target_crs, {}).get("epsg", 4326)
 
     return Transformer.from_crs(
         f"EPSG:{source_epsg}",
@@ -74,10 +142,22 @@ def convert_coordinates(
     Returns:
         List of converted [lon, lat] coordinates in target CRS
     """
-    if source_crs == target_crs:
+    if not coords:
         return coords
 
-    transformer = get_transformer(source_crs, target_crs)
+    sample_x = float(coords[0][0])
+    sample_y = float(coords[0][1])
+    resolved_source_crs = resolve_coordinate_system_key(source_crs, sample_x, sample_y)
+    resolved_target_crs = (
+        resolve_coordinate_system_key(target_crs, sample_x, sample_y)
+        if resolved_source_crs == "wgs84"
+        else resolve_coordinate_system_key(target_crs)
+    )
+
+    if resolved_source_crs == resolved_target_crs:
+        return coords
+
+    transformer = get_transformer(resolved_source_crs, resolved_target_crs)
 
     converted = []
     for coord in coords:
@@ -106,10 +186,17 @@ def convert_single_coordinate(
     Returns:
         Tuple of (x, y) in target CRS
     """
-    if source_crs == target_crs:
+    resolved_source_crs = resolve_coordinate_system_key(source_crs, x, y)
+    resolved_target_crs = (
+        resolve_coordinate_system_key(target_crs, x, y)
+        if resolved_source_crs == "wgs84"
+        else resolve_coordinate_system_key(target_crs)
+    )
+
+    if resolved_source_crs == resolved_target_crs:
         return (x, y)
 
-    transformer = get_transformer(source_crs, target_crs)
+    transformer = get_transformer(resolved_source_crs, resolved_target_crs)
     return transformer.transform(x, y)
 
 

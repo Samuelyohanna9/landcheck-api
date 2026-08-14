@@ -86,6 +86,7 @@ class PlotGeometryUpdateRequest(BaseModel):
 # Coordinate system EPSG codes mapping
 COORDINATE_SYSTEMS = {
     "wgs84": 4326,
+    "wgs84_nigeria_meters": 32632,
     "utm_31n": 32631,
     "utm_32n": 32632,
     "utm_33n": 32633,
@@ -96,6 +97,7 @@ COORDINATE_SYSTEMS = {
 
 COORDINATE_SYSTEM_NAMES = {
     "wgs84": "WGS84 (Lat/Lon)",
+    "wgs84_nigeria_meters": "WGS84 Nigeria Metres",
     "utm_31n": "UTM Zone 31N",
     "utm_32n": "UTM Zone 32N",
     "utm_33n": "UTM Zone 33N",

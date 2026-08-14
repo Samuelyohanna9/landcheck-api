@@ -22,6 +22,7 @@ from sqlalchemy.orm import Session
 
 from app.db import SessionLocal
 from app.routers.plots import COORDINATE_SYSTEMS, get_db
+from app.utils.coordinate_converter import is_nigeria_auto_utm_coordinate_system, resolve_coordinate_system_key
 from app.utils.r2_objects import build_r2_settings, create_r2_client, delete_object_best_effort, upload_bytes
 
 
@@ -128,8 +129,22 @@ def _alpha_station(index: int) -> str:
     return base
 
 
-def _coordinate_system_to_epsg(key: str) -> int:
+def _resolve_target_coordinate_system(key: str, gcps: list[GroundControlPointInput] | None = None) -> str:
     clean = str(key or "wgs84").strip().lower()
+    if not is_nigeria_auto_utm_coordinate_system(clean):
+        return clean
+    for gcp in gcps or []:
+        try:
+            raw_x = float(gcp.ground_x)
+            raw_y = float(gcp.ground_y)
+        except (TypeError, ValueError):
+            continue
+        return resolve_coordinate_system_key(clean, raw_x, raw_y)
+    return resolve_coordinate_system_key(clean)
+
+
+def _coordinate_system_to_epsg(key: str, gcps: list[GroundControlPointInput] | None = None) -> int:
+    clean = _resolve_target_coordinate_system(key, gcps)
     epsg = COORDINATE_SYSTEMS.get(clean)
     if epsg is None:
         raise HTTPException(status_code=400, detail="Unsupported target coordinate system.")
@@ -453,7 +468,8 @@ def _solve_affine(width: int, height: int, coordinate_system_key: str, gcps: lis
     if len(gcps) > MAX_GCP_COUNT:
         raise HTTPException(status_code=400, detail=f"Use at most {MAX_GCP_COUNT} control points per raster.")
 
-    target_epsg = _coordinate_system_to_epsg(coordinate_system_key)
+    resolved_coordinate_system = _resolve_target_coordinate_system(coordinate_system_key, gcps)
+    target_epsg = _coordinate_system_to_epsg(resolved_coordinate_system)
     forward_transformer, reverse_transformer = _make_transformers(target_epsg)
     mercator_forward = Transformer.from_crs(4326, 3857, always_xy=True)
     mercator_reverse = Transformer.from_crs(3857, 4326, always_xy=True)
@@ -544,6 +560,7 @@ def _solve_affine(width: int, height: int, coordinate_system_key: str, gcps: lis
     return {
         "transform_type": transform_kind,
         "target_coordinate_system": coordinate_system_key,
+        "resolved_coordinate_system": resolved_coordinate_system,
         "target_epsg": target_epsg,
         "coefficients": {
             "x": [round(float(value), 10) for value in target_model["coeff_x"].tolist()],
@@ -1361,12 +1378,18 @@ def _format_coordinate_number(value: float, decimals: int) -> str:
 def export_georeference_staking_csv(session_id: str, db: Session = Depends(get_db)):
     row = _load_session_row(db, session_id)
     target_coordinate_system = str(row.get("target_coordinate_system") or "wgs84")
+    transform_json = _safe_json_load(row.get("transform_json"), {}) or {}
+    resolved_coordinate_system = str(
+        transform_json.get("resolved_coordinate_system")
+        or transform_json.get("target_coordinate_system")
+        or target_coordinate_system
+    )
     features = _safe_json_load(row.get("features_json"), [])
     gcps_raw = _safe_json_load(row.get("gcps_json"), [])
 
-    gcp_rows = _build_gcp_rows(gcps_raw, target_coordinate_system)
+    gcp_rows = _build_gcp_rows(gcps_raw, resolved_coordinate_system)
     try:
-        staking_rows = _build_staking_rows(features, target_coordinate_system)
+        staking_rows = _build_staking_rows(features, resolved_coordinate_system)
     except HTTPException:
         # No digitized features yet isn't fatal here - the GCPs entered during georeferencing are
         # still worth exporting on their own; only error out if there's genuinely nothing at all.
