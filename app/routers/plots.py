@@ -38,6 +38,7 @@ from app.db import SessionLocal
 from app.models.plot import Plot
 from app.models.plot_buffer import PlotBuffer
 from app.utils.pdf import generate_plot_report_pdf
+from app.utils.survey_auth_security import require_survey_session, resolve_survey_session
 from app.utils.map_renderer_layout import (
     render_plot_map_layout,
     get_paper_config,
@@ -139,6 +140,7 @@ def ensure_plots_schema_once(db: Session):
         ensure_plot_export_jobs_table(db)
         ensure_plot_query_indexes(db)
         ensure_plot_idempotency_columns(db)
+        ensure_plot_ownership_column(db)
         _PLOTS_SCHEMA_READY = True
 
 
@@ -344,6 +346,17 @@ def ensure_plot_idempotency_columns(db: Session):
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_plot_feature_overrides_client_request_id "
             "ON plot_feature_overrides (client_request_id) WHERE client_request_id IS NOT NULL"
         ))
+        db.commit()
+    except Exception:
+        db.rollback()
+
+
+def ensure_plot_ownership_column(db: Session):
+    # Nullable so anonymous plot creation (the "value first" gate-free flow) is unaffected -
+    # only plots created by (or later claimed by) a signed-in Survey user get this set.
+    try:
+        db.execute(text("ALTER TABLE plots ADD COLUMN IF NOT EXISTS owner_user_id BIGINT"))
+        db.execute(text("CREATE INDEX IF NOT EXISTS idx_plots_owner_user_id ON plots (owner_user_id)"))
         db.commit()
     except Exception:
         db.rollback()
@@ -4675,7 +4688,7 @@ def export_subdivision_batch_clean_copy_pdf(
 # ---------------- CREATE PLOT ----------------
 
 @router.post("")
-def create_plot(payload: Union[PlotCreateRequest, List[List[float]]], db: Session = Depends(get_db)):
+def create_plot(payload: Union[PlotCreateRequest, List[List[float]]], request: Request, db: Session = Depends(get_db)):
 
     coords = payload.coordinates if isinstance(payload, PlotCreateRequest) else payload
     meta = payload.meta if isinstance(payload, PlotCreateRequest) else None
@@ -4704,7 +4717,16 @@ def create_plot(payload: Union[PlotCreateRequest, List[List[float]]], db: Sessio
     polygon = Polygon(coords)
     geom = from_shape(polygon, srid=4326)
 
-    plot = Plot(geom=geom, client_request_id=client_request_id or None)
+    # Anonymous creation stays fully supported (the "value first" gate-free flow) - this only
+    # stamps ownership when the request happens to already carry a signed-in Survey session.
+    owner_user_id = None
+    try:
+        survey_session = resolve_survey_session(db, request)
+        owner_user_id = survey_session.user_id if survey_session else None
+    except Exception:
+        owner_user_id = None
+
+    plot = Plot(geom=geom, client_request_id=client_request_id or None, owner_user_id=owner_user_id)
     db.add(plot)
     db.commit()
     db.refresh(plot)
@@ -4826,6 +4848,60 @@ def create_plot(payload: Union[PlotCreateRequest, List[List[float]]], db: Sessio
     db.commit()
 
     return {"plot_id": plot.id}
+
+
+# ---------------- OWNERSHIP (Survey auth) ----------------
+
+@router.post("/claim")
+def claim_plots(request: Request, plot_ids: List[int] = Body(..., embed=True), db: Session = Depends(get_db)):
+    session = require_survey_session(db, request)
+    if not plot_ids:
+        return {"claimed": []}
+    # Only ever claims currently-unowned plots - never reassigns a plot someone else already owns.
+    rows = db.execute(
+        text(
+            """
+            UPDATE plots
+            SET owner_user_id = :user_id
+            WHERE id = ANY(:plot_ids) AND owner_user_id IS NULL
+            RETURNING id
+            """
+        ),
+        {"user_id": session.user_id, "plot_ids": plot_ids},
+    ).mappings().all()
+    db.commit()
+    return {"claimed": [int(row["id"]) for row in rows]}
+
+
+@router.get("/mine")
+def list_my_plots(request: Request, db: Session = Depends(get_db)):
+    session = require_survey_session(db, request)
+    ensure_plot_meta_table(db)
+    rows = db.execute(
+        text(
+            """
+            SELECT p.id, p.created_at, m.title_text, m.location_text, m.scale_text
+            FROM plots p
+            LEFT JOIN plot_meta m ON m.plot_id = p.id
+            WHERE p.owner_user_id = :user_id
+            ORDER BY p.created_at DESC
+            """
+        ),
+        {"user_id": session.user_id},
+    ).mappings().all()
+    return {
+        "plots": [
+            {
+                "plot_id": int(row["id"]),
+                "created_at": row["created_at"].isoformat() if row["created_at"] else None,
+                "title": row["title_text"],
+                "location": row["location_text"],
+                "scale": row["scale_text"],
+                "status": "completed" if (row["title_text"] or "").strip() else "draft",
+            }
+            for row in rows
+        ]
+    }
 
 
 # ---------------- FEATURES SUMMARY ----------------

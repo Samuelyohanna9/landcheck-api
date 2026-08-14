@@ -25,6 +25,7 @@ from app.routers import (
     green_remote_monitoring,
     green_payouts,
     survey_georeference,
+    survey_auth,
 )
 from app.db_init import init_db
 from app.utils.activity_logger import ensure_activity_log_table, log_request_activity, should_skip_request_logging
@@ -294,6 +295,7 @@ app.include_router(green_sponsor.router)
 app.include_router(green_reports.router)
 app.include_router(green_remote_monitoring.router)
 app.include_router(green_payouts.router)
+app.include_router(survey_auth.router)
 app.include_router(survey_georeference.router)
 
 @app.get("/")

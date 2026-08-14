@@ -11,3 +11,4 @@ class Plot(Base):
     geom = Column(Geometry("POLYGON", srid=4326))
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     client_request_id = Column(Text, nullable=True)
+    owner_user_id = Column(Integer, nullable=True)

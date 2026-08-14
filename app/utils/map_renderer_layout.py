@@ -3578,16 +3578,15 @@ def _draw_cadastral_reference_guide(
     """Draw the South-South single-reference blue guide.
 
     This matches the sample cadastral sheets used in Akwa Ibom, Cross River, and Rivers:
-    one vertical blue reference line aligned to the lower-left parcel point, a horizontal
-    line from the left frame to that same point, and a short matching horizontal line from
-    the bottom frontage edge out to the right frame.
+    one vertical blue reference line aligned to the lower-left parcel point, one horizontal
+    line from the left frame to that same point, plus matching border-origin guide segments
+    from the bottom and right edges into that same plotted coordinate.
     """
     xmin, xmax = ax.get_xlim()
     ymin, ymax = ax.get_ylim()
     span_x = max(abs(xmax - xmin), 1.0)
     span_y = max(abs(ymax - ymin), 1.0)
     ref_x, ref_y = lower_left_point
-    right_x = max(lower_right_point[0], ref_x)
     family = grid_font or CADASTRAL_FONT_FAMILY
     fs = grid_size if grid_size else max(6, int(6.2 * font_scale))
     line_lw = max(0.9, 1.0 * font_scale)
@@ -3606,13 +3605,15 @@ def _draw_cadastral_reference_guide(
             )
         )
 
-    _guide_line([ref_x, ref_x], [ymin, ymax])
+    # Border-origin guide segments only. They should terminate at the coordinate reference point
+    # rather than running as one uninterrupted cross through the whole plotting frame.
+    _guide_line([ref_x, ref_x], [ref_y, ymax])
+    _guide_line([ref_x, ref_x], [ymin, ref_y])
     _guide_line([xmin, ref_x], [ref_y, ref_y])
-    if right_x < xmax:
-        _guide_line([right_x, xmax], [ref_y, ref_y])
+    _guide_line([ref_x, xmax], [ref_y, ref_y])
 
     easting_x = ref_x - span_x * 0.008
-    easting_y = ymax - span_y * 0.18
+    easting_y = ref_y + max(span_y * 0.22, (ymax - ref_y) * 0.42)
     northing_x = xmin + span_x * 0.02
     northing_y = ref_y + span_y * 0.004
 
