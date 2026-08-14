@@ -3540,20 +3540,19 @@ def _pick_cadastral_reference_points(
     poly: Polygon,
     span_x: float,
     span_y: float,
-) -> tuple[tuple[float, float], tuple[float, float], tuple[float, float]]:
+) -> tuple[tuple[float, float], tuple[float, float]]:
     """Pick the South-South cadastral reference corners.
 
-    These templates read best when the blue references are split into:
-    - a west/upper-west point for the U.N. vertical guide,
-    - a south-west point for the left horizontal guide,
-    - a south-east point for the right horizontal guide.
-    This keeps the guides aligned with the sample survey sheets instead of forming one long cross
-    through the plot body.
+    These templates read best when the main blue reference originates from the lower-left parcel
+    corner: one vertical guide up to the U.N. arrow, one horizontal guide from the left frame to
+    that same corner, and a separate right-side horizontal guide from the lower-right frontage
+    corner. That matches the sample sheets more closely than a full crosshair or an upper-left
+    anchor.
     """
     coords = list(poly.exterior.coords[:-1])
     if not coords:
         c = (poly.centroid.x, poly.centroid.y)
-        return c, c, c
+        return c, c
     min_x = min(pt[0] for pt in coords)
     min_y = min(pt[1] for pt in coords)
     span_x = max(float(span_x), 1.0)
@@ -3567,19 +3566,6 @@ def _pick_cadastral_reference_points(
 
     south_tol = max(1.0, span_y * 0.34)
     west_tol = max(1.0, span_x * 0.34)
-    west_band = [pt for pt in coords if pt[0] <= (min_x + west_tol)]
-    if not west_band:
-        west_band = coords
-
-    vertical_ref = min(
-        west_band,
-        key=lambda pt: (
-            _norm(pt)[0] * 0.72 - _norm(pt)[1] * 0.28,
-            _norm(pt)[0],
-            -_norm(pt)[1],
-        ),
-    )
-
     south_west_band = [
         pt for pt in coords
         if pt[0] <= (min_x + west_tol) or pt[1] <= (min_y + south_tol)
@@ -3618,12 +3604,11 @@ def _pick_cadastral_reference_points(
                     pt[0],
                 ),
             )
-    return vertical_ref, lower_left, lower_right
+    return lower_left, lower_right
 
 
 def _draw_cadastral_reference_guide(
     ax,
-    vertical_point: tuple[float, float],
     lower_left_point: tuple[float, float],
     lower_right_point: tuple[float, float],
     font_scale: float = 1.0,
@@ -3634,18 +3619,18 @@ def _draw_cadastral_reference_guide(
     """Draw the South-South single-reference blue guide.
 
     This matches the sample cadastral sheets used in Akwa Ibom, Cross River, and Rivers:
-    one vertical blue reference line aligned to the west-side plot point, one horizontal
-    line from the left frame to the lower-left plot point, and one right-side horizontal from the
-    lower-right frontage point to the frame. The guides should read as separate border references,
-    not as one connected crosshair.
+    one vertical blue reference line rising from the lower-left plot point, one horizontal line
+    from the left frame to that same point, and one right-side horizontal from the lower-right
+    frontage point to the frame. The guides should read as separate border references, not as one
+    connected crosshair.
     """
     xmin, xmax = ax.get_xlim()
     ymin, ymax = ax.get_ylim()
     span_x = max(abs(xmax - xmin), 1.0)
     span_y = max(abs(ymax - ymin), 1.0)
-    vertical_x, vertical_y = vertical_point
     lower_left_x, lower_left_y = lower_left_point
     lower_right_x, lower_right_y = lower_right_point
+    vertical_x, vertical_y = lower_left_point
     family = grid_font or CADASTRAL_FONT_FAMILY
     fs = grid_size if grid_size else max(6, int(6.2 * font_scale))
     line_lw = max(0.9, 1.0 * font_scale)
@@ -4079,13 +4064,13 @@ def _render_plot_map_layout_cadastral(
 
     span_x = max(abs(target_xlim[1] - target_xlim[0]), 1.0)
     span_y = max(abs(target_ylim[1] - target_ylim[0]), 1.0)
-    vertical_ref, lower_left_ref, lower_right_ref = _pick_cadastral_reference_points(poly, span_x, span_y)
+    lower_left_ref, lower_right_ref = _pick_cadastral_reference_points(poly, span_x, span_y)
 
     # The Akwa Ibom / Rivers / Cross River cadastral sheets use a dedicated reference guide that
     # sits slightly inside the left sheet edge, not on the parcel itself. Older saved drafts may
     # still carry another arrow style, so force the proper U.N. marker whenever this cadastral
     # renderer is active.
-    guide_easting = vertical_ref[0]
+    guide_easting = lower_left_ref[0]
     top_northing = target_ylim[1] - span_y * 0.035
 
     guide_fig_x, _ = fig.transFigure.inverted().transform(
@@ -4106,7 +4091,6 @@ def _render_plot_map_layout_cadastral(
 
     _draw_cadastral_reference_guide(
         ax,
-        vertical_point=vertical_ref,
         lower_left_point=lower_left_ref,
         lower_right_point=lower_right_ref,
         font_scale=font_scale,

@@ -11,6 +11,7 @@ from sqlalchemy.orm import Session
 
 from app.routers.plots import get_db
 from app.utils.survey_auth_security import (
+    consume_magic_link_otp,
     consume_magic_link_token,
     create_magic_link_token,
     find_or_create_survey_user,
@@ -42,10 +43,10 @@ def _frontend_base_url() -> str:
 @router.post("/magic-link/request")
 def request_magic_link(email: str = Body(..., embed=True), db: Session = Depends(get_db)):
     user_id = find_or_create_survey_user(db, email=email)
-    raw_token = create_magic_link_token(db, user_id=user_id)
+    raw_token, otp_code = create_magic_link_token(db, user_id=user_id)
     link_url = f"{_frontend_base_url()}/survey/auth/verify?token={raw_token}"
     try:
-        send_magic_link_email(to_email=str(email).strip().lower(), link_url=link_url)
+        send_magic_link_email(to_email=str(email).strip().lower(), link_url=link_url, otp_code=otp_code)
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"Could not send sign-in email: {exc}") from exc
     return {"status": "ok"}
@@ -54,6 +55,17 @@ def request_magic_link(email: str = Body(..., embed=True), db: Session = Depends
 @router.post("/magic-link/verify")
 def verify_magic_link(request: Request, token: str = Body(..., embed=True), db: Session = Depends(get_db)):
     user_id = consume_magic_link_token(db, raw_token=token)
+    return issue_survey_session(db, user_id=user_id, request=request)
+
+
+@router.post("/otp/verify")
+def verify_magic_link_otp(
+    request: Request,
+    email: str = Body(..., embed=True),
+    code: str = Body(..., embed=True),
+    db: Session = Depends(get_db),
+):
+    user_id = consume_magic_link_otp(db, email=email, code=code)
     return issue_survey_session(db, user_id=user_id, request=request)
 
 

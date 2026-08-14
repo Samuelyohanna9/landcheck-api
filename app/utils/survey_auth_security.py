@@ -24,6 +24,7 @@ _SURVEY_AUTH_SCHEMA_LOCK = Lock()
 
 SESSION_TTL_HOURS = 24 * 30  # long-lived: this is a low-friction consumer product, not an admin console
 MAGIC_LINK_TTL_MINUTES = 15
+MAX_OTP_ATTEMPTS = 5  # 6-digit code is guessable given enough tries, so the row locks after this many wrong guesses
 
 
 def _utcnow() -> datetime:
@@ -104,11 +105,22 @@ def ensure_survey_auth_schema() -> None:
                         id BIGSERIAL PRIMARY KEY,
                         user_id BIGINT NOT NULL REFERENCES survey_users(id),
                         token_hash TEXT NOT NULL UNIQUE,
+                        otp_code_hash TEXT,
+                        otp_attempts INTEGER NOT NULL DEFAULT 0,
                         created_at TIMESTAMP NOT NULL DEFAULT NOW(),
                         expires_at TIMESTAMP NOT NULL,
                         used_at TIMESTAMP
                     )
                     """
+                )
+            )
+            connection.execute(
+                text("ALTER TABLE survey_magic_link_tokens ADD COLUMN IF NOT EXISTS otp_code_hash TEXT")
+            )
+            connection.execute(
+                text(
+                    "ALTER TABLE survey_magic_link_tokens "
+                    "ADD COLUMN IF NOT EXISTS otp_attempts INTEGER NOT NULL DEFAULT 0"
                 )
             )
             connection.execute(
@@ -178,7 +190,10 @@ def find_or_create_survey_user_by_google(db: Session, *, google_sub: str, email:
     return int(row["id"])
 
 
-def create_magic_link_token(db: Session, *, user_id: int) -> str:
+def create_magic_link_token(db: Session, *, user_id: int) -> tuple[str, str]:
+    """Issues both a long opaque token (for the emailed link) and a short numeric code (for the
+    "or type this code" OTP path) against the same row - either one signs the user in, and using
+    either one invalidates the other."""
     ensure_survey_auth_schema()
     # Invalidate any prior unused tokens for this user so only the most recently requested link
     # works - avoids a stale earlier email silently remaining valid.
@@ -193,18 +208,24 @@ def create_magic_link_token(db: Session, *, user_id: int) -> str:
         {"user_id": user_id},
     )
     raw_token = secrets.token_urlsafe(32)
+    otp_code = f"{secrets.randbelow(1_000_000):06d}"
     expires_at = _utcnow() + timedelta(minutes=MAGIC_LINK_TTL_MINUTES)
     db.execute(
         text(
             """
-            INSERT INTO survey_magic_link_tokens (user_id, token_hash, expires_at)
-            VALUES (:user_id, :token_hash, :expires_at)
+            INSERT INTO survey_magic_link_tokens (user_id, token_hash, otp_code_hash, expires_at)
+            VALUES (:user_id, :token_hash, :otp_code_hash, :expires_at)
             """
         ),
-        {"user_id": user_id, "token_hash": _hash_token(raw_token), "expires_at": expires_at},
+        {
+            "user_id": user_id,
+            "token_hash": _hash_token(raw_token),
+            "otp_code_hash": _hash_token(otp_code),
+            "expires_at": expires_at,
+        },
     )
     db.commit()
-    return raw_token
+    return raw_token, otp_code
 
 
 def consume_magic_link_token(db: Session, *, raw_token: str) -> int:
@@ -231,6 +252,60 @@ def consume_magic_link_token(db: Session, *, raw_token: str) -> int:
     )
     db.commit()
     return int(row["user_id"])
+
+
+def consume_magic_link_otp(db: Session, *, email: str, code: str) -> int:
+    ensure_survey_auth_schema()
+    clean_email = str(email or "").strip().lower()
+    clean_code = str(code or "").strip()
+    invalid = HTTPException(status_code=400, detail="That code is invalid or has expired")
+    if not clean_email or not clean_code:
+        raise invalid
+
+    user_row = db.execute(
+        text("SELECT id FROM survey_users WHERE email = :email LIMIT 1"),
+        {"email": clean_email},
+    ).mappings().first()
+    if not user_row:
+        raise invalid
+    user_id = int(user_row["id"])
+
+    row = db.execute(
+        text(
+            """
+            SELECT id, otp_code_hash, otp_attempts, expires_at, used_at
+            FROM survey_magic_link_tokens
+            WHERE user_id = :user_id AND used_at IS NULL
+            ORDER BY created_at DESC
+            LIMIT 1
+            """
+        ),
+        {"user_id": user_id},
+    ).mappings().first()
+    if not row or not row["otp_code_hash"] or row["expires_at"] <= _utcnow():
+        raise invalid
+    if int(row["otp_attempts"] or 0) >= MAX_OTP_ATTEMPTS:
+        db.execute(
+            text("UPDATE survey_magic_link_tokens SET used_at = NOW() WHERE id = :id"),
+            {"id": int(row["id"])},
+        )
+        db.commit()
+        raise HTTPException(status_code=400, detail="Too many incorrect attempts. Request a new code.")
+
+    if not secrets.compare_digest(str(row["otp_code_hash"]), _hash_token(clean_code)):
+        db.execute(
+            text("UPDATE survey_magic_link_tokens SET otp_attempts = otp_attempts + 1 WHERE id = :id"),
+            {"id": int(row["id"])},
+        )
+        db.commit()
+        raise invalid
+
+    db.execute(
+        text("UPDATE survey_magic_link_tokens SET used_at = NOW() WHERE id = :id"),
+        {"id": int(row["id"])},
+    )
+    db.commit()
+    return user_id
 
 
 def issue_survey_session(db: Session, *, user_id: int, request: Request | None = None) -> dict[str, Any]:
