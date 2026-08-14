@@ -4904,6 +4904,33 @@ def list_my_plots(request: Request, db: Session = Depends(get_db)):
     }
 
 
+@router.post("/bulk-delete")
+def bulk_delete_plots(request: Request, plot_ids: List[int] = Body(..., embed=True), db: Session = Depends(get_db)):
+    session = require_survey_session(db, request)
+    if not plot_ids:
+        return {"deleted": []}
+
+    # Only ever deletes plots the caller actually owns - never someone else's, and never an
+    # anonymous (unclaimed) one, even if its id is guessed/passed in.
+    owned_rows = db.execute(
+        text("SELECT id FROM plots WHERE id = ANY(:plot_ids) AND owner_user_id = :user_id"),
+        {"plot_ids": plot_ids, "user_id": session.user_id},
+    ).mappings().all()
+    owned_ids = [int(row["id"]) for row in owned_rows]
+    if not owned_ids:
+        return {"deleted": []}
+
+    # plot_meta / plot_feature_overrides / plot_export_jobs / subdivision tables all have
+    # ON DELETE CASCADE, but detected_features and plot_buffers are plain SQLAlchemy ForeignKeys
+    # without it - deleting plots first would fail on those with a foreign-key violation, so
+    # clear them explicitly first.
+    db.execute(text("DELETE FROM detected_features WHERE plot_id = ANY(:ids)"), {"ids": owned_ids})
+    db.execute(text("DELETE FROM plot_buffers WHERE plot_id = ANY(:ids)"), {"ids": owned_ids})
+    db.execute(text("DELETE FROM plots WHERE id = ANY(:ids)"), {"ids": owned_ids})
+    db.commit()
+    return {"deleted": owned_ids}
+
+
 # ---------------- FEATURES SUMMARY ----------------
 
 @router.get("/{plot_id}/features")
