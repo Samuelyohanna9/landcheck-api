@@ -3713,6 +3713,15 @@ def _draw_cadastral_reference_guide(
         vertical_bottom = vertical_y + station_gap_y
     _guide_line([vertical_x, vertical_x], [vertical_bottom, vertical_top])
 
+    # A matching short dash from the bottom border, at the same easting - directly opposite the
+    # top tick, mirroring its "short, capped short of the beacon" treatment rather than reaching
+    # all the way up to it.
+    border_bottom_y = _fig_y_to_data(frame_margin)
+    bottom_dash_top = min(vertical_y, border_bottom_y + span_y * 0.14)
+    if bottom_dash_top >= vertical_y:
+        bottom_dash_top = vertical_y - station_gap_y
+    _guide_line([vertical_x, vertical_x], [border_bottom_y, bottom_dash_top])
+
     easting_x = vertical_x - span_x * 0.008
     easting_y = (vertical_bottom + vertical_top) / 2.0
     northing_x = border_left_x + span_x * 0.02
