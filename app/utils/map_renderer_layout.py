@@ -5298,9 +5298,19 @@ def _render_plot_map_layout_site_plan(
         area_size=area_size,
     )
 
-    photo_h = 0.16
-    photo_w = 0.30
-    photo_x = 0.5 - photo_w / 2.0
+    map_left, map_width = 0.08, 0.84
+    footer_top_y = 0.19
+    map_bottom = footer_top_y
+    gap = 0.02
+    # The vector map below needs enough real room that annotate_vertices' bearing/distance labels
+    # (plain ax.text calls, which - unlike the boundary's Line2D - aren't clipped to the axes box
+    # by default) don't get positioned outside the box and spill into the footer. Size the photo
+    # off whatever's left after guaranteeing the map a floor close to the cadastral template's own
+    # map_height (0.455), rather than a fixed photo size that could crowd the map out.
+    min_map_height = 0.40
+    photo_w = map_width
+    photo_x = map_left
+    photo_h = max(0.16, min(0.30, header_bottom_y - gap - min_map_height - gap - map_bottom))
     photo_y = header_bottom_y - photo_h
     _draw_site_plan_photo_inset(
         fig,
@@ -5312,11 +5322,8 @@ def _render_plot_map_layout_site_plan(
         preview_mode=preview_mode,
     )
 
-    footer_top_y = 0.19
-    map_bottom = footer_top_y
-    map_top = photo_y - 0.02
-    map_height = max(0.28, map_top - map_bottom)
-    map_left, map_width = 0.08, 0.84
+    map_top = photo_y - gap
+    map_height = max(min_map_height, map_top - map_bottom)
     ax = fig.add_axes([map_left, map_bottom, map_width, map_height])
 
     resolved_scale_text, scale_ratio = resolve_scale_text_and_ratio(
