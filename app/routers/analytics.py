@@ -570,9 +570,13 @@ def get_survey_users(request: Request, db: Session = Depends(get_db)):
     ensure_survey_auth_schema()
     ensure_plot_meta_table(db)
 
-    # Plots nested per user (id/title/location/template/date) so the admin dashboard can offer a
-    # "redownload" action per plot without a second round-trip - reuses the same plot_meta fields
-    # the "Plot Details" section already keys its report-download links off of.
+    # Plots nested per user (id/title/location/template/date/raw input coordinates) so the admin
+    # dashboard can offer a "redownload" action per plot, and audit exactly what the surveyor
+    # typed in, without a second round-trip. survey_input_coordinates/coordinate_system are stored
+    # verbatim from the CoordinateInput form (see create_plot/update_plot_meta in plots.py, which
+    # just json.dumps() whatever list the client sent) - never reprojected or normalized in
+    # storage, so this is the exact station/coordinate-system pairing the user entered, not a
+    # converted/derived value.
     rows = db.execute(text("""
         SELECT
             u.id,
@@ -588,7 +592,9 @@ def get_survey_users(request: Request, db: Session = Depends(get_db)):
                         'title_text', pm.title_text,
                         'location_text', pm.location_text,
                         'template_name', pm.template_name,
-                        'created_at', p.created_at
+                        'created_at', p.created_at,
+                        'coordinate_system', pm.coordinate_system,
+                        'survey_input_coordinates', pm.survey_input_coordinates
                     ) ORDER BY p.created_at DESC
                 ) FILTER (WHERE p.id IS NOT NULL),
                 '[]'
@@ -615,6 +621,8 @@ def get_survey_users(request: Request, db: Session = Depends(get_db)):
                     "location_text": plot.get("location_text"),
                     "template_name": plot.get("template_name"),
                     "created_at": plot.get("created_at"),
+                    "coordinate_system": plot.get("coordinate_system"),
+                    "survey_input_coordinates": plot.get("survey_input_coordinates") or [],
                 }
                 for plot in (row["plots"] or [])
             ],
