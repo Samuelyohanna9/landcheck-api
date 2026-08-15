@@ -137,13 +137,14 @@ def _clockwise_ring_coords_and_labels(poly, station_names=None):
 
 
 def format_bearing_dms(bearing_deg: float) -> str:
-    deg = int(bearing_deg)
-    minutes_full = (bearing_deg - deg) * 60.0
-    minutes = int(round(minutes_full))
-    if minutes == 60:
-        deg += 1
-        minutes = 0
-    return f"{deg}\u00B0{minutes:02d}\u2032"
+    """Degrees-minutes-seconds, matching AutoCAD's usual DMS bearing display precision - the
+    on-drawing labels used to truncate to whole minutes, which reads as a "different" bearing
+    next to Civil 3D's seconds-precision readout even when the underlying angle is identical.
+    """
+    total_seconds = int(round(bearing_deg * 3600.0)) % 1296000  # 360 * 3600, wraps safely
+    deg, remainder_seconds = divmod(total_seconds, 3600)
+    minutes, seconds = divmod(remainder_seconds, 60)
+    return f"{deg}\u00B0{minutes:02d}\u2032{seconds:02d}\u2033"
 
 
 def format_area_display(area_m2: float) -> str:
@@ -3037,12 +3038,6 @@ def _render_plot_map_layout_adamawa(
         """),
         {"id": plot_id},
     ).fetchall()
-    area_m2 = float(measurement_area_m2) if measurement_area_m2 is not None else (
-        db.execute(
-            text("SELECT ST_Area(geom::geography) FROM plots WHERE id=:id"),
-            {"id": plot_id}
-        ).scalar() or 0
-    )
 
     plot_geom = wkb.loads(plot_wkb)
     buildings, rivers, fences = [], [], []
@@ -3136,6 +3131,7 @@ def _render_plot_map_layout_adamawa(
         if not poly.is_valid:
             poly = poly.buffer(0)
             gdf_plot = gpd.GeoDataFrame(geometry=[poly], crs=f"EPSG:{display_epsg}")
+    area_m2 = float(measurement_area_m2) if measurement_area_m2 is not None else float(poly.area)
 
     paper_config = get_paper_config(paper_size)
     fig_width = paper_config["width"]
@@ -3990,12 +3986,6 @@ def _render_plot_map_layout_cadastral(
         """),
         {"id": plot_id},
     ).fetchall()
-    area_m2 = float(measurement_area_m2) if measurement_area_m2 is not None else (
-        db.execute(
-            text("SELECT ST_Area(geom::geography) FROM plots WHERE id=:id"),
-            {"id": plot_id}
-        ).scalar() or 0
-    )
 
     plot_geom = wkb.loads(plot_wkb)
     buildings, rivers, fences = [], [], []
@@ -4088,6 +4078,7 @@ def _render_plot_map_layout_cadastral(
         if not poly.is_valid:
             poly = poly.buffer(0)
             gdf_plot = gpd.GeoDataFrame(geometry=[poly], crs=f"EPSG:{display_epsg}")
+    area_m2 = float(measurement_area_m2) if measurement_area_m2 is not None else float(poly.area)
 
     paper_config = get_paper_config(paper_size)
     fig_width = paper_config["width"]
@@ -4594,12 +4585,6 @@ def _render_plot_map_layout_fct(
         """),
         {"id": plot_id},
     ).fetchall()
-    area_m2 = float(measurement_area_m2) if measurement_area_m2 is not None else (
-        db.execute(
-            text("SELECT ST_Area(geom::geography) FROM plots WHERE id=:id"),
-            {"id": plot_id}
-        ).scalar() or 0
-    )
 
     plot_geom = wkb.loads(plot_wkb)
     buildings, rivers, fences = [], [], []
@@ -4689,6 +4674,7 @@ def _render_plot_map_layout_fct(
         if not poly.is_valid:
             poly = poly.buffer(0)
             gdf_plot = gpd.GeoDataFrame(geometry=[poly], crs=f"EPSG:{display_epsg}")
+    area_m2 = float(measurement_area_m2) if measurement_area_m2 is not None else float(poly.area)
 
     paper_config = get_paper_config(paper_size)
     fig_width = paper_config["width"]
@@ -5257,12 +5243,6 @@ def _render_plot_map_layout_site_plan(
         """),
         {"id": plot_id},
     ).fetchall()
-    area_m2 = float(measurement_area_m2) if measurement_area_m2 is not None else (
-        db.execute(
-            text("SELECT ST_Area(geom::geography) FROM plots WHERE id=:id"),
-            {"id": plot_id}
-        ).scalar() or 0
-    )
 
     plot_geom = wkb.loads(plot_wkb)
     buildings, rivers, fences = [], [], []
@@ -5347,6 +5327,7 @@ def _render_plot_map_layout_site_plan(
         if not poly.is_valid:
             poly = poly.buffer(0)
             gdf_plot = gpd.GeoDataFrame(geometry=[poly], crs=f"EPSG:{display_epsg}")
+    area_m2 = float(measurement_area_m2) if measurement_area_m2 is not None else float(poly.area)
 
     vertex_count = max(0, len(list(poly.exterior.coords)) - 1)
     if not station_names:
@@ -5882,13 +5863,6 @@ def render_plot_map_layout(
     if not plot_wkb:
         raise ValueError("Plot not found")
 
-    # Get accurate area using geography (meters squared) - same as back computation
-    area_m2 = float(measurement_area_m2) if measurement_area_m2 is not None else (
-        db.execute(
-            text("SELECT ST_Area(geom::geography) FROM plots WHERE id=:id"),
-            {"id": plot_id}
-        ).scalar() or 0
-    )
 
     plot_geom = wkb.loads(plot_wkb)
     buildings, rivers, fences, detected_roads = [], [], [], []
@@ -5984,6 +5958,7 @@ def render_plot_map_layout(
         if not poly.is_valid:
             poly = poly.buffer(0)
             gdf_plot = gpd.GeoDataFrame(geometry=[poly], crs=f"EPSG:{display_epsg}")
+    area_m2 = float(measurement_area_m2) if measurement_area_m2 is not None else float(poly.area)
 
     # Get paper configuration
     paper_config = get_paper_config(paper_size)

@@ -6874,11 +6874,24 @@ def download_survey_plan_dwg(plot_id: int, db: Session = Depends(get_db)):
 
     dxf_path = f"{out_dir}/plot_{plot_id}_survey_plan.dxf"
 
+    # Build the boundary the same way the PDF/back-computation exports do - directly from the
+    # surveyor's original input coordinates, reprojected once - so the DXF's bearings/distances/
+    # area match the PDF (and AutoCAD, since that's what a surveyor would drive Civil 3D from)
+    # instead of round-tripping through the plot's stored WGS84 geometry a second time.
+    plot_geom_wgs84 = _load_plot_polygon_wgs84(db, plot_id)
+    measurement_context = _resolve_measurement_polygon_context(
+        plot_geom_wgs84,
+        meta.get("coordinate_system") or "wgs84",
+        meta.get("survey_input_coordinates"),
+    )
+
     export_survey_plan_to_dxf(
         db,
         plot_id,
         dxf_path,
         coordinate_system=meta.get("coordinate_system") or "wgs84",
+        measurement_polygon=measurement_context["measurement_polygon"],
+        export_epsg_override=measurement_context["epsg_code"],
     )
 
     return FileResponse(

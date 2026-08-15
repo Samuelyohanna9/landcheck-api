@@ -133,7 +133,26 @@ def draw_grid_and_coords(msp, bounds, spacing):
 # Main Exporter
 # ==========================
 
-def export_survey_plan_to_dxf(db, plot_id: int, output_path: str, coordinate_system: str | None = None):
+def export_survey_plan_to_dxf(
+    db,
+    plot_id: int,
+    output_path: str,
+    coordinate_system: str | None = None,
+    measurement_polygon: Polygon | None = None,
+    export_epsg_override: int | None = None,
+):
+    """
+    `measurement_polygon`/`export_epsg_override` (both required together) let the caller pass the
+    same already-projected polygon the PDF/back-computation paths use (built directly from the
+    surveyor's original input coordinates via `_resolve_measurement_polygon_context`), instead of
+    this function re-deriving the boundary from `plots.geom`. `plots.geom` is itself only ever the
+    *stored* WGS84 conversion of those original coordinates, so reprojecting it again here would
+    round-trip through an extra transform (original CRS -> WGS84 -> export CRS) that the PDF path
+    skips (original CRS -> export CRS directly) - a second lossy transform is exactly what was
+    producing bearings/distances/area in the DXF that were a hair off from both the PDF and from
+    AutoCAD (which a surveyor would drive from their original field coordinates, not a WGS84
+    round-trip of them).
+    """
 
     plot_wkb = db.execute(
         text("SELECT geom FROM plots WHERE id=:id"),
@@ -163,10 +182,13 @@ def export_survey_plan_to_dxf(db, plot_id: int, output_path: str, coordinate_sys
         elif r.feature_type == "river":
             rivers.append(g)
 
-    export_epsg = _resolve_export_epsg(plot_geom, coordinate_system)
-
-    gdf_plot = gpd.GeoDataFrame(geometry=[plot_geom], crs="EPSG:4326").to_crs(epsg=export_epsg)
-    poly = gdf_plot.geometry.iloc[0]
+    if measurement_polygon is not None and export_epsg_override is not None:
+        export_epsg = int(export_epsg_override)
+        poly = measurement_polygon
+    else:
+        export_epsg = _resolve_export_epsg(plot_geom, coordinate_system)
+        gdf_plot = gpd.GeoDataFrame(geometry=[plot_geom], crs="EPSG:4326").to_crs(epsg=export_epsg)
+        poly = gdf_plot.geometry.iloc[0]
 
     gdf_buildings = gpd.GeoDataFrame(geometry=buildings, crs="EPSG:4326").to_crs(epsg=export_epsg) if buildings else None
     gdf_roads = gpd.GeoDataFrame(geometry=roads, crs="EPSG:4326").to_crs(epsg=export_epsg) if roads else None
