@@ -4937,6 +4937,8 @@ def _draw_site_plan_photo_inset(
     boundary_color: str = "red",
     font_scale: float = 1.0,
     preview_mode: bool = False,
+    station_names=None,
+    text_color: str = "black",
 ) -> None:
     """Small framed aerial-photo panel with the boundary overlaid in red - reuses the existing
     ArcGIS World Imagery fetch (`_try_add_arcgis_world_imagery`) plus the same Mapbox/Esri/OSM
@@ -4998,9 +5000,19 @@ def _draw_site_plan_photo_inset(
 
     ax_photo.set_xlim(target_xlim)
     ax_photo.set_ylim(target_ylim)
-    xs, ys = zip(*list(poly.exterior.coords))
+    coords, labels = _clockwise_ring_coords_and_labels(poly, station_names=station_names)
+    xs, ys = zip(*coords)
     ax_photo.plot(xs, ys, color=boundary_color, lw=1.6 * font_scale, zorder=10)
-    ax_photo.scatter(xs[:-1], ys[:-1], s=14 * max(0.8, font_scale), marker="s", color=boundary_color, zorder=11)
+    vertex_coords = coords[:-1] if len(coords) > 1 else coords
+    label_offset = span * 0.02
+    for (vx, vy), label in zip(vertex_coords, labels):
+        ax_photo.scatter([vx], [vy], s=16 * max(0.8, font_scale), marker="s", color=boundary_color, zorder=11)
+        ax_photo.text(
+            vx + label_offset, vy + label_offset, _safe_text(label, "-"),
+            fontsize=max(6, int(6.5 * font_scale)), color=text_color, weight="bold",
+            ha="left", va="bottom", zorder=12,
+            path_effects=[patheffects.withStroke(linewidth=2.2, foreground="white")],
+        )
     ax_photo.set_aspect("equal")
     ax_photo.set_xticks([])
     ax_photo.set_yticks([])
@@ -5302,15 +5314,14 @@ def _render_plot_map_layout_site_plan(
     footer_top_y = 0.19
     map_bottom = footer_top_y
     gap = 0.02
-    # The vector map below needs enough real room that annotate_vertices' bearing/distance labels
-    # (plain ax.text calls, which - unlike the boundary's Line2D - aren't clipped to the axes box
-    # by default) don't get positioned outside the box and spill into the footer. Size the photo
-    # off whatever's left after guaranteeing the map a floor close to the cadastral template's own
-    # map_height (0.455), rather than a fixed photo size that could crowd the map out.
-    min_map_height = 0.40
+    # The photo gets priority on space here - the scale-fit safety net below (compute_fit_scale_ratio
+    # fallback) guarantees the vector map's true-scale render can never exceed whatever box it's
+    # given, so a small map_height floor no longer risks annotate_vertices' bearing/distance labels
+    # (plain ax.text calls, unclipped by default) spilling past the axes into the footer.
+    min_map_height = 0.28
     photo_w = map_width
     photo_x = map_left
-    photo_h = max(0.16, min(0.30, header_bottom_y - gap - min_map_height - gap - map_bottom))
+    photo_h = max(0.16, min(0.45, header_bottom_y - gap - min_map_height - gap - map_bottom))
     photo_y = header_bottom_y - photo_h
     _draw_site_plan_photo_inset(
         fig,
@@ -5320,6 +5331,8 @@ def _render_plot_map_layout_site_plan(
         boundary_color=boundary_color,
         font_scale=font_scale,
         preview_mode=preview_mode,
+        station_names=station_names,
+        text_color=text_color,
     )
 
     map_top = photo_y - gap
@@ -5329,6 +5342,21 @@ def _render_plot_map_layout_site_plan(
     resolved_scale_text, scale_ratio = resolve_scale_text_and_ratio(
         scale_text, poly, fig_width * map_width, fig_height * map_height,
     )
+    # Safety net: an explicit user-chosen scale (e.g. matching a reference document's stated
+    # "1:550") has no relationship to how much of the page site_plan's smaller map area actually
+    # has left after the photo panel above it - if that scale's real-world footprint wouldn't fit
+    # the box, silently widen to whatever scale does fit (same fallback compute_fit_scale_ratio
+    # already provides for "auto"), so annotate_vertices' labels can never be pushed outside the
+    # axes regardless of how the photo/map space is split.
+    minx, miny, maxx, maxy = poly.bounds
+    inch_to_m = 0.0254
+    capacity_w_m = (fig_width * map_width) * inch_to_m * scale_ratio
+    capacity_h_m = (fig_height * map_height) * inch_to_m * scale_ratio
+    if (maxx - minx) > capacity_w_m * 0.92 or (maxy - miny) > capacity_h_m * 0.92:
+        fit_ratio = compute_fit_scale_ratio(poly, fig_width * map_width, fig_height * map_height)
+        if fit_ratio > scale_ratio:
+            scale_ratio = fit_ratio
+            resolved_scale_text = f"1 : {fit_ratio}"
 
     apply_true_scale(ax, poly, scale_ratio, fig_width * map_width, fig_height * map_height)
     target_xlim = ax.get_xlim()
