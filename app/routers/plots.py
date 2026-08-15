@@ -260,6 +260,7 @@ def _ensure_plot_meta_table_impl(db: Session):
             technical_report_plotting_software_text TEXT,
             technical_report_general_observation_text TEXT,
             elevation_points JSONB DEFAULT '[]',
+            survey_input_coordinates JSONB DEFAULT '[]',
             created_at TIMESTAMP DEFAULT NOW(),
             updated_at TIMESTAMP DEFAULT NOW()
         )
@@ -313,6 +314,7 @@ def _ensure_plot_meta_table_impl(db: Session):
         ("technical_report_plotting_software_text", "TEXT"),
         ("technical_report_general_observation_text", "TEXT"),
         ("elevation_points", "JSONB DEFAULT '[]'"),
+        ("survey_input_coordinates", "JSONB DEFAULT '[]'"),
         ("created_at", "TIMESTAMP DEFAULT NOW()"),
         ("updated_at", "TIMESTAMP DEFAULT NOW()"),
     ]
@@ -567,6 +569,7 @@ def upsert_plot_meta(
     technical_report_plotting_software_text: Optional[str] = None,
     technical_report_general_observation_text: Optional[str] = None,
     elevation_points: Optional[list] = None,
+    survey_input_coordinates: Optional[list] = None,
     commit: bool = True,
 ):
     ensure_plot_meta_table(db)
@@ -575,6 +578,9 @@ def upsert_plot_meta(
         json.dumps(technical_report_instruments) if technical_report_instruments is not None else None
     )
     elevation_points_json = json.dumps(elevation_points) if elevation_points is not None else None
+    survey_input_coordinates_json = (
+        json.dumps(survey_input_coordinates) if survey_input_coordinates is not None else None
+    )
 
     db.execute(text("""
         INSERT INTO plot_meta (
@@ -592,7 +598,7 @@ def upsert_plot_meta(
             technical_report_num_labourers, technical_report_recce_text,
             technical_report_demarcation_text, technical_report_computation_software_text,
             technical_report_plotting_software_text, technical_report_general_observation_text,
-            elevation_points
+            elevation_points, survey_input_coordinates
         )
         VALUES (
             :plot_id, :title_text, :location_text, :lga_text, :state_text,
@@ -609,7 +615,8 @@ def upsert_plot_meta(
             :technical_report_num_labourers, :technical_report_recce_text,
             :technical_report_demarcation_text, :technical_report_computation_software_text,
             :technical_report_plotting_software_text, :technical_report_general_observation_text,
-            CAST(COALESCE(:elevation_points, '[]') AS JSONB)
+            CAST(COALESCE(:elevation_points, '[]') AS JSONB),
+            CAST(COALESCE(:survey_input_coordinates, '[]') AS JSONB)
         )
         ON CONFLICT (plot_id) DO UPDATE SET
             title_text = COALESCE(NULLIF(EXCLUDED.title_text, ''), plot_meta.title_text),
@@ -659,6 +666,7 @@ def upsert_plot_meta(
             technical_report_plotting_software_text = COALESCE(NULLIF(EXCLUDED.technical_report_plotting_software_text, ''), plot_meta.technical_report_plotting_software_text),
             technical_report_general_observation_text = COALESCE(NULLIF(EXCLUDED.technical_report_general_observation_text, ''), plot_meta.technical_report_general_observation_text),
             elevation_points = COALESCE(CAST(:elevation_points AS JSONB), plot_meta.elevation_points),
+            survey_input_coordinates = COALESCE(CAST(:survey_input_coordinates AS JSONB), plot_meta.survey_input_coordinates),
             updated_at = NOW()
     """), {
         "plot_id": plot_id,
@@ -710,6 +718,7 @@ def upsert_plot_meta(
         "technical_report_plotting_software_text": technical_report_plotting_software_text,
         "technical_report_general_observation_text": technical_report_general_observation_text,
         "elevation_points": elevation_points_json,
+        "survey_input_coordinates": survey_input_coordinates_json,
     })
     if commit:
         db.commit()
@@ -739,7 +748,7 @@ def get_plot_meta(db: Session, plot_id: int) -> dict:
                technical_report_num_labourers, technical_report_recce_text,
                technical_report_demarcation_text, technical_report_computation_software_text,
                technical_report_plotting_software_text, technical_report_general_observation_text,
-               elevation_points
+               elevation_points, survey_input_coordinates
         FROM plot_meta
         WHERE plot_id = :plot_id
     """), {"plot_id": plot_id}).mappings().first()
@@ -796,6 +805,7 @@ def get_plot_meta(db: Session, plot_id: int) -> dict:
             "technical_report_plotting_software_text": DEFAULT_TECHNICAL_REPORT_PLOTTING_SOFTWARE,
             "technical_report_general_observation_text": DEFAULT_TECHNICAL_REPORT_GENERAL_OBSERVATION,
             "elevation_points": [],
+            "survey_input_coordinates": [],
         }
     raw_instruments = row.get("technical_report_instruments")
     if isinstance(raw_instruments, str):
@@ -813,6 +823,14 @@ def get_plot_meta(db: Session, plot_id: int) -> dict:
             raw_elevation_points = []
     if not isinstance(raw_elevation_points, list):
         raw_elevation_points = []
+    raw_survey_input_coordinates = row.get("survey_input_coordinates")
+    if isinstance(raw_survey_input_coordinates, str):
+        try:
+            raw_survey_input_coordinates = json.loads(raw_survey_input_coordinates)
+        except Exception:
+            raw_survey_input_coordinates = []
+    if not isinstance(raw_survey_input_coordinates, list):
+        raw_survey_input_coordinates = []
     return {
         "title_text": row.get("title_text") or "SURVEY PLAN",
         "location_text": row.get("location_text") or "",
@@ -865,6 +883,7 @@ def get_plot_meta(db: Session, plot_id: int) -> dict:
         "technical_report_plotting_software_text": row.get("technical_report_plotting_software_text") or DEFAULT_TECHNICAL_REPORT_PLOTTING_SOFTWARE,
         "technical_report_general_observation_text": row.get("technical_report_general_observation_text") or DEFAULT_TECHNICAL_REPORT_GENERAL_OBSERVATION,
         "elevation_points": raw_elevation_points,
+        "survey_input_coordinates": raw_survey_input_coordinates,
     }
 
 
@@ -2089,6 +2108,118 @@ def _load_plot_polygon_wgs84(db: Session, plot_id: int) -> Polygon:
     return poly
 
 
+def _normalize_survey_input_coordinates(raw: Any) -> list[dict]:
+    if raw is None:
+        return []
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except Exception:
+            return []
+    if not isinstance(raw, list):
+        return []
+
+    normalized: list[dict] = []
+    for index, item in enumerate(raw):
+        if not isinstance(item, dict):
+            continue
+        try:
+            x = float(item.get("x"))
+            y = float(item.get("y"))
+        except Exception:
+            continue
+        station = str(item.get("station") or item.get("name") or f"P{index + 1}").strip() or f"P{index + 1}"
+        normalized.append(
+            {
+                "station": station,
+                "x": x,
+                "y": y,
+                "height": item.get("height"),
+            }
+        )
+    return normalized
+
+
+def _build_exact_measurement_polygon(
+    survey_input_coordinates: Any,
+    coordinate_system: str | None,
+    target_epsg: int,
+) -> tuple[Polygon | None, float | None, list[dict], str | None]:
+    normalized = _normalize_survey_input_coordinates(survey_input_coordinates)
+    if len(normalized) < 3:
+        return None, None, [], None
+
+    selected_key = str(coordinate_system or "wgs84").strip().lower() or "wgs84"
+    coords = [(float(item["x"]), float(item["y"])) for item in normalized]
+    if coords[0] != coords[-1]:
+        coords.append(coords[0])
+
+    if selected_key == "wgs84":
+        src_epsg = 4326
+        resolved_key = "wgs84"
+    else:
+        sample_x, sample_y = coords[0]
+        resolved_key = resolve_coordinate_system_key(selected_key, sample_x, sample_y)
+        src_epsg = int(COORDINATE_SYSTEMS.get(resolved_key, COORDINATE_SYSTEMS.get(selected_key, 4326)))
+
+    poly = Polygon(coords)
+    poly = _clean_single_polygon(poly)
+    if poly is None:
+        return None, None, normalized, resolved_key
+
+    gdf_poly = gpd.GeoDataFrame(geometry=[poly], crs=f"EPSG:{src_epsg}")
+    if int(src_epsg) != int(target_epsg):
+        gdf_poly = gdf_poly.to_crs(epsg=int(target_epsg))
+    projected_poly = gdf_poly.geometry.iloc[0]
+    projected_poly = _clean_single_polygon(projected_poly)
+    if projected_poly is None:
+        return None, None, normalized, resolved_key
+
+    return projected_poly, float(projected_poly.area), normalized, resolved_key
+
+
+def _resolve_measurement_polygon_context(
+    plot_geom_wgs84: Polygon,
+    coordinate_system: str | None,
+    survey_input_coordinates: Any = None,
+) -> dict:
+    render_coordinate_system, epsg_code, crs_name = _resolve_survey_render_crs(
+        coordinate_system,
+        plot_geom_wgs84,
+    )
+    exact_poly, exact_area_m2, normalized_points, resolved_exact_key = _build_exact_measurement_polygon(
+        survey_input_coordinates,
+        coordinate_system,
+        epsg_code,
+    )
+    if exact_poly is not None and exact_area_m2 is not None:
+        return {
+            "render_coordinate_system": render_coordinate_system,
+            "epsg_code": int(epsg_code),
+            "crs_name": crs_name,
+            "measurement_polygon": exact_poly,
+            "measurement_area_m2": float(exact_area_m2),
+            "survey_input_coordinates": normalized_points,
+            "used_exact_input": True,
+            "resolved_exact_key": resolved_exact_key,
+        }
+
+    fallback_poly = gpd.GeoSeries([plot_geom_wgs84], crs="EPSG:4326").to_crs(epsg=epsg_code).iloc[0]
+    fallback_poly = _clean_single_polygon(fallback_poly)
+    if fallback_poly is None:
+        raise HTTPException(status_code=400, detail="Plot geometry could not be projected for measurement.")
+    return {
+        "render_coordinate_system": render_coordinate_system,
+        "epsg_code": int(epsg_code),
+        "crs_name": crs_name,
+        "measurement_polygon": fallback_poly,
+        "measurement_area_m2": float(fallback_poly.area),
+        "survey_input_coordinates": normalized_points,
+        "used_exact_input": False,
+        "resolved_exact_key": None,
+    }
+
+
 def _safe_filename_fragment(value: str, fallback: str) -> str:
     cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", str(value or "")).strip("._-")
     return cleaned or fallback
@@ -2833,10 +2964,14 @@ def _compose_child_title(parent_meta: dict, lot_no: str, estate_name: str | None
 def _render_survey_plan_pdf_for_plot(db: Session, plot_id: int, output_pdf_path: str):
     meta = get_plot_meta(db, plot_id)
     plot_geom_wgs84 = _load_plot_polygon_wgs84(db, plot_id)
-    render_coordinate_system, epsg_code, crs_name = _resolve_survey_render_crs(
-        meta["coordinate_system"],
+    measurement_context = _resolve_measurement_polygon_context(
         plot_geom_wgs84,
+        meta["coordinate_system"],
+        meta.get("survey_input_coordinates"),
     )
+    render_coordinate_system = measurement_context["render_coordinate_system"]
+    epsg_code = measurement_context["epsg_code"]
+    crs_name = measurement_context["crs_name"]
 
     tmp_map = tempfile.NamedTemporaryFile(suffix="_map.png", delete=False)
     map_path = tmp_map.name
@@ -2858,6 +2993,8 @@ def _render_survey_plan_pdf_for_plot(db: Session, plot_id: int, output_pdf_path:
         coordinate_system=render_coordinate_system,
         epsg_code=epsg_code,
         crs_footer_text=f"COORDINATE SYSTEM: {crs_name}",
+        measurement_polygon=measurement_context["measurement_polygon"],
+        measurement_area_m2=measurement_context["measurement_area_m2"],
         paper_size=meta["paper_size"],
         north_arrow_style="one_side_stem",
         north_arrow_color="blue",
@@ -4236,6 +4373,7 @@ def create_plot_survey_report_export_job(
     fct_origin_beacon_text: str = Body(""),
     fct_cadastral_map_ref: str = Body(""),
     fct_title_prefix: str = Body(""),
+    survey_input_coordinates: Optional[list] = Body(default=None),
 ):
     request_payload = {
         "title_text": title_text,
@@ -4298,6 +4436,7 @@ def create_plot_survey_report_export_job(
         "fct_origin_beacon_text": fct_origin_beacon_text,
         "fct_cadastral_map_ref": fct_cadastral_map_ref,
         "fct_title_prefix": fct_title_prefix,
+        "survey_input_coordinates": survey_input_coordinates or [],
     }
     cache_key = _build_plot_export_cache_key(
         db,
@@ -4830,6 +4969,7 @@ def create_plot(payload: Union[PlotCreateRequest, List[List[float]]], request: R
             surveyor_name=meta.surveyor or None,
             surveyor_rank=meta.rank or None,
             scale_text=meta.scale or None,
+            survey_input_coordinates=getattr(meta, "survey_input_coordinates", None),
         )
 
     # ---------------- BUFFER ----------------
@@ -5600,11 +5740,14 @@ def delete_feature_override(plot_id: int, override_id: int, db: Session = Depend
 
 @router.get("/{plot_id}/report")
 def get_plot_report(plot_id: int, db: Session = Depends(get_db)):
-
-    area = db.execute(
-        text("SELECT ST_Area(geom::geography) FROM plots WHERE id=:id"),
-        {"id": plot_id}
-    ).scalar()
+    meta = get_plot_meta(db, plot_id)
+    plot_geom = _load_plot_polygon_wgs84(db, plot_id)
+    measurement_context = _resolve_measurement_polygon_context(
+        plot_geom,
+        meta.get("coordinate_system"),
+        meta.get("survey_input_coordinates"),
+    )
+    area = measurement_context["measurement_area_m2"]
 
     rows = db.execute(text("""
         SELECT feature_type, location, COUNT(*) as count
@@ -5668,6 +5811,7 @@ def save_plot_metadata(
     fct_origin_beacon_text: str = Body(""),
     fct_cadastral_map_ref: str = Body(""),
     fct_title_prefix: str = Body(""),
+    survey_input_coordinates: Optional[list] = Body(default=None),
 ):
     upsert_plot_meta(
         db=db,
@@ -5708,6 +5852,7 @@ def save_plot_metadata(
         fct_origin_beacon_text=fct_origin_beacon_text,
         fct_cadastral_map_ref=fct_cadastral_map_ref,
         fct_title_prefix=fct_title_prefix,
+        survey_input_coordinates=survey_input_coordinates,
     )
     return {"ok": True, "plot_id": int(plot_id)}
 
@@ -5773,7 +5918,8 @@ def download_plot_report_pdf(plot_id: int, db: Session = Depends(get_db), backgr
     fct_cadastral_zone: str = Body(""),
     fct_origin_beacon_text: str = Body(""),
     fct_cadastral_map_ref: str = Body(""),
-    fct_title_prefix: str = Body("")):
+    fct_title_prefix: str = Body(""),
+    survey_input_coordinates: Optional[list] = Body(default=None)):
 
     reports_dir = REPORTS_DIR
     maps_dir = os.path.join(REPORTS_DIR, "maps")
@@ -5826,13 +5972,20 @@ def download_plot_report_pdf(plot_id: int, db: Session = Depends(get_db), backgr
         fct_origin_beacon_text=fct_origin_beacon_text,
         fct_cadastral_map_ref=fct_cadastral_map_ref,
         fct_title_prefix=fct_title_prefix,
+        survey_input_coordinates=survey_input_coordinates,
     )
 
     plot_geom_wgs84 = _load_plot_polygon_wgs84(db, plot_id)
-    render_coordinate_system, epsg_code, crs_name = _resolve_survey_render_crs(
-        coordinate_system,
+    measurement_context = _resolve_measurement_polygon_context(
         plot_geom_wgs84,
+        coordinate_system,
+        survey_input_coordinates=survey_input_coordinates,
     )
+    render_coordinate_system = measurement_context["render_coordinate_system"]
+    epsg_code = measurement_context["epsg_code"]
+    crs_name = measurement_context["crs_name"]
+    measurement_polygon = measurement_context["measurement_polygon"]
+    measurement_area_m2 = measurement_context["measurement_area_m2"]
 
     render_plot_map_layout(
         db=db,
@@ -5850,6 +6003,8 @@ def download_plot_report_pdf(plot_id: int, db: Session = Depends(get_db), backgr
         coordinate_system=render_coordinate_system,
         epsg_code=epsg_code,
         crs_footer_text=f"COORDINATE SYSTEM: {crs_name}",
+        measurement_polygon=measurement_polygon,
+        measurement_area_m2=measurement_area_m2,
         paper_size=paper_size,
         north_arrow_style=north_arrow_style,
         north_arrow_color=north_arrow_color,
@@ -5962,10 +6117,13 @@ def download_plot_technical_report_docx(plot_id: int, db: Session = Depends(get_
     )
 
     meta = get_plot_meta(db, plot_id)
-    area_m2 = db.execute(
-        text("SELECT ST_Area(geom::geography) FROM plots WHERE id=:id"),
-        {"id": plot_id},
-    ).scalar() or 0
+    plot_geom = _load_plot_polygon_wgs84(db, plot_id)
+    measurement_context = _resolve_measurement_polygon_context(
+        plot_geom,
+        meta.get("coordinate_system"),
+        meta.get("survey_input_coordinates"),
+    )
+    area_m2 = measurement_context["measurement_area_m2"] or 0
 
     _render_technical_report_docx(meta, float(area_m2), docx_path)
 
@@ -6186,7 +6344,8 @@ def preview_plot_map(plot_id: int, db: Session = Depends(get_db), background_tas
     fct_cadastral_zone: str = Body(""),
     fct_origin_beacon_text: str = Body(""),
     fct_cadastral_map_ref: str = Body(""),
-    fct_title_prefix: str = Body("")):
+    fct_title_prefix: str = Body(""),
+    survey_input_coordinates: Optional[list] = Body(default=None)):
 
     effective_scale_text = str(scale_text or "").strip() or "auto"
     resolved_scale_text = effective_scale_text
@@ -6207,11 +6366,16 @@ def preview_plot_map(plot_id: int, db: Session = Depends(get_db), background_tas
     if plot_geom_wgs84 is None or plot_geom_wgs84.is_empty:
         raise HTTPException(status_code=400, detail="Plot geometry is empty.")
 
-    render_coordinate_system, effective_epsg, crs_name = _resolve_survey_render_crs(
-        coordinate_system,
+    measurement_context = _resolve_measurement_polygon_context(
         plot_geom_wgs84,
+        coordinate_system,
+        survey_input_coordinates=survey_input_coordinates,
     )
-    plot_metric = gpd.GeoSeries([plot_geom_wgs84], crs="EPSG:4326").to_crs(epsg=effective_epsg).iloc[0]
+    render_coordinate_system = measurement_context["render_coordinate_system"]
+    effective_epsg = measurement_context["epsg_code"]
+    crs_name = measurement_context["crs_name"]
+    plot_metric = measurement_context["measurement_polygon"]
+    measurement_area_m2 = measurement_context["measurement_area_m2"]
 
     paper_config = get_paper_config(paper_size)
     map_width_fraction, map_height_fraction = _survey_template_map_frame(template_name)
@@ -6287,6 +6451,7 @@ def preview_plot_map(plot_id: int, db: Session = Depends(get_db), background_tas
         "fct_origin_beacon_text": fct_origin_beacon_text,
         "fct_cadastral_map_ref": fct_cadastral_map_ref,
         "fct_title_prefix": fct_title_prefix,
+        "survey_input_coordinates": survey_input_coordinates or [],
     }
     revision_token = build_preview_revision_token(db, plot_id)
     cache_key = build_preview_cache_key(plot_id, payload_for_cache, revision_token)
@@ -6347,13 +6512,10 @@ def preview_plot_map(plot_id: int, db: Session = Depends(get_db), background_tas
         fct_origin_beacon_text=fct_origin_beacon_text,
         fct_cadastral_map_ref=fct_cadastral_map_ref,
         fct_title_prefix=fct_title_prefix,
+        survey_input_coordinates=survey_input_coordinates,
     )
 
-    # Get EPSG code for selected coordinate system
-    render_coordinate_system, epsg_code, crs_name = _resolve_survey_render_crs(
-        coordinate_system,
-        plot_geom_wgs84,
-    )
+    epsg_code = effective_epsg
 
     render_plot_map_layout(
         db=db,
@@ -6371,6 +6533,8 @@ def preview_plot_map(plot_id: int, db: Session = Depends(get_db), background_tas
         coordinate_system=render_coordinate_system,
         epsg_code=epsg_code,
         crs_footer_text=f"COORDINATE SYSTEM: {crs_name}",
+        measurement_polygon=plot_metric,
+        measurement_area_m2=measurement_area_m2,
         paper_size=paper_size,
         north_arrow_style=north_arrow_style,
         north_arrow_color=north_arrow_color,
@@ -6456,30 +6620,31 @@ def preview_plot_map(plot_id: int, db: Session = Depends(get_db), background_tas
 @router.post("/{plot_id}/back-computation/pdf")
 def download_back_computation_pdf(plot_id: int, db: Session = Depends(get_db), background_tasks: BackgroundTasks = None,
     coordinate_system: str = Body("wgs84"),
-    station_names: list[str] = Body(default=[])):
+    station_names: list[str] = Body(default=[]),
+    survey_input_coordinates: Optional[list] = Body(default=None)):
 
     reports_dir = REPORTS_DIR
     os.makedirs(reports_dir, exist_ok=True)
 
     pdf_path = f"{reports_dir}/plot_{plot_id}_back_computation.pdf"
 
-    # Get plot geometry
+    meta = get_plot_meta(db, plot_id)
+
     plot_wkb = db.execute(text("SELECT geom FROM plots WHERE id=:id"), {"id": plot_id}).scalar()
     plot_geom = wkb.loads(plot_wkb)
 
-    # Get accurate area using geography (meters squared)
-    area_m2 = db.execute(
-        text("SELECT ST_Area(geom::geography) FROM plots WHERE id=:id"),
-        {"id": plot_id}
-    ).scalar() or 0
-
-    # Convert to user's selected coordinate system
-    gdf = gpd.GeoDataFrame(geometry=[plot_geom], crs="EPSG:4326")
-
-    _, epsg_code, crs_name = _resolve_survey_render_crs(coordinate_system, plot_geom)
-
-    gdf_projected = gdf.to_crs(epsg=epsg_code)
-    poly = gdf_projected.geometry.iloc[0]
+    measurement_context = _resolve_measurement_polygon_context(
+        plot_geom,
+        coordinate_system or meta.get("coordinate_system"),
+        survey_input_coordinates=(
+            survey_input_coordinates
+            if survey_input_coordinates is not None
+            else meta.get("survey_input_coordinates")
+        ),
+    )
+    poly = measurement_context["measurement_polygon"]
+    area_m2 = measurement_context["measurement_area_m2"]
+    crs_name = measurement_context["crs_name"]
 
     # Use custom station names if provided
     labels = station_names if station_names else None
@@ -6859,10 +7024,14 @@ def get_saved_survey_plan_pdf(plot_id: int, refresh: bool = False, db: Session =
         map_path = tmp_map.name
         tmp_map.close()
         plot_geom_wgs84 = _load_plot_polygon_wgs84(db, plot_id)
-        render_coordinate_system, epsg_code, crs_name = _resolve_survey_render_crs(
-            meta["coordinate_system"],
+        measurement_context = _resolve_measurement_polygon_context(
             plot_geom_wgs84,
+            meta["coordinate_system"],
+            meta.get("survey_input_coordinates"),
         )
+        render_coordinate_system = measurement_context["render_coordinate_system"]
+        epsg_code = measurement_context["epsg_code"]
+        crs_name = measurement_context["crs_name"]
         render_plot_map_layout(
             db=db,
             plot_id=plot_id,
@@ -6879,6 +7048,8 @@ def get_saved_survey_plan_pdf(plot_id: int, refresh: bool = False, db: Session =
             coordinate_system=render_coordinate_system,
             epsg_code=epsg_code,
             crs_footer_text=f"COORDINATE SYSTEM: {crs_name}",
+            measurement_polygon=measurement_context["measurement_polygon"],
+            measurement_area_m2=measurement_context["measurement_area_m2"],
             paper_size=meta["paper_size"],
             north_arrow_style="one_side_stem",
             north_arrow_color="blue",
@@ -6905,12 +7076,12 @@ def get_saved_survey_plan_pdf(plot_id: int, refresh: bool = False, db: Session =
             cadastral_area_name=meta.get("cadastral_area_name") or "",
             cadastral_datum_text=meta.get("cadastral_datum_text") or "",
             cadastral_firm_block_text=meta.get("cadastral_firm_block_text") or "",
-        fct_file_no=meta.get("fct_file_no") or "",
-        fct_district=meta.get("fct_district") or "",
-        fct_cadastral_zone=meta.get("fct_cadastral_zone") or "",
-        fct_origin_beacon_text=meta.get("fct_origin_beacon_text") or "",
-        fct_cadastral_map_ref=meta.get("fct_cadastral_map_ref") or "",
-        fct_title_prefix=meta.get("fct_title_prefix") or "",
+            fct_file_no=meta.get("fct_file_no") or "",
+            fct_district=meta.get("fct_district") or "",
+            fct_cadastral_zone=meta.get("fct_cadastral_zone") or "",
+            fct_origin_beacon_text=meta.get("fct_origin_beacon_text") or "",
+            fct_cadastral_map_ref=meta.get("fct_cadastral_map_ref") or "",
+            fct_title_prefix=meta.get("fct_title_prefix") or "",
         )
         report = get_plot_report(plot_id, db)
         generate_plot_report_pdf(report, pdf_path, map_path, paper_size=meta["paper_size"])
@@ -6999,14 +7170,14 @@ def get_saved_back_computation_pdf(plot_id: int, refresh: bool = False, db: Sess
         # Get plot geometry
         plot_wkb = db.execute(text("SELECT geom FROM plots WHERE id=:id"), {"id": plot_id}).scalar()
         plot_geom = wkb.loads(plot_wkb)
-        area_m2 = db.execute(
-            text("SELECT ST_Area(geom::geography) FROM plots WHERE id=:id"),
-            {"id": plot_id}
-        ).scalar() or 0
-        gdf = gpd.GeoDataFrame(geometry=[plot_geom], crs="EPSG:4326")
-        _, epsg_code, crs_name = _resolve_survey_render_crs(meta["coordinate_system"], plot_geom)
-        gdf_projected = gdf.to_crs(epsg=epsg_code)
-        poly = gdf_projected.geometry.iloc[0]
+        measurement_context = _resolve_measurement_polygon_context(
+            plot_geom,
+            meta["coordinate_system"],
+            meta.get("survey_input_coordinates"),
+        )
+        poly = measurement_context["measurement_polygon"]
+        area_m2 = measurement_context["measurement_area_m2"]
+        crs_name = measurement_context["crs_name"]
         rows, sum_de, sum_dn = compute_back_computation(poly, None)
         render_back_computation_pdf(rows, sum_de, sum_dn, area_m2, plot_id, pdf_path, crs_name)
     if not pdf_path or not os.path.exists(pdf_path):

@@ -1,5 +1,5 @@
 from pydantic import BaseModel
-from typing import List, Optional, Dict
+from typing import List, Optional, Dict, Any
 
 class Station(BaseModel):
     name: str
@@ -14,6 +14,7 @@ class PlotMeta(BaseModel):
     surveyor: Optional[str] = None
     rank: Optional[str] = None
     scale: Optional[str] = "1 : 1000"
+    survey_input_coordinates: Optional[List[Dict[str, Any]]] = None
 
 class PlotCreateRequest(BaseModel):
     coordinates: List[List[float]]

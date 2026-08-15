@@ -3007,6 +3007,8 @@ def _render_plot_map_layout_adamawa(
     bearing_size: int | None = None,
     area_font: str | None = None,
     area_size: int | None = None,
+    measurement_polygon=None,
+    measurement_area_m2: float | None = None,
 ):
     # None means "not overridden" - fall back to this template's own established defaults
     # (which differ slightly from the general template's, e.g. its navy grid/coordinate color)
@@ -3035,10 +3037,12 @@ def _render_plot_map_layout_adamawa(
         """),
         {"id": plot_id},
     ).fetchall()
-    area_m2 = db.execute(
-        text("SELECT ST_Area(geom::geography) FROM plots WHERE id=:id"),
-        {"id": plot_id}
-    ).scalar() or 0
+    area_m2 = float(measurement_area_m2) if measurement_area_m2 is not None else (
+        db.execute(
+            text("SELECT ST_Area(geom::geography) FROM plots WHERE id=:id"),
+            {"id": plot_id}
+        ).scalar() or 0
+    )
 
     plot_geom = wkb.loads(plot_wkb)
     buildings, rivers, fences = [], [], []
@@ -3121,11 +3125,17 @@ def _render_plot_map_layout_adamawa(
         hemisphere = "north" if centroid.y >= 0 else "south"
         display_epsg = 32600 + utm_zone if hemisphere == "north" else 32700 + utm_zone
 
-    gdf_plot = gpd.GeoDataFrame(geometry=[plot_geom], crs="EPSG:4326").to_crs(epsg=display_epsg)
-    poly = gdf_plot.geometry.iloc[0]
-    if not poly.is_valid:
-        poly = poly.buffer(0)
+    if measurement_polygon is not None:
+        poly = measurement_polygon
+        if not poly.is_valid:
+            poly = poly.buffer(0)
         gdf_plot = gpd.GeoDataFrame(geometry=[poly], crs=f"EPSG:{display_epsg}")
+    else:
+        gdf_plot = gpd.GeoDataFrame(geometry=[plot_geom], crs="EPSG:4326").to_crs(epsg=display_epsg)
+        poly = gdf_plot.geometry.iloc[0]
+        if not poly.is_valid:
+            poly = poly.buffer(0)
+            gdf_plot = gpd.GeoDataFrame(geometry=[poly], crs=f"EPSG:{display_epsg}")
 
     paper_config = get_paper_config(paper_size)
     fig_width = paper_config["width"]
@@ -3952,6 +3962,8 @@ def _render_plot_map_layout_cadastral(
     bearing_size: int | None = None,
     area_font: str | None = None,
     area_size: int | None = None,
+    measurement_polygon=None,
+    measurement_area_m2: float | None = None,
 ):
     boundary_color = boundary_color or "red"
     grid_color = grid_color or CADASTRAL_BLUE
@@ -3978,10 +3990,12 @@ def _render_plot_map_layout_cadastral(
         """),
         {"id": plot_id},
     ).fetchall()
-    area_m2 = db.execute(
-        text("SELECT ST_Area(geom::geography) FROM plots WHERE id=:id"),
-        {"id": plot_id}
-    ).scalar() or 0
+    area_m2 = float(measurement_area_m2) if measurement_area_m2 is not None else (
+        db.execute(
+            text("SELECT ST_Area(geom::geography) FROM plots WHERE id=:id"),
+            {"id": plot_id}
+        ).scalar() or 0
+    )
 
     plot_geom = wkb.loads(plot_wkb)
     buildings, rivers, fences = [], [], []
@@ -4063,11 +4077,17 @@ def _render_plot_map_layout_cadastral(
         hemisphere = "north" if centroid.y >= 0 else "south"
         display_epsg = 32600 + utm_zone if hemisphere == "north" else 32700 + utm_zone
 
-    gdf_plot = gpd.GeoDataFrame(geometry=[plot_geom], crs="EPSG:4326").to_crs(epsg=display_epsg)
-    poly = gdf_plot.geometry.iloc[0]
-    if not poly.is_valid:
-        poly = poly.buffer(0)
+    if measurement_polygon is not None:
+        poly = measurement_polygon
+        if not poly.is_valid:
+            poly = poly.buffer(0)
         gdf_plot = gpd.GeoDataFrame(geometry=[poly], crs=f"EPSG:{display_epsg}")
+    else:
+        gdf_plot = gpd.GeoDataFrame(geometry=[plot_geom], crs="EPSG:4326").to_crs(epsg=display_epsg)
+        poly = gdf_plot.geometry.iloc[0]
+        if not poly.is_valid:
+            poly = poly.buffer(0)
+            gdf_plot = gpd.GeoDataFrame(geometry=[poly], crs=f"EPSG:{display_epsg}")
 
     paper_config = get_paper_config(paper_size)
     fig_width = paper_config["width"]
@@ -4543,6 +4563,8 @@ def _render_plot_map_layout_fct(
     bearing_size: int | None = None,
     area_font: str | None = None,
     area_size: int | None = None,
+    measurement_polygon=None,
+    measurement_area_m2: float | None = None,
 ):
     boundary_color = boundary_color or "red"
     text_color = text_color or "black"
@@ -4572,10 +4594,12 @@ def _render_plot_map_layout_fct(
         """),
         {"id": plot_id},
     ).fetchall()
-    area_m2 = db.execute(
-        text("SELECT ST_Area(geom::geography) FROM plots WHERE id=:id"),
-        {"id": plot_id}
-    ).scalar() or 0
+    area_m2 = float(measurement_area_m2) if measurement_area_m2 is not None else (
+        db.execute(
+            text("SELECT ST_Area(geom::geography) FROM plots WHERE id=:id"),
+            {"id": plot_id}
+        ).scalar() or 0
+    )
 
     plot_geom = wkb.loads(plot_wkb)
     buildings, rivers, fences = [], [], []
@@ -4654,11 +4678,17 @@ def _render_plot_map_layout_fct(
         hemisphere = "north" if centroid.y >= 0 else "south"
         display_epsg = 32600 + utm_zone if hemisphere == "north" else 32700 + utm_zone
 
-    gdf_plot = gpd.GeoDataFrame(geometry=[plot_geom], crs="EPSG:4326").to_crs(epsg=display_epsg)
-    poly = gdf_plot.geometry.iloc[0]
-    if not poly.is_valid:
-        poly = poly.buffer(0)
+    if measurement_polygon is not None:
+        poly = measurement_polygon
+        if not poly.is_valid:
+            poly = poly.buffer(0)
         gdf_plot = gpd.GeoDataFrame(geometry=[poly], crs=f"EPSG:{display_epsg}")
+    else:
+        gdf_plot = gpd.GeoDataFrame(geometry=[plot_geom], crs="EPSG:4326").to_crs(epsg=display_epsg)
+        poly = gdf_plot.geometry.iloc[0]
+        if not poly.is_valid:
+            poly = poly.buffer(0)
+            gdf_plot = gpd.GeoDataFrame(geometry=[poly], crs=f"EPSG:{display_epsg}")
 
     paper_config = get_paper_config(paper_size)
     fig_width = paper_config["width"]
@@ -4936,19 +4966,27 @@ def _draw_site_plan_photo_inset(
     display_epsg: int,
     boundary_color: str = "red",
     font_scale: float = 1.0,
-    preview_mode: bool = False,
     station_names=None,
     text_color: str = "black",
 ) -> None:
     """Small framed aerial-photo panel with the boundary overlaid in red - reuses the existing
     ArcGIS World Imagery fetch (`_try_add_arcgis_world_imagery`) plus the same Mapbox/Esri/OSM
     fallback chain used by the standalone orthophoto export, rather than reimplementing image
-    fetching for this template.
+    fetching for this template. Always fetches at preview-grade quality (see below) regardless of
+    the document's own preview/export mode, since this panel is too small to need export-grade
+    imagery and that fetch is the slowest single step in producing a Site Plan.
     """
     x, y, w, h = rect
     ax_photo = fig.add_axes([x, y, w, h])
-    dpi = 150 if preview_mode else 200
     fig_width, fig_height = fig.get_size_inches()
+    # This is a small supplementary inset, not the document's main content - fetching it at the
+    # full document dpi (up to export-quality 4096px-edge imagery) is far more data than a panel
+    # this size can even show, and on a slow connection that's the single biggest thing standing
+    # between clicking download and the file landing. Always request preview-grade imagery
+    # (smaller max edge, no upscaling) at a capped effective dpi, regardless of the document's own
+    # preview_mode - a small inset looks identical at print size either way.
+    inset_fetch_dpi = 110
+    inset_fetch_timeout = (4.0, 10.0)
 
     # The panel's own physical box is wide/short (matching the page layout), not square - fetching
     # a square-cropped bbox and letting set_aspect("equal") reconcile it afterward is what was
@@ -4981,16 +5019,19 @@ def _draw_site_plan_photo_inset(
         fig_height=fig_height,
         map_width_frac=w,
         map_height_frac=h,
-        dpi=dpi,
-        preview_mode=preview_mode,
+        dpi=inset_fetch_dpi,
+        preview_mode=True,
+        timeout=inset_fetch_timeout,
     )
     axis_crs = f"EPSG:{display_epsg}"
-    sat_zoom = 16 if preview_mode else 17
+    # A lower, fixed zoom (rather than scaling with the document's own preview/export mode) keeps
+    # every fallback provider's tile count - and therefore fetch time - small and consistent.
+    sat_zoom = 15
     if not basemap_loaded and MAPBOX_ACCESS_TOKEN:
         try:
             ctx.add_basemap(
                 ax_photo, source=_mapbox_satellite_url(), crs=axis_crs, attribution=False,
-                zoom=sat_zoom + 1, reset_extent=True, timeout=_BASEMAP_FETCH_TIMEOUT,
+                zoom=sat_zoom + 1, reset_extent=True, timeout=inset_fetch_timeout,
             )
             basemap_loaded = True
         except Exception:
@@ -4999,7 +5040,7 @@ def _draw_site_plan_photo_inset(
         try:
             ctx.add_basemap(
                 ax_photo, source=ctx.providers.Esri.WorldImagery, crs=axis_crs, attribution=False,
-                zoom=sat_zoom, reset_extent=True, timeout=_BASEMAP_FETCH_TIMEOUT,
+                zoom=sat_zoom, reset_extent=True, timeout=inset_fetch_timeout,
             )
             basemap_loaded = True
         except Exception:
@@ -5008,7 +5049,7 @@ def _draw_site_plan_photo_inset(
         try:
             ctx.add_basemap(
                 ax_photo, source=ctx.providers.OpenStreetMap.Mapnik, crs=axis_crs, attribution=False,
-                zoom=sat_zoom, reset_extent=True, timeout=_BASEMAP_FETCH_TIMEOUT,
+                zoom=sat_zoom, reset_extent=True, timeout=inset_fetch_timeout,
             )
         except Exception:
             pass
@@ -5188,6 +5229,8 @@ def _render_plot_map_layout_site_plan(
     bearing_size: int | None = None,
     area_font: str | None = None,
     area_size: int | None = None,
+    measurement_polygon=None,
+    measurement_area_m2: float | None = None,
 ):
     boundary_color = boundary_color or "red"
     grid_color = grid_color or CADASTRAL_BLUE
@@ -5214,10 +5257,12 @@ def _render_plot_map_layout_site_plan(
         """),
         {"id": plot_id},
     ).fetchall()
-    area_m2 = db.execute(
-        text("SELECT ST_Area(geom::geography) FROM plots WHERE id=:id"),
-        {"id": plot_id}
-    ).scalar() or 0
+    area_m2 = float(measurement_area_m2) if measurement_area_m2 is not None else (
+        db.execute(
+            text("SELECT ST_Area(geom::geography) FROM plots WHERE id=:id"),
+            {"id": plot_id}
+        ).scalar() or 0
+    )
 
     plot_geom = wkb.loads(plot_wkb)
     buildings, rivers, fences = [], [], []
@@ -5291,11 +5336,17 @@ def _render_plot_map_layout_site_plan(
         hemisphere = "north" if centroid.y >= 0 else "south"
         display_epsg = 32600 + utm_zone if hemisphere == "north" else 32700 + utm_zone
 
-    gdf_plot = gpd.GeoDataFrame(geometry=[plot_geom], crs="EPSG:4326").to_crs(epsg=display_epsg)
-    poly = gdf_plot.geometry.iloc[0]
-    if not poly.is_valid:
-        poly = poly.buffer(0)
+    if measurement_polygon is not None:
+        poly = measurement_polygon
+        if not poly.is_valid:
+            poly = poly.buffer(0)
         gdf_plot = gpd.GeoDataFrame(geometry=[poly], crs=f"EPSG:{display_epsg}")
+    else:
+        gdf_plot = gpd.GeoDataFrame(geometry=[plot_geom], crs="EPSG:4326").to_crs(epsg=display_epsg)
+        poly = gdf_plot.geometry.iloc[0]
+        if not poly.is_valid:
+            poly = poly.buffer(0)
+            gdf_plot = gpd.GeoDataFrame(geometry=[poly], crs=f"EPSG:{display_epsg}")
 
     vertex_count = max(0, len(list(poly.exterior.coords)) - 1)
     if not station_names:
@@ -5345,7 +5396,6 @@ def _render_plot_map_layout_site_plan(
         display_epsg=display_epsg,
         boundary_color=boundary_color,
         font_scale=font_scale,
-        preview_mode=preview_mode,
         station_names=station_names,
         text_color=text_color,
     )
@@ -5597,6 +5647,8 @@ def render_plot_map_layout(
     bearing_size: int | None = None,
     area_font: str | None = None,
     area_size: int | None = None,
+    measurement_polygon=None,
+    measurement_area_m2: float | None = None,
 ):
     normalized_template = str(template_name or "general").strip().lower()
     if normalized_template in CADASTRAL_STATE_LABELS:
@@ -5644,6 +5696,8 @@ def render_plot_map_layout(
             bearing_size=bearing_size,
             area_font=area_font,
             area_size=area_size,
+            measurement_polygon=measurement_polygon,
+            measurement_area_m2=measurement_area_m2,
         )
         return
 
@@ -5693,6 +5747,8 @@ def render_plot_map_layout(
             bearing_size=bearing_size,
             area_font=area_font,
             area_size=area_size,
+            measurement_polygon=measurement_polygon,
+            measurement_area_m2=measurement_area_m2,
         )
         return
 
@@ -5750,6 +5806,8 @@ def render_plot_map_layout(
             bearing_size=bearing_size,
             area_font=area_font,
             area_size=area_size,
+            measurement_polygon=measurement_polygon,
+            measurement_area_m2=measurement_area_m2,
         )
         return
 
@@ -5791,6 +5849,8 @@ def render_plot_map_layout(
             bearing_size=bearing_size,
             area_font=area_font,
             area_size=area_size,
+            measurement_polygon=measurement_polygon,
+            measurement_area_m2=measurement_area_m2,
         )
         return
 
@@ -5823,10 +5883,12 @@ def render_plot_map_layout(
         raise ValueError("Plot not found")
 
     # Get accurate area using geography (meters squared) - same as back computation
-    area_m2 = db.execute(
-        text("SELECT ST_Area(geom::geography) FROM plots WHERE id=:id"),
-        {"id": plot_id}
-    ).scalar() or 0
+    area_m2 = float(measurement_area_m2) if measurement_area_m2 is not None else (
+        db.execute(
+            text("SELECT ST_Area(geom::geography) FROM plots WHERE id=:id"),
+            {"id": plot_id}
+        ).scalar() or 0
+    )
 
     plot_geom = wkb.loads(plot_wkb)
     buildings, rivers, fences, detected_roads = [], [], [], []
@@ -5909,13 +5971,19 @@ def render_plot_map_layout(
         hemisphere = "north" if centroid.y >= 0 else "south"
         display_epsg = 32600 + utm_zone if hemisphere == "north" else 32700 + utm_zone
 
-    gdf_plot = gpd.GeoDataFrame(geometry=[plot_geom], crs="EPSG:4326").to_crs(epsg=display_epsg)
-    poly = gdf_plot.geometry.iloc[0]
-
-    # Fix invalid/self-intersecting polygons
-    if not poly.is_valid:
-        poly = poly.buffer(0)
+    if measurement_polygon is not None:
+        poly = measurement_polygon
+        if not poly.is_valid:
+            poly = poly.buffer(0)
         gdf_plot = gpd.GeoDataFrame(geometry=[poly], crs=f"EPSG:{display_epsg}")
+    else:
+        gdf_plot = gpd.GeoDataFrame(geometry=[plot_geom], crs="EPSG:4326").to_crs(epsg=display_epsg)
+        poly = gdf_plot.geometry.iloc[0]
+
+        # Fix invalid/self-intersecting polygons
+        if not poly.is_valid:
+            poly = poly.buffer(0)
+            gdf_plot = gpd.GeoDataFrame(geometry=[poly], crs=f"EPSG:{display_epsg}")
 
     # Get paper configuration
     paper_config = get_paper_config(paper_size)

@@ -86,6 +86,7 @@ def _load_arcgis_export_image(
     pixel_width: int,
     pixel_height: int,
     preview_mode: bool,
+    timeout: tuple[float, float] | None = None,
 ) -> np.ndarray:
     params = {
         "bbox": f"{xmin},{ymin},{xmax},{ymax}",
@@ -99,7 +100,7 @@ def _load_arcgis_export_image(
     response = requests.get(
         _ARCGIS_WORLD_IMAGERY_EXPORT_URL,
         params=params,
-        timeout=_ARCGIS_EXPORT_TIMEOUT,
+        timeout=timeout or _ARCGIS_EXPORT_TIMEOUT,
         headers={"User-Agent": "LandCheck-Orthophoto/1.0"},
     )
     response.raise_for_status()
@@ -122,6 +123,7 @@ def _try_add_arcgis_world_imagery(
     map_height_frac: float,
     dpi: int,
     preview_mode: bool,
+    timeout: tuple[float, float] | None = None,
 ) -> bool:
     try:
         pixel_width, pixel_height = _compute_arcgis_export_size(
@@ -141,6 +143,7 @@ def _try_add_arcgis_world_imagery(
             pixel_width=pixel_width,
             pixel_height=pixel_height,
             preview_mode=preview_mode,
+            timeout=timeout,
         )
         ax.imshow(
             image,
