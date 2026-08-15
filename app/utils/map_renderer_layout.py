@@ -4947,16 +4947,31 @@ def _draw_site_plan_photo_inset(
     """
     x, y, w, h = rect
     ax_photo = fig.add_axes([x, y, w, h])
-    minx, miny, maxx, maxy = poly.bounds
-    cx, cy = (minx + maxx) / 2.0, (miny + maxy) / 2.0
-    span = max(maxx - minx, maxy - miny, 1.0) * 1.35
-    target_xlim = (cx - span / 2.0, cx + span / 2.0)
-    target_ylim = (cy - span / 2.0, cy + span / 2.0)
-    ax_photo.set_xlim(target_xlim)
-    ax_photo.set_ylim(target_ylim)
-
     dpi = 150 if preview_mode else 200
     fig_width, fig_height = fig.get_size_inches()
+
+    # The panel's own physical box is wide/short (matching the page layout), not square - fetching
+    # a square-cropped bbox and letting set_aspect("equal") reconcile it afterward is what was
+    # visibly stretching the imagery (ArcGIS was asked for a non-square pixel image over a square
+    # bbox, distorting the source pixels themselves). Instead, pad the polygon's bounding box and
+    # grow whichever axis is needed so the fetched bbox's own aspect ratio already matches the
+    # panel's real physical aspect ratio - the imagery comes back undistorted, and the panel shows
+    # more real-world width instead of empty margin either side.
+    box_w_in = max(fig_width * w, 0.01)
+    box_h_in = max(fig_height * h, 0.01)
+    box_aspect = box_w_in / box_h_in
+    minx, miny, maxx, maxy = poly.bounds
+    cx, cy = (minx + maxx) / 2.0, (miny + maxy) / 2.0
+    padded_w = max((maxx - minx) * 1.35, 1.0)
+    padded_h = max((maxy - miny) * 1.35, 1.0)
+    if padded_w / padded_h > box_aspect:
+        padded_h = padded_w / box_aspect
+    else:
+        padded_w = padded_h * box_aspect
+    target_xlim = (cx - padded_w / 2.0, cx + padded_w / 2.0)
+    target_ylim = (cy - padded_h / 2.0, cy + padded_h / 2.0)
+    ax_photo.set_xlim(target_xlim)
+    ax_photo.set_ylim(target_ylim)
     basemap_loaded = _try_add_arcgis_world_imagery(
         ax_photo,
         target_xlim=target_xlim,
@@ -5004,7 +5019,7 @@ def _draw_site_plan_photo_inset(
     xs, ys = zip(*coords)
     ax_photo.plot(xs, ys, color=boundary_color, lw=1.6 * font_scale, zorder=10)
     vertex_coords = coords[:-1] if len(coords) > 1 else coords
-    label_offset = span * 0.02
+    label_offset = min(padded_w, padded_h) * 0.02
     for (vx, vy), label in zip(vertex_coords, labels):
         ax_photo.scatter([vx], [vy], s=16 * max(0.8, font_scale), marker="s", color=boundary_color, zorder=11)
         ax_photo.text(
@@ -5467,7 +5482,9 @@ def _render_plot_map_layout_site_plan(
     )
 
     axes_box = ax.get_position()
-    arrow_x = axes_box.x1
+    # A touch right of the map/photo panels' shared right edge (both are map_width wide) so the
+    # arrow clears the photo panel's frame border instead of sitting right on top of it.
+    arrow_x = min(0.965, axes_box.x1 + 0.025)
     arrow_y = min(0.93, axes_box.y1 + 0.045)
     add_north_arrow(
         ax, font_scale=font_scale * 1.1, style=north_arrow_style, color=north_arrow_color,
