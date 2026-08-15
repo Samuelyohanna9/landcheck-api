@@ -22,6 +22,13 @@ from matplotlib.font_manager import FontProperties
 from matplotlib.path import Path
 from datetime import datetime
 from matplotlib.backends.backend_agg import FigureCanvasAgg as FigureCanvas
+import contextily as ctx
+from app.utils.orthophoto_renderer import (
+    _try_add_arcgis_world_imagery,
+    _mapbox_satellite_url,
+    MAPBOX_ACCESS_TOKEN,
+    _BASEMAP_FETCH_TIMEOUT,
+)
 
 # ======================
 # Paper Size Configuration
@@ -4887,6 +4894,586 @@ def _render_plot_map_layout_fct(
     plt.close(fig)
 
 # ======================
+# Site Plan template
+# ======================
+# A compact single-page layout modeled on a real "Site Plan" reference document: a plain-language
+# title block (no PLAN NO / coordinate-guide apparatus like the cadastral templates above), a
+# small aerial-photo inset panel with the boundary overlaid, the vector boundary plot below it,
+# and a footer showing the first beacon's UTM coordinate plus the surveyor's sign-off.
+
+SITE_PLAN_FONT_FAMILY = "DejaVu Serif"
+
+
+def _utm_zone_band_letter(lat_deg: float) -> str:
+    """MGRS latitude band letter (e.g. the "P" in "zone 33P"). The cadastral templates only ever
+    show a bare UTM zone number via `_resolve_cadastral_coordinate_system_text`; the Site Plan
+    reference labels the zone with its band letter too, so this is new rather than reused.
+    """
+    bands = "CDEFGHJKLMNPQRSTUVWX"
+    lat = float(lat_deg)
+    if lat <= -80.0:
+        return bands[0]
+    if lat >= 84.0:
+        return bands[-1]
+    idx = int((lat + 80.0) // 8.0)
+    idx = min(max(idx, 0), len(bands) - 1)
+    return bands[idx]
+
+
+def _format_site_plan_area(area_m2: float) -> str:
+    """Compact "Area=2954.52Sqm" / "Area=1.2500Ha" style matching the reference document, using
+    the same sub-1-hectare-switches-to-Sqm threshold as `format_area_display` elsewhere.
+    """
+    if area_m2 < 10000:
+        return f"Area={area_m2:.2f}Sqm"
+    return f"Area={area_m2 / 10000.0:.4f}Ha"
+
+
+def _draw_site_plan_photo_inset(
+    fig,
+    rect: tuple[float, float, float, float],
+    poly,
+    display_epsg: int,
+    boundary_color: str = "red",
+    font_scale: float = 1.0,
+    preview_mode: bool = False,
+) -> None:
+    """Small framed aerial-photo panel with the boundary overlaid in red - reuses the existing
+    ArcGIS World Imagery fetch (`_try_add_arcgis_world_imagery`) plus the same Mapbox/Esri/OSM
+    fallback chain used by the standalone orthophoto export, rather than reimplementing image
+    fetching for this template.
+    """
+    x, y, w, h = rect
+    ax_photo = fig.add_axes([x, y, w, h])
+    minx, miny, maxx, maxy = poly.bounds
+    cx, cy = (minx + maxx) / 2.0, (miny + maxy) / 2.0
+    span = max(maxx - minx, maxy - miny, 1.0) * 1.35
+    target_xlim = (cx - span / 2.0, cx + span / 2.0)
+    target_ylim = (cy - span / 2.0, cy + span / 2.0)
+    ax_photo.set_xlim(target_xlim)
+    ax_photo.set_ylim(target_ylim)
+
+    dpi = 150 if preview_mode else 200
+    fig_width, fig_height = fig.get_size_inches()
+    basemap_loaded = _try_add_arcgis_world_imagery(
+        ax_photo,
+        target_xlim=target_xlim,
+        target_ylim=target_ylim,
+        axis_epsg=display_epsg,
+        fig_width=fig_width,
+        fig_height=fig_height,
+        map_width_frac=w,
+        map_height_frac=h,
+        dpi=dpi,
+        preview_mode=preview_mode,
+    )
+    axis_crs = f"EPSG:{display_epsg}"
+    sat_zoom = 16 if preview_mode else 17
+    if not basemap_loaded and MAPBOX_ACCESS_TOKEN:
+        try:
+            ctx.add_basemap(
+                ax_photo, source=_mapbox_satellite_url(), crs=axis_crs, attribution=False,
+                zoom=sat_zoom + 1, reset_extent=True, timeout=_BASEMAP_FETCH_TIMEOUT,
+            )
+            basemap_loaded = True
+        except Exception:
+            pass
+    if not basemap_loaded:
+        try:
+            ctx.add_basemap(
+                ax_photo, source=ctx.providers.Esri.WorldImagery, crs=axis_crs, attribution=False,
+                zoom=sat_zoom, reset_extent=True, timeout=_BASEMAP_FETCH_TIMEOUT,
+            )
+            basemap_loaded = True
+        except Exception:
+            pass
+    if not basemap_loaded:
+        try:
+            ctx.add_basemap(
+                ax_photo, source=ctx.providers.OpenStreetMap.Mapnik, crs=axis_crs, attribution=False,
+                zoom=sat_zoom, reset_extent=True, timeout=_BASEMAP_FETCH_TIMEOUT,
+            )
+        except Exception:
+            pass
+
+    ax_photo.set_xlim(target_xlim)
+    ax_photo.set_ylim(target_ylim)
+    xs, ys = zip(*list(poly.exterior.coords))
+    ax_photo.plot(xs, ys, color=boundary_color, lw=1.6 * font_scale, zorder=10)
+    ax_photo.scatter(xs[:-1], ys[:-1], s=14 * max(0.8, font_scale), marker="s", color=boundary_color, zorder=11)
+    ax_photo.set_aspect("equal")
+    ax_photo.set_xticks([])
+    ax_photo.set_yticks([])
+    for spine in ax_photo.spines.values():
+        spine.set_edgecolor("black")
+        spine.set_linewidth(1.1 * font_scale)
+
+
+def _draw_site_plan_header(
+    fig,
+    applicant_name: str,
+    location_text: str,
+    lga_text: str,
+    state_text: str,
+    area_m2: float,
+    font_scale: float = 1.0,
+    text_color: str = "black",
+    title_font: str | None = None,
+    title_size: int | None = None,
+    area_font: str | None = None,
+    area_size: int | None = None,
+) -> float:
+    """Draws the reference document's title block: a single wrapped sentence ("SITE PLAN IN
+    RESPECT OF ..., LOCATED AT ..., ... LOCAL GOVERNMENT AREA, ... STATE") followed by an
+    underlined italic red area line. Returns the y-coordinate just below the block so the caller
+    can position the photo inset beneath it.
+    """
+    fig.add_artist(patches.Rectangle((0.03, 0.03), 0.94, 0.94, transform=fig.transFigure, fill=False, lw=1.2))
+
+    sentence = (
+        f"SITE PLAN IN RESPECT OF {_safe_text(applicant_name, '-').upper()}, "
+        f"LOCATED AT {_safe_text(location_text, '-').upper()}, "
+        f"{_safe_text(lga_text, '-').upper()} LOCAL GOVERNMENT AREA, "
+        f"{_safe_text(state_text, '-').upper()} STATE"
+    )
+    fs = title_size if title_size else max(8, int(10 * font_scale))
+    family = title_font or SITE_PLAN_FONT_FAMILY
+    lines = _wrap_figure_text(fig, sentence, width_fig=0.86, fontsize=fs, fontweight="bold", fontfamily=family) or [sentence]
+
+    y = 0.955
+    line_h = 0.024
+    for line_text in lines:
+        fig.text(
+            0.5, y, line_text, ha="center", va="center", fontsize=fs, weight="bold",
+            fontfamily=family, color=text_color,
+        )
+        y -= line_h
+
+    y -= 0.006
+    area_text = _format_site_plan_area(area_m2)
+    area_fs = area_size if area_size else max(8, int(9.5 * font_scale))
+    area_family = area_font or SITE_PLAN_FONT_FAMILY
+    fig.text(
+        0.5, y, area_text, ha="center", va="center", fontsize=area_fs, style="italic", weight="bold",
+        fontfamily=area_family, color="red",
+    )
+    try:
+        renderer = fig.canvas.get_renderer()
+    except Exception:
+        fig.canvas.draw()
+        renderer = fig.canvas.get_renderer()
+    fp = FontProperties(size=area_fs, weight="bold", style="italic", family=area_family)
+    try:
+        text_w_px, _, _ = renderer.get_text_width_height_descent(area_text, fp, ismath=False)
+        fig_w_px = max(float(fig.bbox.width), 1.0)
+        half_w = (text_w_px / fig_w_px) / 2.0
+    except Exception:
+        half_w = 0.09
+    underline_y = y - 0.012
+    fig.add_artist(mlines.Line2D(
+        [0.5 - half_w, 0.5 + half_w], [underline_y, underline_y], transform=fig.transFigure,
+        color="red", lw=0.9 * font_scale,
+    ))
+    return underline_y - 0.02
+
+
+def _draw_site_plan_footer(
+    fig,
+    first_easting_m: float,
+    first_northing_m: float,
+    first_station_name: str,
+    display_epsg: int,
+    utm_band_letter: str,
+    surveyor_name: str,
+    surveyor_rank: str,
+    scale_text: str,
+    font_scale: float = 1.0,
+    text_color: str = "black",
+    grid_color: str = CADASTRAL_BLUE,
+) -> None:
+    if 32600 < display_epsg < 32700:
+        zone_number = display_epsg - 32600
+    elif 32700 < display_epsg < 32800:
+        zone_number = display_epsg - 32700
+    else:
+        zone_number = 0
+
+    y_top = 0.155
+    fs = max(7, int(8 * font_scale))
+    fig.text(0.06, y_top, "WGS 84", fontsize=fs, weight="bold", color=grid_color, fontfamily=SITE_PLAN_FONT_FAMILY)
+    fig.text(
+        0.06, y_top - 0.022, f"UTM Coordinate (zone {zone_number}{utm_band_letter})",
+        fontsize=fs, color=grid_color, fontfamily=SITE_PLAN_FONT_FAMILY,
+    )
+    fig.text(
+        0.06, y_top - 0.044,
+        f"{_safe_text(first_station_name, 'TP1')}:{first_easting_m:010.2f}Em,{first_northing_m:010.2f}Nm",
+        fontsize=fs, color=grid_color, fontfamily=SITE_PLAN_FONT_FAMILY,
+    )
+
+    fig.text(
+        0.06, y_top - 0.075, f"Surveyed by: {_safe_text(surveyor_name, '-')}"
+        + (f", {_safe_text(surveyor_rank)}" if _safe_text(surveyor_rank) else ""),
+        fontsize=fs, color=text_color, fontfamily=SITE_PLAN_FONT_FAMILY,
+    )
+    fig.text(0.06, y_top - 0.097, "Sign:____________________", fontsize=fs, color=text_color, fontfamily=SITE_PLAN_FONT_FAMILY)
+
+    fig.text(
+        0.94, y_top, f"Scale {_normalize_scale_label_adamawa(scale_text)}",
+        fontsize=fs, ha="right", color=text_color, fontfamily=SITE_PLAN_FONT_FAMILY,
+    )
+
+
+def _render_plot_map_layout_site_plan(
+    db,
+    plot_id: int,
+    output_path: str,
+    title_text: str,
+    location_text: str,
+    lga_text: str,
+    state_text: str,
+    scale_text: str,
+    surveyor_name: str,
+    surveyor_rank: str,
+    paper_size: str = "A4",
+    station_names=None,
+    coordinate_system: str = "wgs84",
+    epsg_code: int = 4326,
+    north_arrow_style: str = "one_side_stem",
+    north_arrow_color: str = "black",
+    beacon_style: str = "cross",
+    road_width_m: float | None = None,
+    road_width_override_m: float | None = None,
+    preview_mode: bool = False,
+    boundary_color: str | None = None,
+    grid_color: str | None = None,
+    text_color: str | None = None,
+    road_color: str | None = None,
+    river_color: str | None = None,
+    building_color: str | None = None,
+    building_hatch_type: str | None = None,
+    road_style: str | None = None,
+    title_font: str | None = None,
+    title_size: int | None = None,
+    station_font: str | None = None,
+    station_size: int | None = None,
+    bearing_font: str | None = None,
+    bearing_size: int | None = None,
+    area_font: str | None = None,
+    area_size: int | None = None,
+):
+    boundary_color = boundary_color or "red"
+    grid_color = grid_color or CADASTRAL_BLUE
+    text_color = text_color or "black"
+    road_color = road_color or "black"
+    river_color = river_color or "#10a3df"
+    building_color = building_color or "black"
+    building_hatch_type = building_hatch_type or "diagonal"
+    road_style = road_style or ""
+
+    plot_wkb = db.execute(text("SELECT geom FROM plots WHERE id=:id"), {"id": plot_id}).scalar()
+    if not plot_wkb:
+        raise ValueError("Plot not found")
+
+    rows = db.execute(
+        text("SELECT geom, feature_type FROM detected_features WHERE plot_id=:id"),
+        {"id": plot_id},
+    ).fetchall()
+    override_rows = db.execute(
+        text("""
+            SELECT feature_type, action, name, width_m, ST_AsGeoJSON(geom) AS geojson
+            FROM plot_feature_overrides
+            WHERE plot_id = :id
+        """),
+        {"id": plot_id},
+    ).fetchall()
+    area_m2 = db.execute(
+        text("SELECT ST_Area(geom::geography) FROM plots WHERE id=:id"),
+        {"id": plot_id}
+    ).scalar() or 0
+
+    plot_geom = wkb.loads(plot_wkb)
+    buildings, rivers, fences = [], [], []
+    for r in rows:
+        g = wkb.loads(r.geom)
+        if r.feature_type == "building":
+            buildings.append(g)
+        elif r.feature_type == "river":
+            rivers.append(g)
+        elif r.feature_type == "fence":
+            fences.append(g)
+    detected_roads = _fetch_live_road_geoms(db, plot_id)
+
+    overrides = []
+    import json
+    for r in override_rows:
+        geom = None
+        if r.geojson:
+            try:
+                geom = shape(json.loads(r.geojson))
+            except Exception:
+                geom = None
+        overrides.append({"feature_type": r.feature_type, "action": r.action, "name": r.name, "geom": geom})
+
+    def apply_overrides(base_list, feature_type: str):
+        result = list(base_list)
+        added = []
+        delete_geoms = []
+        use_coverage_match = feature_type in ("road", "river", "fence")
+        for ov in overrides:
+            if ov["feature_type"] != feature_type:
+                continue
+            geom = ov["geom"]
+            if geom is None:
+                continue
+            try:
+                if hasattr(geom, "is_valid") and not geom.is_valid:
+                    geom = geom.buffer(0)
+            except Exception:
+                pass
+            if ov["action"] in ("delete", "update"):
+                if use_coverage_match:
+                    result = [g for g in result if not _feature_override_replaces_native(g, geom, feature_type)]
+                else:
+                    result = [g for g in result if not g.intersects(geom)]
+                delete_geoms.append(geom)
+            if ov["action"] in ("add", "update"):
+                result.append(geom)
+                added.append(geom)
+        if delete_geoms:
+            if use_coverage_match:
+                added = [
+                    g for g in added
+                    if not any(_feature_override_replaces_native(g, dg, feature_type) for dg in delete_geoms)
+                ]
+            else:
+                added = [g for g in added if not any(g.intersects(dg) for dg in delete_geoms)]
+        return result, added
+
+    buildings, added_buildings = apply_overrides(buildings, "building")
+    rivers, _ = apply_overrides(rivers, "river")
+    fences, _ = apply_overrides(fences, "fence")
+    roads_for_draw, _ = apply_overrides(detected_roads, "road")
+    road_add_named_overrides = _resolve_override_names(overrides, "road")
+    river_add_named_overrides = _resolve_override_names(overrides, "river")
+
+    display_epsg = epsg_code
+    if coordinate_system == "wgs84" or epsg_code == 4326:
+        centroid = plot_geom.centroid
+        utm_zone = int((centroid.x + 180) / 6) + 1
+        hemisphere = "north" if centroid.y >= 0 else "south"
+        display_epsg = 32600 + utm_zone if hemisphere == "north" else 32700 + utm_zone
+
+    gdf_plot = gpd.GeoDataFrame(geometry=[plot_geom], crs="EPSG:4326").to_crs(epsg=display_epsg)
+    poly = gdf_plot.geometry.iloc[0]
+    if not poly.is_valid:
+        poly = poly.buffer(0)
+        gdf_plot = gpd.GeoDataFrame(geometry=[poly], crs=f"EPSG:{display_epsg}")
+
+    vertex_count = max(0, len(list(poly.exterior.coords)) - 1)
+    if not station_names:
+        station_names = [f"TP{i + 1}" for i in range(vertex_count)]
+
+    paper_config = get_paper_config(paper_size)
+    fig_width = paper_config["width"]
+    fig_height = paper_config["height"]
+    font_scale = paper_config["scale"]
+    dpi = 150 if preview_mode else 200
+
+    fig = plt.figure(figsize=(fig_width, fig_height), dpi=dpi)
+    _ = FigureCanvas(fig)
+
+    header_bottom_y = _draw_site_plan_header(
+        fig,
+        applicant_name=title_text,
+        location_text=location_text,
+        lga_text=lga_text,
+        state_text=state_text,
+        area_m2=float(area_m2 or 0),
+        font_scale=font_scale,
+        text_color=text_color,
+        title_font=title_font,
+        title_size=title_size,
+        area_font=area_font,
+        area_size=area_size,
+    )
+
+    photo_h = 0.16
+    photo_w = 0.30
+    photo_x = 0.5 - photo_w / 2.0
+    photo_y = header_bottom_y - photo_h
+    _draw_site_plan_photo_inset(
+        fig,
+        rect=(photo_x, photo_y, photo_w, photo_h),
+        poly=poly,
+        display_epsg=display_epsg,
+        boundary_color=boundary_color,
+        font_scale=font_scale,
+        preview_mode=preview_mode,
+    )
+
+    footer_top_y = 0.19
+    map_bottom = footer_top_y
+    map_top = photo_y - 0.02
+    map_height = max(0.28, map_top - map_bottom)
+    map_left, map_width = 0.08, 0.84
+    ax = fig.add_axes([map_left, map_bottom, map_width, map_height])
+
+    resolved_scale_text, scale_ratio = resolve_scale_text_and_ratio(
+        scale_text, poly, fig_width * map_width, fig_height * map_height,
+    )
+
+    apply_true_scale(ax, poly, scale_ratio, fig_width * map_width, fig_height * map_height)
+    target_xlim = ax.get_xlim()
+    target_ylim = ax.get_ylim()
+    from shapely.geometry import box
+    extent_poly = box(target_xlim[0], target_ylim[0], target_xlim[1], target_ylim[1])
+
+    visible_rivers = filter_features_by_scale(rivers, display_epsg, scale_ratio, min_paper_mm=2.0)
+    if visible_rivers:
+        gpd.GeoDataFrame(geometry=visible_rivers, crs="EPSG:4326").to_crs(epsg=display_epsg).plot(
+            ax=ax, color=river_color, lw=scaled_line_weight(0.3, font_scale, scale_ratio), zorder=5
+        )
+
+    road_geom_width = []
+    road_snap_tol = max(1.0, (5.0 / 1000.0) * scale_ratio)
+    for geom in roads_for_draw:
+        if geom is None:
+            continue
+        try:
+            gdf_line = gpd.GeoSeries([geom], crs="EPSG:4326").to_crs(epsg=display_epsg)
+            line_proj = gdf_line.iloc[0]
+        except Exception:
+            continue
+        expanded_frame = extent_poly.buffer(road_snap_tol)
+        clipped = line_proj.intersection(expanded_frame)
+        if clipped.is_empty:
+            continue
+        snapped_clipped = snap(clipped, extent_poly.boundary, road_snap_tol)
+        try:
+            half_w = max(1.0, (road_width_m or 3.0) / 2.0)
+            road_geom_width.append((snapped_clipped, half_w))
+        except Exception:
+            continue
+    road_edge_lines = _collect_connected_road_edge_lines(road_geom_width, snap_tol_m=road_snap_tol)
+    _draw_road_edges(ax, road_edge_lines, font_scale=font_scale, color=road_color, linestyle=(0, (6, 4)), scale_ratio=scale_ratio, road_style=road_style)
+
+    if _safe_text(location_text):
+        try:
+            _draw_cadastral_frontage_road(ax, poly, location_text, font_scale=font_scale, color=road_color)
+        except Exception:
+            pass
+
+    def _project_clip_named(geom, name):
+        try:
+            gdf_line = gpd.GeoSeries([geom], crs="EPSG:4326").to_crs(epsg=display_epsg)
+            line_proj = gdf_line.iloc[0]
+        except Exception:
+            return None
+        expanded_frame = extent_poly.buffer(road_snap_tol)
+        clipped = line_proj.intersection(expanded_frame)
+        if clipped.is_empty:
+            return None
+        return snap(clipped, extent_poly.boundary, road_snap_tol), name
+
+    min_named_len = max(2.0, (10.0 / 1000.0) * scale_ratio)
+    road_label_features = [r for r in (_project_clip_named(g, n) for g, n in road_add_named_overrides) if r and r[0].length > min_named_len]
+    river_label_features = [r for r in (_project_clip_named(g, n) for g, n in river_add_named_overrides) if r and r[0].length > min_named_len]
+    _draw_names_along_path(ax, road_label_features, color=road_color, font_scale=font_scale, base_fontsize=6.0)
+    _draw_names_along_path(ax, river_label_features, color=river_color, font_scale=font_scale, base_fontsize=6.0)
+
+    all_buildings = []
+    if buildings:
+        all_buildings.extend(buildings)
+    if added_buildings:
+        all_buildings.extend(added_buildings)
+    visible_buildings = filter_features_by_scale(all_buildings, display_epsg, scale_ratio, min_paper_mm=2.0)
+    if visible_buildings:
+        draw_building_hatch(
+            ax, visible_buildings, display_epsg, scale_ratio=scale_ratio, font_scale=font_scale,
+            color=building_color, hatch_type=building_hatch_type,
+        )
+        gpd.GeoDataFrame(geometry=visible_buildings, crs="EPSG:4326").to_crs(epsg=display_epsg).plot(
+            ax=ax, facecolor="none", edgecolor=building_color, lw=scaled_line_weight(0.2, font_scale, scale_ratio), zorder=8
+        )
+    if fences:
+        draw_fences(ax, fences, display_epsg, scale_ratio=scale_ratio, font_scale=font_scale)
+    fence_avoid_geom = build_fence_avoid_geom(fences, display_epsg=display_epsg, scale_ratio=scale_ratio)
+
+    label_avoid_parts = [g for g in (fence_avoid_geom,) if g is not None]
+    if all_buildings:
+        try:
+            buildings_buffer_m = max(1.0, (2.0 / 1000.0) * scale_ratio)
+            buildings_proj = gpd.GeoSeries(all_buildings, crs="EPSG:4326").to_crs(epsg=display_epsg)
+            buildings_avoid = unary_union(list(buildings_proj.buffer(buildings_buffer_m)))
+            if buildings_avoid is not None and not buildings_avoid.is_empty:
+                label_avoid_parts.append(buildings_avoid)
+        except Exception:
+            pass
+    if road_edge_lines:
+        try:
+            road_buffer_m = max(1.0, (3.0 / 1000.0) * scale_ratio)
+            roads_avoid = unary_union([seg.buffer(road_buffer_m) for seg in road_edge_lines])
+            if roads_avoid is not None and not roads_avoid.is_empty:
+                label_avoid_parts.append(roads_avoid)
+        except Exception:
+            pass
+    label_avoid_geom = unary_union(label_avoid_parts) if label_avoid_parts else None
+
+    gdf_plot.plot(ax=ax, facecolor="none", edgecolor=boundary_color, lw=1.1 * font_scale, zorder=20)
+    ax.set_xlim(target_xlim)
+    ax.set_ylim(target_ylim)
+
+    annotate_vertices(
+        ax, poly, plot_id, station_names=station_names, font_scale=font_scale, min_label_length_m=0.0,
+        avoid_geom=label_avoid_geom, scale_ratio=scale_ratio, boundary_poly=poly, beacon_style=beacon_style,
+        text_color=text_color, boundary_color=boundary_color, station_font=station_font, station_size=station_size,
+        bearing_font=bearing_font, bearing_size=bearing_size,
+    )
+
+    axes_box = ax.get_position()
+    arrow_x = axes_box.x1
+    arrow_y = min(0.93, axes_box.y1 + 0.045)
+    add_north_arrow(
+        ax, font_scale=font_scale * 1.1, style=north_arrow_style, color=north_arrow_color,
+        anchor_x=arrow_x, anchor_y=arrow_y, blue_hex=grid_color,
+    )
+
+    ax.set_aspect("equal")
+    ax.axis("off")
+    fig.canvas.draw()
+
+    first_coords = list(poly.exterior.coords)[0]
+    first_station_name = str(station_names[0]).strip() if station_names else "TP1"
+    try:
+        first_point_wgs84 = gpd.GeoSeries(
+            [Point(first_coords[0], first_coords[1])], crs=f"EPSG:{display_epsg}"
+        ).to_crs(epsg=4326).iloc[0]
+        first_lat = first_point_wgs84.y
+    except Exception:
+        first_lat = plot_geom.centroid.y
+    utm_band_letter = _utm_zone_band_letter(first_lat)
+
+    _draw_site_plan_footer(
+        fig,
+        first_easting_m=first_coords[0],
+        first_northing_m=first_coords[1],
+        first_station_name=first_station_name,
+        display_epsg=display_epsg,
+        utm_band_letter=utm_band_letter,
+        surveyor_name=surveyor_name,
+        surveyor_rank=surveyor_rank,
+        scale_text=resolved_scale_text,
+        font_scale=font_scale,
+        text_color=text_color,
+        grid_color=grid_color,
+    )
+
+    fig.savefig(output_path, dpi=dpi)
+    plt.close(fig)
+
+
+# ======================
 # Main Renderer Function
 # ======================
 
@@ -5105,6 +5692,47 @@ def render_plot_map_layout(
             title_size=title_size,
             grid_font=grid_font,
             grid_size=grid_size,
+            station_font=station_font,
+            station_size=station_size,
+            bearing_font=bearing_font,
+            bearing_size=bearing_size,
+            area_font=area_font,
+            area_size=area_size,
+        )
+        return
+
+    if normalized_template == "site_plan":
+        _render_plot_map_layout_site_plan(
+            db=db,
+            plot_id=plot_id,
+            output_path=output_path,
+            title_text=title_text,
+            location_text=location_text,
+            lga_text=lga_text,
+            state_text=state_text,
+            scale_text=scale_text,
+            surveyor_name=surveyor_name,
+            surveyor_rank=surveyor_rank,
+            paper_size=paper_size,
+            station_names=station_names,
+            coordinate_system=coordinate_system,
+            epsg_code=epsg_code,
+            north_arrow_style=north_arrow_style,
+            north_arrow_color=north_arrow_color,
+            beacon_style=beacon_style,
+            road_width_m=road_width_m,
+            road_width_override_m=road_width_override_m,
+            preview_mode=preview_mode,
+            boundary_color=boundary_color,
+            grid_color=grid_color,
+            text_color=text_color,
+            road_color=road_color,
+            river_color=river_color,
+            building_color=building_color,
+            building_hatch_type=building_hatch_type,
+            road_style=road_style,
+            title_font=title_font,
+            title_size=title_size,
             station_font=station_font,
             station_size=station_size,
             bearing_font=bearing_font,
