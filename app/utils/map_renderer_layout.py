@@ -137,14 +137,11 @@ def _clockwise_ring_coords_and_labels(poly, station_names=None):
 
 
 def format_bearing_dms(bearing_deg: float) -> str:
-    """Degrees-minutes-seconds, matching AutoCAD's usual DMS bearing display precision - the
-    on-drawing labels used to truncate to whole minutes, which reads as a "different" bearing
-    next to Civil 3D's seconds-precision readout even when the underlying angle is identical.
-    """
-    total_seconds = int(round(bearing_deg * 3600.0)) % 1296000  # 360 * 3600, wraps safely
-    deg, remainder_seconds = divmod(total_seconds, 3600)
-    minutes, seconds = divmod(remainder_seconds, 60)
-    return f"{deg}\u00B0{minutes:02d}\u2032{seconds:02d}\u2033"
+    """Degrees-minutes, for the on-drawing plan display (the back-computation report's own
+    deg_to_dms shows seconds - this is deliberately left at minute precision for the plan)."""
+    total_minutes = int(round(bearing_deg * 60.0)) % 21600  # 360 * 60, wraps safely
+    deg, minutes = divmod(total_minutes, 60)
+    return f"{deg}\u00B0{minutes:02d}\u2032"
 
 
 def format_area_display(area_m2: float) -> str:
