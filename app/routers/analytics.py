@@ -568,7 +568,11 @@ def get_survey_users(request: Request, db: Session = Depends(get_db)):
     unlike plot counts/analytics is real PII, so unauthenticated access isn't acceptable here."""
     require_super_admin_request(db, request)
     ensure_survey_auth_schema()
+    ensure_plot_meta_table(db)
 
+    # Plots nested per user (id/title/location/template/date) so the admin dashboard can offer a
+    # "redownload" action per plot without a second round-trip - reuses the same plot_meta fields
+    # the "Plot Details" section already keys its report-download links off of.
     rows = db.execute(text("""
         SELECT
             u.id,
@@ -576,9 +580,22 @@ def get_survey_users(request: Request, db: Session = Depends(get_db)):
             u.full_name,
             u.created_at,
             u.last_login_at,
-            COUNT(p.id) AS plot_count
+            COUNT(p.id) AS plot_count,
+            COALESCE(
+                json_agg(
+                    json_build_object(
+                        'plot_id', p.id,
+                        'title_text', pm.title_text,
+                        'location_text', pm.location_text,
+                        'template_name', pm.template_name,
+                        'created_at', p.created_at
+                    ) ORDER BY p.created_at DESC
+                ) FILTER (WHERE p.id IS NOT NULL),
+                '[]'
+            ) AS plots
         FROM survey_users u
         LEFT JOIN plots p ON p.owner_user_id = u.id
+        LEFT JOIN plot_meta pm ON pm.plot_id = p.id
         GROUP BY u.id
         ORDER BY u.created_at DESC
     """)).mappings().all()
@@ -591,6 +608,16 @@ def get_survey_users(request: Request, db: Session = Depends(get_db)):
             "created_at": row["created_at"].isoformat() if row["created_at"] else None,
             "last_login_at": row["last_login_at"].isoformat() if row["last_login_at"] else None,
             "plot_count": int(row["plot_count"] or 0),
+            "plots": [
+                {
+                    "plot_id": int(plot["plot_id"]),
+                    "title_text": plot.get("title_text"),
+                    "location_text": plot.get("location_text"),
+                    "template_name": plot.get("template_name"),
+                    "created_at": plot.get("created_at"),
+                }
+                for plot in (row["plots"] or [])
+            ],
         }
         for row in rows
     ]
