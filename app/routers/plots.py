@@ -56,6 +56,7 @@ from app.utils.map_renderer_layout import (
 )
 from app.utils.back_computation import compute_back_computation
 from app.utils.back_computation_pdf import render_back_computation_pdf
+from app.utils.coordinate_converter import resolve_coordinate_system_key
 from shapely import wkb
 from shapely.errors import GEOSException
 import geopandas as gpd
@@ -1393,6 +1394,56 @@ def _metric_epsg_for_wgs84_polygon(poly_wgs84: Polygon) -> int:
     zone = int((centroid.x + 180) / 6) + 1
     zone = max(1, min(zone, 60))
     return (32600 + zone) if centroid.y >= 0 else (32700 + zone)
+
+
+def _epsg_display_name(epsg_code: int, fallback_key: str = "wgs84") -> str:
+    try:
+        epsg = int(epsg_code or 4326)
+    except Exception:
+        epsg = 4326
+    if 32600 < epsg < 32700:
+        return f"UTM Zone {epsg - 32600}N"
+    if 32700 < epsg < 32800:
+        return f"UTM Zone {epsg - 32700}S"
+    return COORDINATE_SYSTEM_NAMES.get(str(fallback_key or "wgs84").strip().lower(), f"EPSG:{epsg}")
+
+
+def _resolve_survey_render_crs(
+    coordinate_system: str | None,
+    plot_geom_wgs84: Polygon | None,
+) -> tuple[str, int, str]:
+    selected_key = str(coordinate_system or "wgs84").strip().lower() or "wgs84"
+    resolved_key = selected_key
+
+    if plot_geom_wgs84 is not None and not plot_geom_wgs84.is_empty:
+        centroid = plot_geom_wgs84.centroid
+        if selected_key == "wgs84":
+            metric_epsg = _metric_epsg_for_wgs84_polygon(plot_geom_wgs84)
+            resolved_key = {
+                32631: "utm_31n",
+                32632: "utm_32n",
+                32633: "utm_33n",
+            }.get(int(metric_epsg), selected_key)
+        else:
+            resolved_key = resolve_coordinate_system_key(
+                selected_key,
+                float(centroid.x),
+                float(centroid.y),
+            )
+
+    epsg_code = COORDINATE_SYSTEMS.get(resolved_key, COORDINATE_SYSTEMS.get(selected_key, 4326))
+
+    if selected_key == "wgs84_nigeria_meters":
+        crs_name = f"WGS84 Nigeria Metres ({_epsg_display_name(epsg_code, resolved_key)})"
+        render_key = resolved_key
+    elif selected_key == "wgs84":
+        crs_name = _epsg_display_name(epsg_code, resolved_key)
+        render_key = selected_key
+    else:
+        crs_name = COORDINATE_SYSTEM_NAMES.get(resolved_key, _epsg_display_name(epsg_code, resolved_key))
+        render_key = selected_key
+
+    return render_key, int(epsg_code), crs_name
 
 
 def _survey_template_map_frame(template_name: str | None) -> tuple[float, float]:
@@ -2781,8 +2832,11 @@ def _compose_child_title(parent_meta: dict, lot_no: str, estate_name: str | None
 
 def _render_survey_plan_pdf_for_plot(db: Session, plot_id: int, output_pdf_path: str):
     meta = get_plot_meta(db, plot_id)
-    epsg_code = COORDINATE_SYSTEMS.get(meta["coordinate_system"], 4326)
-    crs_name = COORDINATE_SYSTEM_NAMES.get(meta["coordinate_system"], "WGS84")
+    plot_geom_wgs84 = _load_plot_polygon_wgs84(db, plot_id)
+    render_coordinate_system, epsg_code, crs_name = _resolve_survey_render_crs(
+        meta["coordinate_system"],
+        plot_geom_wgs84,
+    )
 
     tmp_map = tempfile.NamedTemporaryFile(suffix="_map.png", delete=False)
     map_path = tmp_map.name
@@ -2801,7 +2855,7 @@ def _render_survey_plan_pdf_for_plot(db: Session, plot_id: int, output_pdf_path:
         surveyor_rank=meta["surveyor_rank"],
         certification_statement=meta.get("certification_statement"),
         station_names=None,
-        coordinate_system=meta["coordinate_system"],
+        coordinate_system=render_coordinate_system,
         epsg_code=epsg_code,
         crs_footer_text=f"COORDINATE SYSTEM: {crs_name}",
         paper_size=meta["paper_size"],
@@ -3556,7 +3610,11 @@ def _get_subdivision_batch_clean_copy_context(
         effective_paper_size = "A4"
     effective_scale_text = str(scale_text or parent_meta.get("scale_text") or "1 : 1000")
     effective_coordinate_system = str(coordinate_system or parent_meta.get("coordinate_system") or "wgs84")
-    effective_epsg = COORDINATE_SYSTEMS.get(effective_coordinate_system, 4326)
+    parent_plot_geom_wgs84 = _load_plot_polygon_wgs84(db, parent_plot_id)
+    effective_render_coordinate_system, effective_epsg, _ = _resolve_survey_render_crs(
+        effective_coordinate_system,
+        parent_plot_geom_wgs84,
+    )
 
     clean_title = str(title_text or "").strip()
     if not clean_title:
@@ -3605,7 +3663,7 @@ def _get_subdivision_batch_clean_copy_context(
         "title_text": clean_title,
         "paper_size": effective_paper_size,
         "scale_text": effective_scale_text,
-        "coordinate_system": effective_coordinate_system,
+        "coordinate_system": effective_render_coordinate_system,
         "epsg_code": int(effective_epsg),
         "station_names": list(station_names or []),
         "north_arrow_style": str(north_arrow_style or "one_side_stem"),
@@ -5770,9 +5828,11 @@ def download_plot_report_pdf(plot_id: int, db: Session = Depends(get_db), backgr
         fct_title_prefix=fct_title_prefix,
     )
 
-    # Get EPSG code for selected coordinate system
-    epsg_code = COORDINATE_SYSTEMS.get(coordinate_system, 4326)
-    crs_name = COORDINATE_SYSTEM_NAMES.get(coordinate_system, "WGS84")
+    plot_geom_wgs84 = _load_plot_polygon_wgs84(db, plot_id)
+    render_coordinate_system, epsg_code, crs_name = _resolve_survey_render_crs(
+        coordinate_system,
+        plot_geom_wgs84,
+    )
 
     render_plot_map_layout(
         db=db,
@@ -5787,7 +5847,7 @@ def download_plot_report_pdf(plot_id: int, db: Session = Depends(get_db), backgr
         surveyor_rank=surveyor_rank,
         certification_statement=certification_statement,
         station_names=station_names if station_names else None,
-        coordinate_system=coordinate_system,
+        coordinate_system=render_coordinate_system,
         epsg_code=epsg_code,
         crs_footer_text=f"COORDINATE SYSTEM: {crs_name}",
         paper_size=paper_size,
@@ -6147,9 +6207,10 @@ def preview_plot_map(plot_id: int, db: Session = Depends(get_db), background_tas
     if plot_geom_wgs84 is None or plot_geom_wgs84.is_empty:
         raise HTTPException(status_code=400, detail="Plot geometry is empty.")
 
-    effective_epsg = COORDINATE_SYSTEMS.get(coordinate_system, 4326)
-    if coordinate_system == "wgs84" or effective_epsg == 4326:
-        effective_epsg = _metric_epsg_for_wgs84_polygon(plot_geom_wgs84)
+    render_coordinate_system, effective_epsg, crs_name = _resolve_survey_render_crs(
+        coordinate_system,
+        plot_geom_wgs84,
+    )
     plot_metric = gpd.GeoSeries([plot_geom_wgs84], crs="EPSG:4326").to_crs(epsg=effective_epsg).iloc[0]
 
     paper_config = get_paper_config(paper_size)
@@ -6289,8 +6350,10 @@ def preview_plot_map(plot_id: int, db: Session = Depends(get_db), background_tas
     )
 
     # Get EPSG code for selected coordinate system
-    epsg_code = COORDINATE_SYSTEMS.get(coordinate_system, 4326)
-    crs_name = COORDINATE_SYSTEM_NAMES.get(coordinate_system, "WGS84")
+    render_coordinate_system, epsg_code, crs_name = _resolve_survey_render_crs(
+        coordinate_system,
+        plot_geom_wgs84,
+    )
 
     render_plot_map_layout(
         db=db,
@@ -6305,7 +6368,7 @@ def preview_plot_map(plot_id: int, db: Session = Depends(get_db), background_tas
         surveyor_rank=surveyor_rank,
         certification_statement=certification_statement,
         station_names=station_names if station_names else None,
-        coordinate_system=coordinate_system,
+        coordinate_system=render_coordinate_system,
         epsg_code=epsg_code,
         crs_footer_text=f"COORDINATE SYSTEM: {crs_name}",
         paper_size=paper_size,
@@ -6413,17 +6476,7 @@ def download_back_computation_pdf(plot_id: int, db: Session = Depends(get_db), b
     # Convert to user's selected coordinate system
     gdf = gpd.GeoDataFrame(geometry=[plot_geom], crs="EPSG:4326")
 
-    # Get EPSG code for selected coordinate system
-    epsg_code = COORDINATE_SYSTEMS.get(coordinate_system, 4326)
-    crs_name = COORDINATE_SYSTEM_NAMES.get(coordinate_system, "WGS84")
-
-    # If WGS84 is selected, use UTM for calculations (need projected CRS for distances)
-    if coordinate_system == "wgs84":
-        centroid = plot_geom.centroid
-        utm_zone = int((centroid.x + 180) / 6) + 1
-        hemisphere = "north" if centroid.y >= 0 else "south"
-        epsg_code = 32600 + utm_zone if hemisphere == "north" else 32700 + utm_zone
-        crs_name = f"UTM Zone {utm_zone}{'N' if hemisphere == 'north' else 'S'}"
+    _, epsg_code, crs_name = _resolve_survey_render_crs(coordinate_system, plot_geom)
 
     gdf_projected = gdf.to_crs(epsg=epsg_code)
     poly = gdf_projected.geometry.iloc[0]
@@ -6500,9 +6553,11 @@ def orthophoto_preview(plot_id: int, db: Session = Depends(get_db), background_t
         elevation_points=elevation_points if (topo_source == "userdata" and elevation_points) else None,
     )
 
-    # Get EPSG code for selected coordinate system
-    epsg_code = COORDINATE_SYSTEMS.get(coordinate_system, 4326)
-    crs_name = COORDINATE_SYSTEM_NAMES.get(coordinate_system, "WGS84")
+    plot_geom_wgs84 = _load_plot_polygon_wgs84(db, plot_id)
+    render_coordinate_system, epsg_code, crs_name = _resolve_survey_render_crs(
+        coordinate_system,
+        plot_geom_wgs84,
+    )
 
     persisted_elevation_points = elevation_points
     if use_topo_map and topo_source == "userdata" and not persisted_elevation_points:
@@ -6520,7 +6575,7 @@ def orthophoto_preview(plot_id: int, db: Session = Depends(get_db), background_t
         title_text="TOPO MAP" if use_topo_map else "ORTHOPHOTO",
         scale_text=scale_text,
         station_names=station_names if station_names else None,
-        coordinate_system=coordinate_system,
+        coordinate_system=render_coordinate_system,
         epsg_code=epsg_code,
         crs_footer_text=f"COORDINATE SYSTEM: {crs_name}",
         source_footer_text=topo_source_footer,
@@ -6601,9 +6656,11 @@ def orthophoto_pdf(plot_id: int, db: Session = Depends(get_db), background_tasks
         coordinate_system=coordinate_system,
     )
 
-    # Get EPSG code for selected coordinate system
-    epsg_code = COORDINATE_SYSTEMS.get(coordinate_system, 4326)
-    crs_name = COORDINATE_SYSTEM_NAMES.get(coordinate_system, "WGS84")
+    plot_geom_wgs84 = _load_plot_polygon_wgs84(db, plot_id)
+    render_coordinate_system, epsg_code, crs_name = _resolve_survey_render_crs(
+        coordinate_system,
+        plot_geom_wgs84,
+    )
 
     elevation_points = None
     if use_topo_map and topo_source == "userdata":
@@ -6621,7 +6678,7 @@ def orthophoto_pdf(plot_id: int, db: Session = Depends(get_db), background_tasks
         surveyor_name=surveyor_name,
         surveyor_rank=surveyor_rank,
         station_names=station_names if station_names else None,
-        coordinate_system=coordinate_system,
+        coordinate_system=render_coordinate_system,
         epsg_code=epsg_code,
         crs_footer_text=f"COORDINATE SYSTEM: {crs_name}",
         use_topo_map=use_topo_map,
@@ -6801,8 +6858,11 @@ def get_saved_survey_plan_pdf(plot_id: int, refresh: bool = False, db: Session =
         tmp_map = tempfile.NamedTemporaryFile(suffix="_map.png", delete=False)
         map_path = tmp_map.name
         tmp_map.close()
-        epsg_code = COORDINATE_SYSTEMS.get(meta["coordinate_system"], 4326)
-        crs_name = COORDINATE_SYSTEM_NAMES.get(meta["coordinate_system"], "WGS84")
+        plot_geom_wgs84 = _load_plot_polygon_wgs84(db, plot_id)
+        render_coordinate_system, epsg_code, crs_name = _resolve_survey_render_crs(
+            meta["coordinate_system"],
+            plot_geom_wgs84,
+        )
         render_plot_map_layout(
             db=db,
             plot_id=plot_id,
@@ -6816,7 +6876,7 @@ def get_saved_survey_plan_pdf(plot_id: int, refresh: bool = False, db: Session =
             surveyor_rank=meta["surveyor_rank"],
             certification_statement=meta.get("certification_statement"),
             station_names=None,
-            coordinate_system=meta["coordinate_system"],
+            coordinate_system=render_coordinate_system,
             epsg_code=epsg_code,
             crs_footer_text=f"COORDINATE SYSTEM: {crs_name}",
             paper_size=meta["paper_size"],
@@ -6881,8 +6941,11 @@ def get_saved_orthophoto_pdf(plot_id: int, map_type: str = "satellite", refresh:
         tmp_png = tempfile.NamedTemporaryFile(suffix=f"_{safe_type}.png", delete=False)
         png_path = tmp_png.name
         tmp_png.close()
-        epsg_code = COORDINATE_SYSTEMS.get(meta["coordinate_system"], 4326)
-        crs_name = COORDINATE_SYSTEM_NAMES.get(meta["coordinate_system"], "WGS84")
+        plot_geom_wgs84 = _load_plot_polygon_wgs84(db, plot_id)
+        render_coordinate_system, epsg_code, crs_name = _resolve_survey_render_crs(
+            meta["coordinate_system"],
+            plot_geom_wgs84,
+        )
         render_orthophoto_png(
             db=db,
             plot_id=plot_id,
@@ -6895,7 +6958,7 @@ def get_saved_orthophoto_pdf(plot_id: int, map_type: str = "satellite", refresh:
             surveyor_name=meta["surveyor_name"],
             surveyor_rank=meta["surveyor_rank"],
             station_names=None,
-            coordinate_system=meta["coordinate_system"],
+            coordinate_system=render_coordinate_system,
             epsg_code=epsg_code,
             crs_footer_text=f"COORDINATE SYSTEM: {crs_name}",
             source_footer_text=(
@@ -6941,14 +7004,7 @@ def get_saved_back_computation_pdf(plot_id: int, refresh: bool = False, db: Sess
             {"id": plot_id}
         ).scalar() or 0
         gdf = gpd.GeoDataFrame(geometry=[plot_geom], crs="EPSG:4326")
-        epsg_code = COORDINATE_SYSTEMS.get(meta["coordinate_system"], 4326)
-        crs_name = COORDINATE_SYSTEM_NAMES.get(meta["coordinate_system"], "WGS84")
-        if meta["coordinate_system"] == "wgs84":
-            centroid = plot_geom.centroid
-            utm_zone = int((centroid.x + 180) / 6) + 1
-            hemisphere = "north" if centroid.y >= 0 else "south"
-            epsg_code = 32600 + utm_zone if hemisphere == "north" else 32700 + utm_zone
-            crs_name = f"UTM Zone {utm_zone}{'N' if hemisphere == 'north' else 'S'}"
+        _, epsg_code, crs_name = _resolve_survey_render_crs(meta["coordinate_system"], plot_geom)
         gdf_projected = gdf.to_crs(epsg=epsg_code)
         poly = gdf_projected.geometry.iloc[0]
         rows, sum_de, sum_dn = compute_back_computation(poly, None)
