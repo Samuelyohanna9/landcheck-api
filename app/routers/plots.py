@@ -2135,6 +2135,10 @@ def _normalize_survey_input_coordinates(raw: Any) -> list[dict]:
                 "x": x,
                 "y": y,
                 "height": item.get("height"),
+                # Missing/omitted (older saved drafts, or any caller that never set it) defaults
+                # to a boundary point, matching pre-existing behavior where every entered point
+                # was always a boundary vertex.
+                "is_boundary": item.get("is_boundary") is not False,
             }
         )
     return normalized
@@ -2146,11 +2150,15 @@ def _build_exact_measurement_polygon(
     target_epsg: int,
 ) -> tuple[Polygon | None, float | None, list[dict], str | None]:
     normalized = _normalize_survey_input_coordinates(survey_input_coordinates)
-    if len(normalized) < 3:
+    # survey_input_coordinates can hold spot-height-only samples alongside the boundary corners
+    # (see the "Spot Heights" CSV import step) - only the boundary-flagged points form the ring;
+    # everything else exists purely as elevation reference data and must never distort the shape.
+    boundary_points = [item for item in normalized if item.get("is_boundary") is not False]
+    if len(boundary_points) < 3:
         return None, None, [], None
 
     selected_key = str(coordinate_system or "wgs84").strip().lower() or "wgs84"
-    coords = [(float(item["x"]), float(item["y"])) for item in normalized]
+    coords = [(float(item["x"]), float(item["y"])) for item in boundary_points]
     if coords[0] != coords[-1]:
         coords.append(coords[0])
 
@@ -2165,7 +2173,7 @@ def _build_exact_measurement_polygon(
     poly = Polygon(coords)
     poly = _clean_single_polygon(poly)
     if poly is None:
-        return None, None, normalized, resolved_key
+        return None, None, boundary_points, resolved_key
 
     gdf_poly = gpd.GeoDataFrame(geometry=[poly], crs=f"EPSG:{src_epsg}")
     if int(src_epsg) != int(target_epsg):
@@ -2173,9 +2181,9 @@ def _build_exact_measurement_polygon(
     projected_poly = gdf_poly.geometry.iloc[0]
     projected_poly = _clean_single_polygon(projected_poly)
     if projected_poly is None:
-        return None, None, normalized, resolved_key
+        return None, None, boundary_points, resolved_key
 
-    return projected_poly, float(projected_poly.area), normalized, resolved_key
+    return projected_poly, float(projected_poly.area), boundary_points, resolved_key
 
 
 def _resolve_measurement_polygon_context(

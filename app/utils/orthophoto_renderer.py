@@ -13,6 +13,7 @@ import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 import matplotlib.lines as mlines
 import matplotlib.tri as mtri
+import matplotlib.patheffects as patheffects
 import requests
 from sqlalchemy import text
 from shapely import wkb
@@ -179,16 +180,24 @@ def _choose_imagery_scale_ratio(
     return recommended_scale, recommended_scale != requested_scale_ratio
 
 
-def _nice_contour_step(elevation_span_m: float) -> float:
-    # Picks a round contour interval scaled to how much relief is actually in the sampled area -
-    # a flat 2m plot and a hillside 200m plot need very different intervals to read as a real map
-    # instead of either one flat blob or an unreadable tangle of lines.
-    for span_ceiling, step in (
-        (2, 0.25), (5, 0.5), (10, 1), (25, 2), (50, 5), (100, 10), (250, 20), (500, 50),
-    ):
-        if elevation_span_m <= span_ceiling:
-            return step
-    return 100
+_NICE_CONTOUR_STEPS = (0.02, 0.05, 0.1, 0.2, 0.25, 0.5, 1, 2, 2.5, 5, 10, 20, 25, 50, 100)
+
+
+def _nice_contour_step(elevation_span_m: float, target_bands: int = 10) -> float:
+    # Picks a round contour interval that lands close to `target_bands` bands across whatever
+    # relief is actually in the sampled area, rather than a fixed span->step lookup table. The old
+    # table bottomed out at a 0.25m step, so a low-relief dataset (a handful of nearby survey
+    # corners spanning under a metre - which is exactly what "Your Data" elevation points usually
+    # are, see _draw_topo_contours) could round down to just 2-3 levels total: one interior
+    # contour line and two flat filled blocks, not a real-looking topo map. Deriving the step from
+    # a target band count instead means even a gentle, low-relief site still gets subdivided into
+    # several bands (a uniformly sloped surface genuinely does show several evenly-spaced parallel
+    # contours on a real topo map at a fine-enough interval), while a steep site still gets a
+    # coarse interval instead of an unreadable tangle of lines.
+    if elevation_span_m <= 0:
+        return _NICE_CONTOUR_STEPS[0]
+    raw_step = elevation_span_m / max(1, target_bands)
+    return min(_NICE_CONTOUR_STEPS, key=lambda s: abs(s - raw_step))
 
 
 def _draw_topo_contours(
@@ -252,15 +261,20 @@ def _draw_topo_contours(
 
     try:
         ax.tricontourf(triang, elevations, levels=levels, cmap="terrain", alpha=0.5, zorder=0)
-        minor_contours = ax.tricontour(
-            triang, elevations, levels=levels, colors="#5b3a1a", linewidths=0.65 * font_scale, zorder=1,
+        # Minor (intermediate) contours: thin, unlabeled - real topo maps only print elevation
+        # text on the bold index lines, not every line, or a map with many bands turns into a
+        # wall of numbers.
+        ax.tricontour(
+            triang, elevations, levels=levels, colors="#5b3a1a", linewidths=0.5 * font_scale, zorder=1,
         )
-        ax.clabel(minor_contours, inline=True, fontsize=max(5, 6 * font_scale), fmt="%g m")
-        index_levels = levels[::5] if len(levels) > 6 else levels[::2] if len(levels) > 3 else levels
+        index_levels = levels[::5] if len(levels) > 10 else levels[::2] if len(levels) > 4 else levels
         if len(index_levels) >= 2:
-            ax.tricontour(
-                triang, elevations, levels=index_levels, colors="#3f2a12", linewidths=1.5 * font_scale, zorder=2,
+            index_contours = ax.tricontour(
+                triang, elevations, levels=index_levels, colors="#3f2a12", linewidths=1.4 * font_scale, zorder=2,
             )
+            labels = ax.clabel(index_contours, inline=True, fontsize=max(5, 6.5 * font_scale), fmt="%g m")
+            for label in labels:
+                label.set_path_effects([patheffects.withStroke(linewidth=2, foreground="white")])
         if is_user_data:
             ax.scatter(
                 xs, ys, s=(10 * font_scale) ** 2, c="#1d4ed8", marker="+", linewidths=1.1 * font_scale, zorder=3,
