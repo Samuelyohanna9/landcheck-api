@@ -14,6 +14,7 @@ import matplotlib.patches as patches
 import matplotlib.lines as mlines
 import matplotlib.tri as mtri
 import matplotlib.patheffects as patheffects
+import matplotlib.colors as mcolors
 import requests
 from sqlalchemy import text
 from shapely import wkb
@@ -214,11 +215,14 @@ def _draw_topo_contours(
     font_scale: float = 1.0,
     is_user_data: bool = False,
     contour_interval_override: float | None = None,
-) -> bool:
+) -> dict | None:
     """Draws real contour lines derived from sampled elevation points - either the surveyor's own
     uploaded heights (is_user_data=True) or a free global DEM fetched for the plot's footprint.
-    Returns False (leaving the axes untouched) when there isn't enough usable elevation data,
-    so the caller can fall back to the "elevation data unavailable" message.
+    Returns None (leaving the axes untouched) when there isn't enough usable elevation data, so
+    the caller can fall back to the "elevation data unavailable" message. On success returns
+    {"elev_min", "elev_max", "step"} so the caller can draw a matching elevation color legend and
+    show the contour interval actually used (which may differ from a requested override that was
+    too coarse for the site's relief - see the fallback-to-Auto note below).
     """
     points = elevation_points if elevation_points and len(elevation_points) >= 3 else None
     if points is None:
@@ -229,7 +233,7 @@ def _draw_topo_contours(
         points = fetch_dem_elevation_points(boundary_geojson) if boundary_geojson else None
         is_user_data = False
     if not points or len(points) < 3:
-        return False
+        return None
 
     try:
         points_gdf = gpd.GeoDataFrame(
@@ -238,7 +242,7 @@ def _draw_topo_contours(
             crs="EPSG:4326",
         ).to_crs(epsg=display_epsg)
     except Exception:
-        return False
+        return None
 
     xs = points_gdf.geometry.x.to_numpy()
     ys = points_gdf.geometry.y.to_numpy()
@@ -246,18 +250,18 @@ def _draw_topo_contours(
     finite_mask = np.isfinite(xs) & np.isfinite(ys) & np.isfinite(elevations)
     xs, ys, elevations = xs[finite_mask], ys[finite_mask], elevations[finite_mask]
     if len(xs) < 3:
-        return False
+        return None
 
     elev_min, elev_max = float(np.min(elevations)), float(np.max(elevations))
     span = elev_max - elev_min
     if span < 0.05:
         # Dead-flat sampled area - a contour map of it is just noise, not useful terrain info.
-        return False
+        return None
 
     try:
         triang = mtri.Triangulation(xs, ys)
     except Exception:
-        return False
+        return None
 
     # A user-picked interval overrides the automatic band-count heuristic. If it's too coarse for
     # this site's actual relief (fewer than 2 levels would result), fall back to Auto rather than
@@ -272,7 +276,7 @@ def _draw_topo_contours(
         step = _nice_contour_step(span)
         levels = np.arange(math.floor(elev_min / step) * step, math.ceil(elev_max / step) * step + step, step)
     if len(levels) < 2:
-        return False
+        return None
 
     try:
         # Kept fairly translucent (rather than a solid wash) so roads/rivers/buildings drawn on top
@@ -298,11 +302,43 @@ def _draw_topo_contours(
                 xs, ys, s=(10 * font_scale) ** 2, c="#1d4ed8", marker="+", linewidths=1.1 * font_scale, zorder=3,
             )
     except Exception:
-        return False
+        return None
 
     ax.set_xlim(target_xlim)
     ax.set_ylim(target_ylim)
-    return True
+    return {"elev_min": elev_min, "elev_max": elev_max, "step": step}
+
+
+def _draw_elevation_legend(fig, elev_min, elev_max, step, font_scale=1.0):
+    """Small elevation color-scale legend placed beside the KEY box (map_renderer_layout.py's
+    draw_key_box occupies figure x:[0.35, 0.65] - this sits in the empty space to its right),
+    translating the contour fill's terrain colormap into actual metres and showing the contour
+    interval actually used (which may be the Auto-computed value rather than a requested override
+    that was too coarse for the site - see _draw_topo_contours).
+    """
+    try:
+        box_x, box_y, box_w, box_h = 0.665, 0.045, 0.235, 0.153
+        fig.add_artist(
+            patches.Rectangle((box_x, box_y), box_w, box_h, transform=fig.transFigure, fill=False, lw=0.9 * font_scale)
+        )
+        fig.text(
+            box_x + box_w / 2.0, box_y + box_h - 0.020, "ELEVATION (m)",
+            ha="center", fontsize=int(8 * font_scale), weight="bold",
+        )
+
+        cbar_ax = fig.add_axes([box_x + 0.030, box_y + 0.048, 0.045, box_h - 0.095])
+        norm = mcolors.Normalize(vmin=elev_min, vmax=elev_max)
+        sm = plt.cm.ScalarMappable(cmap="terrain", norm=norm)
+        sm.set_array([])
+        cb = fig.colorbar(sm, cax=cbar_ax)
+        cb.ax.tick_params(labelsize=max(5, int(6 * font_scale)), length=2, pad=1.5)
+
+        fig.text(
+            box_x + box_w / 2.0, box_y + 0.027, f"CONTOUR INTERVAL: {step:g} m",
+            ha="center", fontsize=max(5, int(6.5 * font_scale)),
+        )
+    except Exception:
+        pass
 
 
 def _draw_topo_features(
@@ -952,7 +988,7 @@ def render_orthophoto_png(
         # _draw_topo_contours. "userdata" uses the surveyor's own uploaded heights when there are
         # enough of them; otherwise (or as a fallback) it samples a free global DEM for the plot.
         want_user_data = topo_source == "userdata" and elevation_points
-        basemap_loaded = _draw_topo_contours(
+        contour_info = _draw_topo_contours(
             ax,
             plot_geom,
             display_epsg,
@@ -963,6 +999,12 @@ def render_orthophoto_png(
             is_user_data=bool(want_user_data),
             contour_interval_override=contour_interval,
         )
+        basemap_loaded = contour_info is not None
+        if contour_info is not None:
+            _draw_elevation_legend(
+                fig, contour_info["elev_min"], contour_info["elev_max"], contour_info["step"],
+                font_scale=font_scale,
+            )
         # Roads/rivers/buildings are independent of whether contours rendered - a real topo map
         # depicts them regardless of how much elevation relief the site happens to have.
         _draw_topo_features(
