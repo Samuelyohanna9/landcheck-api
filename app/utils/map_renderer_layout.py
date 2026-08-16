@@ -254,14 +254,27 @@ def mm_to_pt(mm: float) -> float:
     return (mm / 25.4) * 72.0
 
 
-def scaled_line_weight(base_mm: float, font_scale: float = 1.0, scale_ratio: float | None = None) -> float:
+def scaled_line_weight(
+    base_mm: float, font_scale: float = 1.0, scale_ratio: float | None = None, allow_scale_boost: bool = True,
+) -> float:
     """A feature-class pen weight (matplotlib `lw`, in points) derived from a real drafting weight
     in millimetres, adjusted for paper size (font_scale, already tied to paper_config) and for the
     plan's scale_ratio. `base_mm` should be the desired weight at the reference scale on an A4
     sheet (font_scale ~1.0) - e.g. ~0.25mm for a building outline, ~0.3mm for a road/river line.
+
+    `allow_scale_boost=False` keeps the "thinner at large scales" half of the scaling (still floors
+    at 0.70x so nothing vanishes when zoomed in) but skips the "heavier at small scales" boost above
+    1.0x. That boost is right for a single long line (a boundary/road/grid line genuinely can thin
+    into invisibility once a lot of ground is compressed onto the page) but wrong for a repeated
+    fill texture like building hatch, where hatch spacing is deliberately kept constant on paper
+    regardless of scale (see draw_building_hatch) - boosting stroke weight on top of that fixed
+    spacing is what turns a light building outline into a solid dark smudge on any plan covering
+    more than a couple of small parcels (a common case, not an edge case, once you're drafting a
+    multi-hectare site rather than a single small plot).
     """
     ratio = float(scale_ratio) if scale_ratio else _REFERENCE_SCALE_RATIO
-    scale_factor = max(0.70, min(1.60, ratio / _REFERENCE_SCALE_RATIO))
+    scale_ceiling = 1.60 if allow_scale_boost else 1.0
+    scale_factor = max(0.70, min(scale_ceiling, ratio / _REFERENCE_SCALE_RATIO))
     mm = max(0.12, float(base_mm) * max(0.75, font_scale) * scale_factor)
     return mm_to_pt(mm)
 
@@ -1871,7 +1884,7 @@ def draw_building_hatch(
     # Example: 3.5 mm on paper => 3.5m at 1:1000, 7m at 1:2000.
     hatch_spacing_mm = 3.5
     base_spacing = max(0.6, (hatch_spacing_mm / 1000.0) * max(scale_ratio, 100))
-    hatch_lw = scaled_line_weight(0.15, font_scale, scale_ratio)
+    hatch_lw = scaled_line_weight(0.15, font_scale, scale_ratio, allow_scale_boost=False)
     for geom in building_geoms:
         try:
             projected = gpd.GeoSeries([geom], crs="EPSG:4326").to_crs(epsg=display_epsg).iloc[0]
@@ -3280,7 +3293,7 @@ def _render_plot_map_layout_adamawa(
             color=building_color, hatch_type=building_hatch_type,
         )
         gpd.GeoDataFrame(geometry=visible_buildings, crs="EPSG:4326").to_crs(epsg=display_epsg).plot(
-            ax=ax, facecolor="none", edgecolor=building_color, lw=scaled_line_weight(0.2, font_scale, scale_ratio), zorder=8
+            ax=ax, facecolor="none", edgecolor=building_color, lw=scaled_line_weight(0.2, font_scale, scale_ratio, allow_scale_boost=False), zorder=8
         )
     if fences:
         draw_fences(ax, fences, display_epsg, scale_ratio=scale_ratio, font_scale=font_scale)
@@ -4216,7 +4229,7 @@ def _render_plot_map_layout_cadastral(
             color=building_color, hatch_type=building_hatch_type,
         )
         gpd.GeoDataFrame(geometry=visible_buildings, crs="EPSG:4326").to_crs(epsg=display_epsg).plot(
-            ax=ax, facecolor="none", edgecolor=building_color, lw=scaled_line_weight(0.2, font_scale, scale_ratio), zorder=8
+            ax=ax, facecolor="none", edgecolor=building_color, lw=scaled_line_weight(0.2, font_scale, scale_ratio, allow_scale_boost=False), zorder=8
         )
     if fences:
         draw_fences(ax, fences, display_epsg, scale_ratio=scale_ratio, font_scale=font_scale)
@@ -4821,7 +4834,7 @@ def _render_plot_map_layout_fct(
             color=building_color, hatch_type=building_hatch_type,
         )
         gpd.GeoDataFrame(geometry=visible_buildings, crs="EPSG:4326").to_crs(epsg=display_epsg).plot(
-            ax=ax, facecolor="none", edgecolor=building_color, lw=scaled_line_weight(0.2, font_scale, scale_ratio), zorder=8
+            ax=ax, facecolor="none", edgecolor=building_color, lw=scaled_line_weight(0.2, font_scale, scale_ratio, allow_scale_boost=False), zorder=8
         )
     if fences:
         draw_fences(ax, fences, display_epsg, scale_ratio=scale_ratio, font_scale=font_scale)
@@ -5495,7 +5508,7 @@ def _render_plot_map_layout_site_plan(
             color=building_color, hatch_type=building_hatch_type,
         )
         gpd.GeoDataFrame(geometry=visible_buildings, crs="EPSG:4326").to_crs(epsg=display_epsg).plot(
-            ax=ax, facecolor="none", edgecolor=building_color, lw=scaled_line_weight(0.2, font_scale, scale_ratio), zorder=8
+            ax=ax, facecolor="none", edgecolor=building_color, lw=scaled_line_weight(0.2, font_scale, scale_ratio, allow_scale_boost=False), zorder=8
         )
     if fences:
         draw_fences(ax, fences, display_epsg, scale_ratio=scale_ratio, font_scale=font_scale)
@@ -6217,7 +6230,7 @@ def render_plot_map_layout(
             color=building_color, hatch_type=building_hatch_type,
         )
 
-    building_lw = scaled_line_weight(0.2, font_scale, scale_ratio)
+    building_lw = scaled_line_weight(0.2, font_scale, scale_ratio, allow_scale_boost=False)
     if visible_buildings:
         gpd.GeoDataFrame(geometry=visible_buildings, crs="EPSG:4326").to_crs(epsg=display_epsg).plot(
             ax=ax, facecolor="none", edgecolor=building_color, lw=building_lw, zorder=8
