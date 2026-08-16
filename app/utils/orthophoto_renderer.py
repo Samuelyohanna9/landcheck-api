@@ -305,7 +305,10 @@ def _draw_topo_contours(
     return True
 
 
-def _draw_topo_features(ax, db, plot_id, plot_geom_wgs84, display_epsg, scale_ratio, font_scale=1.0, fig=None) -> bool:
+def _draw_topo_features(
+    ax, db, plot_id, plot_geom_wgs84, display_epsg, scale_ratio, font_scale=1.0, fig=None,
+    building_hatch_type="solid",
+) -> bool:
     """Draws roads, rivers, and buildings on top of the topo contour layer - the "natural features
     and man-made objects" half of an actual topographic map, not just colored elevation bands.
     Reuses the same data sources and drawing primitives as the main survey-plan renderer and the
@@ -378,7 +381,7 @@ def _draw_topo_features(ax, db, plot_id, plot_geom_wgs84, display_epsg, scale_ra
             try:
                 draw_building_hatch(
                     ax, building_geoms, display_epsg, scale_ratio or 1000, font_scale=font_scale,
-                    color="#4a4a4a", hatch_type="diagonal",
+                    color="#4a4a4a", hatch_type=building_hatch_type,
                 )
                 has_buildings = True
                 drew_anything = True
@@ -871,6 +874,7 @@ def render_orthophoto_png(
     topo_source="opentopomap",
     elevation_points=None,
     contour_interval=None,
+    building_hatch_type="solid",
     paper_size="A4",
     north_arrow_style="one_side_stem",
     north_arrow_color="black",
@@ -963,6 +967,7 @@ def render_orthophoto_png(
         # depicts them regardless of how much elevation relief the site happens to have.
         _draw_topo_features(
             ax, db, plot_id, plot_geom, display_epsg, effective_scale_ratio, font_scale=font_scale, fig=fig,
+            building_hatch_type=building_hatch_type or "solid",
         )
     else:
         sat_zoom = 16 if preview_mode else 17

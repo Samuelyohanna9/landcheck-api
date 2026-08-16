@@ -4547,6 +4547,7 @@ def create_plot_topomap_export_job(
     paper_size: str = Body("A4"),
     topo_source: str = Body("opentopomap"),
     contour_interval: float | None = Body(None),
+    building_hatch_type: str = Body("solid"),
     north_arrow_style: str = Body("one_side_stem"),
     north_arrow_color: str = Body("blue"),
 ):
@@ -4564,6 +4565,7 @@ def create_plot_topomap_export_job(
         "use_topo_map": True,
         "topo_source": topo_source or "opentopomap",
         "contour_interval": contour_interval,
+        "building_hatch_type": building_hatch_type or "solid",
         "north_arrow_style": north_arrow_style,
         "north_arrow_color": north_arrow_color,
     }
@@ -6684,10 +6686,12 @@ def orthophoto_preview(plot_id: int, db: Session = Depends(get_db), background_t
     topo_source: str = Body("opentopomap"),
     elevation_points: list = Body(default=[]),
     contour_interval: float | None = Body(None),
+    building_hatch_type: str = Body("solid"),
     north_arrow_style: str = Body("one_side_stem"),
     north_arrow_color: str = Body("blue")):
 
     topo_source = topo_source or "opentopomap"
+    building_hatch_type = building_hatch_type or "solid"
     payload_for_cache = {
         "scale_text": scale_text,
         "station_names": station_names or [],
@@ -6697,6 +6701,7 @@ def orthophoto_preview(plot_id: int, db: Session = Depends(get_db), background_t
         "topo_source": topo_source,
         "elevation_points": elevation_points if topo_source == "userdata" else [],
         "contour_interval": contour_interval,
+        "building_hatch_type": building_hatch_type,
         "north_arrow_style": north_arrow_style,
         "north_arrow_color": north_arrow_color,
     }
@@ -6760,6 +6765,7 @@ def orthophoto_preview(plot_id: int, db: Session = Depends(get_db), background_t
         topo_source=topo_source,
         elevation_points=persisted_elevation_points,
         contour_interval=contour_interval,
+        building_hatch_type=building_hatch_type,
         paper_size=paper_size,
         north_arrow_style=north_arrow_style,
         north_arrow_color=north_arrow_color,
@@ -6805,10 +6811,12 @@ def orthophoto_pdf(plot_id: int, db: Session = Depends(get_db), background_tasks
     use_topo_map: bool = Body(False),
     topo_source: str = Body("opentopomap"),
     contour_interval: float | None = Body(None),
+    building_hatch_type: str = Body("solid"),
     north_arrow_style: str = Body("one_side_stem"),
     north_arrow_color: str = Body("blue")):
 
     topo_source = topo_source or "opentopomap"
+    building_hatch_type = building_hatch_type or "solid"
     out_dir = os.path.join(REPORTS_DIR, "orthophoto")
     os.makedirs(out_dir, exist_ok=True)
 
@@ -6870,6 +6878,7 @@ def orthophoto_pdf(plot_id: int, db: Session = Depends(get_db), background_tasks
         topo_source=topo_source,
         elevation_points=elevation_points,
         contour_interval=contour_interval,
+        building_hatch_type=building_hatch_type,
         paper_size=paper_size,
         north_arrow_style=north_arrow_style,
         north_arrow_color=north_arrow_color,
@@ -7175,6 +7184,7 @@ def get_saved_orthophoto_pdf(plot_id: int, map_type: str = "satellite", refresh:
             topo_source="userdata" if meta.get("elevation_points") else "opentopomap",
             elevation_points=meta.get("elevation_points"),
             contour_interval=meta.get("contour_interval"),
+            building_hatch_type="solid",
             paper_size=meta["paper_size"],
             north_arrow_style="one_side_stem",
             north_arrow_color="blue",

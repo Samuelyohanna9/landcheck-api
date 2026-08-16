@@ -1834,15 +1834,31 @@ def draw_building_hatch(
     hatch_type: str = "diagonal",
 ):
     """
-    Draw sparse hatch lines clipped to building polygons, similar to common
-    survey-plan building symbols. `hatch_type` is one of "horizontal" (default),
-    "vertical", "diagonal", or "cross" (horizontal + vertical passes combined).
+    Draw building footprints, similar to common survey-plan building symbols. `hatch_type` is one
+    of "horizontal" (default), "vertical", "diagonal", "cross" (horizontal + vertical passes
+    combined), or "solid" (a plain filled outline - no scan lines - which reads more clearly than
+    hatching against a busy background like a topo map's terrain-colored contour fill).
     """
     if not building_geoms:
         return
     normalized_hatch_type = str(hatch_type or "diagonal").strip().lower()
-    if normalized_hatch_type not in ("horizontal", "vertical", "diagonal", "cross"):
+    if normalized_hatch_type not in ("horizontal", "vertical", "diagonal", "cross", "solid"):
         normalized_hatch_type = "diagonal"
+
+    if normalized_hatch_type == "solid":
+        for geom in building_geoms:
+            try:
+                projected = gpd.GeoSeries([geom], crs="EPSG:4326").to_crs(epsg=display_epsg).iloc[0]
+            except Exception:
+                continue
+            for poly in _iter_polygons(projected):
+                try:
+                    xs, ys = poly.exterior.xy
+                    ax.fill(xs, ys, facecolor=color, edgecolor=color, linewidth=0.3 * font_scale, zorder=7.5)
+                except Exception:
+                    continue
+        return
+
     directions = ["horizontal", "vertical"] if normalized_hatch_type == "cross" else [normalized_hatch_type]
     # Hatch spacing in map units derived from paper mm and scale ratio.
     # Example: 3.5 mm on paper => 3.5m at 1:1000, 7m at 1:2000.
