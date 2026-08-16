@@ -2233,6 +2233,25 @@ def _safe_filename_fragment(value: str, fallback: str) -> str:
     return cleaned or fallback
 
 
+def _build_plot_export_filename(plot_id, meta: dict | None, doc_label: str, ext: str) -> str:
+    """Builds a human-readable export filename from whichever identity fields are actually set
+    (applicant/title, location) instead of the opaque `plot_<id>_...` names these endpoints used
+    to return - mirrors the frontend's buildExportFilename/surveyPlanIdentitySegments convention
+    (SurveyPlan.tsx) so the same plot produces a same-shaped name whichever path it's downloaded
+    through (this backend name is also what becomes the R2 storage object key). Falls back to
+    Plot_<id> only when nothing identifying has been filled in yet.
+    """
+    meta = meta or {}
+    title = str(meta.get("title_text") or "").strip()
+    if title.upper() == "SURVEY PLAN":
+        # The literal placeholder default on the general template, not a real identifying name.
+        title = ""
+    location = str(meta.get("location_text") or "").strip()
+    parts = [frag for frag in (_safe_filename_fragment(title, ""), _safe_filename_fragment(location, "")) if frag]
+    identity = "_".join(parts) if parts else f"Plot_{plot_id}"
+    return f"{identity}_{doc_label}.{ext}"
+
+
 def _format_coordinate_number(value: float, decimals: int) -> str:
     try:
         numeric = float(value)
@@ -4465,7 +4484,7 @@ def create_plot_survey_report_export_job(
         plot_id=int(plot_id),
         export_type="survey-plan.pdf",
         cache_key=cache_key,
-        file_name=f"plot_{int(plot_id)}_report.pdf",
+        file_name=_build_plot_export_filename(plot_id, request_payload, "Survey_Plan", "pdf"),
         request_payload=request_payload,
     )
     return _serialize_plot_export_job(job, request=request)
@@ -4524,7 +4543,7 @@ def create_plot_orthophoto_export_job(
         plot_id=int(plot_id),
         export_type="orthophoto.pdf",
         cache_key=cache_key,
-        file_name=f"plot_{int(plot_id)}_orthophoto.pdf",
+        file_name=_build_plot_export_filename(plot_id, request_payload, "Orthophoto", "pdf"),
         request_payload=request_payload,
     )
     return _serialize_plot_export_job(job, request=request)
@@ -4588,7 +4607,7 @@ def create_plot_topomap_export_job(
         plot_id=int(plot_id),
         export_type="topomap.pdf",
         cache_key=cache_key,
-        file_name=f"plot_{int(plot_id)}_topomap.pdf",
+        file_name=_build_plot_export_filename(plot_id, request_payload, "Topo_Map", "pdf"),
         request_payload=request_payload,
     )
     return _serialize_plot_export_job(job, request=request)
@@ -4619,7 +4638,7 @@ def create_plot_dxf_export_job(
         plot_id=int(plot_id),
         export_type="survey-plan.dxf",
         cache_key=cache_key,
-        file_name=f"plot_{int(plot_id)}_survey_plan.dxf",
+        file_name=_build_plot_export_filename(plot_id, get_plot_meta(db, plot_id), "Survey_Plan", "dxf"),
         request_payload={},
     )
     return _serialize_plot_export_job(job, request=request)
@@ -4650,7 +4669,7 @@ def create_plot_shapefile_export_job(
         plot_id=int(plot_id),
         export_type="survey-plan.shapefile",
         cache_key=cache_key,
-        file_name=f"plot_{int(plot_id)}_survey_plan_shapefile.zip",
+        file_name=_build_plot_export_filename(plot_id, get_plot_meta(db, plot_id), "Survey_Plan_Shapefile", "zip"),
         request_payload={},
     )
     return _serialize_plot_export_job(job, request=request)
@@ -6074,7 +6093,9 @@ def download_plot_report_pdf(plot_id: int, db: Session = Depends(get_db), backgr
 
     safe_remove(map_path)
 
-    filename = f"plot_{plot_id}_report.pdf"
+    filename = _build_plot_export_filename(
+        plot_id, {"title_text": title_text, "location_text": location_text}, "Survey_Plan", "pdf",
+    )
     return _pdf_response_with_r2(
         pdf_path,
         filename,
@@ -6139,7 +6160,7 @@ def download_plot_technical_report_docx(plot_id: int, db: Session = Depends(get_
 
     _render_technical_report_docx(meta, float(area_m2), docx_path)
 
-    filename = f"plot_{plot_id}_technical_report.docx"
+    filename = _build_plot_export_filename(plot_id, meta, "Technical_Report", "docx")
     return _docx_response_with_r2(
         docx_path,
         filename,
@@ -6239,7 +6260,7 @@ def create_plot_technical_report_export_job(
         plot_id=int(plot_id),
         export_type="technical-report.docx",
         cache_key=cache_key,
-        file_name=f"plot_{int(plot_id)}_technical_report.docx",
+        file_name=_build_plot_export_filename(plot_id, request_payload, "Technical_Report", "docx"),
         request_payload=request_payload,
     )
     return _serialize_plot_export_job(job, request=request)
@@ -6284,7 +6305,7 @@ def simple_download_pdf(plot_id: int, db: Session = Depends(get_db), background_
 
     safe_remove(map_path)
 
-    filename = f"plot_{plot_id}_report.pdf"
+    filename = _build_plot_export_filename(plot_id, get_plot_meta(db, plot_id), "Survey_Plan", "pdf")
     return _pdf_response_with_r2(
         pdf_path,
         filename,
@@ -6665,7 +6686,7 @@ def download_back_computation_pdf(plot_id: int, db: Session = Depends(get_db), b
 
     render_back_computation_pdf(rows, sum_de, sum_dn, area_m2, plot_id, pdf_path, crs_name)
 
-    filename = f"plot_{plot_id}_back_computation.pdf"
+    filename = _build_plot_export_filename(plot_id, meta, "Back_Computation", "pdf")
     return _pdf_response_with_r2(
         pdf_path,
         filename,
@@ -6886,7 +6907,10 @@ def orthophoto_pdf(plot_id: int, db: Session = Depends(get_db), background_tasks
 
     render_orthophoto_pdf_from_png(png_path, pdf_path, paper_size=paper_size)
 
-    filename = f"plot_{plot_id}_{'topomap' if use_topo_map else 'orthophoto'}.pdf"
+    filename = _build_plot_export_filename(
+        plot_id, {"title_text": title_text, "location_text": location_text},
+        "Topo_Map" if use_topo_map else "Orthophoto", "pdf",
+    )
     safe_remove(png_path)
 
     return _pdf_response_with_r2(
@@ -6927,7 +6951,7 @@ def download_survey_plan_dwg(plot_id: int, db: Session = Depends(get_db)):
     return FileResponse(
         dxf_path,
         media_type="application/dxf",
-        filename=f"plot_{plot_id}_survey_plan.dxf"
+        filename=_build_plot_export_filename(plot_id, meta, "Survey_Plan", "dxf"),
     )
 
 
@@ -6946,8 +6970,8 @@ def download_survey_plan_shapefile(
     feature_sets = get_plot_features_geojson(plot_id, db)
 
     tmp_dir = tempfile.mkdtemp(prefix=f"plot_{plot_id}_shp_")
-    base_name = f"plot_{plot_id}_survey_plan"
-    zip_path = os.path.join(tmp_dir, f"{base_name}_shapefile.zip")
+    export_filename = _build_plot_export_filename(plot_id, meta, "Survey_Plan_Shapefile", "zip")
+    zip_path = os.path.join(tmp_dir, export_filename)
 
     try:
         def station_name(idx: int) -> str:
@@ -7046,7 +7070,7 @@ def download_survey_plan_shapefile(
     return FileResponse(
         zip_path,
         media_type="application/zip",
-        filename=f"{base_name}_shapefile.zip",
+        filename=export_filename,
         background=background_tasks,
     )
 
@@ -7131,7 +7155,9 @@ def get_saved_survey_plan_pdf(plot_id: int, refresh: bool = False, db: Session =
         safe_remove(map_path)
     if not pdf_path or not os.path.exists(pdf_path):
         raise HTTPException(status_code=404, detail="Survey plan PDF not found")
-    filename = f"plot_{plot_id}_survey_plan.pdf"
+    # meta is only loaded above when the cache was actually (re)built - fetch it fresh here too so
+    # the filename is still identity-based on a cache hit that skipped that block.
+    filename = _build_plot_export_filename(plot_id, get_plot_meta(db, plot_id), "Survey_Plan", "pdf")
     return _pdf_response_with_r2(
         pdf_path,
         filename,
@@ -7193,7 +7219,9 @@ def get_saved_orthophoto_pdf(plot_id: int, map_type: str = "satellite", refresh:
         safe_remove(png_path)
     if not pdf_path or not os.path.exists(pdf_path):
         raise HTTPException(status_code=404, detail="Orthophoto PDF not found")
-    filename = f"plot_{plot_id}_{'topomap' if safe_type == 'topo' else 'orthophoto'}.pdf"
+    filename = _build_plot_export_filename(
+        plot_id, get_plot_meta(db, plot_id), "Topo_Map" if safe_type == "topo" else "Orthophoto", "pdf",
+    )
     return _pdf_response_with_r2(
         pdf_path,
         filename,
@@ -7227,7 +7255,7 @@ def get_saved_back_computation_pdf(plot_id: int, refresh: bool = False, db: Sess
         render_back_computation_pdf(rows, sum_de, sum_dn, area_m2, plot_id, pdf_path, crs_name)
     if not pdf_path or not os.path.exists(pdf_path):
         raise HTTPException(status_code=404, detail="Back computation PDF not found")
-    filename = f"plot_{plot_id}_back_computation.pdf"
+    filename = _build_plot_export_filename(plot_id, get_plot_meta(db, plot_id), "Back_Computation", "pdf")
     return _pdf_response_with_r2(
         pdf_path,
         filename,

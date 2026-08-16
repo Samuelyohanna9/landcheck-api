@@ -21,7 +21,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from app.db import SessionLocal
-from app.routers.plots import COORDINATE_SYSTEMS, get_db
+from app.routers.plots import COORDINATE_SYSTEMS, get_db, _safe_filename_fragment
 from app.utils.coordinate_converter import is_nigeria_auto_utm_coordinate_system, resolve_coordinate_system_key
 from app.utils.r2_objects import build_r2_settings, create_r2_client, delete_object_best_effort, upload_bytes
 
@@ -1417,11 +1417,19 @@ def export_georeference_staking_csv(session_id: str, db: Session = Depends(get_d
             ]
         )
     _touch_session(db, session_id)
+    # Mirrors the frontend's own georeference identity fallback chain (SurveyPlan.tsx): session
+    # title, then the originally-uploaded raster's filename (extension stripped), then a short
+    # session-id tag - instead of the full opaque session id used here before.
+    identity_source = str(row.get("title_text") or "").strip()
+    if not identity_source:
+        source_name = str(row.get("source_file_name") or "").strip()
+        identity_source = os.path.splitext(source_name)[0] if source_name else ""
+    identity = _safe_filename_fragment(identity_source, f"Session_{str(session_id)[:8]}")
     return Response(
         content="\ufeff" + csv_buffer.getvalue(),
         media_type="text/csv; charset=utf-8",
         headers={
-            "Content-Disposition": f'attachment; filename="georeference_{session_id}_staking.csv"',
+            "Content-Disposition": f'attachment; filename="{identity}_DGPS_Staking.csv"',
             # This export reflects live, editable session data - a browser or edge cache (e.g.
             # Cloudflare, in front of this API) serving a stale copy by URL would look exactly
             # like "the fix didn't deploy" even after it has. Never cache it.
