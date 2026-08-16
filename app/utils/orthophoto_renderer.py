@@ -22,6 +22,10 @@ import contextily as ctx
 from PIL import Image
 
 from app.utils.elevation import fetch_dem_elevation_points
+from app.utils.hazard_common import fetch_buildings_near
+# NOTE: map_renderer_layout is imported lazily inside _draw_topo_features, not at module level -
+# it imports FROM this module (_try_add_arcgis_world_imagery etc.), so a top-level import here
+# would be circular.
 
 from reportlab.lib.pagesizes import A4, A3, A2, A1, A0
 from reportlab.pdfgen import canvas
@@ -209,6 +213,7 @@ def _draw_topo_contours(
     elevation_points,
     font_scale: float = 1.0,
     is_user_data: bool = False,
+    contour_interval_override: float | None = None,
 ) -> bool:
     """Draws real contour lines derived from sampled elevation points - either the surveyor's own
     uploaded heights (is_user_data=True) or a free global DEM fetched for the plot's footprint.
@@ -254,8 +259,18 @@ def _draw_topo_contours(
     except Exception:
         return False
 
-    step = _nice_contour_step(span)
-    levels = np.arange(math.floor(elev_min / step) * step, math.ceil(elev_max / step) * step + step, step)
+    # A user-picked interval overrides the automatic band-count heuristic. If it's too coarse for
+    # this site's actual relief (fewer than 2 levels would result), fall back to Auto rather than
+    # silently rendering a contour-less map just because the surveyor picked, say, 10m on a 2m-tall
+    # site - the override is a preference, not a guarantee, and Auto always produces a valid map.
+    step = contour_interval_override if contour_interval_override and contour_interval_override > 0 else None
+    if step is not None:
+        levels = np.arange(math.floor(elev_min / step) * step, math.ceil(elev_max / step) * step + step, step)
+        if len(levels) < 2:
+            step = None
+    if step is None:
+        step = _nice_contour_step(span)
+        levels = np.arange(math.floor(elev_min / step) * step, math.ceil(elev_max / step) * step + step, step)
     if len(levels) < 2:
         return False
 
@@ -285,6 +300,95 @@ def _draw_topo_contours(
     ax.set_xlim(target_xlim)
     ax.set_ylim(target_ylim)
     return True
+
+
+def _draw_topo_features(ax, db, plot_id, plot_geom_wgs84, display_epsg, scale_ratio, font_scale=1.0, fig=None) -> bool:
+    """Draws roads, rivers, and buildings on top of the topo contour layer - the "natural features
+    and man-made objects" half of an actual topographic map, not just colored elevation bands.
+    Reuses the same data sources and drawing primitives as the main survey-plan renderer and the
+    hazard maps, just with plain topo-map symbology (thin solid roads, blue rivers, hatched
+    building outlines) instead of the cadastral plan's double-line/hatch treatment - a different
+    visual context. Safe to call even when there's no elevation data at all - features are drawn
+    independently of whether contours rendered. Returns True if anything was actually drawn.
+    """
+    # Imported lazily: map_renderer_layout imports FROM this module at its own top level, so a
+    # module-level import here would be circular.
+    from app.utils.map_renderer_layout import _fetch_live_road_geoms, _draw_road_edges, draw_building_hatch, draw_key_box
+
+    drew_anything = False
+    has_roads = has_rivers = has_buildings = False
+
+    try:
+        boundary_geojson = plot_geom_wgs84.__geo_interface__
+    except Exception:
+        boundary_geojson = None
+
+    # Roads - the same live query the survey-plan templates and Road Names panel already use.
+    try:
+        road_geoms = _fetch_live_road_geoms(db, plot_id)
+    except Exception:
+        road_geoms = []
+    if road_geoms:
+        try:
+            projected_roads = gpd.GeoSeries(road_geoms, crs="EPSG:4326").to_crs(epsg=display_epsg)
+            _draw_road_edges(
+                ax, list(projected_roads), font_scale=font_scale, color="#2b2b2b", linestyle="-",
+                scale_ratio=scale_ratio,
+            )
+            has_roads = True
+            drew_anything = True
+        except Exception:
+            pass
+
+    # Rivers - same detected_features snapshot table buildings/rivers already come from elsewhere;
+    # no standalone river-drawing helper exists to reuse, so draw plain lines directly.
+    try:
+        river_rows = db.execute(
+            text("SELECT geom FROM detected_features WHERE plot_id = :plot_id AND feature_type = 'river'"),
+            {"plot_id": plot_id},
+        ).fetchall()
+        river_geoms = [wkb.loads(row[0]) for row in river_rows]
+    except Exception:
+        river_geoms = []
+    if river_geoms:
+        try:
+            projected_rivers = gpd.GeoSeries(river_geoms, crs="EPSG:4326").to_crs(epsg=display_epsg)
+            for geom in projected_rivers:
+                lines = geom.geoms if geom.geom_type == "MultiLineString" else [geom]
+                for line in lines:
+                    if line.geom_type != "LineString" or line.is_empty:
+                        continue
+                    xs_r, ys_r = line.xy
+                    ax.plot(xs_r, ys_r, color="#1f78d1", linewidth=1.3 * font_scale, zorder=5)
+            has_rivers = True
+            drew_anything = True
+        except Exception:
+            pass
+
+    # Buildings - the same fetch the Flood/Erosion hazard maps already use.
+    if boundary_geojson is not None:
+        try:
+            building_geoms = fetch_buildings_near(db, boundary_geojson, buffer_m=120)
+        except Exception:
+            building_geoms = []
+        if building_geoms:
+            try:
+                draw_building_hatch(
+                    ax, building_geoms, display_epsg, scale_ratio or 1000, font_scale=font_scale,
+                    color="#4a4a4a", hatch_type="diagonal",
+                )
+                has_buildings = True
+                drew_anything = True
+            except Exception:
+                pass
+
+    if drew_anything and fig is not None:
+        try:
+            draw_key_box(fig, has_buildings=has_buildings, has_roads=has_roads, has_rivers=has_rivers, font_scale=font_scale)
+        except Exception:
+            pass
+
+    return drew_anything
 
 
 # Paper size mapping (ReportLab points)
@@ -763,6 +867,7 @@ def render_orthophoto_png(
     use_topo_map=False,
     topo_source="opentopomap",
     elevation_points=None,
+    contour_interval=None,
     paper_size="A4",
     north_arrow_style="one_side_stem",
     north_arrow_color="black",
@@ -838,6 +943,12 @@ def render_orthophoto_png(
             elevation_points if want_user_data else None,
             font_scale=font_scale,
             is_user_data=bool(want_user_data),
+            contour_interval_override=contour_interval,
+        )
+        # Roads/rivers/buildings are independent of whether contours rendered - a real topo map
+        # depicts them regardless of how much elevation relief the site happens to have.
+        _draw_topo_features(
+            ax, db, plot_id, plot_geom, display_epsg, effective_scale_ratio, font_scale=font_scale, fig=fig,
         )
     else:
         sat_zoom = 16 if preview_mode else 17

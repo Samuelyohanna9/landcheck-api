@@ -4546,6 +4546,7 @@ def create_plot_topomap_export_job(
     coordinate_system: str = Body("wgs84"),
     paper_size: str = Body("A4"),
     topo_source: str = Body("opentopomap"),
+    contour_interval: float | None = Body(None),
     north_arrow_style: str = Body("one_side_stem"),
     north_arrow_color: str = Body("blue"),
 ):
@@ -4562,6 +4563,7 @@ def create_plot_topomap_export_job(
         "paper_size": paper_size,
         "use_topo_map": True,
         "topo_source": topo_source or "opentopomap",
+        "contour_interval": contour_interval,
         "north_arrow_style": north_arrow_style,
         "north_arrow_color": north_arrow_color,
     }
@@ -6681,6 +6683,7 @@ def orthophoto_preview(plot_id: int, db: Session = Depends(get_db), background_t
     use_topo_map: bool = Body(False),
     topo_source: str = Body("opentopomap"),
     elevation_points: list = Body(default=[]),
+    contour_interval: float | None = Body(None),
     north_arrow_style: str = Body("one_side_stem"),
     north_arrow_color: str = Body("blue")):
 
@@ -6693,6 +6696,7 @@ def orthophoto_preview(plot_id: int, db: Session = Depends(get_db), background_t
         "use_topo_map": bool(use_topo_map),
         "topo_source": topo_source,
         "elevation_points": elevation_points if topo_source == "userdata" else [],
+        "contour_interval": contour_interval,
         "north_arrow_style": north_arrow_style,
         "north_arrow_color": north_arrow_color,
     }
@@ -6737,7 +6741,7 @@ def orthophoto_preview(plot_id: int, db: Session = Depends(get_db), background_t
         persisted_elevation_points = get_plot_meta(db, plot_id).get("elevation_points") or []
 
     if use_topo_map:
-        topo_source_footer = "SOURCE: Your uploaded elevation data" if topo_source == "userdata" else "SOURCE: Global elevation model (contours)"
+        topo_source_footer = "SOURCE: Your uploaded elevation data" if topo_source == "userdata" else "SOURCE: Global satellite elevation model (Copernicus/NASA DEM)"
     else:
         topo_source_footer = "SOURCE: Satellite Imagery"
 
@@ -6755,6 +6759,7 @@ def orthophoto_preview(plot_id: int, db: Session = Depends(get_db), background_t
         use_topo_map=use_topo_map,
         topo_source=topo_source,
         elevation_points=persisted_elevation_points,
+        contour_interval=contour_interval,
         paper_size=paper_size,
         north_arrow_style=north_arrow_style,
         north_arrow_color=north_arrow_color,
@@ -6799,6 +6804,7 @@ def orthophoto_pdf(plot_id: int, db: Session = Depends(get_db), background_tasks
     paper_size: str = Body("A4"),
     use_topo_map: bool = Body(False),
     topo_source: str = Body("opentopomap"),
+    contour_interval: float | None = Body(None),
     north_arrow_style: str = Body("one_side_stem"),
     north_arrow_color: str = Body("blue")):
 
@@ -6839,6 +6845,11 @@ def orthophoto_pdf(plot_id: int, db: Session = Depends(get_db), background_tasks
     if use_topo_map and topo_source == "userdata":
         elevation_points = get_plot_meta(db, plot_id).get("elevation_points") or None
 
+    if use_topo_map:
+        topo_source_footer = "SOURCE: Your uploaded elevation data" if topo_source == "userdata" else "SOURCE: Global satellite elevation model (Copernicus/NASA DEM)"
+    else:
+        topo_source_footer = "SOURCE: Satellite Imagery"
+
     render_orthophoto_png(
         db=db,
         plot_id=plot_id,
@@ -6850,6 +6861,7 @@ def orthophoto_pdf(plot_id: int, db: Session = Depends(get_db), background_tasks
         scale_text=scale_text,
         surveyor_name=surveyor_name,
         surveyor_rank=surveyor_rank,
+        source_footer_text=topo_source_footer,
         station_names=station_names if station_names else None,
         coordinate_system=render_coordinate_system,
         epsg_code=epsg_code,
@@ -6857,6 +6869,7 @@ def orthophoto_pdf(plot_id: int, db: Session = Depends(get_db), background_tasks
         use_topo_map=use_topo_map,
         topo_source=topo_source,
         elevation_points=elevation_points,
+        contour_interval=contour_interval,
         paper_size=paper_size,
         north_arrow_style=north_arrow_style,
         north_arrow_color=north_arrow_color,
@@ -7155,12 +7168,13 @@ def get_saved_orthophoto_pdf(plot_id: int, map_type: str = "satellite", refresh:
             crs_footer_text=f"COORDINATE SYSTEM: {crs_name}",
             source_footer_text=(
                 "SOURCE: Your uploaded elevation data" if safe_type == "topo" and meta.get("elevation_points")
-                else "SOURCE: Global elevation model (contours)" if safe_type == "topo"
+                else "SOURCE: Global satellite elevation model (Copernicus/NASA DEM)" if safe_type == "topo"
                 else "SOURCE: Satellite Imagery"
             ),
             use_topo_map=(safe_type == "topo"),
             topo_source="userdata" if meta.get("elevation_points") else "opentopomap",
             elevation_points=meta.get("elevation_points"),
+            contour_interval=meta.get("contour_interval"),
             paper_size=meta["paper_size"],
             north_arrow_style="one_side_stem",
             north_arrow_color="blue",
