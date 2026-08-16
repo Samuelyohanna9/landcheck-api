@@ -381,6 +381,10 @@ def get_plot_details(db: Session = Depends(get_db)):
                 m.paper_size,
                 m.coordinate_system,
                 m.template_name,
+                m.parent_plot_id,
+                m.subdivision_batch_id,
+                m.subdivision_lot_no,
+                m.estate_name,
                 m.created_at AS meta_created_at,
                 m.updated_at AS meta_updated_at
             FROM plots p
@@ -406,6 +410,10 @@ def get_plot_details(db: Session = Depends(get_db)):
                     NULL AS paper_size,
                     NULL AS coordinate_system,
                     NULL AS template_name,
+                    NULL AS parent_plot_id,
+                    NULL AS subdivision_batch_id,
+                    NULL AS subdivision_lot_no,
+                    NULL AS estate_name,
                     NULL AS meta_created_at,
                     NULL AS meta_updated_at
                 FROM plots p
@@ -549,6 +557,11 @@ def get_plot_details(db: Session = Depends(get_db)):
             "paper_size": row.get("paper_size"),
             "coordinate_system": row.get("coordinate_system"),
             "template_name": row.get("template_name"),
+            "parent_plot_id": row.get("parent_plot_id"),
+            "subdivision_batch_id": row.get("subdivision_batch_id"),
+            "subdivision_lot_no": row.get("subdivision_lot_no"),
+            "estate_name": row.get("estate_name"),
+            "workflow_type": "subdivision" if row.get("parent_plot_id") else "survey_plan",
             "geometry": geojson,
             "coords": coords,
             "detected_features": features_by_plot.get(plot_id, {"inside": {}, "buffer": {}}),
@@ -594,7 +607,9 @@ def get_survey_users(request: Request, db: Session = Depends(get_db)):
                         'template_name', pm.template_name,
                         'created_at', p.created_at,
                         'coordinate_system', pm.coordinate_system,
-                        'survey_input_coordinates', pm.survey_input_coordinates
+                        'survey_input_coordinates', pm.survey_input_coordinates,
+                        'parent_plot_id', pm.parent_plot_id,
+                        'estate_name', pm.estate_name
                     ) ORDER BY p.created_at DESC
                 ) FILTER (WHERE p.id IS NOT NULL),
                 '[]'
@@ -623,9 +638,56 @@ def get_survey_users(request: Request, db: Session = Depends(get_db)):
                     "created_at": plot.get("created_at"),
                     "coordinate_system": plot.get("coordinate_system"),
                     "survey_input_coordinates": plot.get("survey_input_coordinates") or [],
+                    "parent_plot_id": plot.get("parent_plot_id"),
+                    "estate_name": plot.get("estate_name"),
+                    "workflow_type": "subdivision" if plot.get("parent_plot_id") else "survey_plan",
                 }
                 for plot in (row["plots"] or [])
             ],
+        }
+        for row in rows
+    ]
+
+
+@router.get("/georeference-sessions")
+def get_georeference_sessions(request: Request, db: Session = Depends(get_db)):
+    """Georeference sessions (for the admin dashboard). Unlike Survey Plan/Subdivision plots,
+    these live in a standalone `survey_georeference_sessions` table with no owner_user_id or
+    plot_id linkage at all (see survey_georeference.py) - so unlike get_survey_users above, this
+    can't be grouped per-user, it's just every session that exists, newest first. Same real
+    server-side auth check as get_survey_users, since title_text/source_file_name can carry the
+    same kind of identifying info."""
+    require_super_admin_request(db, request)
+
+    table_exists = db.execute(text("""
+        SELECT EXISTS (
+            SELECT FROM information_schema.tables
+            WHERE table_name = 'survey_georeference_sessions'
+        )
+    """)).scalar()
+    if not table_exists:
+        return []
+
+    rows = db.execute(text("""
+        SELECT
+            id, title_text, status, target_coordinate_system, target_epsg,
+            source_file_name, source_content_type, created_at, updated_at, finalized_at
+        FROM survey_georeference_sessions
+        ORDER BY created_at DESC
+    """)).mappings().all()
+
+    return [
+        {
+            "id": str(row["id"]),
+            "title_text": row.get("title_text"),
+            "status": row.get("status"),
+            "target_coordinate_system": row.get("target_coordinate_system"),
+            "target_epsg": row.get("target_epsg"),
+            "source_file_name": row.get("source_file_name"),
+            "source_content_type": row.get("source_content_type"),
+            "created_at": row["created_at"].isoformat() if row.get("created_at") else None,
+            "updated_at": row["updated_at"].isoformat() if row.get("updated_at") else None,
+            "finalized_at": row["finalized_at"].isoformat() if row.get("finalized_at") else None,
         }
         for row in rows
     ]

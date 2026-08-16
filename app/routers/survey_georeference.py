@@ -1375,7 +1375,7 @@ def _format_coordinate_number(value: float, decimals: int) -> str:
 
 
 @router.get("/sessions/{session_id}/exports/staking.csv")
-def export_georeference_staking_csv(session_id: str, db: Session = Depends(get_db)):
+def export_georeference_staking_csv(session_id: str, raw: bool = False, db: Session = Depends(get_db)):
     row = _load_session_row(db, session_id)
     target_coordinate_system = str(row.get("target_coordinate_system") or "wgs84")
     transform_json = _safe_json_load(row.get("transform_json"), {}) or {}
@@ -1399,8 +1399,13 @@ def export_georeference_staking_csv(session_id: str, db: Session = Depends(get_d
         raise HTTPException(status_code=400, detail="Add ground control points or digitized features before exporting CSV.")
 
     csv_buffer = io.StringIO(newline="")
-    # No "sep=," Excel hint line - GIS/DGPS CSV readers treat it as a malformed data row (wrong
-    # column count) rather than the delimiter directive Excel understands it as.
+    # "sep=," as the literal first line forces Excel to parse this as comma-delimited on
+    # double-click regardless of the machine's regional list separator - the fix for "everything
+    # lands in column A" that most LandCheck Survey users hit, since most open this in Excel, not
+    # GIS software. A GIS/DGPS import tool that needs the strict form (no hint line, since some
+    # CSV readers treat it as a malformed data row) can pass ?raw=1.
+    if not raw:
+        csv_buffer.write("sep=,\r\n")
     writer = csv.writer(csv_buffer, lineterminator="\r\n")
     writer.writerow(["Type", "Station", "Feature", "Coordinate System", "Easting (m)", "Northing (m)", "Longitude", "Latitude"])
     for item in rows:

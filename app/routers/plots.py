@@ -3096,6 +3096,7 @@ def preview_plot_subdivision(
 @router.post("/{plot_id}/subdivision/apply")
 def apply_plot_subdivision(
     plot_id: int,
+    request: Request,
     db: Session = Depends(get_db),
     method: str = Body("by_count"),
     split_count: int | None = Body(None),
@@ -3125,6 +3126,21 @@ def apply_plot_subdivision(
         lot_names=lot_names,
     )
     parent_meta = get_plot_meta(db, plot_id)
+
+    # Child plots inherit the parent's ownership if it's already claimed; otherwise fall back to
+    # whatever Survey session this request carries right now. Without this, `Plot(geom=...)` below
+    # would leave every subdivision lot permanently unowned (owner_user_id NULL) even after the
+    # surveyor logs in - unlike regular plots, which stamp ownership at creation time.
+    parent_owner_id = db.execute(
+        text("SELECT owner_user_id FROM plots WHERE id = :id"), {"id": plot_id}
+    ).scalar()
+    child_owner_id = parent_owner_id
+    if child_owner_id is None:
+        try:
+            survey_session = resolve_survey_session(db, request)
+            child_owner_id = survey_session.user_id if survey_session else None
+        except Exception:
+            child_owner_id = None
 
     batch_id = db.execute(
         text(
@@ -3160,7 +3176,7 @@ def apply_plot_subdivision(
             if geom_obj is None:
                 raise HTTPException(status_code=400, detail=f"Invalid generated geometry for lot {row['lot_no']}.")
 
-            child_plot = Plot(geom=from_shape(geom_obj, srid=4326))
+            child_plot = Plot(geom=from_shape(geom_obj, srid=4326), owner_user_id=child_owner_id)
             db.add(child_plot)
             db.flush()
             child_plot_id = int(child_plot.id)
@@ -3450,6 +3466,11 @@ def _generate_subdivision_batch_zip(
 
         manifest_path = os.path.join(tmp_dir, "batch_manifest.csv")
         with open(manifest_path, "w", encoding="utf-8-sig", newline="") as f:
+            # "sep=," as the literal first line is a Microsoft-documented Excel hint that forces
+            # comma-delimited parsing on double-click, regardless of the machine's regional list
+            # separator (many Windows locales default to semicolon) - safe here since this file is
+            # a human-facing summary, not a GIS/DGPS ingestion target.
+            f.write("sep=,\n")
             writer = csv.writer(
                 f,
                 delimiter=",",
@@ -3470,10 +3491,28 @@ def _generate_subdivision_batch_zip(
             )
             writer.writerows(setting_out_rows)
 
+        # Excel-friendly companion of the same setting-out data, with the "sep=," hint. Kept as a
+        # separate file rather than added to setting_out_points_dgps.csv above, because QGIS/Civil3D/
+        # DGPS-receiver CSV importers treat a "sep=," first line as a malformed data row (wrong
+        # column count), not the delimiter directive Excel understands it as - the DGPS file has to
+        # stay strict for those tools, so Excel users get their own copy instead.
+        setting_out_excel_path = os.path.join(tmp_dir, "setting_out_points.csv")
+        with open(setting_out_excel_path, "w", encoding="utf-8-sig", newline="") as f:
+            f.write("sep=,\n")
+            writer = csv.writer(
+                f,
+                delimiter=",",
+                quotechar='"',
+                quoting=csv.QUOTE_MINIMAL,
+                lineterminator="\n",
+            )
+            writer.writerows(setting_out_rows)
+
         zip_path = os.path.join(tmp_dir, zip_name)
         with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
             zf.write(manifest_path, arcname="batch_manifest.csv")
             zf.write(setting_out_path, arcname="setting_out_points_dgps.csv")
+            zf.write(setting_out_excel_path, arcname="setting_out_points.csv")
             for fp in pdf_files:
                 if os.path.isfile(fp):
                     zf.write(fp, arcname=os.path.basename(fp))
@@ -5119,8 +5158,30 @@ def claim_plots(request: Request, plot_ids: List[int] = Body(..., embed=True), d
         ),
         {"user_id": session.user_id, "plot_ids": plot_ids},
     ).mappings().all()
+
+    # Subdivision lots generated from a parent plot before the surveyor logged in never got their
+    # own owner_user_id stamped (only the parent plot id is tracked in the browser's draft list -
+    # see savePlotToStorage in SurveyPlan.tsx). Claiming the parent should transitively claim every
+    # lot generated from it too, so they show up in the admin/"my plots" listing the same way.
+    child_rows = db.execute(
+        text(
+            """
+            UPDATE plots child
+            SET owner_user_id = :user_id
+            FROM plot_meta pm
+            WHERE child.id = pm.plot_id
+              AND child.owner_user_id IS NULL
+              AND pm.parent_plot_id IS NOT NULL
+              AND pm.parent_plot_id IN (
+                  SELECT id FROM plots WHERE owner_user_id = :user_id
+              )
+            RETURNING child.id
+            """
+        ),
+        {"user_id": session.user_id},
+    ).mappings().all()
     db.commit()
-    return {"claimed": [int(row["id"]) for row in rows]}
+    return {"claimed": [int(row["id"]) for row in rows] + [int(row["id"]) for row in child_rows]}
 
 
 @router.get("/mine")
