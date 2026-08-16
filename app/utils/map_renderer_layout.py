@@ -576,7 +576,10 @@ def draw_fence_symbol(fig, x0, x1, y, color="black", lw=1.0):
     )
 
 
-def draw_key_box(fig, has_buildings: bool, has_roads: bool, has_rivers: bool, has_fences: bool = False, font_scale=1.0):
+def draw_key_box(
+    fig, has_buildings: bool, has_roads: bool, has_rivers: bool, has_fences: bool = False, font_scale=1.0,
+    building_hatch_type: str = "diagonal",
+):
     """
     KEY shows ONLY features that exist on map.
     Buildings symbol is a rectangle (not a line).
@@ -653,37 +656,41 @@ def draw_key_box(fig, has_buildings: bool, has_roads: bool, has_rivers: bool, ha
             fig.add_artist(line2)
 
         elif sym == "rect":
-            # Building rectangle symbol
-            fig.add_artist(
-                patches.Rectangle(
-                    (x + 0.04, yy - 0.008),
-                    0.05,
-                    0.016,
-                    transform=fig.transFigure,
-                    fill=False,
-                    edgecolor=col,
-                    lw=1.2,
+            # Building rectangle symbol - matches whichever building style (solid fill, or one of
+            # the hatch patterns) is actually selected, instead of a fixed generic hatch icon that
+            # didn't reflect the real render (e.g. showing hatch lines when Solid Fill was chosen).
+            rect_x, rect_y, rect_w, rect_h = x + 0.04, yy - 0.008, 0.05, 0.016
+            normalized_bh = str(building_hatch_type or "diagonal").strip().lower()
+            if normalized_bh == "solid":
+                fig.add_artist(
+                    patches.Rectangle(
+                        (rect_x, rect_y), rect_w, rect_h,
+                        transform=fig.transFigure, facecolor=col, edgecolor=col, lw=1.2,
+                    )
                 )
-            )
-            # Show simple hatch inside the building symbol.
-            fig.add_artist(
-                mlines.Line2D(
-                    [x + 0.042, x + 0.088],
-                    [yy - 0.003, yy - 0.003],
-                    transform=fig.transFigure,
-                    color=col,
-                    lw=0.8,
+            else:
+                fig.add_artist(
+                    patches.Rectangle(
+                        (rect_x, rect_y), rect_w, rect_h,
+                        transform=fig.transFigure, fill=False, edgecolor=col, lw=1.2,
+                    )
                 )
-            )
-            fig.add_artist(
-                mlines.Line2D(
-                    [x + 0.042, x + 0.088],
-                    [yy + 0.003, yy + 0.003],
-                    transform=fig.transFigure,
-                    color=col,
-                    lw=0.8,
-                )
-            )
+
+                def _key_hatch_line(x0, y0, x1, y1):
+                    fig.add_artist(
+                        mlines.Line2D([x0, x1], [y0, y1], transform=fig.transFigure, color=col, lw=0.8)
+                    )
+
+                if normalized_bh in ("horizontal", "cross"):
+                    _key_hatch_line(rect_x + 0.002, rect_y + rect_h * 0.33, rect_x + rect_w - 0.002, rect_y + rect_h * 0.33)
+                    _key_hatch_line(rect_x + 0.002, rect_y + rect_h * 0.67, rect_x + rect_w - 0.002, rect_y + rect_h * 0.67)
+                if normalized_bh in ("vertical", "cross"):
+                    _key_hatch_line(rect_x + rect_w * 0.33, rect_y + 0.002, rect_x + rect_w * 0.33, rect_y + rect_h - 0.002)
+                    _key_hatch_line(rect_x + rect_w * 0.67, rect_y + 0.002, rect_x + rect_w * 0.67, rect_y + rect_h - 0.002)
+                if normalized_bh == "diagonal":
+                    _key_hatch_line(rect_x + 0.002, rect_y + 0.002, rect_x + rect_w - 0.002, rect_y + rect_h - 0.002)
+                    _key_hatch_line(rect_x + rect_w * 0.55, rect_y + 0.002, rect_x + rect_w - 0.002, rect_y + rect_h * 0.55)
+                    _key_hatch_line(rect_x + 0.002, rect_y + rect_h * 0.45, rect_x + rect_w * 0.45, rect_y + rect_h - 0.002)
         elif sym == "fence_line":
             draw_fence_symbol(fig, x + 0.03, x + 0.10, yy, color=col, lw=lw * font_scale)
 
@@ -6186,6 +6193,7 @@ def render_plot_map_layout(
         has_rivers=has_rivers,
         has_fences=has_fences,
         font_scale=font_scale,
+        building_hatch_type=building_hatch_type,
     )
     draw_certification_box(
         fig,

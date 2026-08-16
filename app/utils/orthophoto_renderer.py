@@ -426,7 +426,10 @@ def _draw_topo_features(
 
     if drew_anything and fig is not None:
         try:
-            draw_key_box(fig, has_buildings=has_buildings, has_roads=has_roads, has_rivers=has_rivers, font_scale=font_scale)
+            draw_key_box(
+                fig, has_buildings=has_buildings, has_roads=has_roads, has_rivers=has_rivers, font_scale=font_scale,
+                building_hatch_type=building_hatch_type,
+            )
         except Exception:
             pass
 
@@ -551,7 +554,8 @@ def draw_footer(fig, crs, source, surveyor, rank, font_scale=1.0):
     fig.text(0.05, y-0.036, "SIGNATURE: ____________________", fontsize=int(8*font_scale))
     fig.text(0.05, y-0.054, f"DATE PRINTED: {now}", fontsize=int(8*font_scale))
     fig.text(0.05, 0.05, crs, fontsize=int(7*font_scale), color="blue")
-    fig.text(0.95, 0.05, source, fontsize=int(7*font_scale), ha="right")
+    if source:
+        fig.text(0.95, 0.05, source, fontsize=int(7*font_scale), ha="right")
 
 
 def add_north_arrow(ax, font_scale=1.0, style: str = "one_side_stem", color: str = "black"):
@@ -1177,7 +1181,10 @@ def render_orthophoto_png(
 
     draw_sheet_frame(fig, font_scale)
     draw_title_block(fig, title_text, plot_id, scale_text_for_layout, location_text, lga_text, state_text, font_scale)
-    draw_footer(fig, crs_footer_text, source_footer_text, surveyor_name, surveyor_rank, font_scale)
+    # The topo map's elevation legend already occupies the bottom-right corner where the source
+    # line used to sit, and the GEE/user-data distinction is already conveyed there - so skip it
+    # for topo maps specifically rather than crowding the new legend. Orthophoto keeps its source line.
+    draw_footer(fig, crs_footer_text, "" if use_topo_map else source_footer_text, surveyor_name, surveyor_rank, font_scale)
     add_north_arrow(ax, font_scale, style=north_arrow_style, color=north_arrow_color)
     add_scalebar(ax, choose_scalebar_length(effective_scale_ratio), font_scale=font_scale)
 
