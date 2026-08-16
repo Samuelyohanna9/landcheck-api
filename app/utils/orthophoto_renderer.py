@@ -275,7 +275,10 @@ def _draw_topo_contours(
         return False
 
     try:
-        ax.tricontourf(triang, elevations, levels=levels, cmap="terrain", alpha=0.5, zorder=0)
+        # Kept fairly translucent (rather than a solid wash) so roads/rivers/buildings drawn on top
+        # (see _draw_topo_features) stay clearly legible against it instead of getting visually
+        # buried under a vivid terrain colormap.
+        ax.tricontourf(triang, elevations, levels=levels, cmap="terrain", alpha=0.35, zorder=0)
         # Minor (intermediate) contours: thin, unlabeled - real topo maps only print elevation
         # text on the bold index lines, not every line, or a map with many bands turns into a
         # wall of numbers.
@@ -907,7 +910,18 @@ def render_orthophoto_png(
     map_left, map_bottom, map_width, map_height = 0.10, 0.30, 0.80, 0.45
     ax = fig.add_axes([map_left, map_bottom, map_width, map_height])
 
-    requested_scale_ratio = parse_scale_ratio(scale_text)
+    # Imported lazily to avoid a circular import: map_renderer_layout imports FROM this module.
+    from app.utils.map_renderer_layout import is_auto_scale_text, compute_fit_scale_ratio
+
+    if is_auto_scale_text(scale_text):
+        # First-render default (and anything the user hasn't manually overridden) - fit the plot
+        # to the map frame the same way the main Survey Plan preview already does, instead of
+        # silently falling back to a flat 1:1000 that leaves a small plot lost in a sea of white
+        # space on the page (or a large plot clipped) regardless of its actual size.
+        requested_scale_ratio = compute_fit_scale_ratio(poly, fig_width * map_width, fig_height * map_height)
+        scale_text = f"1 : {requested_scale_ratio}"
+    else:
+        requested_scale_ratio = parse_scale_ratio(scale_text)
     effective_scale_ratio = requested_scale_ratio
     scale_text_for_layout = scale_text
     if not use_topo_map:
