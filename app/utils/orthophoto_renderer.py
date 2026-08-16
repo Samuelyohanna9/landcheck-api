@@ -73,13 +73,28 @@ def _compute_arcgis_export_size(
     preview_mode: bool,
 ) -> tuple[int, int]:
     max_edge = _ARCGIS_ORTHO_PREVIEW_MAX_EDGE if preview_mode else _ARCGIS_ORTHO_EXPORT_MAX_EDGE
-    base_width = max(640, int(round(fig_width * map_width_frac * dpi)))
-    base_height = max(640, int(round(fig_height * map_height_frac * dpi)))
     upscale_factor = 1.0 if preview_mode else 1.5
-    width = max(640, int(round(base_width * upscale_factor)))
-    height = max(640, int(round(base_height * upscale_factor)))
-    scale = min(max_edge / max(width, 1), max_edge / max(height, 1), 1.0)
-    return max(640, int(round(width * scale))), max(640, int(round(height * scale)))
+    width = max(1.0, fig_width * map_width_frac * dpi) * upscale_factor
+    height = max(1.0, fig_height * map_height_frac * dpi) * upscale_factor
+    # Apply the 640px-minimum and max_edge-maximum bounds as ONE proportional scale covering both
+    # dimensions together, never floor/cap width and height independently - that would send
+    # ArcGIS's export endpoint a `size` whose aspect ratio no longer matches the requested `bbox`,
+    # very likely for a short, wide panel like the site_plan photo inset (physically ~0.84 x
+    # 0.16-0.3 of the page, rendered at a deliberately low dpi for fetch speed - see
+    # _draw_site_plan_photo_inset). When `size` and `bbox` disagree, ArcGIS's export endpoint
+    # silently expands the image's real-world footprint to match the mismatched pixel aspect
+    # ratio, but this code still draws the returned image using the originally-requested (narrower)
+    # extent - which is exactly what made the plot boundary drawn on top appear shifted relative to
+    # the satellite imagery beneath it. A single scale factor keeps `size`'s aspect ratio identical
+    # to `bbox`'s no matter which bound ends up binding, so the image ArcGIS actually returns
+    # always lines up with the extent we tell imshow it covers.
+    scale = 1.0
+    min_edge = min(width, height)
+    if min_edge < 640:
+        scale = 640.0 / min_edge
+    if max(width, height) * scale > max_edge:
+        scale = max_edge / max(width, height)
+    return max(1, int(round(width * scale))), max(1, int(round(height * scale)))
 
 
 def _load_arcgis_export_image(
