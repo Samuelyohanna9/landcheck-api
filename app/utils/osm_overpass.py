@@ -45,18 +45,22 @@ FAILED_FETCH_RETRY_MINUTES = 15  # how long a *failed* fetch (timeout/network/5x
                                  # silently detected nothing, with no way to tell a "confirmed
                                  # empty" bucket from a "we never actually managed to check" one.
                                  # This is what "sometimes detects, sometimes doesn't" was.
-OVERPASS_TIMEOUT_S = 12  # passed to osmnx as both the HTTP client timeout AND the embedded
-                         # Overpass QL `[timeout:N]` server-side hint - neither is a hard wall-
-                         # clock deadline on its own (requests' timeout is inter-chunk, not total;
-                         # Overpass's is a soft "try to abort around here"), which is why
-                         # _fetch_bucket_from_overpass also wraps the call in a hard thread timeout.
-OVERPASS_HARD_TIMEOUT_S = 35  # absolute ceiling regardless of what the HTTP/Overpass layers do -
+OVERPASS_TIMEOUT_S = 8  # passed to osmnx as both the per-ENDPOINT HTTP client timeout AND the
+                        # embedded Overpass QL `[timeout:N]` server-side hint - neither is a hard
+                        # wall-clock deadline on its own (requests' timeout is inter-chunk, not
+                        # total; Overpass's is a soft "try to abort around here"). Kept fairly
+                        # tight since _fetch_bucket_from_overpass_uncapped now tries up to 3
+                        # mirror endpoints in sequence on failure - a slow/dead one should get cut
+                        # loose quickly so there's still time left to try the next.
+OVERPASS_HARD_TIMEOUT_S = 45  # absolute ceiling regardless of what the HTTP/Overpass layers do -
                               # see _fetch_bucket_from_overpass. Only matters when this ends up
                               # running inline (no BackgroundTasks available) - see
                               # _run_plot_feature_detection in plots.py, which is the normal path.
-                              # Raised from 25s now that a timeout retries itself shortly after
-                              # (FAILED_FETCH_RETRY_MINUTES) instead of being cached for 90 days -
-                              # worth giving genuinely-slow-but-working fetches more room to finish
+                              # Sized for up to 3 sequential endpoint attempts (OVERPASS_TIMEOUT_S
+                              # each) plus response-parsing overhead, not just one - a timeout here
+                              # retries itself shortly after anyway (FAILED_FETCH_RETRY_MINUTES)
+                              # instead of being cached for 90 days, so there's little downside to
+                              # giving the full mirror list a real chance to answer first.
                               # on the first try rather than needing a second attempt at all.
 
 _SCHEMA_READY = False
@@ -144,17 +148,65 @@ def _bucket_bounds(bucket_key: str) -> tuple[float, float, float, float]:
     return (lon - half, lat - half, lon + half, lat + half)  # west, south, east, north
 
 
+# Base URLs as osmnx expects them (it appends "/interpreter" itself - see osmnx._overpass, `url =
+# settings.overpass_url.rstrip("/") + "/interpreter"`). overpass-api.de first since it's the
+# best-known/most complete instance; the OSM wiki itself documents it as slow/overloaded under
+# load, so the other two are real fallbacks, not decorative - all three mirror the same underlying
+# OSM database (global coverage, not limited to their host country despite the domains), so
+# failing over between them changes nothing about data freshness/completeness, only which server
+# actually answers. Each was verified live (not just taken from documentation) immediately before
+# being listed here: overpass.kumi.systems and overpass.private.coffee - both commonly recommended
+# historically - didn't respond at all when tested; osm.ch and maps.mail.ru both did.
+_OVERPASS_ENDPOINTS = [
+    "https://overpass-api.de/api",
+    "https://overpass.osm.ch/api",
+    "https://maps.mail.ru/osm/tools/overpass/api",
+]
+
+
 def _fetch_bucket_from_overpass_uncapped(bucket_key: str):
     """The actual osmnx/Overpass call, with no time limit of its own - always call this through
-    _fetch_bucket_from_overpass, never directly, so the hard timeout below applies."""
-    import osmnx as ox
+    _fetch_bucket_from_overpass, never directly, so the hard timeout below applies.
 
+    Tries each endpoint in _OVERPASS_ENDPOINTS in turn, since the default public instance is
+    documented (OSM wiki, and this module's own observed behavior) as frequently slow/overloaded.
+    """
+    import osmnx as ox
+    from osmnx._errors import InsufficientResponseError
+
+    # osmnx's built-in rate limiter queries the server's `/status` endpoint before every request
+    # to decide how long to pause - a documented, occasionally-broken mechanism upstream
+    # (gboeing/osmnx#832, #697: a status-endpoint format change or load-balanced inconsistency can
+    # make this hang or misreport, stalling even a trivial small-bbox query for over a minute,
+    # independent of whether Overpass itself could have answered quickly). This module's own
+    # request volume to Overpass is already naturally throttled by the bucket cache (one real
+    # fetch per ~2.2km area per 90 days, see ensure_bucket_cached), so osmnx's extra layer buys
+    # nothing here and is a documented source of exactly the failures this module exists to route
+    # around.
+    ox.settings.overpass_rate_limit = False
     ox.settings.requests_timeout = OVERPASS_TIMEOUT_S
+
     west, south, east, north = _bucket_bounds(bucket_key)
-    return ox.features.features_from_bbox(
-        bbox=(west, south, east, north),
-        tags={"building": True, "highway": True, "waterway": True},
-    )
+    last_error: Exception | None = None
+    for endpoint in _OVERPASS_ENDPOINTS:
+        ox.settings.overpass_url = endpoint
+        try:
+            return ox.features.features_from_bbox(
+                bbox=(west, south, east, north),
+                tags={"building": True, "highway": True, "waterway": True},
+            )
+        except InsufficientResponseError:
+            # A real, authoritative "nothing here" answer - every mirror draws from the same OSM
+            # database, so there's no point asking a different one the same question.
+            raise
+        except Exception as exc:
+            last_error = exc
+            logger.warning(
+                "Overpass endpoint %s failed for bucket %s: %r - trying next endpoint",
+                endpoint, bucket_key, exc,
+            )
+            continue
+    raise last_error or RuntimeError("All Overpass endpoints failed")
 
 
 def _fetch_bucket_from_overpass(
