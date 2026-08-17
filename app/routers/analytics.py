@@ -649,6 +649,42 @@ def get_survey_users(request: Request, db: Session = Depends(get_db)):
     ]
 
 
+@router.get("/support-messages")
+def get_support_messages(request: Request, db: Session = Depends(get_db)):
+    """Support/Help requests submitted from the user dashboard (see POST /feedback/support).
+    Same real server-side auth check as get_survey_users - these carry an email/full_name."""
+    require_super_admin_request(db, request)
+
+    table_exists = db.execute(text("""
+        SELECT EXISTS (
+            SELECT FROM information_schema.tables
+            WHERE table_name = 'survey_support_messages'
+        )
+    """)).scalar()
+    if not table_exists:
+        return []
+
+    rows = db.execute(text("""
+        SELECT id, user_id, email, full_name, subject, message, page_context, created_at
+        FROM survey_support_messages
+        ORDER BY created_at DESC
+    """)).mappings().all()
+
+    return [
+        {
+            "id": int(row["id"]),
+            "user_id": row.get("user_id"),
+            "email": row.get("email"),
+            "full_name": row.get("full_name"),
+            "subject": row.get("subject"),
+            "message": row.get("message"),
+            "page_context": row.get("page_context"),
+            "created_at": row["created_at"].isoformat() if row.get("created_at") else None,
+        }
+        for row in rows
+    ]
+
+
 @router.get("/georeference-sessions")
 def get_georeference_sessions(request: Request, db: Session = Depends(get_db)):
     """Georeference sessions (for the admin dashboard). Unlike Survey Plan/Subdivision plots,

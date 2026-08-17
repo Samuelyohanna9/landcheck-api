@@ -12,7 +12,7 @@ from threading import Lock
 from typing import Any
 
 import numpy as np
-from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, Body, Depends, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import Response, StreamingResponse
 from PIL import Image, ImageOps
 from pydantic import BaseModel, Field, model_validator
@@ -22,6 +22,7 @@ from sqlalchemy.orm import Session
 
 from app.db import SessionLocal
 from app.routers.plots import COORDINATE_SYSTEMS, get_db, _safe_filename_fragment
+from app.utils.survey_auth_security import require_survey_session, resolve_survey_session
 from app.utils.coordinate_converter import is_nigeria_auto_utm_coordinate_system, resolve_coordinate_system_key
 from app.utils.r2_objects import build_r2_settings, create_r2_client, delete_object_best_effort, upload_bytes
 
@@ -194,6 +195,9 @@ def _ensure_schema(db: Session):
             )
         )
         db.execute(
+            text("ALTER TABLE survey_georeference_sessions ADD COLUMN IF NOT EXISTS owner_user_id BIGINT")
+        )
+        db.execute(
             text(
                 "CREATE INDEX IF NOT EXISTS idx_survey_georef_delete_after ON survey_georeference_sessions(delete_after_at)"
             )
@@ -201,6 +205,11 @@ def _ensure_schema(db: Session):
         db.execute(
             text(
                 "CREATE INDEX IF NOT EXISTS idx_survey_georef_status_updated ON survey_georeference_sessions(status, updated_at DESC)"
+            )
+        )
+        db.execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS idx_survey_georef_owner ON survey_georeference_sessions(owner_user_id)"
             )
         )
         db.commit()
@@ -1131,12 +1140,24 @@ def run_georeference_retention_cleanup() -> dict[str, int]:
 
 @router.post("/sessions")
 async def create_georeference_session(
+    request: Request,
     file: UploadFile = File(...),
     title_text: str | None = Form(None),
     target_coordinate_system: str = Form("wgs84"),
     db: Session = Depends(get_db),
 ):
     _ensure_schema(db)
+
+    # Anonymous creation stays fully supported (same "value first" pattern as regular plots -
+    # see create_plot in plots.py) - this only stamps ownership when the request happens to
+    # already carry a signed-in Survey session, so the dashboard can list it under "mine"
+    # immediately instead of relying on the claim-after-login step below.
+    owner_user_id = None
+    try:
+        survey_session = resolve_survey_session(db, request)
+        owner_user_id = survey_session.user_id if survey_session else None
+    except Exception:
+        owner_user_id = None
     settings = _build_r2()
 
     content_type = str(file.content_type or "").strip().lower()
@@ -1199,7 +1220,8 @@ async def create_georeference_session(
                 source_height,
                 gcps_json,
                 features_json,
-                delete_after_at
+                delete_after_at,
+                owner_user_id
             )
             VALUES (
                 :session_id,
@@ -1215,7 +1237,8 @@ async def create_georeference_session(
                 :source_height,
                 '[]'::jsonb,
                 '[]'::jsonb,
-                :delete_after_at
+                :delete_after_at,
+                :owner_user_id
             )
             """
         ),
@@ -1231,11 +1254,70 @@ async def create_georeference_session(
             "source_width": int(width),
             "source_height": int(height),
             "delete_after_at": delete_after_at,
+            "owner_user_id": owner_user_id,
         },
     )
     db.commit()
     row = _load_session_row(db, session_id)
     return {"ok": True, "session": _session_to_payload(row)}
+
+
+@router.post("/sessions/claim")
+def claim_georeference_sessions(request: Request, session_ids: list[str] = Body(..., embed=True), db: Session = Depends(get_db)):
+    """Mirrors POST /plots/claim - a session started before the surveyor logged in has no
+    owner_user_id yet (only tracked by id in this browser's local draft list, see
+    saveGeorefSessionToStorage in SurveyPlan.tsx), so this attaches it to their account right
+    after sign-in the same way regular plots get claimed."""
+    _ensure_schema(db)
+    session = require_survey_session(db, request)
+    if not session_ids:
+        return {"claimed": []}
+    rows = db.execute(
+        text(
+            """
+            UPDATE survey_georeference_sessions
+            SET owner_user_id = :user_id
+            WHERE id = ANY(:session_ids) AND owner_user_id IS NULL
+            RETURNING id
+            """
+        ),
+        {"user_id": session.user_id, "session_ids": [str(s) for s in session_ids]},
+    ).mappings().all()
+    db.commit()
+    return {"claimed": [str(row["id"]) for row in rows]}
+
+
+@router.get("/sessions/mine")
+def list_my_georeference_sessions(request: Request, db: Session = Depends(get_db)):
+    _ensure_schema(db)
+    session = require_survey_session(db, request)
+    rows = db.execute(
+        text(
+            """
+            SELECT id, title_text, status, target_coordinate_system, source_file_name,
+                   created_at, updated_at, finalized_at
+            FROM survey_georeference_sessions
+            WHERE owner_user_id = :user_id
+            ORDER BY updated_at DESC
+            """
+        ),
+        {"user_id": session.user_id},
+    ).mappings().all()
+    return {
+        "sessions": [
+            {
+                "session_id": str(row["id"]),
+                "title": row["title_text"],
+                "status": row["status"],
+                "coordinate_system": row["target_coordinate_system"],
+                "source_file_name": row["source_file_name"],
+                "created_at": row["created_at"].isoformat() if row["created_at"] else None,
+                "updated_at": row["updated_at"].isoformat() if row["updated_at"] else None,
+                "finalized_at": row["finalized_at"].isoformat() if row["finalized_at"] else None,
+            }
+            for row in rows
+        ]
+    }
 
 
 @router.get("/sessions/{session_id}")

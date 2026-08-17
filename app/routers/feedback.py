@@ -1,11 +1,12 @@
 # app/routers/feedback.py
 
-from fastapi import APIRouter, Depends, Body
+from fastapi import APIRouter, Depends, Body, HTTPException, Request
 from sqlalchemy.orm import Session
 from sqlalchemy import text
 from datetime import datetime
 
 from app.db import SessionLocal
+from app.utils.survey_auth_security import require_survey_session
 
 router = APIRouter(prefix="/feedback", tags=["feedback"])
 
@@ -74,6 +75,69 @@ def submit_feedback(
     db.commit()
 
     return {"status": "success", "message": "Feedback submitted successfully"}
+
+
+def ensure_support_messages_table(db: Session):
+    db.execute(text("""
+        CREATE TABLE IF NOT EXISTS survey_support_messages (
+            id SERIAL PRIMARY KEY,
+            user_id BIGINT,
+            email VARCHAR(255),
+            full_name VARCHAR(255),
+            subject VARCHAR(255),
+            message TEXT NOT NULL,
+            page_context VARCHAR(100),
+            created_at TIMESTAMP DEFAULT NOW()
+        )
+    """))
+    db.commit()
+
+
+@router.post("/support")
+def submit_support_message(
+    request: Request,
+    subject: str = Body(""),
+    message: str = Body(...),
+    page_context: str = Body(""),
+    db: Session = Depends(get_db),
+):
+    """Dashboard's "Help / Support" widget - unlike the profession/satisfaction survey above,
+    this is a quick "I have a question or a problem" note tied to the signed-in surveyor's
+    account, so we already know who it's from without asking them to type their email again."""
+    session = require_survey_session(db, request)
+    clean_message = message.strip()
+    if not clean_message:
+        raise HTTPException(status_code=400, detail="Message can't be empty.")
+
+    ensure_support_messages_table(db)
+    db.execute(text("""
+        INSERT INTO survey_support_messages (user_id, email, full_name, subject, message, page_context)
+        VALUES (:user_id, :email, :full_name, :subject, :message, :page_context)
+    """), {
+        "user_id": session.user_id,
+        "email": session.email,
+        "full_name": session.full_name,
+        "subject": subject.strip() or "(no subject)",
+        "message": clean_message,
+        "page_context": page_context.strip() or "dashboard",
+    })
+    db.commit()
+
+    try:
+        from app.utils.survey_email import send_support_message_email
+        send_support_message_email(
+            subject=subject.strip() or "(no subject)",
+            message=clean_message,
+            from_email=session.email or "",
+            from_name=session.full_name or "A LandCheck Survey user",
+            page_context=page_context.strip() or "dashboard",
+        )
+    except Exception:
+        # The message is already saved above - a missing/misconfigured SMTP_HOST shouldn't ever
+        # surface as a failure to the user submitting the request.
+        pass
+
+    return {"status": "success"}
 
 
 @router.get("")

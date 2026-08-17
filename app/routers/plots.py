@@ -5191,7 +5191,8 @@ def list_my_plots(request: Request, db: Session = Depends(get_db)):
     rows = db.execute(
         text(
             """
-            SELECT p.id, p.created_at, m.title_text, m.location_text, m.scale_text
+            SELECT p.id, p.created_at, m.title_text, m.location_text, m.scale_text,
+                   m.parent_plot_id, m.subdivision_batch_id, m.subdivision_lot_no, m.estate_name
             FROM plots p
             LEFT JOIN plot_meta m ON m.plot_id = p.id
             WHERE p.owner_user_id = :user_id
@@ -5209,6 +5210,11 @@ def list_my_plots(request: Request, db: Session = Depends(get_db)):
                 "location": row["location_text"],
                 "scale": row["scale_text"],
                 "status": "completed" if (row["title_text"] or "").strip() else "draft",
+                "workflow_type": "subdivision" if row["parent_plot_id"] else "survey_plan",
+                "parent_plot_id": row["parent_plot_id"],
+                "subdivision_batch_id": row["subdivision_batch_id"],
+                "subdivision_lot_no": row["subdivision_lot_no"],
+                "estate_name": row["estate_name"],
             }
             for row in rows
         ]
