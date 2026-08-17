@@ -3308,13 +3308,23 @@ def _render_plot_map_layout_adamawa(
     major = nice_grid_step(max(ax.get_xlim()[1] - ax.get_xlim()[0], ax.get_ylim()[1] - ax.get_ylim()[0]))
     draw_grid(ax, poly, major / 5.0, major, font_scale, full_grid=False, edge_ticks=False, color=grid_color)
 
+    # Segments shorter than this (on paper, at this scale) have their bearing/distance label
+    # deferred to the overflow table instead of fighting for space inline - matching the general
+    # template's threshold (see render_plot_map_layout). Without this, annotate_vertices'
+    # min_label_length_m stayed 0.0 here, which disables its skip-to-table logic entirely
+    # (`if min_label_length_m and dist < min_label_length_m`) - every label got attempted inline
+    # regardless of how tightly packed the vertices were, which is what produced illegible
+    # overlapping text on a dense/many-sided boundary instead of using the table this template now
+    # actually has access to.
+    min_label_mm = 12
+    min_label_length_m = (min_label_mm / 1000.0) * scale_ratio
     skipped_entries, _boundary_label_boxes = annotate_vertices(
         ax,
         poly,
         plot_id,
         station_names=station_names,
         font_scale=font_scale,
-        min_label_length_m=0.0,
+        min_label_length_m=min_label_length_m,
         avoid_geom=fence_avoid_geom,
         scale_ratio=scale_ratio,
         boundary_poly=poly,
@@ -4270,13 +4280,17 @@ def _render_plot_map_layout_cadastral(
     ax.set_xlim(target_xlim)
     ax.set_ylim(target_ylim)
 
+    # See the Adamawa template's identical block for why this can't stay 0.0 - it's what actually
+    # triggers annotate_vertices' skip-to-table behavior for tightly packed vertices.
+    min_label_mm = 12
+    min_label_length_m = (min_label_mm / 1000.0) * scale_ratio
     skipped_entries, _boundary_label_boxes = annotate_vertices(
         ax,
         poly,
         plot_id,
         station_names=station_names,
         font_scale=font_scale,
-        min_label_length_m=0.0,
+        min_label_length_m=min_label_length_m,
         avoid_geom=label_avoid_geom,
         scale_ratio=scale_ratio,
         boundary_poly=poly,
@@ -4878,13 +4892,17 @@ def _render_plot_map_layout_fct(
     ax.set_xlim(target_xlim)
     ax.set_ylim(target_ylim)
 
+    # See the Adamawa template's identical block for why this can't stay 0.0 - it's what actually
+    # triggers annotate_vertices' skip-to-table behavior for tightly packed vertices.
+    min_label_mm = 12
+    min_label_length_m = (min_label_mm / 1000.0) * scale_ratio
     skipped_entries, _boundary_label_boxes = annotate_vertices(
         ax,
         poly,
         plot_id,
         station_names=station_names,
         font_scale=font_scale,
-        min_label_length_m=0.0,
+        min_label_length_m=min_label_length_m,
         avoid_geom=label_avoid_geom,
         scale_ratio=scale_ratio,
         boundary_poly=poly,
@@ -5570,8 +5588,12 @@ def _render_plot_map_layout_site_plan(
     ax.set_xlim(target_xlim)
     ax.set_ylim(target_ylim)
 
+    # See the Adamawa template's identical block for why this can't stay 0.0 - it's what actually
+    # triggers annotate_vertices' skip-to-table behavior for tightly packed vertices.
+    min_label_mm = 12
+    min_label_length_m = (min_label_mm / 1000.0) * scale_ratio
     skipped_entries, _boundary_label_boxes = annotate_vertices(
-        ax, poly, plot_id, station_names=station_names, font_scale=font_scale, min_label_length_m=0.0,
+        ax, poly, plot_id, station_names=station_names, font_scale=font_scale, min_label_length_m=min_label_length_m,
         avoid_geom=label_avoid_geom, scale_ratio=scale_ratio, boundary_poly=poly, beacon_style=beacon_style,
         text_color=text_color, boundary_color=boundary_color, station_font=station_font, station_size=station_size,
         bearing_font=bearing_font, bearing_size=bearing_size,
