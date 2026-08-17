@@ -36,16 +36,28 @@ REGION_BUCKET_DEG = 0.02  # ~2.2km grid cells - smaller than the first cut (0.05
                           # ~5000 buildings), since Overpass server-side processing time and payload
                           # size scale with area. Still much larger than a plot's ~150m buffer, so
                           # most plots in the same neighborhood still share one already-cached bucket.
-CACHE_MAX_AGE_DAYS = 90
+CACHE_MAX_AGE_DAYS = 90  # how long a *successful* fetch (even a genuinely empty one) is trusted.
+FAILED_FETCH_RETRY_MINUTES = 15  # how long a *failed* fetch (timeout/network/5xx) blocks retries -
+                                 # short on purpose. A failure used to get cached with the same
+                                 # 90-day lifetime as a real result, which meant one transient
+                                 # Overpass hiccup could permanently starve an entire ~2.2km area
+                                 # of features for months - every plot created there afterwards
+                                 # silently detected nothing, with no way to tell a "confirmed
+                                 # empty" bucket from a "we never actually managed to check" one.
+                                 # This is what "sometimes detects, sometimes doesn't" was.
 OVERPASS_TIMEOUT_S = 12  # passed to osmnx as both the HTTP client timeout AND the embedded
                          # Overpass QL `[timeout:N]` server-side hint - neither is a hard wall-
                          # clock deadline on its own (requests' timeout is inter-chunk, not total;
                          # Overpass's is a soft "try to abort around here"), which is why
                          # _fetch_bucket_from_overpass also wraps the call in a hard thread timeout.
-OVERPASS_HARD_TIMEOUT_S = 25  # absolute ceiling regardless of what the HTTP/Overpass layers do -
+OVERPASS_HARD_TIMEOUT_S = 35  # absolute ceiling regardless of what the HTTP/Overpass layers do -
                               # see _fetch_bucket_from_overpass. Only matters when this ends up
                               # running inline (no BackgroundTasks available) - see
                               # _run_plot_feature_detection in plots.py, which is the normal path.
+                              # Raised from 25s now that a timeout retries itself shortly after
+                              # (FAILED_FETCH_RETRY_MINUTES) instead of being cached for 90 days -
+                              # worth giving genuinely-slow-but-working fetches more room to finish
+                              # on the first try rather than needing a second attempt at all.
 
 _SCHEMA_READY = False
 
@@ -145,17 +157,29 @@ def _fetch_bucket_from_overpass_uncapped(bucket_key: str):
     )
 
 
-def _fetch_bucket_from_overpass(bucket_key: str) -> dict[str, list[tuple[BaseGeometry, str | None, str | None]]]:
-    """Returns {"building"|"road"|"river": [(geom, name, subtype), ...]}. `name` is the OSM
-    `name` tag (used for road labels on the general template, matching what Nigeria's `lines`
-    table already provides); `subtype` is the matched tag's value (e.g. "primary", "residential",
-    "river", "stream") - captured for completeness/future use, not currently read by any renderer."""
+def _fetch_bucket_from_overpass(
+    bucket_key: str,
+) -> tuple[dict[str, list[tuple[BaseGeometry, str | None, str | None]]], bool]:
+    """Returns ({"building"|"road"|"river": [(geom, name, subtype), ...]}, success).
+
+    `success` distinguishes "we asked Overpass and it genuinely has nothing here" (a real result,
+    safe to cache for CACHE_MAX_AGE_DAYS) from "we don't actually know" - a timeout, network error,
+    or 5xx (must NOT be cached the same way, or one transient hiccup silently starves an entire
+    ~2.2km area of features for months; see FAILED_FETCH_RETRY_MINUTES). Callers must check this
+    before treating an empty result dict as a confirmed-empty area.
+
+    `name` is the OSM `name` tag (used for road labels on the general template, matching what
+    Nigeria's `lines` table already provides); `subtype` is the matched tag's value (e.g.
+    "primary", "residential", "river", "stream") - captured for completeness/future use, not
+    currently read by any renderer.
+    """
     result: dict[str, list[tuple[BaseGeometry, str | None, str | None]]] = {"building": [], "road": [], "river": []}
     try:
         import osmnx  # noqa: F401 - just checking it's installed before spinning up a thread
+        from osmnx._errors import InsufficientResponseError
     except ImportError:
         logger.warning("osmnx is not installed - skipping Overpass fetch for bucket %s", bucket_key)
-        return result
+        return result, False
 
     # requests' own `timeout` only measures gaps between chunks, not total request duration, and
     # Overpass's embedded `[timeout:N]` is a soft server-side hint it can run past - so a slow-
@@ -178,22 +202,26 @@ def _fetch_bucket_from_overpass(bucket_key: str) -> dict[str, list[tuple[BaseGeo
 
     if thread.is_alive():
         logger.warning(
-            "Overpass fetch for bucket %s exceeded the %ss hard timeout - treating as empty "
-            "(the abandoned request may still complete server-side; a later plot in this area "
-            "will retry the fetch since nothing gets cached on a timeout)",
-            bucket_key, OVERPASS_HARD_TIMEOUT_S,
+            "Overpass fetch for bucket %s exceeded the %ss hard timeout - will retry in %s "
+            "minutes (the abandoned request may still complete server-side, but its result is "
+            "discarded either way)",
+            bucket_key, OVERPASS_HARD_TIMEOUT_S, FAILED_FETCH_RETRY_MINUTES,
         )
-        return result
+        return result, False
     if "error" in outcome:
-        # Covers osmnx's own "nothing found" exception as well as real network/5xx failures -
-        # either way this bucket just gets treated as empty, never a hard error that could block
-        # whatever triggered it.
-        logger.warning("Overpass fetch failed for bucket %s: %r", bucket_key, outcome["error"])
-        return result
+        exc = outcome["error"]
+        if isinstance(exc, InsufficientResponseError):
+            # A real answer: Overpass was reachable and this bbox genuinely has none of the
+            # tags we asked for. Safe to cache as a confirmed-empty bucket.
+            return result, True
+        # Network error, timeout inside requests itself, 5xx, etc. - we don't know what's really
+        # out there, so this must NOT be cached as if it were a confirmed-empty result.
+        logger.warning("Overpass fetch failed for bucket %s: %r", bucket_key, exc)
+        return result, False
     gdf = outcome.get("gdf")
 
     if gdf is None or gdf.empty:
-        return result
+        return result, True
 
     has_building = "building" in gdf.columns
     has_waterway = "waterway" in gdf.columns
@@ -252,12 +280,12 @@ def _fetch_bucket_from_overpass(bucket_key: str) -> dict[str, list[tuple[BaseGeo
                 continue
             result["road"].append((geom, name, _tag_text(row.get("highway"))))
 
-    return result
+    return result, True
 
 
 def _bucket_is_fresh(db: Session, bucket_key: str) -> bool:
     row = db.execute(
-        text("SELECT fetched_at FROM osm_overpass_cache_buckets WHERE bucket_key = :bk"),
+        text("SELECT fetched_at, status FROM osm_overpass_cache_buckets WHERE bucket_key = :bk"),
         {"bk": bucket_key},
     ).mappings().first()
     if not row or row["fetched_at"] is None:
@@ -265,14 +293,35 @@ def _bucket_is_fresh(db: Session, bucket_key: str) -> bool:
     fetched_at = row["fetched_at"]
     if fetched_at.tzinfo is None:
         fetched_at = fetched_at.replace(tzinfo=timezone.utc)
-    return (datetime.now(timezone.utc) - fetched_at) < timedelta(days=CACHE_MAX_AGE_DAYS)
+    age = datetime.now(timezone.utc) - fetched_at
+    # A 'failed' bucket (timeout/network error - see _fetch_bucket_from_overpass) only blocks
+    # retries briefly, not for the full 90 days a genuine result (found-something or confirmed-
+    # empty, both 'ok') is trusted for.
+    max_age = timedelta(minutes=FAILED_FETCH_RETRY_MINUTES) if row["status"] == "failed" else timedelta(days=CACHE_MAX_AGE_DAYS)
+    return age < max_age
 
 
 def _store_bucket_cache(
     db: Session,
     bucket_key: str,
     features: dict[str, list[tuple[BaseGeometry, str | None, str | None]]],
+    success: bool,
 ) -> int:
+    if not success:
+        # Record the attempt (so _bucket_is_fresh's short failure-cooldown applies) without
+        # touching osm_overpass_cache_features at all - if an earlier successful fetch already
+        # cached real features here, a later failed retry must never wipe them out.
+        db.execute(
+            text("""
+                INSERT INTO osm_overpass_cache_buckets (bucket_key, fetched_at, feature_count, status)
+                VALUES (:bucket_key, NOW(), 0, 'failed')
+                ON CONFLICT (bucket_key) DO UPDATE SET fetched_at = NOW(), status = 'failed'
+            """),
+            {"bucket_key": bucket_key},
+        )
+        db.commit()
+        return 0
+
     db.execute(
         text("""
             INSERT INTO osm_overpass_cache_buckets (bucket_key, fetched_at, feature_count, status)
@@ -310,13 +359,14 @@ def _store_bucket_cache(
 
 def ensure_bucket_cached(db: Session, lat: float, lon: float) -> tuple[str, bool]:
     """Returns (bucket_key, was_cache_hit). Fetches from Overpass and populates the cache tables
-    only on a miss/stale bucket."""
+    only on a miss/stale bucket (see _bucket_is_fresh for what "stale" means for a failed vs. a
+    successful previous attempt)."""
     ensure_osm_overpass_schema(db)
     bucket_key = _bucket_key(lat, lon)
     if _bucket_is_fresh(db, bucket_key):
         return bucket_key, True
-    features = _fetch_bucket_from_overpass(bucket_key)
-    _store_bucket_cache(db, bucket_key, features)
+    features, success = _fetch_bucket_from_overpass(bucket_key)
+    _store_bucket_cache(db, bucket_key, features, success)
     return bucket_key, False
 
 
