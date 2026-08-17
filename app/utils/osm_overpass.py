@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import logging
 import time
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from datetime import datetime, timedelta, timezone
 
 from shapely.geometry.base import BaseGeometry
@@ -29,10 +30,21 @@ from sqlalchemy.orm import Session
 
 logger = logging.getLogger(__name__)
 
-REGION_BUCKET_DEG = 0.05  # ~5.5km grid cells - much larger than a plot's ~150m buffer, so the
-                          # vast majority of plots land entirely inside one already-cached bucket.
+REGION_BUCKET_DEG = 0.02  # ~2.2km grid cells - smaller than the first cut (0.05deg/~5.5km), which
+                          # took 60-80s to fetch for a single dense-city bucket (e.g. central Accra,
+                          # ~5000 buildings), since Overpass server-side processing time and payload
+                          # size scale with area. Still much larger than a plot's ~150m buffer, so
+                          # most plots in the same neighborhood still share one already-cached bucket.
 CACHE_MAX_AGE_DAYS = 90
-OVERPASS_TIMEOUT_S = 20
+OVERPASS_TIMEOUT_S = 12  # passed to osmnx as both the HTTP client timeout AND the embedded
+                         # Overpass QL `[timeout:N]` server-side hint - neither is a hard wall-
+                         # clock deadline on its own (requests' timeout is inter-chunk, not total;
+                         # Overpass's is a soft "try to abort around here"), which is why
+                         # _fetch_bucket_from_overpass also wraps the call in a hard thread timeout.
+OVERPASS_HARD_TIMEOUT_S = 25  # absolute ceiling regardless of what the HTTP/Overpass layers do -
+                              # see _fetch_bucket_from_overpass. Only matters when this ends up
+                              # running inline (no BackgroundTasks available) - see
+                              # _run_plot_feature_detection in plots.py, which is the normal path.
 
 _SCHEMA_READY = False
 
@@ -115,26 +127,47 @@ def _bucket_bounds(bucket_key: str) -> tuple[float, float, float, float]:
     return (lon - half, lat - half, lon + half, lat + half)  # west, south, east, north
 
 
+def _fetch_bucket_from_overpass_uncapped(bucket_key: str):
+    """The actual osmnx/Overpass call, with no time limit of its own - always call this through
+    _fetch_bucket_from_overpass, never directly, so the hard timeout below applies."""
+    import osmnx as ox
+
+    ox.settings.requests_timeout = OVERPASS_TIMEOUT_S
+    west, south, east, north = _bucket_bounds(bucket_key)
+    return ox.features.features_from_bbox(
+        bbox=(west, south, east, north),
+        tags={"building": True, "highway": True, "waterway": True},
+    )
+
+
 def _fetch_bucket_from_overpass(bucket_key: str) -> dict[str, list[BaseGeometry]]:
     result: dict[str, list[BaseGeometry]] = {"building": [], "road": [], "river": []}
     try:
-        import osmnx as ox
+        import osmnx  # noqa: F401 - just checking it's installed before spinning up a thread
     except ImportError:
         logger.warning("osmnx is not installed - skipping Overpass fetch for bucket %s", bucket_key)
         return result
 
-    ox.settings.requests_timeout = OVERPASS_TIMEOUT_S
-    west, south, east, north = _bucket_bounds(bucket_key)
-
     try:
-        gdf = ox.features.features_from_bbox(
-            bbox=(west, south, east, north),
-            tags={"building": True, "highway": True, "waterway": True},
+        # requests' own `timeout` only measures gaps between chunks, not total request duration,
+        # and Overpass's embedded `[timeout:N]` is a soft server-side hint it can run past - so a
+        # slow-but-still-streaming response can take far longer than OVERPASS_TIMEOUT_S even with
+        # both of those set (observed: a single dense-city bucket took ~77s despite a 15s setting
+        # on both). This thread-based wrapper is the only thing that actually enforces a ceiling.
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(_fetch_bucket_from_overpass_uncapped, bucket_key)
+            gdf = future.result(timeout=OVERPASS_HARD_TIMEOUT_S)
+    except FutureTimeoutError:
+        logger.warning(
+            "Overpass fetch for bucket %s exceeded the %ss hard timeout - treating as empty "
+            "(the abandoned request may still complete server-side and be picked up on a later retry)",
+            bucket_key, OVERPASS_HARD_TIMEOUT_S,
         )
+        return result
     except Exception as exc:
-        # Covers osmnx's own "nothing found" exception as well as real network/timeout/5xx
-        # failures - either way this bucket just gets treated as empty, never a hard error that
-        # could block the plot creation request that triggered it.
+        # Covers osmnx's own "nothing found" exception as well as real network/5xx failures -
+        # either way this bucket just gets treated as empty, never a hard error that could block
+        # whatever triggered it.
         logger.warning("Overpass fetch failed for bucket %s: %r", bucket_key, exc)
         return result
 

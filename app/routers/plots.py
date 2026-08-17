@@ -2001,7 +2001,21 @@ def _apply_child_plot_meta(
     )
 
 
-def _run_plot_feature_detection(db: Session, plot_id: int):
+def _run_overpass_detection_background(plot_id: int, centroid_lat: float, centroid_lon: float):
+    """Entry point for BackgroundTasks (see _run_plot_feature_detection below) - runs after the
+    HTTP response has already been sent, so it needs its own DB session rather than reusing the
+    request-scoped one, which FastAPI closes around when the response goes out."""
+    db = SessionLocal()
+    try:
+        from app.utils.osm_overpass import run_overpass_feature_detection
+        run_overpass_feature_detection(db, plot_id, centroid_lat, centroid_lon)
+    except Exception:
+        logger.warning("Background Overpass feature detection failed for plot %s", plot_id, exc_info=True)
+    finally:
+        db.close()
+
+
+def _run_plot_feature_detection(db: Session, plot_id: int, background_tasks: BackgroundTasks | None = None):
     db.execute(
         text(
             """
@@ -2039,11 +2053,21 @@ def _run_plot_feature_detection(db: Session, plot_id: int):
     centroid_lat = float(centroid_row["lat"]) if centroid_row and centroid_row["lat"] is not None else None
 
     if centroid_lon is not None and centroid_lat is not None and not validate_nigeria_bounds(centroid_lon, centroid_lat):
-        try:
-            from app.utils.osm_overpass import run_overpass_feature_detection
-            run_overpass_feature_detection(db, int(plot_id), centroid_lat, centroid_lon)
-        except Exception:
-            logger.warning("Overpass feature detection failed for plot %s", plot_id, exc_info=True)
+        # Even with its own hard timeout (osm_overpass.OVERPASS_HARD_TIMEOUT_S), a single Overpass
+        # fetch can take 10-25s - far too long to hold open the plot-creation request that
+        # triggered it. Whenever the caller has a BackgroundTasks instance (every real request
+        # path does - create_plot, apply_plot_subdivision), defer to it: the plot itself is
+        # already created and returned to the user by the time features show up moments later.
+        # Only falls back to running inline if no BackgroundTasks was passed in (e.g. an internal/
+        # test caller), which keeps the hard timeout as the backstop instead of nothing at all.
+        if background_tasks is not None:
+            background_tasks.add_task(_run_overpass_detection_background, int(plot_id), centroid_lat, centroid_lon)
+        else:
+            try:
+                from app.utils.osm_overpass import run_overpass_feature_detection
+                run_overpass_feature_detection(db, int(plot_id), centroid_lat, centroid_lon)
+            except Exception:
+                logger.warning("Overpass feature detection failed for plot %s", plot_id, exc_info=True)
         return
 
     # Buildings
@@ -3156,6 +3180,7 @@ def preview_plot_subdivision(
 def apply_plot_subdivision(
     plot_id: int,
     request: Request,
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
     method: str = Body("by_count"),
     split_count: int | None = Body(None),
@@ -3272,7 +3297,7 @@ def apply_plot_subdivision(
             )
 
             if include_feature_detection:
-                _run_plot_feature_detection(db, child_plot_id)
+                _run_plot_feature_detection(db, child_plot_id, background_tasks=background_tasks)
 
             created_items.append(
                 {
@@ -5035,7 +5060,12 @@ def export_subdivision_batch_clean_copy_pdf(
 # ---------------- CREATE PLOT ----------------
 
 @router.post("")
-def create_plot(payload: Union[PlotCreateRequest, List[List[float]]], request: Request, db: Session = Depends(get_db)):
+def create_plot(
+    payload: Union[PlotCreateRequest, List[List[float]]],
+    request: Request,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+):
 
     coords = payload.coordinates if isinstance(payload, PlotCreateRequest) else payload
     meta = payload.meta if isinstance(payload, PlotCreateRequest) else None
@@ -5103,7 +5133,7 @@ def create_plot(payload: Union[PlotCreateRequest, List[List[float]]], request: R
 
     # Buffer + buildings/roads/rivers detection (Nigeria: local-table query; elsewhere: Overpass-
     # backed regional cache) - shared with subdivision child plots, see _run_plot_feature_detection.
-    _run_plot_feature_detection(db, plot.id)
+    _run_plot_feature_detection(db, plot.id, background_tasks=background_tasks)
 
     db.commit()
 
