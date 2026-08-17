@@ -685,6 +685,74 @@ def get_support_messages(request: Request, db: Session = Depends(get_db)):
     ]
 
 
+@router.get("/osm-overpass-usage")
+def get_osm_overpass_usage(request: Request, db: Session = Depends(get_db)):
+    """Per-country usage of the Overpass live-fetch fallback (see app/utils/osm_overpass.py) -
+    the data behind the "does this country have enough sustained usage to earn a real bulk-
+    imported OSM extract, like Nigeria has" call. Same server-side auth check as the other admin
+    listings in this file."""
+    require_super_admin_request(db, request)
+
+    table_exists = db.execute(text("""
+        SELECT EXISTS (
+            SELECT FROM information_schema.tables
+            WHERE table_name = 'osm_overpass_usage_log'
+        )
+    """)).scalar()
+    if not table_exists:
+        return {"by_country": [], "recent": []}
+
+    by_country = db.execute(text("""
+        SELECT
+            COALESCE(country_hint, 'Unknown') AS country_hint,
+            COUNT(*) AS total_calls,
+            COUNT(*) FILTER (WHERE cache_hit) AS cache_hits,
+            COUNT(DISTINCT bucket_key) AS distinct_buckets,
+            COUNT(DISTINCT plot_id) AS distinct_plots,
+            MIN(created_at) AS first_seen,
+            MAX(created_at) AS last_seen,
+            AVG(duration_ms) FILTER (WHERE NOT cache_hit) AS avg_fetch_ms
+        FROM osm_overpass_usage_log
+        GROUP BY country_hint
+        ORDER BY total_calls DESC
+    """)).mappings().all()
+
+    recent = db.execute(text("""
+        SELECT plot_id, bucket_key, country_hint, cache_hit, feature_count, duration_ms, created_at
+        FROM osm_overpass_usage_log
+        ORDER BY created_at DESC
+        LIMIT 200
+    """)).mappings().all()
+
+    return {
+        "by_country": [
+            {
+                "country_hint": row["country_hint"],
+                "total_calls": int(row["total_calls"] or 0),
+                "cache_hits": int(row["cache_hits"] or 0),
+                "distinct_buckets": int(row["distinct_buckets"] or 0),
+                "distinct_plots": int(row["distinct_plots"] or 0),
+                "first_seen": row["first_seen"].isoformat() if row["first_seen"] else None,
+                "last_seen": row["last_seen"].isoformat() if row["last_seen"] else None,
+                "avg_fetch_ms": round(float(row["avg_fetch_ms"]), 0) if row["avg_fetch_ms"] is not None else None,
+            }
+            for row in by_country
+        ],
+        "recent": [
+            {
+                "plot_id": row["plot_id"],
+                "bucket_key": row["bucket_key"],
+                "country_hint": row["country_hint"],
+                "cache_hit": row["cache_hit"],
+                "feature_count": row["feature_count"],
+                "duration_ms": row["duration_ms"],
+                "created_at": row["created_at"].isoformat() if row["created_at"] else None,
+            }
+            for row in recent
+        ],
+    }
+
+
 @router.get("/georeference-sessions")
 def get_georeference_sessions(request: Request, db: Session = Depends(get_db)):
     """Georeference sessions (for the admin dashboard). Unlike Survey Plan/Subdivision plots,

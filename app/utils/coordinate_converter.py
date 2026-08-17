@@ -47,6 +47,36 @@ COORDINATE_SYSTEMS = {
         "name": "Minna Datum Zone 33",
         "epsg": 26333,
         "description": "Nigerian National Grid - East (Clarke 1880)"
+    },
+    "ghana_utm_30n": {
+        "name": "Ghana UTM Zone 30N",
+        "epsg": 32630,
+        "description": "Modern GPS-compatible grid covering most of Ghana (Easting, Northing)"
+    },
+    "ghana_leigon_grid": {
+        "name": "Ghana Leigon National Grid",
+        "epsg": 25000,
+        "description": "Ghana's national cadastral grid since 1978 (Clarke 1880 RGS)"
+    },
+    "uganda_utm_35n": {
+        "name": "Uganda UTM Zone 35N",
+        "epsg": 32635,
+        "description": "Modern GPS-compatible grid, western Uganda - west of 30E (Easting, Northing)"
+    },
+    "uganda_utm_36n": {
+        "name": "Uganda UTM Zone 36N",
+        "epsg": 32636,
+        "description": "Modern GPS-compatible grid, eastern Uganda - east of 30E (Easting, Northing)"
+    },
+    "uganda_arc1960_35n": {
+        "name": "Uganda Arc 1960 Zone 35N",
+        "epsg": 21095,
+        "description": "Local pre-GPS datum, western Uganda - west of 30E (Clarke 1880 RGS)"
+    },
+    "uganda_arc1960_36n": {
+        "name": "Uganda Arc 1960 Zone 36N",
+        "epsg": 21096,
+        "description": "Local pre-GPS datum, eastern Uganda - east of 30E (Clarke 1880 RGS)"
     }
 }
 

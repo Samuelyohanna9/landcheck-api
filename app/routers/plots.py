@@ -28,7 +28,10 @@ import textwrap
 import uuid
 import threading
 import mimetypes
+import logging
 from threading import Lock
+
+logger = logging.getLogger(__name__)
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -56,7 +59,7 @@ from app.utils.map_renderer_layout import (
 )
 from app.utils.back_computation import compute_back_computation
 from app.utils.back_computation_pdf import render_back_computation_pdf
-from app.utils.coordinate_converter import resolve_coordinate_system_key
+from app.utils.coordinate_converter import resolve_coordinate_system_key, validate_nigeria_bounds
 from shapely import wkb
 from shapely.errors import GEOSException
 import geopandas as gpd
@@ -95,6 +98,16 @@ COORDINATE_SYSTEMS = {
     "minna_31": 26331,
     "minna_32": 26332,
     "minna_33": 26333,
+    # Ghana - most of the country falls in UTM zone 30N; Leigon / Ghana Metre Grid (EPSG:25000) is
+    # the national grid in use since 1978, superseding the older Accra / Ghana National Grid.
+    "ghana_utm_30n": 32630,
+    "ghana_leigon_grid": 25000,
+    # Uganda spans UTM zones 35N (west of 30E) and 36N (east of 30E); Arc 1960 is the pre-GPS local
+    # datum still used on older cadastral records, WGS84 UTM is the modern GPS-compatible option.
+    "uganda_utm_35n": 32635,
+    "uganda_utm_36n": 32636,
+    "uganda_arc1960_35n": 21095,
+    "uganda_arc1960_36n": 21096,
 }
 
 COORDINATE_SYSTEM_NAMES = {
@@ -106,6 +119,32 @@ COORDINATE_SYSTEM_NAMES = {
     "minna_31": "Minna Datum Zone 31",
     "minna_32": "Minna Datum Zone 32",
     "minna_33": "Minna Datum Zone 33",
+    "ghana_utm_30n": "Ghana UTM Zone 30N",
+    "ghana_leigon_grid": "Ghana Leigon National Grid",
+    "uganda_utm_35n": "Uganda UTM Zone 35N",
+    "uganda_utm_36n": "Uganda UTM Zone 36N",
+    "uganda_arc1960_35n": "Uganda Arc 1960 Zone 35N",
+    "uganda_arc1960_36n": "Uganda Arc 1960 Zone 36N",
+}
+
+# Which country a coordinate system key belongs to - drives the country-grouped picker on the
+# frontend and (via plot centroid, not this map) the Overpass-vs-local-table feature detection
+# dispatch in _run_plot_feature_detection.
+COORDINATE_SYSTEM_COUNTRY = {
+    "wgs84": "Global",
+    "wgs84_nigeria_meters": "Nigeria",
+    "utm_31n": "Nigeria",
+    "utm_32n": "Nigeria",
+    "utm_33n": "Nigeria",
+    "minna_31": "Nigeria",
+    "minna_32": "Nigeria",
+    "minna_33": "Nigeria",
+    "ghana_utm_30n": "Ghana",
+    "ghana_leigon_grid": "Ghana",
+    "uganda_utm_35n": "Uganda",
+    "uganda_utm_36n": "Uganda",
+    "uganda_arc1960_35n": "Uganda",
+    "uganda_arc1960_36n": "Uganda",
 }
 
 DEFAULT_CERTIFICATION_STATEMENT = (
@@ -1986,6 +2025,26 @@ def _run_plot_feature_detection(db: Session, plot_id: int):
         ),
         {"plot_id": int(plot_id)},
     )
+
+    # `multipolygons`/`lines` below are a one-time bulk import of a Nigeria OSM extract - real,
+    # fast, local data, but only for Nigeria. A plot centered outside Nigeria's bounds gets its
+    # buildings/roads/rivers from the Overpass-backed regional cache instead (see
+    # app/utils/osm_overpass.py for why: per-country bulk imports for every country a surveyor
+    # might ever use aren't worth the storage until a country shows real, sustained usage).
+    centroid_row = db.execute(
+        text("SELECT ST_X(ST_Centroid(geom)) AS lon, ST_Y(ST_Centroid(geom)) AS lat FROM plots WHERE id = :plot_id"),
+        {"plot_id": int(plot_id)},
+    ).mappings().first()
+    centroid_lon = float(centroid_row["lon"]) if centroid_row and centroid_row["lon"] is not None else None
+    centroid_lat = float(centroid_row["lat"]) if centroid_row and centroid_row["lat"] is not None else None
+
+    if centroid_lon is not None and centroid_lat is not None and not validate_nigeria_bounds(centroid_lon, centroid_lat):
+        try:
+            from app.utils.osm_overpass import run_overpass_feature_detection
+            run_overpass_feature_detection(db, int(plot_id), centroid_lat, centroid_lon)
+        except Exception:
+            logger.warning("Overpass feature detection failed for plot %s", plot_id, exc_info=True)
+        return
 
     # Buildings
     db.execute(
@@ -5042,97 +5101,9 @@ def create_plot(payload: Union[PlotCreateRequest, List[List[float]]], request: R
             survey_input_coordinates=getattr(meta, "survey_input_coordinates", None),
         )
 
-    # ---------------- BUFFER ----------------
-
-    db.execute(text("""
-        INSERT INTO plot_buffers (plot_id, geom)
-        SELECT :plot_id,
-               ST_Buffer(geom::geography, 50)::geometry
-        FROM plots
-        WHERE id = :plot_id
-    """), {"plot_id": plot.id})
-
-    # ---------------- BUILDINGS ----------------
-
-    db.execute(text("""
-        INSERT INTO detected_features (plot_id, feature_type, location, geom)
-        SELECT :plot_id, 'building', 'inside', m.geom
-        FROM multipolygons m
-        JOIN plots p ON p.id = :plot_id
-        WHERE m.building IS NOT NULL
-          AND ST_Intersects(m.geom, p.geom)
-    """), {"plot_id": plot.id})
-
-    db.execute(text("""
-        INSERT INTO detected_features (plot_id, feature_type, location, geom)
-        SELECT :plot_id, 'building', 'buffer', m.geom
-        FROM multipolygons m
-        JOIN plot_buffers b ON b.plot_id = :plot_id
-        JOIN plots p ON p.id = :plot_id
-        WHERE m.building IS NOT NULL
-          AND ST_Intersects(m.geom, b.geom)
-          AND NOT ST_Intersects(m.geom, p.geom)
-    """), {"plot_id": plot.id})
-
-    # ---------------- ROADS ----------------
-
-    db.execute(text("""
-        INSERT INTO detected_features (plot_id, feature_type, location, geom)
-        SELECT :plot_id, 'road', 'inside', r.geom
-        FROM (
-            SELECT geom FROM lines WHERE highway IS NOT NULL
-            UNION ALL
-            SELECT geom FROM multilinestrings
-            WHERE type = 'highway' OR other_tags LIKE '%highway%'
-        ) r
-        JOIN plots p ON p.id = :plot_id
-        WHERE ST_Intersects(r.geom, p.geom)
-    """), {"plot_id": plot.id})
-
-    db.execute(text("""
-        INSERT INTO detected_features (plot_id, feature_type, location, geom)
-        SELECT :plot_id, 'road', 'buffer', r.geom
-        FROM (
-            SELECT geom FROM lines WHERE highway IS NOT NULL
-            UNION ALL
-            SELECT geom FROM multilinestrings
-            WHERE type = 'highway' OR other_tags LIKE '%highway%'
-        ) r
-        JOIN plot_buffers b ON b.plot_id = :plot_id
-        JOIN plots p ON p.id = :plot_id
-        WHERE ST_Intersects(r.geom, b.geom)
-          AND NOT ST_Intersects(r.geom, p.geom)
-    """), {"plot_id": plot.id})
-
-    # ---------------- RIVERS ----------------
-
-    db.execute(text("""
-        INSERT INTO detected_features (plot_id, feature_type, location, geom)
-        SELECT :plot_id, 'river', 'inside', r.geom
-        FROM (
-            SELECT geom FROM lines WHERE waterway IS NOT NULL
-            UNION ALL
-            SELECT geom FROM multilinestrings
-            WHERE type = 'waterway' OR other_tags LIKE '%waterway%'
-        ) r
-        JOIN plots p ON p.id = :plot_id
-        WHERE ST_Intersects(r.geom, p.geom)
-    """), {"plot_id": plot.id})
-
-    db.execute(text("""
-        INSERT INTO detected_features (plot_id, feature_type, location, geom)
-        SELECT :plot_id, 'river', 'buffer', r.geom
-        FROM (
-            SELECT geom FROM lines WHERE waterway IS NOT NULL
-            UNION ALL
-            SELECT geom FROM multilinestrings
-            WHERE type = 'waterway' OR other_tags LIKE '%waterway%'
-        ) r
-        JOIN plot_buffers b ON b.plot_id = :plot_id
-        JOIN plots p ON p.id = :plot_id
-        WHERE ST_Intersects(r.geom, b.geom)
-          AND NOT ST_Intersects(r.geom, p.geom)
-    """), {"plot_id": plot.id})
+    # Buffer + buildings/roads/rivers detection (Nigeria: local-table query; elsewhere: Overpass-
+    # backed regional cache) - shared with subdivision child plots, see _run_plot_feature_detection.
+    _run_plot_feature_detection(db, plot.id)
 
     db.commit()
 
