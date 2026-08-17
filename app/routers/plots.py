@@ -1498,16 +1498,27 @@ def _resolve_survey_render_crs(
 ) -> tuple[str, int, str]:
     selected_key = str(coordinate_system or "wgs84").strip().lower() or "wgs84"
     resolved_key = selected_key
+    epsg_code: int | None = None
 
     if plot_geom_wgs84 is not None and not plot_geom_wgs84.is_empty:
         centroid = plot_geom_wgs84.centroid
         if selected_key == "wgs84":
-            metric_epsg = _metric_epsg_for_wgs84_polygon(plot_geom_wgs84)
-            resolved_key = {
+            metric_epsg = int(_metric_epsg_for_wgs84_polygon(plot_geom_wgs84))
+            named_key = {
                 32631: "utm_31n",
                 32632: "utm_32n",
                 32633: "utm_33n",
-            }.get(int(metric_epsg), selected_key)
+            }.get(metric_epsg)
+            if named_key is not None:
+                resolved_key = named_key
+            else:
+                # No named Nigeria zone matches - the plot is outside Nigeria. Use the
+                # auto-picked global UTM EPSG directly (any longitude/hemisphere) instead of
+                # silently falling back to WGS84 (EPSG:4326) itself below, which would make
+                # every "metric" area/render calculation downstream nonsensical (square degrees,
+                # not square metres) for any non-Nigeria plot left on plain "WGS84" rather than
+                # an explicit projected system.
+                epsg_code = metric_epsg
         else:
             resolved_key = resolve_coordinate_system_key(
                 selected_key,
@@ -1515,7 +1526,8 @@ def _resolve_survey_render_crs(
                 float(centroid.y),
             )
 
-    epsg_code = COORDINATE_SYSTEMS.get(resolved_key, COORDINATE_SYSTEMS.get(selected_key, 4326))
+    if epsg_code is None:
+        epsg_code = COORDINATE_SYSTEMS.get(resolved_key, COORDINATE_SYSTEMS.get(selected_key, 4326))
 
     if selected_key == "wgs84_nigeria_meters":
         crs_name = f"WGS84 Nigeria Metres ({_epsg_display_name(epsg_code, resolved_key)})"
