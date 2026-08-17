@@ -97,7 +97,7 @@ def _compute_arcgis_export_size(
     return max(1, int(round(width * scale))), max(1, int(round(height * scale)))
 
 
-def _load_arcgis_export_image(
+def _request_arcgis_export_image(
     *,
     xmin: float,
     ymin: float,
@@ -107,7 +107,7 @@ def _load_arcgis_export_image(
     pixel_width: int,
     pixel_height: int,
     preview_mode: bool,
-    timeout: tuple[float, float] | None = None,
+    timeout: tuple[float, float] | None,
 ) -> np.ndarray:
     params = {
         "bbox": f"{xmin},{ymin},{xmax},{ymax}",
@@ -130,6 +130,52 @@ def _load_arcgis_export_image(
         raise RuntimeError(f"ArcGIS exportImage returned JSON instead of imagery: {response.text[:240]}")
     image = Image.open(BytesIO(response.content)).convert("RGB")
     return np.asarray(image)
+
+
+def _load_arcgis_export_image(
+    *,
+    xmin: float,
+    ymin: float,
+    xmax: float,
+    ymax: float,
+    axis_epsg: int,
+    pixel_width: int,
+    pixel_height: int,
+    preview_mode: bool,
+    timeout: tuple[float, float] | None = None,
+) -> np.ndarray:
+    """Requests imagery for this bbox at pixel_width x pixel_height, retrying at progressively
+    lower resolution (same bbox, same aspect ratio) if the server rejects the request.
+
+    ArcGIS's free World_Imagery/MapServer/export endpoint doesn't just return soft/blurry imagery
+    when the requested pixel density exceeds what it's willing to serve for a given ground area -
+    past an undocumented (and apparently fairly conservative - measured well below what
+    _ORTHOPHOTO_MAX_UPSCALE_FACTOR alone accounts for) threshold, it outright refuses with a
+    generic 500 "Error: bytes" response, no matter the absolute pixel count (a huge bbox happily
+    serves the same pixel size that a small one rejects). _draw_site_plan_photo_inset and
+    render_orthophoto_png's own scale-widening already reduce how often this gets hit at all, but
+    neither can know the server's exact real threshold for a given tile in advance - so this is
+    the actual backstop: ask for less resolution until the server accepts, rather than falling all
+    the way through to a different (often lower-quality or unavailable) basemap provider over a
+    request that would have worked at 60% the size.
+    """
+    width, height = pixel_width, pixel_height
+    last_error: Exception | None = None
+    for _attempt in range(7):
+        try:
+            return _request_arcgis_export_image(
+                xmin=xmin, ymin=ymin, xmax=xmax, ymax=ymax, axis_epsg=axis_epsg,
+                pixel_width=width, pixel_height=height, preview_mode=preview_mode, timeout=timeout,
+            )
+        except Exception as exc:  # noqa: BLE001 - any failure here is worth a smaller retry
+            last_error = exc
+            # Halving (rather than the gentler 0.6x tried first) crosses the server's undocumented
+            # threshold in far fewer round-trips - measured empirically at ~250-300px for a ~153m-
+            # wide bbox, which a 0.6x step took 3 attempts to approach and still hadn't cleared.
+            width, height = int(width * 0.5), int(height * 0.5)
+            if min(width, height) < 80:
+                break
+    raise last_error or RuntimeError("ArcGIS exportImage failed for an unknown reason")
 
 
 def _try_add_arcgis_world_imagery(

@@ -28,6 +28,8 @@ from app.utils.orthophoto_renderer import (
     _mapbox_satellite_url,
     MAPBOX_ACCESS_TOKEN,
     _BASEMAP_FETCH_TIMEOUT,
+    _ORTHOPHOTO_SOURCE_GSD_METERS,
+    _ORTHOPHOTO_MAX_UPSCALE_FACTOR,
 )
 
 # ======================
@@ -5021,6 +5023,21 @@ def _draw_site_plan_photo_inset(
     cx, cy = (minx + maxx) / 2.0, (miny + maxy) / 2.0
     padded_w = max((maxx - minx) * 1.35, 1.0)
     padded_h = max((maxy - miny) * 1.35, 1.0)
+    # For a small plot, that 1.35x pad alone can still cover far less ground than this panel's
+    # pixel request needs to stay within the source imagery's real resolution. ArcGIS World
+    # Imagery's native ground sample distance is ~_ORTHOPHOTO_SOURCE_GSD_METERS per pixel - asking
+    # for more detail than that (a small ground width squeezed into the same pixel count a large
+    # plot would get) makes the server upsample/interpolate to fill the request, which is exactly
+    # what "small plots look blurry, big ones look clear" is - a resolution mismatch, not a
+    # rendering bug. Widen the bbox (show more real-world context around the plot) instead of
+    # letting the fetch ask for detail the source can't provide, mirroring what the standalone
+    # Orthophoto export already does via _choose_imagery_scale_ratio.
+    map_pixel_width = max(1.0, fig_width * w * inset_fetch_dpi)
+    map_pixel_height = max(1.0, fig_height * h * inset_fetch_dpi)
+    min_ground_width = (map_pixel_width * _ORTHOPHOTO_SOURCE_GSD_METERS) / _ORTHOPHOTO_MAX_UPSCALE_FACTOR
+    min_ground_height = (map_pixel_height * _ORTHOPHOTO_SOURCE_GSD_METERS) / _ORTHOPHOTO_MAX_UPSCALE_FACTOR
+    padded_w = max(padded_w, min_ground_width)
+    padded_h = max(padded_h, min_ground_height)
     if padded_w / padded_h > box_aspect:
         padded_h = padded_w / box_aspect
     else:
