@@ -4,6 +4,7 @@ import html
 import os
 import smtplib
 from email.message import EmailMessage
+from email.utils import formatdate, make_msgid
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -33,6 +34,13 @@ def _send_email(*, to_email: str, subject: str, body_text: str, body_html: str, 
     msg["To"] = to_email
     if reply_to:
         msg["Reply-To"] = reply_to
+    # Strict inbox providers (Yahoo/Outlook in particular) weigh RFC 5322 hygiene more heavily
+    # than Gmail does when deciding whether to deliver vs. silently drop/spam-bin - neither header
+    # was being set before, which left it up to whatever the SMTP relay chose to backfill (some
+    # do, some don't). Explicit Message-ID (domain-scoped, not the relay's) and Date cost nothing
+    # and rule this out as a contributing factor either way.
+    msg["Message-ID"] = make_msgid(domain=smtp_from_email.split("@")[-1] or None)
+    msg["Date"] = formatdate(localtime=True)
     msg.set_content(body_text)
     msg.add_alternative(body_html, subtype="html")
 
