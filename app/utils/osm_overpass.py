@@ -20,8 +20,8 @@ a legitimately empty area.
 from __future__ import annotations
 
 import logging
+import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from datetime import datetime, timedelta, timezone
 
 from shapely.geometry.base import BaseGeometry
@@ -148,28 +148,40 @@ def _fetch_bucket_from_overpass(bucket_key: str) -> dict[str, list[BaseGeometry]
         logger.warning("osmnx is not installed - skipping Overpass fetch for bucket %s", bucket_key)
         return result
 
-    try:
-        # requests' own `timeout` only measures gaps between chunks, not total request duration,
-        # and Overpass's embedded `[timeout:N]` is a soft server-side hint it can run past - so a
-        # slow-but-still-streaming response can take far longer than OVERPASS_TIMEOUT_S even with
-        # both of those set (observed: a single dense-city bucket took ~77s despite a 15s setting
-        # on both). This thread-based wrapper is the only thing that actually enforces a ceiling.
-        with ThreadPoolExecutor(max_workers=1) as pool:
-            future = pool.submit(_fetch_bucket_from_overpass_uncapped, bucket_key)
-            gdf = future.result(timeout=OVERPASS_HARD_TIMEOUT_S)
-    except FutureTimeoutError:
+    # requests' own `timeout` only measures gaps between chunks, not total request duration, and
+    # Overpass's embedded `[timeout:N]` is a soft server-side hint it can run past - so a slow-
+    # but-still-streaming response can take far longer than OVERPASS_TIMEOUT_S even with both set
+    # (observed: a single dense-city bucket took ~77s despite a 15s setting on both). This thread-
+    # based wrapper is what actually enforces a ceiling. The thread is started as a daemon so an
+    # abandoned (timed-out) fetch never keeps the process alive waiting for it - it just finishes
+    # (or errors) on its own in the background and its result is discarded via `outcome`.
+    outcome: dict = {}
+
+    def _worker():
+        try:
+            outcome["gdf"] = _fetch_bucket_from_overpass_uncapped(bucket_key)
+        except Exception as exc:  # noqa: BLE001 - captured for the main thread to log/handle
+            outcome["error"] = exc
+
+    thread = threading.Thread(target=_worker, daemon=True)
+    thread.start()
+    thread.join(timeout=OVERPASS_HARD_TIMEOUT_S)
+
+    if thread.is_alive():
         logger.warning(
             "Overpass fetch for bucket %s exceeded the %ss hard timeout - treating as empty "
-            "(the abandoned request may still complete server-side and be picked up on a later retry)",
+            "(the abandoned request may still complete server-side; a later plot in this area "
+            "will retry the fetch since nothing gets cached on a timeout)",
             bucket_key, OVERPASS_HARD_TIMEOUT_S,
         )
         return result
-    except Exception as exc:
+    if "error" in outcome:
         # Covers osmnx's own "nothing found" exception as well as real network/5xx failures -
         # either way this bucket just gets treated as empty, never a hard error that could block
         # whatever triggered it.
-        logger.warning("Overpass fetch failed for bucket %s: %r", bucket_key, exc)
+        logger.warning("Overpass fetch failed for bucket %s: %r", bucket_key, outcome["error"])
         return result
+    gdf = outcome.get("gdf")
 
     if gdf is None or gdf.empty:
         return result
