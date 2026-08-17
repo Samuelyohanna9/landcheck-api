@@ -3308,7 +3308,7 @@ def _render_plot_map_layout_adamawa(
     major = nice_grid_step(max(ax.get_xlim()[1] - ax.get_xlim()[0], ax.get_ylim()[1] - ax.get_ylim()[0]))
     draw_grid(ax, poly, major / 5.0, major, font_scale, full_grid=False, edge_ticks=False, color=grid_color)
 
-    annotate_vertices(
+    skipped_entries, _boundary_label_boxes = annotate_vertices(
         ax,
         poly,
         plot_id,
@@ -3326,6 +3326,11 @@ def _render_plot_map_layout_adamawa(
         bearing_font=bearing_font,
         bearing_size=bearing_size,
     )
+    # Same overflow table the general template uses when vertices are packed too tightly for
+    # every bearing/distance label to fit inline - see the site_plan template's identical addition
+    # for why (annotate_vertices always computed which labels got skipped; this template just
+    # never drew the table those escape to).
+    draw_skipped_table(ax, skipped_entries, font_scale, poly=poly)
     area_label_point = None
     try:
         # Prefer an interior visual center for label placement.
@@ -4265,7 +4270,7 @@ def _render_plot_map_layout_cadastral(
     ax.set_xlim(target_xlim)
     ax.set_ylim(target_ylim)
 
-    annotate_vertices(
+    skipped_entries, _boundary_label_boxes = annotate_vertices(
         ax,
         poly,
         plot_id,
@@ -4283,6 +4288,11 @@ def _render_plot_map_layout_cadastral(
         bearing_font=bearing_font,
         bearing_size=bearing_size,
     )
+    # Same overflow table the general template uses when vertices are packed too tightly for
+    # every bearing/distance label to fit inline - see the site_plan template's identical addition
+    # for why (annotate_vertices always computed which labels got skipped; this template just
+    # never drew the table those escape to).
+    draw_skipped_table(ax, skipped_entries, font_scale, poly=poly)
 
     span_x = max(abs(target_xlim[1] - target_xlim[0]), 1.0)
     span_y = max(abs(target_ylim[1] - target_ylim[0]), 1.0)
@@ -4868,7 +4878,7 @@ def _render_plot_map_layout_fct(
     ax.set_xlim(target_xlim)
     ax.set_ylim(target_ylim)
 
-    annotate_vertices(
+    skipped_entries, _boundary_label_boxes = annotate_vertices(
         ax,
         poly,
         plot_id,
@@ -4886,6 +4896,11 @@ def _render_plot_map_layout_fct(
         bearing_font=bearing_font,
         bearing_size=bearing_size,
     )
+    # Same overflow table the general template uses when vertices are packed too tightly for
+    # every bearing/distance label to fit inline - see the site_plan template's identical addition
+    # for why (annotate_vertices always computed which labels got skipped; this template just
+    # never drew the table those escape to).
+    draw_skipped_table(ax, skipped_entries, font_scale, poly=poly)
 
     area_label_point = None
     try:
@@ -5555,12 +5570,18 @@ def _render_plot_map_layout_site_plan(
     ax.set_xlim(target_xlim)
     ax.set_ylim(target_ylim)
 
-    annotate_vertices(
+    skipped_entries, _boundary_label_boxes = annotate_vertices(
         ax, poly, plot_id, station_names=station_names, font_scale=font_scale, min_label_length_m=0.0,
         avoid_geom=label_avoid_geom, scale_ratio=scale_ratio, boundary_poly=poly, beacon_style=beacon_style,
         text_color=text_color, boundary_color=boundary_color, station_font=station_font, station_size=station_size,
         bearing_font=bearing_font, bearing_size=bearing_size,
     )
+    # Same overflow table the general template uses when vertices are packed too tightly for
+    # every bearing/distance label to fit inline (annotate_vertices already computes which ones
+    # got skipped to avoid overlap - this template just never drew the table those escape to,
+    # which for a dense/many-sided boundary meant crowded/overlapping labels with no legible
+    # fallback for the ones that didn't fit).
+    draw_skipped_table(ax, skipped_entries, font_scale, poly=poly)
 
     axes_box = ax.get_position()
     # A touch right of the map/photo panels' shared right edge (both are map_width wide) so the
