@@ -77,6 +77,26 @@ COORDINATE_SYSTEMS = {
         "name": "Uganda Arc 1960 Zone 36N",
         "epsg": 21096,
         "description": "Local pre-GPS datum, eastern Uganda - east of 30E (Clarke 1880 RGS)"
+    },
+    "uganda_utm_35s": {
+        "name": "Uganda UTM Zone 35S",
+        "epsg": 32735,
+        "description": "Modern GPS-compatible grid, SW Uganda - south of equator, west of 30E (Easting, Northing)"
+    },
+    "uganda_utm_36s": {
+        "name": "Uganda UTM Zone 36S",
+        "epsg": 32736,
+        "description": "Modern GPS-compatible grid, southern Uganda - south of equator, east of 30E (Easting, Northing)"
+    },
+    "uganda_arc1960_35s": {
+        "name": "Uganda Arc 1960 Zone 35S",
+        "epsg": 21035,
+        "description": "Local pre-GPS datum, SW Uganda - south of equator, west of 30E (Clarke 1880 RGS)"
+    },
+    "uganda_arc1960_36s": {
+        "name": "Uganda Arc 1960 Zone 36S",
+        "epsg": 21036,
+        "description": "Local pre-GPS datum, southern Uganda - south of equator, east of 30E (Clarke 1880 RGS)"
     }
 }
 

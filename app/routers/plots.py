@@ -108,6 +108,15 @@ COORDINATE_SYSTEMS = {
     "uganda_utm_36n": 32636,
     "uganda_arc1960_35n": 21095,
     "uganda_arc1960_36n": 21096,
+    # Uganda dips south of the equator too (Lake Victoria/Masaka/Kabale area) - EPSG explicitly
+    # documents 21035/21036 as covering "Uganda - south of equator" for west/east of 30E
+    # respectively (verified against epsg.io), so these are additions alongside the *N zones
+    # above, not replacements. Zone 37S (EPSG:21037) is Kenya/Tanzania only, not Uganda's
+    # territory, so it's deliberately not included here.
+    "uganda_utm_35s": 32735,
+    "uganda_utm_36s": 32736,
+    "uganda_arc1960_35s": 21035,
+    "uganda_arc1960_36s": 21036,
 }
 
 COORDINATE_SYSTEM_NAMES = {
@@ -125,6 +134,10 @@ COORDINATE_SYSTEM_NAMES = {
     "uganda_utm_36n": "Uganda UTM Zone 36N",
     "uganda_arc1960_35n": "Uganda Arc 1960 Zone 35N",
     "uganda_arc1960_36n": "Uganda Arc 1960 Zone 36N",
+    "uganda_utm_35s": "Uganda UTM Zone 35S",
+    "uganda_utm_36s": "Uganda UTM Zone 36S",
+    "uganda_arc1960_35s": "Uganda Arc 1960 Zone 35S",
+    "uganda_arc1960_36s": "Uganda Arc 1960 Zone 36S",
 }
 
 # Which country a coordinate system key belongs to - drives the country-grouped picker on the
@@ -145,6 +158,10 @@ COORDINATE_SYSTEM_COUNTRY = {
     "uganda_utm_36n": "Uganda",
     "uganda_arc1960_35n": "Uganda",
     "uganda_arc1960_36n": "Uganda",
+    "uganda_utm_35s": "Uganda",
+    "uganda_utm_36s": "Uganda",
+    "uganda_arc1960_35s": "Uganda",
+    "uganda_arc1960_36s": "Uganda",
 }
 
 DEFAULT_CERTIFICATION_STATEMENT = (
@@ -230,6 +247,15 @@ def ensure_plot_query_indexes(db: Session):
     for table_name, ddl_sql in index_plan:
         if _table_exists(db, table_name):
             _safe_run_ddl(db, ddl_sql)
+
+    # `name`/`subtype` on detected_features - nullable, so Nigeria rows (which never set them,
+    # since Nigeria's live "lines"/"multipolygons" tables already carry name/highway themselves)
+    # are unaffected. Populated only by the Overpass-backed regional cache for non-Nigeria
+    # countries (see app/utils/osm_overpass.py), so a road detected there can still show its real
+    # OSM name on the general template's final export the same way a Nigeria road already can.
+    if _table_exists(db, "public.detected_features"):
+        _safe_run_ddl(db, "ALTER TABLE detected_features ADD COLUMN IF NOT EXISTS name TEXT")
+        _safe_run_ddl(db, "ALTER TABLE detected_features ADD COLUMN IF NOT EXISTS subtype TEXT")
 
 
 def ensure_plot_meta_table(db: Session):

@@ -24,6 +24,7 @@ import threading
 import time
 from datetime import datetime, timedelta, timezone
 
+import pandas as pd
 from shapely.geometry.base import BaseGeometry
 from sqlalchemy import text
 from sqlalchemy.orm import Session
@@ -81,9 +82,13 @@ def ensure_osm_overpass_schema(db: Session) -> None:
             id SERIAL PRIMARY KEY,
             bucket_key TEXT NOT NULL REFERENCES osm_overpass_cache_buckets(bucket_key) ON DELETE CASCADE,
             feature_type TEXT NOT NULL,
+            name TEXT,
+            subtype TEXT,
             geom GEOMETRY(GEOMETRY, 4326) NOT NULL
         )
     """))
+    db.execute(text("ALTER TABLE osm_overpass_cache_features ADD COLUMN IF NOT EXISTS name TEXT"))
+    db.execute(text("ALTER TABLE osm_overpass_cache_features ADD COLUMN IF NOT EXISTS subtype TEXT"))
     db.execute(text(
         "CREATE INDEX IF NOT EXISTS idx_osm_overpass_cache_features_geom "
         "ON osm_overpass_cache_features USING GIST (geom)"
@@ -140,8 +145,12 @@ def _fetch_bucket_from_overpass_uncapped(bucket_key: str):
     )
 
 
-def _fetch_bucket_from_overpass(bucket_key: str) -> dict[str, list[BaseGeometry]]:
-    result: dict[str, list[BaseGeometry]] = {"building": [], "road": [], "river": []}
+def _fetch_bucket_from_overpass(bucket_key: str) -> dict[str, list[tuple[BaseGeometry, str | None, str | None]]]:
+    """Returns {"building"|"road"|"river": [(geom, name, subtype), ...]}. `name` is the OSM
+    `name` tag (used for road labels on the general template, matching what Nigeria's `lines`
+    table already provides); `subtype` is the matched tag's value (e.g. "primary", "residential",
+    "river", "stream") - captured for completeness/future use, not currently read by any renderer."""
+    result: dict[str, list[tuple[BaseGeometry, str | None, str | None]]] = {"building": [], "road": [], "river": []}
     try:
         import osmnx  # noqa: F401 - just checking it's installed before spinning up a thread
     except ImportError:
@@ -189,20 +198,59 @@ def _fetch_bucket_from_overpass(bucket_key: str) -> dict[str, list[BaseGeometry]
     has_building = "building" in gdf.columns
     has_waterway = "waterway" in gdf.columns
     has_highway = "highway" in gdf.columns
+    has_name = "name" in gdf.columns
+
+    # osmnx GeoDataFrame columns are pandas object columns holding a mix of real values and
+    # missing entries as float NaN (not Python None) wherever a row lacks that tag - naively
+    # str()-ing a NaN produces the literal text "nan", which very nearly shipped as a building
+    # name. pd.isna() is the only reliable way to catch both None and NaN in one check.
+    def _tag_present(value) -> bool:
+        # True/"yes" both mean "this boolean-style tag applies" (building=yes, waterway=yes);
+        # None/NaN/False/"no" all mean it doesn't.
+        if value is None or value is False:
+            return False
+        if not isinstance(value, bool) and pd.isna(value):
+            return False
+        return str(value).strip().lower() != "no"
+
+    def _tag_text(value) -> str | None:
+        # A real classification/name string if one exists, else None for a bare boolean tag
+        # (building=yes carries presence but no extra info) or a missing value.
+        if value is None or isinstance(value, bool):
+            return None
+        if pd.isna(value):
+            return None
+        text_value = str(value).strip()
+        return text_value or None
 
     for _, row in gdf.iterrows():
         geom = row.get("geometry")
         if geom is None or geom.is_empty:
             continue
+        name = _tag_text(row.get("name")) if has_name else None
+        # A building whose true OSM way straddles this bucket's bbox edge gets clipped by
+        # Overpass/osmnx at the boundary - if the clip cuts through a closed ring, what comes
+        # back is an open LineString fragment (sometimes spanning most of the bucket) instead of
+        # a Polygon. A LineString can't be meaningfully hatch-filled as a building, and rendering
+        # it anyway is exactly what produced stray diagonal lines across an otherwise-clean plan -
+        # so buildings are restricted to real area geometry, discarding the rest. Roads/rivers get
+        # the opposite treatment: they're supposed to be lines, not areas.
+        geom_type = geom.geom_type
         # A feature can only be one of the three here - checked in this order because a way
         # tagged both building=* and something else (rare, usually data-entry noise) is still
         # most usefully drawn as a building on the plan.
-        if has_building and row.get("building") not in (None, "no", False):
-            result["building"].append(geom)
-        elif has_waterway and row.get("waterway") is not None:
-            result["river"].append(geom)
-        elif has_highway and row.get("highway") is not None:
-            result["road"].append(geom)
+        if has_building and _tag_present(row.get("building")):
+            if geom_type not in ("Polygon", "MultiPolygon"):
+                continue
+            result["building"].append((geom, name, _tag_text(row.get("building"))))
+        elif has_waterway and _tag_present(row.get("waterway")):
+            if geom_type not in ("LineString", "MultiLineString"):
+                continue
+            result["river"].append((geom, name, _tag_text(row.get("waterway"))))
+        elif has_highway and _tag_present(row.get("highway")):
+            if geom_type not in ("LineString", "MultiLineString"):
+                continue
+            result["road"].append((geom, name, _tag_text(row.get("highway"))))
 
     return result
 
@@ -220,7 +268,11 @@ def _bucket_is_fresh(db: Session, bucket_key: str) -> bool:
     return (datetime.now(timezone.utc) - fetched_at) < timedelta(days=CACHE_MAX_AGE_DAYS)
 
 
-def _store_bucket_cache(db: Session, bucket_key: str, features: dict[str, list[BaseGeometry]]) -> int:
+def _store_bucket_cache(
+    db: Session,
+    bucket_key: str,
+    features: dict[str, list[tuple[BaseGeometry, str | None, str | None]]],
+) -> int:
     db.execute(
         text("""
             INSERT INTO osm_overpass_cache_buckets (bucket_key, fetched_at, feature_count, status)
@@ -232,15 +284,15 @@ def _store_bucket_cache(db: Session, bucket_key: str, features: dict[str, list[B
     db.execute(text("DELETE FROM osm_overpass_cache_features WHERE bucket_key = :bk"), {"bk": bucket_key})
 
     total = 0
-    for feature_type, geoms in features.items():
-        for geom in geoms:
+    for feature_type, entries in features.items():
+        for geom, name, subtype in entries:
             try:
                 db.execute(
                     text("""
-                        INSERT INTO osm_overpass_cache_features (bucket_key, feature_type, geom)
-                        VALUES (:bucket_key, :feature_type, ST_SetSRID(ST_GeomFromText(:wkt), 4326))
+                        INSERT INTO osm_overpass_cache_features (bucket_key, feature_type, name, subtype, geom)
+                        VALUES (:bucket_key, :feature_type, :name, :subtype, ST_SetSRID(ST_GeomFromText(:wkt), 4326))
                     """),
-                    {"bucket_key": bucket_key, "feature_type": feature_type, "wkt": geom.wkt},
+                    {"bucket_key": bucket_key, "feature_type": feature_type, "name": name, "subtype": subtype, "wkt": geom.wkt},
                 )
                 total += 1
             except Exception:
@@ -286,8 +338,8 @@ def run_overpass_feature_detection(db: Session, plot_id: int, centroid_lat: floa
         for feature_type in ("building", "road", "river"):
             db.execute(
                 text("""
-                    INSERT INTO detected_features (plot_id, feature_type, location, geom)
-                    SELECT :plot_id, :feature_type, 'inside', c.geom
+                    INSERT INTO detected_features (plot_id, feature_type, location, name, subtype, geom)
+                    SELECT :plot_id, :feature_type, 'inside', c.name, c.subtype, c.geom
                     FROM osm_overpass_cache_features c
                     JOIN plots p ON p.id = :plot_id
                     WHERE c.bucket_key = :bucket_key AND c.feature_type = :feature_type
@@ -297,8 +349,8 @@ def run_overpass_feature_detection(db: Session, plot_id: int, centroid_lat: floa
             )
             db.execute(
                 text("""
-                    INSERT INTO detected_features (plot_id, feature_type, location, geom)
-                    SELECT :plot_id, :feature_type, 'buffer', c.geom
+                    INSERT INTO detected_features (plot_id, feature_type, location, name, subtype, geom)
+                    SELECT :plot_id, :feature_type, 'buffer', c.name, c.subtype, c.geom
                     FROM osm_overpass_cache_features c
                     JOIN plot_buffers b ON b.plot_id = :plot_id
                     JOIN plots p ON p.id = :plot_id

@@ -5881,7 +5881,7 @@ def render_plot_map_layout(
 
     plot_wkb = db.execute(text("SELECT geom FROM plots WHERE id=:id"), {"id": plot_id}).scalar()
     rows = db.execute(
-        text("SELECT geom, feature_type FROM detected_features WHERE plot_id=:id"),
+        text("SELECT geom, feature_type, name FROM detected_features WHERE plot_id=:id"),
         {"id": plot_id},
     ).fetchall()
     override_rows = db.execute(
@@ -5899,6 +5899,11 @@ def render_plot_map_layout(
 
     plot_geom = wkb.loads(plot_wkb)
     buildings, rivers, fences, detected_roads = [], [], [], []
+    # Parallel (geom, name) list for detected_features-sourced roads specifically - used as the
+    # final-export fallback below when the live "lines" table (Nigeria-only) has nothing for this
+    # plot, so a non-Nigeria road detected via Overpass (see osm_overpass.py) can still show its
+    # real OSM name instead of silently not rendering at all.
+    detected_roads_named = []
     for r in rows:
         g = wkb.loads(r.geom)
         if r.feature_type == "building":
@@ -5909,6 +5914,7 @@ def render_plot_map_layout(
             fences.append(g)
         elif r.feature_type == "road":
             detected_roads.append(g)
+            detected_roads_named.append((g, str(r.name).strip() if r.name else None))
 
     overrides = []
     import json
@@ -6126,10 +6132,17 @@ def render_plot_map_layout(
             ov["geom"] for ov in overrides
             if ov["feature_type"] == "road" and ov["action"] in ("delete", "update") and ov["geom"] is not None
         ]
-        for row in road_rows:
-            geom = wkb.loads(row.geom)
-            highway = row.highway
-            name = row.name
+        # `lines` only has Nigeria's bulk-imported OSM extract, so this query is always empty for
+        # a plot outside Nigeria - fall back to the already-fetched detected_features rows (which
+        # for those plots came from the Overpass-backed regional cache, name included; see
+        # osm_overpass.py) instead of silently rendering with no roads at all on the final export.
+        effective_road_rows = (
+            [(row.geom, row.highway, row.name, True) for row in road_rows]
+            if road_rows
+            else [(geom, None, name, False) for geom, name in detected_roads_named]
+        )
+        for row_geom, highway, name, is_live_row in effective_road_rows:
+            geom = wkb.loads(row_geom) if is_live_row else row_geom
             if _road_segment_replaced(geom, road_replaced_geoms, display_epsg):
                 continue
             try:
@@ -6174,7 +6187,7 @@ def render_plot_map_layout(
                 continue
 
         road_edge_lines = _collect_connected_road_edge_lines(road_geom_width, snap_tol_m=road_snap_tol)
-        has_roads = len(road_rows) > 0 or len(road_add_geoms) > 0
+        has_roads = len(effective_road_rows) > 0 or len(road_add_geoms) > 0
 
     # River names come from user-provided overrides (rivers have no name in detected_features/OSM
     # here) - named the same way as manually-added road overrides above.
