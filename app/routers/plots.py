@@ -1953,6 +1953,7 @@ def _subdivide_polygon_by_dimension(
 def _compute_subdivision_payload(
     parent_plot_id: int,
     parent_geom_wgs84: Polygon,
+    db: Session,
     *,
     method: str,
     split_count: int | None,
@@ -1993,9 +1994,23 @@ def _compute_subdivision_payload(
     unit_key = str(dimension_unit or "m").strip().lower()
     ft_to_m = 0.3048
     if exclude_road:
-        corridor = _build_road_exclusion_geom(db, parent_plot_id, parent_metric, metric_epsg, road_width_m)
+        try:
+            corridor = _build_road_exclusion_geom(db, parent_plot_id, parent_metric, metric_epsg, road_width_m)
+        except Exception:
+            corridor = None
+        if corridor is not None and not corridor.is_valid:
+            try:
+                corridor = corridor.buffer(0)
+            except Exception:
+                corridor = None
         if corridor is not None:
-            remainder = parent_metric.difference(corridor)
+            try:
+                remainder = parent_metric.difference(corridor)
+            except GEOSException:
+                # Real OSM road geometry can be messy enough that a direct difference hits a GEOS
+                # topology exception - nudging both operands through buffer(0) first fixes almost
+                # all of these without changing the result in any way that matters here.
+                remainder = _clean_single_polygon(parent_metric.buffer(0)).difference(corridor.buffer(0))
             significant_parts = [p for p in _polygon_parts(remainder) if p.area > total_area_m2 * 0.01]
             if len(significant_parts) > 1:
                 raise HTTPException(
@@ -3496,6 +3511,7 @@ def preview_plot_subdivision(
     payload = _compute_subdivision_payload(
         plot_id,
         parent_geom_wgs84,
+        db,
         method=method,
         split_count=split_count,
         target_area_m2=target_area_m2,
@@ -3543,6 +3559,7 @@ def apply_plot_subdivision(
     payload = _compute_subdivision_payload(
         plot_id,
         parent_geom_wgs84,
+        db,
         method=method,
         split_count=split_count,
         target_area_m2=target_area_m2,
