@@ -1969,36 +1969,77 @@ def _subdivide_polygon_by_dimension(
 
 
 def _distribute_count_across_parts(parts: list[Polygon], total_count: int) -> list[int]:
-    """Splits total_count lots across parts so the *entire* combined area (both sides of an
-    excluded road) is divided up with nothing left over, while keeping every resulting lot as
-    close in size to every other as this "use it all" constraint allows. Every part is guaranteed
-    at least 1 lot (so a smaller side never becomes unused "leftover" land - the whole point is
-    that all of it gets divided, exactly as if the road weren't there); any lots beyond that
-    guaranteed minimum are then handed out one at a time to whichever part currently has the
-    largest per-lot area if it got one more, so the split converges toward equal sizes wherever
-    the requested count leaves room to.
+    """How many *whole* target-sized lots fit in each part (floor, never rounded up) - a part
+    smaller than one target lot gets 0 here on purpose; its entire area instead becomes part of
+    the merged "combined" lot built by _subdivide_polygon_multi_part_equal_count, rather than
+    either being force-fit into one oversized/undersized lot of its own or left unused.
     """
-    n = len(parts)
-    areas = [max(p.area, 1e-9) for p in parts]
-    counts = [1] * n
-    for _ in range(max(0, total_count - n)):
-        best_i = max(range(n), key=lambda i: areas[i] / (counts[i] + 1))
-        counts[best_i] += 1
-    return counts
+    total_area = sum(max(p.area, 1e-9) for p in parts)
+    target = total_area / max(total_count, 1)
+    return [int(math.floor(p.area / target)) if target > 0 else 0 for p in parts]
 
 
 def _subdivide_polygon_multi_part_equal_count(
     parts: list[Polygon], total_count: int, orientation_deg: float
 ) -> list[Polygon]:
-    counts = _distribute_count_across_parts(parts, total_count)
-    out: list[Polygon] = []
-    for part, count in zip(parts, counts):
-        if count <= 1:
-            cleaned = _clean_single_polygon(part)
+    """Splits total_count *equal-sized* lots out of the combined area on both sides of an
+    excluded road, exactly as if the road weren't there. Each part is cut into as many
+    target-sized whole lots as fully fit; whatever's left over in each part (a part too small for
+    even one whole lot ends up entirely "left over") is pooled together across every part and
+    merged into one combined lot - not shown as unused "leftover" land, and not force-fit onto
+    whichever side happens to have it, but folded into the split so every one of the total_count
+    lots comes out the same size. That combined lot may end up as a MultiPolygon (spanning both
+    sides of the road) - callers need to handle that when serializing lot geometry.
+    """
+    total_area = sum(max(p.area, 1e-9) for p in parts)
+    target = total_area / max(total_count, 1)
+    whole_counts = _distribute_count_across_parts(parts, total_count)
+
+    out: list[Any] = []
+    remainder_pieces: list[Any] = []
+    whole_lots_used = 0
+    for part, whole_count in zip(parts, whole_counts):
+        if whole_count <= 0:
+            remainder_pieces.append(part)
+            continue
+        whole_lots_used += whole_count
+        remainder_target_area = part.area - whole_count * target
+        clean_part = part
+        if remainder_target_area > target * 0.01:
+            base_poly = _clean_single_polygon(part)
+            rotated = _clean_single_polygon(rotate(base_poly, -orientation_deg, origin="centroid", use_radians=False)) if base_poly is not None else None
+            if rotated is not None:
+                try:
+                    remainder_rot, clean_rot = _split_polygon_once_by_area(rotated, remainder_target_area)
+                    remainder_pieces.append(
+                        rotate(remainder_rot, orientation_deg, origin=base_poly.centroid, use_radians=False)
+                    )
+                    clean_part = rotate(clean_rot, orientation_deg, origin=base_poly.centroid, use_radians=False)
+                except HTTPException:
+                    pass
+        if whole_count == 1:
+            cleaned = _clean_single_polygon(clean_part)
             if cleaned is not None and cleaned.area > 1e-8:
                 out.append(cleaned)
-            continue
-        out.extend(_subdivide_polygon_equal_count(part, count, orientation_deg))
+        else:
+            out.extend(_subdivide_polygon_equal_count(clean_part, whole_count, orientation_deg))
+
+    deficit = total_count - whole_lots_used
+    if remainder_pieces:
+        if deficit == 1:
+            combined = unary_union(remainder_pieces)
+            if combined is not None and not combined.is_empty and combined.area > 1e-8:
+                out.append(combined)
+        else:
+            # More than one extra lot's worth of pooled remainder (rare - needs 3+ sides with
+            # modest fractional shares each) - the area-bisection helper this function otherwise
+            # relies on assumes one contiguous polygon, so a scattered multi-part pool can't be
+            # safely bisected further here. Hand each remainder back as its own lot instead of
+            # dropping it, rather than risk mis-splitting a MultiPolygon.
+            for piece in remainder_pieces:
+                cleaned = piece if piece.geom_type in ("Polygon", "MultiPolygon") else _clean_single_polygon(piece)
+                if cleaned is not None and not cleaned.is_empty and cleaned.area > 1e-8:
+                    out.append(cleaned)
     return out
 
 
@@ -2109,6 +2150,7 @@ def _compute_subdivision_payload(
     leftover_metric = None
     lot_width_m = None
     lot_height_m = None
+    lot_count_balanced = False
     if method_key == "by_count":
         if resolved_count is None or resolved_count < 2:
             raise HTTPException(status_code=400, detail="For 'by_count', set derived plot count to 2 or more.")
@@ -2116,6 +2158,7 @@ def _compute_subdivision_payload(
             pieces_wgs84 = _subdivide_polygon_multi_part_equal_count(
                 working_parts, int(resolved_count), orientation_deg
             )
+            lot_count_balanced = len(pieces_wgs84) != int(resolved_count)
         else:
             pieces_wgs84 = _subdivide_polygon_equal_count(working_metric, int(resolved_count), orientation_deg)
     elif method_key == "by_dimension":
@@ -2232,22 +2275,42 @@ def _compute_subdivision_payload(
     custom_lot_names = list(lot_names or [])
     plots: list[dict] = []
     derived_total = 0.0
-    for idx, (poly_wgs, poly_metric) in enumerate(zip(gdf_out.geometry.tolist(), pieces_wgs84), start=1):
-        area_m2 = float(max(poly_metric.area, 0.0))
-        derived_total += area_m2
-        ring = [[float(x), float(y)] for x, y in list(poly_wgs.exterior.coords)]
-        custom_name = str(custom_lot_names[idx - 1] or "").strip() if idx - 1 < len(custom_lot_names) else ""
-        plot_no = custom_name or f"{safe_prefix}-{idx:03d}"
-        plots.append(
-            {
-                "index": idx,
-                "lot_no": plot_no,
-                "area_m2": round(area_m2, 2),
-                "area_hectares": round(area_m2 / 10000.0, 4),
-                "geometry": {"type": "Polygon", "coordinates": [ring]},
-                "station_names": [_station_name(i) for i in range(max(0, len(ring) - 1))],
-            }
-        )
+    output_idx = 0
+    for source_idx, (poly_wgs, poly_metric) in enumerate(zip(gdf_out.geometry.tolist(), pieces_wgs84)):
+        custom_name = str(custom_lot_names[source_idx] or "").strip() if source_idx < len(custom_lot_names) else ""
+        base_plot_no = custom_name or f"{safe_prefix}-{source_idx + 1:03d}"
+
+        # A lot combining both sides of an excluded road (see
+        # _subdivide_polygon_multi_part_equal_count) is a MultiPolygon here - every *saved* plot
+        # is a single contiguous parcel at the database level (the CAD editor, survey plan
+        # renderer, etc. all assume that too), so each part becomes its own ordinary lot entry
+        # sharing one base lot number (LOT-004A / LOT-004B via combined_group) instead of one
+        # entry carrying a geometry most of the app can't handle.
+        if poly_wgs.geom_type == "MultiPolygon":
+            wgs_parts = list(poly_wgs.geoms)
+            metric_parts = list(poly_metric.geoms) if poly_metric.geom_type == "MultiPolygon" else [poly_metric]
+        else:
+            wgs_parts = [poly_wgs]
+            metric_parts = [poly_metric]
+
+        is_combined = len(wgs_parts) > 1
+        for part_idx, (part_wgs, part_metric) in enumerate(zip(wgs_parts, metric_parts)):
+            output_idx += 1
+            area_m2 = float(max(part_metric.area, 0.0))
+            derived_total += area_m2
+            ring = [[float(x), float(y)] for x, y in list(part_wgs.exterior.coords)]
+            plot_no = f"{base_plot_no}{chr(65 + part_idx)}" if is_combined else base_plot_no
+            plots.append(
+                {
+                    "index": output_idx,
+                    "lot_no": plot_no,
+                    "area_m2": round(area_m2, 2),
+                    "area_hectares": round(area_m2 / 10000.0, 4),
+                    "geometry": mapping(part_wgs),
+                    "station_names": [_station_name(i) for i in range(max(0, len(ring) - 1))],
+                    "combined_group": base_plot_no if is_combined else None,
+                }
+            )
 
     feature_collection = {
         "type": "FeatureCollection",
@@ -2259,6 +2322,7 @@ def _compute_subdivision_payload(
                     "index": p["index"],
                     "area_m2": p["area_m2"],
                     "area_hectares": p["area_hectares"],
+                    "combined_group": p.get("combined_group"),
                 },
                 "geometry": p["geometry"],
             }
@@ -2301,6 +2365,7 @@ def _compute_subdivision_payload(
         "road_segments": road_segments_out,
         "leftover_geojson": leftover_geojson,
         "leftover_area_m2": leftover_area_m2,
+        "lot_count_balanced": lot_count_balanced,
         "resolved_count": len(plots),
         "total_area_m2": round(total_area_m2, 2),
         "derived_total_area_m2": round(derived_total, 2),
@@ -3749,7 +3814,23 @@ def apply_plot_subdivision(
     created_items: list[dict] = []
     try:
         for row in payload["plots"]:
-            geom_obj = _clean_single_polygon(shape(row["geometry"]))
+            raw_geom = shape(row["geometry"])
+            if raw_geom.geom_type != "Polygon":
+                # A lot combining both sides of an excluded road (see
+                # _subdivide_polygon_multi_part_equal_count) is a MultiPolygon in the interactive
+                # preview - but every saved plot is a single contiguous parcel at the database
+                # level, so silently keeping only the larger piece here (which
+                # _clean_single_polygon would otherwise do) would quietly save less land than the
+                # preview showed and promised. Fail loudly instead.
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"Lot {row['lot_no']} combines area from both sides of the excluded road and can't be "
+                        "saved as a single plot. Increase the plot count so every lot fits on one side, or turn "
+                        "off 'Exclude access road' for this split."
+                    ),
+                )
+            geom_obj = _clean_single_polygon(raw_geom)
             if geom_obj is None:
                 raise HTTPException(status_code=400, detail=f"Invalid generated geometry for lot {row['lot_no']}.")
 
