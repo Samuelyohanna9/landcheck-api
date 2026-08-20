@@ -1617,6 +1617,49 @@ def _split_polygon_once_by_area(poly_metric: Polygon, target_area: float) -> tup
     return best_left, right_geom
 
 
+def _split_polygon_by_distance_from(poly_metric: Polygon, reference_geom: Any, target_area: float) -> tuple[Polygon, Polygon]:
+    """Splits poly into (near, far) relative to reference_geom - `near` is the portion within some
+    distance of reference_geom, sized (via binary search on that distance) to have area close to
+    target_area. Unlike _split_polygon_once_by_area's fixed left-to-right sweep, this always pulls
+    from whichever edge of the polygon actually touches reference_geom, wherever that is.
+    """
+    poly = _clean_single_polygon(poly_metric)
+    if poly is None:
+        raise HTTPException(status_code=400, detail="Subdivision failed: invalid geometry for road-adjacent split.")
+
+    minx, miny, maxx, maxy = poly.bounds
+    lo, hi = 0.0, math.hypot(maxx - minx, maxy - miny) + 1.0
+    best_near: Polygon | None = None
+    best_diff = float("inf")
+
+    for _ in range(50):
+        mid = (lo + hi) / 2.0
+        try:
+            near = _clean_single_polygon(poly.intersection(reference_geom.buffer(mid)))
+        except Exception:
+            near = None
+        near_area = float(near.area) if near is not None else 0.0
+        diff = abs(near_area - target_area)
+        if diff < best_diff and near is not None:
+            best_diff = diff
+            best_near = near
+        if near_area < target_area:
+            lo = mid
+        else:
+            hi = mid
+
+    if best_near is None or best_near.area <= 1e-6:
+        raise HTTPException(status_code=400, detail="Subdivision failed: unable to compute road-adjacent split.")
+
+    far = _clean_single_polygon(poly.difference(best_near))
+    if far is None or far.area <= 1e-6:
+        far = _clean_single_polygon(poly.difference(best_near.buffer(1e-6)))
+    if far is None or far.area <= 1e-6:
+        raise HTTPException(status_code=400, detail="Subdivision failed: unable to compute the remaining parcel after the road-adjacent split.")
+
+    return best_near, far
+
+
 def _subdivide_polygon_equal_count(poly_metric: Polygon, split_count: int, orientation_deg: float) -> list[Polygon]:
     if split_count < 2:
         raise HTTPException(status_code=400, detail="Subdivision requires at least 2 derived plots.")
@@ -1980,7 +2023,7 @@ def _distribute_count_across_parts(parts: list[Polygon], total_count: int) -> li
 
 
 def _subdivide_polygon_multi_part_equal_count(
-    parts: list[Polygon], total_count: int, orientation_deg: float
+    parts: list[Polygon], total_count: int, orientation_deg: float, road_reference_geom: Any = None
 ) -> list[Polygon]:
     """Splits total_count *equal-sized* lots out of the combined area on both sides of an
     excluded road, exactly as if the road weren't there. Each part is cut into as many
@@ -1990,6 +2033,11 @@ def _subdivide_polygon_multi_part_equal_count(
     whichever side happens to have it, but folded into the split so every one of the total_count
     lots comes out the same size. That combined lot may end up as a MultiPolygon (spanning both
     sides of the road) - callers need to handle that when serializing lot geometry.
+
+    When road_reference_geom (the excluded road corridor) is given, each part's remainder is cut
+    from whichever portion of it actually sits nearest the road, not an arbitrary corner - so the
+    piece that goes on to merge with the small side's own remainder sits right next to it on the
+    map, reading as one lot straddling the road, instead of two unrelated-looking fragments.
     """
     total_area = sum(max(p.area, 1e-9) for p in parts)
     target = total_area / max(total_count, 1)
@@ -2006,17 +2054,26 @@ def _subdivide_polygon_multi_part_equal_count(
         remainder_target_area = part.area - whole_count * target
         clean_part = part
         if remainder_target_area > target * 0.01:
-            base_poly = _clean_single_polygon(part)
-            rotated = _clean_single_polygon(rotate(base_poly, -orientation_deg, origin="centroid", use_radians=False)) if base_poly is not None else None
-            if rotated is not None:
+            if road_reference_geom is not None:
                 try:
-                    remainder_rot, clean_rot = _split_polygon_once_by_area(rotated, remainder_target_area)
-                    remainder_pieces.append(
-                        rotate(remainder_rot, orientation_deg, origin=base_poly.centroid, use_radians=False)
+                    remainder_piece, clean_part = _split_polygon_by_distance_from(
+                        part, road_reference_geom, remainder_target_area
                     )
-                    clean_part = rotate(clean_rot, orientation_deg, origin=base_poly.centroid, use_radians=False)
+                    remainder_pieces.append(remainder_piece)
                 except HTTPException:
-                    pass
+                    clean_part = part
+            else:
+                base_poly = _clean_single_polygon(part)
+                rotated = _clean_single_polygon(rotate(base_poly, -orientation_deg, origin="centroid", use_radians=False)) if base_poly is not None else None
+                if rotated is not None:
+                    try:
+                        remainder_rot, clean_rot = _split_polygon_once_by_area(rotated, remainder_target_area)
+                        remainder_pieces.append(
+                            rotate(remainder_rot, orientation_deg, origin=base_poly.centroid, use_radians=False)
+                        )
+                        clean_part = rotate(clean_rot, orientation_deg, origin=base_poly.centroid, use_radians=False)
+                    except HTTPException:
+                        pass
         if whole_count == 1:
             cleaned = _clean_single_polygon(clean_part)
             if cleaned is not None and cleaned.area > 1e-8:
@@ -2156,7 +2213,7 @@ def _compute_subdivision_payload(
             raise HTTPException(status_code=400, detail="For 'by_count', set derived plot count to 2 or more.")
         if len(working_parts) > 1:
             pieces_wgs84 = _subdivide_polygon_multi_part_equal_count(
-                working_parts, int(resolved_count), orientation_deg
+                working_parts, int(resolved_count), orientation_deg, excluded_geom_metric
             )
             lot_count_balanced = len(pieces_wgs84) != int(resolved_count)
         else:
