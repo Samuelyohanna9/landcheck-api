@@ -1748,12 +1748,18 @@ def _subdivide_polygon_weighted(poly_metric: Polygon, weights: list[float], orie
     return out
 
 
-def _load_plot_road_lines_wgs84(db: Session, plot_id: int) -> list[Any]:
+def _load_plot_road_segments_wgs84(db: Session, plot_id: int) -> list[dict]:
     """Road centerlines for this plot in WGS84 - OSM-detected roads clipped to the plot buffer,
     plus/minus whatever the Feature Editor's road overrides (add/delete/update) say. Same road
     definition get_plot_features_geojson uses for the CAD editor, kept as an independent, minimal
     copy here rather than a shared extraction - that endpoint has since grown scale-aware label
     decoration (position hints, segment keys) this doesn't need.
+
+    Each entry carries enough identity for a caller to act on "just this one road" - a detected/
+    OSM segment has no row of its own to delete, so it's identified by a stable hash of its own
+    geometry (the same way one gets suppressed today: a matching "delete" override), while an
+    "add" override carries its real plot_feature_overrides.id, deletable directly.
+    Returns [{"id": str, "source": "detected"|"override", "override_id": int|None, "geom": LineString}, ...]
     """
     road_rows = db.execute(text("""
         WITH roads AS (
@@ -1777,16 +1783,23 @@ def _load_plot_road_lines_wgs84(db: Session, plot_id: int) -> list[Any]:
         WHERE ST_GeometryType(geom) = 'ST_LineString'
     """), {"plot_id": plot_id}).fetchall()
 
-    lines: list[Any] = []
+    def _detected_segment(geom) -> dict:
+        try:
+            seg_id = "detected:" + hashlib.sha1(bytes(geom.wkb)).hexdigest()[:16]
+        except Exception:
+            seg_id = "detected:" + hashlib.sha1(str(geom).encode("utf-8")).hexdigest()[:16]
+        return {"id": seg_id, "source": "detected", "override_id": None, "geom": geom}
+
+    segments: list[dict] = []
     for r in road_rows:
         if not r.geojson:
             continue
         try:
-            lines.append(shape(json.loads(r.geojson)))
+            segments.append(_detected_segment(shape(json.loads(r.geojson))))
         except Exception:
             continue
 
-    if not lines:
+    if not segments:
         # Fallback for plots without a plot_buffers row yet (mirrors get_plot_features_geojson).
         feature_rows = db.execute(text("""
             SELECT ST_AsGeoJSON(geom) AS geojson
@@ -1797,12 +1810,12 @@ def _load_plot_road_lines_wgs84(db: Session, plot_id: int) -> list[Any]:
             if not r.geojson:
                 continue
             try:
-                lines.append(shape(json.loads(r.geojson)))
+                segments.append(_detected_segment(shape(json.loads(r.geojson))))
             except Exception:
                 continue
 
     override_rows = db.execute(text("""
-        SELECT action, ST_AsGeoJSON(geom) AS geojson
+        SELECT id, action, ST_AsGeoJSON(geom) AS geojson
         FROM plot_feature_overrides
         WHERE plot_id = :plot_id AND feature_type = 'road'
     """), {"plot_id": plot_id}).fetchall()
@@ -1825,21 +1838,26 @@ def _load_plot_road_lines_wgs84(db: Session, plot_id: int) -> list[Any]:
             continue
         action = str(r.action or "").strip().lower()
         if action in ("delete", "update"):
-            lines = [g for g in lines if not _line_replaced_by(g, override_geom)]
+            segments = [s for s in segments if not _line_replaced_by(s["geom"], override_geom)]
         if action in ("add", "update"):
-            lines.append(override_geom)
+            segments.append({
+                "id": f"override:{r.id}",
+                "source": "override",
+                "override_id": int(r.id),
+                "geom": override_geom,
+            })
 
-    return lines
+    return segments
 
 
 def _build_road_exclusion_geom(
     db: Session, plot_id: int, parent_metric: Polygon, metric_epsg: int, road_width_m: float,
 ) -> Any:
     """The road-reserve corridor to carve out of the mother parcel before subdividing: every road
-    line on this plot (see _load_plot_road_lines_wgs84), buffered by half the requested width on
-    each side, unioned, and clipped to the parcel itself. None if there's no road on this plot.
+    line on this plot (see _load_plot_road_segments_wgs84), buffered by half the requested width
+    on each side, unioned, and clipped to the parcel itself. None if there's no road on this plot.
     """
-    lines_wgs84 = _load_plot_road_lines_wgs84(db, plot_id)
+    lines_wgs84 = [seg["geom"] for seg in _load_plot_road_segments_wgs84(db, plot_id)]
     if not lines_wgs84:
         return None
     try:
@@ -2040,9 +2058,22 @@ def _compute_subdivision_payload(
     # parcel is in separate pieces, so those two still require a single contiguous area.
     working_parts: list[Polygon] = [parent_metric]
     excluded_geom_metric = None
+    road_segments_out: list[dict] = []
     unit_key = str(dimension_unit or "m").strip().lower()
     ft_to_m = 0.3048
     if exclude_road:
+        # Reported back so the subdivision preview can show/act on individual roads (delete just
+        # one) rather than only the final merged corridor - see _load_plot_road_segments_wgs84.
+        try:
+            for seg in _load_plot_road_segments_wgs84(db, parent_plot_id):
+                road_segments_out.append({
+                    "id": seg["id"],
+                    "source": seg["source"],
+                    "override_id": seg["override_id"],
+                    "geojson": {"type": "Feature", "properties": {}, "geometry": mapping(seg["geom"])},
+                })
+        except Exception:
+            road_segments_out = []
         try:
             corridor = _build_road_exclusion_geom(db, parent_plot_id, parent_metric, metric_epsg, road_width_m)
         except Exception:
@@ -2271,6 +2302,7 @@ def _compute_subdivision_payload(
         "road_width_m": round(float(road_width_m), 2) if exclude_road else None,
         "excluded_geojson": excluded_geojson,
         "excluded_area_m2": excluded_area_m2,
+        "road_segments": road_segments_out,
         "leftover_geojson": leftover_geojson,
         "leftover_area_m2": leftover_area_m2,
         "resolved_count": len(plots),
