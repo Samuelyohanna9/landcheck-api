@@ -1969,42 +1969,37 @@ def _subdivide_polygon_by_dimension(
 
 
 def _distribute_count_across_parts(parts: list[Polygon], total_count: int) -> list[int]:
-    """Splits total_count lots across parts so every resulting lot ends up as close in size to
-    every other as possible - both sides of an excluded road are counted as one combined area for
-    this, exactly as if the road weren't there. Each of the total_count lots is handed, one at a
-    time, to whichever part would have the largest per-lot area *if* it got that lot - the same
-    greedy logic behind the D'Hondt/Jefferson apportionment method, just optimizing for equal lot
-    size instead of proportional representation. A part can legitimately end up with 0: if it's
-    too small to fairly hold even one lot at the size everything else is landing on, forcing one
-    on it anyway would make that one lot a different size than all the others (exactly what
-    "at least 1 per part" used to do) - it becomes leftover instead.
+    """Splits total_count lots across parts so the *entire* combined area (both sides of an
+    excluded road) is divided up with nothing left over, while keeping every resulting lot as
+    close in size to every other as this "use it all" constraint allows. Every part is guaranteed
+    at least 1 lot (so a smaller side never becomes unused "leftover" land - the whole point is
+    that all of it gets divided, exactly as if the road weren't there); any lots beyond that
+    guaranteed minimum are then handed out one at a time to whichever part currently has the
+    largest per-lot area if it got one more, so the split converges toward equal sizes wherever
+    the requested count leaves room to.
     """
+    n = len(parts)
     areas = [max(p.area, 1e-9) for p in parts]
-    counts = [0] * len(parts)
-    for _ in range(total_count):
-        best_i = max(range(len(parts)), key=lambda i: areas[i] / (counts[i] + 1))
+    counts = [1] * n
+    for _ in range(max(0, total_count - n)):
+        best_i = max(range(n), key=lambda i: areas[i] / (counts[i] + 1))
         counts[best_i] += 1
     return counts
 
 
 def _subdivide_polygon_multi_part_equal_count(
     parts: list[Polygon], total_count: int, orientation_deg: float
-) -> tuple[list[Polygon], Any]:
+) -> list[Polygon]:
     counts = _distribute_count_across_parts(parts, total_count)
     out: list[Polygon] = []
-    leftover_parts: list[Polygon] = []
     for part, count in zip(parts, counts):
-        if count <= 0:
-            leftover_parts.append(part)
-            continue
-        if count == 1:
+        if count <= 1:
             cleaned = _clean_single_polygon(part)
             if cleaned is not None and cleaned.area > 1e-8:
                 out.append(cleaned)
             continue
         out.extend(_subdivide_polygon_equal_count(part, count, orientation_deg))
-    leftover = unary_union(leftover_parts) if leftover_parts else None
-    return out, leftover
+    return out
 
 
 def _compute_subdivision_payload(
@@ -2118,7 +2113,7 @@ def _compute_subdivision_payload(
         if resolved_count is None or resolved_count < 2:
             raise HTTPException(status_code=400, detail="For 'by_count', set derived plot count to 2 or more.")
         if len(working_parts) > 1:
-            pieces_wgs84, leftover_metric = _subdivide_polygon_multi_part_equal_count(
+            pieces_wgs84 = _subdivide_polygon_multi_part_equal_count(
                 working_parts, int(resolved_count), orientation_deg
             )
         else:
@@ -2156,27 +2151,18 @@ def _compute_subdivision_payload(
             if target_area <= 0:
                 raise HTTPException(status_code=400, detail="For 'by_area', provide a positive target plot size (sqm).")
             if len(working_parts) > 1:
-                # A part too small to fairly hold even one target_area-sized lot becomes leftover
-                # rather than one undersized lot - same principle as by_count's equal-lot-size fix.
+                # The entire combined area (both sides of the excluded road) is divided up with
+                # nothing left over - every part gets at least one lot, even a part smaller than
+                # target_area, same "use it all" principle as by_count above.
                 pieces_wgs84 = []
-                leftover_area_parts = []
                 for part in working_parts:
-                    part_count = min(500, int(round(part.area / target_area)))
-                    if part_count <= 0:
-                        leftover_area_parts.append(part)
-                        continue
+                    part_count = max(1, min(500, int(round(part.area / target_area))))
                     if part_count == 1:
                         cleaned = _clean_single_polygon(part)
                         if cleaned is not None and cleaned.area > 1e-8:
                             pieces_wgs84.append(cleaned)
                         continue
                     pieces_wgs84.extend(_subdivide_polygon_equal_count(part, part_count, orientation_deg))
-                if not pieces_wgs84:
-                    raise HTTPException(
-                        status_code=400,
-                        detail="No part of the parcel is large enough for even one lot at this target area. Reduce the target area.",
-                    )
-                leftover_metric = unary_union(leftover_area_parts) if leftover_area_parts else None
                 resolved_count = min(max(2, len(pieces_wgs84)), 500)
             else:
                 approx_count = int(round(working_area_m2 / target_area))
