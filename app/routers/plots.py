@@ -1950,6 +1950,49 @@ def _subdivide_polygon_by_dimension(
     return out_lots, out_leftover
 
 
+def _distribute_count_across_parts(parts: list[Polygon], total_count: int) -> list[int]:
+    """Splits total_count across parts proportional to each part's area (largest-remainder
+    rounding so the counts sum to exactly total_count), each part getting at least 1.
+    """
+    if len(parts) > total_count:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Excluding the road leaves {len(parts)} separate areas - "
+                f"set the plot count to at least {len(parts)}."
+            ),
+        )
+    areas = [max(p.area, 1e-9) for p in parts]
+    total_area = sum(areas)
+    raw = [total_count * a / total_area for a in areas]
+    counts = [max(1, int(math.floor(v))) for v in raw]
+    remainder_order = sorted(range(len(parts)), key=lambda i: (raw[i] - math.floor(raw[i])), reverse=True)
+    idx = 0
+    while sum(counts) < total_count:
+        counts[remainder_order[idx % len(remainder_order)]] += 1
+        idx += 1
+    while sum(counts) > total_count:
+        for i in range(len(counts)):
+            if counts[i] > 1 and sum(counts) > total_count:
+                counts[i] -= 1
+    return counts
+
+
+def _subdivide_polygon_multi_part_equal_count(
+    parts: list[Polygon], total_count: int, orientation_deg: float
+) -> list[Polygon]:
+    counts = _distribute_count_across_parts(parts, total_count)
+    out: list[Polygon] = []
+    for part, count in zip(parts, counts):
+        if count <= 1:
+            cleaned = _clean_single_polygon(part)
+            if cleaned is not None and cleaned.area > 1e-8:
+                out.append(cleaned)
+            continue
+        out.extend(_subdivide_polygon_equal_count(part, count, orientation_deg))
+    return out
+
+
 def _compute_subdivision_payload(
     parent_plot_id: int,
     parent_geom_wgs84: Polygon,
@@ -1988,8 +2031,14 @@ def _compute_subdivision_payload(
 
     # Optionally carve the access road out of the parcel before running whichever split method
     # was requested, so a road never ends up sliced across multiple lots. The excluded corridor
-    # is reported separately (excluded_geojson/excluded_area_m2), never as a numbered lot.
-    working_metric = parent_metric
+    # is reported separately (excluded_geojson/excluded_area_m2), never as a numbered lot. An
+    # internal estate road commonly splits the parcel into two or more disconnected pieces (not
+    # just a frontage strip along one edge) - each piece is then subdivided independently rather
+    # than rejected outright, for the methods where "which piece gets which lot" doesn't need an
+    # explicit answer (by_count/by_area/by_dimension). by_fraction/by_custom_area assign a
+    # specific share to a specific position, which doesn't have an unambiguous meaning once the
+    # parcel is in separate pieces, so those two still require a single contiguous area.
+    working_parts: list[Polygon] = [parent_metric]
     excluded_geom_metric = None
     unit_key = str(dimension_unit or "m").strip().lower()
     ft_to_m = 0.3048
@@ -2012,20 +2061,24 @@ def _compute_subdivision_payload(
                 # all of these without changing the result in any way that matters here.
                 remainder = _clean_single_polygon(parent_metric.buffer(0)).difference(corridor.buffer(0))
             significant_parts = [p for p in _polygon_parts(remainder) if p.area > total_area_m2 * 0.01]
-            if len(significant_parts) > 1:
+            if len(significant_parts) > 1 and method_key in ("by_fraction", "by_custom_area"):
                 raise HTTPException(
                     status_code=400,
                     detail=(
-                        "Excluding this road would split the parcel into separate, disconnected areas. "
-                        "Subdivide each side of the road separately instead."
+                        f"Excluding this road splits the parcel into {len(significant_parts)} separate areas, "
+                        "which fraction/custom-area splitting can't divide across. Use 'Split by number of "
+                        "plots', 'Split by target plot area', or the fixed-size method instead, or subdivide "
+                        "each side of the road separately."
                     ),
                 )
-            cleaned_remainder = _clean_single_polygon(remainder)
-            if cleaned_remainder is not None and cleaned_remainder.area > 1e-6:
-                working_metric = cleaned_remainder
+            if significant_parts:
+                # Left-to-right by centroid so lot numbering reads in a sensible order across sides.
+                significant_parts.sort(key=lambda p: p.centroid.x)
+                working_parts = significant_parts
                 excluded_geom_metric = corridor
 
-    working_area_m2 = float(working_metric.area)
+    working_metric = working_parts[0]
+    working_area_m2 = float(sum(p.area for p in working_parts))
     resolved_count = _coerce_positive_int(split_count)
     target_area = _coerce_float(target_area_m2, 0.0)
     effective_fraction_weights: list[float] = []
@@ -2037,7 +2090,10 @@ def _compute_subdivision_payload(
     if method_key == "by_count":
         if resolved_count is None or resolved_count < 2:
             raise HTTPException(status_code=400, detail="For 'by_count', set derived plot count to 2 or more.")
-        pieces_wgs84 = _subdivide_polygon_equal_count(working_metric, int(resolved_count), orientation_deg)
+        if len(working_parts) > 1:
+            pieces_wgs84 = _subdivide_polygon_multi_part_equal_count(working_parts, int(resolved_count), orientation_deg)
+        else:
+            pieces_wgs84 = _subdivide_polygon_equal_count(working_metric, int(resolved_count), orientation_deg)
     elif method_key == "by_dimension":
         raw_width = _coerce_float(lot_width, 0.0)
         raw_height = _coerce_float(lot_height, 0.0)
@@ -2046,17 +2102,46 @@ def _compute_subdivision_payload(
         unit_mult = ft_to_m if unit_key == "ft" else 1.0
         lot_width_m = raw_width * unit_mult
         lot_height_m = raw_height * unit_mult
-        pieces_wgs84, leftover_metric = _subdivide_polygon_by_dimension(
-            working_metric, lot_width_m, lot_height_m, orientation_deg
-        )
+        pieces_wgs84 = []
+        leftover_parts = []
+        for part in working_parts:
+            try:
+                part_lots, part_leftover = _subdivide_polygon_by_dimension(
+                    part, lot_width_m, lot_height_m, orientation_deg
+                )
+                pieces_wgs84.extend(part_lots)
+                if part_leftover is not None:
+                    leftover_parts.append(part_leftover)
+            except HTTPException:
+                # This piece is too small for even one full-size lot - treat the whole thing as
+                # leftover rather than failing the entire subdivision over one small side.
+                leftover_parts.append(part)
+        if not pieces_wgs84:
+            raise HTTPException(
+                status_code=400,
+                detail="No full-size lot fits inside this parcel at the given dimensions. Reduce the lot size.",
+            )
+        leftover_metric = unary_union(leftover_parts) if leftover_parts else None
     else:
         if method_key == "by_area":
             if target_area <= 0:
                 raise HTTPException(status_code=400, detail="For 'by_area', provide a positive target plot size (sqm).")
-            approx_count = int(round(working_area_m2 / target_area))
-            resolved_count = max(2, approx_count)
-            resolved_count = min(int(resolved_count or 2), 500)
-            pieces_wgs84 = _subdivide_polygon_equal_count(working_metric, resolved_count, orientation_deg)
+            if len(working_parts) > 1:
+                pieces_wgs84 = []
+                for part in working_parts:
+                    part_count = max(1, min(500, int(round(part.area / target_area))))
+                    if part_count <= 1:
+                        cleaned = _clean_single_polygon(part)
+                        if cleaned is not None and cleaned.area > 1e-8:
+                            pieces_wgs84.append(cleaned)
+                        continue
+                    pieces_wgs84.extend(_subdivide_polygon_equal_count(part, part_count, orientation_deg))
+                resolved_count = min(max(2, len(pieces_wgs84)), 500)
+            else:
+                approx_count = int(round(working_area_m2 / target_area))
+                resolved_count = max(2, approx_count)
+                resolved_count = min(int(resolved_count or 2), 500)
+                pieces_wgs84 = _subdivide_polygon_equal_count(working_metric, resolved_count, orientation_deg)
         elif method_key == "by_fraction":
             normalized_breaks = _normalize_fraction_breaks(fraction_breaks)
             normalized_weights = _normalize_fraction_weights(fraction_weights)
