@@ -97,6 +97,80 @@ def _compute_arcgis_export_size(
     return max(1, int(round(width * scale))), max(1, int(round(height * scale)))
 
 
+class _PlaceholderImageryError(RuntimeError):
+    """Raised when a provider responded successfully but the image content is a placeholder/error
+    graphic, not real imagery. Distinct from a plain RuntimeError so `_load_arcgis_export_image`'s
+    resolution-halving retry loop can recognize it and give up immediately instead of wasting
+    several slow round-trips re-requesting the same "no imagery here" tile at smaller sizes - a
+    smaller request doesn't fix an area the provider has no coverage for.
+    """
+
+
+def _image_looks_like_placeholder(image: np.ndarray) -> bool:
+    """True if `image` looks like a flat "no imagery"/error placeholder tile (e.g. Esri's own
+    "Map data not yet available" graphic) rather than real aerial/satellite photography.
+
+    A tile provider can return a perfectly valid HTTP 200 image response that is nonetheless just
+    an error graphic - that's a *content* failure, invisible to the status-code/JSON checks above.
+    Real aerial imagery of any real place (built, vegetated, bare, or water) always has
+    substantial per-pixel texture; a placeholder is dominated by one or two flat fill colors plus
+    a bit of overlaid text. Every basemap fetch in this module (and the site_plan photo inset in
+    map_renderer_layout.py) is expected to run this before trusting a "successful" fetch.
+    """
+    try:
+        if image.size == 0:
+            return True
+        gray = image[..., :3].mean(axis=2) if image.ndim == 3 else image
+        # Downsample for speed - the dominant-color/variance signal doesn't need every pixel.
+        step_y = max(1, gray.shape[0] // 300)
+        step_x = max(1, gray.shape[1] // 300)
+        sample = gray[::step_y, ::step_x]
+        flat = sample.astype(np.int16).ravel()
+        if flat.size == 0:
+            return True
+        # Bucket into groups of 4 to absorb JPEG compression noise around what's otherwise one
+        # flat fill color, so a lightly-compressed placeholder still reads as "dominant color".
+        bucketed = (flat // 4) * 4
+        _, counts = np.unique(bucketed, return_counts=True)
+        counts_desc = np.sort(counts)[::-1]
+        dominant_fraction = float(counts_desc[0]) / flat.size
+        top2_fraction = float(counts_desc[:2].sum()) / flat.size
+        # A placeholder graphic is essentially one or two flat fill colors (background, plus
+        # optionally a block of overlaid text/logo in a second color) covering nearly the whole
+        # tile. Real aerial imagery - even of visually uniform ground like calm water, desert, or a
+        # flat crop field - still spreads across many more distinct colors than that once you
+        # account for natural per-pixel sensor/compression variation, so requiring near-total
+        # coverage by just the top 1-2 colors (rather than a looser variance check, which
+        # conflates "two flat regions with different brightness" with genuine texture) keeps this
+        # from misflagging real but visually simple scenes.
+        return dominant_fraction > 0.85 or top2_fraction > 0.95
+    except Exception:
+        # Never let the placeholder check itself be the reason a perfectly good image gets
+        # rejected - fail open (treat as real imagery) rather than closed here.
+        return False
+
+
+def _reject_if_placeholder_basemap(ax) -> bool:
+    """Call right after a `ctx.add_basemap()` that did NOT raise. contextily/requests only ever
+    sees an HTTP-level failure - a tile provider returning a "no imagery here" placeholder graphic
+    at 200 OK looks like success to it. This inspects the tile(s) it just drew with the same
+    content heuristic used for the ArcGIS export path and, if they look like a placeholder, removes
+    that artist so the caller's fallback chain (next provider, then the honest "temporarily
+    unavailable" message) actually runs instead of a placeholder shipping as if it were real imagery.
+    Returns True if the basemap just added looks legitimate and should be kept.
+    """
+    try:
+        if not ax.images:
+            return False
+        array = np.asarray(ax.images[-1].get_array())
+        if _image_looks_like_placeholder(array):
+            ax.images[-1].remove()
+            return False
+        return True
+    except Exception:
+        return True
+
+
 def _request_arcgis_export_image(
     *,
     xmin: float,
@@ -129,7 +203,10 @@ def _request_arcgis_export_image(
     if "json" in content_type:
         raise RuntimeError(f"ArcGIS exportImage returned JSON instead of imagery: {response.text[:240]}")
     image = Image.open(BytesIO(response.content)).convert("RGB")
-    return np.asarray(image)
+    array = np.asarray(image)
+    if _image_looks_like_placeholder(array):
+        raise _PlaceholderImageryError("ArcGIS exportImage returned a flat placeholder tile (no real imagery for this area/request)")
+    return array
 
 
 def _load_arcgis_export_image(
@@ -167,7 +244,12 @@ def _load_arcgis_export_image(
                 xmin=xmin, ymin=ymin, xmax=xmax, ymax=ymax, axis_epsg=axis_epsg,
                 pixel_width=width, pixel_height=height, preview_mode=preview_mode, timeout=timeout,
             )
-        except Exception as exc:  # noqa: BLE001 - any failure here is worth a smaller retry
+        except _PlaceholderImageryError:
+            # A smaller request gets the same "no coverage here" placeholder back - retrying only
+            # burns time a slow connection doesn't have. Fail fast so the caller's own
+            # provider-level fallback chain (Mapbox/Esri/OSM) gets a chance instead.
+            raise
+        except Exception as exc:  # noqa: BLE001 - any other failure here is worth a smaller retry
             last_error = exc
             # Halving (rather than the gentler 0.6x tried first) crosses the server's undocumented
             # threshold in far fewer round-trips - measured empirically at ~250-300px for a ~153m-
@@ -1103,7 +1185,7 @@ def render_orthophoto_png(
                         reset_extent=True,
                         timeout=_BASEMAP_FETCH_TIMEOUT,
                     )
-                    basemap_loaded = True
+                    basemap_loaded = _reject_if_placeholder_basemap(ax)
                 except Exception as e:
                     print(f"Mapbox Satellite failed: {e}")
             if not basemap_loaded:
@@ -1117,7 +1199,7 @@ def render_orthophoto_png(
                         reset_extent=True,
                         timeout=_BASEMAP_FETCH_TIMEOUT,
                     )
-                    basemap_loaded = True
+                    basemap_loaded = _reject_if_placeholder_basemap(ax)
                 except Exception:
                     pass
             if not basemap_loaded:
@@ -1131,7 +1213,7 @@ def render_orthophoto_png(
                         reset_extent=True,
                         timeout=_BASEMAP_FETCH_TIMEOUT,
                     )
-                    basemap_loaded = True
+                    basemap_loaded = _reject_if_placeholder_basemap(ax)
                 except Exception:
                     basemap_loaded = False
         else:
@@ -1155,7 +1237,9 @@ def render_orthophoto_png(
                         reset_extent=True,
                         timeout=_BASEMAP_FETCH_TIMEOUT,
                     )
-                    basemap_loaded = True
+                    basemap_loaded = _reject_if_placeholder_basemap(ax)
+                    if not basemap_loaded:
+                        print("Mapbox Satellite returned a placeholder tile, not real imagery")
                 except Exception as e:
                     print(f"Mapbox Satellite failed: {e}")
 
@@ -1171,7 +1255,9 @@ def render_orthophoto_png(
                         reset_extent=True,
                         timeout=_BASEMAP_FETCH_TIMEOUT,
                     )
-                    basemap_loaded = True
+                    basemap_loaded = _reject_if_placeholder_basemap(ax)
+                    if not basemap_loaded:
+                        print("Esri WorldImagery returned a placeholder tile, not real imagery")
                 except Exception as e:
                     print(f"Esri WorldImagery failed: {e}")
 
@@ -1186,7 +1272,9 @@ def render_orthophoto_png(
                         reset_extent=True,
                         timeout=_BASEMAP_FETCH_TIMEOUT,
                     )
-                    basemap_loaded = True
+                    basemap_loaded = _reject_if_placeholder_basemap(ax)
+                    if not basemap_loaded:
+                        print("OpenStreetMap returned a placeholder tile, not real imagery")
                 except Exception as e:
                     print(f"OpenStreetMap failed: {e}")
 
@@ -1203,7 +1291,10 @@ def render_orthophoto_png(
                             reset_extent=True,
                             timeout=_BASEMAP_FETCH_TIMEOUT,
                         )
-                        basemap_loaded = True
+                        basemap_loaded = _reject_if_placeholder_basemap(ax)
+                        if not basemap_loaded:
+                            print(f"{name} returned a placeholder tile, not real imagery")
+                            continue
                         print(f"Loaded basemap from {name}")
                         break
                     except Exception as e:

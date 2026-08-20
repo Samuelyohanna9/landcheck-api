@@ -26,6 +26,7 @@ import contextily as ctx
 from app.utils.orthophoto_renderer import (
     _try_add_arcgis_world_imagery,
     _mapbox_satellite_url,
+    _reject_if_placeholder_basemap,
     MAPBOX_ACCESS_TOKEN,
     _BASEMAP_FETCH_TIMEOUT,
     _ORTHOPHOTO_SOURCE_GSD_METERS,
@@ -5168,7 +5169,7 @@ def _draw_site_plan_photo_inset(
                 ax_photo, source=_mapbox_satellite_url(), crs=axis_crs, attribution=False,
                 zoom=sat_zoom + 1, reset_extent=True, timeout=inset_fetch_timeout,
             )
-            basemap_loaded = True
+            basemap_loaded = _reject_if_placeholder_basemap(ax_photo)
         except Exception:
             pass
     if not basemap_loaded:
@@ -5177,7 +5178,7 @@ def _draw_site_plan_photo_inset(
                 ax_photo, source=ctx.providers.Esri.WorldImagery, crs=axis_crs, attribution=False,
                 zoom=sat_zoom, reset_extent=True, timeout=inset_fetch_timeout,
             )
-            basemap_loaded = True
+            basemap_loaded = _reject_if_placeholder_basemap(ax_photo)
         except Exception:
             pass
     if not basemap_loaded:
@@ -5186,8 +5187,21 @@ def _draw_site_plan_photo_inset(
                 ax_photo, source=ctx.providers.OpenStreetMap.Mapnik, crs=axis_crs, attribution=False,
                 zoom=sat_zoom, reset_extent=True, timeout=inset_fetch_timeout,
             )
+            basemap_loaded = _reject_if_placeholder_basemap(ax_photo)
         except Exception:
             pass
+
+    if not basemap_loaded:
+        # Same honest-failure treatment as the standalone Orthophoto export (orthophoto_renderer.py)
+        # - this inset previously just left the panel blank (boundary on white) with no indication
+        # anything had gone wrong, which is exactly the "silently ship broken content as finished"
+        # failure mode the fallback message elsewhere in this file already avoids.
+        ax_photo.set_facecolor("#e8f4e8")
+        ax_photo.text(
+            0.5, 0.5, "Satellite imagery\ntemporarily unavailable",
+            transform=ax_photo.transAxes, ha="center", va="center",
+            fontsize=max(5, int(6 * font_scale)), color="#555", alpha=0.85,
+        )
 
     ax_photo.set_xlim(target_xlim)
     ax_photo.set_ylim(target_ylim)
