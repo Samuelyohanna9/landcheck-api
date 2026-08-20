@@ -5658,7 +5658,7 @@ def _render_plot_map_layout_site_plan(
     # triggers annotate_vertices' skip-to-table behavior for tightly packed vertices.
     min_label_mm = 12
     min_label_length_m = (min_label_mm / 1000.0) * scale_ratio
-    skipped_entries, _boundary_label_boxes = annotate_vertices(
+    skipped_entries, boundary_label_boxes = annotate_vertices(
         ax, poly, plot_id, station_names=station_names, font_scale=font_scale, min_label_length_m=min_label_length_m,
         avoid_geom=label_avoid_geom, scale_ratio=scale_ratio, boundary_poly=poly, beacon_style=beacon_style,
         text_color=text_color, boundary_color=boundary_color, station_font=station_font, station_size=station_size,
