@@ -4,7 +4,7 @@ from fastapi import APIRouter, Depends, Body, HTTPException, BackgroundTasks, Qu
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 from geoalchemy2.shape import from_shape
-from shapely.geometry import Polygon, shape, Point, box
+from shapely.geometry import Polygon, shape, Point, box, mapping
 from shapely import wkt as shapely_wkt
 from shapely.affinity import rotate
 from shapely.ops import unary_union, snap
@@ -525,6 +525,24 @@ def ensure_plot_subdivision_tables(db: Session):
     ]:
         try:
             db.execute(text(f"ALTER TABLE plot_meta ADD COLUMN IF NOT EXISTS {col_name} {col_type}"))
+        except Exception:
+            pass
+
+    # Added for road-exclusion and fixed-dimension-lot subdivision - nullable/defaulted so
+    # existing batch rows and readers are unaffected.
+    for col_name, col_type in [
+        ("exclude_road", "BOOLEAN DEFAULT FALSE"),
+        ("road_width_m", "DOUBLE PRECISION"),
+        ("lot_width_m", "DOUBLE PRECISION"),
+        ("lot_height_m", "DOUBLE PRECISION"),
+        ("dimension_unit", "TEXT"),
+        ("leftover_area_m2", "DOUBLE PRECISION"),
+        ("excluded_area_m2", "DOUBLE PRECISION"),
+        ("leftover_geojson", "JSONB"),
+        ("excluded_geojson", "JSONB"),
+    ]:
+        try:
+            db.execute(text(f"ALTER TABLE plot_subdivision_batches ADD COLUMN IF NOT EXISTS {col_name} {col_type}"))
         except Exception:
             pass
 
@@ -1730,6 +1748,208 @@ def _subdivide_polygon_weighted(poly_metric: Polygon, weights: list[float], orie
     return out
 
 
+def _load_plot_road_lines_wgs84(db: Session, plot_id: int) -> list[Any]:
+    """Road centerlines for this plot in WGS84 - OSM-detected roads clipped to the plot buffer,
+    plus/minus whatever the Feature Editor's road overrides (add/delete/update) say. Same road
+    definition get_plot_features_geojson uses for the CAD editor, kept as an independent, minimal
+    copy here rather than a shared extraction - that endpoint has since grown scale-aware label
+    decoration (position hints, segment keys) this doesn't need.
+    """
+    road_rows = db.execute(text("""
+        WITH roads AS (
+            SELECT
+                CASE
+                    WHEN ST_SRID(r.geom) = 4326 THEN r.geom
+                    WHEN ST_SRID(r.geom) = 0 THEN ST_SetSRID(r.geom, 4326)
+                    ELSE ST_Transform(r.geom, 4326)
+                END AS geom
+            FROM lines r
+            WHERE r.highway IS NOT NULL
+        ),
+        clipped AS (
+            SELECT (ST_Dump(ST_Intersection(roads.geom, b.geom))).geom AS geom
+            FROM roads
+            JOIN plot_buffers b ON b.plot_id = :plot_id
+            WHERE ST_Intersects(roads.geom, b.geom)
+        )
+        SELECT ST_AsGeoJSON(geom) AS geojson
+        FROM clipped
+        WHERE ST_GeometryType(geom) = 'ST_LineString'
+    """), {"plot_id": plot_id}).fetchall()
+
+    lines: list[Any] = []
+    for r in road_rows:
+        if not r.geojson:
+            continue
+        try:
+            lines.append(shape(json.loads(r.geojson)))
+        except Exception:
+            continue
+
+    if not lines:
+        # Fallback for plots without a plot_buffers row yet (mirrors get_plot_features_geojson).
+        feature_rows = db.execute(text("""
+            SELECT ST_AsGeoJSON(geom) AS geojson
+            FROM detected_features
+            WHERE plot_id = :plot_id AND feature_type = 'road'
+        """), {"plot_id": plot_id}).fetchall()
+        for r in feature_rows:
+            if not r.geojson:
+                continue
+            try:
+                lines.append(shape(json.loads(r.geojson)))
+            except Exception:
+                continue
+
+    override_rows = db.execute(text("""
+        SELECT action, ST_AsGeoJSON(geom) AS geojson
+        FROM plot_feature_overrides
+        WHERE plot_id = :plot_id AND feature_type = 'road'
+    """), {"plot_id": plot_id}).fetchall()
+
+    def _line_replaced_by(geom, override_geom, tol_deg: float = 0.00001) -> bool:
+        try:
+            total_len = max(getattr(geom, "length", 0.0), 1e-9)
+            uncovered = geom.difference(override_geom.buffer(tol_deg))
+            uncovered_len = getattr(uncovered, "length", 0.0)
+            return uncovered_len < total_len * 0.1
+        except Exception:
+            return geom.intersects(override_geom)
+
+    for r in override_rows:
+        if not r.geojson:
+            continue
+        try:
+            override_geom = shape(json.loads(r.geojson))
+        except Exception:
+            continue
+        action = str(r.action or "").strip().lower()
+        if action in ("delete", "update"):
+            lines = [g for g in lines if not _line_replaced_by(g, override_geom)]
+        if action in ("add", "update"):
+            lines.append(override_geom)
+
+    return lines
+
+
+def _build_road_exclusion_geom(
+    db: Session, plot_id: int, parent_metric: Polygon, metric_epsg: int, road_width_m: float,
+) -> Any:
+    """The road-reserve corridor to carve out of the mother parcel before subdividing: every road
+    line on this plot (see _load_plot_road_lines_wgs84), buffered by half the requested width on
+    each side, unioned, and clipped to the parcel itself. None if there's no road on this plot.
+    """
+    lines_wgs84 = _load_plot_road_lines_wgs84(db, plot_id)
+    if not lines_wgs84:
+        return None
+    try:
+        gdf_lines = gpd.GeoDataFrame(geometry=lines_wgs84, crs="EPSG:4326").to_crs(epsg=metric_epsg)
+    except Exception:
+        return None
+    half_width = max(0.1, float(road_width_m) / 2.0)
+    buffered = [
+        geom.buffer(half_width) for geom in gdf_lines.geometry.tolist() if geom is not None and not geom.is_empty
+    ]
+    if not buffered:
+        return None
+    try:
+        corridor = unary_union(buffered).intersection(parent_metric)
+    except Exception:
+        return None
+    if corridor is None or corridor.is_empty or corridor.area <= 1e-6:
+        return None
+    return corridor
+
+
+def _subdivide_polygon_by_dimension(
+    poly_metric: Polygon, lot_width_m: float, lot_height_m: float, orientation_deg: float,
+) -> tuple[list[Polygon], Any]:
+    """Tiles poly_metric with lot_width_m x lot_height_m rectangles (grid-aligned to
+    orientation_deg), keeping only cells that land essentially whole inside the parcel. Returns
+    (full_lots, leftover) where leftover = poly - union(full_lots) is computed as an exact
+    difference (not accumulated cell-by-cell), so lots + leftover always exactly reconstruct the
+    input polygon with no gap or double-count. leftover may be a MultiPolygon (several disjoint
+    unusable slivers), so it's deliberately never passed through _clean_single_polygon, which
+    would silently keep only the single largest piece.
+    """
+    if lot_width_m <= 0 or lot_height_m <= 0:
+        raise HTTPException(status_code=400, detail="Lot width and height must be positive.")
+
+    base_poly = _clean_single_polygon(poly_metric)
+    if base_poly is None:
+        raise HTTPException(status_code=400, detail="Mother parcel geometry is invalid.")
+
+    rotated = _clean_single_polygon(rotate(base_poly, -orientation_deg, origin="centroid", use_radians=False))
+    if rotated is None:
+        raise HTTPException(status_code=400, detail="Subdivision failed: unable to rotate mother parcel.")
+
+    minx, miny, maxx, maxy = rotated.bounds
+    cell_area = lot_width_m * lot_height_m
+    bounds_area = max(0.0, (maxx - minx) * (maxy - miny))
+    if cell_area > 0 and bounds_area / cell_area > 5000:
+        raise HTTPException(
+            status_code=400,
+            detail="This lot size would generate far too many plots for this parcel. Increase lot size or pick a smaller area.",
+        )
+
+    full_lots: list[Polygon] = []
+    full_area_threshold = cell_area * 0.985
+    y = miny
+    while y < maxy:
+        x = minx
+        while x < maxx:
+            cell = box(x, y, x + lot_width_m, y + lot_height_m)
+            try:
+                clipped = _clean_single_polygon(rotated.intersection(cell))
+            except Exception:
+                clipped = None
+            if clipped is not None and clipped.area >= full_area_threshold:
+                full_lots.append(clipped)
+                if len(full_lots) > 500:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="This lot size would generate over 500 plots. Increase lot size or split the parcel first.",
+                    )
+            x += lot_width_m
+        y += lot_height_m
+
+    if not full_lots:
+        raise HTTPException(
+            status_code=400,
+            detail="No full-size lot fits inside this parcel at the given dimensions. Reduce the lot size.",
+        )
+
+    # Row-major reading order (bottom-to-top rows, left-to-right within a row) in the rotated
+    # frame, so lot numbering reads naturally instead of following grid-scan/insertion order.
+    full_lots.sort(key=lambda p: (round(p.centroid.y / max(lot_height_m, 1e-6)), p.centroid.x))
+
+    leftover_rotated = None
+    try:
+        diff = rotated.difference(unary_union(full_lots))
+        if not diff.is_valid:
+            diff = diff.buffer(0)
+        if diff is not None and not diff.is_empty and diff.area > 1e-6:
+            leftover_rotated = diff
+    except Exception:
+        leftover_rotated = None
+
+    out_lots: list[Polygon] = []
+    for piece in full_lots:
+        restored = _clean_single_polygon(rotate(piece, orientation_deg, origin=base_poly.centroid, use_radians=False))
+        if restored is None or restored.area <= 1e-8:
+            continue
+        out_lots.append(restored)
+    if not out_lots:
+        raise HTTPException(status_code=400, detail="Subdivision failed: generated only degenerate lots.")
+
+    out_leftover = None
+    if leftover_rotated is not None:
+        restored_leftover = rotate(leftover_rotated, orientation_deg, origin=base_poly.centroid, use_radians=False)
+        out_leftover = restored_leftover if not restored_leftover.is_empty else None
+
+    return out_lots, out_leftover
+
+
 def _compute_subdivision_payload(
     parent_plot_id: int,
     parent_geom_wgs84: Polygon,
@@ -1743,12 +1963,18 @@ def _compute_subdivision_payload(
     fraction_breaks: list[float] | None = None,
     custom_areas_m2: list[float] | None = None,
     lot_names: list[str] | None = None,
+    exclude_road: bool = False,
+    road_width_m: float = 10.0,
+    lot_width: float | None = None,
+    lot_height: float | None = None,
+    dimension_unit: str = "m",
 ) -> dict:
     method_key = (method or "by_count").strip().lower()
-    if method_key not in {"by_count", "by_area", "by_fraction", "by_custom_area"}:
+    valid_methods = {"by_count", "by_area", "by_fraction", "by_custom_area", "by_dimension"}
+    if method_key not in valid_methods:
         raise HTTPException(
             status_code=400,
-            detail="Invalid subdivision method. Use 'by_count', 'by_area', 'by_fraction', or 'by_custom_area'.",
+            detail="Invalid subdivision method. Use 'by_count', 'by_area', 'by_fraction', 'by_custom_area', or 'by_dimension'.",
         )
 
     metric_epsg = _metric_epsg_for_wgs84_polygon(parent_geom_wgs84)
@@ -1758,23 +1984,64 @@ def _compute_subdivision_payload(
         raise HTTPException(status_code=400, detail="Mother parcel area is too small for subdivision.")
 
     total_area_m2 = float(parent_metric.area)
+
+    # Optionally carve the access road out of the parcel before running whichever split method
+    # was requested, so a road never ends up sliced across multiple lots. The excluded corridor
+    # is reported separately (excluded_geojson/excluded_area_m2), never as a numbered lot.
+    working_metric = parent_metric
+    excluded_geom_metric = None
+    unit_key = str(dimension_unit or "m").strip().lower()
+    ft_to_m = 0.3048
+    if exclude_road:
+        corridor = _build_road_exclusion_geom(db, parent_plot_id, parent_metric, metric_epsg, road_width_m)
+        if corridor is not None:
+            remainder = parent_metric.difference(corridor)
+            significant_parts = [p for p in _polygon_parts(remainder) if p.area > total_area_m2 * 0.01]
+            if len(significant_parts) > 1:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "Excluding this road would split the parcel into separate, disconnected areas. "
+                        "Subdivide each side of the road separately instead."
+                    ),
+                )
+            cleaned_remainder = _clean_single_polygon(remainder)
+            if cleaned_remainder is not None and cleaned_remainder.area > 1e-6:
+                working_metric = cleaned_remainder
+                excluded_geom_metric = corridor
+
+    working_area_m2 = float(working_metric.area)
     resolved_count = _coerce_positive_int(split_count)
     target_area = _coerce_float(target_area_m2, 0.0)
     effective_fraction_weights: list[float] = []
     effective_fraction_breaks: list[float] = []
     effective_custom_areas_m2: list[float] = []
+    leftover_metric = None
+    lot_width_m = None
+    lot_height_m = None
     if method_key == "by_count":
         if resolved_count is None or resolved_count < 2:
             raise HTTPException(status_code=400, detail="For 'by_count', set derived plot count to 2 or more.")
-        pieces_wgs84 = _subdivide_polygon_equal_count(parent_metric, int(resolved_count), orientation_deg)
+        pieces_wgs84 = _subdivide_polygon_equal_count(working_metric, int(resolved_count), orientation_deg)
+    elif method_key == "by_dimension":
+        raw_width = _coerce_float(lot_width, 0.0)
+        raw_height = _coerce_float(lot_height, 0.0)
+        if raw_width <= 0 or raw_height <= 0:
+            raise HTTPException(status_code=400, detail="For 'by_dimension', provide a positive lot width and height.")
+        unit_mult = ft_to_m if unit_key == "ft" else 1.0
+        lot_width_m = raw_width * unit_mult
+        lot_height_m = raw_height * unit_mult
+        pieces_wgs84, leftover_metric = _subdivide_polygon_by_dimension(
+            working_metric, lot_width_m, lot_height_m, orientation_deg
+        )
     else:
         if method_key == "by_area":
             if target_area <= 0:
                 raise HTTPException(status_code=400, detail="For 'by_area', provide a positive target plot size (sqm).")
-            approx_count = int(round(total_area_m2 / target_area))
+            approx_count = int(round(working_area_m2 / target_area))
             resolved_count = max(2, approx_count)
             resolved_count = min(int(resolved_count or 2), 500)
-            pieces_wgs84 = _subdivide_polygon_equal_count(parent_metric, resolved_count, orientation_deg)
+            pieces_wgs84 = _subdivide_polygon_equal_count(working_metric, resolved_count, orientation_deg)
         elif method_key == "by_fraction":
             normalized_breaks = _normalize_fraction_breaks(fraction_breaks)
             normalized_weights = _normalize_fraction_weights(fraction_weights)
@@ -1794,7 +2061,7 @@ def _compute_subdivision_payload(
             resolved_count = min(len(effective_fraction_weights), 500)
             effective_fraction_weights = effective_fraction_weights[:resolved_count]
             effective_fraction_breaks = _weights_to_breaks(effective_fraction_weights)
-            pieces_wgs84 = _subdivide_polygon_weighted(parent_metric, effective_fraction_weights, orientation_deg)
+            pieces_wgs84 = _subdivide_polygon_weighted(working_metric, effective_fraction_weights, orientation_deg)
         else:
             normalized_custom_areas = _normalize_fraction_weights(custom_areas_m2)
             if resolved_count is not None and resolved_count >= 2 and len(normalized_custom_areas) != resolved_count:
@@ -1810,26 +2077,26 @@ def _compute_subdivision_payload(
 
             allocated_sum = float(sum(normalized_custom_areas))
             tolerance_m2 = 0.01
-            if allocated_sum > total_area_m2 + tolerance_m2:
+            if allocated_sum > working_area_m2 + tolerance_m2:
                 raise HTTPException(
                     status_code=400,
                     detail=(
-                        "Custom areas exceed mother parcel area by "
-                        f"{allocated_sum - total_area_m2:.2f} sqm. Reduce allocations."
+                        "Custom areas exceed the available parcel area by "
+                        f"{allocated_sum - working_area_m2:.2f} sqm. Reduce allocations."
                     ),
                 )
-            if allocated_sum < total_area_m2 - tolerance_m2:
+            if allocated_sum < working_area_m2 - tolerance_m2:
                 raise HTTPException(
                     status_code=400,
                     detail=(
-                        "Custom areas do not fully allocate mother parcel. Remaining "
-                        f"{total_area_m2 - allocated_sum:.2f} sqm. Adjust allocations to match total area."
+                        "Custom areas do not fully allocate the available parcel area. Remaining "
+                        f"{working_area_m2 - allocated_sum:.2f} sqm. Adjust allocations to match total area."
                     ),
                 )
 
             resolved_count = min(len(normalized_custom_areas), 500)
             effective_custom_areas_m2 = normalized_custom_areas[:resolved_count]
-            pieces_wgs84 = _subdivide_polygon_weighted(parent_metric, effective_custom_areas_m2, orientation_deg)
+            pieces_wgs84 = _subdivide_polygon_weighted(working_metric, effective_custom_areas_m2, orientation_deg)
 
     resolved_count = min(int(resolved_count or 2), 500)
     gdf_out = gpd.GeoDataFrame(geometry=pieces_wgs84, crs=f"EPSG:{metric_epsg}").to_crs(epsg=4326)
@@ -1872,6 +2139,21 @@ def _compute_subdivision_payload(
         ],
     }
 
+    def _to_wgs84_geojson(geom_metric):
+        # geom_metric may be a Polygon or MultiPolygon (a road split into two reserve strips,
+        # several disjoint dimension-tiling leftover slivers) - mapping() handles either directly
+        # rather than forcing it through the single-polygon-only helpers used for actual lots.
+        if geom_metric is None or geom_metric.is_empty:
+            return None, None
+        try:
+            geom_wgs84 = gpd.GeoSeries([geom_metric], crs=f"EPSG:{metric_epsg}").to_crs(epsg=4326).iloc[0]
+        except Exception:
+            return None, None
+        return {"type": "Feature", "properties": {}, "geometry": mapping(geom_wgs84)}, round(float(geom_metric.area), 2)
+
+    excluded_geojson, excluded_area_m2 = _to_wgs84_geojson(excluded_geom_metric)
+    leftover_geojson, leftover_area_m2 = _to_wgs84_geojson(leftover_metric)
+
     return {
         "parent_plot_id": int(parent_plot_id),
         "method": method_key,
@@ -1882,6 +2164,15 @@ def _compute_subdivision_payload(
         "fraction_weights": [round(float(w), 6) for w in effective_fraction_weights] if effective_fraction_weights else None,
         "fraction_breaks": [round(float(v), 6) for v in effective_fraction_breaks] if effective_fraction_breaks else None,
         "custom_areas_m2": [round(float(v), 4) for v in effective_custom_areas_m2] if effective_custom_areas_m2 else None,
+        "lot_width_m": round(float(lot_width_m), 4) if lot_width_m else None,
+        "lot_height_m": round(float(lot_height_m), 4) if lot_height_m else None,
+        "dimension_unit": unit_key if lot_width_m else None,
+        "exclude_road": bool(exclude_road),
+        "road_width_m": round(float(road_width_m), 2) if exclude_road else None,
+        "excluded_geojson": excluded_geojson,
+        "excluded_area_m2": excluded_area_m2,
+        "leftover_geojson": leftover_geojson,
+        "leftover_area_m2": leftover_area_m2,
         "resolved_count": len(plots),
         "total_area_m2": round(total_area_m2, 2),
         "derived_total_area_m2": round(derived_total, 2),
@@ -3195,6 +3486,11 @@ def preview_plot_subdivision(
     fraction_breaks: list[float] | None = Body(None),
     custom_areas_m2: list[float] | None = Body(None),
     lot_names: list[str] | None = Body(None),
+    exclude_road: bool = Body(False),
+    road_width_m: float = Body(10.0),
+    lot_width: float | None = Body(None),
+    lot_height: float | None = Body(None),
+    dimension_unit: str = Body("m"),
 ):
     parent_geom_wgs84 = _load_plot_polygon_wgs84(db, plot_id)
     payload = _compute_subdivision_payload(
@@ -3209,6 +3505,11 @@ def preview_plot_subdivision(
         fraction_breaks=fraction_breaks,
         custom_areas_m2=custom_areas_m2,
         lot_names=lot_names,
+        exclude_road=exclude_road,
+        road_width_m=road_width_m,
+        lot_width=lot_width,
+        lot_height=lot_height,
+        dimension_unit=dimension_unit,
     )
     payload["estate_name"] = str(estate_name or "").strip()
     return payload
@@ -3231,6 +3532,11 @@ def apply_plot_subdivision(
     custom_areas_m2: list[float] | None = Body(None),
     lot_names: list[str] | None = Body(None),
     include_feature_detection: bool = Body(False),
+    exclude_road: bool = Body(False),
+    road_width_m: float = Body(10.0),
+    lot_width: float | None = Body(None),
+    lot_height: float | None = Body(None),
+    dimension_unit: str = Body("m"),
 ):
     parent_geom_wgs84 = _load_plot_polygon_wgs84(db, plot_id)
     safe_estate_name = str(estate_name or "").strip()
@@ -3246,6 +3552,11 @@ def apply_plot_subdivision(
         fraction_breaks=fraction_breaks,
         custom_areas_m2=custom_areas_m2,
         lot_names=lot_names,
+        exclude_road=exclude_road,
+        road_width_m=road_width_m,
+        lot_width=lot_width,
+        lot_height=lot_height,
+        dimension_unit=dimension_unit,
     )
     parent_meta = get_plot_meta(db, plot_id)
 
@@ -3269,11 +3580,16 @@ def apply_plot_subdivision(
             """
             INSERT INTO plot_subdivision_batches (
                 parent_plot_id, estate_name, method, requested_count, target_area_m2,
-                orientation_deg, generated_count, total_area_m2, status
+                orientation_deg, generated_count, total_area_m2, status,
+                exclude_road, road_width_m, lot_width_m, lot_height_m, dimension_unit,
+                leftover_area_m2, excluded_area_m2, leftover_geojson, excluded_geojson
             )
             VALUES (
                 :parent_plot_id, :estate_name, :method, :requested_count, :target_area_m2,
-                :orientation_deg, 0, 0, 'processing'
+                :orientation_deg, 0, 0, 'processing',
+                :exclude_road, :road_width_m, :lot_width_m, :lot_height_m, :dimension_unit,
+                :leftover_area_m2, :excluded_area_m2,
+                CAST(:leftover_geojson AS JSONB), CAST(:excluded_geojson AS JSONB)
             )
             RETURNING id
             """
@@ -3285,6 +3601,15 @@ def apply_plot_subdivision(
             "requested_count": payload.get("requested_count"),
             "target_area_m2": payload.get("target_area_m2"),
             "orientation_deg": payload.get("orientation_deg") or 0.0,
+            "exclude_road": bool(payload.get("exclude_road")),
+            "road_width_m": payload.get("road_width_m"),
+            "lot_width_m": payload.get("lot_width_m"),
+            "lot_height_m": payload.get("lot_height_m"),
+            "dimension_unit": payload.get("dimension_unit"),
+            "leftover_area_m2": payload.get("leftover_area_m2"),
+            "excluded_area_m2": payload.get("excluded_area_m2"),
+            "leftover_geojson": json.dumps(payload.get("leftover_geojson")) if payload.get("leftover_geojson") else None,
+            "excluded_geojson": json.dumps(payload.get("excluded_geojson")) if payload.get("excluded_geojson") else None,
         },
     ).scalar()
     if batch_id is None:

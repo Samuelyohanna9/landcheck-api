@@ -1687,7 +1687,7 @@ def annotate_vertices(
         distance_line = f"{dist:.2f}m"
         label_text = f"{bearing_line}\n{distance_line}" if first_line_is_outside else f"{distance_line}\n{bearing_line}"
 
-        place_text(
+        placed = place_text(
             mx,
             my,
             label_text,
@@ -1703,67 +1703,132 @@ def annotate_vertices(
             allow_center=not fence_edge,
             font_family=bearing_font,
         )
+        if not placed:
+            skipped.append(
+                {
+                    "from": label,
+                    "to": next_label,
+                    "bearing": bearing,
+                    "distance": dist,
+                }
+            )
 
     return skipped, placed_boxes
 
 
-def draw_skipped_table(ax, entries, font_scale=1.0, poly=None):
+def draw_skipped_table(ax, entries, font_scale=1.0, poly=None, avoid_boxes=None):
     if not entries:
         return
 
-    max_rows = 8
-    entries = entries[:max_rows]
-
     header = ["From", "To", "Bearing", "Dist (m)"]
-    cell_text = [
-        [
-            e["from"],
-            e["to"],
-            format_bearing_dms(e["bearing"]),
-            f"{e['distance']:.2f}",
-        ]
-        for e in entries
-    ]
 
-    table_w, table_h = 0.36, 0.18
+    # A hard 8-row cap used to just silently drop every station beyond the 8th - on a plot with
+    # many closely spaced vertices (a curved frontage, a many-sided parcel) most of the boundary
+    # schedule vanished instead of being shown anywhere. Instead keep every entry and grow the
+    # table sideways into extra "newspaper" column-groups (repeating the header) once a single
+    # column would run past a comfortable height, rather than truncating the data.
+    row_h = 0.026
+    max_col_h = 0.5  # fraction of the axes height a single column of rows may occupy
+    rows_per_group = max(4, int(max_col_h / row_h) - 1)
+    num_groups = max(1, math.ceil(len(entries) / rows_per_group))
+    rows_this_group = math.ceil(len(entries) / num_groups)
+
+    group_w = 0.34
+    table_w = min(0.94, group_w * num_groups)
+    group_w = table_w / num_groups
+    table_h = (rows_this_group + 1) * row_h
+
+    cell_text = []
+    for row_i in range(rows_this_group):
+        row_cells = []
+        for group_i in range(num_groups):
+            idx = group_i * rows_this_group + row_i
+            if idx < len(entries):
+                e = entries[idx]
+                row_cells.extend([e["from"], e["to"], format_bearing_dms(e["bearing"]), f"{e['distance']:.2f}"])
+            else:
+                row_cells.extend(["", "", "", ""])
+        cell_text.append(row_cells)
+    full_header = header * num_groups
+
     # A fixed corner can land right on top of the boundary/points depending on the plot's shape
     # and orientation - so pick whichever of the 4 axes corners has the least (ideally zero)
     # overlap with the plot's own footprint, rather than always defaulting to bottom-right.
     candidates = [
-        (0.62, 0.02), (0.02, 0.02), (0.62, 0.80), (0.02, 0.80),
+        (max(0.0, 0.98 - table_w), 0.02),
+        (0.02, 0.02),
+        (max(0.0, 0.98 - table_w), max(0.02, 0.98 - table_h)),
+        (0.02, max(0.02, 0.98 - table_h)),
     ]
     bbox_xy = candidates[0]
-    if poly is not None:
+    if poly is not None or avoid_boxes:
         try:
             xmin, xmax = ax.get_xlim()
             ymin, ymax = ax.get_ylim()
             x_span = max(xmax - xmin, 1e-9)
             y_span = max(ymax - ymin, 1e-9)
-            poly_minx, poly_miny, poly_maxx, poly_maxy = poly.bounds
-            frac_minx = (poly_minx - xmin) / x_span
-            frac_maxx = (poly_maxx - xmin) / x_span
-            frac_miny = (poly_miny - ymin) / y_span
-            frac_maxy = (poly_maxy - ymin) / y_span
+            normalized_avoid_boxes = []
+            if poly is not None:
+                poly_minx, poly_miny, poly_maxx, poly_maxy = poly.bounds
+                normalized_avoid_boxes.append(
+                    (
+                        (poly_minx - xmin) / x_span,
+                        (poly_miny - ymin) / y_span,
+                        (poly_maxx - xmin) / x_span,
+                        (poly_maxy - ymin) / y_span,
+                    )
+                )
+            for box in avoid_boxes or []:
+                bx0, by0, bx1, by1 = box
+                normalized_avoid_boxes.append(
+                    (
+                        (bx0 - xmin) / x_span,
+                        (by0 - ymin) / y_span,
+                        (bx1 - xmin) / x_span,
+                        (by1 - ymin) / y_span,
+                    )
+                )
             margin = 0.02
 
             def overlap_area(cx, cy):
-                ox0, ox1 = max(cx, frac_minx - margin), min(cx + table_w, frac_maxx + margin)
-                oy0, oy1 = max(cy, frac_miny - margin), min(cy + table_h, frac_maxy + margin)
-                return max(0.0, ox1 - ox0) * max(0.0, oy1 - oy0)
+                total = 0.0
+                for frac_minx, frac_miny, frac_maxx, frac_maxy in normalized_avoid_boxes:
+                    ox0, ox1 = max(cx, frac_minx - margin), min(cx + table_w, frac_maxx + margin)
+                    oy0, oy1 = max(cy, frac_miny - margin), min(cy + table_h, frac_maxy + margin)
+                    total += max(0.0, ox1 - ox0) * max(0.0, oy1 - oy0)
+                return total
 
             bbox_xy = min(candidates, key=lambda c: overlap_area(*c))
         except Exception:
             bbox_xy = candidates[0]
 
+    # An opaque backdrop behind the table keeps it legible even in the worst case (a densely
+    # vertexed plot that fills the whole frame, so every corner still has some overlap) - without
+    # this the grid/boundary/labels underneath would show straight through the table's own
+    # transparent cells instead of the table reading as a clean, separate panel.
+    pad = 0.008
+    ax.add_patch(patches.Rectangle(
+        (bbox_xy[0] - pad, bbox_xy[1] - pad),
+        table_w + 2 * pad,
+        table_h + 2 * pad,
+        transform=ax.transAxes,
+        facecolor="white",
+        edgecolor="#333333",
+        lw=0.6,
+        zorder=90,
+        clip_on=False,
+    ))
+
     table = ax.table(
         cellText=cell_text,
-        colLabels=header,
+        colLabels=full_header,
         cellLoc="center",
         colLoc="center",
         bbox=[bbox_xy[0], bbox_xy[1], table_w, table_h],
     )
     table.auto_set_font_size(False)
     table.set_fontsize(max(5, int(6 * font_scale)))
+    table.set_zorder(91)
     for (row, col), cell in table.get_celld().items():
         if row == 0:
             cell.set_text_props(weight="bold")
@@ -3318,7 +3383,7 @@ def _render_plot_map_layout_adamawa(
     # actually has access to.
     min_label_mm = 12
     min_label_length_m = (min_label_mm / 1000.0) * scale_ratio
-    skipped_entries, _boundary_label_boxes = annotate_vertices(
+    skipped_entries, boundary_label_boxes = annotate_vertices(
         ax,
         poly,
         plot_id,
@@ -3340,7 +3405,7 @@ def _render_plot_map_layout_adamawa(
     # every bearing/distance label to fit inline - see the site_plan template's identical addition
     # for why (annotate_vertices always computed which labels got skipped; this template just
     # never drew the table those escape to).
-    draw_skipped_table(ax, skipped_entries, font_scale, poly=poly)
+    draw_skipped_table(ax, skipped_entries, font_scale, poly=poly, avoid_boxes=boundary_label_boxes)
     area_label_point = None
     try:
         # Prefer an interior visual center for label placement.
@@ -4284,7 +4349,7 @@ def _render_plot_map_layout_cadastral(
     # triggers annotate_vertices' skip-to-table behavior for tightly packed vertices.
     min_label_mm = 12
     min_label_length_m = (min_label_mm / 1000.0) * scale_ratio
-    skipped_entries, _boundary_label_boxes = annotate_vertices(
+    skipped_entries, boundary_label_boxes = annotate_vertices(
         ax,
         poly,
         plot_id,
@@ -4306,7 +4371,7 @@ def _render_plot_map_layout_cadastral(
     # every bearing/distance label to fit inline - see the site_plan template's identical addition
     # for why (annotate_vertices always computed which labels got skipped; this template just
     # never drew the table those escape to).
-    draw_skipped_table(ax, skipped_entries, font_scale, poly=poly)
+    draw_skipped_table(ax, skipped_entries, font_scale, poly=poly, avoid_boxes=boundary_label_boxes)
 
     span_x = max(abs(target_xlim[1] - target_xlim[0]), 1.0)
     span_y = max(abs(target_ylim[1] - target_ylim[0]), 1.0)
@@ -4896,7 +4961,7 @@ def _render_plot_map_layout_fct(
     # triggers annotate_vertices' skip-to-table behavior for tightly packed vertices.
     min_label_mm = 12
     min_label_length_m = (min_label_mm / 1000.0) * scale_ratio
-    skipped_entries, _boundary_label_boxes = annotate_vertices(
+    skipped_entries, boundary_label_boxes = annotate_vertices(
         ax,
         poly,
         plot_id,
@@ -4918,7 +4983,7 @@ def _render_plot_map_layout_fct(
     # every bearing/distance label to fit inline - see the site_plan template's identical addition
     # for why (annotate_vertices always computed which labels got skipped; this template just
     # never drew the table those escape to).
-    draw_skipped_table(ax, skipped_entries, font_scale, poly=poly)
+    draw_skipped_table(ax, skipped_entries, font_scale, poly=poly, avoid_boxes=boundary_label_boxes)
 
     area_label_point = None
     try:
@@ -5603,7 +5668,7 @@ def _render_plot_map_layout_site_plan(
     # got skipped to avoid overlap - this template just never drew the table those escape to,
     # which for a dense/many-sided boundary meant crowded/overlapping labels with no legible
     # fallback for the ones that didn't fit).
-    draw_skipped_table(ax, skipped_entries, font_scale, poly=poly)
+    draw_skipped_table(ax, skipped_entries, font_scale, poly=poly, avoid_boxes=boundary_label_boxes)
 
     axes_box = ax.get_position()
     # A touch right of the map/photo panels' shared right edge (both are map_width wide) so the
@@ -6361,7 +6426,7 @@ def render_plot_map_layout(
         bearing_font=bearing_font,
         bearing_size=bearing_size,
     )
-    draw_skipped_table(ax, skipped_entries, font_scale, poly=poly)
+    draw_skipped_table(ax, skipped_entries, font_scale, poly=poly, avoid_boxes=boundary_label_boxes)
 
     # Road/river names (optional). Follow the path's own direction; keep clear of boundary labels.
     major_classes = {
