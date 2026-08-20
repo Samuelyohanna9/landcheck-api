@@ -1377,7 +1377,7 @@ def draw_coordinate_frame(
     # Add first point coordinates text to the LEFT of the grid frame (to avoid scale bar overlap)
     if first_point_info:
         station_name, easting, northing = first_point_info
-        coord_text = f"{station_name}: {easting:.2f}E, {northing:.2f}N"
+        coord_text = f"{station_name}: {easting:.3f}E, {northing:.3f}N"
         ax.text(
             xmin,
             ymin - pad * 2.0,
@@ -4608,8 +4608,8 @@ def _draw_fct_note_box(
     lines = [
         f"FULL BEACON NUMBER {full_beacon_text}",
         f"COORDINATES OF {short_name}",
-        f"N. {northing_m:,.2f}",
-        f"E. {easting_m:,.2f}",
+        f"N. {northing_m:,.3f}",
+        f"E. {easting_m:,.3f}",
         f"COORDINATE SYSTEM {_resolve_fct_coordinate_system_text(display_epsg)}",
     ]
     for ln in lines:
@@ -5310,7 +5310,7 @@ def _draw_site_plan_footer(
     )
     fig.text(
         0.06, y_top - 0.044,
-        f"{_safe_text(first_station_name, 'TP1')}:{first_easting_m:010.2f}Em,{first_northing_m:010.2f}Nm",
+        f"{_safe_text(first_station_name, 'TP1')}:{first_easting_m:011.3f}Em,{first_northing_m:011.3f}Nm",
         fontsize=fs, color=grid_color, fontfamily=SITE_PLAN_FONT_FAMILY,
     )
 
