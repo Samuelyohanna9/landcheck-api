@@ -388,7 +388,8 @@ def draw_footer(fig, crs_text, source_text, surveyor, rank, font_scale=1.0, text
     for idx, line in enumerate(crs_lines):
         fig.text(0.06, y_bot - idx * crs_line_step, line, fontsize=crs_fontsize, color="blue")
 
-    fig.text(0.94, y_bot_source, str(source_text), fontsize=int(8*font_scale), ha="right", color=text_color)
+    if source_text:
+        fig.text(0.94, y_bot_source, str(source_text), fontsize=int(8*font_scale), ha="right", color=text_color)
 
 
 def _draw_figure_text_justified(fig, x, y, text, width_fig, fontsize, fontweight="normal"):
@@ -5728,7 +5729,7 @@ def render_plot_map_layout(
     state_text: str = "STATE",
     scale_text: str = "1 : 1000",
     crs_footer_text: str = "ORIGIN: WGS84",
-    source_footer_text: str = "SOURCE: LandCheck",
+    source_footer_text: str = "",
     surveyor_name: str = "SURV",
     surveyor_rank: str = "RANK",
     certification_statement: str | None = None,
