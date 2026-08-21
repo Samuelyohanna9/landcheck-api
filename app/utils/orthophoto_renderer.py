@@ -1202,26 +1202,18 @@ def render_orthophoto_png(
                     basemap_loaded = _reject_if_placeholder_basemap(ax)
                 except Exception:
                     pass
-            if not basemap_loaded:
-                try:
-                    ctx.add_basemap(
-                        ax,
-                        source=ctx.providers.OpenStreetMap.Mapnik,
-                        crs=axis_crs,
-                        attribution=False,
-                        zoom=sat_zoom,
-                        reset_extent=True,
-                        timeout=_BASEMAP_FETCH_TIMEOUT,
-                    )
-                    basemap_loaded = _reject_if_placeholder_basemap(ax)
-                except Exception:
-                    basemap_loaded = False
         else:
-        # Use satellite/aerial imagery
+        # Use satellite/aerial imagery. OpenStreetMap Mapnik and CartoDB Light are deliberately
+        # excluded from every fallback here (and below) - they're street/vector basemaps, not
+        # aerial photography, so even a "successful" fetch from either would be the wrong content
+        # for a panel that must show real satellite imagery. Showing the honest "temporarily
+        # unavailable" message is correct when no real aerial source responds; substituting a
+        # street map never is. This also sidesteps OSM's tile usage policy, which blocks
+        # server-side bulk/automated fetching without the app-registration this never had -
+        # confirmed in production as OSM returning its own "403 Access blocked" tile-usage-policy
+        # graphic, itself another provider-side "placeholder" that just isn't a flat color.
             basemap_sources = [
                 ("Esri WorldImagery", "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}"),
-                ("OpenStreetMap", "https://tile.openstreetmap.org/{z}/{x}/{y}.png"),
-                ("CartoDB Light", "https://basemaps.cartocdn.com/light_all/{z}/{x}/{y}.png"),
             ]
 
             # Mapbox Satellite first when configured - denser high-res (30-50cm) coverage in
@@ -1260,23 +1252,6 @@ def render_orthophoto_png(
                         print("Esri WorldImagery returned a placeholder tile, not real imagery")
                 except Exception as e:
                     print(f"Esri WorldImagery failed: {e}")
-
-            if not basemap_loaded:
-                try:
-                    ctx.add_basemap(
-                        ax,
-                        source=ctx.providers.OpenStreetMap.Mapnik,
-                        crs=axis_crs,
-                        attribution=False,
-                        zoom=sat_zoom,
-                        reset_extent=True,
-                        timeout=_BASEMAP_FETCH_TIMEOUT,
-                    )
-                    basemap_loaded = _reject_if_placeholder_basemap(ax)
-                    if not basemap_loaded:
-                        print("OpenStreetMap returned a placeholder tile, not real imagery")
-                except Exception as e:
-                    print(f"OpenStreetMap failed: {e}")
 
             if not basemap_loaded:
                 # Try URL-based approach as last resort

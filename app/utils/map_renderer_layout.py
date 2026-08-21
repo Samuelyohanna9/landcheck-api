@@ -5181,16 +5181,13 @@ def _draw_site_plan_photo_inset(
             basemap_loaded = _reject_if_placeholder_basemap(ax_photo)
         except Exception:
             pass
-    if not basemap_loaded:
-        try:
-            ctx.add_basemap(
-                ax_photo, source=ctx.providers.OpenStreetMap.Mapnik, crs=axis_crs, attribution=False,
-                zoom=sat_zoom, reset_extent=True, timeout=inset_fetch_timeout,
-            )
-            basemap_loaded = _reject_if_placeholder_basemap(ax_photo)
-        except Exception:
-            pass
-
+    # No further fallback to OpenStreetMap Mapnik here - it's a street/vector basemap, not aerial
+    # photography, so even a "successful" fetch would be the wrong content for a panel labelled as
+    # imagery. Confirmed in production as the actual failure mode behind this: OSM's tile servers
+    # returning their own "403 Access blocked" tile-usage-policy graphic (a real image, not a flat
+    # placeholder, so _reject_if_placeholder_basemap doesn't catch it either) composited in as if
+    # it were the plot's satellite imagery. The honest "temporarily unavailable" message below is
+    # correct whenever no real aerial source responds - never substitute a street map for it.
     if not basemap_loaded:
         # Same honest-failure treatment as the standalone Orthophoto export (orthophoto_renderer.py)
         # - this inset previously just left the panel blank (boundary on white) with no indication
