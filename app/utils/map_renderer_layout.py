@@ -1144,7 +1144,7 @@ def _nice_scalebar_length_m(target_m: float) -> float:
 
 
 def add_scalebar(ax, length_m: float, segments: int = 4, font_scale=1.0):
-    x0, y0, bar_h = 0.225, -0.15, 0.012
+    y0, bar_h = -0.15, 0.012
     # total_w (the bar's actual drawn width, in axes-fraction) must be derived from the axes' real
     # ground-distance span (set by apply_true_scale to genuinely match the printed "SCALE 1:N"
     # ratio) - previously this was a fixed 0.55 regardless of scale_ratio, so the printed tick
@@ -1158,9 +1158,11 @@ def add_scalebar(ax, length_m: float, segments: int = 4, font_scale=1.0):
     if not (0.15 <= frac <= 0.65):
         length_m = _nice_scalebar_length_m(axes_ground_width_m * 0.40)
         frac = length_m / axes_ground_width_m
-    # x0 = 0.225, so total_w must stay well under 0.75 (0.225 + 0.75 = 1.0) to keep the bar - and
-    # its end-value label - from running past the axes' right edge.
     total_w = max(0.05, min(0.65, frac))
+    # Centered under the map rather than anchored to a fixed left offset - the bar's width now
+    # varies with the map's real scale/extent (see above), so a fixed x0 would only look centered
+    # by coincidence at whichever width it was originally tuned for.
+    x0 = 0.5 - total_w / 2.0
     seg_w = total_w / float(segments)
 
     for i in range(segments):
