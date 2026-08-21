@@ -677,10 +677,7 @@ def draw_sheet_frame(fig, font_scale=1.0):
                                      transform=fig.transFigure, fill=False, lw=0.8*font_scale, zorder=10))
 
 
-def draw_title_block(fig, title_text, plot_id, scale_text, location, lga, state, font_scale=1.0):
-    # Plot number at top right corner for identification
-    fig.text(0.94, 0.95, f"Plot #{plot_id}", ha="right", fontsize=int(8*font_scale), weight="bold",)
-    
+def draw_title_block(fig, title_text, scale_text, location, lga, state, font_scale=1.0):
     y = 0.955
     fig.text(0.5, y, title_text, ha="center", fontsize=int(12*font_scale), weight="bold")
     fig.text(0.5, y-0.030, f"LOCATED AT: {location}", ha="center", fontsize=int(9*font_scale))
@@ -917,10 +914,42 @@ def choose_scalebar_length(scale_ratio):
     return 500
 
 
+def _nice_scalebar_length_m(target_m: float) -> float:
+    """Round `target_m` down to a cartographically "nice" number (1/2/2.5/5 x 10^n) so a scale
+    bar's printed end value reads naturally (e.g. "200m", not "173m")."""
+    if target_m <= 0:
+        return 1.0
+    magnitude = 10 ** math.floor(math.log10(target_m))
+    nice = magnitude
+    for mult in (1, 2, 2.5, 5, 10):
+        candidate = mult * magnitude
+        if candidate <= target_m:
+            nice = candidate
+        else:
+            break
+    return nice
+
+
 def add_scalebar(ax, length_m, segments=4, font_scale=1.0):
     trans = ax.transAxes
     x0, y0, bar_h = 0.32, -0.12, 0.018
-    seg = 0.25 / segments
+
+    # The bar's drawn width must be derived from the axes' real ground-distance span (set to the
+    # true "SCALE 1:N" ratio earlier in the render), not a fixed fraction of the panel - otherwise
+    # the printed tick labels (e.g. "0 50 100 150 200m") describe a distance the bar's actual
+    # length on the page has no real relationship to, which is a placeholder wearing a scale bar's
+    # clothes, not an actual graphical scale. `length_m` from choose_scalebar_length is a starting
+    # suggestion, corrected here if it would draw off the page or shrink to an illegible sliver.
+    xlim = ax.get_xlim()
+    axes_ground_width_m = abs(xlim[1] - xlim[0]) or 1.0
+    frac = length_m / axes_ground_width_m
+    if not (0.15 <= frac <= 0.55):
+        length_m = _nice_scalebar_length_m(axes_ground_width_m * 0.35)
+        frac = length_m / axes_ground_width_m
+    # x0 = 0.32, so bar_w must stay well under 0.68 (0.32 + 0.68 = 1.0) to keep the bar - and its
+    # end-value label - from running past the axes' right edge.
+    bar_w = max(0.05, min(0.55, frac))
+    seg = bar_w / segments
 
     for i in range(segments):
         face = "black" if i % 2 == 0 else "white"
@@ -930,7 +959,7 @@ def add_scalebar(ax, length_m, segments=4, font_scale=1.0):
         ))
 
     ax.add_patch(patches.Rectangle(
-        (x0, y0), 0.25, bar_h,
+        (x0, y0), bar_w, bar_h,
         transform=trans, fill=False, edgecolor="black", lw=1.2*font_scale, clip_on=False, zorder=16
     ))
 
@@ -938,7 +967,7 @@ def add_scalebar(ax, length_m, segments=4, font_scale=1.0):
     for i in range(1, segments + 1):
         ax.text(x0 + i * seg, y0 - 0.04, f"{int(length_m * i / segments)}",
                 transform=trans, ha="center", fontsize=int(8*font_scale))
-    ax.text(x0 + 0.125, y0 + bar_h + 0.02, "meters", transform=trans, ha="center", fontsize=int(8*font_scale))
+    ax.text(x0 + bar_w / 2.0, y0 + bar_h + 0.02, "meters", transform=trans, ha="center", fontsize=int(8*font_scale))
 
 
 def draw_grid(ax, minor, major, font_scale=1.0):
@@ -1307,7 +1336,7 @@ def render_orthophoto_png(
     annotate_vertices_orthophoto(ax, poly, station_names, font_scale, scale_ratio=effective_scale_ratio)
 
     draw_sheet_frame(fig, font_scale)
-    draw_title_block(fig, title_text, plot_id, scale_text_for_layout, location_text, lga_text, state_text, font_scale)
+    draw_title_block(fig, title_text, scale_text_for_layout, location_text, lga_text, state_text, font_scale)
     # The topo map's elevation legend already occupies the bottom-right corner where the source
     # line used to sit, and the GEE/user-data distinction is already conveyed there - so skip it
     # for topo maps specifically rather than crowding the new legend. Orthophoto keeps its source line.

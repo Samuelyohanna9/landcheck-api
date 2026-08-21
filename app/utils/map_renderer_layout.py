@@ -345,14 +345,11 @@ def draw_sheet_frame(fig):
 
 
 def draw_title_block(
-    fig, title_text, plot_id, area_m2, scale_text, location_text, lga_text, state_text, font_scale=1.0,
+    fig, title_text, area_m2, scale_text, location_text, lga_text, state_text, font_scale=1.0,
     title_font: str | None = None, title_size: int | None = None,
     area_font: str | None = None, area_size: int | None = None,
     text_color: str = "black",
 ):
-    # Plot number at top right corner for identification
-    fig.text(0.94, 0.95, f"Plot #{plot_id}", ha="right", fontsize=int(8*font_scale), weight="bold", color=text_color)
-
     y = 0.955
     fig.text(
         0.5, y, str(title_text), ha="center", fontsize=title_size if title_size else int(12*font_scale), weight="bold",
@@ -1130,9 +1127,40 @@ def add_north_arrow(
     )
 
 
+def _nice_scalebar_length_m(target_m: float) -> float:
+    """Round `target_m` down to a cartographically "nice" number (1/2/2.5/5 x 10^n) so a scale
+    bar's printed end value reads naturally (e.g. "200m", not "173m")."""
+    if target_m <= 0:
+        return 1.0
+    magnitude = 10 ** math.floor(math.log10(target_m))
+    nice = magnitude
+    for mult in (1, 2, 2.5, 5, 10):
+        candidate = mult * magnitude
+        if candidate <= target_m:
+            nice = candidate
+        else:
+            break
+    return nice
+
+
 def add_scalebar(ax, length_m: float, segments: int = 4, font_scale=1.0):
-    # Keep your current fixed position in axes coordinates
-    x0, y0, bar_h, total_w = 0.225, -0.15, 0.012, 0.55
+    x0, y0, bar_h = 0.225, -0.15, 0.012
+    # total_w (the bar's actual drawn width, in axes-fraction) must be derived from the axes' real
+    # ground-distance span (set by apply_true_scale to genuinely match the printed "SCALE 1:N"
+    # ratio) - previously this was a fixed 0.55 regardless of scale_ratio, so the printed tick
+    # labels (e.g. "0 125 250 375 500m") described a distance the bar's actual length on the page
+    # had no real relationship to: a placeholder wearing a scale bar's clothes, not an actual
+    # graphical scale. `length_m` is a starting suggestion from the caller, corrected here if it
+    # would draw off the page or shrink to an illegible sliver at this particular map's extent.
+    xlim = ax.get_xlim()
+    axes_ground_width_m = abs(xlim[1] - xlim[0]) or 1.0
+    frac = length_m / axes_ground_width_m
+    if not (0.15 <= frac <= 0.65):
+        length_m = _nice_scalebar_length_m(axes_ground_width_m * 0.40)
+        frac = length_m / axes_ground_width_m
+    # x0 = 0.225, so total_w must stay well under 0.75 (0.225 + 0.75 = 1.0) to keep the bar - and
+    # its end-value label - from running past the axes' right edge.
+    total_w = max(0.05, min(0.65, frac))
     seg_w = total_w / float(segments)
 
     for i in range(segments):
@@ -6164,7 +6192,7 @@ def render_plot_map_layout(
 
     draw_sheet_frame(fig)
     draw_title_block(
-        fig, title_text, plot_id, area_m2, resolved_scale_text, location_text, lga_text, state_text, font_scale,
+        fig, title_text, area_m2, resolved_scale_text, location_text, lga_text, state_text, font_scale,
         title_font=title_font, title_size=title_size, area_font=area_font, area_size=area_size,
         text_color=text_color,
     )
