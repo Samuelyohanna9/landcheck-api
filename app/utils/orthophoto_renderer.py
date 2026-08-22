@@ -678,24 +678,69 @@ def draw_sheet_frame(fig, font_scale=1.0):
 
 
 def draw_title_block(fig, title_text, scale_text, location, lga, state, font_scale=1.0):
+    # Imported lazily: map_renderer_layout imports FROM this module at its own top level, so a
+    # module-level import here would be circular.
+    from app.utils.map_renderer_layout import _wrap_figure_text
+
     y = 0.955
-    fig.text(0.5, y, title_text, ha="center", fontsize=int(12*font_scale), weight="bold")
-    fig.text(0.5, y-0.030, f"LOCATED AT: {location}", ha="center", fontsize=int(9*font_scale))
-    fig.text(0.5, y-0.050, lga, ha="center", fontsize=int(9*font_scale))
-    fig.text(0.5, y-0.070, state, ha="center", fontsize=int(9*font_scale))
-    fig.text(0.5, y-0.100, f"SCALE {scale_text}", ha="center", fontsize=int(9*font_scale))
+    title_fs = int(12*font_scale)
+    # Wrapped, not a single fig.text() call - an unwrapped long title (a lengthy institutional
+    # applicant name, a "total land area of ..." style description, etc.) used to run straight off
+    # both edges of the page instead of onto a second/third line, since matplotlib's ha="center"
+    # only centers text - it never wraps or shrinks it to fit the sheet.
+    title_lines = _wrap_figure_text(fig, str(title_text), width_fig=0.86, fontsize=title_fs, fontweight="bold") or [str(title_text)]
+    title_line_h = 0.026
+    for line_text in title_lines:
+        fig.text(0.5, y, line_text, ha="center", fontsize=title_fs, weight="bold")
+        y -= title_line_h
+    # A title that wrapped onto more than one line pushes everything below down by the same extra
+    # amount; a title that still fits on one line reproduces the exact original spacing.
+    y -= (0.030 - title_line_h)
+    fig.text(0.5, y, f"LOCATED AT: {location}", ha="center", fontsize=int(9*font_scale))
+    y -= 0.020
+    fig.text(0.5, y, lga, ha="center", fontsize=int(9*font_scale))
+    y -= 0.020
+    fig.text(0.5, y, state, ha="center", fontsize=int(9*font_scale))
+    y -= 0.030
+    fig.text(0.5, y, f"SCALE {scale_text}", ha="center", fontsize=int(9*font_scale))
 
 
 def draw_footer(fig, crs, source, surveyor, rank, font_scale=1.0):
-    y = 0.155
+    # Imported lazily: map_renderer_layout imports FROM this module at its own top level, so a
+    # module-level import here would be circular.
+    from app.utils.map_renderer_layout import _wrap_figure_text
+
+    y_top = 0.155
+    y_bot = 0.05
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
-    fig.text(0.05, y, f"SURVEYOR: {surveyor}", fontsize=int(8*font_scale))
-    fig.text(0.05, y-0.018, f"RANK: {rank}", fontsize=int(8*font_scale))
-    fig.text(0.05, y-0.036, "SIGNATURE: ____________________", fontsize=int(8*font_scale))
-    fig.text(0.05, y-0.054, f"DATE PRINTED: {now}", fontsize=int(8*font_scale))
-    fig.text(0.05, 0.05, crs, fontsize=int(7*font_scale), color="blue")
+
+    # Wrapped, capped at 2 lines, and RANK/SIGNATURE/DATE PRINTED stepped tighter when it wraps -
+    # a long or multi-surveyor name ("A and B") drawn as one unwrapped line here could otherwise
+    # run into the KEY box (_draw_topo_features draws it via the shared draw_key_box, whose left
+    # edge sits at x=0.35).
+    surveyor_fontsize = int(8*font_scale)
+    surveyor_lines = _wrap_figure_text(
+        fig, f"SURVEYOR: {surveyor}", width_fig=0.27, fontsize=surveyor_fontsize,
+    ) or [f"SURVEYOR: {surveyor}"]
+    if len(surveyor_lines) > 2:
+        surveyor_lines = surveyor_lines[:2]
+        surveyor_lines[-1] = surveyor_lines[-1].rstrip() + "..."
+
+    total_lines = len(surveyor_lines) + 3  # + RANK, SIGNATURE, DATE PRINTED
+    line_step = min(0.018, (y_top - y_bot - 0.015) / max(1, total_lines - 1))
+
+    y = y_top
+    for line in surveyor_lines:
+        fig.text(0.05, y, line, fontsize=surveyor_fontsize)
+        y -= line_step
+    fig.text(0.05, y, f"RANK: {rank}", fontsize=int(8*font_scale))
+    y -= line_step
+    fig.text(0.05, y, "SIGNATURE: ____________________", fontsize=int(8*font_scale))
+    y -= line_step
+    fig.text(0.05, y, f"DATE PRINTED: {now}", fontsize=int(8*font_scale))
+    fig.text(0.05, y_bot, crs, fontsize=int(7*font_scale), color="blue")
     if source:
-        fig.text(0.95, 0.05, source, fontsize=int(7*font_scale), ha="right")
+        fig.text(0.95, y_bot, source, fontsize=int(7*font_scale), ha="right")
 
 
 def add_north_arrow(ax, font_scale=1.0, style: str = "one_side_stem", color: str = "black"):

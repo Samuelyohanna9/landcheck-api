@@ -351,19 +351,39 @@ def draw_title_block(
     text_color: str = "black",
 ):
     y = 0.955
+    title_fs = title_size if title_size else int(12*font_scale)
+    # Wrapped, not a single fig.text() call - an unwrapped long title (a lengthy institutional
+    # applicant name, a "total land area of ..." style description, etc.) used to run straight off
+    # both edges of the page instead of onto a second/third line, since matplotlib's ha="center"
+    # only centers text - it never wraps or shrinks it to fit the sheet.
+    title_lines = _wrap_figure_text(
+        fig, str(title_text), width_fig=0.86, fontsize=title_fs, fontweight="bold",
+        fontfamily=title_font,
+    ) or [str(title_text)]
+    title_line_h = 0.026
+    for line_text in title_lines:
+        fig.text(
+            0.5, y, line_text, ha="center", fontsize=title_fs, weight="bold", color=text_color,
+            **({"fontfamily": title_font} if title_font else {}),
+        )
+        y -= title_line_h
+    # A title that wrapped onto more than one line pushes everything below down by the same extra
+    # amount, rather than letting LOCATED AT/LGA/STATE/AREA/SCALE collide with line 2+; a title
+    # that still fits on one line reproduces the exact original spacing (y - 0.030 for LOCATED AT).
+    y -= (0.030 - title_line_h)
+    fig.text(0.5, y, f"LOCATED AT: {location_text}", ha="center", fontsize=int(9*font_scale), color=text_color)
+    y -= 0.020
+    fig.text(0.5, y, str(lga_text), ha="center", fontsize=int(9*font_scale), color=text_color)
+    y -= 0.020
+    fig.text(0.5, y, str(state_text), ha="center", fontsize=int(9*font_scale), color=text_color)
+    y -= 0.030
     fig.text(
-        0.5, y, str(title_text), ha="center", fontsize=title_size if title_size else int(12*font_scale), weight="bold",
-        **({"fontfamily": title_font} if title_font else {}),
-    )
-    fig.text(0.5, y - 0.030, f"LOCATED AT: {location_text}", ha="center", fontsize=int(9*font_scale), color=text_color)
-    fig.text(0.5, y - 0.050, str(lga_text), ha="center", fontsize=int(9*font_scale), color=text_color)
-    fig.text(0.5, y - 0.070, str(state_text), ha="center", fontsize=int(9*font_scale), color=text_color)
-    fig.text(
-        0.5, y - 0.100, f"AREA = {format_area_display(area_m2)}", ha="center",
+        0.5, y, f"AREA = {format_area_display(area_m2)}", ha="center",
         fontsize=area_size if area_size else int(9*font_scale), color="red",
         **({"fontfamily": area_font} if area_font else {}),
     )
-    fig.text(0.5, y - 0.120, f"SCALE  {scale_text}", ha="center", fontsize=int(9*font_scale), color=text_color)
+    y -= 0.020
+    fig.text(0.5, y, f"SCALE  {scale_text}", ha="center", fontsize=int(9*font_scale), color=text_color)
 
 
 def draw_footer(fig, crs_text, source_text, surveyor, rank, font_scale=1.0, text_color: str = "black"):
@@ -372,10 +392,32 @@ def draw_footer(fig, crs_text, source_text, surveyor, rank, font_scale=1.0, text
     y_bot_source = 0.045
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
 
-    fig.text(0.06, y_top, f"SURVEYOR: {surveyor}", fontsize=int(9*font_scale), color=text_color)
-    fig.text(0.06, y_top - 0.025, f"RANK: {rank}", fontsize=int(9*font_scale), color=text_color)
-    fig.text(0.06, y_top - 0.050, "SIGNATURE: ____________________", fontsize=int(9*font_scale), color=text_color)
-    fig.text(0.06, y_top - 0.075, f"DATE PRINTED: {now}", fontsize=int(9*font_scale), color=text_color)
+    # Wrapped to the same safe width as the CRS text below (clear of the KEY box's left edge at
+    # x=0.35) - a long surveyor name, or more than one surveyor (e.g. "A and B"), drawn as one
+    # unwrapped line at a fixed x/y could otherwise run far enough right to visually intrude into
+    # the legend box sitting beside it. Capped at 2 lines, and RANK/SIGNATURE/DATE PRINTED below
+    # step tighter when it wraps, so a long name still fits inside the same fixed footer space
+    # above the CRS line instead of pushing DATE PRINTED down into it.
+    surveyor_fontsize = int(9*font_scale)
+    surveyor_lines = _wrap_figure_text(
+        fig, f"SURVEYOR: {surveyor}", width_fig=0.27, fontsize=surveyor_fontsize,
+    ) or [f"SURVEYOR: {surveyor}"]
+    if len(surveyor_lines) > 2:
+        surveyor_lines = surveyor_lines[:2]
+        surveyor_lines[-1] = surveyor_lines[-1].rstrip() + "..."
+
+    total_lines = len(surveyor_lines) + 3  # + RANK, SIGNATURE, DATE PRINTED
+    line_step = min(0.025, (y_top - y_bot - 0.020) / max(1, total_lines - 1))
+
+    y = y_top
+    for line in surveyor_lines:
+        fig.text(0.06, y, line, fontsize=surveyor_fontsize, color=text_color)
+        y -= line_step
+    fig.text(0.06, y, f"RANK: {rank}", fontsize=int(9*font_scale), color=text_color)
+    y -= line_step
+    fig.text(0.06, y, "SIGNATURE: ____________________", fontsize=int(9*font_scale), color=text_color)
+    y -= line_step
+    fig.text(0.06, y, f"DATE PRINTED: {now}", fontsize=int(9*font_scale), color=text_color)
 
     # Wrapped to a width that stays clear of the KEY box's left edge (x=0.35) - a long CRS
     # description drawn as one line at a fixed x/y can otherwise run far enough right to visually
@@ -2457,6 +2499,20 @@ def _draw_road_tick_symbols(ax, line_geom, color: str, lw: float, scale_ratio=No
         d += step
 
 
+def _road_generalization_tolerance_m(scale_ratio) -> float:
+    """Douglas-Peucker tolerance (real-world meters) for smoothing road/river linework before it's
+    drawn - wiggle finer than _ROAD_SIMPLIFY_TARGET_MM on the printed page reads as noise, not real
+    shape, the same generalization principle a real cartographic product applies as scale shrinks.
+    Buildings never showed this (simple few-vertex rectangles, barely any vertex density to begin
+    with); a live OSM road/river way, sampled at real-world GPS/digitization vertex spacing, does -
+    especially once a large parcel compresses a lot of ground onto one small page and that raw
+    per-vertex noise becomes visible as jagged/hairy linework.
+    """
+    _ROAD_SIMPLIFY_TARGET_MM = 0.35
+    ratio = float(scale_ratio) if scale_ratio else _REFERENCE_SCALE_RATIO
+    return max(0.05, (_ROAD_SIMPLIFY_TARGET_MM / 1000.0) * ratio)
+
+
 def _draw_road_edges(
     ax, edge_lines, font_scale=1.0, color: str = "black", linestyle="-", scale_ratio=None,
     road_style: str = "",
@@ -2474,6 +2530,18 @@ def _draw_road_edges(
         ]
         if not edge_lines:
             return
+        # Smooth out sub-pixel vertex noise before snapping/merging - simplifying first (rather
+        # than after) means the snap step below only has to reconcile genuine junction endpoints,
+        # not also fight through the geometry's own now-removed noise.
+        tolerance_m = _road_generalization_tolerance_m(scale_ratio)
+        simplified_edges = []
+        for seg in edge_lines:
+            try:
+                simple_seg = seg.simplify(tolerance_m, preserve_topology=True)
+                simplified_edges.append(seg if simple_seg.is_empty else simple_seg)
+            except Exception:
+                simplified_edges.append(seg)
+        edge_lines = simplified_edges
     lw = scaled_line_weight(0.3, font_scale, scale_ratio)
     draw_lines = edge_lines
     try:
