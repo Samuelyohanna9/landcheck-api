@@ -2804,6 +2804,15 @@ def _normalize_survey_input_coordinates(raw: Any) -> list[dict]:
     return normalized
 
 
+def _station_names_from_survey_input_coordinates(raw: Any) -> list[str]:
+    """Recover the exact boundary station labels entered by the surveyor for saved re-renders."""
+    return [
+        str(point["station"])
+        for point in _normalize_survey_input_coordinates(raw)
+        if point.get("is_boundary") is not False
+    ]
+
+
 def _build_exact_measurement_polygon(
     survey_input_coordinates: Any,
     coordinate_system: str | None,
@@ -3650,6 +3659,7 @@ def _compose_child_title(parent_meta: dict, lot_no: str, estate_name: str | None
 
 def _render_survey_plan_pdf_for_plot(db: Session, plot_id: int, output_pdf_path: str):
     meta = get_plot_meta(db, plot_id)
+    station_names = _station_names_from_survey_input_coordinates(meta.get("survey_input_coordinates"))
     plot_geom_wgs84 = _load_plot_polygon_wgs84(db, plot_id)
     measurement_context = _resolve_measurement_polygon_context(
         plot_geom_wgs84,
@@ -3676,7 +3686,7 @@ def _render_survey_plan_pdf_for_plot(db: Session, plot_id: int, output_pdf_path:
         surveyor_name=meta["surveyor_name"],
         surveyor_rank=meta["surveyor_rank"],
         certification_statement=meta.get("certification_statement"),
-        station_names=None,
+        station_names=station_names or None,
         coordinate_system=render_coordinate_system,
         epsg_code=epsg_code,
         crs_footer_text=f"COORDINATE SYSTEM: {crs_name}",
@@ -5025,8 +5035,11 @@ def _run_single_plot_export_job(job_id: str):
         if not source_path or not os.path.isfile(source_path):
             raise RuntimeError("Export generated without a readable output file.")
         file_name = str(getattr(response, "filename", "") or "").strip() or str(job.get("file_name") or "").strip() or os.path.basename(source_path)
+        # The renderer's conventional report paths are reused by later requests for the same
+        # plot. Archive every completed job under its cache key so this job remains the exact
+        # bytes the user requested, including its station labels and appearance choices.
         local_path = source_path
-        if export_type == "survey-plan.shapefile":
+        if export_type in {"survey-plan.pdf", "orthophoto.pdf", "topomap.pdf", "survey-plan.shapefile", "technical-report.docx"}:
             local_path = _cache_single_plot_export_file(
                 plot_id=plot_id,
                 export_type=export_type,
@@ -7877,6 +7890,7 @@ def get_saved_survey_plan_pdf(plot_id: int, refresh: bool = False, db: Session =
     ])
     if refresh or not pdf_path:
         meta = get_plot_meta(db, plot_id)
+        station_names = _station_names_from_survey_input_coordinates(meta.get("survey_input_coordinates"))
         maps_dir = os.path.join(REPORTS_DIR, "maps")
         os.makedirs(REPORTS_DIR, exist_ok=True)
         os.makedirs(maps_dir, exist_ok=True)
@@ -7905,7 +7919,7 @@ def get_saved_survey_plan_pdf(plot_id: int, refresh: bool = False, db: Session =
             surveyor_name=meta["surveyor_name"],
             surveyor_rank=meta["surveyor_rank"],
             certification_statement=meta.get("certification_statement"),
-            station_names=None,
+            station_names=station_names or None,
             coordinate_system=render_coordinate_system,
             epsg_code=epsg_code,
             crs_footer_text=f"COORDINATE SYSTEM: {crs_name}",
@@ -7969,6 +7983,7 @@ def get_saved_orthophoto_pdf(plot_id: int, map_type: str = "satellite", refresh:
     ])
     if refresh or not pdf_path:
         meta = get_plot_meta(db, plot_id)
+        station_names = _station_names_from_survey_input_coordinates(meta.get("survey_input_coordinates"))
         out_dir = os.path.join(REPORTS_DIR, "orthophoto")
         os.makedirs(out_dir, exist_ok=True)
         pdf_path = os.path.join(out_dir, f"plot_{plot_id}_orthophoto_{safe_type}.pdf")
@@ -7991,7 +8006,7 @@ def get_saved_orthophoto_pdf(plot_id: int, map_type: str = "satellite", refresh:
             scale_text=meta["scale_text"],
             surveyor_name=meta["surveyor_name"],
             surveyor_rank=meta["surveyor_rank"],
-            station_names=None,
+            station_names=station_names or None,
             coordinate_system=render_coordinate_system,
             epsg_code=epsg_code,
             crs_footer_text=f"COORDINATE SYSTEM: {crs_name}",

@@ -583,6 +583,7 @@ def get_survey_users(request: Request, db: Session = Depends(get_db)):
     require_super_admin_request(db, request)
     ensure_survey_auth_schema()
     ensure_plot_meta_table(db)
+    ensure_plot_export_jobs_table(db)
 
     # Plots nested per user (id/title/location/template/date/raw input coordinates) so the admin
     # dashboard can offer a "redownload" action per plot, and audit exactly what the surveyor
@@ -610,7 +611,25 @@ def get_survey_users(request: Request, db: Session = Depends(get_db)):
                         'coordinate_system', pm.coordinate_system,
                         'survey_input_coordinates', pm.survey_input_coordinates,
                         'parent_plot_id', pm.parent_plot_id,
-                        'estate_name', pm.estate_name
+                        'estate_name', pm.estate_name,
+                        'exports', COALESCE(
+                            (
+                                SELECT json_agg(
+                                    json_build_object(
+                                        'job_id', e.id,
+                                        'export_type', e.export_type,
+                                        'file_name', e.file_name,
+                                        'completed_at', e.completed_at
+                                    )
+                                    ORDER BY e.completed_at DESC, e.created_at DESC
+                                )
+                                FROM plot_export_jobs e
+                                WHERE e.plot_id = p.id
+                                  AND e.status = 'completed'
+                                  AND e.local_path IS NOT NULL
+                            ),
+                            '[]'::json
+                        )
                     ) ORDER BY p.created_at DESC
                 ) FILTER (WHERE p.id IS NOT NULL),
                 '[]'
@@ -642,6 +661,7 @@ def get_survey_users(request: Request, db: Session = Depends(get_db)):
                     "parent_plot_id": plot.get("parent_plot_id"),
                     "estate_name": plot.get("estate_name"),
                     "workflow_type": "subdivision" if plot.get("parent_plot_id") else "survey_plan",
+                    "exports": plot.get("exports") or [],
                 }
                 for plot in (row["plots"] or [])
             ],

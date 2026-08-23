@@ -1040,31 +1040,66 @@ def draw_grid(ax, minor, major, font_scale=1.0):
 
 
 def annotate_vertices_orthophoto(ax, poly, station_names=None, font_scale=1.0, scale_ratio: int = 1000):
-    """Add station name labels to plot vertices in orthophoto."""
+    """Add legible, collision-aware station labels to orthophoto vertices."""
     from shapely.geometry import Point
 
     coords = list(poly.exterior.coords)
     default_labels = list("ABCDEFGHIJKLMNOPQRSTUVWXYZ")
-    labels = station_names if station_names else default_labels
+    vertex_count = max(0, len(coords) - 1)
+    labels = []
+    for index in range(vertex_count):
+        raw = station_names[index] if station_names and index < len(station_names) else default_labels[index % len(default_labels)]
+        labels.append(format_station_label(raw or default_labels[index % len(default_labels)]))
 
-    for i in range(len(coords) - 1):
+    x0, x1 = ax.get_xlim()
+    y0, y1 = ax.get_ylim()
+    span_x = max(abs(x1 - x0), 1.0)
+    span_y = max(abs(y1 - y0), 1.0)
+    placed_boxes = []
+    centroid = poly.centroid
+
+    def text_box(x, y, label):
+        longest_line = max((len(line) for line in str(label).splitlines()), default=1)
+        line_count = max(1, len(str(label).splitlines()))
+        width = span_x * 0.018 * max(1.0, longest_line / 8.0)
+        height = span_y * 0.022 * (1.0 + 0.5 * (line_count - 1))
+        return (x - width / 2, y - height / 2, x + width / 2, y + height / 2)
+
+    def overlaps(candidate):
+        return any(not (candidate[2] < box[0] or candidate[0] > box[2] or candidate[3] < box[1] or candidate[1] > box[3]) for box in placed_boxes)
+
+    for i in range(vertex_count):
         p1 = Point(coords[i])
         p2 = Point(coords[i + 1])
-        label = format_station_label(labels[i % len(labels)])
+        label = labels[i]
 
         seg_dx = p2.x - p1.x
         seg_dy = p2.y - p1.y
         seg_len = math.hypot(seg_dx, seg_dy) or 1.0
         nx, ny = -seg_dy / seg_len, seg_dx / seg_len
-        station_offset = max(2.0, (5.0 / 1000.0) * scale_ratio)
-        lx = p1.x + nx * station_offset
-        ly = p1.y + ny * station_offset
+        station_offset = max(2.0, (6.0 / 1000.0) * scale_ratio)
+        # Start on the exterior side of the parcel, then progressively move outward until labels
+        # no longer collide with one another on dense boundaries.
+        if Point(p1.x + nx * station_offset, p1.y + ny * station_offset).distance(centroid) < Point(p1.x - nx * station_offset, p1.y - ny * station_offset).distance(centroid):
+            nx, ny = -nx, -ny
+        candidates = [
+            (p1.x + direction * nx * station_offset * multiple, p1.y + direction * ny * station_offset * multiple)
+            for multiple in (1.0, 1.55, 2.2, 3.0)
+            for direction in (1, -1)
+        ]
+        lx, ly = candidates[-1]
+        label_box = text_box(lx, ly, label)
+        for candidate_x, candidate_y in candidates:
+            candidate_box = text_box(candidate_x, candidate_y, label)
+            if not overlaps(candidate_box):
+                lx, ly, label_box = candidate_x, candidate_y, candidate_box
+                break
 
         ax.text(
             lx,
             ly,
             label,
-            fontsize=int(8*font_scale),
+            fontsize=max(6, int(7 * font_scale)),
             color="black",
             ha="center",
             va="center",
@@ -1072,8 +1107,10 @@ def annotate_vertices_orthophoto(ax, poly, station_names=None, font_scale=1.0, s
             multialignment="center",
             linespacing=0.95,
             zorder=25,
-            bbox=dict(facecolor="white", edgecolor="black", boxstyle="round,pad=0.15", alpha=0.85)
+            bbox=dict(facecolor="white", edgecolor="#3f3f3f", boxstyle="round,pad=0.14", alpha=0.92),
+            path_effects=[patheffects.withStroke(linewidth=max(1.2, 1.8 * font_scale), foreground="white")],
         )
+        placed_boxes.append(label_box)
 
 
 def draw_coordinate_frame(ax, spacing, axis_epsg=3857, label_epsg=3857, font_scale=1.0):

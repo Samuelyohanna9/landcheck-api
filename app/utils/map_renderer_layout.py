@@ -1543,6 +1543,7 @@ def annotate_vertices(
         line_spacing: float = 0.95,
         allow_center: bool = True,
         font_family=None,
+        text_effects=None,
     ):
         offset_m = max(2.0, (6.0 / 1000.0) * scale_ratio) * max(0.6, normal_offset_mult)
         candidates = [(x, y)]
@@ -1553,10 +1554,9 @@ def annotate_vertices(
                 if boundary_poly.contains(test_pt):
                     nx, ny = -nx, -ny
             candidates = [
-                (x + nx * offset_m, y + ny * offset_m),
-                (x - nx * offset_m, y - ny * offset_m),
-                (x + nx * offset_m * 1.5, y + ny * offset_m * 1.5),
-                (x - nx * offset_m * 1.5, y - ny * offset_m * 1.5),
+                (x + direction * nx * offset_m * multiple, y + direction * ny * offset_m * multiple)
+                for multiple in (1.0, 1.5, 2.1, 2.8)
+                for direction in (1, -1)
             ]
             if allow_center:
                 candidates.append((x, y))
@@ -1605,6 +1605,7 @@ def annotate_vertices(
                     linespacing=line_spacing,
                     zorder=25,
                     **({"fontfamily": font_family} if font_family else {}),
+                    **({"path_effects": text_effects} if text_effects else {}),
                 )
                 placed_boxes.append(bx)
                 return True
@@ -1678,24 +1679,21 @@ def annotate_vertices(
         if show_beacons:
             draw_beacon(p1.x, p1.y)
         if show_station_names:
-            station_offset = max(2.0, (5.0 / 1000.0) * scale_ratio)
-            nx, ny = normal
-            if boundary_poly is not None:
-                test_pt = Point(p1.x + nx * station_offset, p1.y + ny * station_offset)
-                if boundary_poly.contains(test_pt):
-                    nx, ny = -nx, -ny
             place_text(
-                p1.x + nx * station_offset,
-                p1.y + ny * station_offset,
+                p1.x,
+                p1.y,
                 label,
-                font_size=station_size if station_size else int(8 * font_scale),
+                font_size=station_size if station_size else int(7 * font_scale),
                 color=text_color,
                 rotation=0,
-                weight="normal",
-                scale_w=0.010,
-                scale_h=0.016,
-                normal=None,
+                weight="bold",
+                scale_w=0.018,
+                scale_h=0.020,
+                normal=normal,
+                normal_offset_mult=1.15,
+                allow_center=False,
                 font_family=station_font,
+                text_effects=[patheffects.withStroke(linewidth=max(1.5, 2.2 * font_scale), foreground="white")],
             )
 
         bearing, dist = calculate_bearing_deg(p1, p2), p1.distance(p2)
