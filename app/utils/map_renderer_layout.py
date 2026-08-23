@@ -234,6 +234,18 @@ def road_half_width_m(highway: str) -> float:
     return 3.0
 
 
+def road_half_width_for_render(road_width_m: float | None, scale_ratio: float | None) -> float:
+    """Return a road edge offset that remains legible on a printed survey plan.
+
+    Roads are drawn as two edges. At small printed scales the historic 3 m fallback can put
+    those edges closer than the pen strokes themselves, so they read as one dark centerline.
+    This affects only display geometry and never changes the stored road or a larger user width.
+    """
+    configured_width = float(road_width_m or road_half_width_m(""))
+    minimum_visible_width = (max(float(scale_ratio or 0.0), 0.0) / 1000.0) * 1.6
+    return max(1.0, configured_width / 2.0, minimum_visible_width / 2.0)
+
+
 def apply_true_scale(ax, geom_for_extent, scale_ratio: int, map_width_in: float, map_height_in: float):
     minx, miny, maxx, maxy = geom_for_extent.bounds
     cx, cy = (minx + maxx) / 2.0, (miny + maxy) / 2.0
@@ -3397,7 +3409,7 @@ def _render_plot_map_layout_adamawa(
             continue
         snapped_clipped = snap(clipped, extent_poly.boundary, road_snap_tol)
         try:
-            half_w = max(1.0, (road_width_m or 3.0) / 2.0)
+            half_w = road_half_width_for_render(road_width_m, scale_ratio)
             road_geom_width.append((snapped_clipped, half_w))
         except Exception:
             continue
@@ -4365,7 +4377,7 @@ def _render_plot_map_layout_cadastral(
             continue
         snapped_clipped = snap(clipped, extent_poly.boundary, road_snap_tol)
         try:
-            half_w = max(1.0, (road_width_m or 3.0) / 2.0)
+            half_w = road_half_width_for_render(road_width_m, scale_ratio)
             road_geom_width.append((snapped_clipped, half_w))
         except Exception:
             continue
@@ -4956,7 +4968,7 @@ def _render_plot_map_layout_fct(
             continue
         snapped_clipped = snap(clipped, extent_poly.boundary, road_snap_tol)
         try:
-            half_w = max(1.0, (road_width_m or 3.0) / 2.0)
+            half_w = road_half_width_for_render(road_width_m, scale_ratio)
             road_geom_width.append((snapped_clipped, half_w))
         except Exception:
             continue
@@ -5690,7 +5702,7 @@ def _render_plot_map_layout_site_plan(
             continue
         snapped_clipped = snap(clipped, extent_poly.boundary, road_snap_tol)
         try:
-            half_w = max(1.0, (road_width_m or 3.0) / 2.0)
+            half_w = road_half_width_for_render(road_width_m, scale_ratio)
             road_geom_width.append((snapped_clipped, half_w))
         except Exception:
             continue
@@ -6311,7 +6323,7 @@ def render_plot_map_layout(
                 continue
             snapped_clipped = snap(clipped, extent_poly.boundary, road_snap_tol)
             try:
-                half_w = max(1.0, (road_width_m or 3.0) / 2.0)
+                half_w = road_half_width_for_render(road_width_m, scale_ratio)
                 road_geom_width.append((snapped_clipped, half_w))
             except Exception:
                 continue
@@ -6395,7 +6407,7 @@ def render_plot_map_layout(
             road_label_features.append((snapped_clipped, name, highway))
             # Use buffered road polygon to keep intersections connected
             try:
-                half_w = max(1.0, (road_width_m or 3.0) / 2.0)
+                half_w = road_half_width_for_render(road_width_m, scale_ratio)
                 road_geom_width.append((snapped_clipped, half_w))
             except Exception:
                 continue

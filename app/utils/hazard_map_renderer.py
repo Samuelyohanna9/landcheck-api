@@ -14,6 +14,7 @@ import matplotlib.pyplot as plt
 import matplotlib.tri as mtri
 import numpy as np
 from matplotlib.collections import PolyCollection
+from matplotlib.colors import LightSource, to_rgb
 from pyproj import Transformer
 from shapely.geometry import shape
 from shapely.geometry.base import BaseGeometry
@@ -56,6 +57,22 @@ NO_DATA_WASH_EDGE_COLOR = "#cbd5e1"
 SLOPE_BAND_LABELS = [0.0, 2.0, 5.0, 10.0, 15.0, 25.0]
 SLOPE_COLORS = ["#dcfce7", "#bbf7d0", "#fde047", "#fb923c", "#ef4444", "#7f1d1d"]
 BUILDING_SLOPE_THREATENED_DEG = 15.0
+
+# Esri's official 10m Annual Land Cover class scheme (class value -> (label, hex color)), verified
+# against the live gee-community-catalog.org listing for this exact dataset (see hazard_lulc.py's
+# LULC_ASSET_ID) rather than guessed - these are the same colors Esri's own published maps use, and
+# match the user's reference poster exactly.
+LULC_CLASS_COLORS: Dict[int, Tuple[str, str]] = {
+    1: ("Water", "#1A5BAB"),
+    2: ("Trees", "#358221"),
+    3: ("Flooded Vegetation", "#87D19E"),
+    4: ("Crops", "#FFDB5C"),
+    5: ("Built Area", "#ED022A"),
+    6: ("Bare Ground", "#EDE9E4"),
+    7: ("Snow/Ice", "#F2FAFF"),
+    8: ("Clouds", "#C8C8C8"),
+    9: ("Rangeland", "#C6AD8D"),
+}
 
 
 def _local_slope_triangulation(points: List[Dict[str, float]], display_epsg: int):
@@ -705,3 +722,147 @@ def render_erosion_hazard_map(
         "value_key": export_value_key,
         "interactive": interactive_meta,
     }
+
+
+def _landcover_grid_to_rgba(landcover_grid: np.ndarray, alpha: float = 0.75) -> np.ndarray:
+    """Converts a 2D array of Esri class codes into an HxWx4 RGBA array using LULC_CLASS_COLORS,
+    left fully transparent wherever the code isn't a real class (e.g. the sampling grid's nodata
+    fill value) - built as a direct per-pixel lookup rather than a matplotlib ListedColormap/
+    BoundaryNorm, since the class codes are non-contiguous (1-9, with no gaps here, but the scheme
+    reserves room for others) and a direct lookup sidesteps norm-edge-case bugs entirely.
+    """
+    rgba = np.zeros((*landcover_grid.shape, 4), dtype=float)
+    for class_id, (_, hex_color) in LULC_CLASS_COLORS.items():
+        mask = landcover_grid == class_id
+        if not mask.any():
+            continue
+        r, g, b = to_rgb(hex_color)
+        rgba[mask, 0] = r
+        rgba[mask, 1] = g
+        rgba[mask, 2] = b
+        rgba[mask, 3] = alpha
+    return rgba
+
+
+def render_lulc_hazard_map(
+    boundary_geojson: Dict[str, Any],
+    landcover_grid: Optional[np.ndarray],
+    landcover_scale_m: float,
+    elevation_grid: Optional[np.ndarray],
+    elevation_scale_m: float,
+    class_areas: List[Dict[str, Any]],
+    buffer_m: float = 500,
+) -> Tuple[bytes, Dict[str, Any]]:
+    """Renders a Land Use / Land Cover map: a true DEM-derived hillshade terrain background (real
+    3D relief shading, matplotlib LightSource) with Esri's 10m landcover classification overlaid in
+    its official class colors, plus a %-of-area bar chart inset - unlike the flood/erosion maps,
+    there's no risk score, no buildings, and no contour lines (the hillshade already gives the
+    terrain context contours would otherwise provide, and would visually compete with it).
+    """
+    boundary_geom = shape(boundary_geojson)
+    display_epsg = _display_epsg_for(boundary_geom)
+
+    gdf_boundary = gpd.GeoDataFrame(geometry=[boundary_geom], crs="EPSG:4326").to_crs(epsg=display_epsg)
+    boundary_proj = gdf_boundary.geometry.iloc[0]
+    minx, miny, maxx, maxy = boundary_proj.buffer(buffer_m).bounds
+    span_m = max(maxx - minx, maxy - miny)
+
+    fig, ax = plt.subplots(figsize=(10.0, 8.4), dpi=150)
+    fig.subplots_adjust(left=0.025, right=0.738, top=0.91, bottom=0.045)
+    ax.set_aspect("equal")
+    ax.set_facecolor(LAND_COLOR)
+    ax.set_xlim(minx, maxx)
+    ax.set_ylim(miny, maxy)
+    ax.set_xticks([])
+    ax.set_yticks([])
+    for spine in ax.spines.values():
+        spine.set_visible(False)
+
+    # Hillshade terrain background - real 3D relief shading from actual elevation data, not a flat
+    # map. origin="upper" matters here: the dense grid comes from ee.Image.sampleRectangle(), whose
+    # nested-list result is row-major north-to-south (image convention) - matplotlib's default
+    # origin="lower" would render it vertically flipped relative to the boundary/scalebar/north
+    # arrow below, which stay in projected-coordinate (increasing-north-is-up) space.
+    if elevation_grid is not None and elevation_grid.size > 4:
+        try:
+            hillshade = LightSource(azdeg=315, altdeg=45).hillshade(
+                elevation_grid, vert_exag=2.0, dx=elevation_scale_m, dy=elevation_scale_m,
+            )
+            ax.imshow(hillshade, cmap="gray", extent=(minx, maxx, miny, maxy), origin="upper", zorder=1)
+        except Exception:
+            pass
+
+    landcover_available = landcover_grid is not None and landcover_grid.size > 4
+    if landcover_available:
+        try:
+            rgba = _landcover_grid_to_rgba(landcover_grid)
+            ax.imshow(rgba, extent=(minx, maxx, miny, maxy), origin="upper", zorder=2)
+        except Exception:
+            landcover_available = False
+
+    if not landcover_available:
+        ax.add_patch(mpatches.Rectangle(
+            (minx, miny), maxx - minx, maxy - miny,
+            facecolor=NO_DATA_WASH_COLOR, edgecolor="none", zorder=0.5,
+        ))
+
+    gdf_boundary.plot(ax=ax, facecolor="none", edgecolor=BOUNDARY_COLOR, linewidth=2.4, zorder=10)
+
+    _draw_scalebar(ax, span_m)
+    _draw_north_arrow(ax, span_m)
+
+    ax.set_title("Land Use / Land Cover", fontsize=12, weight="bold", color="#111827", pad=10)
+
+    legend_handles = []
+    if landcover_available:
+        for c in class_areas:
+            if c.get("pct", 0) <= 0:
+                continue
+            legend_handles.append(mpatches.Patch(facecolor=c["color"], edgecolor="none", label=f"{c['label']} ({c['pct']:.1f}%)"))
+    else:
+        legend_handles.append(mpatches.Patch(
+            facecolor=NO_DATA_WASH_COLOR, edgecolor=NO_DATA_WASH_EDGE_COLOR, label="No land cover data available",
+        ))
+    legend_handles.append(mpatches.Patch(facecolor="none", edgecolor=BOUNDARY_COLOR, linewidth=2, label="Plot boundary"))
+
+    if not landcover_available:
+        ax.text(
+            0.98, 0.02, "No land cover data available for this location",
+            transform=ax.transAxes, ha="right", va="bottom", fontsize=7.5, color="#475569",
+            bbox=dict(boxstyle="round,pad=0.45", facecolor="white", edgecolor="#d1d5db", alpha=0.92),
+            zorder=15,
+        )
+
+    # % of area bar chart - first ax.barh() in this codebase (every other hazard map here is a
+    # continuous graduated surface, not discrete classes). Placed in the same reserved right-hand
+    # gutter the legend uses, positioned low enough to clear even a full 9-class + boundary legend.
+    if landcover_available and class_areas:
+        inset_ax = fig.add_axes([0.775, 0.06, 0.185, 0.32])
+        labels = [c["label"] for c in class_areas]
+        pcts = [c["pct"] for c in class_areas]
+        colors_list = [c["color"] for c in class_areas]
+        inset_ax.barh(labels, pcts, color=colors_list, edgecolor="#4b5563", linewidth=0.4)
+        inset_ax.invert_yaxis()
+        inset_ax.set_xlabel("% of area", fontsize=7)
+        inset_ax.tick_params(labelsize=6.5)
+        inset_ax.set_title("Land cover composition", fontsize=7.5, weight="bold", pad=4)
+        for spine_name in ("top", "right"):
+            inset_ax.spines[spine_name].set_visible(False)
+
+    # Attribution footer - flood/erosion don't have one, since GloFAS/Sentinel-2/HydroSHEDS are
+    # already named in their PDF method text; this map is more often viewed standalone (no PDF
+    # wrapper guaranteed), so the source belongs on the image itself. Bottom-RIGHT, not bottom-left
+    # - the scale bar (_draw_scalebar) is anchored bottom-left in data coordinates, and a bottom-left
+    # attribution text in axes-fraction coordinates would sit directly on top of it.
+    ax.text(
+        0.98, 0.01, "Datasource: Esri Land Cover, Copernicus GLO-30 DEM",
+        transform=ax.transAxes, fontsize=6.5, color="#475569", ha="right", va="bottom", zorder=15,
+        bbox=dict(boxstyle="round,pad=0.35", facecolor="white", edgecolor="#d1d5db", alpha=0.85),
+    )
+
+    png_bytes, interactive_meta = _finalize_hazard_map(
+        fig, ax, legend_handles, minx, miny, maxx, maxy, display_epsg,
+        value_points=None, value_key="class_id", contour_points=None, buildings_gdf=None,
+    )
+
+    return png_bytes, {"interactive": interactive_meta}

@@ -42,6 +42,7 @@ from app.models.plot import Plot
 from app.models.plot_buffer import PlotBuffer
 from app.utils.pdf import generate_plot_report_pdf
 from app.utils.survey_auth_security import require_survey_session, resolve_survey_session
+from app.utils.survey_activity import ensure_survey_activity_table, log_survey_activity
 from app.utils.map_renderer_layout import (
     render_plot_map_layout,
     get_paper_config,
@@ -83,6 +84,7 @@ PREVIEW_LAYOUT_VERSION = "survey_layout_2026_08_13_autofit_preview_v86"
 SURVEY_REPORT_RENDER_VERSION = "survey_report_2026_03_23_clockwise_v1"
 CLEAN_COPY_RENDER_VERSION = "clean_copy_2026_03_20_layout_v14"
 PLOT_EXPORT_JOB_STATUS_VALUES = {"queued", "running", "completed", "failed"}
+STANDARD_SURVEY_SCALE_DENOMINATORS = (250, 500, 1000, 1250, 2000, 2500, 5000, 10000, 12500, 20000, 25000, 50000)
 
 
 class PlotGeometryUpdateRequest(BaseModel):
@@ -1569,6 +1571,15 @@ def _survey_template_map_frame(template_name: str | None) -> tuple[float, float]
     if template == "fct_abuja_osg":
         return 0.66, 0.48
     return 0.80, 0.45
+
+
+def _select_standard_survey_scale(fitted_ratio: int) -> int:
+    """Choose the first recognised scale that still contains the fitted map extent."""
+    required = max(1, int(fitted_ratio or 1))
+    for scale in STANDARD_SURVEY_SCALE_DENOMINATORS:
+        if scale >= required:
+            return scale
+    return STANDARD_SURVEY_SCALE_DENOMINATORS[-1]
 
 
 def _split_polygon_once_by_area(poly_metric: Polygon, target_area: float) -> tuple[Polygon, Polygon]:
@@ -3712,6 +3723,7 @@ def _render_survey_plan_pdf_for_plot(db: Session, plot_id: int, output_pdf_path:
 @router.post("/{plot_id}/subdivision/preview")
 def preview_plot_subdivision(
     plot_id: int,
+    request: Request,
     db: Session = Depends(get_db),
     method: str = Body("by_count"),
     split_count: int | None = Body(None),
@@ -3750,6 +3762,14 @@ def preview_plot_subdivision(
         dimension_unit=dimension_unit,
     )
     payload["estate_name"] = str(estate_name or "").strip()
+    log_survey_activity(
+        db,
+        event_type="preview_completed",
+        workflow="subdivision",
+        request=request,
+        plot_id=plot_id,
+        details={"method": method, "lot_count": payload.get("resolved_count")},
+    )
     return payload
 
 
@@ -4898,6 +4918,7 @@ def get_plot_export_job_status(
 @router.get("/export-jobs/{job_id}/download", name="download_plot_export_job")
 def download_plot_export_job(
     job_id: str,
+    request: Request,
     db: Session = Depends(get_db),
 ):
     job = _get_plot_export_job(db, job_id)
@@ -4922,6 +4943,15 @@ def download_plot_export_job(
             )
     if not local_path or not os.path.isfile(local_path):
         raise HTTPException(status_code=404, detail="Export file is no longer available.")
+    log_survey_activity(
+        db,
+        event_type="export_downloaded",
+        workflow="subdivision" if int(job.get("subdivision_batch_id") or 0) else "survey_plan",
+        request=request,
+        plot_id=int(job["plot_id"]) if job.get("plot_id") else None,
+        subdivision_batch_id=int(job["subdivision_batch_id"]) if job.get("subdivision_batch_id") else None,
+        details={"export_type": job.get("export_type"), "file_name": file_name, "job_id": job_id},
+    )
     media_type = mimetypes.guess_type(file_name)[0] or "application/octet-stream"
     return FileResponse(
         local_path,
@@ -5762,6 +5792,7 @@ def create_plot(
 @router.post("/claim")
 def claim_plots(request: Request, plot_ids: List[int] = Body(..., embed=True), db: Session = Depends(get_db)):
     session = require_survey_session(db, request)
+    ensure_survey_activity_table(db)
     if not plot_ids:
         return {"claimed": []}
     # Only ever claims currently-unowned plots - never reassigns a plot someone else already owns.
@@ -5798,8 +5829,20 @@ def claim_plots(request: Request, plot_ids: List[int] = Body(..., embed=True), d
         ),
         {"user_id": session.user_id},
     ).mappings().all()
+    claimed_ids = [int(row["id"]) for row in rows] + [int(row["id"]) for row in child_rows]
+    if claimed_ids:
+        # Attribute pre-sign-in previews/exports to the account that claimed this browser's plots.
+        # Only anonymous events are updated; activity belonging to another account is immutable.
+        db.execute(
+            text("""
+                UPDATE survey_activity_events
+                SET actor_user_id = :user_id
+                WHERE actor_user_id IS NULL AND plot_id = ANY(:plot_ids)
+            """),
+            {"user_id": session.user_id, "plot_ids": claimed_ids},
+        )
     db.commit()
-    return {"claimed": [int(row["id"]) for row in rows] + [int(row["id"]) for row in child_rows]}
+    return {"claimed": claimed_ids}
 
 
 @router.get("/mine")
@@ -7001,8 +7044,65 @@ def simple_download_pdf(plot_id: int, db: Session = Depends(get_db), background_
 
 # ---------------- SURVEY PLAN PREVIEW ----------------
 
+@router.post("/{plot_id}/scale-recommendation")
+def get_plot_scale_recommendation(
+    plot_id: int,
+    coordinate_system: str = Body("wgs84"),
+    paper_size: str = Body("A4"),
+    template_name: str = Body(DEFAULT_TEMPLATE_NAME),
+    survey_input_coordinates: Optional[list] = Body(default=None),
+    db: Session = Depends(get_db),
+):
+    """Recommend a standard scale before the first plan render.
+
+    The result uses the same metric measurement polygon and template map frame as the renderer.
+    The selected denominator is always rounded upward, never down, so a standard scale cannot
+    crop the parcel merely to look tidier on the title block.
+    """
+    plot_geom_wgs84 = _load_plot_polygon_wgs84(db, plot_id)
+    measurement_context = _resolve_measurement_polygon_context(
+        plot_geom_wgs84,
+        coordinate_system,
+        survey_input_coordinates=survey_input_coordinates,
+    )
+    plot_metric = measurement_context["measurement_polygon"]
+    map_width_fraction, map_height_fraction = _survey_template_map_frame(template_name)
+
+    def recommendation_for(size: str) -> tuple[int, int]:
+        config = get_paper_config(size)
+        fitted = compute_fit_scale_ratio(
+            plot_metric,
+            config["width"] * map_width_fraction,
+            config["height"] * map_height_fraction,
+        )
+        return fitted, _select_standard_survey_scale(fitted)
+
+    requested_paper = str(paper_size or "A4").upper()
+    if requested_paper not in {"A4", "A3", "A2", "A1", "A0"}:
+        requested_paper = "A4"
+    fitted_ratio, standard_ratio = recommendation_for(requested_paper)
+    recommended_paper = requested_paper
+
+    # A3 is recommended only where an A4 plan would need a small-scale 1:5000+ sheet. This
+    # keeps ordinary plots on A4 while making large plots more readable without forcing A3.
+    if requested_paper == "A4" and standard_ratio >= 5000:
+        a3_fitted, a3_standard = recommendation_for("A3")
+        if a3_standard < standard_ratio:
+            recommended_paper = "A3"
+            fitted_ratio, standard_ratio = a3_fitted, a3_standard
+
+    return {
+        "paper_size": recommended_paper,
+        "scale_text": f"1 : {standard_ratio}",
+        "scale_denominator": standard_ratio,
+        "fitted_scale_denominator": fitted_ratio,
+        "template_name": str(template_name or DEFAULT_TEMPLATE_NAME),
+        "reason": "The selected standard scale contains the full parcel in the template map frame.",
+    }
+
+
 @router.post("/{plot_id}/report/preview")
-def preview_plot_map(plot_id: int, db: Session = Depends(get_db), background_tasks: BackgroundTasks = None,
+def preview_plot_map(plot_id: int, request: Request, db: Session = Depends(get_db), background_tasks: BackgroundTasks = None,
     title_text: str = Body("SURVEY PLAN"),
     location_text: str = Body(""),
     lga_text: str = Body(""),
@@ -7321,6 +7421,15 @@ def preview_plot_map(plot_id: int, db: Session = Depends(get_db), background_tas
         if served_background is None:
             served_background = BackgroundTasks()
         served_background.add_task(safe_remove, map_path)
+
+    log_survey_activity(
+        db,
+        event_type="preview_completed",
+        workflow="survey_plan",
+        request=request,
+        plot_id=plot_id,
+        details={"template_name": template_name, "paper_size": paper_size, "scale": resolved_scale_text},
+    )
 
     return FileResponse(
         served_path,

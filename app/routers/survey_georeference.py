@@ -23,6 +23,7 @@ from sqlalchemy.orm import Session
 from app.db import SessionLocal
 from app.routers.plots import COORDINATE_SYSTEMS, get_db, _safe_filename_fragment
 from app.utils.survey_auth_security import require_survey_session, resolve_survey_session
+from app.utils.survey_activity import ensure_survey_activity_table, log_survey_activity
 from app.utils.coordinate_converter import is_nigeria_auto_utm_coordinate_system, resolve_coordinate_system_key
 from app.utils.r2_objects import build_r2_settings, create_r2_client, delete_object_best_effort, upload_bytes
 
@@ -1259,6 +1260,14 @@ async def create_georeference_session(
     )
     db.commit()
     row = _load_session_row(db, session_id)
+    log_survey_activity(
+        db,
+        event_type="raster_uploaded",
+        workflow="georeference",
+        request=request,
+        georeference_session_id=session_id,
+        details={"file_name": str(file.filename or ""), "coordinate_system": target_coordinate_system},
+    )
     return {"ok": True, "session": _session_to_payload(row)}
 
 
@@ -1270,6 +1279,7 @@ def claim_georeference_sessions(request: Request, session_ids: list[str] = Body(
     after sign-in the same way regular plots get claimed."""
     _ensure_schema(db)
     session = require_survey_session(db, request)
+    ensure_survey_activity_table(db)
     if not session_ids:
         return {"claimed": []}
     rows = db.execute(
@@ -1283,8 +1293,19 @@ def claim_georeference_sessions(request: Request, session_ids: list[str] = Body(
         ),
         {"user_id": session.user_id, "session_ids": [str(s) for s in session_ids]},
     ).mappings().all()
+    claimed_ids = [str(row["id"]) for row in rows]
+    if claimed_ids:
+        db.execute(
+            text("""
+                UPDATE survey_activity_events
+                SET actor_user_id = :user_id
+                WHERE actor_user_id IS NULL
+                  AND georeference_session_id = ANY(:session_ids)
+            """),
+            {"user_id": session.user_id, "session_ids": claimed_ids},
+        )
     db.commit()
-    return {"claimed": [str(row["id"]) for row in rows]}
+    return {"claimed": claimed_ids}
 
 
 @router.get("/sessions/mine")
@@ -1375,7 +1396,7 @@ def stream_georeference_overlay_raster(session_id: str, db: Session = Depends(ge
 
 
 @router.post("/sessions/{session_id}/solve")
-def solve_georeference_session(session_id: str, payload: SolveGeoreferenceRequest, db: Session = Depends(get_db)):
+def solve_georeference_session(session_id: str, payload: SolveGeoreferenceRequest, request: Request, db: Session = Depends(get_db)):
     row = _load_session_row(db, session_id)
     width = int(row.get("source_width") or 0)
     height = int(row.get("source_height") or 0)
@@ -1410,11 +1431,19 @@ def solve_georeference_session(session_id: str, payload: SolveGeoreferenceReques
     )
     db.commit()
     updated = _load_session_row(db, session_id)
+    log_survey_activity(
+        db,
+        event_type="georeference_solved",
+        workflow="georeference",
+        request=request,
+        georeference_session_id=session_id,
+        details={"gcp_count": len(payload.ground_control_points), "coordinate_system": payload.target_coordinate_system},
+    )
     return {"ok": True, "session": _session_to_payload(updated)}
 
 
 @router.post("/sessions/{session_id}/features")
-def save_georeference_features(session_id: str, payload: SaveDigitizedFeaturesRequest, db: Session = Depends(get_db)):
+def save_georeference_features(session_id: str, payload: SaveDigitizedFeaturesRequest, request: Request, db: Session = Depends(get_db)):
     row = _load_session_row(db, session_id)
     transform = _normalize_session_transform(row, _safe_json_load(row.get("transform_json"), None))
     if not isinstance(transform, dict):
@@ -1443,6 +1472,14 @@ def save_georeference_features(session_id: str, payload: SaveDigitizedFeaturesRe
     )
     db.commit()
     updated = _load_session_row(db, session_id)
+    log_survey_activity(
+        db,
+        event_type="digitizing_saved",
+        workflow="georeference",
+        request=request,
+        georeference_session_id=session_id,
+        details={"feature_count": len(features)},
+    )
     return {"ok": True, "session": _session_to_payload(updated)}
 
 
@@ -1457,7 +1494,7 @@ def _format_coordinate_number(value: float, decimals: int) -> str:
 
 
 @router.get("/sessions/{session_id}/exports/staking.csv")
-def export_georeference_staking_csv(session_id: str, raw: bool = False, db: Session = Depends(get_db)):
+def export_georeference_staking_csv(session_id: str, request: Request, raw: bool = False, db: Session = Depends(get_db)):
     row = _load_session_row(db, session_id)
     target_coordinate_system = str(row.get("target_coordinate_system") or "wgs84")
     transform_json = _safe_json_load(row.get("transform_json"), {}) or {}
@@ -1512,6 +1549,14 @@ def export_georeference_staking_csv(session_id: str, raw: bool = False, db: Sess
         source_name = str(row.get("source_file_name") or "").strip()
         identity_source = os.path.splitext(source_name)[0] if source_name else ""
     identity = _safe_filename_fragment(identity_source, f"Session_{str(session_id)[:8]}")
+    log_survey_activity(
+        db,
+        event_type="export_downloaded",
+        workflow="georeference",
+        request=request,
+        georeference_session_id=session_id,
+        details={"export_type": "staking.csv", "row_count": len(rows)},
+    )
     return Response(
         content="\ufeff" + csv_buffer.getvalue(),
         media_type="text/csv; charset=utf-8",

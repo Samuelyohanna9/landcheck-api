@@ -12,7 +12,8 @@ from app.db import SessionLocal
 from app.utils.hazard_common import classify_risk, risk_tier_legend
 from app.utils.hazard_flood import compute_flood_risk, overlay_to_data_url as flood_overlay_to_data_url
 from app.utils.hazard_erosion import compute_erosion_risk, overlay_to_data_url as erosion_overlay_to_data_url
-from app.utils.hazard_pdf import render_flood_report_pdf, render_erosion_report_pdf
+from app.utils.hazard_lulc import compute_lulc_summary, overlay_to_data_url as lulc_overlay_to_data_url
+from app.utils.hazard_pdf import render_flood_report_pdf, render_erosion_report_pdf, render_lulc_report_pdf
 from app.utils.hazard_gis_export import build_hazard_gis_export_zip
 from app.utils.hazard_jobs import (
     get_hazard_job,
@@ -456,6 +457,73 @@ def erosion_pdf(payload: dict = Body(...), db: Session = Depends(get_db)):
     return _pdf_response_with_r2(pdf_path, "erosion_risk_report.pdf", "hazard-erosion")
 
 
+# ---------------- LAND USE / LAND COVER ----------------
+# Architecturally the odd one out among the three hazard types: purely informational (no risk
+# score/tier/badge - land cover isn't itself a hazard), no OSM buildings, no local-survey inputs.
+# compute_lulc_summary() returns (breakdown, overlay_png) - a 2-tuple, not flood/erosion's 4-tuple -
+# so it can't share their result-unpacking line in _run_hazard_analysis_job below.
+
+def _lulc_preview_payload(breakdown: dict, overlay_png: bytes) -> dict:
+    return {
+        "class_areas": breakdown.get("class_areas", []),
+        "class_count": breakdown.get("class_count", 0),
+        "dominant_class": breakdown.get("dominant_class"),
+        "dominant_pct": breakdown.get("dominant_pct"),
+        "total_area_ha": breakdown.get("total_area_ha"),
+        "overlay": lulc_overlay_to_data_url(overlay_png),
+        "note": "Land cover composition for this site, from Esri's 10m Annual Land Cover dataset.",
+        "buffer_m": breakdown.get("buffer_m", 500),
+        "data_available": bool(breakdown.get("data_available", True)),
+        "legend": breakdown.get("legend", []),
+        "interactive": breakdown.get("_interactive"),
+        "references": breakdown.get("_references", []),
+    }
+
+
+def _lulc_pdf_summary(breakdown: dict) -> dict:
+    return {
+        "class_areas": breakdown.get("class_areas", []),
+        "class_count": breakdown.get("class_count", 0),
+        "dominant_class": breakdown.get("dominant_class"),
+        "dominant_pct": breakdown.get("dominant_pct"),
+        "total_area_ha": breakdown.get("total_area_ha"),
+        "note": "Land cover composition for this site, from Esri's 10m Annual Land Cover dataset.",
+        "buffer_m": breakdown.get("buffer_m", 500),
+        "legend": breakdown.get("legend", []),
+        "references": breakdown.get("_references", []),
+    }
+
+
+@router.post("/lulc/preview")
+def lulc_preview(payload: dict = Body(...), db: Session = Depends(get_db)):
+    boundary = _extract_boundary(payload)
+    try:
+        breakdown, overlay_png = compute_lulc_summary(db, boundary)
+    except Exception as exc:
+        logger.exception("LULC preview failed")
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    return _lulc_preview_payload(breakdown, overlay_png)
+
+
+@router.post("/lulc/pdf")
+def lulc_pdf(payload: dict = Body(...), db: Session = Depends(get_db)):
+    boundary = _extract_boundary(payload)
+    try:
+        breakdown, overlay_png = compute_lulc_summary(db, boundary)
+    except Exception as exc:
+        logger.exception("LULC PDF failed")
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    os.makedirs(REPORTS_DIR, exist_ok=True)
+    tmp_pdf = tempfile.NamedTemporaryFile(suffix="_lulc_report.pdf", delete=False)
+    pdf_path = tmp_pdf.name
+    tmp_pdf.close()
+
+    summary = _lulc_pdf_summary(breakdown)
+    render_lulc_report_pdf(pdf_path, overlay_png, summary)
+    return _pdf_response_with_r2(pdf_path, "lulc_report.pdf", "hazard-lulc")
+
+
 # ---------------- GIS EXPORT ----------------
 
 def _gis_export_response(zip_bytes: bytes, filename: str) -> Response:
@@ -609,27 +677,35 @@ def _run_hazard_analysis_job(job_id: str) -> None:
         set_hazard_job_status(db, job_id, status="running", stage="Starting analysis...", progress_pct=1, started=True)
         report = make_progress_reporter(db, job_id)
 
+        # LULC returns a different shape (2-tuple: breakdown, overlay_png - no risk_value/risk_class,
+        # since land cover isn't itself a hazard) and so can't share flood/erosion's unpacking line.
+        risk_value = risk_class = class_color = legend = None
         if hazard_type == "flood":
             risk_value, risk_class, breakdown, overlay_png = compute_flood_risk(
                 db, boundary, show_raster, return_period, local_elevation_points,
                 site_type=site_params["site_type"], design_rainfall_mm=site_params["design_rainfall_mm"],
                 analysis_mode=site_params["analysis_mode"], progress_cb=report,
             )
-        else:
+            _, class_color = classify_risk(risk_value, breakdown.get("data_available", True))
+            legend = _build_legend(risk_class, class_color, "This Site", show_raster, RASTER_LEGEND_FLOOD)
+        elif hazard_type == "erosion":
             risk_value, risk_class, breakdown, overlay_png = compute_erosion_risk(
                 db, boundary, show_raster, local_elevation_points,
                 analysis_mode=site_params["analysis_mode"], progress_cb=report,
             )
-
-        _, class_color = classify_risk(risk_value, breakdown.get("data_available", True))
-        raster_legend = RASTER_LEGEND_FLOOD if hazard_type == "flood" else RASTER_LEGEND_EROSION
-        legend = _build_legend(risk_class, class_color, "This Site", show_raster, raster_legend)
+            _, class_color = classify_risk(risk_value, breakdown.get("data_available", True))
+            legend = _build_legend(risk_class, class_color, "This Site", show_raster, RASTER_LEGEND_EROSION)
+        else:  # lulc
+            breakdown, overlay_png = compute_lulc_summary(db, boundary, progress_cb=report)
+            legend = breakdown.get("legend", [])
 
         if output_type == "preview":
             if hazard_type == "flood":
                 result = _flood_preview_payload(risk_value, risk_class, class_color, breakdown, overlay_png, show_raster, return_period, legend)
-            else:
+            elif hazard_type == "erosion":
                 result = _erosion_preview_payload(risk_value, risk_class, class_color, breakdown, overlay_png, show_raster, legend)
+            else:
+                result = _lulc_preview_payload(breakdown, overlay_png)
             set_hazard_job_status(db, job_id, status="completed", stage="Complete", progress_pct=100, result_payload=result, completed=True)
 
         elif output_type == "pdf":
@@ -640,22 +716,34 @@ def _run_hazard_analysis_job(job_id: str) -> None:
             if hazard_type == "flood":
                 summary = _flood_pdf_summary(risk_value, risk_class, class_color, breakdown, show_raster, return_period, legend)
                 render_flood_report_pdf(pdf_path, overlay_png, summary)
-            else:
+                file_name = "flood_risk_report.pdf"
+            elif hazard_type == "erosion":
                 summary = _erosion_pdf_summary(risk_value, risk_class, class_color, breakdown, show_raster, legend)
                 render_erosion_report_pdf(pdf_path, overlay_png, summary)
+                file_name = "erosion_risk_report.pdf"
+            else:
+                summary = _lulc_pdf_summary(breakdown)
+                render_lulc_report_pdf(pdf_path, overlay_png, summary)
+                file_name = "lulc_report.pdf"
             with open(pdf_path, "rb") as f:
                 file_bytes = f.read()
             try:
                 os.remove(pdf_path)
             except OSError:
                 pass
-            file_name = "flood_risk_report.pdf" if hazard_type == "flood" else "erosion_risk_report.pdf"
             set_hazard_job_status(
                 db, job_id, status="completed", stage="Complete", progress_pct=100,
                 file_bytes=file_bytes, file_name=file_name, content_type="application/pdf", completed=True,
             )
 
         elif output_type == "gis-export":
+            if hazard_type == "lulc":
+                # Categorical land cover has no buildings/risk-score/value-surface to export in the
+                # shape build_hazard_gis_export_zip expects - out of scope for v1 rather than
+                # exporting something misleading. create_hazard_analysis_job already rejects this
+                # combination with an immediate 400 before a job is even queued; this is just the
+                # defense-in-depth backstop if that endpoint-level guard is ever bypassed.
+                raise ValueError("GIS export is not available for land cover analysis")
             export_data = breakdown.get("_gis_export") or {}
             if hazard_type == "flood":
                 zip_bytes = build_hazard_gis_export_zip(
@@ -711,11 +799,17 @@ def _run_hazard_analysis_job(job_id: str) -> None:
 
 @router.post("/{hazard_type}/analyze")
 def create_hazard_analysis_job(hazard_type: str, payload: dict = Body(...), db: Session = Depends(get_db)):
-    if hazard_type not in ("flood", "erosion"):
+    if hazard_type not in ("flood", "erosion", "lulc"):
         raise HTTPException(status_code=404, detail="Unknown hazard type")
     output_type = str(payload.get("output_type") or "preview")
     if output_type not in ("preview", "pdf", "gis-export"):
         raise HTTPException(status_code=400, detail="Unsupported output_type")
+    if hazard_type == "lulc" and output_type == "gis-export":
+        # Categorical land cover has no buildings/risk-score/value-surface to export in the shape
+        # build_hazard_gis_export_zip expects - rejected immediately here (rather than after
+        # queuing and polling a job that would always fail) - see _run_hazard_analysis_job's
+        # gis-export branch for the defense-in-depth backstop.
+        raise HTTPException(status_code=400, detail="GIS export is not available for land cover analysis")
     request_payload = {
         "geometry": _extract_boundary(payload),
         "show_raster": bool(payload.get("show_raster", False)),

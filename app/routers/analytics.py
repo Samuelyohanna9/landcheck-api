@@ -11,6 +11,7 @@ import glob
 from app.db import SessionLocal
 from app.utils.auth_security import require_super_admin_request
 from app.utils.survey_auth_security import ensure_survey_auth_schema
+from app.utils.survey_activity import ensure_survey_activity_table
 
 router = APIRouter(prefix="/analytics", tags=["analytics"])
 
@@ -644,6 +645,45 @@ def get_survey_users(request: Request, db: Session = Depends(get_db)):
                 }
                 for plot in (row["plots"] or [])
             ],
+        }
+        for row in rows
+    ]
+
+
+@router.get("/survey-activity")
+def get_survey_activity(request: Request, db: Session = Depends(get_db)):
+    """Recent server-confirmed Survey activity, including anonymous preview-only sessions."""
+    require_super_admin_request(db, request)
+    ensure_survey_activity_table(db)
+    rows = db.execute(text("""
+        SELECT e.id, e.event_type, e.workflow, e.plot_id, e.subdivision_batch_id,
+               e.georeference_session_id, e.details, e.created_at,
+               u.email AS actor_email, u.full_name AS actor_name
+               , CASE WHEN e.event_type = 'preview_completed' AND NOT EXISTS (
+                    SELECT 1
+                    FROM survey_activity_events later
+                    WHERE later.plot_id = e.plot_id
+                      AND later.event_type = 'export_downloaded'
+                      AND later.created_at >= e.created_at
+                 ) THEN TRUE ELSE FALSE END AS preview_only
+        FROM survey_activity_events e
+        LEFT JOIN survey_users u ON u.id = e.actor_user_id
+        ORDER BY e.created_at DESC, e.id DESC
+        LIMIT 250
+    """)).mappings().all()
+    return [
+        {
+            "id": int(row["id"]),
+            "event_type": row["event_type"],
+            "workflow": row["workflow"],
+            "plot_id": row.get("plot_id"),
+            "subdivision_batch_id": row.get("subdivision_batch_id"),
+            "georeference_session_id": row.get("georeference_session_id"),
+            "details": row.get("details") or {},
+            "created_at": row["created_at"].isoformat() if row.get("created_at") else None,
+            "actor_email": row.get("actor_email"),
+            "actor_name": row.get("actor_name"),
+            "preview_only": bool(row.get("preview_only")),
         }
         for row in rows
     ]

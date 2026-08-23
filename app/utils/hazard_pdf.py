@@ -94,6 +94,7 @@ def _render_hazard_report_pdf(
     insight: str = "",
     map_has_own_legend: bool = False,
     references: List[Dict[str, str]] = None,
+    show_risk_badge: bool = True,
 ) -> None:
     c = canvas.Canvas(output_path, pagesize=A4)
     width, height = A4
@@ -101,16 +102,21 @@ def _render_hazard_report_pdf(
     content_top = _draw_hazard_header(c, width, height, report_label=report_label, subtitle=subtitle)
 
     y = content_top - 26
-    _draw_risk_badge(c, 36, y - 40, risk_class, risk_score, class_color)
+    # Land cover has no risk score/tier - showing an empty/meaningless badge would look like a real
+    # result. headline_x shifts left to fill the space the badge would otherwise occupy.
+    headline_x = 36
+    if show_risk_badge:
+        _draw_risk_badge(c, 36, y - 40, risk_class, risk_score, class_color)
+        headline_x = 200
 
     c.setFillColor(HexColor("#111827"))
     c.setFont("Helvetica-Bold", 11)
-    c.drawString(200, y - 6, headline)
+    c.drawString(headline_x, y - 6, headline)
     content_bottom = y - 22
     if note:
         c.setFont("Helvetica", 8.5)
         c.setFillColor(HexColor("#4b5563"))
-        content_bottom = _draw_wrapped(c, note, 200, y - 22, width - 236, 11)
+        content_bottom = _draw_wrapped(c, note, headline_x, y - 22, width - 36 - headline_x, 11)
 
     if insight:
         insight_box_y = content_bottom - 4
@@ -388,4 +394,55 @@ def render_erosion_report_pdf(output_path: str, overlay_png: bytes, summary: Dic
         insight=insight,
         map_has_own_legend=True,
         references=summary.get("references") or [],
+    )
+
+
+def render_lulc_report_pdf(output_path: str, overlay_png: bytes, summary: Dict[str, object]) -> None:
+    class_areas = summary.get("class_areas") or []
+    # component_bars values are FRACTIONS (0-1), not percentages - _render_hazard_report_pdf's
+    # shared bar-chart block multiplies by 100 itself (matching flood/erosion's own component
+    # scores, which are already 0-1). Passing already-0-100 percentages here would double them.
+    bar_data = [(c["label"], float(c.get("pct", 0)) / 100.0, c["color"]) for c in class_areas]
+
+    dominant_label = summary.get("dominant_class") or "mixed cover"
+    dominant_pct = summary.get("dominant_pct")
+    headline = (
+        f"Land cover composition — {dominant_label} dominant ({dominant_pct}% of site)"
+        if dominant_pct is not None
+        else f"Land cover composition — {dominant_label} dominant"
+    )
+
+    _render_hazard_report_pdf(
+        output_path,
+        overlay_png,
+        report_label="Land Cover Report",
+        subtitle="Land use / land cover composition",
+        risk_score="",
+        risk_class="",
+        class_color="#000000",
+        headline=headline,
+        stat_cards=[
+            ("Classes Present", str(summary.get("class_count", "-"))),
+            ("Dominant Class", str(dominant_label)),
+            ("Total Area (ha)", str(summary.get("total_area_ha", "-"))),
+        ],
+        component_bars=bar_data,
+        method=(
+            "Land cover is classified from Esri's 10m resolution Sentinel-2-derived Annual Land "
+            "Cover dataset (Karra et al., 2021 - Impact Observatory / Esri, via Google Earth "
+            "Engine). Per-class area is a pixel-count histogram over the site boundary at native "
+            "10m resolution.\n"
+            "The map's hillshade terrain background is derived from the Copernicus GLO-30 global DEM."
+        ),
+        footnotes=[
+            f"Analysis buffer: {summary.get('buffer_m', '500')} m around the plot (map context only "
+            "- land cover % is measured over the plot boundary itself).",
+            "Datasource: Esri Land Cover, Copernicus GLO-30 DEM.",
+            "Informational land cover summary only - not a risk score or hazard determination.",
+        ],
+        legend=summary.get("legend") or [],
+        note=str(summary.get("note", "")),
+        map_has_own_legend=True,
+        references=summary.get("references") or [],
+        show_risk_badge=False,
     )
