@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import io
+import logging
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import ee
@@ -13,6 +14,8 @@ from sqlalchemy.orm import Session
 from app.utils.gee_client import init_gee
 from app.utils.hazard_map_renderer import LULC_CLASS_COLORS, _display_epsg_for, render_lulc_hazard_map
 
+logger = logging.getLogger(__name__)
+
 # Esri's 10m Annual Land Cover time series (Sentinel-2-derived, via Impact Observatory / National
 # Geographic Society), 2017-present, hosted on Earth Engine's community catalog. Chosen specifically
 # because its class scheme/colors are the ones the user's reference poster uses - ESA WorldCover and
@@ -21,6 +24,9 @@ from app.utils.hazard_map_renderer import LULC_CLASS_COLORS, _display_epsg_for, 
 # rather than assumed - community datasets do occasionally get renamed/rehosted, so if this ever
 # 404s, check that catalog page for the current asset ID first.
 LULC_ASSET_ID = "projects/sat-io/open-datasets/landcover/ESRI_Global-LULC_10m_TS"
+# Single-year (2020) fallback if the time-series collection can't be loaded/queried for some
+# reason - also verified live against the same catalog.
+LULC_ASSET_ID_FALLBACK = "projects/sat-io/open-datasets/landcover/ESRI_Global-LULC_10m"
 
 LULC_REFERENCES = [
     {
@@ -115,24 +121,36 @@ def compute_lulc_summary(
 
     geom = ee.Geometry(boundary_geojson)
 
-    report("Loading land cover classification...", 20)
-    landcover_collection = ee.ImageCollection(LULC_ASSET_ID)
-    landcover_image = landcover_collection.sort("system:time_start", False).first().rename("landcover")
-
     # Class-area % is computed over the plot boundary itself (not the wider render buffer) - "how
     # much of MY land is water/trees/crops" is the natural question, the buffer below is only for
     # the map's visual field of view, matching how flood/erosion already separate "what's scored"
     # from "what's shown for context".
-    report("Computing land cover composition...", 35)
+    report("Loading land cover classification...", 20)
     hist_info: Dict[str, int] = {}
-    try:
-        hist = landcover_image.reduceRegion(
-            reducer=ee.Reducer.frequencyHistogram(),
-            geometry=geom, scale=10, maxPixels=int(1e9), bestEffort=True,
-        ).get("landcover")
-        hist_info = hist.getInfo() or {}
-    except Exception:
-        hist_info = {}
+    landcover_image: Optional["ee.Image"] = None
+    for asset_id in (LULC_ASSET_ID, LULC_ASSET_ID_FALLBACK):
+        try:
+            # .mosaic() (not .sort("system:time_start", False).first()) - the same idiom already
+            # used for the DEM collection just above, and proven to work in this environment. A
+            # single "most recent image" pick depends on this specific community-catalog
+            # collection actually setting system:time_start in a sortable format, which isn't
+            # guaranteed and was the suspected cause of every real request silently coming back
+            # with zero classified pixels despite the DEM/hillshade fetch succeeding fine. Mosaic
+            # merges every image the collection has, so it doesn't depend on that assumption at all.
+            candidate_image = ee.ImageCollection(asset_id).mosaic().rename("landcover")
+            hist = candidate_image.reduceRegion(
+                reducer=ee.Reducer.frequencyHistogram(),
+                geometry=geom, scale=10, maxPixels=int(1e9), bestEffort=True,
+            ).get("landcover")
+            candidate_hist = hist.getInfo() or {}
+        except Exception:
+            logger.warning("Land cover histogram fetch failed for asset %s", asset_id, exc_info=True)
+            continue
+        if candidate_hist:
+            hist_info = candidate_hist
+            landcover_image = candidate_image
+            break
+        logger.warning("Land cover asset %s returned zero classified pixels for this boundary", asset_id)
 
     try:
         total_area_ha = float(geom.area(1).getInfo()) / 10000.0
@@ -181,9 +199,12 @@ def compute_lulc_summary(
     elevation_grid, elevation_scale_m = _fetch_ee_grid(
         dem_image, "elevation", minx, miny, maxx, maxy, display_epsg, base_scale_m=30.0,
     )
-    landcover_grid, landcover_scale_m = _fetch_ee_grid(
-        landcover_image, "landcover", minx, miny, maxx, maxy, display_epsg, base_scale_m=10.0, default_value=0,
-    )
+    landcover_grid: Optional[np.ndarray] = None
+    landcover_scale_m = 10.0
+    if landcover_image is not None:
+        landcover_grid, landcover_scale_m = _fetch_ee_grid(
+            landcover_image, "landcover", minx, miny, maxx, maxy, display_epsg, base_scale_m=10.0, default_value=0,
+        )
 
     breakdown: Dict[str, Any] = {
         "class_areas": class_areas,
