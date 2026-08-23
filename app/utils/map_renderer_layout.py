@@ -1802,17 +1802,89 @@ def annotate_vertices(
     return skipped, placed_boxes
 
 
+MAX_IN_MAP_DEFERRED_DIMENSIONS = 6
+
+
+def _write_deferred_boundary_schedule_pages(fig, output_path: str, paper_size: str, dpi: int = 200) -> None:
+    """Write clean companion sheets for dimensions that cannot be read on the map sheet."""
+    entries = getattr(fig, "_landcheck_deferred_boundary_entries", None)
+    if not entries:
+        return
+
+    page_size = get_paper_config(paper_size or "A4")
+    rows_per_group = 15
+    groups_per_page = 2
+    rows_per_page = rows_per_group * groups_per_page
+    for page_index, start in enumerate(range(0, len(entries), rows_per_page), start=1):
+        page_entries = entries[start:start + rows_per_page]
+        schedule_fig = plt.figure(figsize=(page_size["width"], page_size["height"]))
+        schedule_ax = schedule_fig.add_axes([0.055, 0.075, 0.89, 0.85])
+        schedule_ax.axis("off")
+        schedule_fig.text(0.5, 0.95, "BOUNDARY DIMENSION SCHEDULE", ha="center", va="top", fontsize=13, weight="bold")
+        schedule_fig.text(
+            0.5,
+            0.925,
+            f"SHEET {page_index + 1} - close boundary dimensions deferred from the survey plan graphic",
+            ha="center",
+            va="top",
+            fontsize=8,
+        )
+        schedule_fig.text(0.055, 0.045, "All values are in metres. Refer to station letters on Sheet 1.", ha="left", va="bottom", fontsize=7)
+
+        groups = [page_entries[i:i + rows_per_group] for i in range(0, len(page_entries), rows_per_group)]
+        group_count = max(1, len(groups))
+        group_width = 0.96 / group_count
+        for group_index, group in enumerate(groups):
+            table = schedule_ax.table(
+                cellText=[
+                    [item["from"], item["to"], format_bearing_dms(item["bearing"]), f"{item['distance']:.2f}"]
+                    for item in group
+                ],
+                colLabels=["FROM", "TO", "BEARING", "DIST (m)"],
+                cellLoc="center",
+                colLoc="center",
+                bbox=[0.02 + group_index * group_width, 0.08, group_width - 0.025, 0.78],
+            )
+            table.auto_set_font_size(False)
+            table.set_fontsize(7)
+            for (row, _), cell in table.get_celld().items():
+                cell.set_edgecolor("#333333")
+                cell.set_linewidth(0.45)
+                if row == 0:
+                    cell.set_facecolor("#f1f1f1")
+                    cell.set_text_props(weight="bold")
+
+        schedule_fig.savefig(f"{output_path}.boundary-schedule-{page_index}.png", dpi=dpi)
+        plt.close(schedule_fig)
+
+
 def draw_skipped_table(ax, entries, font_scale=1.0, poly=None, avoid_boxes=None):
     if not entries:
         return
 
+    # A large table over the graphic makes neither the parcel nor its dimensions legible. Keep
+    # only a genuinely small schedule on Sheet 1; the PDF compositor appends the full schedule
+    # as Sheet 2 (and further sheets where necessary).
+    if len(entries) > MAX_IN_MAP_DEFERRED_DIMENSIONS:
+        ax.figure._landcheck_deferred_boundary_entries = list(entries)
+        ax.text(
+            0.03,
+            0.035,
+            f"CLOSE BOUNDARY DIMENSIONS: SEE SHEET 2 ({len(entries)} SEGMENTS)",
+            transform=ax.transAxes,
+            ha="left",
+            va="bottom",
+            fontsize=max(5, int(5.5 * font_scale)),
+            color="black",
+            bbox={"boxstyle": "square,pad=0.25", "facecolor": "white", "edgecolor": "#333333", "linewidth": 0.5},
+            zorder=92,
+        )
+        return
+
     header = ["From", "To", "Bearing", "Dist (m)"]
 
-    # A hard 8-row cap used to just silently drop every station beyond the 8th - on a plot with
-    # many closely spaced vertices (a curved frontage, a many-sided parcel) most of the boundary
-    # schedule vanished instead of being shown anywhere. Instead keep every entry and grow the
-    # table sideways into extra "newspaper" column-groups (repeating the header) once a single
-    # column would run past a comfortable height, rather than truncating the data.
+    # This path is deliberately capped by MAX_IN_MAP_DEFERRED_DIMENSIONS, so it remains a small
+    # local reference rather than an overlay that obscures the drawing.
     row_h = 0.026
     max_col_h = 0.5  # fraction of the axes height a single column of rows may occupy
     rows_per_group = max(4, int(max_col_h / row_h) - 1)
@@ -3526,6 +3598,7 @@ def _render_plot_map_layout_adamawa(
     ax.set_aspect("equal")
     ax.axis("off")
     fig.canvas.draw()
+    _write_deferred_boundary_schedule_pages(fig, output_path, paper_size, dpi=dpi)
     fig.savefig(output_path, dpi=dpi)
     plt.close(fig)
 
@@ -4493,6 +4566,7 @@ def _render_plot_map_layout_cadastral(
     ax.set_aspect("equal")
     ax.axis("off")
     fig.canvas.draw()
+    _write_deferred_boundary_schedule_pages(fig, output_path, paper_size, dpi=dpi)
     fig.savefig(output_path, dpi=dpi)
     plt.close(fig)
 
@@ -5087,6 +5161,7 @@ def _render_plot_map_layout_fct(
         font_scale=font_scale, text_color=text_color,
     )
 
+    _write_deferred_boundary_schedule_pages(fig, output_path, paper_size, dpi=dpi)
     fig.savefig(output_path, dpi=dpi)
     plt.close(fig)
 
@@ -5768,6 +5843,7 @@ def _render_plot_map_layout_site_plan(
         grid_color=grid_color,
     )
 
+    _write_deferred_boundary_schedule_pages(fig, output_path, paper_size, dpi=dpi)
     fig.savefig(output_path, dpi=dpi)
     plt.close(fig)
 
@@ -6544,5 +6620,6 @@ def render_plot_map_layout(
 
     fig.canvas.draw()
     # Match orthophoto save behavior so the page frame fills the preview consistently.
+    _write_deferred_boundary_schedule_pages(fig, output_path, paper_size, dpi=dpi)
     fig.savefig(output_path, dpi=dpi)
     plt.close(fig)
