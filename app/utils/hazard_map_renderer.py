@@ -58,20 +58,50 @@ SLOPE_BAND_LABELS = [0.0, 2.0, 5.0, 10.0, 15.0, 25.0]
 SLOPE_COLORS = ["#dcfce7", "#bbf7d0", "#fde047", "#fb923c", "#ef4444", "#7f1d1d"]
 BUILDING_SLOPE_THREATENED_DEG = 15.0
 
-# Esri's official 10m Annual Land Cover class scheme (class value -> (label, hex color)), verified
-# against the live gee-community-catalog.org listing for this exact dataset (see hazard_lulc.py's
-# LULC_ASSET_ID) rather than guessed - these are the same colors Esri's own published maps use, and
-# match the user's reference poster exactly.
-LULC_CLASS_COLORS: Dict[int, Tuple[str, str]] = {
+# Esri publishes its 10m Land Cover under TWO genuinely different raw pixel-value schemes across
+# its Earth Engine community-catalog assets - verified with two separate direct, verbatim-quoted
+# fetches of the catalog pages, since assuming they shared one scheme is exactly what caused a real
+# wrong result (a Nigerian savanna plot reading as "93% Snow/Ice", because the raw pixel values were
+# being read against the wrong table). Which table applies depends on which asset actually supplied
+# the data for a given request - see hazard_lulc.py's per-asset selection logic.
+
+# projects/sat-io/open-datasets/landcover/ESRI_Global-LULC_10m_TS (2017-2025 annual time series,
+# PRIMARY asset - this is the one whose class list/colors match the user's reference poster,
+# specifically its "Rangeland" class). Raw values have GAPS (3 and 6 are not used) - do not
+# "renumber" these down to a contiguous 1-9, that mismatch was the bug.
+LULC_CLASS_COLORS_TS: Dict[int, Tuple[str, str]] = {
     1: ("Water", "#1A5BAB"),
     2: ("Trees", "#358221"),
-    3: ("Flooded Vegetation", "#87D19E"),
-    4: ("Crops", "#FFDB5C"),
-    5: ("Built Area", "#ED022A"),
-    6: ("Bare Ground", "#EDE9E4"),
-    7: ("Snow/Ice", "#F2FAFF"),
-    8: ("Clouds", "#C8C8C8"),
-    9: ("Rangeland", "#C6AD8D"),
+    4: ("Flooded Vegetation", "#87D19E"),
+    5: ("Crops", "#FFDB5C"),
+    7: ("Built Area", "#ED022A"),
+    8: ("Bare Ground", "#EDE9E4"),
+    9: ("Snow/Ice", "#F2FAFF"),
+    10: ("Clouds", "#C8C8C8"),
+    11: ("Rangeland", "#C6AD8D"),
+}
+
+# projects/sat-io/open-datasets/landcover/ESRI_Global-LULC_10m (single-year 2020, FALLBACK) - the
+# OLDER pre-merge scheme, before Esri combined Grass + Scrub into one "Rangeland" class. Reconstructed
+# from Digital Earth Africa's own product documentation (docs.digitalearthafrica.org), which states
+# outright that Grass was "formerly class 3" and Scrub was "formerly class 6" - i.e. these are
+# exactly the two values now sitting unused (gaps) in LULC_CLASS_COLORS_TS above, because they were
+# retired into that scheme's class 11 "Rangeland". Every other class keeps the same value in both
+# schemes; DEA's documentation doesn't confirm a "No Data" class exists at all for this dataset (an
+# earlier, less authoritative community-wiki fetch claimed one at value 1 with everything else
+# shifted by one, which does not reconcile with DEA's explicit "class 3"/"class 6" values, so that
+# claim was discarded in favor of this DEA-corroborated reconstruction).
+LULC_CLASS_COLORS_2020: Dict[int, Tuple[str, str]] = {
+    1: ("Water", "#1A5BAB"),
+    2: ("Trees", "#358221"),
+    3: ("Grass", "#88B053"),
+    4: ("Flooded Vegetation", "#87D19E"),
+    5: ("Crops", "#FFDB5C"),
+    6: ("Scrub/Shrub", "#DFC35A"),
+    7: ("Built Area", "#ED022A"),
+    8: ("Bare Ground", "#EDE9E4"),
+    9: ("Snow/Ice", "#F2FAFF"),
+    10: ("Clouds", "#C8C8C8"),
 }
 
 
@@ -724,15 +754,20 @@ def render_erosion_hazard_map(
     }
 
 
-def _landcover_grid_to_rgba(landcover_grid: np.ndarray, alpha: float = 0.75) -> np.ndarray:
-    """Converts a 2D array of Esri class codes into an HxWx4 RGBA array using LULC_CLASS_COLORS,
-    left fully transparent wherever the code isn't a real class (e.g. the sampling grid's nodata
-    fill value) - built as a direct per-pixel lookup rather than a matplotlib ListedColormap/
-    BoundaryNorm, since the class codes are non-contiguous (1-9, with no gaps here, but the scheme
-    reserves room for others) and a direct lookup sidesteps norm-edge-case bugs entirely.
+def _landcover_grid_to_rgba(
+    landcover_grid: np.ndarray, class_colors: Dict[int, Tuple[str, str]], alpha: float = 0.75,
+) -> np.ndarray:
+    """Converts a 2D array of Esri class codes into an HxWx4 RGBA array, left fully transparent
+    wherever the code isn't a real class (e.g. the sampling grid's nodata fill value, or an
+    out-of-scheme code). `class_colors` must be whichever of LULC_CLASS_COLORS_TS/_2020 actually
+    matches the asset this grid's pixel values came from - the two Esri assets use genuinely
+    different raw value schemes (see the constants above), so this can never be hardcoded to one
+    global table. Built as a direct per-pixel lookup rather than a matplotlib ListedColormap/
+    BoundaryNorm, since both schemes have gaps in their value ranges and a direct lookup sidesteps
+    norm-edge-case bugs entirely.
     """
     rgba = np.zeros((*landcover_grid.shape, 4), dtype=float)
-    for class_id, (_, hex_color) in LULC_CLASS_COLORS.items():
+    for class_id, (_, hex_color) in class_colors.items():
         mask = landcover_grid == class_id
         if not mask.any():
             continue
@@ -748,6 +783,7 @@ def render_lulc_hazard_map(
     boundary_geojson: Dict[str, Any],
     landcover_grid: Optional[np.ndarray],
     landcover_scale_m: float,
+    landcover_class_colors: Dict[int, Tuple[str, str]],
     elevation_grid: Optional[np.ndarray],
     elevation_scale_m: float,
     class_areas: List[Dict[str, Any]],
@@ -795,7 +831,7 @@ def render_lulc_hazard_map(
     landcover_available = landcover_grid is not None and landcover_grid.size > 4
     if landcover_available:
         try:
-            rgba = _landcover_grid_to_rgba(landcover_grid)
+            rgba = _landcover_grid_to_rgba(landcover_grid, landcover_class_colors)
             ax.imshow(rgba, extent=(minx, maxx, miny, maxy), origin="upper", zorder=2)
         except Exception:
             landcover_available = False

@@ -12,27 +12,43 @@ from shapely.geometry import shape
 from sqlalchemy.orm import Session
 
 from app.utils.gee_client import init_gee
-from app.utils.hazard_map_renderer import LULC_CLASS_COLORS, _display_epsg_for, render_lulc_hazard_map
+from app.utils.hazard_map_renderer import (
+    LULC_CLASS_COLORS_2020,
+    LULC_CLASS_COLORS_TS,
+    _display_epsg_for,
+    render_lulc_hazard_map,
+)
 
 logger = logging.getLogger(__name__)
 
-# Esri's 10m Global Land Use Land Cover from Sentinel-2 (Impact Observatory / National Geographic
-# Society), hosted on Earth Engine's community catalog. Chosen specifically because its class
-# scheme/colors are the ones the user's reference poster uses - ESA WorldCover and Google Dynamic
-# World both use different class lists (no "Rangeland", different wetland/grass splits) and would
-# not visually match. Verified live against the catalog (gee-community-catalog.org) rather than
-# assumed - community datasets do occasionally get renamed/rehosted, so if this ever 404s, check
-# that catalog page for the current asset ID first.
+# Esri's 10m Land Cover from Sentinel-2 (Impact Observatory / National Geographic Society), hosted
+# on Earth Engine's community catalog. Chosen specifically because its class list/colors are the
+# ones the user's reference poster uses - ESA WorldCover and Google Dynamic World both use different
+# class lists and would not visually match.
 #
-# The single-year (2020) asset is PRIMARY, not the multi-year "_TS" time-series collection - a real
-# test against the time series produced an implausible result (~93% "Snow/Ice" and an out-of-scheme
-# "Class 11" for a savanna plot in Adamawa, Nigeria), most likely from mosaicking across years whose
-# per-tile coverage/encoding doesn't line up cleanly. The single well-established 2020 classification
-# doesn't have that multi-year-composite risk. The time series is kept as a fallback in case the
-# single-year asset is ever unavailable, but a genuinely wrong-but-non-empty result from it must not
-# be silently trusted either - see the valid-class-code filter in compute_lulc_summary below.
-LULC_ASSET_ID = "projects/sat-io/open-datasets/landcover/ESRI_Global-LULC_10m"
-LULC_ASSET_ID_FALLBACK = "projects/sat-io/open-datasets/landcover/ESRI_Global-LULC_10m_TS"
+# Two assets exist, and they use GENUINELY DIFFERENT raw pixel-value schemes - the ORIGINAL bug was
+# reading one asset's raw values against a wrong, invented contiguous 1-9 table, which produced an
+# impossible "93% Snow/Ice" reading for a real plot in Adamawa, Nigeria:
+#   - ESRI_Global-LULC_10m_TS (2017-2025 annual time series): 1=Water, 2=Trees, 4=Flooded
+#     Vegetation, 5=Crops, 7=Built Area, 8=Bare Ground, 9=Snow/Ice, 10=Clouds, 11=Rangeland. This
+#     is PRIMARY - its "Rangeland" class matches the reference poster. Verified against a direct,
+#     verbatim-quoted fetch of the community catalog page.
+#   - ESRI_Global-LULC_10m (single-year 2020, FALLBACK): the OLDER pre-merge scheme, before Esri
+#     combined Grass + Scrub into the TS scheme's "Rangeland" class - 1=Water, 2=Trees, 3=Grass,
+#     4=Flooded Vegetation, 5=Crops, 6=Scrub/Shrub, 7=Built Area, 8=Bare Ground, 9=Snow/Ice,
+#     10=Clouds. Cross-checked against Digital Earth Africa's product documentation, which states
+#     Grass was "formerly class 3" and Scrub was "formerly class 6" - exactly the two values now
+#     unused (gaps) in the TS scheme above, confirming both tables reconcile with each other.
+# See LULC_CLASS_COLORS_TS/_2020 in hazard_map_renderer.py for the full reasoning. LULC_ASSETS below
+# pairs each asset with its own correct table so this class of bug can't happen again silently.
+LULC_ASSET_ID = "projects/sat-io/open-datasets/landcover/ESRI_Global-LULC_10m_TS"
+LULC_ASSET_ID_FALLBACK = "projects/sat-io/open-datasets/landcover/ESRI_Global-LULC_10m"
+
+# (asset_id, its correct class-code table) pairs, tried in order.
+LULC_ASSETS: List[Tuple[str, Dict[int, Tuple[str, str]]]] = [
+    (LULC_ASSET_ID, LULC_CLASS_COLORS_TS),
+    (LULC_ASSET_ID_FALLBACK, LULC_CLASS_COLORS_2020),
+]
 
 LULC_REFERENCES = [
     {
@@ -60,9 +76,9 @@ LULC_REFERENCES = [
 _MAX_GRID_PIXELS = 500 * 500
 
 
-def _is_known_class_code(class_id_str: str) -> bool:
+def _is_known_class_code(class_id_str: str, class_colors: Dict[int, Tuple[str, str]]) -> bool:
     try:
-        return int(float(class_id_str)) in LULC_CLASS_COLORS
+        return int(float(class_id_str)) in class_colors
     except (TypeError, ValueError):
         return False
 
@@ -157,7 +173,8 @@ def compute_lulc_summary(
     report("Loading land cover classification...", 20)
     hist_info: Dict[str, int] = {}
     landcover_image: Optional["ee.Image"] = None
-    for asset_id in (LULC_ASSET_ID, LULC_ASSET_ID_FALLBACK):
+    landcover_class_colors: Dict[int, Tuple[str, str]] = LULC_CLASS_COLORS_TS
+    for asset_id, class_colors in LULC_ASSETS:
         try:
             candidate_image = _load_landcover_source_image(asset_id)
             hist = candidate_image.reduceRegion(
@@ -169,14 +186,14 @@ def compute_lulc_summary(
             logger.warning("Land cover histogram fetch failed for asset %s", asset_id, exc_info=True)
             continue
 
-        # Keep only Esri's actual known class codes (1-9). A real test against the "_TS" asset
-        # returned a supposed "Class 11", which doesn't exist in Esri's published scheme at all -
-        # that's a masking/encoding artifact from mosaicking across years, not a legitimate 10th
-        # land-cover type, and must never be counted as real area or shown as a fabricated legend
-        # entry. If most of the pixels this asset returned aren't valid codes, the whole result is
-        # untrustworthy (not just the invalid pixels) - move on to the next asset instead.
+        # Keep only THIS asset's own known class codes (see LULC_ASSETS above - the two Esri
+        # assets use different raw value schemes, each with gaps). A real test once returned a
+        # supposed "Class 11" because the wrong table was used to interpret the values - an
+        # out-of-scheme code must never be counted as real area or shown as a fabricated legend
+        # entry. If most of the pixels this asset returned aren't valid codes for ITS OWN table,
+        # the whole result is untrustworthy (not just the invalid pixels) - try the next asset.
         raw_pixels = sum(int(v) for v in raw_hist.values())
-        valid_hist = {k: v for k, v in raw_hist.items() if _is_known_class_code(k)}
+        valid_hist = {k: v for k, v in raw_hist.items() if _is_known_class_code(k, class_colors)}
         valid_pixels = sum(int(v) for v in valid_hist.values())
         if raw_pixels and valid_pixels / raw_pixels < 0.5:
             logger.warning(
@@ -187,6 +204,7 @@ def compute_lulc_summary(
         if valid_hist:
             hist_info = valid_hist
             landcover_image = candidate_image
+            landcover_class_colors = class_colors
             break
         logger.warning("Land cover asset %s returned zero classified pixels for this boundary", asset_id)
 
@@ -204,7 +222,7 @@ def compute_lulc_summary(
             class_id = int(float(class_id_str))
         except (TypeError, ValueError):
             continue
-        label, color = LULC_CLASS_COLORS.get(class_id, (f"Class {class_id}", "#9ca3af"))
+        label, color = landcover_class_colors.get(class_id, (f"Class {class_id}", "#9ca3af"))
         pct = (count / total_pixels * 100.0) if total_pixels else 0.0
         class_areas.append({
             "class_id": class_id,
@@ -261,6 +279,7 @@ def compute_lulc_summary(
         boundary_geojson=boundary_geojson,
         landcover_grid=landcover_grid,
         landcover_scale_m=landcover_scale_m,
+        landcover_class_colors=landcover_class_colors,
         elevation_grid=elevation_grid,
         elevation_scale_m=elevation_scale_m,
         class_areas=class_areas,
