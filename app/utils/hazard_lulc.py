@@ -16,17 +16,23 @@ from app.utils.hazard_map_renderer import LULC_CLASS_COLORS, _display_epsg_for, 
 
 logger = logging.getLogger(__name__)
 
-# Esri's 10m Annual Land Cover time series (Sentinel-2-derived, via Impact Observatory / National
-# Geographic Society), 2017-present, hosted on Earth Engine's community catalog. Chosen specifically
-# because its class scheme/colors are the ones the user's reference poster uses - ESA WorldCover and
-# Google Dynamic World both use different class lists (no "Rangeland", different wetland/grass
-# splits) and would not visually match. Verified live against the catalog (gee-community-catalog.org)
-# rather than assumed - community datasets do occasionally get renamed/rehosted, so if this ever
-# 404s, check that catalog page for the current asset ID first.
-LULC_ASSET_ID = "projects/sat-io/open-datasets/landcover/ESRI_Global-LULC_10m_TS"
-# Single-year (2020) fallback if the time-series collection can't be loaded/queried for some
-# reason - also verified live against the same catalog.
-LULC_ASSET_ID_FALLBACK = "projects/sat-io/open-datasets/landcover/ESRI_Global-LULC_10m"
+# Esri's 10m Global Land Use Land Cover from Sentinel-2 (Impact Observatory / National Geographic
+# Society), hosted on Earth Engine's community catalog. Chosen specifically because its class
+# scheme/colors are the ones the user's reference poster uses - ESA WorldCover and Google Dynamic
+# World both use different class lists (no "Rangeland", different wetland/grass splits) and would
+# not visually match. Verified live against the catalog (gee-community-catalog.org) rather than
+# assumed - community datasets do occasionally get renamed/rehosted, so if this ever 404s, check
+# that catalog page for the current asset ID first.
+#
+# The single-year (2020) asset is PRIMARY, not the multi-year "_TS" time-series collection - a real
+# test against the time series produced an implausible result (~93% "Snow/Ice" and an out-of-scheme
+# "Class 11" for a savanna plot in Adamawa, Nigeria), most likely from mosaicking across years whose
+# per-tile coverage/encoding doesn't line up cleanly. The single well-established 2020 classification
+# doesn't have that multi-year-composite risk. The time series is kept as a fallback in case the
+# single-year asset is ever unavailable, but a genuinely wrong-but-non-empty result from it must not
+# be silently trusted either - see the valid-class-code filter in compute_lulc_summary below.
+LULC_ASSET_ID = "projects/sat-io/open-datasets/landcover/ESRI_Global-LULC_10m"
+LULC_ASSET_ID_FALLBACK = "projects/sat-io/open-datasets/landcover/ESRI_Global-LULC_10m_TS"
 
 LULC_REFERENCES = [
     {
@@ -52,6 +58,29 @@ LULC_REFERENCES = [
 # for an unusually large boundary from producing an oversized getInfo() payload. _fetch_ee_grid
 # steps its scale coarser (never finer) until a request would fit within this.
 _MAX_GRID_PIXELS = 500 * 500
+
+
+def _is_known_class_code(class_id_str: str) -> bool:
+    try:
+        return int(float(class_id_str)) in LULC_CLASS_COLORS
+    except (TypeError, ValueError):
+        return False
+
+
+def _load_landcover_source_image(asset_id: str) -> "ee.Image":
+    """Loads a landcover asset as a single classification image, regardless of whether it's
+    published as an ImageCollection (a set of tiles needing .mosaic() to merge into one continuous
+    image - the common pattern for global community-hosted datasets) or a plain single ee.Image.
+    Not verifiable against the live catalog from this environment, so this tries the collection
+    form first (the more likely one for a global-coverage dataset) and falls back to a bare Image.
+    ee calls are lazy - neither branch actually validates anything server-side until the caller
+    evaluates it (e.g. via reduceRegion().getInfo()), so this only reflects client-side type errors,
+    not "does this asset exist" - the real validation happens in compute_lulc_summary's caller loop.
+    """
+    try:
+        return ee.ImageCollection(asset_id).mosaic().rename("landcover")
+    except Exception:
+        return ee.Image(asset_id).rename("landcover")
 
 
 def _fetch_ee_grid(
@@ -130,24 +159,33 @@ def compute_lulc_summary(
     landcover_image: Optional["ee.Image"] = None
     for asset_id in (LULC_ASSET_ID, LULC_ASSET_ID_FALLBACK):
         try:
-            # .mosaic() (not .sort("system:time_start", False).first()) - the same idiom already
-            # used for the DEM collection just above, and proven to work in this environment. A
-            # single "most recent image" pick depends on this specific community-catalog
-            # collection actually setting system:time_start in a sortable format, which isn't
-            # guaranteed and was the suspected cause of every real request silently coming back
-            # with zero classified pixels despite the DEM/hillshade fetch succeeding fine. Mosaic
-            # merges every image the collection has, so it doesn't depend on that assumption at all.
-            candidate_image = ee.ImageCollection(asset_id).mosaic().rename("landcover")
+            candidate_image = _load_landcover_source_image(asset_id)
             hist = candidate_image.reduceRegion(
                 reducer=ee.Reducer.frequencyHistogram(),
                 geometry=geom, scale=10, maxPixels=int(1e9), bestEffort=True,
             ).get("landcover")
-            candidate_hist = hist.getInfo() or {}
+            raw_hist = hist.getInfo() or {}
         except Exception:
             logger.warning("Land cover histogram fetch failed for asset %s", asset_id, exc_info=True)
             continue
-        if candidate_hist:
-            hist_info = candidate_hist
+
+        # Keep only Esri's actual known class codes (1-9). A real test against the "_TS" asset
+        # returned a supposed "Class 11", which doesn't exist in Esri's published scheme at all -
+        # that's a masking/encoding artifact from mosaicking across years, not a legitimate 10th
+        # land-cover type, and must never be counted as real area or shown as a fabricated legend
+        # entry. If most of the pixels this asset returned aren't valid codes, the whole result is
+        # untrustworthy (not just the invalid pixels) - move on to the next asset instead.
+        raw_pixels = sum(int(v) for v in raw_hist.values())
+        valid_hist = {k: v for k, v in raw_hist.items() if _is_known_class_code(k)}
+        valid_pixels = sum(int(v) for v in valid_hist.values())
+        if raw_pixels and valid_pixels / raw_pixels < 0.5:
+            logger.warning(
+                "Land cover asset %s returned mostly out-of-scheme class codes (%d/%d pixels valid) - discarding",
+                asset_id, valid_pixels, raw_pixels,
+            )
+            continue
+        if valid_hist:
+            hist_info = valid_hist
             landcover_image = candidate_image
             break
         logger.warning("Land cover asset %s returned zero classified pixels for this boundary", asset_id)
