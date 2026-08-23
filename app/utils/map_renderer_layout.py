@@ -74,6 +74,8 @@ DEFAULT_ADAMAWA_COPYRIGHT_TEXT = "Copy Right Reserved"
 DEFAULT_ADAMAWA_PREPARED_BY_TEXT = "Plan Prepared by Office of the Surveyor General Adamawa State"
 ADAMAWA_FONT_FAMILY = "DejaVu Serif"
 ADAMAWA_BLUE = "#1f2f8a"
+# Roads need to remain secondary to boundary and station work on printed plans.
+SURVEY_ROAD_COLOR = "#56616B"
 
 
 def format_station_label(label) -> str:
@@ -3237,7 +3239,7 @@ def _render_plot_map_layout_adamawa(
     boundary_color = boundary_color or "red"
     grid_color = grid_color or ADAMAWA_BLUE
     text_color = text_color or "black"
-    road_color = road_color or "black"
+    road_color = road_color or SURVEY_ROAD_COLOR
     river_color = river_color or "#10a3df"
     building_color = building_color or "black"
     building_hatch_type = building_hatch_type or "diagonal"
@@ -4200,7 +4202,7 @@ def _render_plot_map_layout_cadastral(
     boundary_color = boundary_color or "red"
     grid_color = grid_color or CADASTRAL_BLUE
     text_color = text_color or "black"
-    road_color = road_color or "black"
+    road_color = road_color or SURVEY_ROAD_COLOR
     river_color = river_color or "#10a3df"
     building_color = building_color or "black"
     building_hatch_type = building_hatch_type or "diagonal"
@@ -4805,7 +4807,7 @@ def _render_plot_map_layout_fct(
 ):
     boundary_color = boundary_color or "red"
     text_color = text_color or "black"
-    road_color = road_color or "black"
+    road_color = road_color or SURVEY_ROAD_COLOR
     river_color = river_color or "#10a3df"
     building_color = building_color or "black"
     building_hatch_type = building_hatch_type or "diagonal"
@@ -5502,7 +5504,7 @@ def _render_plot_map_layout_site_plan(
     boundary_color = boundary_color or "red"
     grid_color = grid_color or CADASTRAL_BLUE
     text_color = text_color or "black"
-    road_color = road_color or "black"
+    road_color = road_color or SURVEY_ROAD_COLOR
     river_color = river_color or "#10a3df"
     building_color = building_color or "black"
     building_hatch_type = building_hatch_type or "diagonal"
@@ -6132,7 +6134,7 @@ def render_plot_map_layout(
     boundary_color = boundary_color or "red"
     grid_color = grid_color or "blue"
     text_color = text_color or "black"
-    road_color = road_color or "black"
+    road_color = road_color or SURVEY_ROAD_COLOR
     river_color = river_color or "blue"
     building_color = building_color or "black"
     building_hatch_type = building_hatch_type or "diagonal"
