@@ -1087,13 +1087,13 @@ def annotate_vertices_orthophoto(ax, poly, station_names=None, font_scale=1.0, s
             nx, ny = -seg_dy / seg_len, seg_dx / seg_len
         else:
             nx, ny = nx / bisector_len, ny / bisector_len
-        station_offset = max(2.0, (108.0 / 1000.0) * scale_ratio)
+        station_offset = max(2.0, (25.0 / 1000.0) * scale_ratio)
         # Floor the offset against the map's actual visible span, not just scale_ratio - a very
         # large real-world plot compressed onto one sheet can make the scale_ratio-derived offset
         # above tiny relative to the plot's own extent even though it's "correct" in paper
-        # millimetres, which is what let a station name visually sit on top of its own beacon
+        # millimetres, which would let a station name visually sit on top of its own beacon
         # instead of just being close to it.
-        station_offset = max(station_offset, max(span_x, span_y) * 0.045)
+        station_offset = max(station_offset, max(span_x, span_y) * 0.02)
         # Start in the exterior angle, then progressively move farther along that same side only
         # when labels are crowded. This keeps every station label visually consistent.
         if poly.contains(Point(p1.x + nx * station_offset, p1.y + ny * station_offset)):
