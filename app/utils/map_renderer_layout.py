@@ -1547,7 +1547,7 @@ def annotate_vertices(
         leader_from=None,
     ):
         offset_m = max(2.0, (6.0 / 1000.0) * scale_ratio) * max(0.6, normal_offset_mult)
-        if normal_offset_mult >= 3.0:
+        if normal_offset_mult >= 1.5:
             # Station-name-style large offsets (only the station-name call site below uses
             # normal_offset_mult this high; bearing/distance labels use 1.0 and are untouched by
             # this) must clear the beacon mark by a visible margin relative to what's actually on
@@ -1564,9 +1564,16 @@ def annotate_vertices(
                 test_pt = Point(x + nx * offset_m, y + ny * offset_m)
                 if boundary_poly.contains(test_pt):
                     nx, ny = -nx, -ny
+            # Station names (normal_offset_mult >= 1.5) are capped to a much tighter escalation
+            # range than bearing/distance labels - on a real, cluttered plot (lots of crossing
+            # road/river linework near the middle), letting a station name escalate all the way to
+            # 2.8x to dodge that clutter is exactly what made it read as "far away" from its own
+            # beacon instead of just being close to it. Bearing/distance labels (mult=1.0) keep the
+            # original wider escalation range unchanged.
+            multiples = (1.0, 1.2) if normal_offset_mult >= 1.5 else (1.0, 1.5, 2.1, 2.8)
             candidates = [
                 (x + direction * nx * offset_m * multiple, y + direction * ny * offset_m * multiple)
-                for multiple in (1.0, 1.5, 2.1, 2.8)
+                for multiple in multiples
                 for direction in (1, -1)
             ]
             if allow_center:
@@ -1741,11 +1748,10 @@ def annotate_vertices(
                 scale_w=0.018,
                 scale_h=0.020,
                 normal=station_normal,
-                normal_offset_mult=4.0,
+                normal_offset_mult=2.2,
                 allow_center=False,
                 font_family=station_font,
                 text_effects=[patheffects.withStroke(linewidth=max(1.5, 2.2 * font_scale), foreground="white")],
-                leader_from=(p1.x, p1.y),
             )
 
         bearing, dist = calculate_bearing_deg(p1, p2), p1.distance(p2)

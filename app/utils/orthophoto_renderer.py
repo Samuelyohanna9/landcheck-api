@@ -1087,7 +1087,7 @@ def annotate_vertices_orthophoto(ax, poly, station_names=None, font_scale=1.0, s
             nx, ny = -seg_dy / seg_len, seg_dx / seg_len
         else:
             nx, ny = nx / bisector_len, ny / bisector_len
-        station_offset = max(2.0, (25.0 / 1000.0) * scale_ratio)
+        station_offset = max(2.0, (14.0 / 1000.0) * scale_ratio)
         # Floor the offset against the map's actual visible span, not just scale_ratio - a very
         # large real-world plot compressed onto one sheet can make the scale_ratio-derived offset
         # above tiny relative to the plot's own extent even though it's "correct" in paper
@@ -1098,9 +1098,13 @@ def annotate_vertices_orthophoto(ax, poly, station_names=None, font_scale=1.0, s
         # when labels are crowded. This keeps every station label visually consistent.
         if poly.contains(Point(p1.x + nx * station_offset, p1.y + ny * station_offset)):
             nx, ny = -nx, -ny
+        # Escalation is capped tight (unlike the wider range this used to try) - on a real,
+        # cluttered plot (lots of crossing road/river linework near the middle), escalating far to
+        # dodge that clutter is exactly what made a station name read as "far away" from its own
+        # beacon instead of just being close to it.
         candidates = [
             (p1.x + nx * station_offset * multiple, p1.y + ny * station_offset * multiple)
-            for multiple in (1.0, 1.5, 2.1, 2.8)
+            for multiple in (1.0, 1.2)
         ]
         lx, ly = candidates[-1]
         label_box = text_box(lx, ly, label)
@@ -1110,7 +1114,6 @@ def annotate_vertices_orthophoto(ax, poly, station_names=None, font_scale=1.0, s
                 lx, ly, label_box = candidate_x, candidate_y, candidate_box
                 break
 
-        ax.plot([p1.x, lx], [p1.y, ly], color="black", lw=max(0.35, 0.45 * font_scale), alpha=0.8, zorder=24)
         ax.text(
             lx,
             ly,
