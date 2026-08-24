@@ -1087,13 +1087,17 @@ def annotate_vertices_orthophoto(ax, poly, station_names=None, font_scale=1.0, s
             nx, ny = -seg_dy / seg_len, seg_dx / seg_len
         else:
             nx, ny = nx / bisector_len, ny / bisector_len
-        station_offset = max(2.0, (14.0 / 1000.0) * scale_ratio)
-        # Floor the offset against the map's actual visible span, not just scale_ratio - a very
-        # large real-world plot compressed onto one sheet can make the scale_ratio-derived offset
-        # above tiny relative to the plot's own extent even though it's "correct" in paper
-        # millimetres, which would let a station name visually sit on top of its own beacon
-        # instead of just being close to it.
-        station_offset = max(station_offset, max(span_x, span_y) * 0.02)
+        # Offset tied to the label's OWN font size on paper, not a fixed real-world-metre floor -
+        # cartographic convention places a point label a small distance relative to its own text
+        # size, consistently, regardless of the plot's absolute size or the sheet's scale ratio. A
+        # fixed-metre floor (the previous approach here, matching the same bug in annotate_vertices
+        # in map_renderer_layout.py) instead produced a hugely disproportionate offset on a small
+        # plot drawn at a tight scale (e.g. a ~25m parcel at 1:700), because a couple of real
+        # metres is a big fraction of a 25m plot even though it's a reasonable few millimetres on
+        # paper for a large one.
+        font_pt = max(6, int(7 * font_scale))
+        font_mm = font_pt * 0.3528
+        station_offset = max(0.3, (font_mm * 1.15 / 1000.0) * scale_ratio)
         # Start in the exterior angle, then progressively move farther along that same side only
         # when labels are crowded. This keeps every station label visually consistent.
         if poly.contains(Point(p1.x + nx * station_offset, p1.y + ny * station_offset)):

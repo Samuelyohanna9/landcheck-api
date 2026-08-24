@@ -1548,15 +1548,19 @@ def annotate_vertices(
     ):
         offset_m = max(2.0, (6.0 / 1000.0) * scale_ratio) * max(0.6, normal_offset_mult)
         if normal_offset_mult >= 1.5:
-            # Station-name-style large offsets (only the station-name call site below uses
-            # normal_offset_mult this high; bearing/distance labels use 1.0 and are untouched by
-            # this) must clear the beacon mark by a visible margin relative to what's actually on
-            # the page, not just relative to scale_ratio. A very large real-world plot compressed
-            # onto one sheet can make the scale_ratio-derived offset above tiny relative to the
-            # plot's own extent even though it's "correct" in paper millimetres - that mismatch is
-            # what let a station name visually sit on top of its own beacon instead of just being
-            # close to it. Flooring against the map's actual visible span is scale_ratio-agnostic.
-            offset_m = max(offset_m, max(span_x, span_y) * 0.02)
+            # Station names (only the station-name call site below uses normal_offset_mult this
+            # high; bearing/distance labels use 1.0 and are untouched by this) are offset by a
+            # distance tied to the label's OWN font size on paper, not a fixed "6mm" baseline meant
+            # for bearing/distance text, and not a fixed real-world-metre floor. Cartographic
+            # convention places a point label a small distance relative to its own text size,
+            # consistently, regardless of the plot's absolute size or the sheet's scale ratio - a
+            # fixed-metre floor (the previous approach here) instead produced a hugely
+            # disproportionate offset on a small plot drawn at a tight scale (e.g. a ~25m parcel at
+            # 1:700), because 2 real metres is a big fraction of a 25m plot even though it's a
+            # reasonable few millimetres on paper for a large one.
+            font_pt = float(font_size) if font_size else 7.0
+            font_mm = font_pt * 0.3528
+            offset_m = max(0.3, (font_mm * 1.15 / 1000.0) * scale_ratio)
         candidates = [(x, y)]
         if normal is not None:
             nx, ny = normal
