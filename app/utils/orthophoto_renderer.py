@@ -1087,7 +1087,7 @@ def annotate_vertices_orthophoto(ax, poly, station_names=None, font_scale=1.0, s
             nx, ny = -seg_dy / seg_len, seg_dx / seg_len
         else:
             nx, ny = nx / bisector_len, ny / bisector_len
-        station_offset = max(2.0, (4.0 / 1000.0) * scale_ratio)
+        station_offset = max(2.0, (7.0 / 1000.0) * scale_ratio)
         # Start in the exterior angle, then progressively move farther along that same side only
         # when labels are crowded. This keeps every station label visually consistent.
         if poly.contains(Point(p1.x + nx * station_offset, p1.y + ny * station_offset)):
@@ -1104,6 +1104,7 @@ def annotate_vertices_orthophoto(ax, poly, station_names=None, font_scale=1.0, s
                 lx, ly, label_box = candidate_x, candidate_y, candidate_box
                 break
 
+        ax.plot([p1.x, lx], [p1.y, ly], color="black", lw=max(0.35, 0.45 * font_scale), alpha=0.8, zorder=24)
         ax.text(
             lx,
             ly,

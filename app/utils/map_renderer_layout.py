@@ -1544,6 +1544,7 @@ def annotate_vertices(
         allow_center: bool = True,
         font_family=None,
         text_effects=None,
+        leader_from=None,
     ):
         offset_m = max(2.0, (6.0 / 1000.0) * scale_ratio) * max(0.6, normal_offset_mult)
         candidates = [(x, y)]
@@ -1591,6 +1592,17 @@ def annotate_vertices(
         for dx, dy in offsets:
             bx = estimate_box(x + dx, y + dy, text, scale_w, scale_h)
             if not collides(bx):
+                if leader_from is not None and (leader_from[0] != x + dx or leader_from[1] != y + dy):
+                    # A short leader keeps the mark-label association unambiguous once the text
+                    # is offset far enough that its glyph box cannot cover the station itself.
+                    ax.plot(
+                        [leader_from[0], x + dx],
+                        [leader_from[1], y + dy],
+                        color=color,
+                        lw=max(0.35, 0.45 * font_scale),
+                        zorder=24,
+                        solid_capstyle="round",
+                    )
                 ax.text(
                     x + dx,
                     y + dy,
@@ -1706,10 +1718,11 @@ def annotate_vertices(
                 scale_w=0.018,
                 scale_h=0.020,
                 normal=station_normal,
-                normal_offset_mult=0.7,
+                normal_offset_mult=1.3,
                 allow_center=False,
                 font_family=station_font,
                 text_effects=[patheffects.withStroke(linewidth=max(1.5, 2.2 * font_scale), foreground="white")],
+                leader_from=(p1.x, p1.y),
             )
 
         bearing, dist = calculate_bearing_deg(p1, p2), p1.distance(p2)
