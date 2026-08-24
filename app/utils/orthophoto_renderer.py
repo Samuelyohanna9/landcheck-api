@@ -1057,12 +1057,21 @@ def annotate_vertices_orthophoto(ax, poly, station_names=None, font_scale=1.0, s
     span_y = max(abs(y1 - y0), 1.0)
     placed_boxes = []
 
-    def text_box(x, y, label):
+    def text_box(x, y, label, ha="center", va="center"):
         longest_line = max((len(line) for line in str(label).splitlines()), default=1)
         line_count = max(1, len(str(label).splitlines()))
         width = span_x * 0.018 * max(1.0, longest_line / 8.0)
         height = span_y * 0.022 * (1.0 + 0.5 * (line_count - 1))
-        return (x - width / 2, y - height / 2, x + width / 2, y + height / 2)
+        # Mirrors matplotlib's own ha/va anchor semantics, so the collision box reflects where the
+        # glyphs actually land when the label isn't centered on (x, y) - see the anchor computed
+        # below, which anchors the label at an edge/corner facing away from its point instead of
+        # centering it on the offset position, so a long name extends away from the point rather
+        # than half of it drifting back to overlap it.
+        x0 = x - width if ha == "right" else x if ha == "left" else x - width / 2.0
+        x1 = x if ha == "right" else x + width if ha == "left" else x + width / 2.0
+        y0 = y - height if va == "top" else y if va == "bottom" else y - height / 2.0
+        y1 = y if va == "top" else y + height if va == "bottom" else y + height / 2.0
+        return (x0, y0, x1, y1)
 
     def overlaps(candidate):
         return any(not (candidate[2] < box[0] or candidate[0] > box[2] or candidate[3] < box[1] or candidate[1] > box[3]) for box in placed_boxes)
@@ -1097,7 +1106,7 @@ def annotate_vertices_orthophoto(ax, poly, station_names=None, font_scale=1.0, s
         # paper for a large one.
         font_pt = max(6, int(7 * font_scale))
         font_mm = font_pt * 0.3528
-        station_offset = max(0.3, (font_mm * 1.15 / 1000.0) * scale_ratio)
+        station_offset = max(0.3, (font_mm * 1.7 / 1000.0) * scale_ratio)
         # Start in the exterior angle, then progressively move farther along that same side only
         # when labels are crowded. This keeps every station label visually consistent.
         if poly.contains(Point(p1.x + nx * station_offset, p1.y + ny * station_offset)):
@@ -1106,14 +1115,20 @@ def annotate_vertices_orthophoto(ax, poly, station_names=None, font_scale=1.0, s
         # cluttered plot (lots of crossing road/river linework near the middle), escalating far to
         # dodge that clutter is exactly what made a station name read as "far away" from its own
         # beacon instead of just being close to it.
+        # Anchored at an edge/corner facing away from the point (not centered on the offset
+        # position) - centering is what let a long station name overlap its own beacon even once
+        # the offset itself cleared the beacon fine, since half the text reached back past a short
+        # offset toward the point.
+        label_ha = "left" if nx > 0.35 else "right" if nx < -0.35 else "center"
+        label_va = "bottom" if ny > 0.35 else "top" if ny < -0.35 else "center"
         candidates = [
             (p1.x + nx * station_offset * multiple, p1.y + ny * station_offset * multiple)
             for multiple in (1.0, 1.2)
         ]
         lx, ly = candidates[-1]
-        label_box = text_box(lx, ly, label)
+        label_box = text_box(lx, ly, label, ha=label_ha, va=label_va)
         for candidate_x, candidate_y in candidates:
-            candidate_box = text_box(candidate_x, candidate_y, label)
+            candidate_box = text_box(candidate_x, candidate_y, label, ha=label_ha, va=label_va)
             if not overlaps(candidate_box):
                 lx, ly, label_box = candidate_x, candidate_y, candidate_box
                 break
@@ -1124,9 +1139,9 @@ def annotate_vertices_orthophoto(ax, poly, station_names=None, font_scale=1.0, s
             label,
             fontsize=max(6, int(7 * font_scale)),
             color="black",
-            ha="center",
-            va="center",
-            weight="bold",
+            ha=label_ha,
+            va=label_va,
+            weight="normal",
             multialignment="center",
             linespacing=0.95,
             zorder=25,

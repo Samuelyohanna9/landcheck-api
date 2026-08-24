@@ -1518,7 +1518,7 @@ def annotate_vertices(
     def collides(box):
         return any(intersects(box, other) for other in placed_boxes)
 
-    def estimate_box(x, y, text_value, scale_w, scale_h):
+    def estimate_box(x, y, text_value, scale_w, scale_h, ha="center", va="center"):
         lines = [line for line in str(text_value).splitlines() if line is not None]
         if not lines:
             lines = [str(text_value)]
@@ -1526,7 +1526,15 @@ def annotate_vertices(
         line_count = max(1, len(lines))
         w = span_x * scale_w * max(1.0, max_len / 8.0)
         h = span_y * scale_h * (1.0 + 0.55 * (line_count - 1))
-        return (x - w / 2.0, y - h / 2.0, x + w / 2.0, y + h / 2.0)
+        # Mirrors matplotlib's own ha/va anchor semantics, so the collision box actually reflects
+        # where the glyphs land when the label isn't centered on (x, y) - see anchor_from_normal in
+        # place_text below, which anchors station names at a corner/edge instead of their center so
+        # a long name extends away from its own point rather than half of it drifting back onto it.
+        x0 = x - w if ha == "right" else x if ha == "left" else x - w / 2.0
+        x1 = x if ha == "right" else x + w if ha == "left" else x + w / 2.0
+        y0 = y - h if va == "top" else y if va == "bottom" else y - h / 2.0
+        y1 = y if va == "top" else y + h if va == "bottom" else y + h / 2.0
+        return (x0, y0, x1, y1)
 
     def place_text(
         x,
@@ -1545,6 +1553,7 @@ def annotate_vertices(
         font_family=None,
         text_effects=None,
         leader_from=None,
+        anchor_from_normal: bool = False,
     ):
         offset_m = max(2.0, (6.0 / 1000.0) * scale_ratio) * max(0.6, normal_offset_mult)
         if normal_offset_mult >= 1.5:
@@ -1560,8 +1569,22 @@ def annotate_vertices(
             # reasonable few millimetres on paper for a large one.
             font_pt = float(font_size) if font_size else 7.0
             font_mm = font_pt * 0.3528
-            offset_m = max(0.3, (font_mm * 1.15 / 1000.0) * scale_ratio)
-        candidates = [(x, y)]
+            offset_m = max(0.3, (font_mm * 1.7 / 1000.0) * scale_ratio)
+        def anchor_for(dx_dir, dy_dir):
+            # Anchors the label at an edge/corner of its own box facing AWAY from the point,
+            # instead of centering the box on the offset position - centering is what let a long
+            # station name (its far half reaching back past a short offset) still overlap its own
+            # beacon even once the offset itself cleared the beacon fine. Only used for station
+            # names (anchor_from_normal=True); bearing/distance labels keep the original centered
+            # behavior, which is already correct for them (they're placed at a precomputed position
+            # with their own rotation, not offset from a point they must visually clear).
+            if not anchor_from_normal:
+                return "center", "center"
+            ha = "left" if dx_dir > 0.35 else "right" if dx_dir < -0.35 else "center"
+            va = "bottom" if dy_dir > 0.35 else "top" if dy_dir < -0.35 else "center"
+            return ha, va
+
+        candidates = [(x, y, "center", "center")]
         if normal is not None:
             nx, ny = normal
             if boundary_poly is not None:
@@ -1575,28 +1598,32 @@ def annotate_vertices(
             # beacon instead of just being close to it. Bearing/distance labels (mult=1.0) keep the
             # original wider escalation range unchanged.
             multiples = (1.0, 1.2) if normal_offset_mult >= 1.5 else (1.0, 1.5, 2.1, 2.8)
-            candidates = [
-                (x + direction * nx * offset_m * multiple, y + direction * ny * offset_m * multiple)
-                for multiple in multiples
-                for direction in (1, -1)
-            ]
+            candidates = []
+            for multiple in multiples:
+                for direction in (1, -1):
+                    ddx, ddy = nx * direction, ny * direction
+                    ha, va = anchor_for(ddx, ddy)
+                    candidates.append((x + ddx * offset_m * multiple, y + ddy * offset_m * multiple, ha, va))
             if allow_center:
-                candidates.append((x, y))
+                candidates.append((x, y, "center", "center"))
             if avoid_geom is not None:
                 candidates = [c for c in candidates if not avoid_geom.contains(Point(c[0], c[1]))]
                 if not candidates:
                     for k in range(2, 7):
-                        cand_pos = (x + nx * offset_m * k, y + ny * offset_m * k)
-                        cand_neg = (x - nx * offset_m * k, y - ny * offset_m * k)
+                        ha_pos, va_pos = anchor_for(nx, ny)
+                        ha_neg, va_neg = anchor_for(-nx, -ny)
+                        cand_pos = (x + nx * offset_m * k, y + ny * offset_m * k, ha_pos, va_pos)
+                        cand_neg = (x - nx * offset_m * k, y - ny * offset_m * k, ha_neg, va_neg)
                         if not avoid_geom.contains(Point(cand_pos[0], cand_pos[1])):
                             candidates.append(cand_pos)
                         if not avoid_geom.contains(Point(cand_neg[0], cand_neg[1])):
                             candidates.append(cand_neg)
                     if not candidates:
                         if allow_center:
-                            candidates = [(x, y)]
+                            candidates = [(x, y, "center", "center")]
                         else:
-                            candidates = [(x - nx * offset_m * 2.0, y - ny * offset_m * 2.0)]
+                            ha, va = anchor_for(-nx, -ny)
+                            candidates = [(x - nx * offset_m * 2.0, y - ny * offset_m * 2.0, ha, va)]
         elif avoid_geom is not None:
             candidates = [c for c in candidates if not avoid_geom.contains(Point(c[0], c[1]))] or candidates
         offsets = [
@@ -1612,16 +1639,13 @@ def annotate_vertices(
         ]
         # Try each candidate position in turn (nearest normal-direction offset first, farther ones
         # only if it collides), refining each with a small jitter for local collision avoidance.
-        # candidates defaults to [(x, y)] when normal/avoid_geom don't apply (e.g. bearing/distance
-        # labels, which compute their own offset position before calling place_text) - iterating a
-        # single-element list here reproduces that existing behavior exactly. The bug this fixes:
-        # candidates used to be computed above and then never actually consulted - the loop tried
-        # only tiny jitters around the raw (x, y) vertex, so a station name's carefully computed
-        # normal-direction offset_m never had any effect and the label rendered on top of its own
-        # beacon mark regardless of how large offset_m/normal_offset_mult was set.
-        for cx, cy in candidates:
+        # candidates defaults to [(x, y, "center", "center")] when normal/avoid_geom don't apply
+        # (e.g. bearing/distance labels, which compute their own offset position before calling
+        # place_text) - iterating a single-element list here reproduces that existing behavior
+        # exactly.
+        for cx, cy, ha, va in candidates:
             for dx, dy in offsets:
-                bx = estimate_box(cx + dx, cy + dy, text, scale_w, scale_h)
+                bx = estimate_box(cx + dx, cy + dy, text, scale_w, scale_h, ha=ha, va=va)
                 if not collides(bx):
                     break
             else:
@@ -1643,8 +1667,8 @@ def annotate_vertices(
                 text,
                 fontsize=font_size,
                 color=color,
-                ha="center",
-                va="center",
+                ha=ha,
+                va=va,
                 rotation=rotation,
                 weight=weight,
                 multialignment="center",
@@ -1748,7 +1772,7 @@ def annotate_vertices(
                 font_size=station_size if station_size else int(7 * font_scale),
                 color=text_color,
                 rotation=0,
-                weight="bold",
+                weight="normal",
                 scale_w=0.018,
                 scale_h=0.020,
                 normal=station_normal,
@@ -1756,6 +1780,7 @@ def annotate_vertices(
                 allow_center=False,
                 font_family=station_font,
                 text_effects=[patheffects.withStroke(linewidth=max(1.5, 2.2 * font_scale), foreground="white")],
+                anchor_from_normal=True,
             )
 
         bearing, dist = calculate_bearing_deg(p1, p2), p1.distance(p2)
