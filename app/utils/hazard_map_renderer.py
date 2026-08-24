@@ -430,15 +430,15 @@ def render_flood_hazard_map(
     class_color: str,
     return_period: int,
     buffer_m: float = 1000,
-    value_source: str = "glofas",
-    susceptibility_points: Optional[List[Dict[str, float]]] = None,
 ) -> Tuple[bytes, Dict[str, int]]:
-    """Renders a premium, locally-composited flood hazard map. Normally a graduated depth surface
-    (real JRC/GloFAS values, not a flat risk-tier fill); when GloFAS has no modeled flood extent at
-    all for this plot, compute_flood_risk falls back to a local terrain-based susceptibility
-    surface instead (value_source="local_terrain_proxy", susceptibility_points populated) so the
-    map still shows something real rather than a blank "no data" state. Either way: terrain contour
-    context, and real OSM building footprints colored red where they sit in the hazard zone.
+    """Renders a premium, locally-composited RIVER flood hazard map: a graduated depth surface
+    (real JRC/GloFAS values, not a flat risk-tier fill), terrain contour context, and real OSM
+    building footprints colored red where they sit in the hazard zone. Depth-only - the pluvial/
+    surface-water susceptibility map is a separate, independent render, see
+    render_pluvial_hazard_map() below (this function used to also handle that as a fallback branch
+    when GloFAS had no coverage, which is exactly the ambiguity the two-engine flood split removed:
+    a plot with no GloFAS coverage now honestly shows no river-flood surface here at all, rather
+    than silently substituting a different methodology's numbers into what looks like the same map).
     Returns (png_bytes, stats) where stats reports how many buildings were found and threatened.
     """
     boundary_geom = shape(boundary_geojson)
@@ -467,36 +467,27 @@ def render_flood_hazard_map(
     # Terrain contour lines - context only, drawn first so everything else sits on top.
     _draw_contours(ax, contour_points, display_epsg)
 
-    is_proxy = value_source == "local_terrain_proxy"
-    active_points = susceptibility_points if is_proxy else depth_points
-    active_value_key = "flood_susceptibility_pct" if is_proxy else "depth_m"
-    bands_all = SUSCEPTIBILITY_BANDS if is_proxy else DEPTH_BANDS
-    band_labels_all = SUSCEPTIBILITY_BAND_LABELS if is_proxy else DEPTH_BAND_LABELS
-    band_colors_all = SUSCEPTIBILITY_COLORS if is_proxy else DEPTH_COLORS
-    threatened_threshold = SUSCEPTIBILITY_THREATENED_PCT if is_proxy else DEPTH_THREATENED_M
-    band_step = 20.0 if is_proxy else 0.5
-
     surface_available = False
     drawn_band_labels: List[float] = []
     drawn_band_colors: List[str] = []
     surface_capped = False
     value_interp = None
-    if active_points and len(active_points) >= 3:
+    if depth_points and len(depth_points) >= 3:
         try:
-            xs, ys, values = _points_to_projected_xyz(active_points, active_value_key, display_epsg)
-            if len(xs) >= 3 and float(np.nanmax(values)) > bands_all[0]:
+            xs, ys, values = _points_to_projected_xyz(depth_points, "depth_m", display_epsg)
+            if len(xs) >= 3 and float(np.nanmax(values)) > DEPTH_BANDS[0]:
                 triang = mtri.Triangulation(xs, ys)
                 max_value = float(np.nanmax(values))
                 # Only include bands the data actually reaches, so the legend matches what's
                 # really on the map instead of always showing the full palette.
-                band_count = sum(1 for b in band_labels_all if b < max_value) or 1
-                surface_capped = band_count < len(band_labels_all)
-                levels = [bands_all[0]] + band_labels_all[1:band_count] + [max_value + 0.01]
-                colors_for_levels = band_colors_all[:band_count]
+                band_count = sum(1 for b in DEPTH_BAND_LABELS if b < max_value) or 1
+                surface_capped = band_count < len(DEPTH_BAND_LABELS)
+                levels = [DEPTH_BANDS[0]] + DEPTH_BAND_LABELS[1:band_count] + [max_value + 0.01]
+                colors_for_levels = DEPTH_COLORS[:band_count]
                 ax.tricontourf(triang, values, levels=levels, colors=colors_for_levels, zorder=2, alpha=0.88)
                 value_interp = mtri.LinearTriInterpolator(triang, values)
                 surface_available = True
-                drawn_band_labels = band_labels_all[:band_count]
+                drawn_band_labels = DEPTH_BAND_LABELS[:band_count]
                 drawn_band_colors = colors_for_levels
         except Exception:
             surface_available = False
@@ -515,7 +506,7 @@ def render_flood_hazard_map(
         interpolated = value_interp(cx, cy)
         values = np.ma.filled(interpolated, 0.0)
         mask_invalid = np.ma.getmaskarray(interpolated) if np.ma.is_masked(interpolated) else np.zeros(len(cx), dtype=bool)
-        return (~mask_invalid) & (values > threatened_threshold)
+        return (~mask_invalid) & (values > DEPTH_THREATENED_M)
 
     buildings_total, buildings_threatened, buildings_gdf_wgs84 = _draw_buildings(ax, buildings, display_epsg, _flood_threatened)
 
@@ -525,52 +516,40 @@ def render_flood_hazard_map(
     _draw_scalebar(ax, span_m)
     _draw_north_arrow(ax, span_m)
 
-    title = "Local Flood Susceptibility — Terrain Estimate" if is_proxy else f"Flood Hazard Map — {return_period}-Year Return Period"
-    ax.set_title(title, fontsize=12, weight="bold", color="#111827", pad=10)
+    ax.set_title(f"River Flood Hazard Map — {return_period}-Year Return Period", fontsize=12, weight="bold", color="#111827", pad=10)
 
-    unit = "%" if is_proxy else " m"
-    fmt = "{:.0f}" if is_proxy else "{:.1f}"
     legend_handles = []
     if surface_available:
-        surface_title = "Local Susceptibility (Est.)" if is_proxy else f"RP{return_period} Flow Depth"
-        legend_handles.append(mpatches.Patch(facecolor="none", edgecolor="none", label=surface_title))
+        legend_handles.append(mpatches.Patch(facecolor="none", edgecolor="none", label=f"RP{return_period} Flow Depth"))
         for i, lo in enumerate(drawn_band_labels):
             is_last = i == len(drawn_band_labels) - 1
             if is_last and surface_capped:
-                label = f"> {fmt.format(lo)}{unit}"
+                label = f"> {lo:.1f} m"
             else:
-                hi = drawn_band_labels[i + 1] if not is_last else lo + band_step
-                label = f"{fmt.format(lo)} - {fmt.format(hi)}{unit}"
+                hi = drawn_band_labels[i + 1] if not is_last else lo + 0.5
+                label = f"{lo:.1f} - {hi:.1f} m"
             legend_handles.append(mpatches.Patch(facecolor=drawn_band_colors[i], edgecolor="none", label=label))
     if not surface_available:
         legend_handles.append(mpatches.Patch(
-            facecolor=NO_DATA_WASH_COLOR, edgecolor=NO_DATA_WASH_EDGE_COLOR, label="No flood data available",
+            facecolor=NO_DATA_WASH_COLOR, edgecolor=NO_DATA_WASH_EDGE_COLOR, label="No GloFAS river-flood data available",
         ))
     if buildings_total:
-        threatened_label = "On susceptible ground" if is_proxy else "Threatened building"
-        legend_handles.append(mpatches.Patch(facecolor=BUILDING_THREATENED_COLOR, edgecolor="#7f1d1d", label=threatened_label))
+        legend_handles.append(mpatches.Patch(facecolor=BUILDING_THREATENED_COLOR, edgecolor="#7f1d1d", label="Threatened building"))
         legend_handles.append(mpatches.Patch(facecolor=BUILDING_SAFE_COLOR, edgecolor="#4b5563", label="Other building"))
     legend_handles.append(mpatches.Patch(facecolor="none", edgecolor=BOUNDARY_COLOR, linewidth=2, label="Plot boundary"))
 
     if not surface_available:
         ax.text(
-            0.98, 0.02, "No flood hazard data available for this location",
+            0.98, 0.02, "No modelled GloFAS inundation detected at this location",
             transform=ax.transAxes, ha="right", va="bottom", fontsize=7.5, color="#475569",
             bbox=dict(boxstyle="round,pad=0.45", facecolor="white", edgecolor="#d1d5db", alpha=0.92),
             zorder=15,
         )
-    elif is_proxy:
-        ax.text(
-            0.98, 0.02, "Local terrain-based estimate — not official GloFAS river flood modeling",
-            transform=ax.transAxes, ha="right", va="bottom", fontsize=7.5, color="#92400e",
-            bbox=dict(boxstyle="round,pad=0.45", facecolor="#fffbeb", edgecolor="#fbbf24", alpha=0.95),
-            zorder=15,
-        )
 
-    final_value_points = active_points if surface_available else None
+    final_value_points = depth_points if surface_available else None
     png_bytes, interactive_meta = _finalize_hazard_map(
         fig, ax, legend_handles, minx, miny, maxx, maxy, display_epsg,
-        value_points=final_value_points, value_key=active_value_key,
+        value_points=final_value_points, value_key="depth_m",
         contour_points=contour_points, buildings_gdf=buildings_gdf_wgs84,
     )
 
@@ -579,9 +558,150 @@ def render_flood_hazard_map(
         "buildings_threatened": buildings_threatened,
         "buildings_gdf": buildings_gdf_wgs84,
         "value_points": final_value_points,
-        "value_key": active_value_key,
+        "value_key": "depth_m",
         "interactive": interactive_meta,
-        "value_source": value_source,
+        "value_source": "glofas",
+    }
+
+
+def render_pluvial_hazard_map(
+    boundary_geojson: Dict[str, Any],
+    susceptibility_points: Optional[List[Dict[str, float]]],
+    contour_points: Optional[List[Dict[str, float]]],
+    buildings: List[BaseGeometry],
+    risk_class: str,
+    class_color: str,
+    buffer_m: float = 1000,
+) -> Tuple[bytes, Dict[str, int]]:
+    """Renders the SURFACE-WATER / RAINFALL flood susceptibility map: a graduated terrain+rainfall+
+    soil+built-surface susceptibility surface (percent, amber palette - deliberately distinct from
+    the river map's blue depth palette so the two are never visually mistaken for each other), plus
+    terrain contour context and real OSM building footprints colored where they sit on susceptible
+    ground. This is a genuinely different methodology from GloFAS's river-routing simulation (see
+    compute_pluvial_risk in hazard_pluvial.py) - always labeled as an estimate, never presented as
+    if it were river-flood depth data. Mirrors render_flood_hazard_map's structure exactly (same
+    contour/building/scalebar/north-arrow/legend machinery) but is its own independent function
+    rather than a branch of it, so the two hazard types can never bleed into one ambiguous map.
+    Returns (png_bytes, stats) where stats reports how many buildings were found and threatened.
+    """
+    boundary_geom = shape(boundary_geojson)
+    display_epsg = _display_epsg_for(boundary_geom)
+
+    gdf_boundary = gpd.GeoDataFrame(geometry=[boundary_geom], crs="EPSG:4326").to_crs(epsg=display_epsg)
+    boundary_proj = gdf_boundary.geometry.iloc[0]
+    minx, miny, maxx, maxy = boundary_proj.buffer(buffer_m).bounds
+    span_m = max(maxx - minx, maxy - miny)
+
+    fig, ax = plt.subplots(figsize=(10.0, 8.4), dpi=150)
+    fig.subplots_adjust(left=0.025, right=0.738, top=0.91, bottom=0.045)
+    ax.set_aspect("equal")
+    ax.set_facecolor(LAND_COLOR)
+    ax.set_xlim(minx, maxx)
+    ax.set_ylim(miny, maxy)
+    ax.set_xticks([])
+    ax.set_yticks([])
+    for spine in ax.spines.values():
+        spine.set_visible(False)
+
+    _draw_contours(ax, contour_points, display_epsg)
+
+    surface_available = False
+    drawn_band_labels: List[float] = []
+    drawn_band_colors: List[str] = []
+    surface_capped = False
+    value_interp = None
+    if susceptibility_points and len(susceptibility_points) >= 3:
+        try:
+            xs, ys, values = _points_to_projected_xyz(susceptibility_points, "flood_susceptibility_pct", display_epsg)
+            if len(xs) >= 3 and float(np.nanmax(values)) > SUSCEPTIBILITY_BANDS[0]:
+                triang = mtri.Triangulation(xs, ys)
+                max_value = float(np.nanmax(values))
+                band_count = sum(1 for b in SUSCEPTIBILITY_BAND_LABELS if b < max_value) or 1
+                surface_capped = band_count < len(SUSCEPTIBILITY_BAND_LABELS)
+                levels = [SUSCEPTIBILITY_BANDS[0]] + SUSCEPTIBILITY_BAND_LABELS[1:band_count] + [max_value + 0.01]
+                colors_for_levels = SUSCEPTIBILITY_COLORS[:band_count]
+                ax.tricontourf(triang, values, levels=levels, colors=colors_for_levels, zorder=2, alpha=0.88)
+                value_interp = mtri.LinearTriInterpolator(triang, values)
+                surface_available = True
+                drawn_band_labels = SUSCEPTIBILITY_BAND_LABELS[:band_count]
+                drawn_band_colors = colors_for_levels
+        except Exception:
+            surface_available = False
+
+    if not surface_available:
+        ax.add_patch(mpatches.Rectangle(
+            (minx, miny), maxx - minx, maxy - miny,
+            facecolor=NO_DATA_WASH_COLOR, edgecolor="none", zorder=0.5,
+        ))
+
+    def _pluvial_threatened(cx, cy):
+        if not surface_available:
+            return np.zeros(len(cx), dtype=bool)
+        interpolated = value_interp(cx, cy)
+        values = np.ma.filled(interpolated, 0.0)
+        mask_invalid = np.ma.getmaskarray(interpolated) if np.ma.is_masked(interpolated) else np.zeros(len(cx), dtype=bool)
+        return (~mask_invalid) & (values > SUSCEPTIBILITY_THREATENED_PCT)
+
+    buildings_total, buildings_threatened, buildings_gdf_wgs84 = _draw_buildings(ax, buildings, display_epsg, _pluvial_threatened)
+
+    gdf_boundary.plot(ax=ax, facecolor="none", edgecolor=BOUNDARY_COLOR, linewidth=2.4, zorder=10)
+
+    _draw_scalebar(ax, span_m)
+    _draw_north_arrow(ax, span_m)
+
+    ax.set_title("Surface-Water / Rainfall Flood Susceptibility", fontsize=12, weight="bold", color="#111827", pad=10)
+
+    legend_handles = []
+    if surface_available:
+        legend_handles.append(mpatches.Patch(facecolor="none", edgecolor="none", label="Susceptibility (Est.)"))
+        for i, lo in enumerate(drawn_band_labels):
+            is_last = i == len(drawn_band_labels) - 1
+            if is_last and surface_capped:
+                label = f"> {lo:.0f}%"
+            else:
+                hi = drawn_band_labels[i + 1] if not is_last else lo + 20.0
+                label = f"{lo:.0f} - {hi:.0f}%"
+            legend_handles.append(mpatches.Patch(facecolor=drawn_band_colors[i], edgecolor="none", label=label))
+    if not surface_available:
+        legend_handles.append(mpatches.Patch(
+            facecolor=NO_DATA_WASH_COLOR, edgecolor=NO_DATA_WASH_EDGE_COLOR, label="No susceptibility data available",
+        ))
+    if buildings_total:
+        legend_handles.append(mpatches.Patch(facecolor=BUILDING_THREATENED_COLOR, edgecolor="#7f1d1d", label="On susceptible ground"))
+        legend_handles.append(mpatches.Patch(facecolor=BUILDING_SAFE_COLOR, edgecolor="#4b5563", label="Other building"))
+    legend_handles.append(mpatches.Patch(facecolor="none", edgecolor=BOUNDARY_COLOR, linewidth=2, label="Plot boundary"))
+
+    if surface_available:
+        ax.text(
+            0.98, 0.02,
+            "Modeled from terrain, extreme rainfall, soil infiltration, and built-up surface fraction — not a river-flood simulation",
+            transform=ax.transAxes, ha="right", va="bottom", fontsize=7.5, color="#92400e",
+            bbox=dict(boxstyle="round,pad=0.45", facecolor="#fffbeb", edgecolor="#fbbf24", alpha=0.95),
+            zorder=15,
+        )
+    else:
+        ax.text(
+            0.98, 0.02, "No surface-water susceptibility data available for this location",
+            transform=ax.transAxes, ha="right", va="bottom", fontsize=7.5, color="#475569",
+            bbox=dict(boxstyle="round,pad=0.45", facecolor="white", edgecolor="#d1d5db", alpha=0.92),
+            zorder=15,
+        )
+
+    final_value_points = susceptibility_points if surface_available else None
+    png_bytes, interactive_meta = _finalize_hazard_map(
+        fig, ax, legend_handles, minx, miny, maxx, maxy, display_epsg,
+        value_points=final_value_points, value_key="flood_susceptibility_pct",
+        contour_points=contour_points, buildings_gdf=buildings_gdf_wgs84,
+    )
+
+    return png_bytes, {
+        "buildings_total": buildings_total,
+        "buildings_threatened": buildings_threatened,
+        "buildings_gdf": buildings_gdf_wgs84,
+        "value_points": final_value_points,
+        "value_key": "flood_susceptibility_pct",
+        "interactive": interactive_meta,
+        "value_source": "pluvial_engine",
     }
 
 

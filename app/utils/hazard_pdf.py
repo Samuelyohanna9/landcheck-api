@@ -1,6 +1,6 @@
 import io
 from datetime import datetime, timezone
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from reportlab.lib.pagesizes import A4
 from reportlab.lib import colors
@@ -95,8 +95,18 @@ def _render_hazard_report_pdf(
     map_has_own_legend: bool = False,
     references: List[Dict[str, str]] = None,
     show_risk_badge: bool = True,
-) -> None:
-    c = canvas.Canvas(output_path, pagesize=A4)
+    c: Optional[canvas.Canvas] = None,
+) -> canvas.Canvas:
+    """Renders one hazard-report page. Normally self-contained (creates its own single-page PDF and
+    saves it) - erosion and land-cover reports both still call it this way, unchanged. Pass an
+    existing `c` to instead render onto that canvas as one page of a larger multi-page document
+    (used by flood's 3-page River/Rainfall/Overall report) - the caller is then responsible for its
+    own page breaks (c.showPage()) and final c.save(). Returns the canvas either way, so a caller
+    building a multi-page document can keep chaining calls onto the same one.
+    """
+    owns_canvas = c is None
+    if c is None:
+        c = canvas.Canvas(output_path, pagesize=A4)
     width, height = A4
 
     content_top = _draw_hazard_header(c, width, height, report_label=report_label, subtitle=subtitle)
@@ -237,107 +247,216 @@ def _render_hazard_report_pdf(
     c.setFillColor(HexColor("#111827"))
     c.drawRightString(width - 36, footer_y, "LandCheck")
 
+    if owns_canvas:
+        c.showPage()
+        c.save()
+    return c
+
+
+def _draw_flood_overall_summary_page(c: canvas.Canvas, width: float, height: float, summary: Dict[str, object]) -> None:
+    """The 3-page flood report's first page: a lightweight overview - combined risk badge,
+    primary-driver sentence, and a River-vs-Rainfall score comparison - not the full stat-card/map/
+    legend machinery _render_hazard_report_pdf draws for the two detail pages that follow. A reader
+    who only looks at page 1 should still walk away with the headline answer; pages 2-3 are for
+    anyone who wants the full evidence behind either half of it.
+    """
+    overall = summary.get("overall") or {}
+    river = summary.get("river") or {}
+    rainfall = summary.get("rainfall") or {}
+
+    content_top = _draw_hazard_header(
+        c, width, height, report_label="Flood Risk Report", subtitle="River & rainfall flood exposure screening",
+    )
+    y = content_top - 40
+
+    risk_class = str(overall.get("risk_class", "Low"))
+    class_color = str(overall.get("class_color") or "#22c55e")
+    _draw_risk_badge(c, 36, y - 54, risk_class, str(overall.get("risk_score", "0")), class_color)
+
+    c.setFillColor(HexColor("#111827"))
+    c.setFont("Helvetica-Bold", 14)
+    c.drawString(200, y - 20, "Overall Screening Risk")
+    driver = overall.get("primary_driver")
+    driver_label = "Surface-water / rainfall flooding" if driver == "rainfall" else "River / fluvial flooding"
+    c.setFont("Helvetica", 9.5)
+    c.setFillColor(HexColor("#4b5563"))
+    c.drawString(200, y - 38, f"Primary driver: {driver_label}")
+    c.setFont("Helvetica", 8.5)
+    _draw_wrapped(c, str(overall.get("note", "")), 200, y - 54, width - 236, 11)
+
+    # Two-row River vs Rainfall comparison - the whole point of splitting the report into two
+    # engines is undermined if the one page most readers actually look at doesn't show both.
+    comp_top = y - 130
+    row_h = 46
+    for i, (label, section, color) in enumerate((
+        ("River / Fluvial", river, "#1d4ed8"),
+        ("Surface-Water / Rainfall", rainfall, "#b45309"),
+    )):
+        ry = comp_top - i * (row_h + 14)
+        section_class = str(section.get("risk_class", "Low"))
+        section_score = str(section.get("risk_score", "0"))
+        section_available = section.get("data_available", True)
+        _draw_rounded_box(c, 36, ry - row_h, width - 72, row_h, 8, fill_color=HexColor("#f8fafc"), stroke_color=HexColor("#e2e8f0"))
+        c.setFillColor(HexColor("#111827"))
+        c.setFont("Helvetica-Bold", 10.5)
+        c.drawString(52, ry - 18, label)
+        c.setFont("Helvetica", 8)
+        c.setFillColor(HexColor("#6b7280"))
+        subtext = (
+            "No modelled coverage at this location" if (not section_available and label.startswith("River"))
+            else "Susceptibility assessment (not a storm prediction)" if label.startswith("Surface")
+            else ""
+        )
+        c.drawString(52, ry - 32, subtext)
+        # Simple horizontal bar showing this engine's own score, scaled to a fixed max width.
+        bar_x, bar_w_max = 260, width - 72 - 260 - 100
+        try:
+            score_frac = max(0.0, min(1.0, float(section_score) / 100.0))
+        except (TypeError, ValueError):
+            score_frac = 0.0
+        c.setFillColor(HexColor("#e2e8f0"))
+        c.rect(bar_x, ry - 26, bar_w_max, 10, fill=1, stroke=0)
+        c.setFillColor(HexColor(color))
+        c.rect(bar_x, ry - 26, bar_w_max * score_frac, 10, fill=1, stroke=0)
+        c.setFillColor(HexColor("#111827"))
+        c.setFont("Helvetica-Bold", 11)
+        c.drawRightString(width - 40, ry - 18, f"{section_score}%  {section_class.upper()}")
+
+    footer_y = 60
+    c.setStrokeColor(HexColor("#e5e7eb"))
+    c.setLineWidth(0.5)
+    c.line(36, footer_y + 12, width - 36, footer_y + 12)
+    c.setFont("Helvetica", 7.5)
+    c.setFillColor(HexColor("#6b7280"))
+    c.drawString(36, footer_y, "See following pages for full River and Surface-Water/Rainfall detail, including method and confidence.")
+    c.setFont("Helvetica-Bold", 8)
+    c.setFillColor(HexColor("#111827"))
+    c.drawRightString(width - 36, footer_y, "LandCheck")
+
+
+def render_flood_report_pdf(output_path: str, river_png: bytes, pluvial_png: bytes, summary: Dict[str, object]) -> None:
+    """3-page report: an Overall Screening Risk summary, then full River Flood Risk detail, then
+    full Surface-Water/Rainfall Flood Risk detail - each engine gets its own page rather than being
+    collapsed into one shared, ambiguous score (per the reviewer feedback that motivated the
+    flood/pluvial split in the first place).
+    """
+    river = summary.get("river") or {}
+    rainfall = summary.get("rainfall") or {}
+    legend = summary.get("legend") or []
+
+    c = canvas.Canvas(output_path, pagesize=A4)
+    width, height = A4
+    _draw_flood_overall_summary_page(c, width, height, summary)
     c.showPage()
-    c.save()
 
+    # --- River detail page ---
+    river_class = str(river.get("risk_class", "Low"))
+    river_available = river.get("data_available", True)
+    return_period = river.get("return_period", "100")
+    buildings_total = int(river.get("buildings_total", 0) or 0)
+    buildings_threatened = int(river.get("buildings_threatened", 0) or 0)
 
-def render_flood_report_pdf(output_path: str, overlay_png: bytes, summary: Dict[str, object]) -> None:
-    risk_class = str(summary.get("risk_class", "Low"))
-    class_color = str(summary.get("class_color") or "#22c55e")
-    return_period = summary.get("return_period", "100")
-    buildings_total = int(summary.get("buildings_total", 0) or 0)
-    buildings_threatened = int(summary.get("buildings_threatened", 0) or 0)
-    is_proxy = str(summary.get("flood_data_source") or "glofas") == "local_terrain_proxy"
-
-    if is_proxy:
-        headline = f"{risk_class} local flood/ponding susceptibility (terrain-based estimate)"
-        if buildings_total > 0:
-            headline = f"{buildings_threatened} of {buildings_total} buildings sit on susceptible ground (terrain-based estimate)"
+    if not river_available:
+        river_headline = "No modelled GloFAS river-flood inundation detected at this location"
     else:
-        headline = f"{risk_class} flood risk at the {return_period}-year return period"
+        river_headline = f"{river_class} river flood risk at the {return_period}-year return period"
         if buildings_total > 0:
-            headline = f"{buildings_threatened} of {buildings_total} buildings sit in the flood zone at the {return_period}-year return period"
+            river_headline = f"{buildings_threatened} of {buildings_total} buildings sit in the river flood zone at the {return_period}-year return period"
 
-    insight = ""
+    river_insight = ""
     if summary.get("local_elevation_used") and summary.get("relative_elevation_m") is not None:
         rel = float(summary["relative_elevation_m"])
         if rel < -0.3:
-            insight = (
+            river_insight = (
                 f"Site elevation note: your surveyed points average {abs(rel):.1f} m BELOW the "
                 "surrounding terrain - low-lying sites are more prone to ponding and slow drainage "
-                "during heavy rainfall, independent of the river-based score above."
+                "during heavy rainfall (see the Surface-Water/Rainfall page), independent of the "
+                "river-based score above."
             )
         elif rel > 0.3:
-            insight = (
+            river_insight = (
                 f"Site elevation note: your surveyed points average {rel:.1f} m ABOVE the "
                 "surrounding terrain, which is generally favorable for drainage."
             )
         else:
-            insight = "Site elevation note: your surveyed points are close to the surrounding terrain average."
+            river_insight = "Site elevation note: your surveyed points are close to the surrounding terrain average."
 
-    if is_proxy:
-        stat_cards = [
-            ("Slope (deg)", str(summary.get("terrain_slope_deg", "-"))),
-            ("Rel. Elevation (m)", str(summary.get("terrain_depression_m", "-"))),
-            ("Dist. to Drainage (m)", str(summary.get("distance_to_river_m", "-"))),
-            ("Buildings Flagged", f"{buildings_threatened} / {buildings_total}" if buildings_total else "-"),
-        ]
-        component_bars = [
-            ("Low-lying terrain", float(summary.get("terrain_depression_score", 0) or 0), "#b45309"),
-            ("Flatness", float(summary.get("terrain_flatness_score", 0) or 0), "#f59e0b"),
-            ("Drainage prox.", float(summary.get("terrain_drainage_score", 0) or 0), "#fbbf24"),
-        ]
-        method = (
-            "GloFAS carries no modeled river-flood extent at this location, so susceptibility is "
-            "estimated from terrain instead - not official GloFAS river-flood modeling. Buildings "
-            "are real OpenStreetMap footprints, flagged where the local susceptibility surface "
-            "exceeds 60%.\n"
-            "Score = 40% low-lying terrain (elevation relative to the surrounding 300 m) "
-            "+ 35% flatness (slope) + 25% proximity to the nearest natural drainage line."
-        )
-    else:
-        stat_cards = [
-            ("Mean Depth (m)", str(summary.get("mean_depth_m", "-"))),
-            ("Max Depth (m)", str(summary.get("max_depth_m", "-"))),
-            ("Inundation (%)", str(summary.get("inundation_percent", "-"))),
-            ("Buildings Threatened", f"{buildings_threatened} / {buildings_total}" if buildings_total else "-"),
-        ]
-        component_bars = [
-            ("Depth", float(summary.get("depth_score", 0) or 0), "#1d4ed8"),
-            ("Inundation", float(summary.get("inundation_score", 0) or 0), "#0ea5e9"),
-            ("River prox.", float(summary.get("river_proximity_score", 0) or 0), "#38bdf8"),
-        ]
-        method = (
-            "Flood depth is sampled from the JRC/Copernicus GloFAS global hazard model at the "
-            "chosen return period, inside a 1 km buffer around the plot. Buildings are real "
-            "OpenStreetMap footprints, flagged as threatened where the interpolated depth surface "
-            "exceeds 5 cm.\n"
-            "Score = 60% mean depth (normalized to 3 m) + 25% inundated area fraction "
-            "+ 15% proximity to a major river channel."
-        )
-
-    _render_hazard_report_pdf(
+    c = _render_hazard_report_pdf(
         output_path,
-        overlay_png,
-        report_label="Flood Risk Report",
-        subtitle="River & rainfall flood exposure screening",
-        risk_score=str(summary.get("risk_score", "0")),
-        risk_class=risk_class,
-        class_color=class_color,
-        headline=headline,
-        stat_cards=stat_cards,
-        component_bars=component_bars,
-        method=method,
+        river_png,
+        report_label="River Flood Risk",
+        subtitle="Fluvial exposure - JRC/Copernicus GloFAS river-flood modeling",
+        risk_score=str(river.get("risk_score", "0")),
+        risk_class=river_class,
+        class_color=str(river.get("class_color") or "#94a3b8"),
+        headline=river_headline,
+        stat_cards=[
+            ("Mean Depth (m)", str(river.get("mean_depth_m", "-"))),
+            ("Max Depth (m)", str(river.get("max_depth_m", "-"))),
+            ("Inundation (%)", str(river.get("inundation_percent", "-"))),
+            ("Buildings Threatened", f"{buildings_threatened} / {buildings_total}" if buildings_total else "-"),
+        ],
+        component_bars=[
+            ("Depth", float(river.get("depth_score", 0) or 0), "#1d4ed8"),
+            ("Inundation", float(river.get("inundation_score", 0) or 0), "#0ea5e9"),
+            ("River prox.", float(river.get("river_proximity_score", 0) or 0), "#38bdf8"),
+        ],
+        method=str(river.get("method", "")),
         footnotes=[
             f"Return period: {return_period} years  |  analysis buffer: {summary.get('buffer_m', '1000')} m around the plot.",
             "Screening-level assessment only - not a legal flood determination or substitute for a licensed hydrological survey.",
         ],
-        legend=summary.get("legend") or [],
-        note=str(summary.get("note", "")),
-        insight=insight,
+        legend=legend,
+        note=str(river.get("note", "")),
+        insight=river_insight,
         map_has_own_legend=True,
-        references=summary.get("references") or [],
+        references=river.get("references") or [],
+        c=c,
     )
+    c.showPage()
+
+    # --- Surface-Water/Rainfall detail page ---
+    rainfall_class = str(rainfall.get("risk_class", "Low"))
+    rf_buildings_total = int(rainfall.get("buildings_total", 0) or 0)
+    rf_buildings_threatened = int(rainfall.get("buildings_threatened", 0) or 0)
+    rainfall_headline = f"{rainfall_class} surface-water/rainfall susceptibility for this site"
+    if rf_buildings_total > 0:
+        rainfall_headline = f"{rf_buildings_threatened} of {rf_buildings_total} buildings sit on susceptible ground"
+
+    c = _render_hazard_report_pdf(
+        output_path,
+        pluvial_png,
+        report_label="Surface-Water / Rainfall Flood Risk",
+        subtitle="Pluvial susceptibility - terrain, rainfall, soil & built-surface modeling",
+        risk_score=str(rainfall.get("risk_score", "0")),
+        risk_class=rainfall_class,
+        class_color=str(rainfall.get("class_color") or "#94a3b8"),
+        headline=rainfall_headline,
+        stat_cards=[
+            ("Design Rainfall (mm)", str(rainfall.get("design_rainfall_mm", "-"))),
+            ("Soil Group", str(rainfall.get("hydrologic_soil_group", "-"))),
+            ("Impervious Surface (%)", str(rainfall.get("impervious_fraction_pct", "-"))),
+            ("Buildings Flagged", f"{rf_buildings_threatened} / {rf_buildings_total}" if rf_buildings_total else "-"),
+        ],
+        component_bars=[
+            ("Terrain", float(rainfall.get("terrain_score", 0) or 0), "#b45309"),
+            ("Runoff", float(rainfall.get("runoff_score", 0) or 0), "#f59e0b"),
+            ("Impervious surface", float(rainfall.get("impervious_score", 0) or 0), "#fbbf24"),
+        ],
+        method=str(rainfall.get("method", "")),
+        footnotes=[
+            f"Analysis buffer: {summary.get('buffer_m', '1000')} m around the plot.",
+            "Susceptibility assessment based on terrain, land cover, soil, and historical extreme-rainfall "
+            "characteristics - not a prediction that any specific future storm will flood the property.",
+        ],
+        legend=legend,
+        note=str(rainfall.get("note", "")),
+        map_has_own_legend=True,
+        references=rainfall.get("references") or [],
+        c=c,
+    )
+    c.showPage()
+    c.save()
 
 
 def render_erosion_report_pdf(output_path: str, overlay_png: bytes, summary: Dict[str, object]) -> None:

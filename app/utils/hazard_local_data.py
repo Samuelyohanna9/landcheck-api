@@ -170,8 +170,16 @@ SOURCE_QUALITY = {
     "glofas": 0.85,
     "satellite_hydrosheds": 0.65,
     "local_terrain_proxy": 0.65,
+    "chirps_rainfall": 0.65,  # gauge-calibrated satellite rainfall, same tier as HydroSHEDS/the
+                              # terrain proxy - a purpose-built, widely-validated regional dataset,
+                              # not a generic stand-in for something it wasn't designed to measure.
+    "esri_lulc_impervious": 0.60,  # AI-classified land cover, same tier as satellite_ndvi below -
+                                    # a real satellite classification, but a proxy for "impervious
+                                    # surface" rather than a purpose-built imperviousness product.
     "satellite_ndvi": 0.60,
     "global_dem": 0.55,
+    "global_soil_texture": 0.55,  # same tier as global_dem - a coarse global model of the site,
+                                   # not a purpose-built regional hazard model or a local survey.
     "not_available": 0.0,
 }
 
