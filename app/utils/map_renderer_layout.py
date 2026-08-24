@@ -1665,6 +1665,7 @@ def annotate_vertices(
             )
 
     for i in range(len(coords) - 1):
+        p0 = Point(coords[i - 1] if i > 0 else coords[-2])
         p1, p2 = Point(coords[i]), Point(coords[i + 1])
         raw_label = labels[i % len(labels)]
         raw_next_label = labels[(i + 1) % len(labels)]
@@ -1675,6 +1676,21 @@ def annotate_vertices(
         seg_dy = p2.y - p1.y
         seg_len = math.hypot(seg_dx, seg_dy) or 1.0
         normal = (-seg_dy / seg_len, seg_dx / seg_len)
+
+        # Station names are placed consistently in the exterior angle at each vertex, rather
+        # than on the point or arbitrarily on one incident edge. This preserves a close,
+        # horizontal, survey-drafting-style label even when the boundary direction changes.
+        prev_dx = p1.x - p0.x
+        prev_dy = p1.y - p0.y
+        prev_len = math.hypot(prev_dx, prev_dy) or 1.0
+        prev_normal = (-prev_dy / prev_len, prev_dx / prev_len)
+        station_normal_x = prev_normal[0] + normal[0]
+        station_normal_y = prev_normal[1] + normal[1]
+        station_normal_len = math.hypot(station_normal_x, station_normal_y)
+        if station_normal_len <= 1e-6:
+            station_normal = normal
+        else:
+            station_normal = (station_normal_x / station_normal_len, station_normal_y / station_normal_len)
 
         if show_beacons:
             draw_beacon(p1.x, p1.y)
@@ -1689,8 +1705,8 @@ def annotate_vertices(
                 weight="bold",
                 scale_w=0.018,
                 scale_h=0.020,
-                normal=normal,
-                normal_offset_mult=1.15,
+                normal=station_normal,
+                normal_offset_mult=0.7,
                 allow_center=False,
                 font_family=station_font,
                 text_effects=[patheffects.withStroke(linewidth=max(1.5, 2.2 * font_scale), foreground="white")],

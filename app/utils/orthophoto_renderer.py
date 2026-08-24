@@ -1056,7 +1056,6 @@ def annotate_vertices_orthophoto(ax, poly, station_names=None, font_scale=1.0, s
     span_x = max(abs(x1 - x0), 1.0)
     span_y = max(abs(y1 - y0), 1.0)
     placed_boxes = []
-    centroid = poly.centroid
 
     def text_box(x, y, label):
         longest_line = max((len(line) for line in str(label).splitlines()), default=1)
@@ -1069,6 +1068,7 @@ def annotate_vertices_orthophoto(ax, poly, station_names=None, font_scale=1.0, s
         return any(not (candidate[2] < box[0] or candidate[0] > box[2] or candidate[3] < box[1] or candidate[1] > box[3]) for box in placed_boxes)
 
     for i in range(vertex_count):
+        p0 = Point(coords[i - 1] if i > 0 else coords[-2])
         p1 = Point(coords[i])
         p2 = Point(coords[i + 1])
         label = labels[i]
@@ -1077,15 +1077,24 @@ def annotate_vertices_orthophoto(ax, poly, station_names=None, font_scale=1.0, s
         seg_dy = p2.y - p1.y
         seg_len = math.hypot(seg_dx, seg_dy) or 1.0
         nx, ny = -seg_dy / seg_len, seg_dx / seg_len
-        station_offset = max(2.0, (6.0 / 1000.0) * scale_ratio)
-        # Start on the exterior side of the parcel, then progressively move outward until labels
-        # no longer collide with one another on dense boundaries.
-        if Point(p1.x + nx * station_offset, p1.y + ny * station_offset).distance(centroid) < Point(p1.x - nx * station_offset, p1.y - ny * station_offset).distance(centroid):
+        prev_dx = p1.x - p0.x
+        prev_dy = p1.y - p0.y
+        prev_len = math.hypot(prev_dx, prev_dy) or 1.0
+        prev_nx, prev_ny = -prev_dy / prev_len, prev_dx / prev_len
+        nx, ny = prev_nx + nx, prev_ny + ny
+        bisector_len = math.hypot(nx, ny)
+        if bisector_len <= 1e-6:
+            nx, ny = -seg_dy / seg_len, seg_dx / seg_len
+        else:
+            nx, ny = nx / bisector_len, ny / bisector_len
+        station_offset = max(2.0, (4.0 / 1000.0) * scale_ratio)
+        # Start in the exterior angle, then progressively move farther along that same side only
+        # when labels are crowded. This keeps every station label visually consistent.
+        if poly.contains(Point(p1.x + nx * station_offset, p1.y + ny * station_offset)):
             nx, ny = -nx, -ny
         candidates = [
-            (p1.x + direction * nx * station_offset * multiple, p1.y + direction * ny * station_offset * multiple)
-            for multiple in (1.0, 1.55, 2.2, 3.0)
-            for direction in (1, -1)
+            (p1.x + nx * station_offset * multiple, p1.y + ny * station_offset * multiple)
+            for multiple in (1.0, 1.5, 2.1, 2.8)
         ]
         lx, ly = candidates[-1]
         label_box = text_box(lx, ly, label)
