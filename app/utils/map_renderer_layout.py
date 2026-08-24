@@ -1599,38 +1599,51 @@ def annotate_vertices(
             (span_x * 0.01, -span_y * 0.01),
             (-span_x * 0.01, -span_y * 0.01),
         ]
-        for dx, dy in offsets:
-            bx = estimate_box(x + dx, y + dy, text, scale_w, scale_h)
-            if not collides(bx):
-                if leader_from is not None and (leader_from[0] != x + dx or leader_from[1] != y + dy):
-                    # A short leader keeps the mark-label association unambiguous once the text
-                    # is offset far enough that its glyph box cannot cover the station itself.
-                    ax.plot(
-                        [leader_from[0], x + dx],
-                        [leader_from[1], y + dy],
-                        color=color,
-                        lw=max(0.35, 0.45 * font_scale),
-                        zorder=24,
-                        solid_capstyle="round",
-                    )
-                ax.text(
-                    x + dx,
-                    y + dy,
-                    text,
-                    fontsize=font_size,
+        # Try each candidate position in turn (nearest normal-direction offset first, farther ones
+        # only if it collides), refining each with a small jitter for local collision avoidance.
+        # candidates defaults to [(x, y)] when normal/avoid_geom don't apply (e.g. bearing/distance
+        # labels, which compute their own offset position before calling place_text) - iterating a
+        # single-element list here reproduces that existing behavior exactly. The bug this fixes:
+        # candidates used to be computed above and then never actually consulted - the loop tried
+        # only tiny jitters around the raw (x, y) vertex, so a station name's carefully computed
+        # normal-direction offset_m never had any effect and the label rendered on top of its own
+        # beacon mark regardless of how large offset_m/normal_offset_mult was set.
+        for cx, cy in candidates:
+            for dx, dy in offsets:
+                bx = estimate_box(cx + dx, cy + dy, text, scale_w, scale_h)
+                if not collides(bx):
+                    break
+            else:
+                continue
+            if leader_from is not None and (leader_from[0] != cx + dx or leader_from[1] != cy + dy):
+                # A short leader keeps the mark-label association unambiguous once the text
+                # is offset far enough that its glyph box cannot cover the station itself.
+                ax.plot(
+                    [leader_from[0], cx + dx],
+                    [leader_from[1], cy + dy],
                     color=color,
-                    ha="center",
-                    va="center",
-                    rotation=rotation,
-                    weight=weight,
-                    multialignment="center",
-                    linespacing=line_spacing,
-                    zorder=25,
-                    **({"fontfamily": font_family} if font_family else {}),
-                    **({"path_effects": text_effects} if text_effects else {}),
+                    lw=max(0.35, 0.45 * font_scale),
+                    zorder=24,
+                    solid_capstyle="round",
                 )
-                placed_boxes.append(bx)
-                return True
+            ax.text(
+                cx + dx,
+                cy + dy,
+                text,
+                fontsize=font_size,
+                color=color,
+                ha="center",
+                va="center",
+                rotation=rotation,
+                weight=weight,
+                multialignment="center",
+                linespacing=line_spacing,
+                zorder=25,
+                **({"fontfamily": font_family} if font_family else {}),
+                **({"path_effects": text_effects} if text_effects else {}),
+            )
+            placed_boxes.append(bx)
+            return True
         return False
 
     skipped = []
