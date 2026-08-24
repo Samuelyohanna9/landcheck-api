@@ -173,6 +173,8 @@ SOURCE_QUALITY = {
     "chirps_rainfall": 0.65,  # gauge-calibrated satellite rainfall, same tier as HydroSHEDS/the
                               # terrain proxy - a purpose-built, widely-validated regional dataset,
                               # not a generic stand-in for something it wasn't designed to measure.
+    "merit_hydro_hand": 0.65,  # MERIT Hydro (Yamazaki et al. 2019) - a purpose-built, peer-reviewed
+                                # global hydrography product, same tier as CHIRPS/HydroSHEDS.
     "esri_lulc_impervious": 0.60,  # AI-classified land cover, same tier as satellite_ndvi below -
                                     # a real satellite classification, but a proxy for "impervious
                                     # surface" rather than a purpose-built imperviousness product.

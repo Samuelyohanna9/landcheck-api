@@ -38,6 +38,16 @@ SUSCEPTIBILITY_BAND_LABELS = [0.0, 20.0, 40.0, 60.0, 80.0]
 SUSCEPTIBILITY_COLORS = ["#fef3c7", "#fde68a", "#fbbf24", "#f59e0b", "#b45309"]
 SUSCEPTIBILITY_THREATENED_PCT = 60.0
 
+# Floodplain Susceptibility (Height Above Nearest Drainage) - a third, visually distinct teal
+# palette so all three flood maps (river blue, floodplain teal, rainfall amber) are never mistaken
+# for each other at a glance. Same 0-100% susceptibility-percent framing as the rainfall map (the
+# HAND-to-percent transform lives in hazard_floodplain.py, not here - this module stays pure
+# rendering with zero Earth Engine coupling).
+FLOODPLAIN_BANDS = [1.0, 20.0, 40.0, 60.0, 80.0]
+FLOODPLAIN_BAND_LABELS = [0.0, 20.0, 40.0, 60.0, 80.0]
+FLOODPLAIN_COLORS = ["#ccfbf1", "#5eead4", "#2dd4bf", "#0d9488", "#134e4a"]
+FLOODPLAIN_THREATENED_PCT = 60.0
+
 BUILDING_THREATENED_COLOR = "#dc2626"
 BUILDING_SAFE_COLOR = "#9ca3af"
 BOUNDARY_COLOR = "#0f172a"
@@ -702,6 +712,147 @@ def render_pluvial_hazard_map(
         "value_key": "flood_susceptibility_pct",
         "interactive": interactive_meta,
         "value_source": "pluvial_engine",
+    }
+
+
+def render_floodplain_hazard_map(
+    boundary_geojson: Dict[str, Any],
+    susceptibility_points: Optional[List[Dict[str, float]]],
+    contour_points: Optional[List[Dict[str, float]]],
+    buildings: List[BaseGeometry],
+    risk_class: str,
+    class_color: str,
+    buffer_m: float = 1000,
+) -> Tuple[bytes, Dict[str, int]]:
+    """Renders the FLOODPLAIN SUSCEPTIBILITY map: a graduated Height-Above-Nearest-Drainage-derived
+    susceptibility surface (percent, teal palette - distinct from both river's blue depth and
+    rainfall's amber susceptibility), plus terrain contour context and real OSM building footprints
+    colored where they sit on susceptible ground. Mirrors render_pluvial_hazard_map's structure
+    exactly (same contour/building/scalebar/north-arrow/legend machinery, same
+    flood_susceptibility_pct value_key so the same GIS export/interactive-map plumbing works
+    unchanged) but is its own independent function, and its input is a plain point cloud - like
+    every other function in this module, it has zero direct Earth Engine coupling; the caller
+    (hazard_floodplain.py) is responsible for converting HAND meters to a 0-1 susceptibility image
+    and sampling it into `susceptibility_points` before calling this.
+    """
+    boundary_geom = shape(boundary_geojson)
+    display_epsg = _display_epsg_for(boundary_geom)
+
+    gdf_boundary = gpd.GeoDataFrame(geometry=[boundary_geom], crs="EPSG:4326").to_crs(epsg=display_epsg)
+    boundary_proj = gdf_boundary.geometry.iloc[0]
+    minx, miny, maxx, maxy = boundary_proj.buffer(buffer_m).bounds
+    span_m = max(maxx - minx, maxy - miny)
+
+    fig, ax = plt.subplots(figsize=(10.0, 8.4), dpi=150)
+    fig.subplots_adjust(left=0.025, right=0.738, top=0.91, bottom=0.045)
+    ax.set_aspect("equal")
+    ax.set_facecolor(LAND_COLOR)
+    ax.set_xlim(minx, maxx)
+    ax.set_ylim(miny, maxy)
+    ax.set_xticks([])
+    ax.set_yticks([])
+    for spine in ax.spines.values():
+        spine.set_visible(False)
+
+    _draw_contours(ax, contour_points, display_epsg)
+
+    surface_available = False
+    drawn_band_labels: List[float] = []
+    drawn_band_colors: List[str] = []
+    surface_capped = False
+    value_interp = None
+    if susceptibility_points and len(susceptibility_points) >= 3:
+        try:
+            xs, ys, values = _points_to_projected_xyz(susceptibility_points, "flood_susceptibility_pct", display_epsg)
+            if len(xs) >= 3 and float(np.nanmax(values)) > FLOODPLAIN_BANDS[0]:
+                triang = mtri.Triangulation(xs, ys)
+                max_value = float(np.nanmax(values))
+                band_count = sum(1 for b in FLOODPLAIN_BAND_LABELS if b < max_value) or 1
+                surface_capped = band_count < len(FLOODPLAIN_BAND_LABELS)
+                levels = [FLOODPLAIN_BANDS[0]] + FLOODPLAIN_BAND_LABELS[1:band_count] + [max_value + 0.01]
+                colors_for_levels = FLOODPLAIN_COLORS[:band_count]
+                ax.tricontourf(triang, values, levels=levels, colors=colors_for_levels, zorder=2, alpha=0.88)
+                value_interp = mtri.LinearTriInterpolator(triang, values)
+                surface_available = True
+                drawn_band_labels = FLOODPLAIN_BAND_LABELS[:band_count]
+                drawn_band_colors = colors_for_levels
+        except Exception:
+            surface_available = False
+
+    if not surface_available:
+        ax.add_patch(mpatches.Rectangle(
+            (minx, miny), maxx - minx, maxy - miny,
+            facecolor=NO_DATA_WASH_COLOR, edgecolor="none", zorder=0.5,
+        ))
+
+    def _floodplain_threatened(cx, cy):
+        if not surface_available:
+            return np.zeros(len(cx), dtype=bool)
+        interpolated = value_interp(cx, cy)
+        values = np.ma.filled(interpolated, 0.0)
+        mask_invalid = np.ma.getmaskarray(interpolated) if np.ma.is_masked(interpolated) else np.zeros(len(cx), dtype=bool)
+        return (~mask_invalid) & (values > FLOODPLAIN_THREATENED_PCT)
+
+    buildings_total, buildings_threatened, buildings_gdf_wgs84 = _draw_buildings(ax, buildings, display_epsg, _floodplain_threatened)
+
+    gdf_boundary.plot(ax=ax, facecolor="none", edgecolor=BOUNDARY_COLOR, linewidth=2.4, zorder=10)
+
+    _draw_scalebar(ax, span_m)
+    _draw_north_arrow(ax, span_m)
+
+    ax.set_title("Floodplain Susceptibility (Height Above Nearest Drainage)", fontsize=12, weight="bold", color="#111827", pad=10)
+
+    legend_handles = []
+    if surface_available:
+        legend_handles.append(mpatches.Patch(facecolor="none", edgecolor="none", label="Susceptibility (Est.)"))
+        for i, lo in enumerate(drawn_band_labels):
+            is_last = i == len(drawn_band_labels) - 1
+            if is_last and surface_capped:
+                label = f"> {lo:.0f}%"
+            else:
+                hi = drawn_band_labels[i + 1] if not is_last else lo + 20.0
+                label = f"{lo:.0f} - {hi:.0f}%"
+            legend_handles.append(mpatches.Patch(facecolor=drawn_band_colors[i], edgecolor="none", label=label))
+    if not surface_available:
+        legend_handles.append(mpatches.Patch(
+            facecolor=NO_DATA_WASH_COLOR, edgecolor=NO_DATA_WASH_EDGE_COLOR, label="No susceptibility data available",
+        ))
+    if buildings_total:
+        legend_handles.append(mpatches.Patch(facecolor=BUILDING_THREATENED_COLOR, edgecolor="#7f1d1d", label="On susceptible ground"))
+        legend_handles.append(mpatches.Patch(facecolor=BUILDING_SAFE_COLOR, edgecolor="#4b5563", label="Other building"))
+    legend_handles.append(mpatches.Patch(facecolor="none", edgecolor=BOUNDARY_COLOR, linewidth=2, label="Plot boundary"))
+
+    if surface_available:
+        ax.text(
+            0.98, 0.02,
+            "Modeled from elevation relative to the surrounding drainage network — not a river-flood simulation",
+            transform=ax.transAxes, ha="right", va="bottom", fontsize=7.5, color="#134e4a",
+            bbox=dict(boxstyle="round,pad=0.45", facecolor="#f0fdfa", edgecolor="#2dd4bf", alpha=0.95),
+            zorder=15,
+        )
+    else:
+        ax.text(
+            0.98, 0.02, "No floodplain susceptibility data available for this location",
+            transform=ax.transAxes, ha="right", va="bottom", fontsize=7.5, color="#475569",
+            bbox=dict(boxstyle="round,pad=0.45", facecolor="white", edgecolor="#d1d5db", alpha=0.92),
+            zorder=15,
+        )
+
+    final_value_points = susceptibility_points if surface_available else None
+    png_bytes, interactive_meta = _finalize_hazard_map(
+        fig, ax, legend_handles, minx, miny, maxx, maxy, display_epsg,
+        value_points=final_value_points, value_key="flood_susceptibility_pct",
+        contour_points=contour_points, buildings_gdf=buildings_gdf_wgs84,
+    )
+
+    return png_bytes, {
+        "buildings_total": buildings_total,
+        "buildings_threatened": buildings_threatened,
+        "buildings_gdf": buildings_gdf_wgs84,
+        "value_points": final_value_points,
+        "value_key": "flood_susceptibility_pct",
+        "interactive": interactive_meta,
+        "value_source": "floodplain_engine",
     }
 
 

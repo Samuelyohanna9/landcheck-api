@@ -9,7 +9,12 @@ from sqlalchemy.orm import Session
 
 from app.utils.elevation import fetch_dem_elevation_points
 from app.utils.gee_client import init_gee
-from app.utils.hazard_common import FLOOD_REFERENCES_TERRAIN_PROXY, classify_risk, fetch_buildings_near
+from app.utils.hazard_common import (
+    FLOOD_REFERENCES_TERRAIN_PROXY,
+    classify_risk,
+    fetch_buildings_near,
+    fetch_susceptibility_points,
+)
 from app.utils.hazard_local_data import (
     DEFAULT_SITE_TYPE,
     LOCAL_DATA_REFERENCES,
@@ -80,51 +85,23 @@ def _site_type_from_impervious_fraction(impervious_frac: float) -> str:
     return "agricultural"
 
 
-def _fetch_susceptibility_points(image: "ee.Image", region: "ee.Geometry", scale_m: int = 90) -> Optional[List[Dict[str, float]]]:
-    """Samples a 0-1 susceptibility image as a {lng, lat, flood_susceptibility_pct} point cloud for
-    the map's graduated surface - same pixelLonLat + toList idiom used throughout this app's hazard
-    modules. The sole consumer of this helper is this module (the river engine no longer needs a
-    susceptibility surface at all after the two-engine flood split), so it lives here rather than in
-    the pure-rendering hazard_map_renderer.py, which otherwise has zero direct Earth Engine coupling.
-    """
-    try:
-        sampled = image.multiply(100).rename("flood_susceptibility_pct").addBands(ee.Image.pixelLonLat())
-        reduced = sampled.reduceRegion(
-            reducer=ee.Reducer.toList(),
-            geometry=region,
-            scale=scale_m,
-            maxPixels=int(1e9),
-            bestEffort=True,
-        )
-        info = reduced.getInfo() or {}
-        lons = info.get("longitude") or []
-        lats = info.get("latitude") or []
-        values = info.get("flood_susceptibility_pct") or []
-        if len(lons) < 3 or len(lons) != len(lats) or len(lons) != len(values):
-            return None
-        points = [
-            {"lng": float(lo), "lat": float(la), "flood_susceptibility_pct": float(v)}
-            for lo, la, v in zip(lons, lats, values)
-            if v is not None
-        ]
-        return points if len(points) >= 3 else None
-    except Exception:
-        return None
-
-
-def _fetch_impervious_fraction(geom: "ee.Geometry") -> Tuple[Optional[float], Optional["ee.Image"]]:
-    """Fraction (0-1) of the plot classified as Esri "Built Area", reusing hazard_lulc.py's already
+def _fetch_impervious_fraction(
+    geom: "ee.Geometry", _resolved: Optional[Tuple["ee.Image", Any]] = None,
+) -> Tuple[Optional[float], Optional["ee.Image"], Optional[Any]]:
+    """Fraction (0-1) of `geom` classified as Esri "Built Area", reusing hazard_lulc.py's already
     live-verified asset/class-code pairing (LULC_ASSETS) rather than re-deriving it - the exact
     per-asset class-code mismatch that caused a real "93% Snow/Ice in Adamawa" bug earlier is the
-    reason this doesn't just hardcode one asset ID here. Tries each (asset_id, class_table) pair in
-    order, validates the same way compute_lulc_summary does (mostly-known class codes), and returns
-    (built_fraction, the winning classification image) so the caller can reuse the same image for
-    the map overlay's built-area context without a second fetch. Returns (None, None) if no asset
-    could be loaded/validated for this location.
+    reason this doesn't just hardcode one asset ID here.
+
+    `_resolved`, when given an (image, class_colors) pair from a previous call, skips straight to
+    the histogram step instead of re-running the per-asset fallback loop - used so the parcel-scale
+    and neighbourhood-scale reads below resolve the LULC asset only once per request, mirroring the
+    efficiency pattern validated in scratch/test_impervious_scale_correlation.py. Returns
+    (built_fraction, image, class_colors); (None, None, None) if no asset could be resolved.
     """
-    for asset_id, class_colors in LULC_ASSETS:
+    candidates = [_resolved] if _resolved else _lulc_assets_with_images()
+    for candidate_image, class_colors in candidates:
         try:
-            candidate_image = _load_landcover_source_image(asset_id)
             hist = candidate_image.reduceRegion(
                 reducer=ee.Reducer.frequencyHistogram(),
                 geometry=geom, scale=10, maxPixels=int(1e9), bestEffort=True,
@@ -148,8 +125,16 @@ def _fetch_impervious_fraction(geom: "ee.Geometry") -> Tuple[Optional[float], Op
             continue
 
         built_pixels = sum(float(v) for k, v in valid_hist.items() if int(float(k)) == _BUILT_AREA_CLASS_CODE)
-        return min(1.0, built_pixels / valid_pixels), candidate_image
-    return None, None
+        return min(1.0, built_pixels / valid_pixels), candidate_image, class_colors
+    return None, None, None
+
+
+def _lulc_assets_with_images():
+    for asset_id, class_colors in LULC_ASSETS:
+        try:
+            yield _load_landcover_source_image(asset_id), class_colors
+        except Exception:
+            continue
 
 
 def compute_pluvial_risk(
@@ -182,6 +167,25 @@ def compute_pluvial_risk(
     survey-based "local" hybrid capability) - when not supplied, both are derived automatically from
     the built-area fraction and CHIRPS respectively, so this engine never falls back to a
     placeholder the way compute_scs_runoff historically did when nothing was supplied.
+
+    V2 ARCHITECTURAL CORRECTION (impervious double-counting): earlier, parcel-scale built fraction
+    fed BOTH a standalone 30%-weighted `impervious_score` AND (via `_site_type_from_impervious_
+    fraction`) the SCS curve number driving `runoff_score` - the same evidence counted twice, which
+    live diagnostic testing traced as the dominant driver of the pluvial score (r=+0.899 with the
+    final result, versus terrain's +0.275) and the reason real flood corridors and well-drained
+    control neighbourhoods became statistically indistinguishable once real building parcels were
+    tested (34 of 35 real buildings read ~100% built at parcel scale, including a genuinely
+    low-density GRA). Widening the standalone component to a 300m neighbourhood-scale reading was
+    tested as a fix and rejected: Pearson r=0.734 between parcel-scale and 300m-scale imperviousness
+    across the 35 diagnostic parcels, with the 5 locations that mattered most reading within 0.1
+    percentage points of each other at both scales - not a genuinely independent signal.
+
+    Standalone `impervious_score` is therefore REMOVED. Parcel-scale built fraction keeps its one
+    remaining job (site_type -> curve number -> runoff_score); the vacated weight is not given to a
+    substitute variable, it is redistributed to terrain and runoff preserving their prior 1:1 ratio
+    (0.35:0.35 -> 0.5:0.5). Both parcel-scale and a 300m neighbourhood-scale built-fraction reading
+    are still surfaced in the breakdown for transparency - urban sealing is real evidence a reader
+    may want to see - but neither independently moves risk_value anymore.
     """
     report = progress_cb or (lambda stage, pct: None)
     report("Connecting to Earth Engine...", 5)
@@ -261,11 +265,25 @@ def compute_pluvial_risk(
     hydrologic_soil_group = derive_hydrologic_soil_group(sand_pct, clay_pct) if sand_pct is not None and clay_pct is not None else "B"
 
     # --- Impervious/built-up surface fraction, reusing the Esri LULC asset -----------------------
+    # Parcel-scale drives site_type/CN below (its one remaining job). A second, wider read over
+    # the same 300m "neighbourhood" radius used elsewhere in this module is transparency-only
+    # context (surfaced in the breakdown, never scored) - reuses the already-resolved asset/class-
+    # table from the parcel-scale call rather than re-running the fallback loop a second time.
     report("Checking built-up surface coverage...", 55)
-    impervious_frac, landcover_image = _fetch_impervious_fraction(geom)
+    impervious_frac, landcover_image, landcover_class_colors = _fetch_impervious_fraction(geom)
     impervious_available = impervious_frac is not None
     if not impervious_available:
         impervious_frac = 0.0
+
+    neighborhood_impervious_frac: Optional[float] = None
+    if landcover_image is not None:
+        # 300m - the exact radius empirically tested in scratch/test_impervious_scale_correlation.py
+        # (Pearson r=0.734 vs parcel-scale) - NOT the same as analysis_region above (1000m, used for
+        # CHIRPS/soil sampling reasons unrelated to this reading).
+        neighborhood_region = geom.buffer(300)
+        neighborhood_impervious_frac, _, _ = _fetch_impervious_fraction(
+            neighborhood_region, _resolved=(landcover_image, landcover_class_colors),
+        )
 
     site_type_source = "user_input"
     resolved_site_type = site_type
@@ -304,14 +322,12 @@ def compute_pluvial_risk(
 
     terrain_score = max(0.0, min(1.0, float(terrain_combined.get("susceptibility") or 0.0)))
     runoff_score = max(0.0, min(1.0, runoff_coefficient))
-    impervious_score = max(0.0, min(1.0, impervious_frac))
 
     data_available = True
-    risk_value = (
-        terrain_score * 0.35
-        + runoff_score * 0.35
-        + impervious_score * 0.30
-    )
+    # No standalone impervious_score - see the V2 architectural-correction note in this function's
+    # docstring. Terrain/runoff renormalized to preserve their prior 1:1 ratio (0.35:0.35 -> 0.5:0.5)
+    # arithmetically, not fit against any validation labels.
+    risk_value = terrain_score * 0.5 + runoff_score * 0.5
     risk_value = max(0.0, min(1.0, risk_value))
     risk_class, class_color = classify_risk(risk_value, data_available)
 
@@ -328,10 +344,14 @@ def compute_pluvial_risk(
         "susceptibility_pct": round(terrain_score * 100, 1),
         "design_rainfall_mm": round(resolved_rainfall_mm, 1) if resolved_rainfall_mm else None,
         "runoff_coefficient": round(runoff_coefficient, 3),
+        # Both impervious readings below are transparency-only context - neither independently
+        # moves risk_value. impervious_fraction_pct (parcel scale) still drives site_type_used/CN.
         "impervious_fraction_pct": round(impervious_frac * 100, 1),
+        "neighborhood_impervious_fraction_pct": (
+            round(neighborhood_impervious_frac * 100, 1) if neighborhood_impervious_frac is not None else None
+        ),
         "terrain_score": round(terrain_score, 3),
         "runoff_score": round(runoff_score, 3),
-        "impervious_score": round(impervious_score, 3),
         "terrain_slope_deg": terrain_slope_deg,
         "terrain_depression_m": terrain_depression_m,
         "distance_to_drainage_m": round(capped_drainage_dist, 1),
@@ -349,7 +369,7 @@ def compute_pluvial_risk(
         "_references": PLUVIAL_REFERENCES + (LOCAL_DATA_REFERENCES if soil_source == "user_input" or design_rainfall_mm else []),
     }
 
-    factor_weights = {"terrain": 0.35, "runoff": 0.35, "impervious": 0.30}
+    factor_weights = {"terrain": 0.5, "runoff": 0.5}
     try:
         plot_area_ha = float(geom.area(1).getInfo()) / 10000.0
     except Exception:
@@ -369,7 +389,7 @@ def compute_pluvial_risk(
     # Real susceptibility surface (for the graduated map) and real building footprints (flagged
     # against susceptibility, not depth) - fetched together, same pattern as the river engine.
     report("Rendering surface-water susceptibility map...", 80)
-    surface_points = _fetch_susceptibility_points(susceptibility_img, analysis_region)
+    surface_points = fetch_susceptibility_points(susceptibility_img, analysis_region)
     contour_points = fetch_dem_elevation_points(boundary_geojson, buffer_m=1000)
     buildings = fetch_buildings_near(db, boundary_geojson, 600)
 

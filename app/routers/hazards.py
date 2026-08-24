@@ -9,8 +9,9 @@ import tempfile
 import logging
 
 from app.db import SessionLocal
-from app.utils.hazard_common import classify_risk, risk_tier_legend
+from app.utils.hazard_common import RISK_TIERS, classify_risk, risk_tier_legend
 from app.utils.hazard_flood import compute_flood_risk, overlay_to_data_url as flood_overlay_to_data_url
+from app.utils.hazard_floodplain import compute_floodplain_risk, floodplain_overlay_to_data_url
 from app.utils.hazard_pluvial import compute_pluvial_risk, pluvial_overlay_to_data_url
 from app.utils.hazard_erosion import compute_erosion_risk, overlay_to_data_url as erosion_overlay_to_data_url
 from app.utils.hazard_lulc import compute_lulc_summary, overlay_to_data_url as lulc_overlay_to_data_url
@@ -194,29 +195,101 @@ def _pluvial_note_and_method(breakdown: dict) -> tuple[str, str]:
     method = (
         "Combines terrain ponding susceptibility (40% low-lying terrain relative to the surrounding "
         "300 m + 35% flatness + 25% proximity to the nearest natural drainage line - HydroSHEDS - "
-        "following Beven & Kirkby, 1979, and Huang et al., 2019), a rainfall-runoff estimate (SCS/"
+        "following Beven & Kirkby, 1979, and Huang et al., 2019) and a rainfall-runoff estimate (SCS/"
         "NRCS Curve Number method, USDA NEH-4/TR-55, driven by the 99th-percentile daily rainfall "
         "from 40+ years of CHIRPS satellite-rainfall estimates - Funk et al., 2015 - and a "
-        "Hydrologic Soil Group derived from global soil texture data) and impervious/built-up "
-        "surface fraction (Esri 10m Land Cover" + site_note + ") into a single weighted score: "
-        "35% terrain susceptibility + 35% runoff + 30% impervious surface. The design-storm "
-        "rainfall figure is an empirical historical extreme, not a formal engineered intensity-"
-        "duration-frequency curve - a rarer, more severe individual storm can still exceed it."
+        "Hydrologic Soil Group derived from global soil texture data) into a single weighted score: "
+        "50% terrain susceptibility + 50% runoff. Impervious/built-up surface fraction (Esri 10m "
+        "Land Cover" + site_note + ") sets the site type feeding the runoff estimate's curve number, "
+        "but is not itself an independently-weighted score component - an earlier version double-"
+        "counted the same built-fraction evidence in both places, which real-parcel testing showed "
+        "made flood-prone and well-drained neighbourhoods statistically indistinguishable; the fix "
+        "is disclosed here rather than silently corrected. The design-storm rainfall figure is an "
+        "empirical historical extreme, not a formal engineered intensity-duration-frequency curve - "
+        "a rarer, more severe individual storm can still exceed it."
+    )
+    note += (
+        " This branch is experimental and has not yet passed independent validation - a same-city "
+        "matched test found it could not reliably distinguish a documented flood zone from a "
+        "matched, better-drained district (Lekki vs Ikeja GRA, Kubwa vs Wuse 2, both in Lagos/Abuja)."
     )
     return note, method
 
 
-def _flood_overall_note(river_breakdown: dict, pluvial_breakdown: dict, primary_driver: str) -> str:
-    river_available = bool(river_breakdown.get("data_available"))
-    if primary_driver == "rainfall" and not river_available:
-        return (
-            "No modelled GloFAS river-flood inundation was detected at this location. Overall flood "
-            "risk here is driven by surface-water/rainfall susceptibility (see below), not a river "
-            "overflow scenario."
-        )
-    if primary_driver == "rainfall":
-        return "Surface-water/rainfall flooding is the primary driver of flood risk at this site, exceeding the river/fluvial component."
-    return "River/fluvial flooding is the primary driver of flood risk at this site."
+def _floodplain_note_and_method(breakdown: dict) -> tuple[str, str]:
+    note = (
+        "Floodplain susceptibility - how close this site sits to the surrounding drainage/river "
+        "network in elevation terms, independent of whether JRC/GloFAS has a routed river-flood "
+        "simulation here. This is the fallback signal for locations with real fluvial exposure but "
+        "no direct modelled river-inundation depth available."
+    )
+    method = (
+        "Derived from MERIT Hydro's Height Above Nearest Drainage (HAND, Yamazaki et al. 2019; "
+        "method of Rennó et al. 2008), sampled as a median across a 300 m local area rather than a "
+        "single pixel. Risk score = 1 - (median HAND in metres / 25), clamped to 0-1. The 25 m "
+        "constant is a documented, provisional pre-validation modelling assumption informed by (not "
+        "fit to) a small diagnostic set - not a peer-reviewed universal threshold, and not "
+        "adjusted after formal validation begins. Distance to the nearest major mapped river channel "
+        "and upstream contributing area are shown as supporting context but do not affect the score "
+        "- both were tested as candidate score inputs and found unreliable for small urban streams."
+    )
+    return note, method
+
+
+def _floodplain_display_tier(risk_class: str, class_color: str) -> tuple[str, str]:
+    """Customer-facing terminology cap: never show "Severe" for the floodplain/HAND branch. Phase 4
+    found HAND has genuine but moderate discrimination (AUC 0.72-0.75) with imperfect specificity -
+    "Severe" could read to a buyer as a validated depth-model verdict the way River's badge is,
+    which this branch has not earned. Reuses the existing High tier's own color from RISK_TIERS
+    rather than a duplicated hex literal. The underlying risk_value/classify_risk threshold and
+    compute_floodplain_risk() are NOT changed - this only relabels what's displayed.
+    """
+    if risk_class == "Severe":
+        for _, label, color in RISK_TIERS:
+            if label == "High":
+                return "High", color
+    return risk_class, class_color
+
+
+def _flood_floodplain_section(risk_value, risk_class, class_color, breakdown, overlay_png, pdf: bool = False) -> dict:
+    risk_class, class_color = _floodplain_display_tier(risk_class, class_color)
+    note, method = _floodplain_note_and_method(breakdown)
+    fmt = (lambda v: str(v)) if pdf else (lambda v: v)
+    return {
+        "risk_score": fmt(round(risk_value * 100, 1)),
+        "risk_class": risk_class,
+        "class_color": class_color,
+        "hand_median_m": fmt(breakdown.get("hand_median_m")),
+        "hand_p10_m": fmt(breakdown.get("hand_p10_m")),
+        "distance_to_major_river_m": fmt(breakdown.get("distance_to_major_river_m")),
+        "upstream_area_km2": fmt(breakdown.get("upstream_area_km2")),
+        "buildings_total": breakdown.get("buildings_total", 0),
+        "buildings_threatened": breakdown.get("buildings_threatened", 0),
+        "overlay": None if pdf else floodplain_overlay_to_data_url(overlay_png),
+        "note": note,
+        "method": method,
+        "data_available": bool(breakdown.get("data_available", True)),
+        "interactive": breakdown.get("_interactive"),
+        "flood_data_source": breakdown.get("flood_data_source", "hand_merit_hydro"),
+        "data_sources": breakdown.get("data_sources"),
+        "confidence": breakdown.get("confidence"),
+        "references": breakdown.get("_references", []),
+    }
+
+
+def _flood_recommendation(river_breakdown: dict, floodplain_breakdown: dict, river_class: str, floodplain_class: str) -> str:
+    """Plain-text guidance derived ONLY from River and Floodplain - the two branches retained as
+    customer-facing evidence after Phase 4's blind validation. Rainfall/pluvial is deliberately
+    excluded from this decision: Phase 4 found it does not reliably discriminate (same-city matched
+    test AUC 0.361), so it must never silently influence a recommendation a reader might act on.
+    """
+    elevated = {"Moderate", "High", "Severe"}
+    if river_class in elevated or floodplain_class in elevated:
+        return "Further site-specific drainage/flood assessment advised before development."
+    return (
+        "No significant modelled river or floodplain flood indicators at this location. "
+        "Rainfall/surface-water susceptibility remains experimental and not yet independently validated."
+    )
 
 
 def _flood_river_section(risk_value, risk_class, class_color, breakdown, overlay_png, return_period, pdf: bool = False) -> dict:
@@ -262,10 +335,13 @@ def _flood_rainfall_section(risk_value, risk_class, class_color, breakdown, over
         "susceptibility_pct": fmt(breakdown.get("susceptibility_pct")),
         "design_rainfall_mm": fmt(breakdown.get("design_rainfall_mm")),
         "runoff_coefficient": fmt(breakdown.get("runoff_coefficient")),
+        # Both impervious readings are transparency-only context - neither independently drives
+        # risk_score (see hazard_pluvial.py's V2 architectural-correction note). parcel-scale
+        # still sets site_type_used/hydrologic curve number below.
         "impervious_fraction_pct": fmt(breakdown.get("impervious_fraction_pct")),
+        "neighborhood_impervious_fraction_pct": fmt(breakdown.get("neighborhood_impervious_fraction_pct")),
         "terrain_score": breakdown.get("terrain_score"),
         "runoff_score": breakdown.get("runoff_score"),
-        "impervious_score": breakdown.get("impervious_score"),
         "terrain_slope_deg": breakdown.get("terrain_slope_deg"),
         "terrain_depression_m": breakdown.get("terrain_depression_m"),
         "distance_to_drainage_m": breakdown.get("distance_to_drainage_m"),
@@ -278,6 +354,7 @@ def _flood_rainfall_section(risk_value, risk_class, class_color, breakdown, over
         "overlay": None if pdf else pluvial_overlay_to_data_url(overlay_png),
         "note": note,
         "method": method,
+        "experimental": True,
         "data_available": bool(breakdown.get("data_available", True)),
         "interactive": breakdown.get("_interactive"),
         "data_sources": breakdown.get("data_sources"),
@@ -287,54 +364,56 @@ def _flood_rainfall_section(risk_value, risk_class, class_color, breakdown, over
     }
 
 
-def _compute_combined_flood(
+def _compute_flood_branches(
     db, boundary, show_raster, return_period, local_elevation_points, site_params, progress_cb=None,
 ):
-    """Runs both flood engines and combines them - the one place this logic lives, called by every
-    flood endpoint (sync preview/pdf/gis-export and the async job runner) so the max()+primary_driver
-    +classify_risk behavior can never silently diverge between them.
+    """Runs all three flood engines independently. Called by every flood endpoint (sync preview/
+    pdf/gis-export and the async job runner) so the three branches are always computed the same
+    way. Does NOT combine them into a single score - Phase 4's blind validation showed the previous
+    max()+primary_driver combination actively destroyed specificity (a false-positive pluvial
+    reading could pull an otherwise-correct floodplain "clear" back up to Moderate+), and that
+    Pluvial itself does not reliably discriminate (same-city matched-pair AUC 0.361). River and
+    Floodplain remain independent, customer-facing evidence; Rainfall is retained as experimental,
+    transparency-only evidence, never blended into a composite figure a reader might act on.
     """
     river_risk, river_class, river_breakdown, river_png = compute_flood_risk(
         db, boundary, show_raster, return_period, local_elevation_points, progress_cb=progress_cb,
+    )
+    floodplain_risk, floodplain_class, floodplain_breakdown, floodplain_png = compute_floodplain_risk(
+        db, boundary, progress_cb=progress_cb,
     )
     pluvial_risk, pluvial_class, pluvial_breakdown, pluvial_png = compute_pluvial_risk(
         db, boundary, local_elevation_points,
         site_type=site_params["site_type"], design_rainfall_mm=site_params["design_rainfall_mm"],
         analysis_mode=site_params["analysis_mode"], progress_cb=progress_cb,
     )
-    risk_value = max(river_risk, pluvial_risk)
-    primary_driver = "river" if river_risk >= pluvial_risk else "rainfall"
-    combined_data_available = bool(river_breakdown.get("data_available")) or bool(pluvial_breakdown.get("data_available"))
-    risk_class, class_color = classify_risk(risk_value, combined_data_available)
-
     river_result = (river_risk, river_class, river_breakdown, river_png)
+    floodplain_result = (floodplain_risk, floodplain_class, floodplain_breakdown, floodplain_png)
     pluvial_result = (pluvial_risk, pluvial_class, pluvial_breakdown, pluvial_png)
-    overall = {
-        "risk_value": risk_value,
-        "risk_class": risk_class,
-        "class_color": class_color,
-        "primary_driver": primary_driver,
-        "data_available": combined_data_available,
-    }
-    return river_result, pluvial_result, overall
+    return river_result, floodplain_result, pluvial_result
 
 
-def _flood_combined_payload(river_result, pluvial_result, overall, show_raster, return_period) -> dict:
+def _flood_summary_payload(river_result, floodplain_result, pluvial_result, show_raster, return_period) -> dict:
     river_risk, river_class, river_breakdown, river_png = river_result
+    floodplain_risk, floodplain_class, floodplain_breakdown, floodplain_png = floodplain_result
     pluvial_risk, pluvial_class, pluvial_breakdown, pluvial_png = pluvial_result
     _, river_color = classify_risk(river_risk, river_breakdown.get("data_available", True))
+    _, floodplain_color = classify_risk(floodplain_risk, floodplain_breakdown.get("data_available", True))
     _, pluvial_color = classify_risk(pluvial_risk, pluvial_breakdown.get("data_available", True))
-    legend = _build_legend(overall["risk_class"], overall["class_color"], "This Site", show_raster, RASTER_LEGEND_FLOOD)
+    # Built once, then read back for the summary line/legend below, so the display-terminology cap
+    # ("Severe" -> "High" for this branch - see _floodplain_display_tier) can never disagree between
+    # the detail card and the summary line.
+    floodplain_section = _flood_floodplain_section(floodplain_risk, floodplain_class, floodplain_color, floodplain_breakdown, floodplain_png)
+    legend = _build_legend(floodplain_section["risk_class"], floodplain_section["class_color"], "This Site", show_raster, RASTER_LEGEND_FLOOD)
     return {
-        "overall": {
-            "risk_score": round(overall["risk_value"] * 100, 1),
-            "risk_class": overall["risk_class"],
-            "class_color": overall["class_color"],
-            "primary_driver": overall["primary_driver"],
-            "data_available": overall["data_available"],
-            "note": _flood_overall_note(river_breakdown, pluvial_breakdown, overall["primary_driver"]),
+        "summary": {
+            "river_class": river_class,
+            "river_available": bool(river_breakdown.get("data_available", True)),
+            "floodplain_class": floodplain_section["risk_class"],
+            "recommendation": _flood_recommendation(river_breakdown, floodplain_breakdown, river_class, floodplain_section["risk_class"]),
         },
         "river": _flood_river_section(river_risk, river_class, river_color, river_breakdown, river_png, return_period),
+        "floodplain": floodplain_section,
         "rainfall": _flood_rainfall_section(pluvial_risk, pluvial_class, pluvial_color, pluvial_breakdown, pluvial_png),
         "local_elevation_used": bool(river_breakdown.get("local_elevation_used")),
         "relative_elevation_m": river_breakdown.get("relative_elevation_m"),
@@ -345,21 +424,24 @@ def _flood_combined_payload(river_result, pluvial_result, overall, show_raster, 
     }
 
 
-def _flood_combined_pdf_summary(river_result, pluvial_result, overall, show_raster, return_period) -> dict:
+def _flood_summary_pdf_summary(river_result, floodplain_result, pluvial_result, show_raster, return_period) -> dict:
     river_risk, river_class, river_breakdown, _river_png = river_result
+    floodplain_risk, floodplain_class, floodplain_breakdown, _floodplain_png = floodplain_result
     pluvial_risk, pluvial_class, pluvial_breakdown, _pluvial_png = pluvial_result
     _, river_color = classify_risk(river_risk, river_breakdown.get("data_available", True))
+    _, floodplain_color = classify_risk(floodplain_risk, floodplain_breakdown.get("data_available", True))
     _, pluvial_color = classify_risk(pluvial_risk, pluvial_breakdown.get("data_available", True))
-    legend = _build_legend(overall["risk_class"], overall["class_color"], "This Site", show_raster, RASTER_LEGEND_FLOOD)
+    floodplain_section = _flood_floodplain_section(floodplain_risk, floodplain_class, floodplain_color, floodplain_breakdown, None, pdf=True)
+    legend = _build_legend(floodplain_section["risk_class"], floodplain_section["class_color"], "This Site", show_raster, RASTER_LEGEND_FLOOD)
     return {
-        "overall": {
-            "risk_score": f"{round(overall['risk_value'] * 100, 1)}",
-            "risk_class": overall["risk_class"],
-            "class_color": overall["class_color"],
-            "primary_driver": overall["primary_driver"],
-            "note": _flood_overall_note(river_breakdown, pluvial_breakdown, overall["primary_driver"]),
+        "summary": {
+            "river_class": river_class,
+            "river_available": bool(river_breakdown.get("data_available", True)),
+            "floodplain_class": floodplain_section["risk_class"],
+            "recommendation": _flood_recommendation(river_breakdown, floodplain_breakdown, river_class, floodplain_section["risk_class"]),
         },
         "river": _flood_river_section(river_risk, river_class, river_color, river_breakdown, None, return_period, pdf=True),
+        "floodplain": floodplain_section,
         "rainfall": _flood_rainfall_section(pluvial_risk, pluvial_class, pluvial_color, pluvial_breakdown, None, pdf=True),
         "legend": legend,
         "show_raster": str(show_raster),
@@ -374,14 +456,14 @@ def flood_preview(payload: dict = Body(...), db: Session = Depends(get_db)):
     local_elevation_points = _extract_local_elevation_points(payload)
     site_params = _extract_site_params(payload)
     try:
-        river_result, pluvial_result, overall = _compute_combined_flood(
+        river_result, floodplain_result, pluvial_result = _compute_flood_branches(
             db, boundary, show_raster, return_period, local_elevation_points, site_params,
         )
     except Exception as exc:
         logger.exception("Flood preview failed")
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
-    return _flood_combined_payload(river_result, pluvial_result, overall, show_raster, return_period)
+    return _flood_summary_payload(river_result, floodplain_result, pluvial_result, show_raster, return_period)
 
 
 @router.post("/flood/pdf")
@@ -392,7 +474,7 @@ def flood_pdf(payload: dict = Body(...), db: Session = Depends(get_db)):
     local_elevation_points = _extract_local_elevation_points(payload)
     site_params = _extract_site_params(payload)
     try:
-        river_result, pluvial_result, overall = _compute_combined_flood(
+        river_result, floodplain_result, pluvial_result = _compute_flood_branches(
             db, boundary, show_raster, return_period, local_elevation_points, site_params,
         )
     except Exception as exc:
@@ -404,8 +486,8 @@ def flood_pdf(payload: dict = Body(...), db: Session = Depends(get_db)):
     pdf_path = tmp_pdf.name
     tmp_pdf.close()
 
-    summary = _flood_combined_pdf_summary(river_result, pluvial_result, overall, show_raster, return_period)
-    render_flood_report_pdf(pdf_path, river_result[3], pluvial_result[3], summary)
+    summary = _flood_summary_pdf_summary(river_result, floodplain_result, pluvial_result, show_raster, return_period)
+    render_flood_report_pdf(pdf_path, river_result[3], floodplain_result[3], pluvial_result[3], summary)
     return _pdf_response_with_r2(pdf_path, "flood_risk_report.pdf", "hazard-flood")
 
 
@@ -621,13 +703,14 @@ def flood_gis_export(payload: dict = Body(...), db: Session = Depends(get_db)):
     return_period = int(payload.get("return_period", 100))
     local_elevation_points = _extract_local_elevation_points(payload)
     site_params = _extract_site_params(payload)
-    # River and rainfall are two different value surfaces (depth in metres vs. susceptibility in
-    # percent) - build_hazard_gis_export_zip's value_key/value_points shape assumes one surface per
-    # export, so this exports one engine at a time, defaulting to "river" (the pre-existing default
-    # behavior, for any caller that doesn't yet know about the two-engine split).
+    # River, floodplain, and rainfall are three different value surfaces (depth in metres vs. two
+    # different susceptibility-percent readings) - build_hazard_gis_export_zip's value_key/
+    # value_points shape assumes one surface per export, so this exports one engine at a time,
+    # defaulting to "river" (the pre-existing default behavior, for any caller that doesn't yet
+    # know about the three-engine split).
     engine = str(payload.get("engine") or "river")
-    if engine not in ("river", "rainfall"):
-        raise HTTPException(status_code=400, detail="engine must be 'river' or 'rainfall'")
+    if engine not in ("river", "floodplain", "rainfall"):
+        raise HTTPException(status_code=400, detail="engine must be 'river', 'floodplain', or 'rainfall'")
     try:
         if engine == "river":
             risk_value, risk_class, breakdown, _overlay_png = compute_flood_risk(
@@ -639,6 +722,14 @@ def flood_gis_export(payload: dict = Body(...), db: Session = Depends(get_db)):
                 "flagged as threatened where interpolated depth exceeds 5cm."
             )
             file_name = "flood_river_hazard_gis_export.zip"
+        elif engine == "floodplain":
+            risk_value, risk_class, breakdown, _overlay_png = compute_floodplain_risk(db, boundary)
+            method_text = (
+                "Floodplain susceptibility from MERIT Hydro's Height Above Nearest Drainage (HAND). "
+                "Buildings are OpenStreetMap footprints, flagged where they sit on susceptible "
+                "ground - not a river-flood simulation."
+            )
+            file_name = "flood_floodplain_susceptibility_gis_export.zip"
         else:
             risk_value, risk_class, breakdown, _overlay_png = compute_pluvial_risk(
                 db, boundary, local_elevation_points,
@@ -648,7 +739,9 @@ def flood_gis_export(payload: dict = Body(...), db: Session = Depends(get_db)):
             method_text = (
                 "Surface-water/rainfall susceptibility from terrain, CHIRPS extreme rainfall, soil "
                 "infiltration, and built-up surface fraction. Buildings are OpenStreetMap footprints, "
-                "flagged where they sit on susceptible ground - not a river-flood simulation."
+                "flagged where they sit on susceptible ground - not a river-flood simulation. "
+                "EXPERIMENTAL: this branch has not passed independent validation and should not be "
+                "used as decision-making evidence on its own."
             )
             file_name = "flood_rainfall_susceptibility_gis_export.zip"
     except Exception as exc:
@@ -780,13 +873,14 @@ def _run_hazard_analysis_job(job_id: str) -> None:
 
         # LULC returns a different shape (2-tuple: breakdown, overlay_png - no risk_value/risk_class,
         # since land cover isn't itself a hazard) and so can't share flood/erosion's unpacking line.
-        # Flood returns two full results (river + rainfall engines) rather than one, so it uses its
-        # own river_result/pluvial_result/overall variables instead of the shared risk_value/
-        # risk_class/class_color/breakdown/overlay_png used by erosion/lulc below.
+        # Flood returns three independent results (river + floodplain + rainfall engines) rather
+        # than one, so it uses its own river_result/floodplain_result/pluvial_result variables
+        # instead of the shared risk_value/risk_class/class_color/breakdown/overlay_png used by
+        # erosion/lulc. No combined "overall" - see _compute_flood_branches's docstring.
         risk_value = risk_class = class_color = legend = None
-        river_result = pluvial_result = overall = None
+        river_result = floodplain_result = pluvial_result = None
         if hazard_type == "flood":
-            river_result, pluvial_result, overall = _compute_combined_flood(
+            river_result, floodplain_result, pluvial_result = _compute_flood_branches(
                 db, boundary, show_raster, return_period, local_elevation_points, site_params, progress_cb=report,
             )
         elif hazard_type == "erosion":
@@ -802,7 +896,7 @@ def _run_hazard_analysis_job(job_id: str) -> None:
 
         if output_type == "preview":
             if hazard_type == "flood":
-                result = _flood_combined_payload(river_result, pluvial_result, overall, show_raster, return_period)
+                result = _flood_summary_payload(river_result, floodplain_result, pluvial_result, show_raster, return_period)
             elif hazard_type == "erosion":
                 result = _erosion_preview_payload(risk_value, risk_class, class_color, breakdown, overlay_png, show_raster, legend)
             else:
@@ -815,8 +909,8 @@ def _run_hazard_analysis_job(job_id: str) -> None:
             pdf_path = tmp_pdf.name
             tmp_pdf.close()
             if hazard_type == "flood":
-                summary = _flood_combined_pdf_summary(river_result, pluvial_result, overall, show_raster, return_period)
-                render_flood_report_pdf(pdf_path, river_result[3], pluvial_result[3], summary)
+                summary = _flood_summary_pdf_summary(river_result, floodplain_result, pluvial_result, show_raster, return_period)
+                render_flood_report_pdf(pdf_path, river_result[3], floodplain_result[3], pluvial_result[3], summary)
                 file_name = "flood_risk_report.pdf"
             elif hazard_type == "erosion":
                 summary = _erosion_pdf_summary(risk_value, risk_class, class_color, breakdown, show_raster, legend)
@@ -846,11 +940,12 @@ def _run_hazard_analysis_job(job_id: str) -> None:
                 # defense-in-depth backstop if that endpoint-level guard is ever bypassed.
                 raise ValueError("GIS export is not available for land cover analysis")
             if hazard_type == "flood":
-                # River and rainfall are two different value surfaces - export one at a time,
-                # selected the same way the sync /flood/gis-export endpoint does (default "river").
+                # River, floodplain, and rainfall are three different value surfaces - export one at
+                # a time, selected the same way the sync /flood/gis-export endpoint does (default
+                # "river").
                 engine = str(payload.get("engine") or "river")
-                if engine not in ("river", "rainfall"):
-                    raise ValueError("engine must be 'river' or 'rainfall'")
+                if engine not in ("river", "floodplain", "rainfall"):
+                    raise ValueError("engine must be 'river', 'floodplain', or 'rainfall'")
                 if engine == "river":
                     engine_risk, engine_class, engine_breakdown, _png = river_result
                     method_text = (
@@ -860,6 +955,15 @@ def _run_hazard_analysis_job(job_id: str) -> None:
                     )
                     default_value_key = "depth_m"
                     file_name = "flood_river_hazard_gis_export.zip"
+                elif engine == "floodplain":
+                    engine_risk, engine_class, engine_breakdown, _png = floodplain_result
+                    method_text = (
+                        "Floodplain susceptibility from MERIT Hydro's Height Above Nearest Drainage "
+                        "(HAND). Buildings are OpenStreetMap footprints, flagged where they sit on "
+                        "susceptible ground - not a river-flood simulation."
+                    )
+                    default_value_key = "flood_susceptibility_pct"
+                    file_name = "flood_floodplain_susceptibility_gis_export.zip"
                 else:
                     engine_risk, engine_class, engine_breakdown, _png = pluvial_result
                     method_text = (

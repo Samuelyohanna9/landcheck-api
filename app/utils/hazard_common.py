@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import json
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
+import ee
 from shapely import wkb
 from shapely.geometry.base import BaseGeometry
 from sqlalchemy import text
@@ -95,6 +96,38 @@ def risk_tier_legend() -> list[dict]:
         labels_seen.add(label)
         legend.append({"label": label, "color": color})
     return legend
+
+
+def fetch_susceptibility_points(image: "ee.Image", region: "ee.Geometry", scale_m: int = 90) -> Optional[List[Dict[str, float]]]:
+    """Samples a 0-1 susceptibility image as a {lng, lat, flood_susceptibility_pct} point cloud for
+    a map's graduated surface - same pixelLonLat + toList idiom used throughout this app's hazard
+    modules. Shared by hazard_pluvial.py and hazard_floodplain.py (two independent engines each
+    producing their own 0-1 susceptibility surface); lives here rather than in the pure-rendering
+    hazard_map_renderer.py, which deliberately has zero direct Earth Engine coupling.
+    """
+    try:
+        sampled = image.multiply(100).rename("flood_susceptibility_pct").addBands(ee.Image.pixelLonLat())
+        reduced = sampled.reduceRegion(
+            reducer=ee.Reducer.toList(),
+            geometry=region,
+            scale=scale_m,
+            maxPixels=int(1e9),
+            bestEffort=True,
+        )
+        info = reduced.getInfo() or {}
+        lons = info.get("longitude") or []
+        lats = info.get("latitude") or []
+        values = info.get("flood_susceptibility_pct") or []
+        if len(lons) < 3 or len(lons) != len(lats) or len(lons) != len(values):
+            return None
+        points = [
+            {"lng": float(lo), "lat": float(la), "flood_susceptibility_pct": float(v)}
+            for lo, la, v in zip(lons, lats, values)
+            if v is not None
+        ]
+        return points if len(points) >= 3 else None
+    except Exception:
+        return None
 
 
 def fetch_buildings_near(db: Session, boundary_geojson: Dict[str, Any], buffer_m: float = 500, limit: int = 4000) -> List[BaseGeometry]:
