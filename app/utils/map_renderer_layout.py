@@ -1556,7 +1556,7 @@ def annotate_vertices(
             # plot's own extent even though it's "correct" in paper millimetres - that mismatch is
             # what let a station name visually sit on top of its own beacon instead of just being
             # close to it. Flooring against the map's actual visible span is scale_ratio-agnostic.
-            offset_m = max(offset_m, max(span_x, span_y) * 0.022)
+            offset_m = max(offset_m, max(span_x, span_y) * 0.045)
         candidates = [(x, y)]
         if normal is not None:
             nx, ny = normal
@@ -1728,7 +1728,7 @@ def annotate_vertices(
                 scale_w=0.018,
                 scale_h=0.020,
                 normal=station_normal,
-                normal_offset_mult=10.5,
+                normal_offset_mult=18.0,
                 allow_center=False,
                 font_family=station_font,
                 text_effects=[patheffects.withStroke(linewidth=max(1.5, 2.2 * font_scale), foreground="white")],
