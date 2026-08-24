@@ -1718,7 +1718,7 @@ def annotate_vertices(
                 scale_w=0.018,
                 scale_h=0.020,
                 normal=station_normal,
-                normal_offset_mult=1.3,
+                normal_offset_mult=2.0,
                 allow_center=False,
                 font_family=station_font,
                 text_effects=[patheffects.withStroke(linewidth=max(1.5, 2.2 * font_scale), foreground="white")],
