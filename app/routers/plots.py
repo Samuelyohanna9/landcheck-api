@@ -87,6 +87,25 @@ PLOT_EXPORT_JOB_STATUS_VALUES = {"queued", "running", "completed", "failed"}
 STANDARD_SURVEY_SCALE_DENOMINATORS = (250, 500, 1000, 1250, 2000, 2500, 5000, 10000, 12500, 20000, 25000, 50000)
 
 
+def _export_render_slot_count() -> int:
+    try:
+        return max(1, int(os.getenv("PLOT_EXPORT_RENDER_CONCURRENCY", "2")))
+    except (TypeError, ValueError):
+        return 2
+
+
+# PDF/map exports are CPU- and database-intensive. A thread per click can exhaust PostgreSQL's
+# connection pool while long renders are in progress, so queue surplus export jobs in-process.
+_PLOT_EXPORT_RENDER_SLOTS = threading.BoundedSemaphore(_export_render_slot_count())
+
+
+def _limit_plot_export_concurrency(worker):
+    def run(*args, **kwargs):
+        with _PLOT_EXPORT_RENDER_SLOTS:
+            return worker(*args, **kwargs)
+    return run
+
+
 class PlotGeometryUpdateRequest(BaseModel):
     coordinates: List[List[float]]
 
@@ -4673,6 +4692,7 @@ def _generate_subdivision_batch_clean_copy_pdf(
     return cached_pdf_path
 
 
+@_limit_plot_export_concurrency
 def _run_subdivision_batch_export_job(job_id: str):
     db = SessionLocal()
     try:
@@ -4710,6 +4730,7 @@ def _run_subdivision_batch_export_job(job_id: str):
         db.close()
 
 
+@_limit_plot_export_concurrency
 def _run_subdivision_batch_clean_copy_export_job(job_id: str):
     db = SessionLocal()
     try:
@@ -4988,6 +5009,7 @@ def _cache_single_plot_export_file(
     return cache_path
 
 
+@_limit_plot_export_concurrency
 def _run_single_plot_export_job(job_id: str):
     db = SessionLocal()
     source_path = ""
