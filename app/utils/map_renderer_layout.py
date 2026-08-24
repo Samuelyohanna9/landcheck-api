@@ -1547,6 +1547,16 @@ def annotate_vertices(
         leader_from=None,
     ):
         offset_m = max(2.0, (6.0 / 1000.0) * scale_ratio) * max(0.6, normal_offset_mult)
+        if normal_offset_mult >= 3.0:
+            # Station-name-style large offsets (only the station-name call site below uses
+            # normal_offset_mult this high; bearing/distance labels use 1.0 and are untouched by
+            # this) must clear the beacon mark by a visible margin relative to what's actually on
+            # the page, not just relative to scale_ratio. A very large real-world plot compressed
+            # onto one sheet can make the scale_ratio-derived offset above tiny relative to the
+            # plot's own extent even though it's "correct" in paper millimetres - that mismatch is
+            # what let a station name visually sit on top of its own beacon instead of just being
+            # close to it. Flooring against the map's actual visible span is scale_ratio-agnostic.
+            offset_m = max(offset_m, max(span_x, span_y) * 0.022)
         candidates = [(x, y)]
         if normal is not None:
             nx, ny = normal
@@ -1718,7 +1728,7 @@ def annotate_vertices(
                 scale_w=0.018,
                 scale_h=0.020,
                 normal=station_normal,
-                normal_offset_mult=8.35,
+                normal_offset_mult=10.5,
                 allow_center=False,
                 font_family=station_font,
                 text_effects=[patheffects.withStroke(linewidth=max(1.5, 2.2 * font_scale), foreground="white")],
