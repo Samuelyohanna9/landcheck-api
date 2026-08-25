@@ -28,15 +28,27 @@ _RIVER_DIST_CAP_M = 2000.0  # fastDistanceTransform only searches a bounded pixe
                              # - capped the same way hazard_pluvial.py caps its own drainage-
                              # distance signal.
 
-# The linear HAND-to-risk transformation below (1 - HAND_m/25) is a PROVISIONAL, PRE-VALIDATION
-# MODELLING ASSUMPTION, not an empirically fitted or peer-reviewed risk relationship. The 25m
-# constant was chosen as a plain round number that reproduces the correct qualitative direction and
-# rough RISK_TIERS placement for every real-parcel-diagnostic site (Ogbaru ~2m -> ~0.92, Makurdi
-# 7.8m -> ~0.69, Ogunpa 12.8m -> ~0.49, Lokoja 18.2m -> ~0.27, Bodija 20.4m -> ~0.18, Abuja 23.1m ->
-# ~0.08, Jos 31.6m -> 0) - it was NOT fit via regression against those labels, and it is explicitly
-# frozen: do not adjust it based on Phase 3 blind-validation results without separate, deliberate
-# sign-off. Phase 3 exists to test this constant, not to be optimized against.
-_HAND_RISK_CEILING_M = 25.0
+# V3.1 FROZEN TERRAIN SUSCEPTIBILITY INDEX - supersedes the earlier single-variable, provisional
+# "1 - HAND/25" transform (see scratch/V3_1_TERRAIN_INDEX_PERMANENT_RECORD.md for the full R&D
+# history). V3.1 = 0.5*normalize(-HAND) + 0.5*normalize(-RelativeElevation_1000m), where both
+# terms are negated (lower HAND / lower relative elevation = higher susceptibility) before a fixed
+# min-max rescale. The formula, both terms, and the normalization constants below are FROZEN - they
+# were derived once from 417 pooled samples across 13 independent UFO flood events and are not to be
+# refit, retuned, or adjusted based on any single future result (that is precisely the discipline
+# that produced two independent out-of-sample replications: median AUC 0.734 on UFO, 0.729 on
+# Sen1Floods11 - see the permanent record). No weight in this formula was ever fit to a label.
+#
+# IMPORTANT SCOPE NOTE: this is a validated TERRAIN INUNDATION SUSCEPTIBILITY signal (low-lying
+# terrain relative to its surroundings predicts observed flood extent across two independent global
+# benchmarks). It is NOT a validated Nigerian urban-pluvial/drainage risk model - every attempt this
+# session to obtain qualifying Nigerian pluvial ground truth failed at the data-qualification stage,
+# before this index was ever tested against it (see scratch/V3_NIGERIA_SEARCH_CLOSURE.md). Do not
+# extend the customer-facing framing beyond "floodplain/terrain susceptibility" on the strength of
+# this deployment alone. The Pluvial/Rainfall branch's separate "Experimental" label is unaffected
+# by this change and must not be upgraded until genuine Nigerian pluvial ground truth is obtained.
+_HAND_ORIENTED_MIN, _HAND_ORIENTED_MAX = -165.94714902903826, -0.011056458756802398
+_RELELEV_ORIENTED_MIN, _RELELEV_ORIENTED_MAX = -90.06438029231361, 76.09087863884835
+_RELATIVE_ELEV_RADIUS_M = 1000.0
 
 FLOODPLAIN_REFERENCES = [
     {
@@ -73,10 +85,12 @@ def compute_floodplain_risk(
     Ogbaru, a River Niger floodplain town, read Low on the pluvial engine and had zero GloFAS
     coverage, yet its median Height Above Nearest Drainage across real building parcels was ~2m).
 
-    Deliberately single-signal (HAND only) - MERIT Hydro's own channel-mask distance and upstream
-    contributing-area were tested as candidate additional score inputs and found unreliable for
+    Score is the frozen V3.1 terrain index: 0.5*normalize(-HAND) + 0.5*normalize(-RelativeElevation
+    at 1000m) - see the module-level comment above for the full frozen-formula rationale and its
+    two independent out-of-sample replications. MERIT Hydro's own channel-mask distance and upstream
+    contributing-area were separately tested as candidate score inputs and found unreliable for
     small urban streams (going the wrong direction on a real diagnostic pair), so they're surfaced
-    in the breakdown as supporting context only, never part of risk_value.
+    in the breakdown as supporting context only, never part of risk_value - same treatment as before.
     """
     report = progress_cb or (lambda stage, pct: None)
     report("Connecting to Earth Engine...", 10)
@@ -94,6 +108,11 @@ def compute_floodplain_risk(
         river_mask.fastDistanceTransform(30).sqrt().multiply(merit_wat.projection().nominalScale()).rename("river_dist_m")
     )
 
+    # V3.1's second term - point elevation minus the 1000m-radius focal-mean elevation, sampled at
+    # the same location as everything else here. Same asset/scale as the frozen R&D methodology.
+    dem = ee.ImageCollection("COPERNICUS/DEM/GLO30_2024_1").select("DEM").mosaic()
+    dem_focal_1000 = dem.focal_mean(radius=_RELATIVE_ELEV_RADIUS_M, units="meters")
+
     report("Sampling elevation above nearest drainage...", 40)
     pct_reducer = (
         ee.Reducer.median().combine(ee.Reducer.min(), sharedInputs=True).combine(ee.Reducer.percentile([10]), sharedInputs=True)
@@ -101,19 +120,38 @@ def compute_floodplain_risk(
     combined = ee.Dictionary({
         "upa_km2": merit_upa.reduceRegion(ee.Reducer.mean(), local_area, scale=_MERIT_SCALE_M, maxPixels=1e9, bestEffort=True).get("upa"),
         "river_dist_m": river_dist_m_img.reduceRegion(ee.Reducer.mean(), local_area, scale=_MERIT_SCALE_M, maxPixels=1e9, bestEffort=True).get("river_dist_m"),
+        "elev_m": dem.reduceRegion(ee.Reducer.mean(), geom, scale=30, maxPixels=1e9, bestEffort=True).get("DEM"),
+        "focal_1000_m": dem_focal_1000.reduceRegion(ee.Reducer.mean(), geom, scale=30, maxPixels=1e9, bestEffort=True).get("DEM"),
     }).getInfo()
     hand_stats = hand_img.reduceRegion(pct_reducer, local_area, scale=_MERIT_SCALE_M, maxPixels=1e9, bestEffort=True).getInfo()
 
     hand_median_m = hand_stats.get("hnd_median")
     hand_min_m = hand_stats.get("hnd_min")
     hand_p10_m = hand_stats.get("hnd_p10")
+    elev_m = combined.get("elev_m")
+    focal_1000_m = combined.get("focal_1000_m")
+    relative_elev_1000m = (
+        float(elev_m) - float(focal_1000_m) if elev_m is not None and focal_1000_m is not None else None
+    )
     data_available = hand_median_m is not None  # MERIT Hydro has complete global coverage - this
                                                   # should be True for virtually every real request;
                                                   # False only on a genuine EE failure, never on a
                                                   # legitimate "no data here" the way GloFAS can be.
 
+    def _normalize(oriented_value: float, lo: float, hi: float) -> float:
+        scaled = (oriented_value - lo) / (hi - lo) if hi > lo else 0.5
+        return max(0.0, min(1.0, scaled))  # clip - see permanent record's clipping-rule note
+
     if data_available:
-        risk_value = max(0.0, min(1.0, 1.0 - float(hand_median_m) / _HAND_RISK_CEILING_M))
+        hand_term = _normalize(-float(hand_median_m), _HAND_ORIENTED_MIN, _HAND_ORIENTED_MAX)
+        if relative_elev_1000m is not None:
+            relelev_term = _normalize(-relative_elev_1000m, _RELELEV_ORIENTED_MIN, _RELELEV_ORIENTED_MAX)
+            risk_value = 0.5 * hand_term + 0.5 * relelev_term
+        else:
+            # Copernicus DEM has near-complete coverage too, but if this specific read fails, fall
+            # back to the HAND-only term rather than failing the whole engine - still the frozen
+            # formula's own HAND component, not a different constant.
+            risk_value = hand_term
     else:
         risk_value = 0.0
     risk_class, class_color = classify_risk(risk_value, data_available)
@@ -127,10 +165,12 @@ def compute_floodplain_risk(
         "hand_median_m": round(float(hand_median_m), 1) if hand_median_m is not None else None,
         "hand_min_m": round(float(hand_min_m), 1) if hand_min_m is not None else None,
         "hand_p10_m": round(float(hand_p10_m), 1) if hand_p10_m is not None else None,
+        "relative_elevation_1000m_m": round(relative_elev_1000m, 1) if relative_elev_1000m is not None else None,
         "distance_to_major_river_m": round(capped_river_dist, 1),
         "upstream_area_km2": round(float(upa_km2), 2) if upa_km2 is not None else None,
-        "flood_data_source": "hand_merit_hydro",
-        "data_sources": {"floodplain": "merit_hydro_hand"},
+        "flood_data_source": "hand_merit_hydro_v3_1",
+        "score_method": "v3_1_frozen_terrain_index",
+        "data_sources": {"floodplain": "merit_hydro_hand_plus_copernicus_dem_relative_elevation"},
         "_references": FLOODPLAIN_REFERENCES,
     }
 
@@ -139,10 +179,21 @@ def compute_floodplain_risk(
     )
     breakdown["confidence"] = confidence
 
-    # Converts HAND meters to the same 0-1 susceptibility-image convention every other engine's map
-    # sampling expects, using the SAME frozen 1 - HAND/ceiling transform as the score above (kept
-    # visually consistent with risk_value, never a second, different mapping).
-    susceptibility_img = ee.Image(1).subtract(hand_img.divide(_HAND_RISK_CEILING_M)).max(0).min(1)
+    # Converts the frozen V3.1 index to the same 0-1 susceptibility-image convention every other
+    # engine's map sampling expects, using the SAME formula/constants as risk_value above (kept
+    # visually consistent, never a second, different mapping).
+    hand_term_img = (
+        hand_img.multiply(-1).subtract(_HAND_ORIENTED_MIN).divide(_HAND_ORIENTED_MAX - _HAND_ORIENTED_MIN).max(0).min(1)
+    )
+    relative_elev_img = dem.subtract(dem_focal_1000).rename("relative_elev_1000m")
+    relelev_term_img = (
+        relative_elev_img.multiply(-1)
+        .subtract(_RELELEV_ORIENTED_MIN)
+        .divide(_RELELEV_ORIENTED_MAX - _RELELEV_ORIENTED_MIN)
+        .max(0)
+        .min(1)
+    )
+    susceptibility_img = hand_term_img.multiply(0.5).add(relelev_term_img.multiply(0.5))
     surface_points = fetch_susceptibility_points(susceptibility_img, local_area)
     contour_points = fetch_dem_elevation_points(boundary_geojson, buffer_m=1000)
 
