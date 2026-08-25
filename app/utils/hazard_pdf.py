@@ -284,16 +284,35 @@ def _draw_flood_screening_summary_page(c: canvas.Canvas, width: float, height: f
     ]
 
     row_h = 50
+    stacked_row_h = 62  # taller - label and value stack vertically instead of sharing one line
+    label_font, label_size = "Helvetica-Bold", 11
+    value_font, value_size = "Helvetica-Bold", 12
+    row_padding = 16  # minimum gap to keep label and value from ever touching
+    available_w = (width - 52) - 52  # same left/right inset the strings are drawn at
+
     ry = y
     for label, value, color in lines:
-        _draw_rounded_box(c, 36, ry - row_h, width - 72, row_h, 8, fill_color=HexColor("#f8fafc"), stroke_color=HexColor("#e2e8f0"))
+        display_value = value.upper() if value in ("Low", "Moderate", "High", "Severe") else value
+        label_w = c.stringWidth(label, label_font, label_size)
+        value_w = c.stringWidth(display_value, value_font, value_size)
+        # Side-by-side (label left, value right on one line) only when both actually fit with
+        # room to spare - measured, not assumed, so a long status phrase (e.g. the Rainfall row's
+        # "Experimental - insufficient validated local drainage data") can never overlap a long
+        # label instead of silently colliding in the middle of the box.
+        fits_side_by_side = (label_w + value_w + row_padding) <= available_w
+        this_row_h = row_h if fits_side_by_side else stacked_row_h
+
+        _draw_rounded_box(c, 36, ry - this_row_h, width - 72, this_row_h, 8, fill_color=HexColor("#f8fafc"), stroke_color=HexColor("#e2e8f0"))
         c.setFillColor(HexColor("#111827"))
-        c.setFont("Helvetica-Bold", 11)
+        c.setFont(label_font, label_size)
         c.drawString(52, ry - 20, label)
         c.setFillColor(HexColor(color))
-        c.setFont("Helvetica-Bold", 12)
-        c.drawRightString(width - 52, ry - 20, value.upper() if value in ("Low", "Moderate", "High", "Severe") else value)
-        ry -= row_h + 14
+        c.setFont(value_font, value_size)
+        if fits_side_by_side:
+            c.drawRightString(width - 52, ry - 20, display_value)
+        else:
+            c.drawString(52, ry - 40, display_value)
+        ry -= this_row_h + 14
 
     c.setFillColor(HexColor("#111827"))
     c.setFont("Helvetica-Bold", 11)
