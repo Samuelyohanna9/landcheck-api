@@ -80,7 +80,7 @@ REPORTS_DIR = os.path.join(BASE_DIR, "reports")
 PREVIEW_CACHE_DIR = os.path.join(REPORTS_DIR, "previews_cache")
 PREVIEW_CACHE_TTL_SECONDS = max(30, int(os.getenv("PLOT_PREVIEW_CACHE_TTL_SECONDS", "180")))
 PREVIEW_CACHE_MAX_FILES_PER_PLOT = max(5, int(os.getenv("PLOT_PREVIEW_CACHE_MAX_FILES_PER_PLOT", "24")))
-PREVIEW_LAYOUT_VERSION = "survey_layout_2026_08_24_station_label_offset_v89"
+PREVIEW_LAYOUT_VERSION = "survey_layout_2026_08_27_named_road_labels_v90"
 SURVEY_REPORT_RENDER_VERSION = "survey_report_2026_08_24_station_label_offset_v4"
 CLEAN_COPY_RENDER_VERSION = "clean_copy_2026_03_20_layout_v14"
 PLOT_EXPORT_JOB_STATUS_VALUES = {"queued", "running", "completed", "failed"}
@@ -1363,6 +1363,25 @@ def build_preview_revision_token(db: Session, plot_id: int) -> dict:
         WHERE plot_id = :plot_id
     """), {"plot_id": plot_id}).mappings().first() if _table_exists(db, "public.plot_feature_overrides") else {"updated_epoch": 0, "count": 0}
 
+    # The preview must change when a road is renamed, even where an older database has no
+    # updated_at trigger or two edits happen in the same second.  Count/timestamp alone can
+    # otherwise return the previous cached drawing after the Road Names panel says "Saved".
+    override_signature_rows = db.execute(text("""
+        SELECT
+            id,
+            feature_type,
+            action,
+            COALESCE(name, '') AS name,
+            COALESCE(width_m, -1) AS width_m,
+            COALESCE(encode(ST_AsEWKB(geom), 'hex'), '') AS geom_hex
+        FROM plot_feature_overrides
+        WHERE plot_id = :plot_id
+        ORDER BY id
+    """), {"plot_id": plot_id}).mappings().all() if _table_exists(db, "public.plot_feature_overrides") else []
+    override_signature = hashlib.sha256(
+        json.dumps([dict(row) for row in override_signature_rows], sort_keys=True, default=str).encode("utf-8")
+    ).hexdigest()
+
     geom_hex = db.execute(
         text("SELECT encode(ST_AsEWKB(geom), 'hex') FROM plots WHERE id = :plot_id"),
         {"plot_id": plot_id},
@@ -1373,6 +1392,7 @@ def build_preview_revision_token(db: Session, plot_id: int) -> dict:
         "features_count": int((feature_row or {}).get("count") or 0),
         "overrides_updated_epoch": int((override_row or {}).get("updated_epoch") or 0),
         "overrides_count": int((override_row or {}).get("count") or 0),
+        "overrides_signature": override_signature,
         "plot_geom_hash": hashlib.sha256((geom_hex or "").encode("utf-8")).hexdigest() if geom_hex else "",
     }
 

@@ -6675,8 +6675,16 @@ def render_plot_map_layout(
     qualifying_road_pairs = [
         (geom, name) for geom, name, highway in road_label_features
         if str(name or "").strip()
-        and geom.length > min_label_length_m * 1.5
-        and (not highway or highway.lower() in major_classes or highway == "override")
+        # A name entered in the Road Names panel is an explicit drafting instruction.  Do not
+        # suppress it just because that road is a minor OSM class or below the auto-label size.
+        # _draw_names_along_path still rejects paths that physically cannot hold their text.
+        and (
+            highway == "override"
+            or (
+                geom.length > min_label_length_m * 1.5
+                and (not highway or highway.lower() in major_classes)
+            )
+        )
     ]
     _draw_names_along_path(
         ax, qualifying_road_pairs, color=road_color, font_scale=font_scale,
