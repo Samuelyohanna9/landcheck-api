@@ -1685,7 +1685,19 @@ def annotate_vertices(
 
     skipped = []
     def draw_beacon(px, py):
-        size_m = max(1.0, (3.0 / 1000.0) * scale_ratio)
+        # Keep the selected beacon style legible without overpowering a close-scale plan. The
+        # size is expressed on paper, then converted to map metres for the active plan scale.
+        if scale_ratio <= 1000:
+            beacon_mm = 2.2
+        elif scale_ratio <= 2500:
+            beacon_mm = 2.6
+        elif scale_ratio <= 5000:
+            beacon_mm = 3.0
+        elif scale_ratio <= 10000:
+            beacon_mm = 3.5
+        else:
+            beacon_mm = 4.0
+        size_m = max(0.6, (beacon_mm / 1000.0) * scale_ratio)
         style = (beacon_style or "circle").lower()
         if style == "square":
             ax.add_patch(
