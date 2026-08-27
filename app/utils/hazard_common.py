@@ -73,15 +73,21 @@ EROSION_REFERENCES = [
 ]
 
 
-def classify_risk(value: float, data_available: bool = True) -> Tuple[str, str]:
+def classify_risk(
+    value: float, data_available: bool = True, tiers: Optional[List[Tuple[float, str, str]]] = None,
+) -> Tuple[str, str]:
     """Maps a 0-1 risk score to (label, hex color). data_available=False always returns the
     "No Data" tier regardless of value, since a 0.0 score from missing data must never be
     displayed the same way as a genuine "Low" score.
+
+    `tiers` overrides the shared RISK_TIERS - used by branches whose score distribution doesn't
+    match the shared cutoffs' assumptions (currently only Floodplain; see hazards.py's
+    _FLOODPLAIN_RISK_TIERS for why) without forking this whole function.
     """
     if not data_available:
         return "No Data", NO_DATA_COLOR
     safe_value = max(0.0, min(1.0, float(value)))
-    for ceiling, label, color in RISK_TIERS:
+    for ceiling, label, color in (tiers or RISK_TIERS):
         if safe_value < ceiling:
             return label, color
     return "Severe", "#ef4444"

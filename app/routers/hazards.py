@@ -9,7 +9,7 @@ import tempfile
 import logging
 
 from app.db import SessionLocal
-from app.utils.hazard_common import RISK_TIERS, classify_risk, risk_tier_legend
+from app.utils.hazard_common import classify_risk, risk_tier_legend
 from app.utils.hazard_flood import compute_flood_risk, overlay_to_data_url as flood_overlay_to_data_url
 from app.utils.hazard_floodplain import compute_floodplain_risk, floodplain_overlay_to_data_url
 from app.utils.hazard_pluvial import compute_pluvial_risk, pluvial_overlay_to_data_url
@@ -236,23 +236,44 @@ def _floodplain_note_and_method(breakdown: dict) -> tuple[str, str]:
     return note, method
 
 
-def _floodplain_display_tier(risk_class: str, class_color: str) -> tuple[str, str]:
-    """Customer-facing terminology cap: never show "Severe" for the floodplain/HAND branch. Phase 4
-    found HAND has genuine but moderate discrimination (AUC 0.72-0.75) with imperfect specificity -
-    "Severe" could read to a buyer as a validated depth-model verdict the way River's badge is,
-    which this branch has not earned. Reuses the existing High tier's own color from RISK_TIERS
-    rather than a duplicated hex literal. The underlying risk_value/classify_risk threshold and
-    compute_floodplain_risk() are NOT changed - this only relabels what's displayed.
+# Floodplain-specific risk tiers - NOT the shared RISK_TIERS every other hazard branch uses.
+# Calibrated (2026-08-27) against the frozen V3.1 score's real distribution across Nigeria, not
+# picked to match a target look: sampled one point per Nigerian state capital + Abuja (37 points,
+# see scratch/floodplain_tier_recalibration.py in landcheck-api) and found the shared cutoffs
+# (Low<25%, Moderate<50%, High<75%, Severe>=75%) put ZERO of the 37 in Low or Moderate - all 37
+# landed High or Severe, because V3.1's frozen min-max normalization range was set by a validation
+# sample's extremes (HAND up to 166m) that essentially never occur in ordinary Nigerian terrain.
+# Confirmed live at 10 additional hand-picked diverse points too (scratch/
+# floodplain_v31_calibration_check.py), including highland towns (Jos Plateau, Abuja's Asokoro
+# hills) that read 58-67% despite not being unusually flood-prone.
+#
+# These cutoffs instead reflect where an ordinary Nigerian site actually falls within V3.1's own
+# scale (national sample: mean 0.735, stdev 0.049, range 0.638-0.809) - roughly the sample's own
+# quartiles (p25=0.696, p50=0.743, p75=0.767), rounded to clean numbers. This does NOT touch
+# compute_floodplain_risk()'s formula, weights, or normalization constants - those remain fully
+# frozen per the V3.1 permanent record. Only what a given score is LABELED as to the reader changes.
+_FLOODPLAIN_RISK_TIERS = [
+    (0.70, "Low", "#22c55e"),
+    (0.74, "Moderate", "#f59e0b"),
+    (0.77, "High", "#f97316"),
+    (1.01, "Severe", "#ef4444"),
+]
+
+
+def _floodplain_display_tier(risk_value: float, data_available: bool) -> tuple[str, str]:
+    """Re-classifies the floodplain score against the Nigeria-calibrated tiers above instead of the
+    shared generic RISK_TIERS - see _FLOODPLAIN_RISK_TIERS for why. Supersedes the narrower "cap
+    Severe to High" terminology adjustment this function used to do; that was a partial fix for the
+    same underlying problem (HAND's imperfect specificity making an uncapped score overclaim
+    confidence this branch hasn't earned) - this fixes it at the root by reclassifying from the raw
+    score against a properly-calibrated scale, not just re-labeling whatever the shared, mismatched
+    tiers already produced.
     """
-    if risk_class == "Severe":
-        for _, label, color in RISK_TIERS:
-            if label == "High":
-                return "High", color
-    return risk_class, class_color
+    return classify_risk(risk_value, data_available, tiers=_FLOODPLAIN_RISK_TIERS)
 
 
-def _flood_floodplain_section(risk_value, risk_class, class_color, breakdown, overlay_png, pdf: bool = False) -> dict:
-    risk_class, class_color = _floodplain_display_tier(risk_class, class_color)
+def _flood_floodplain_section(risk_value, breakdown, overlay_png, pdf: bool = False) -> dict:
+    risk_class, class_color = _floodplain_display_tier(risk_value, breakdown.get("data_available", True))
     note, method = _floodplain_note_and_method(breakdown)
     fmt = (lambda v: str(v)) if pdf else (lambda v: v)
     return {
@@ -395,15 +416,14 @@ def _compute_flood_branches(
 
 def _flood_summary_payload(river_result, floodplain_result, pluvial_result, show_raster, return_period) -> dict:
     river_risk, river_class, river_breakdown, river_png = river_result
-    floodplain_risk, floodplain_class, floodplain_breakdown, floodplain_png = floodplain_result
+    floodplain_risk, _floodplain_class, floodplain_breakdown, floodplain_png = floodplain_result
     pluvial_risk, pluvial_class, pluvial_breakdown, pluvial_png = pluvial_result
     _, river_color = classify_risk(river_risk, river_breakdown.get("data_available", True))
-    _, floodplain_color = classify_risk(floodplain_risk, floodplain_breakdown.get("data_available", True))
     _, pluvial_color = classify_risk(pluvial_risk, pluvial_breakdown.get("data_available", True))
-    # Built once, then read back for the summary line/legend below, so the display-terminology cap
-    # ("Severe" -> "High" for this branch - see _floodplain_display_tier) can never disagree between
-    # the detail card and the summary line.
-    floodplain_section = _flood_floodplain_section(floodplain_risk, floodplain_class, floodplain_color, floodplain_breakdown, floodplain_png)
+    # Built once, then read back for the summary line/legend below, so the Nigeria-calibrated tier
+    # reclassification (see _floodplain_display_tier) can never disagree between the detail card
+    # and the summary line.
+    floodplain_section = _flood_floodplain_section(floodplain_risk, floodplain_breakdown, floodplain_png)
     legend = _build_legend(floodplain_section["risk_class"], floodplain_section["class_color"], "This Site", show_raster, RASTER_LEGEND_FLOOD)
     return {
         "summary": {
@@ -426,12 +446,11 @@ def _flood_summary_payload(river_result, floodplain_result, pluvial_result, show
 
 def _flood_summary_pdf_summary(river_result, floodplain_result, pluvial_result, show_raster, return_period) -> dict:
     river_risk, river_class, river_breakdown, _river_png = river_result
-    floodplain_risk, floodplain_class, floodplain_breakdown, _floodplain_png = floodplain_result
+    floodplain_risk, _floodplain_class, floodplain_breakdown, _floodplain_png = floodplain_result
     pluvial_risk, pluvial_class, pluvial_breakdown, _pluvial_png = pluvial_result
     _, river_color = classify_risk(river_risk, river_breakdown.get("data_available", True))
-    _, floodplain_color = classify_risk(floodplain_risk, floodplain_breakdown.get("data_available", True))
     _, pluvial_color = classify_risk(pluvial_risk, pluvial_breakdown.get("data_available", True))
-    floodplain_section = _flood_floodplain_section(floodplain_risk, floodplain_class, floodplain_color, floodplain_breakdown, None, pdf=True)
+    floodplain_section = _flood_floodplain_section(floodplain_risk, floodplain_breakdown, None, pdf=True)
     legend = _build_legend(floodplain_section["risk_class"], floodplain_section["class_color"], "This Site", show_raster, RASTER_LEGEND_FLOOD)
     return {
         "summary": {
@@ -723,7 +742,10 @@ def flood_gis_export(payload: dict = Body(...), db: Session = Depends(get_db)):
             )
             file_name = "flood_river_hazard_gis_export.zip"
         elif engine == "floodplain":
-            risk_value, risk_class, breakdown, _overlay_png = compute_floodplain_risk(db, boundary)
+            risk_value, _risk_class, breakdown, _overlay_png = compute_floodplain_risk(db, boundary)
+            # Nigeria-calibrated tiers, not the shared RISK_TIERS - see _FLOODPLAIN_RISK_TIERS,
+            # so this export's embedded risk_class always matches what the app/PDF show.
+            risk_class, _ = _floodplain_display_tier(risk_value, breakdown.get("data_available", True))
             method_text = (
                 "Floodplain susceptibility from MERIT Hydro's Height Above Nearest Drainage (HAND). "
                 "Buildings are OpenStreetMap footprints, flagged where they sit on susceptible "

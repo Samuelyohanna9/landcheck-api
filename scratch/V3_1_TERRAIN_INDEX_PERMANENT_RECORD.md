@@ -132,3 +132,40 @@ no further terrain variables are to be searched for. The next authorized step is
 frozen formula (unchanged) against genuinely qualified Nigerian pluvial events once obtained — not
 retraining, not re-normalizing, not adding features in response to that data, and not extending its
 customer-facing claim beyond "floodplain/terrain susceptibility" until that validation exists.
+
+## Addendum (2026-08-27): customer-facing risk-tier recalibration (score itself untouched)
+
+**Reported symptom**: the Floodplain Susceptibility badge read High/Severe on almost every real
+site tested, including places with no business scoring as flood-susceptible.
+
+**Diagnosed live**, not assumed: sampled the exact frozen formula/constants above at 10 hand-picked
+diverse points (`scratch/floodplain_v31_calibration_check.py`) and, more rigorously, at one point
+per Nigerian state capital + Abuja (`scratch/floodplain_tier_recalibration.py`, n=37 — a systematic,
+reproducible sampling frame rather than a hand-picked one). Result: applying the shared RISK_TIERS
+(Low<25%, Moderate<50%, High<75%, Severe≥75%) put **zero** of the 37 state capitals in Low or
+Moderate — all 37 landed High or Severe (mean 0.735, stdev 0.049, range 0.638–0.809).
+
+**Root cause**: this is not a flaw in the frozen score's discrimination (the 0.734/0.729 AUC
+results above are real and unaffected). AUC only certifies *relative ranking* within the 417/331-
+point validation samples; it says nothing about whether the min-max-normalized value is a
+well-calibrated absolute percentage for the general population of real-world sites. The frozen
+normalization range's extremes (HAND up to 165.9m) come from that validation sample's own outliers,
+which essentially never occur in ordinary Nigerian terrain — so almost every real Nigerian site,
+however unremarkable, lands compressed into the upper half of the 0–1 scale.
+
+**Fix (per explicit instruction, after presenting the evidence and options)**: added
+`_FLOODPLAIN_RISK_TIERS` in `app/routers/hazards.py` and threaded an optional `tiers` param through
+`classify_risk()` (`app/utils/hazard_common.py`) so Floodplain can classify against its own,
+Nigeria-calibrated cutoffs (Low<0.70, Moderate<0.74, High<0.77, Severe≥0.77 — roughly the 37-point
+sample's own quartiles) instead of the shared generic tiers every other hazard branch uses. This
+**does not change** `compute_floodplain_risk()`'s formula, weights, or normalization constants in
+any way — the raw 0–1 score returned and exported is bit-for-bit identical to before. Only the
+Low/Moderate/High/Severe label a given score maps to changes. Supersedes the older, narrower
+`_floodplain_display_tier` behavior (which only capped "Severe" down to "High"); that was a partial
+answer to the same underlying problem, now fixed at the root by reclassifying from the raw score
+against a properly-calibrated scale.
+
+Verified end-to-end through the actual production code path (not just the standalone formula):
+Obudu Plateau (extreme highland) stayed Low as expected; Ibadan/Port Harcourt (genuinely in the
+national upper quartile) stayed High/Severe appropriately — the recalibration redistributes labels
+across the real distribution, it doesn't flatten everything to "safe."
