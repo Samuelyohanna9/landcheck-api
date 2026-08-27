@@ -1801,25 +1801,21 @@ def annotate_vertices(
             ang += 180
 
         label_nx, label_ny = normal
-        # Boundary dimensions are drafted just inside their own segment, as on a conventional
-        # survey plan. This leaves both stacked values inside without pushing them deep into the
-        # parcel to make space for a nearby road name.
-        label_offset_mult = 1.65
-        # Keep bearing/distance vertical spacing consistent on every boundary edge.
-        label_line_spacing = 2.2
+        # Survey convention: bearing is outside its boundary edge and distance is inside. Keep
+        # them as independent labels, rather than a stacked block whose order can reverse after
+        # a readability rotation on a vertical or angled segment.
+        label_offset_mult = 0.9
         base_offset = max(2.0, (6.0 / 1000.0) * scale_ratio)
         if boundary_poly is not None:
             test_pt = Point(mx + label_nx * base_offset, my + label_ny * base_offset)
-            if not boundary_poly.contains(test_pt):
+            if boundary_poly.contains(test_pt):
                 label_nx, label_ny = -label_nx, -label_ny
         bearing_line = format_bearing_dms(bearing)
         distance_line = f"{dist:.2f}m"
-        label_text = f"{bearing_line}\n{distance_line}"
-
-        placed = place_text(
+        bearing_placed = place_text(
             mx,
             my,
-            label_text,
+            bearing_line,
             font_size=bearing_size if bearing_size else int(7.0 * font_scale),
             color=boundary_color,
             rotation=ang,
@@ -1828,12 +1824,27 @@ def annotate_vertices(
             scale_h=0.025,
             normal=(label_nx, label_ny),
             normal_offset_mult=label_offset_mult,
-            line_spacing=label_line_spacing,
             allow_center=False,
             font_family=bearing_font,
             restrict_to_normal=True,
         )
-        if not placed:
+        distance_placed = place_text(
+            mx,
+            my,
+            distance_line,
+            font_size=bearing_size if bearing_size else int(7.0 * font_scale),
+            color=boundary_color,
+            rotation=ang,
+            weight="normal",
+            scale_w=0.02,
+            scale_h=0.025,
+            normal=(-label_nx, -label_ny),
+            normal_offset_mult=label_offset_mult,
+            allow_center=False,
+            font_family=bearing_font,
+            restrict_to_normal=True,
+        )
+        if not bearing_placed or not distance_placed:
             skipped.append(
                 {
                     "from": label,
