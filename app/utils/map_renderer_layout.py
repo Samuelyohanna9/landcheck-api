@@ -2671,7 +2671,6 @@ def _draw_names_along_path(
     halo: bool = True,
     skip_point_fn=None,
     force_label: bool = False,
-    position_adjuster=None,
 ) -> None:
     """Draws each (geometry, name) pair's name text following the geometry's own direction,
     matching how road/river names read on real cadastral plans. A short line gets one centered
@@ -2747,11 +2746,6 @@ def _draw_names_along_path(
                 if angle < -90 or angle > 90:
                     angle += 180
                 draw_x, draw_y = mid.x, mid.y
-                if position_adjuster is not None:
-                    adjusted = position_adjuster(draw_x, draw_y, label, angle)
-                    if adjusted is None:
-                        continue
-                    draw_x, draw_y = adjusted
                 if skip_point_fn is not None and skip_point_fn(draw_x, draw_y, label):
                     continue
                 text_kwargs = dict(
@@ -6656,33 +6650,6 @@ def render_plot_map_layout(
     def boundary_skip(x, y, label):
         return label_overlaps_boundary(estimate_box(x, y, len(label)))
 
-    def clear_of_boundary_labels(x, y, label, angle):
-        # User-entered road names take priority over automatic road labels, but must not cover
-        # the legally important bearing/distance callouts.  Move the name normal to the road to
-        # the first clear side; the candidate spacing is measured in printed-sheet proportions.
-        base_box = estimate_box(x, y, len(label))
-        if not label_overlaps_boundary(base_box):
-            return x, y
-        normal = math.radians(angle + 90.0)
-        margin_x = span_x * 0.03
-        margin_y = span_y * 0.03
-        for direction in (1.0, -1.0):
-            for paper_offset in (0.07, 0.11, 0.15):
-                candidate_x = x + direction * math.cos(normal) * span_x * paper_offset
-                candidate_y = y + direction * math.sin(normal) * span_y * paper_offset
-                candidate_box = estimate_box(candidate_x, candidate_y, len(label))
-                inside_frame = (
-                    candidate_box[0] >= target_xlim[0] + margin_x
-                    and candidate_box[2] <= target_xlim[1] - margin_x
-                    and candidate_box[1] >= target_ylim[0] + margin_y
-                    and candidate_box[3] <= target_ylim[1] - margin_y
-                )
-                if inside_frame and not label_overlaps_boundary(candidate_box):
-                    return candidate_x, candidate_y
-        # Preserve the explicit name even on a crowded plan; the halo leaves the bearing text
-        # readable when no clear side of the road is available.
-        return x, y
-
     explicit_road_pairs = [
         (geom, name) for geom, name, highway in road_label_features
         if str(name or "").strip() and highway == "override"
@@ -6700,7 +6667,7 @@ def render_plot_map_layout(
     )
     _draw_names_along_path(
         ax, explicit_road_pairs, color=road_color, font_scale=font_scale,
-        force_label=True, position_adjuster=clear_of_boundary_labels,
+        force_label=True,
     )
     _draw_names_along_path(
         ax, river_label_features, color=river_color, font_scale=font_scale,
