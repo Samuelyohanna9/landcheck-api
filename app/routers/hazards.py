@@ -272,12 +272,35 @@ def _floodplain_display_tier(risk_value: float, data_available: bool) -> tuple[s
     return classify_risk(risk_value, data_available, tiers=_FLOODPLAIN_RISK_TIERS)
 
 
+# Anchors the DISPLAYED percentage to the exact same real-Nigeria breakpoints as
+# _FLOODPLAIN_RISK_TIERS (0.70/0.74/0.77 -> 25/50/75) rather than inventing a separate set of
+# numbers - so "Low ends at 25%, Moderate at 50%, High at 75%" reads the way every other hazard
+# branch's percentage already does, instead of a typical Nigerian site (which clusters tightly in
+# the 60s-80s on the FROZEN scale - see _FLOODPLAIN_RISK_TIERS's comment) always printing 70-90%
+# regardless of its real relative standing.
+_FLOODPLAIN_DISPLAY_ANCHORS = [(0.0, 0.0), (0.70, 25.0), (0.74, 50.0), (0.77, 75.0), (1.0, 100.0)]
+
+
+def _floodplain_display_score(risk_value: float) -> float:
+    """Rescales the frozen 0-1 floodplain score onto a more intuitive 0-100 display percentage -
+    does NOT change risk_value, classify_risk, or anything used for tier classification/export
+    identity, purely what number is printed next to the badge (and in the floodplain GIS export's
+    risk_score field, for the same reason). See _FLOODPLAIN_DISPLAY_ANCHORS above for the mapping.
+    """
+    safe_value = max(0.0, min(1.0, float(risk_value)))
+    for (x0, y0), (x1, y1) in zip(_FLOODPLAIN_DISPLAY_ANCHORS, _FLOODPLAIN_DISPLAY_ANCHORS[1:]):
+        if safe_value <= x1:
+            frac = (safe_value - x0) / (x1 - x0) if x1 > x0 else 0.0
+            return round(y0 + frac * (y1 - y0), 1)
+    return 100.0
+
+
 def _flood_floodplain_section(risk_value, breakdown, overlay_png, pdf: bool = False) -> dict:
     risk_class, class_color = _floodplain_display_tier(risk_value, breakdown.get("data_available", True))
     note, method = _floodplain_note_and_method(breakdown)
     fmt = (lambda v: str(v)) if pdf else (lambda v: v)
     return {
-        "risk_score": fmt(round(risk_value * 100, 1)),
+        "risk_score": fmt(_floodplain_display_score(risk_value)),
         "risk_class": risk_class,
         "class_color": class_color,
         "hand_median_m": fmt(breakdown.get("hand_median_m")),
@@ -735,6 +758,7 @@ def flood_gis_export(payload: dict = Body(...), db: Session = Depends(get_db)):
             risk_value, risk_class, breakdown, _overlay_png = compute_flood_risk(
                 db, boundary, False, return_period, local_elevation_points,
             )
+            risk_score_pct = round(risk_value * 100, 1)
             method_text = (
                 f"Flood depth sampled from JRC/CEMS GloFAS Flood Hazard v2.1 at the "
                 f"{return_period}-year return period. Buildings are OpenStreetMap footprints, "
@@ -743,9 +767,11 @@ def flood_gis_export(payload: dict = Body(...), db: Session = Depends(get_db)):
             file_name = "flood_river_hazard_gis_export.zip"
         elif engine == "floodplain":
             risk_value, _risk_class, breakdown, _overlay_png = compute_floodplain_risk(db, boundary)
-            # Nigeria-calibrated tiers, not the shared RISK_TIERS - see _FLOODPLAIN_RISK_TIERS,
-            # so this export's embedded risk_class always matches what the app/PDF show.
+            # Nigeria-calibrated tiers/display score, not the shared RISK_TIERS or raw risk_value*100
+            # - see _FLOODPLAIN_RISK_TIERS/_floodplain_display_score - so this export's embedded
+            # risk_class/risk_score always match what the app/PDF show.
             risk_class, _ = _floodplain_display_tier(risk_value, breakdown.get("data_available", True))
+            risk_score_pct = _floodplain_display_score(risk_value)
             method_text = (
                 "Floodplain susceptibility from MERIT Hydro's Height Above Nearest Drainage (HAND). "
                 "Buildings are OpenStreetMap footprints, flagged where they sit on susceptible "
@@ -758,6 +784,7 @@ def flood_gis_export(payload: dict = Body(...), db: Session = Depends(get_db)):
                 site_type=site_params["site_type"], design_rainfall_mm=site_params["design_rainfall_mm"],
                 analysis_mode=site_params["analysis_mode"],
             )
+            risk_score_pct = round(risk_value * 100, 1)
             method_text = (
                 "Surface-water/rainfall susceptibility from terrain, CHIRPS extreme rainfall, soil "
                 "infiltration, and built-up surface fraction. Buildings are OpenStreetMap footprints, "
@@ -778,7 +805,7 @@ def flood_gis_export(payload: dict = Body(...), db: Session = Depends(get_db)):
         value_points=export_data.get("value_points"),
         value_key=export_data.get("value_key", "depth_m" if engine == "river" else "flood_susceptibility_pct"),
         risk_class=risk_class,
-        risk_score=round(risk_value * 100, 1),
+        risk_score=risk_score_pct,
         method_text=method_text,
     )
     return _gis_export_response(zip_bytes, file_name)
