@@ -1801,9 +1801,10 @@ def annotate_vertices(
             ang += 180
 
         label_nx, label_ny = normal
-        # Boundary dimensions are always drafted inside the parcel. The larger inward offset
-        # keeps both stacked lines clear of the boundary, instead of putting one outside it.
-        label_offset_mult = 2.5
+        # Boundary dimensions are drafted just inside their own segment, as on a conventional
+        # survey plan. This leaves both stacked values inside without pushing them deep into the
+        # parcel to make space for a nearby road name.
+        label_offset_mult = 1.65
         # Keep bearing/distance vertical spacing consistent on every boundary edge.
         label_line_spacing = 2.2
         base_offset = max(2.0, (6.0 / 1000.0) * scale_ratio)
