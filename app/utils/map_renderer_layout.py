@@ -1556,7 +1556,7 @@ def annotate_vertices(
         anchor_from_normal: bool = False,
         restrict_to_normal: bool = False,
     ):
-        offset_m = max(2.0, (6.0 / 1000.0) * scale_ratio) * max(0.6, normal_offset_mult)
+        offset_m = max(2.0, (6.0 / 1000.0) * scale_ratio) * max(0.35, normal_offset_mult)
         if normal_offset_mult >= 1.5:
             # Station names (only the station-name call site below uses normal_offset_mult this
             # high; bearing/distance labels use 1.0 and are untouched by this) are offset by a
@@ -1804,7 +1804,7 @@ def annotate_vertices(
         # Survey convention: bearing is outside its boundary edge and distance is inside. Keep
         # them as independent labels, rather than a stacked block whose order can reverse after
         # a readability rotation on a vertical or angled segment.
-        label_offset_mult = 0.9
+        label_offset_mult = 0.35
         base_offset = max(2.0, (6.0 / 1000.0) * scale_ratio)
         if boundary_poly is not None:
             test_pt = Point(mx + label_nx * base_offset, my + label_ny * base_offset)
