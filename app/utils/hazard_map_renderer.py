@@ -46,7 +46,22 @@ SUSCEPTIBILITY_THREATENED_PCT = 60.0
 FLOODPLAIN_BANDS = [1.0, 20.0, 40.0, 60.0, 80.0]
 FLOODPLAIN_BAND_LABELS = [0.0, 20.0, 40.0, 60.0, 80.0]
 FLOODPLAIN_COLORS = ["#ccfbf1", "#5eead4", "#2dd4bf", "#0d9488", "#134e4a"]
-FLOODPLAIN_THREATENED_PCT = 60.0
+
+# "Buildings threatened" flagging - NOT a single fixed percentage. Live-tested (scratch/
+# floodplain_building_threshold_check.py) against 4 real dense-building sites: a flat cutoff
+# swings wildly between sites (0% to 45% flagged at the same threshold, one real customer site
+# reported 91.7% flagged) because V3.1's frozen score's absolute baseline itself varies by site
+# (national range ~64-81%, see hazards.py's _FLOODPLAIN_RISK_TIERS) - a flat cutoff mostly just
+# measures "is this whole site above or below the cutoff," not "which buildings within it are
+# actually worse than their neighbours." A building is now flagged only when BOTH hold:
+#   1. RELATIVE: its score sits in the upper (1 - LOCAL_FRACTION) portion of THIS render's own
+#      local min-max range - the same "worse than its surroundings" logic already used for the
+#      flood-water tiles in the frontend's 3D view, applied here to buildings instead of tiles.
+#   2. ABSOLUTE: its score also clears the Nigeria-calibrated "Moderate" floor (matches hazards.py's
+#      _FLOODPLAIN_RISK_TIERS) - so a uniformly low-risk site can't have its "locally worst" 40%
+#      flagged despite nothing there being risky in absolute terms.
+FLOODPLAIN_THREATENED_LOCAL_FRACTION = 0.6
+FLOODPLAIN_THREATENED_ABSOLUTE_FLOOR_PCT = 70.0
 
 BUILDING_THREATENED_COLOR = "#dc2626"
 BUILDING_SAFE_COLOR = "#9ca3af"
@@ -761,12 +776,14 @@ def render_floodplain_hazard_map(
     drawn_band_colors: List[str] = []
     surface_capped = False
     value_interp = None
+    threatened_cutoff = FLOODPLAIN_THREATENED_ABSOLUTE_FLOOR_PCT
     if susceptibility_points and len(susceptibility_points) >= 3:
         try:
             xs, ys, values = _points_to_projected_xyz(susceptibility_points, "flood_susceptibility_pct", display_epsg)
             if len(xs) >= 3 and float(np.nanmax(values)) > FLOODPLAIN_BANDS[0]:
                 triang = mtri.Triangulation(xs, ys)
                 max_value = float(np.nanmax(values))
+                min_value = float(np.nanmin(values))
                 band_count = sum(1 for b in FLOODPLAIN_BAND_LABELS if b < max_value) or 1
                 surface_capped = band_count < len(FLOODPLAIN_BAND_LABELS)
                 levels = [FLOODPLAIN_BANDS[0]] + FLOODPLAIN_BAND_LABELS[1:band_count] + [max_value + 0.01]
@@ -776,6 +793,8 @@ def render_floodplain_hazard_map(
                 surface_available = True
                 drawn_band_labels = FLOODPLAIN_BAND_LABELS[:band_count]
                 drawn_band_colors = colors_for_levels
+                local_cutoff = min_value + FLOODPLAIN_THREATENED_LOCAL_FRACTION * (max_value - min_value)
+                threatened_cutoff = max(local_cutoff, FLOODPLAIN_THREATENED_ABSOLUTE_FLOOR_PCT)
         except Exception:
             surface_available = False
 
@@ -791,7 +810,7 @@ def render_floodplain_hazard_map(
         interpolated = value_interp(cx, cy)
         values = np.ma.filled(interpolated, 0.0)
         mask_invalid = np.ma.getmaskarray(interpolated) if np.ma.is_masked(interpolated) else np.zeros(len(cx), dtype=bool)
-        return (~mask_invalid) & (values > FLOODPLAIN_THREATENED_PCT)
+        return (~mask_invalid) & (values > threatened_cutoff)
 
     buildings_total, buildings_threatened, buildings_gdf_wgs84 = _draw_buildings(ax, buildings, display_epsg, _floodplain_threatened)
 
