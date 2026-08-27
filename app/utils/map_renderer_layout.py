@@ -2702,14 +2702,16 @@ def _draw_names_along_path(
     zorder: int = 10,
     halo: bool = True,
     skip_point_fn=None,
+    force_label: bool = False,
 ) -> None:
     """Draws each (geometry, name) pair's name text following the geometry's own direction,
     matching how road/river names read on real cadastral plans. A short line gets one centered
     label; a long or curved one gets the label repeated at intervals, each instance locally
     rotated to the path's tangent there, so the name reads naturally along bends instead of being
     confined to a single point. Placement always uses a sub-segment long enough to hold the whole
-    label so it never spills past a junction or a line's end. A white halo keeps the text legible
-    when a road/river crosses building hatch or another line.
+    label so it never spills past a junction or a line's end. `force_label` is for a name the
+    surveyor explicitly entered: it places one centered label even when the segment is shorter
+    than the rendered text at the selected scale. A white halo keeps text legible over linework.
     """
     if not name_geom_pairs:
         return
@@ -2754,11 +2756,19 @@ def _draw_names_along_path(
 
         placed_any = False
         for seg in parts:
+            if force_label and placed_any:
+                break
             seg_len = seg.length
             if seg_len < min_len_for_label:
-                continue
-            n_labels = max(1, int(seg_len // spacing))
-            half_pad = min(0.45, (min_len_for_label / 2.0) / seg_len)
+                if not force_label:
+                    continue
+                # The user deliberately named this road. Keep one centered label visible rather
+                # than making it disappear at larger scales where the line is short on paper.
+                n_labels = 1
+                half_pad = 0.0
+            else:
+                n_labels = max(1, int(seg_len // spacing))
+                half_pad = min(0.45, (min_len_for_label / 2.0) / seg_len)
             for i in range(n_labels):
                 frac = min(max((i + 0.5) / n_labels, half_pad), 1 - half_pad)
                 mid = seg.interpolate(frac, normalized=True)
@@ -3542,9 +3552,8 @@ def _render_plot_map_layout_adamawa(
 
     min_road_label_len = max(2.0, (10.0 / 1000.0) * scale_ratio)
     _draw_names_along_path(
-        ax,
-        [(g, n) for g, n in road_label_features if g.length > min_road_label_len],
-        color=road_color, font_scale=font_scale, base_fontsize=6.0,
+        ax, road_label_features, color=road_color, font_scale=font_scale,
+        base_fontsize=6.0, force_label=True,
     )
     _draw_names_along_path(
         ax,
@@ -4499,9 +4508,9 @@ def _render_plot_map_layout_cadastral(
         return snap(clipped, extent_poly.boundary, road_snap_tol), name
 
     min_named_len = max(2.0, (10.0 / 1000.0) * scale_ratio)
-    road_label_features = [r for r in (_project_clip_named(g, n) for g, n in road_add_named_overrides) if r and r[0].length > min_named_len]
+    road_label_features = [r for r in (_project_clip_named(g, n) for g, n in road_add_named_overrides) if r]
     river_label_features = [r for r in (_project_clip_named(g, n) for g, n in river_add_named_overrides) if r and r[0].length > min_named_len]
-    _draw_names_along_path(ax, road_label_features, color=road_color, font_scale=font_scale, base_fontsize=6.0)
+    _draw_names_along_path(ax, road_label_features, color=road_color, font_scale=font_scale, base_fontsize=6.0, force_label=True)
     _draw_names_along_path(ax, river_label_features, color=river_color, font_scale=font_scale, base_fontsize=6.0)
 
     all_buildings = []
@@ -5114,9 +5123,9 @@ def _render_plot_map_layout_fct(
         return snap(clipped, extent_poly.boundary, road_snap_tol), name
 
     min_named_len = max(2.0, (10.0 / 1000.0) * scale_ratio)
-    road_label_features = [r for r in (_project_clip_named(g, n) for g, n in road_add_named_overrides) if r and r[0].length > min_named_len]
+    road_label_features = [r for r in (_project_clip_named(g, n) for g, n in road_add_named_overrides) if r]
     river_label_features = [r for r in (_project_clip_named(g, n) for g, n in river_add_named_overrides) if r and r[0].length > min_named_len]
-    _draw_names_along_path(ax, road_label_features, color=road_color, font_scale=font_scale, base_fontsize=6.0)
+    _draw_names_along_path(ax, road_label_features, color=road_color, font_scale=font_scale, base_fontsize=6.0, force_label=True)
     _draw_names_along_path(ax, river_label_features, color=river_color, font_scale=font_scale, base_fontsize=6.0)
 
     all_buildings = []
@@ -5826,9 +5835,9 @@ def _render_plot_map_layout_site_plan(
         return snap(clipped, extent_poly.boundary, road_snap_tol), name
 
     min_named_len = max(2.0, (10.0 / 1000.0) * scale_ratio)
-    road_label_features = [r for r in (_project_clip_named(g, n) for g, n in road_add_named_overrides) if r and r[0].length > min_named_len]
+    road_label_features = [r for r in (_project_clip_named(g, n) for g, n in road_add_named_overrides) if r]
     river_label_features = [r for r in (_project_clip_named(g, n) for g, n in river_add_named_overrides) if r and r[0].length > min_named_len]
-    _draw_names_along_path(ax, road_label_features, color=road_color, font_scale=font_scale, base_fontsize=6.0)
+    _draw_names_along_path(ax, road_label_features, color=road_color, font_scale=font_scale, base_fontsize=6.0, force_label=True)
     _draw_names_along_path(ax, river_label_features, color=river_color, font_scale=font_scale, base_fontsize=6.0)
 
     all_buildings = []
@@ -6672,23 +6681,24 @@ def render_plot_map_layout(
     def boundary_skip(x, y, label):
         return label_overlaps_boundary(estimate_box(x, y, len(label)))
 
+    explicit_road_pairs = [
+        (geom, name) for geom, name, highway in road_label_features
+        if str(name or "").strip() and highway == "override"
+    ]
     qualifying_road_pairs = [
         (geom, name) for geom, name, highway in road_label_features
         if str(name or "").strip()
-        # A name entered in the Road Names panel is an explicit drafting instruction.  Do not
-        # suppress it just because that road is a minor OSM class or below the auto-label size.
-        # _draw_names_along_path still rejects paths that physically cannot hold their text.
-        and (
-            highway == "override"
-            or (
-                geom.length > min_label_length_m * 1.5
-                and (not highway or highway.lower() in major_classes)
-            )
-        )
+        and highway != "override"
+        and geom.length > min_label_length_m * 1.5
+        and (not highway or highway.lower() in major_classes)
     ]
     _draw_names_along_path(
         ax, qualifying_road_pairs, color=road_color, font_scale=font_scale,
         skip_point_fn=boundary_skip,
+    )
+    _draw_names_along_path(
+        ax, explicit_road_pairs, color=road_color, font_scale=font_scale,
+        force_label=True,
     )
     _draw_names_along_path(
         ax, river_label_features, color=river_color, font_scale=font_scale,
