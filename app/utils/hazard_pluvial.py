@@ -36,7 +36,19 @@ _BUILT_AREA_CLASS_CODE = 7
 # Extreme-rainfall design storm, gauge-calibrated satellite precipitation, 1981-present, ~5.5km
 # resolution - long-established, stable GEE catalog dataset. DAILY (not PENTAD/5-day sums) because
 # pluvial flooding is driven by a single extreme-rainfall day, not a multi-day accumulation.
+#
+# The 99th-percentile-per-pixel image is NOT computed live from this collection anymore - confirmed
+# live (scratch/chirps_p99_timing_diagnostic.py) that Reducer.percentile over the full 16,600+-image
+# CHIRPS DAILY collection throws EEException "Computation timed out" on Earth Engine's own servers,
+# and still does at 30-year and 15-year windows (percentile-over-ImageCollection has to sort the
+# full per-pixel stack, so it isn't cheap enough for a live per-request call at any of those sizes).
+# _CHIRPS_P99_ASSET_ID is a pre-computed Image (same 1981-present record, same 99th percentile,
+# computed once via a batch Export task - see scratch/export_chirps_p99_nigeria.py - which has a far
+# larger compute budget than an interactive request) covering Nigeria; reading one pixel from it is
+# the same cheap reduceRegion every other static layer in this module already does. Re-run that
+# export script periodically (e.g. yearly) to fold in newer rainfall years.
 _CHIRPS_DAILY_ASSET = "UCSB-CHG/CHIRPS/DAILY"
+_CHIRPS_P99_ASSET_ID = "projects/landcheck-gee/assets/chirps_p99_daily_nigeria"
 _CHIRPS_SCALE_M = 5500
 
 # Global soil texture (surface/0cm depth) - verified live against this exact asset/band this
@@ -223,8 +235,10 @@ def compute_pluvial_risk(
     chirps_p99_mm: Optional[float] = None
     if not design_rainfall_mm:
         try:
-            chirps_daily = ee.ImageCollection(_CHIRPS_DAILY_ASSET).select("precipitation")
-            p99_image = chirps_daily.reduce(ee.Reducer.percentile([99])).rename("p99_daily_mm")
+            # Pre-computed asset, not a live percentile-over-collection - see the module-level
+            # comment on _CHIRPS_P99_ASSET_ID for why (the live version reliably times out on
+            # Earth Engine regardless of how far the collection is windowed).
+            p99_image = ee.Image(_CHIRPS_P99_ASSET_ID).select("p99_daily_mm")
             # Sampled over analysis_region (geom buffered 1000m), not the raw plot boundary - a
             # real GEE quirk confirmed live this session: reduceRegion over a small polygon (a
             # typical plot, tens of metres across) against a coarse-scale dataset (CHIRPS is
