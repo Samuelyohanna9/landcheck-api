@@ -1554,6 +1554,7 @@ def annotate_vertices(
         text_effects=None,
         leader_from=None,
         anchor_from_normal: bool = False,
+        restrict_to_normal: bool = False,
     ):
         offset_m = max(2.0, (6.0 / 1000.0) * scale_ratio) * max(0.6, normal_offset_mult)
         if normal_offset_mult >= 1.5:
@@ -1587,7 +1588,7 @@ def annotate_vertices(
         candidates = [(x, y, "center", "center")]
         if normal is not None:
             nx, ny = normal
-            if boundary_poly is not None:
+            if boundary_poly is not None and not restrict_to_normal:
                 test_pt = Point(x + nx * offset_m, y + ny * offset_m)
                 if boundary_poly.contains(test_pt):
                     nx, ny = -nx, -ny
@@ -1600,7 +1601,7 @@ def annotate_vertices(
             multiples = (1.0, 1.2) if normal_offset_mult >= 1.5 else (1.0, 1.5, 2.1, 2.8)
             candidates = []
             for multiple in multiples:
-                for direction in (1, -1):
+                for direction in ((1,) if restrict_to_normal else (1, -1)):
                     ddx, ddy = nx * direction, ny * direction
                     ha, va = anchor_for(ddx, ddy)
                     candidates.append((x + ddx * offset_m * multiple, y + ddy * offset_m * multiple, ha, va))
@@ -1616,14 +1617,15 @@ def annotate_vertices(
                         cand_neg = (x - nx * offset_m * k, y - ny * offset_m * k, ha_neg, va_neg)
                         if not avoid_geom.contains(Point(cand_pos[0], cand_pos[1])):
                             candidates.append(cand_pos)
-                        if not avoid_geom.contains(Point(cand_neg[0], cand_neg[1])):
+                        if not restrict_to_normal and not avoid_geom.contains(Point(cand_neg[0], cand_neg[1])):
                             candidates.append(cand_neg)
                     if not candidates:
                         if allow_center:
                             candidates = [(x, y, "center", "center")]
                         else:
-                            ha, va = anchor_for(-nx, -ny)
-                            candidates = [(x - nx * offset_m * 2.0, y - ny * offset_m * 2.0, ha, va)]
+                            direction = 1 if restrict_to_normal else -1
+                            ha, va = anchor_for(nx * direction, ny * direction)
+                            candidates = [(x + nx * offset_m * 2.0 * direction, y + ny * offset_m * 2.0 * direction, ha, va)]
         elif avoid_geom is not None:
             candidates = [c for c in candidates if not avoid_geom.contains(Point(c[0], c[1]))] or candidates
         offsets = [
@@ -1799,66 +1801,19 @@ def annotate_vertices(
             ang += 180
 
         label_nx, label_ny = normal
-        label_offset_mult = 1.0
+        # Boundary dimensions are always drafted inside the parcel. The larger inward offset
+        # keeps both stacked lines clear of the boundary, instead of putting one outside it.
+        label_offset_mult = 2.5
         # Keep bearing/distance vertical spacing consistent on every boundary edge.
         label_line_spacing = 2.2
-        fence_edge = False
         base_offset = max(2.0, (6.0 / 1000.0) * scale_ratio)
         if boundary_poly is not None:
             test_pt = Point(mx + label_nx * base_offset, my + label_ny * base_offset)
-            if boundary_poly.contains(test_pt):
+            if not boundary_poly.contains(test_pt):
                 label_nx, label_ny = -label_nx, -label_ny
-        if avoid_geom is not None:
-            try:
-                check_buf = avoid_geom.buffer(max(0.2, base_offset * 0.15))
-                plus_pt = Point(mx + label_nx * base_offset, my + label_ny * base_offset)
-                minus_pt = Point(mx - label_nx * base_offset, my - label_ny * base_offset)
-                plus_blocked = check_buf.contains(plus_pt)
-                minus_blocked = check_buf.contains(minus_pt)
-                if plus_blocked and not minus_blocked:
-                    label_nx, label_ny = -label_nx, -label_ny
-            except Exception:
-                pass
-        # If this edge is fenced, push the bearing/distance text farther away
-        # so the red annotation clears the fence teeth.
-        if avoid_geom is not None:
-            try:
-                seg = LineString([(p1.x, p1.y), (p2.x, p2.y)])
-                fence_touch_tol = max(0.5, (2.5 / 1000.0) * scale_ratio)
-                if seg.buffer(fence_touch_tol).intersects(avoid_geom):
-                    fence_edge = True
-                    # Keep a subtle extra separation only on fenced edges.
-                    label_offset_mult = 1.15
-            except Exception:
-                pass
-        if fence_edge and avoid_geom is not None:
-            try:
-                plus_pt = Point(mx + label_nx * base_offset * label_offset_mult, my + label_ny * base_offset * label_offset_mult)
-                minus_pt = Point(mx - label_nx * base_offset * label_offset_mult, my - label_ny * base_offset * label_offset_mult)
-                plus_d = avoid_geom.distance(plus_pt)
-                minus_d = avoid_geom.distance(minus_pt)
-                if minus_d > plus_d:
-                    label_nx, label_ny = -label_nx, -label_ny
-            except Exception:
-                pass
-
-        # The text block is vertically centered on an anchor pushed only slightly outside the
-        # polygon (base_offset), which is smaller than the gap between the two stacked lines - so
-        # the first line ends up further from the edge (outside) and the second line crosses back
-        # to the inside. Which line that first slot actually is depends on both the readability
-        # flip on `ang` (keeps text right-side-up) and the interior-avoidance flips on
-        # (label_nx, label_ny) above - two independent flips, so a fixed line order isn't reliably
-        # outside/inside the same way on every edge. Instead, work out which physical direction
-        # the first line's slot actually lands in on THIS edge, and order distance/bearing so
-        # distance always lands inside and bearing always lands outside.
-        first_line_dir = (
-            -math.sin(math.radians(ang)),
-            math.cos(math.radians(ang)),
-        )
-        first_line_is_outside = (first_line_dir[0] * label_nx + first_line_dir[1] * label_ny) > 0
         bearing_line = format_bearing_dms(bearing)
         distance_line = f"{dist:.2f}m"
-        label_text = f"{bearing_line}\n{distance_line}" if first_line_is_outside else f"{distance_line}\n{bearing_line}"
+        label_text = f"{bearing_line}\n{distance_line}"
 
         placed = place_text(
             mx,
@@ -1873,8 +1828,9 @@ def annotate_vertices(
             normal=(label_nx, label_ny),
             normal_offset_mult=label_offset_mult,
             line_spacing=label_line_spacing,
-            allow_center=not fence_edge,
+            allow_center=False,
             font_family=bearing_font,
+            restrict_to_normal=True,
         )
         if not placed:
             skipped.append(
