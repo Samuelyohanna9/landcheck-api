@@ -1505,6 +1505,29 @@ def annotate_vertices(
     Applies simple collision-aware placement for tight turns.
     """
     coords, labels = _clockwise_ring_coords_and_labels(poly, station_names=station_names)
+    # Dimension labels are a single typographic family on a plan. Determine their one common
+    # printed size from the shortest segment that will still be drawn inline, rather than making
+    # individual edges look smaller than their neighbours.
+    min_inline_length_m = min_label_length_m * (8.0 / 12.0) if min_label_length_m else 0.0
+    inline_lengths = [
+        math.hypot(float(coords[index + 1][0]) - float(coords[index][0]), float(coords[index + 1][1]) - float(coords[index][1]))
+        for index in range(len(coords) - 1)
+        if not min_inline_length_m
+        or math.hypot(float(coords[index + 1][0]) - float(coords[index][0]), float(coords[index + 1][1]) - float(coords[index][1])) >= min_inline_length_m
+    ]
+    base_dimension_font_size = float(bearing_size if bearing_size else 7.0 * font_scale)
+    shortest_inline_length_m = min(inline_lengths) if inline_lengths else None
+    global_compact_ratio = (
+        min(1.0, shortest_inline_length_m / max(min_label_length_m, 1e-9))
+        if shortest_inline_length_m is not None and min_label_length_m
+        else 1.0
+    )
+    minimum_dimension_font_size = min(base_dimension_font_size, 5.5)
+    dimension_font_size = max(
+        minimum_dimension_font_size,
+        base_dimension_font_size * max(0.72, global_compact_ratio),
+    )
+    dimension_box_scale = dimension_font_size / max(base_dimension_font_size, 1e-9)
 
     placed_boxes = []
     x0, x1 = ax.get_xlim()
@@ -1801,7 +1824,6 @@ def annotate_vertices(
         # Keep ordinary drafting text where it fits, but compact just the bearing/distance pair
         # for short lines. A 5.5 pt lower limit remains readable when printed; anything shorter
         # than roughly 8 mm on paper belongs in the boundary schedule rather than the graphic.
-        min_inline_length_m = min_label_length_m * (8.0 / 12.0) if min_label_length_m else 0.0
         if min_inline_length_m and dist < min_inline_length_m:
             skipped.append({
                 "from": label,
@@ -1830,14 +1852,6 @@ def annotate_vertices(
                 label_nx, label_ny = -label_nx, -label_ny
         bearing_line = format_bearing_dms(bearing)
         distance_line = f"{dist:.2f}m"
-        base_dimension_font_size = float(bearing_size if bearing_size else 7.0 * font_scale)
-        compact_ratio = min(1.0, dist / max(min_label_length_m, 1e-9)) if min_label_length_m else 1.0
-        minimum_dimension_font_size = min(base_dimension_font_size, 5.5)
-        dimension_font_size = max(
-            minimum_dimension_font_size,
-            base_dimension_font_size * max(0.72, compact_ratio),
-        )
-        dimension_box_scale = dimension_font_size / max(base_dimension_font_size, 1e-9)
         bearing_placed = place_text(
             mx,
             my,
