@@ -1530,8 +1530,18 @@ def _largest_polygon(geom: Any) -> Polygon | None:
 def _clean_single_polygon(geom: Any) -> Polygon | None:
     if geom is None:
         return None
-    cleaned = geom.buffer(0)
-    return _largest_polygon(cleaned)
+    try:
+        if geom.is_empty:
+            return None
+        # buffer(0) repairs the common self-touching / self-crossing rings produced by
+        # imported survey coordinates. Keep only a meaningful polygonal result.
+        cleaned = geom.buffer(0)
+    except (AttributeError, GEOSException, ValueError, TypeError):
+        return None
+    polygon = _largest_polygon(cleaned)
+    if polygon is None or polygon.is_empty or not math.isfinite(float(polygon.area)):
+        return None
+    return polygon
 
 
 def _metric_epsg_for_wgs84_polygon(poly_wgs84: Polygon) -> int:
@@ -2209,9 +2219,17 @@ def _compute_subdivision_payload(
             detail="Invalid subdivision method. Use 'by_count', 'by_area', 'by_fraction', 'by_custom_area', or 'by_dimension'.",
         )
 
-    metric_epsg = _metric_epsg_for_wgs84_polygon(parent_geom_wgs84)
-    gdf_metric = gpd.GeoDataFrame(geometry=[parent_geom_wgs84], crs="EPSG:4326").to_crs(epsg=metric_epsg)
-    parent_metric = _clean_single_polygon(gdf_metric.geometry.iloc[0])
+    # Use the original survey coordinates whenever present. They retain the exact parcel ring
+    # and avoid subdivision failing after the stored WGS84 display geometry has been rounded or
+    # repaired. Older plots continue to use the stored parcel as a safe fallback.
+    parent_meta = get_plot_meta(db, parent_plot_id)
+    measurement_context = _resolve_measurement_polygon_context(
+        parent_geom_wgs84,
+        parent_meta.get("coordinate_system"),
+        parent_meta.get("survey_input_coordinates"),
+    )
+    metric_epsg = int(measurement_context["epsg_code"])
+    parent_metric = _clean_single_polygon(measurement_context["measurement_polygon"])
     if parent_metric is None or parent_metric.area <= 1e-6:
         raise HTTPException(status_code=400, detail="Mother parcel area is too small for subdivision.")
 
@@ -2828,14 +2846,33 @@ def _load_plot_polygon_wgs84(db: Session, plot_id: int) -> Polygon:
     plot_wkb = db.execute(text("SELECT geom FROM plots WHERE id = :id"), {"id": int(plot_id)}).scalar()
     if plot_wkb is None:
         raise HTTPException(status_code=404, detail="Mother parcel not found.")
+    poly = None
     try:
         geom = wkb.loads(plot_wkb)
+        poly = _clean_single_polygon(geom)
     except Exception:
-        raise HTTPException(status_code=400, detail="Mother parcel geometry is invalid.")
-    poly = _clean_single_polygon(geom)
-    if poly is None:
-        raise HTTPException(status_code=400, detail="Mother parcel geometry is invalid.")
-    return poly
+        pass
+    if poly is not None:
+        return poly
+
+    # Some legacy imports retained a malformed display geometry even though the original
+    # survey stations were saved correctly. Rebuild the WGS84 parcel from those stations rather
+    # than rejecting an otherwise valid survey job.
+    meta_row = db.execute(
+        text("SELECT coordinate_system, survey_input_coordinates FROM plot_meta WHERE plot_id = :plot_id"),
+        {"plot_id": int(plot_id)},
+    ).mappings().first()
+    if meta_row:
+        rebuilt, _, _, _ = _build_exact_measurement_polygon(
+            meta_row.get("survey_input_coordinates"),
+            meta_row.get("coordinate_system"),
+            4326,
+        )
+        rebuilt = _clean_single_polygon(rebuilt)
+        if rebuilt is not None:
+            return rebuilt
+
+    raise HTTPException(status_code=400, detail="Mother parcel geometry is invalid. Re-enter at least three valid boundary stations and save the plan again.")
 
 
 def _normalize_survey_input_coordinates(raw: Any) -> list[dict]:
