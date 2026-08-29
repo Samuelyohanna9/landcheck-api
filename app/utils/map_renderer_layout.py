@@ -1804,6 +1804,8 @@ def annotate_vertices(
                 "to": next_label,
                 "bearing": bearing,
                 "distance": dist,
+                "start": (p1.x, p1.y),
+                "end": (p2.x, p2.y),
             })
             continue
 
@@ -1863,6 +1865,8 @@ def annotate_vertices(
                     "to": next_label,
                     "bearing": bearing,
                     "distance": dist,
+                    "start": (p1.x, p1.y),
+                    "end": (p2.x, p2.y),
                 }
             )
 
@@ -1870,6 +1874,42 @@ def annotate_vertices(
 
 
 MAX_IN_MAP_DEFERRED_DIMENSIONS = 6
+
+
+def _draw_deferred_boundary_detail(ax, entries):
+    """Draw an enlarged, diagram-only view of the deferred boundary cluster."""
+    segments = []
+    for item in entries:
+        try:
+            start = item["start"]
+            end = item["end"]
+            segments.append((start, end, str(item["from"]), str(item["to"])))
+        except (KeyError, TypeError, ValueError):
+            continue
+    if not segments:
+        ax.axis("off")
+        return
+
+    points = [point for segment in segments for point in segment[:2]]
+    xs = [float(point[0]) for point in points]
+    ys = [float(point[1]) for point in points]
+    span = max(max(xs) - min(xs), max(ys) - min(ys), 1.0)
+    padding = span * 0.14
+    for start, end, from_label, to_label in segments:
+        ax.plot([start[0], end[0]], [start[1], end[1]], color="red", lw=1.2, zorder=2)
+        ax.plot(start[0], start[1], marker="+", color="black", markersize=6, mew=0.9, zorder=3)
+        ax.text(start[0], start[1], from_label, fontsize=7, ha="left", va="bottom", zorder=4)
+        ax.plot(end[0], end[1], marker="+", color="black", markersize=6, mew=0.9, zorder=3)
+        ax.text(end[0], end[1], to_label, fontsize=7, ha="left", va="bottom", zorder=4)
+    ax.set_xlim(min(xs) - padding, max(xs) + padding)
+    ax.set_ylim(min(ys) - padding, max(ys) + padding)
+    ax.set_aspect("equal")
+    ax.set_title("DETAIL A - CLOSE BOUNDARY STATIONS", fontsize=9, weight="bold", pad=6)
+    ax.text(0.5, -0.09, "Dimensions: Boundary Dimension Schedule", transform=ax.transAxes, ha="center", va="top", fontsize=6.5)
+    ax.set_xticks([])
+    ax.set_yticks([])
+    for spine in ax.spines.values():
+        spine.set_linewidth(0.7)
 
 
 def _write_deferred_boundary_schedule_pages(fig, output_path: str, paper_size: str, dpi: int = 200) -> None:
@@ -1885,8 +1925,10 @@ def _write_deferred_boundary_schedule_pages(fig, output_path: str, paper_size: s
     for page_index, start in enumerate(range(0, len(entries), rows_per_page), start=1):
         page_entries = entries[start:start + rows_per_page]
         schedule_fig = plt.figure(figsize=(page_size["width"], page_size["height"]))
-        schedule_ax = schedule_fig.add_axes([0.055, 0.075, 0.89, 0.85])
+        detail_ax = schedule_fig.add_axes([0.055, 0.26, 0.36, 0.58])
+        schedule_ax = schedule_fig.add_axes([0.445, 0.075, 0.50, 0.82])
         schedule_ax.axis("off")
+        _draw_deferred_boundary_detail(detail_ax, page_entries)
         schedule_fig.text(0.5, 0.95, "BOUNDARY DIMENSION SCHEDULE", ha="center", va="top", fontsize=13, weight="bold")
         schedule_fig.text(
             0.5,
