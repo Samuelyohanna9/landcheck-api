@@ -80,13 +80,13 @@ REPORTS_DIR = os.path.join(BASE_DIR, "reports")
 PREVIEW_CACHE_DIR = os.path.join(REPORTS_DIR, "previews_cache")
 PREVIEW_CACHE_TTL_SECONDS = max(30, int(os.getenv("PLOT_PREVIEW_CACHE_TTL_SECONDS", "180")))
 PREVIEW_CACHE_MAX_FILES_PER_PLOT = max(5, int(os.getenv("PLOT_PREVIEW_CACHE_MAX_FILES_PER_PLOT", "24")))
-PREVIEW_LAYOUT_VERSION = "survey_layout_2026_08_29_close_station_detail_v99"
+PREVIEW_LAYOUT_VERSION = "survey_layout_2026_08_30_adaptive_dimension_text_v100"
 SURVEY_REPORT_RENDER_VERSION = "survey_report_2026_08_24_station_label_offset_v4"
 CLEAN_COPY_RENDER_VERSION = "clean_copy_2026_03_20_layout_v14"
 PLOT_EXPORT_JOB_STATUS_VALUES = {"queued", "running", "completed", "failed"}
 STANDARD_SURVEY_SCALE_DENOMINATORS = (250, 500, 1000, 1250, 2000, 2500, 5000, 10000, 12500, 20000, 25000, 50000)
 BEARING_DISTANCE_CLEARANCE_MM = 9.0
-MIN_INLINE_DIMENSION_MM = 12.0
+MIN_INLINE_DIMENSION_MM = 8.0
 
 
 def _export_render_slot_count() -> int:

@@ -1798,7 +1798,11 @@ def annotate_vertices(
             )
 
         bearing, dist = calculate_bearing_deg(p1, p2), p1.distance(p2)
-        if min_label_length_m and dist < min_label_length_m:
+        # Keep ordinary drafting text where it fits, but compact just the bearing/distance pair
+        # for short lines. A 5.5 pt lower limit remains readable when printed; anything shorter
+        # than roughly 8 mm on paper belongs in the boundary schedule rather than the graphic.
+        min_inline_length_m = min_label_length_m * (8.0 / 12.0) if min_label_length_m else 0.0
+        if min_inline_length_m and dist < min_inline_length_m:
             skipped.append({
                 "from": label,
                 "to": next_label,
@@ -1826,16 +1830,24 @@ def annotate_vertices(
                 label_nx, label_ny = -label_nx, -label_ny
         bearing_line = format_bearing_dms(bearing)
         distance_line = f"{dist:.2f}m"
+        base_dimension_font_size = float(bearing_size if bearing_size else 7.0 * font_scale)
+        compact_ratio = min(1.0, dist / max(min_label_length_m, 1e-9)) if min_label_length_m else 1.0
+        minimum_dimension_font_size = min(base_dimension_font_size, 5.5)
+        dimension_font_size = max(
+            minimum_dimension_font_size,
+            base_dimension_font_size * max(0.72, compact_ratio),
+        )
+        dimension_box_scale = dimension_font_size / max(base_dimension_font_size, 1e-9)
         bearing_placed = place_text(
             mx,
             my,
             bearing_line,
-            font_size=bearing_size if bearing_size else int(7.0 * font_scale),
+            font_size=dimension_font_size,
             color=boundary_color,
             rotation=ang,
             weight="normal",
-            scale_w=0.02,
-            scale_h=0.025,
+            scale_w=0.02 * dimension_box_scale,
+            scale_h=0.025 * dimension_box_scale,
             normal=(label_nx, label_ny),
             normal_offset_mult=label_offset_mult,
             allow_center=False,
@@ -1846,12 +1858,12 @@ def annotate_vertices(
             mx,
             my,
             distance_line,
-            font_size=bearing_size if bearing_size else int(7.0 * font_scale),
+            font_size=dimension_font_size,
             color=boundary_color,
             rotation=ang,
             weight="normal",
-            scale_w=0.02,
-            scale_h=0.025,
+            scale_w=0.02 * dimension_box_scale,
+            scale_h=0.025 * dimension_box_scale,
             normal=(-label_nx, -label_ny),
             normal_offset_mult=label_offset_mult,
             allow_center=False,
