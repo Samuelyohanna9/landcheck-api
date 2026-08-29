@@ -80,7 +80,7 @@ REPORTS_DIR = os.path.join(BASE_DIR, "reports")
 PREVIEW_CACHE_DIR = os.path.join(REPORTS_DIR, "previews_cache")
 PREVIEW_CACHE_TTL_SECONDS = max(30, int(os.getenv("PLOT_PREVIEW_CACHE_TTL_SECONDS", "180")))
 PREVIEW_CACHE_MAX_FILES_PER_PLOT = max(5, int(os.getenv("PLOT_PREVIEW_CACHE_MAX_FILES_PER_PLOT", "24")))
-PREVIEW_LAYOUT_VERSION = "survey_layout_2026_08_30_fct_schedule_overflow_v102"
+PREVIEW_LAYOUT_VERSION = "survey_layout_2026_08_30_station_label_length_v103"
 SURVEY_REPORT_RENDER_VERSION = "survey_report_2026_08_24_station_label_offset_v4"
 CLEAN_COPY_RENDER_VERSION = "clean_copy_2026_03_20_layout_v14"
 PLOT_EXPORT_JOB_STATUS_VALUES = {"queued", "running", "completed", "failed"}
@@ -7655,6 +7655,7 @@ def orthophoto_preview(plot_id: int, db: Session = Depends(get_db), background_t
     topo_source = topo_source or "opentopomap"
     building_hatch_type = building_hatch_type or "solid"
     payload_for_cache = {
+        "_layout_version": PREVIEW_LAYOUT_VERSION,
         "scale_text": scale_text,
         "station_names": station_names or [],
         "coordinate_system": coordinate_system,

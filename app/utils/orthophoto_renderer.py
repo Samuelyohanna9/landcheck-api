@@ -611,10 +611,12 @@ def format_station_label(label) -> str:
     raw = str(label or "").strip()
     if not raw:
         return raw
-    # Format codes like SCAD5130 -> SCAD\n5130 for clearer station labeling.
-    match = re.match(r"^([A-Za-z]{1,4})\s*[-_/]?\s*(\d+)$", raw)
-    if match:
-        return f"{match.group(1).upper()}\n{match.group(2)}"
+    # Keep short labels (P20, A12) on one line. Only long beacon/control identifiers need a
+    # two-line treatment to stay legible beside a station mark.
+    compact = re.sub(r"\s*[-_/]\s*", "", raw)
+    match = re.match(r"^([A-Za-z]+)(\d+[A-Za-z]*)$", compact)
+    if match and len(compact) > 6:
+        return f"{match.group(1).upper()}\n{match.group(2).upper()}"
     return raw
 
 
