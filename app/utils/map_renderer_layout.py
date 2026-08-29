@@ -4803,9 +4803,24 @@ def _draw_fct_beacon_table(
         fig.text(cx, y_top, label, weight="bold", fontsize=fs,
                   fontfamily=FCT_FONT_FAMILY, color=text_color, ha="left", va="top")
     y = y_top - 0.02
-    row_h = max(0.013, min(0.02, (y - y_bottom) / max(1, len(rows))))
+    # The FCT schedule shares the same finite footer space as the note and certification blocks.
+    # Match the Adamawa overflow convention instead of compressing a long list into illegible
+    # rows: retain the first seven stations, then state exactly how many continue on the plan.
+    max_visible_rows = 8
+    if len(rows) > max_visible_rows:
+        visible_rows = list(rows[: max_visible_rows - 1]) + [("__overflow__", "", len(rows) - (max_visible_rows - 1), None)]
+    else:
+        visible_rows = rows
+    row_h = max(0.013, min(0.02, (y - y_bottom) / max(1, len(visible_rows))))
     line_fs = fs if row_h >= 0.016 else max(5, int(fs * 0.85))
-    for frm, to, dist_m, bearing in rows:
+    for frm, to, dist_m, bearing in visible_rows:
+        if frm == "__overflow__":
+            fig.text(col1_x, y, "...", fontsize=line_fs, fontfamily=FCT_FONT_FAMILY,
+                     color=text_color, ha="left", va="top")
+            fig.text(col2_x, y, f"+{int(dist_m)} more", fontsize=line_fs, fontfamily=FCT_FONT_FAMILY,
+                     color=text_color, ha="left", va="top")
+            y -= row_h
+            continue
         fig.text(col1_x, y, f"FROM {frm} TO {to}  =",
                   fontsize=line_fs, fontfamily=FCT_FONT_FAMILY, color=text_color, ha="left", va="top")
         fig.text(col2_x, y, f"{dist_m:.2f}m",
