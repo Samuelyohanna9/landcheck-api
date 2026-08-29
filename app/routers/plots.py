@@ -85,6 +85,8 @@ SURVEY_REPORT_RENDER_VERSION = "survey_report_2026_08_24_station_label_offset_v4
 CLEAN_COPY_RENDER_VERSION = "clean_copy_2026_03_20_layout_v14"
 PLOT_EXPORT_JOB_STATUS_VALUES = {"queued", "running", "completed", "failed"}
 STANDARD_SURVEY_SCALE_DENOMINATORS = (250, 500, 1000, 1250, 2000, 2500, 5000, 10000, 12500, 20000, 25000, 50000)
+BEARING_DISTANCE_CLEARANCE_MM = 9.0
+MIN_INLINE_DIMENSION_MM = 12.0
 
 
 def _export_render_slot_count() -> int:
@@ -1619,6 +1621,35 @@ def _select_standard_survey_scale(fitted_ratio: int) -> int:
         if scale >= required:
             return scale
     return STANDARD_SURVEY_SCALE_DENOMINATORS[-1]
+
+
+def _compute_annotation_aware_fit_scale(geom_for_extent, map_width_in: float, map_height_in: float) -> int:
+    """Fit the parcel with paper space reserved for bearing/distance drafting around its edge."""
+    clearance_in = BEARING_DISTANCE_CLEARANCE_MM / 25.4
+    printable_width_in = max(0.1, float(map_width_in) - 2.0 * clearance_in)
+    printable_height_in = max(0.1, float(map_height_in) - 2.0 * clearance_in)
+    return compute_fit_scale_ratio(
+        geom_for_extent,
+        printable_width_in,
+        printable_height_in,
+        padding_factor=1.08,
+    )
+
+
+def _count_dimensions_requiring_schedule(poly_metric, scale_ratio: int) -> int:
+    """Count boundary segments that cannot carry a readable 12 mm inline dimension pair."""
+    try:
+        coords = list(poly_metric.exterior.coords)
+    except Exception:
+        return 0
+    if len(coords) < 2:
+        return 0
+    minimum_length_m = (MIN_INLINE_DIMENSION_MM / 1000.0) * max(1, int(scale_ratio))
+    return sum(
+        1
+        for start, end in zip(coords, coords[1:])
+        if math.hypot(float(end[0]) - float(start[0]), float(end[1]) - float(start[1])) < minimum_length_m
+    )
 
 
 def _split_polygon_once_by_area(poly_metric: Polygon, target_area: float) -> tuple[Polygon, Polygon]:
@@ -7110,9 +7141,9 @@ def get_plot_scale_recommendation(
 ):
     """Recommend a standard scale before the first plan render.
 
-    The result uses the same metric measurement polygon and template map frame as the renderer.
-    The selected denominator is always rounded upward, never down, so a standard scale cannot
-    crop the parcel merely to look tidier on the title block.
+    The result uses the renderer's metric polygon and template map frame, while reserving 9 mm
+    on each printed side for bearing/distance drafting. The selected denominator is always
+    rounded upward, never down, so a standard scale cannot crop the parcel merely to look tidier.
     """
     plot_geom_wgs84 = _load_plot_polygon_wgs84(db, plot_id)
     measurement_context = _resolve_measurement_polygon_context(
@@ -7125,7 +7156,7 @@ def get_plot_scale_recommendation(
 
     def recommendation_for(size: str) -> tuple[int, int]:
         config = get_paper_config(size)
-        fitted = compute_fit_scale_ratio(
+        fitted = _compute_annotation_aware_fit_scale(
             plot_metric,
             config["width"] * map_width_fraction,
             config["height"] * map_height_fraction,
@@ -7151,8 +7182,9 @@ def get_plot_scale_recommendation(
         "scale_text": f"1 : {standard_ratio}",
         "scale_denominator": standard_ratio,
         "fitted_scale_denominator": fitted_ratio,
+        "deferred_dimension_count": _count_dimensions_requiring_schedule(plot_metric, standard_ratio),
         "template_name": str(template_name or DEFAULT_TEMPLATE_NAME),
-        "reason": "The selected standard scale contains the full parcel in the template map frame.",
+        "reason": "The selected standard scale contains the full parcel and reserves printed space for bearing and distance annotations.",
     }
 
 
