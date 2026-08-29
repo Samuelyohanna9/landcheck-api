@@ -2962,6 +2962,33 @@ def _build_exact_measurement_polygon(
     return projected_poly, float(projected_poly.area), boundary_points, resolved_key
 
 
+def _load_plot_or_request_boundary_wgs84(
+    db: Session,
+    plot_id: int,
+    coordinate_system: str | None,
+    survey_input_coordinates: Any = None,
+) -> Polygon:
+    """Use a valid stored parcel, or rebuild it from the boundary supplied for this render."""
+    try:
+        return _load_plot_polygon_wgs84(db, plot_id)
+    except HTTPException as exc:
+        if exc.status_code != 400:
+            raise
+
+    rebuilt, _, _, _ = _build_exact_measurement_polygon(
+        survey_input_coordinates,
+        coordinate_system,
+        4326,
+    )
+    rebuilt = _clean_single_polygon(rebuilt)
+    if rebuilt is not None:
+        return rebuilt
+    raise HTTPException(
+        status_code=400,
+        detail="Plot boundary is invalid. Check that at least three boundary stations have valid coordinates.",
+    )
+
+
 def _resolve_measurement_polygon_context(
     plot_geom_wgs84: Polygon,
     coordinate_system: str | None,
@@ -7182,7 +7209,12 @@ def get_plot_scale_recommendation(
     on each printed side for bearing/distance drafting. The selected denominator is always
     rounded upward, never down, so a standard scale cannot crop the parcel merely to look tidier.
     """
-    plot_geom_wgs84 = _load_plot_polygon_wgs84(db, plot_id)
+    plot_geom_wgs84 = _load_plot_or_request_boundary_wgs84(
+        db,
+        plot_id,
+        coordinate_system,
+        survey_input_coordinates,
+    )
     measurement_context = _resolve_measurement_polygon_context(
         plot_geom_wgs84,
         coordinate_system,
@@ -7292,21 +7324,12 @@ def preview_plot_map(plot_id: int, request: Request, db: Session = Depends(get_d
     effective_scale_text = str(scale_text or "").strip() or "auto"
     resolved_scale_text = effective_scale_text
 
-    plot_geom_hex = db.execute(
-        text("SELECT encode(ST_AsBinary(geom), 'hex') FROM plots WHERE id=:id"),
-        {"id": plot_id},
-    ).scalar()
-    if not plot_geom_hex:
-        raise HTTPException(status_code=404, detail="Plot not found")
-    try:
-        plot_geom_wgs84 = wkb.loads(plot_geom_hex, hex=True)
-    except GEOSException:
-        raise HTTPException(
-            status_code=400,
-            detail="Plot geometry is invalid. Re-save the parcel boundary and try preview again.",
-        )
-    if plot_geom_wgs84 is None or plot_geom_wgs84.is_empty:
-        raise HTTPException(status_code=400, detail="Plot geometry is empty.")
+    plot_geom_wgs84 = _load_plot_or_request_boundary_wgs84(
+        db,
+        plot_id,
+        coordinate_system,
+        survey_input_coordinates,
+    )
 
     measurement_context = _resolve_measurement_polygon_context(
         plot_geom_wgs84,
