@@ -348,6 +348,22 @@ def _nice_contour_step(elevation_span_m: float, target_bands: int = 10) -> float
     return min(_NICE_CONTOUR_STEPS, key=lambda s: abs(s - raw_step))
 
 
+# Marker/color per AI Field-to-Finish category (see app/utils/field_to_finish.py's POINT_CATEGORIES
+# - kept in sync manually since this module has no Python import relationship to that one). Boundary
+# and spot_height are deliberately absent: boundary points are already drawn as the plot's own
+# boundary polygon, and spot_height points are exactly what the existing "+" scatter above already
+# marks - a category marker for them would just duplicate that mark, not add information.
+_FIELD_FEATURE_POINT_STYLES: dict[str, dict[str, str]] = {
+    "tree": {"marker": "^", "color": "#15803d", "label": "Tree"},
+    "electric_pole": {"marker": "o", "color": "#b45309", "label": "Electric pole"},
+    "drain": {"marker": "s", "color": "#1d4ed8", "label": "Drain"},
+    "building_corner": {"marker": "D", "color": "#4a4a4a", "label": "Building corner"},
+    "fence": {"marker": "x", "color": "#6b7280", "label": "Fence"},
+    "road_edge": {"marker": "P", "color": "#111827", "label": "Road edge"},
+    "other": {"marker": "*", "color": "#7c3aed", "label": "Other feature"},
+}
+
+
 def _draw_topo_contours(
     ax,
     plot_geom_wgs84,
@@ -378,9 +394,14 @@ def _draw_topo_contours(
     if not points or len(points) < 3:
         return None
 
+    # category rides along as a plain string column (default "" for any point that doesn't carry
+    # one - every plot saved before this field existed, and every DEM-sampled point, has none) so
+    # it survives the same reprojection/finite-value filtering as the coordinates and elevations
+    # themselves, rather than trying to re-match filtered points back to the original list after.
+    point_categories_raw = [str(p.get("category") or "").strip().lower() for p in points]
     try:
         points_gdf = gpd.GeoDataFrame(
-            {"elevation_m": [float(p["elevation_m"]) for p in points]},
+            {"elevation_m": [float(p["elevation_m"]) for p in points], "category": point_categories_raw},
             geometry=gpd.points_from_xy([float(p["lng"]) for p in points], [float(p["lat"]) for p in points]),
             crs="EPSG:4326",
         ).to_crs(epsg=display_epsg)
@@ -390,8 +411,11 @@ def _draw_topo_contours(
     xs = points_gdf.geometry.x.to_numpy()
     ys = points_gdf.geometry.y.to_numpy()
     elevations = points_gdf["elevation_m"].to_numpy()
+    point_categories = points_gdf["category"].to_numpy()
     finite_mask = np.isfinite(xs) & np.isfinite(ys) & np.isfinite(elevations)
-    xs, ys, elevations = xs[finite_mask], ys[finite_mask], elevations[finite_mask]
+    xs, ys, elevations, point_categories = (
+        xs[finite_mask], ys[finite_mask], elevations[finite_mask], point_categories[finite_mask],
+    )
     if len(xs) < 3:
         return None
 
@@ -444,12 +468,33 @@ def _draw_topo_contours(
             ax.scatter(
                 xs, ys, s=(10 * font_scale) ** 2, c="#1d4ed8", marker="+", linewidths=1.1 * font_scale, zorder=3,
             )
+        plotted_feature_labels: list[str] = []
+        if is_user_data:
+            # AI Field-to-Finish category markers - additive on top of the generic "+" spot-height
+            # mark above. No-op (zero visual change) for every plot saved before this field existed,
+            # since point_categories is then all empty strings and never matches a style key.
+            for category_key, style in _FIELD_FEATURE_POINT_STYLES.items():
+                category_mask = point_categories == category_key
+                if not np.any(category_mask):
+                    continue
+                ax.scatter(
+                    xs[category_mask], ys[category_mask], s=(11 * font_scale) ** 2,
+                    c=style["color"], marker=style["marker"], edgecolors="white",
+                    linewidths=0.6 * font_scale, zorder=4, label=style["label"],
+                )
+                plotted_feature_labels.append(style["label"])
+        if plotted_feature_labels:
+            legend = ax.legend(
+                loc="upper left", fontsize=max(5, 6.5 * font_scale), framealpha=0.85,
+                facecolor="white", edgecolor="#5b3a1a", borderpad=0.5, handletextpad=0.4,
+            )
+            legend.set_zorder(10)
     except Exception:
         return None
 
     ax.set_xlim(target_xlim)
     ax.set_ylim(target_ylim)
-    return {"elev_min": elev_min, "elev_max": elev_max, "step": step}
+    return {"elev_min": elev_min, "elev_max": elev_max, "step": step, "feature_categories": plotted_feature_labels}
 
 
 def _draw_elevation_legend(fig, elev_min, elev_max, step, font_scale=1.0):
