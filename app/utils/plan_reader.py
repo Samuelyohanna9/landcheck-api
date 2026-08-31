@@ -130,10 +130,16 @@ def extract_survey_plan(file_bytes: bytes, content_type: str) -> Dict[str, Any]:
     last_error: Optional[str] = None
     for attempt in range(1, 3):
         try:
-            response = requests.post(url, params={"key": api_key}, json=request_body, timeout=60)
+            # Explicit (connect, read) tuple, not one combined 60s figure - a genuinely blocked/
+            # unreachable network path should fail in a few seconds, not hang for a minute; a real
+            # but slow Gemini response still gets a generous read window. Keeps the worst case
+            # (2 attempts) comfortably under common reverse-proxy timeouts, so the proxy never gets
+            # to time out first and mask our own clean error behind a generic 502.
+            response = requests.post(url, params={"key": api_key}, json=request_body, timeout=(6, 25))
         except requests.RequestException as exc:
             last_error = f"Could not reach the AI service ({exc})."
-            time.sleep(1.5)
+            logger.warning("Plan reader Gemini call failed to reach the API (attempt %s): %s", attempt, exc)
+            time.sleep(1.0)
             continue
         if response.status_code == 429:
             last_error = "The AI service is rate-limited right now - please try again shortly."

@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 
 from fastapi import APIRouter, File, HTTPException, UploadFile
+from starlette.concurrency import run_in_threadpool
 
 from app.utils.plan_reader import (
     ALLOWED_CONTENT_TYPES,
@@ -36,7 +37,13 @@ async def plan_reader_extract(file: UploadFile = File(...)):
         raise HTTPException(status_code=400, detail=f"File exceeds the {MAX_UPLOAD_BYTES // (1024 * 1024)} MB upload limit.")
 
     try:
-        extracted = extract_survey_plan(payload, content_type)
+        # extract_survey_plan is a synchronous, blocking call (requests.post + time.sleep retries)
+        # - running it directly on this async route would block the whole event loop for the
+        # entire Gemini round trip, stalling every other request the server is handling
+        # concurrently, and risking a worker-timeout kill on a slow/retried call (which surfaces
+        # to the client as a proxy 502, indistinguishable from a real network failure). Off-loading
+        # it to a thread is the fix either way, not just a maybe.
+        extracted = await run_in_threadpool(extract_survey_plan, payload, content_type)
     except PlanReaderError as exc:
         logger.warning("Plan reader extraction failed: %s", exc)
         raise HTTPException(status_code=502, detail=str(exc)) from exc
