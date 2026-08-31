@@ -75,13 +75,22 @@ _RESPONSE_SCHEMA = {
             "type": "STRING",
             "description": "One or two plain-language sentences describing which raw column you interpreted as which field, e.g. 'Column 1 is the point number, column 2 is easting, column 3 is northing, column 4 is elevation, column 5 is the feature code.'",
         },
+        "coordinate_system_guess": {
+            "type": "STRING",
+            "enum": ["wgs84", "minna_31", "minna_32", "minna_33", "utm_31n", "utm_32n", "utm_33n", "unknown"],
+            "description": "Guessed from coordinate magnitude/format (small decimal degrees ~2-15 range => wgs84; large 6-7 digit metre values => a projected system) and any explicit datum/zone label in the file. Use 'unknown' rather than guessing a specific zone with no real evidence.",
+        },
+        "coordinate_system_evidence": {
+            "type": "STRING", "nullable": True,
+            "description": "Short reason for the coordinate_system_guess, e.g. 'Easting/Northing values in the 300000-800000 range, typical of Minna/UTM metres' or an explicit zone label found in the file.",
+        },
         "extraction_notes": {
             "type": "ARRAY",
             "items": {"type": "STRING"},
             "description": "Anything ambiguous, inconsistent, or unusual a human should double check - e.g. rows that didn't match the pattern of the rest of the file.",
         },
     },
-    "required": ["points", "column_mapping_summary"],
+    "required": ["points", "column_mapping_summary", "coordinate_system_guess"],
 }
 
 _PROMPT_TEMPLATE = """You are cleaning up a raw coordinate data file exported from a GNSS receiver, \
@@ -103,6 +112,13 @@ road_edge, BP/PB/BDY -> boundary. A point with NO feature code and no descriptio
 spot_height (a plain elevation sample), not boundary - only mark a point "boundary" when its code or \
 description actually says so (e.g. "BP1", "BDY", "boundary peg"), since most raw field files are \
 mostly ordinary elevation/detail shots, not the boundary corners themselves.
+
+Also determine the coordinate system from the x/y magnitudes across the whole file: values roughly \
+in the 2-15 range for x and 4-15 for y are WGS84 latitude/longitude (degrees); values in the tens or \
+hundreds of thousands to low millions are a projected Easting/Northing in metres, on the Minna Datum \
+or WGS84 UTM, zone 31N, 32N, or 33N (Nigeria spans all three - zone boundaries at 6 deg E and 12 deg \
+E). Prefer an explicit datum/zone label in the file over guessing from magnitude alone, and quote it \
+in coordinate_system_evidence. Use "unknown" if there's genuinely no basis to tell.
 
 Raw file content:
 {raw_text}
