@@ -132,6 +132,62 @@ _RESPONSE_SCHEMA = {
                 "required": ["station", "x", "y", "confidence"],
             },
         },
+        "layout_type": {
+            "type": "STRING",
+            "enum": ["single_plot", "estate_layout"],
+            "description": "'estate_layout' only if the plan clearly shows more than one distinct numbered plot (e.g. a subdivision/estate sheet); otherwise 'single_plot'.",
+        },
+        "plots": {
+            "type": "ARRAY",
+            "description": (
+                "One entry per distinct plot/parcel on the plan. A single_plot plan still has exactly "
+                "one entry here (the SAME beacons as the top-level 'beacons' field). An estate_layout "
+                "plan lists every numbered plot here, in addition to putting its first/most prominent "
+                "plot's beacons in the top-level 'beacons' field for backward compatibility."
+            ),
+            "items": {
+                "type": "OBJECT",
+                "properties": {
+                    "plot_number": {"type": "STRING", "nullable": True, "description": "The plot/lot number or label exactly as printed, e.g. 'PLOT 14', 'LOT 7B'."},
+                    "beacons": {
+                        "type": "ARRAY",
+                        "items": {
+                            "type": "OBJECT",
+                            "properties": {
+                                "station": {"type": "STRING"},
+                                "x": {"type": "NUMBER"},
+                                "y": {"type": "NUMBER"},
+                                "confidence": {"type": "NUMBER"},
+                                "raw_text": {"type": "STRING", "nullable": True},
+                            },
+                            "required": ["station", "x", "y", "confidence"],
+                        },
+                    },
+                },
+                "required": ["beacons"],
+            },
+        },
+        "roads": {
+            "type": "ARRAY",
+            "description": "Road centerlines visible on an estate layout, if any. Empty array for a single_plot plan or any plan with no roads drawn.",
+            "items": {
+                "type": "OBJECT",
+                "properties": {
+                    "name": {"type": "STRING", "nullable": True, "description": "Road name/label exactly as printed, if any."},
+                    "width_m": {"type": "NUMBER", "nullable": True},
+                    "points": {
+                        "type": "ARRAY",
+                        "description": "Reference points along the road centerline/edge, in the same coordinate system as the beacons.",
+                        "items": {
+                            "type": "OBJECT",
+                            "properties": {"x": {"type": "NUMBER"}, "y": {"type": "NUMBER"}},
+                            "required": ["x", "y"],
+                        },
+                    },
+                },
+                "required": ["points"],
+            },
+        },
         "extraction_notes": {
             "type": "ARRAY",
             "items": {"type": "STRING"},
@@ -155,7 +211,17 @@ system, use "unknown" rather than assuming.
 
 List beacons in the order they appear in the plan's coordinate table (this is usually also their \
 boundary traverse order). Use the station names/numbers exactly as labelled (e.g. "PB1", "SC/AK/L \
-72723", "A"). Return ONLY the structured JSON described by the response schema - no prose."""
+72723", "A").
+
+If this plan shows only ONE parcel/plot, set layout_type to "single_plot" and put that plot's \
+beacons in both the top-level "beacons" field and as the single entry in "plots" - leave "roads" \
+empty. If it is an ESTATE LAYOUT showing multiple distinct numbered plots (a subdivision sheet, \
+scheme layout, or similar), set layout_type to "estate_layout", list EVERY plot in "plots" with its \
+own plot_number and beacon set, still put the first/most prominent plot's beacons in the top-level \
+"beacons" field too, and list any road centerlines you can read into "roads". Never invent a plot \
+or road that isn't actually drawn on the plan.
+
+Return ONLY the structured JSON described by the response schema - no prose."""
 
 
 def extract_survey_plan(file_bytes: bytes, content_type: str) -> Dict[str, Any]:
