@@ -133,23 +133,36 @@ def extract_survey_plan(file_bytes: bytes, content_type: str) -> Dict[str, Any]:
     }
     url = f"{GEMINI_API_BASE_URL}/models/{_gemini_model()}:generateContent"
 
+    # 3 attempts, not 2 - confirmed live (2026-08-31) that this project hits real, transient 429s
+    # from Gemini even well under its displayed Tier 1 quota (a documented Google-side issue -
+    # billing/tier status not always fully propagated to the rate limiter yet, plus a separate
+    # "acceleration limit" that briefly throttles a project/key with no usage history regardless of
+    # its stated cap - see plan_reader's calling code comment). Safe to retry a bit harder now that
+    # this call runs in a background thread (see plan_reader.py's router) rather than blocking the
+    # event loop, so a slightly longer worst case here no longer risks a gunicorn worker-timeout
+    # kill the way it would have before that fix.
+    max_attempts = 3
     last_error: Optional[str] = None
-    for attempt in range(1, 3):
+    for attempt in range(1, max_attempts + 1):
         try:
             # Explicit (connect, read) tuple, not one combined 60s figure - a genuinely blocked/
             # unreachable network path should fail in a few seconds, not hang for a minute; a real
-            # but slow Gemini response still gets a generous read window. Keeps the worst case
-            # (2 attempts) comfortably under common reverse-proxy timeouts, so the proxy never gets
-            # to time out first and mask our own clean error behind a generic 502.
+            # but slow Gemini response still gets a generous read window.
             response = requests.post(url, params={"key": api_key}, json=request_body, timeout=(6, 25))
         except requests.RequestException as exc:
             last_error = f"Could not reach the AI service ({exc})."
-            logger.warning("Plan reader Gemini call failed to reach the API (attempt %s): %s", attempt, exc)
+            logger.warning("Plan reader Gemini call failed to reach the API (attempt %s/%s): %s", attempt, max_attempts, exc)
             time.sleep(1.0)
             continue
         if response.status_code == 429:
             last_error = "The AI service is rate-limited right now - please try again shortly."
-            time.sleep(2.0)
+            retry_after_header = str(response.headers.get("Retry-After") or "").strip()
+            wait_seconds = float(retry_after_header) if retry_after_header.replace(".", "", 1).isdigit() else 2.0 * attempt
+            logger.warning(
+                "Plan reader Gemini call hit 429 (attempt %s/%s) - waiting %.1fs. Body: %s",
+                attempt, max_attempts, min(wait_seconds, 8.0), response.text[:300],
+            )
+            time.sleep(min(wait_seconds, 8.0))
             continue
         if not response.ok:
             raise PlanReaderError(f"AI plan reading failed ({response.status_code}): {response.text[:300]}")
