@@ -68,16 +68,45 @@ def check_plot_survey_quality(
         }
     items.append({"severity": "ok", "code": "station_count", "message": f"{station_count} boundary station(s) detected."})
 
-    duplicate_found = False
+    # Union-find clustering, not a pairwise report - with several points at the same spot (e.g. a
+    # batch of freshly-added, still-unedited stations), a plain pairwise loop would emit one warning
+    # per PAIR (N points at the same spot => N*(N-1)/2 near-identical messages, 15 for just 6 points).
+    # Grouping into clusters first gives one clear message per actual cluster of coincident points.
+    cluster_parent = list(range(station_count))
+
+    def _find(node: int) -> int:
+        while cluster_parent[node] != node:
+            cluster_parent[node] = cluster_parent[cluster_parent[node]]
+            node = cluster_parent[node]
+        return node
+
+    def _union(a: int, b: int) -> None:
+        root_a, root_b = _find(a), _find(b)
+        if root_a != root_b:
+            cluster_parent[root_a] = root_b
+
     for i in range(station_count):
         for j in range(i + 1, station_count):
             dist = math.hypot(points[i]["x"] - points[j]["x"], points[i]["y"] - points[j]["y"])
             if dist <= DUPLICATE_COORDINATE_TOLERANCE_M:
-                duplicate_found = True
-                items.append({
-                    "severity": "warning", "code": "duplicate_coordinate",
-                    "message": f'Stations "{points[i]["station"]}" and "{points[j]["station"]}" are only {dist:.2f}m apart - likely the same point entered twice.',
-                })
+                _union(i, j)
+
+    clusters: Dict[int, List[int]] = {}
+    for i in range(station_count):
+        clusters.setdefault(_find(i), []).append(i)
+
+    duplicate_found = False
+    for members in clusters.values():
+        if len(members) > 1:
+            duplicate_found = True
+            station_names = [str(points[m]["station"]) for m in members]
+            items.append({
+                "severity": "warning", "code": "duplicate_coordinate",
+                "message": (
+                    f'{len(members)} stations sit at the same coordinate (within {DUPLICATE_COORDINATE_TOLERANCE_M}m): '
+                    f'{", ".join(station_names)} - check for un-edited or duplicated points.'
+                ),
+            })
     if not duplicate_found:
         items.append({"severity": "ok", "code": "no_duplicates", "message": "No duplicate coordinates detected."})
 
