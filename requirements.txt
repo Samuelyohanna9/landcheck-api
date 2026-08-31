@@ -8,6 +8,7 @@ reportlab
 matplotlib
 geopandas
 Pillow
+imagehash
 contextily>=1.3.0
 ezdxf
 shapely

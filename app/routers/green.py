@@ -27,6 +27,7 @@ import threading
 from urllib.parse import quote, unquote, urlparse
 from email.message import EmailMessage
 from starlette.background import BackgroundTask
+from starlette.concurrency import run_in_threadpool
 import requests
 
 import boto3
@@ -52,6 +53,24 @@ from app.utils.green_pdf import (
     render_green_merchant_report_pdf,
 )
 from app.utils.green_remote_monitoring import compute_remote_monitoring_report
+from app.utils.green_photo_evidence import (
+    check_photo_location_and_time,
+    compute_perceptual_hash,
+    ensure_photo_evidence_schema,
+    extract_exif_gps_and_time,
+    find_similar_photo,
+    get_task_photo_flags,
+    record_photo_evidence,
+)
+from app.utils.tree_health_ai import (
+    TreeHealthError,
+    TREE_HEALTH_DAILY_LIMIT,
+    assess_tree_health,
+    ensure_tree_health_schema,
+    get_latest_tree_health_check,
+    record_tree_health_check,
+)
+from app.utils.plan_reader import consume_daily_reading
 from app.utils.r2_exports import upload_export_file_best_effort, _build_export_r2_settings
 from app.utils.activity_logger import ensure_activity_log_table, safe_log_activity
 from app.utils.auth_security import (
@@ -8696,6 +8715,34 @@ async def upload_photo_to_r2(
     if len(payload) > max_bytes:
         raise HTTPException(status_code=413, detail="Image too large. Max size is 10MB.")
 
+    # Cheap, local, no-AI fraud/mistake signals - perceptual-hash near-duplicate detection and an
+    # EXIF GPS/capture-time sanity check against the tree's own recorded location. Computed
+    # unconditionally (pure CPU work on bytes already in hand); only actually used below when this
+    # upload is linked to a tree/task, since a generic upload (e.g. an organisation logo) has
+    # nothing meaningful to compare against. See app/utils/green_photo_evidence.py's module
+    # docstring - neither ever blocks the upload, both are advisory flags for the agent/a reviewer.
+    ensure_photo_evidence_schema(db)
+    photo_phash = compute_perceptual_hash(payload)
+    exif_data = extract_exif_gps_and_time(payload)
+    photo_checks: dict | None = None
+
+    def _build_photo_checks(check_tree_id: int) -> tuple[dict, int | None]:
+        """Returns (checks, project_id) - the caller needs project_id too (to store alongside this
+        photo's hash for future comparisons), so this resolves it once and hands it back rather
+        than making the caller re-query the same tree row.
+        """
+        location_row = db.execute(
+            text("SELECT project_id, ST_X(geom) AS lng, ST_Y(geom) AS lat FROM trees WHERE id = :tree_id"),
+            {"tree_id": check_tree_id},
+        ).mappings().first()
+        project_id = location_row.get("project_id") if location_row else None
+        tree_lat = location_row.get("lat") if location_row else None
+        tree_lng = location_row.get("lng") if location_row else None
+
+        duplicate = find_similar_photo(db, project_id, photo_phash, exclude_tree_id=check_tree_id) if photo_phash else None
+        location_time = check_photo_location_and_time(exif_data, tree_lat, tree_lng)
+        return {"duplicate": duplicate, **location_time}, project_id
+
     settings = _build_r2_settings()
 
     ext = Path(file.filename or "").suffix.lower()
@@ -8768,6 +8815,7 @@ async def upload_photo_to_r2(
         if not linked_tree_id:
             db.rollback()
             raise HTTPException(status_code=404, detail="Tree not found for photo link.")
+        photo_checks, photo_project_id = _build_photo_checks(int(linked_tree_id))
         linked_task_candidate = db.execute(
             text("""
                 SELECT id, photo_urls
@@ -8802,6 +8850,15 @@ async def upload_photo_to_r2(
             ).mappings().first()
             if linked_task_row:
                 linked_task_id = linked_task_row["id"]
+        # Recorded with whatever task got linked above (if any) - so a reviewer looking at that
+        # task's row in the review queue can find this photo's flags via get_task_photo_flags.
+        record_photo_evidence(
+            db, tree_id=int(linked_tree_id), task_id=int(linked_task_id) if linked_task_id else None,
+            project_id=photo_project_id,
+            object_key=object_key, phash_hex=photo_phash,
+            exif_lat=exif_data.get("lat"), exif_lng=exif_data.get("lng"), exif_captured_at=exif_data.get("captured_at"),
+            checks=photo_checks,
+        )
         db.commit()
     elif task_id is not None:
         locked = db.execute(
@@ -8829,6 +8886,13 @@ async def upload_photo_to_r2(
             raise HTTPException(status_code=404, detail="Task not found for photo link.")
         linked_task_id = task_row["id"]
         linked_tree_id = task_row["tree_id"]
+        photo_checks, photo_project_id = _build_photo_checks(int(linked_tree_id))
+        record_photo_evidence(
+            db, tree_id=int(linked_tree_id), task_id=int(linked_task_id), project_id=photo_project_id,
+            object_key=object_key, phash_hex=photo_phash,
+            exif_lat=exif_data.get("lat"), exif_lng=exif_data.get("lng"), exif_captured_at=exif_data.get("captured_at"),
+            checks=photo_checks,
+        )
         existing_tree_photo_urls = db.execute(
             text("SELECT photo_urls FROM trees WHERE id = :tree_id"),
             {"tree_id": linked_tree_id},
@@ -8850,6 +8914,7 @@ async def upload_photo_to_r2(
         "public_url": public_url,
         "linked_tree_id": linked_tree_id,
         "linked_task_id": linked_task_id,
+        "photo_checks": photo_checks,
     }
 
 
@@ -26193,6 +26258,90 @@ def add_task(
     return {"id": row}
 
 
+def _tree_for_health_check(db: Session, tree_id: int) -> dict:
+    row = db.execute(
+        text("""
+            SELECT tr.id, tr.species, tr.photo_url, tr.photo_urls, tr.project_id, p.organization_id
+            FROM trees tr
+            JOIN green_projects p ON p.id = tr.project_id
+            WHERE tr.id = :tree_id
+        """),
+        {"tree_id": tree_id},
+    ).mappings().first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Tree not found")
+    return dict(row)
+
+
+@router.get("/trees/{tree_id}/health-check")
+def get_tree_health_check(tree_id: int, request: Request, db: Session = Depends(get_db)):
+    """Returns the most recent stored AI health check for this tree, if any - free to call (does
+    not consume the daily quota), so the inspector sidebar can show a prior result immediately on
+    open without forcing a fresh AI call.
+    """
+    session = require_authenticated_session(db, request, auth_modes={"partner_user", "env_admin"})
+    tree = _tree_for_health_check(db, tree_id)
+    if not session.is_super_admin and int(session.organization_id or 0) != int(tree.get("organization_id") or 0):
+        raise HTTPException(status_code=403, detail="Session organization does not match this tree's project")
+    ensure_tree_health_schema(db)
+    latest = get_latest_tree_health_check(db, tree_id)
+    return {"latest": latest}
+
+
+@router.post("/trees/{tree_id}/health-check")
+async def run_tree_health_check(tree_id: int, request: Request, db: Session = Depends(get_db)):
+    """Runs a fresh AI vision health assessment against the tree's current photo. Advisory only -
+    same 'flag for a human, don't auto-certify' discipline as the Plan Reader checker and the Green
+    photo-evidence duplicate/EXIF checks. Capped at TREE_HEALTH_DAILY_LIMIT per logged-in user per
+    day (free-tier Gemini quota is shared across every feature on this key).
+    """
+    session = require_authenticated_session(db, request, auth_modes={"partner_user", "env_admin"})
+    tree = _tree_for_health_check(db, tree_id)
+    if not session.is_super_admin and int(session.organization_id or 0) != int(tree.get("organization_id") or 0):
+        raise HTTPException(status_code=403, detail="Session organization does not match this tree's project")
+
+    photo_urls = _normalize_photo_urls(tree.get("photo_urls"))
+    photo_url = str(tree.get("photo_url") or "").strip() or (photo_urls[-1] if photo_urls else None)
+    if not photo_url:
+        raise HTTPException(status_code=400, detail="This tree has no photo yet - upload one before requesting an AI health check.")
+    object_key = _extract_object_key_from_asset_value(photo_url)
+    if not object_key:
+        raise HTTPException(status_code=400, detail="Could not resolve this tree's photo for AI review.")
+
+    identity_key = f"treehealth:user:{session.user_id}" if session.user_id else f"treehealth:envadmin:{session.session_uid}"
+    remaining_count = consume_daily_reading(db, identity_key, limit=TREE_HEALTH_DAILY_LIMIT)
+    if remaining_count is None:
+        raise HTTPException(
+            status_code=429,
+            detail=f"You've used all {TREE_HEALTH_DAILY_LIMIT} AI tree health checks for today - resets tomorrow.",
+        )
+
+    try:
+        image_bytes, content_type, _cache_control = _load_uploaded_photo_payload(object_key)
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(status_code=502, detail="Could not load this tree's photo for AI review.")
+
+    try:
+        result = await run_in_threadpool(assess_tree_health, image_bytes, content_type, tree.get("species"))
+    except TreeHealthError as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+
+    ensure_tree_health_schema(db)
+    saved = record_tree_health_check(
+        db,
+        tree_id=tree_id,
+        project_id=int(tree["project_id"]),
+        checked_by=session.display_name,
+        object_key=object_key,
+        result=result,
+    )
+    saved["checks_used_today"] = remaining_count
+    saved["checks_remaining_today"] = max(0, TREE_HEALTH_DAILY_LIMIT - remaining_count)
+    return saved
+
+
 @router.get("/trees/{tree_id}/tasks")
 def list_tree_tasks(tree_id: int, db: Session = Depends(get_db)):
     rows = db.execute(text("""
@@ -27521,7 +27670,15 @@ def task_review_queue(
         """),
         {"project_id": project_id, "assignee_name": assignee_name},
     ).mappings().all()
-    return [dict(row) for row in rows]
+    ensure_photo_evidence_schema(db)
+    task_ids = [int(row["id"]) for row in rows]
+    flags_by_task = get_task_photo_flags(db, task_ids)
+    results = []
+    for row in rows:
+        item = dict(row)
+        item["photo_flags"] = flags_by_task.get(int(row["id"]))
+        results.append(item)
+    return results
 
 
 @router.post("/tasks/{task_id}/submit")
