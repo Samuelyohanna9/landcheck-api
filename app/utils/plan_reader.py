@@ -9,8 +9,54 @@ import time
 from typing import Any, Dict, List, Optional
 
 import requests
+from sqlalchemy import text
+from sqlalchemy.orm import Session
 
 logger = logging.getLogger(__name__)
+
+# Per-identity daily cap on actual AI reads (not on file-validation failures, which never reach
+# this far) - protects the shared Gemini quota (as few as 20 requests/day on a free-tier key, see
+# the V3.1-style permanent-record discipline this session already applies elsewhere) from one
+# enthusiastic user consuming the whole team's daily budget alone.
+DAILY_READING_LIMIT = 3
+
+
+def ensure_plan_reader_usage_schema(db: Session) -> None:
+    db.execute(text("""
+        CREATE TABLE IF NOT EXISTS plan_reader_usage (
+            id SERIAL PRIMARY KEY,
+            identity_key TEXT NOT NULL,
+            usage_date DATE NOT NULL,
+            count INTEGER NOT NULL DEFAULT 0,
+            UNIQUE (identity_key, usage_date)
+        )
+    """))
+    db.commit()
+
+
+def consume_daily_reading(db: Session, identity_key: str, limit: int = DAILY_READING_LIMIT) -> Optional[int]:
+    """Atomically checks-and-increments today's usage count for identity_key. Returns the new
+    count if the caller is still within the daily limit, or None if they've already used it up.
+
+    The UPDATE's own WHERE clause (not a separate SELECT-then-UPDATE) is what makes this safe
+    under concurrent requests: once count reaches the limit, the conflict branch's WHERE no longer
+    matches, so the increment simply doesn't happen and RETURNING yields nothing - a race between
+    two simultaneous requests from the same identity can't both sneak past the cap.
+    """
+    ensure_plan_reader_usage_schema(db)
+    row = db.execute(
+        text("""
+            INSERT INTO plan_reader_usage (identity_key, usage_date, count)
+            VALUES (:key, CURRENT_DATE, 1)
+            ON CONFLICT (identity_key, usage_date)
+            DO UPDATE SET count = plan_reader_usage.count + 1
+            WHERE plan_reader_usage.count < :limit
+            RETURNING count
+        """),
+        {"key": identity_key, "limit": limit},
+    ).fetchone()
+    db.commit()
+    return int(row[0]) if row else None
 
 # Reuses the exact call pattern already proven in green.py's _ask_gemini_assistant (same env var,
 # same base URL, same REST call - not the SDK) rather than a second, divergent way of talking to
