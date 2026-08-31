@@ -28,7 +28,13 @@ def _gemini_api_key() -> Optional[str]:
 
 
 def _gemini_model() -> str:
-    return str(os.getenv("GEMINI_PLAN_READER_MODEL") or "gemini-2.5-flash").strip() or "gemini-2.5-flash"
+    # gemini-2.5-flash was retired for accounts/projects created after Google's cutoff (confirmed
+    # live in production: a real 404 "no longer available to new users... use models/gemini-3.6-
+    # flash" from Google's own API against the "LC Green" project, created Jul 2026). generateContent
+    # (what this module calls) remains fully supported for 3.6-flash - Google's newer "Interactions
+    # API" is only recommended for stateful/multi-turn/agentic use, not a single-shot extraction
+    # call like this one, so no request-shape migration is needed, just the model id.
+    return str(os.getenv("GEMINI_PLAN_READER_MODEL") or "gemini-3.6-flash").strip() or "gemini-3.6-flash"
 
 
 class PlanReaderError(Exception):
