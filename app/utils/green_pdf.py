@@ -3049,6 +3049,7 @@ def render_green_existing_trees_report_pdf(
     summary: dict,
     include_photos: bool = False,
     photo_rows: list[dict] | None = None,
+    ai_narrative: str | None = None,
 ):
     c = canvas.Canvas(output_path, pagesize=A4)
     width, height = A4
@@ -3181,6 +3182,20 @@ def render_green_existing_trees_report_pdf(
         c.setFont("Helvetica", 8)
         c.setFillColorRGB(0.45, 0.45, 0.45)
         c.drawString(34, height - 360, "No species CO2 summary available for the current existing-tree scope.")
+
+    ai_narrative_clean = str(ai_narrative or "").strip()
+    if ai_narrative_clean:
+        c.setFont("Helvetica-Bold", 9)
+        c.setFillColorRGB(0.18, 0.18, 0.18)
+        c.drawString(34, height - 500, "Impact Summary (AI-drafted)")
+        c.setFont("Helvetica", 7.8)
+        c.setFillColorRGB(0.3, 0.3, 0.3)
+        narrative_line_y = height - 514
+        for line in _wrap_text(ai_narrative_clean, "Helvetica", 7.8, width - 68):
+            if narrative_line_y < 160:
+                break
+            c.drawString(34, narrative_line_y, line)
+            narrative_line_y -= 10
 
     c.setFont("Helvetica-Bold", 9)
     c.setFillColorRGB(0.18, 0.18, 0.18)
@@ -4995,6 +5010,7 @@ def render_green_agric_programme_pdf(
     overview_map_png: bytes | None = None,
     overview_map_view: dict | None = None,
     include_photos: bool = False,
+    ai_narrative: str | None = None,
 ):
     c = canvas.Canvas(output_path, pagesize=A4)
     width, height = A4
@@ -5257,14 +5273,27 @@ def render_green_agric_programme_pdf(
             )
         _draw_bar_chart(c, 34, 214, width - 68, 110, bar_rows, title="Mapped Commodity Footprint (ha)")
 
+    ai_narrative_clean = str(ai_narrative or "").strip()
+    if ai_narrative_clean:
+        summary_title = "Executive Summary (AI-drafted)"
+        summary_lines = [
+            paragraph.strip()
+            for paragraph in ai_narrative_clean.replace("\r\n", "\n").split("\n")
+            if paragraph.strip()
+        ] or [ai_narrative_clean]
+        summary_bullet = False
+    else:
+        summary_title = "Executive Summary"
+        summary_lines = executive_summary_lines()
+        summary_bullet = True
     draw_list_box(
-        "Executive Summary",
+        summary_title,
         34,
         52,
         (width - 78) / 2,
         148,
-        executive_summary_lines(),
-        bullet=True,
+        summary_lines,
+        bullet=summary_bullet,
     )
     draw_list_box(
         "Data Coverage Snapshot",
@@ -5541,6 +5570,7 @@ def render_green_relief_programme_pdf(
     overview_map_png: bytes | None = None,
     overview_map_view: dict | None = None,
     include_photos: bool = False,
+    ai_narrative: str | None = None,
 ):
     c = canvas.Canvas(output_path, pagesize=A4)
     width, height = A4
@@ -5812,14 +5842,27 @@ def render_green_relief_programme_pdf(
             )
         _draw_bar_chart(c, 34, 214, width - 68, 110, bar_rows, title="Mapped Asset Mix (site count)")
 
+    ai_narrative_clean = str(ai_narrative or "").strip()
+    if ai_narrative_clean:
+        summary_title = "Executive Summary (AI-drafted)"
+        summary_lines = [
+            paragraph.strip()
+            for paragraph in ai_narrative_clean.replace("\r\n", "\n").split("\n")
+            if paragraph.strip()
+        ] or [ai_narrative_clean]
+        summary_bullet = False
+    else:
+        summary_title = "Executive Summary"
+        summary_lines = executive_summary_lines()
+        summary_bullet = True
     draw_list_box(
-        "Executive Summary",
+        summary_title,
         34,
         52,
         (width - 78) / 2,
         148,
-        executive_summary_lines(),
-        bullet=True,
+        summary_lines,
+        bullet=summary_bullet,
     )
     draw_list_box(
         "Data Coverage Snapshot",

@@ -59,6 +59,7 @@ from app.utils.map_renderer_layout import (
     format_area_display,
 )
 from app.utils.back_computation import compute_back_computation
+from app.utils.survey_qc import check_plot_survey_quality
 from app.utils.back_computation_pdf import render_back_computation_pdf
 from app.utils.coordinate_converter import resolve_coordinate_system_key, validate_nigeria_bounds
 from shapely import wkb
@@ -7255,6 +7256,21 @@ def get_plot_scale_recommendation(
         "template_name": str(template_name or DEFAULT_TEMPLATE_NAME),
         "reason": "The selected standard scale contains the full parcel and reserves printed space for bearing and distance annotations.",
     }
+
+
+@router.get("/{plot_id}/qc-check")
+def check_plot_quality(plot_id: int, stated_area_m2: float | None = None, db: Session = Depends(get_db)):
+    """The surveyor's '✨ AI CHECK' button - a deterministic quality-control pass over this plot's
+    already-saved boundary coordinates (closure, area, duplicate stations, coordinate-format/range
+    consistency, unusually long segments, and an optional area-mismatch comparison). No AI model is
+    called here - see survey_qc.py's module docstring for why: the actual math must be exact and
+    reproducible, never a second source of hallucination on top of anything else. stated_area_m2 is
+    a one-off comparison figure the surveyor can type in for this single check; it is never saved.
+    """
+    meta = get_plot_meta(db, plot_id)
+    normalized = _normalize_survey_input_coordinates(meta.get("survey_input_coordinates"))
+    boundary_points = [p for p in normalized if p.get("is_boundary") is not False]
+    return check_plot_survey_quality(boundary_points, meta.get("coordinate_system") or "wgs84", stated_area_m2)
 
 
 @router.post("/{plot_id}/report/preview")
