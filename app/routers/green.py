@@ -26263,7 +26263,7 @@ def _tree_for_health_check(db: Session, tree_id: int) -> dict:
         text("""
             SELECT tr.id, tr.species, tr.photo_url, tr.photo_urls, tr.project_id, p.organization_id
             FROM trees tr
-            JOIN green_projects p ON p.id = tr.project_id
+            JOIN tree_projects p ON p.id = tr.project_id
             WHERE tr.id = :tree_id
         """),
         {"tree_id": tree_id},
