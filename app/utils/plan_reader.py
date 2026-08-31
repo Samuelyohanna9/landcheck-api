@@ -24,7 +24,13 @@ ALLOWED_CONTENT_TYPES = {"image/jpeg", "image/png", "image/webp", "application/p
 
 
 def _gemini_api_key() -> Optional[str]:
-    return str(os.getenv("GEMINI_API_KEY") or "").strip() or None
+    # GEMINI_PLAN_READER_API_KEY is optional and independent of GEMINI_API_KEY (the one green.py's
+    # chat fallback already uses) - lets this feature run on a separate, free-tier-only key/project
+    # (no billing attached) without sharing a rate-limit budget with, or being taken down by, an
+    # unrelated feature's billing account running dry. Falls back to GEMINI_API_KEY if not set, so
+    # nothing breaks for a deployment that intentionally shares one key across both features.
+    dedicated = str(os.getenv("GEMINI_PLAN_READER_API_KEY") or "").strip()
+    return dedicated or str(os.getenv("GEMINI_API_KEY") or "").strip() or None
 
 
 def _gemini_model() -> str:
