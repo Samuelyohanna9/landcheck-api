@@ -12,6 +12,7 @@ from app.db import SessionLocal
 from app.utils.auth_security import require_super_admin_request
 from app.utils.survey_auth_security import ensure_survey_auth_schema
 from app.utils.survey_activity import ensure_survey_activity_table
+from app.utils.plan_reader import DAILY_READING_LIMIT, ensure_plan_reader_usage_schema
 
 router = APIRouter(prefix="/analytics", tags=["analytics"])
 
@@ -668,6 +669,52 @@ def get_survey_users(request: Request, db: Session = Depends(get_db)):
         }
         for row in rows
     ]
+
+
+@router.get("/plan-reader-usage")
+def get_plan_reader_usage(request: Request, db: Session = Depends(get_db)):
+    """Who has used the AI Plan Reader (identified surveyors resolved by email/name, anonymous
+    callers shown by IP - see plan_reader.py's _rate_limit_identity for why identity_key is either
+    'user:<id>' or 'ip:<address>'), with total reads, today's count against the shared daily cap,
+    and when they last used it. Real PII (email) is in here, same as get_survey_users, so this
+    enforces the same real auth check rather than being open like the anonymous-friendly endpoints
+    in this file.
+    """
+    require_super_admin_request(db, request)
+    ensure_plan_reader_usage_schema(db)
+    ensure_survey_auth_schema()
+    rows = db.execute(text(r"""
+        SELECT
+            pru.identity_key,
+            u.id AS user_id,
+            u.email,
+            u.full_name,
+            SUM(pru.count) AS total_reads,
+            MAX(pru.count) FILTER (WHERE pru.usage_date = CURRENT_DATE) AS reads_today,
+            MAX(pru.usage_date) AS last_used_date
+        FROM plan_reader_usage pru
+        LEFT JOIN survey_users u
+            ON u.id = substring(pru.identity_key FROM '^user:(\d+)$')::INTEGER
+        GROUP BY pru.identity_key, u.id, u.email, u.full_name
+        ORDER BY MAX(pru.usage_date) DESC, total_reads DESC
+    """)).mappings().all()
+
+    return {
+        "daily_limit": DAILY_READING_LIMIT,
+        "users": [
+            {
+                "identity_key": row["identity_key"],
+                "user_id": int(row["user_id"]) if row["user_id"] is not None else None,
+                "email": row["email"],
+                "full_name": row["full_name"],
+                "is_anonymous": row["user_id"] is None,
+                "total_reads": int(row["total_reads"] or 0),
+                "reads_today": int(row["reads_today"] or 0),
+                "last_used_date": row["last_used_date"].isoformat() if row["last_used_date"] else None,
+            }
+            for row in rows
+        ],
+    }
 
 
 @router.get("/survey-activity")
