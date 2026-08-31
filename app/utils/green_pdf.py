@@ -3371,6 +3371,7 @@ def render_green_csr_programme_report_pdf(
     stakeholder_rows: list[dict] | None = None,
     timeline_rows: list[dict] | None = None,
     csr_report_profile: dict | None = None,
+    ai_narrative: str | None = None,
 ):
     c = canvas.Canvas(output_path, pagesize=A4)
     width, height = A4
@@ -3568,13 +3569,27 @@ def render_green_csr_programme_report_pdf(
     latest_activity = _fmt_date(summary.get("latest_activity_at"))
 
     top_stakeholders = stakeholder_rows[:3]
-    board_summary_lines = [
-        f"{client_name} currently has {total_trees} verified implementation tree(s) on record across {total_rows} CSR field record(s).",
-        f"Operational status mix: {alive_trees} healthy/alive, {attention_trees} needing attention, and {dead_trees} dead or removed.",
-        f"Evidence coverage stands at {photo_rows_count}/{total_rows} photo-backed record(s) and {mapped_rows_count}/{total_rows} mapped record(s).",
-        f"Review and care status: {reviewed_rows_count} record(s) already reviewed, with {maintenance_done}/{maintenance_total or 1} maintenance action(s) marked done.",
-        f"Climate metrics currently estimate {_fmt_num(summary.get('current_co2_tonnes', 0), 2)} t CO2 stored and {_fmt_num(summary.get('projected_lifetime_co2_tonnes', 0), 2)} t projected over 40 years.",
-    ]
+    ai_narrative_clean = str(ai_narrative or "").strip()
+    board_summary_title = "Board Summary"
+    if ai_narrative_clean:
+        # AI-drafted from the same verified metrics below, but it's still generated prose - labelled
+        # so a board reader (or auditor) can tell this paragraph wasn't hand-written or independently
+        # verified sentence-by-sentence, same "never let AI output pass as silently-verified fact"
+        # discipline used for the Plan Reader checker and the Green photo-evidence flags.
+        board_summary_title = "Board Summary (AI-drafted)"
+        board_summary_lines = [
+            paragraph.strip()
+            for paragraph in ai_narrative_clean.replace("\r\n", "\n").split("\n")
+            if paragraph.strip()
+        ] or [ai_narrative_clean]
+    else:
+        board_summary_lines = [
+            f"{client_name} currently has {total_trees} verified implementation tree(s) on record across {total_rows} CSR field record(s).",
+            f"Operational status mix: {alive_trees} healthy/alive, {attention_trees} needing attention, and {dead_trees} dead or removed.",
+            f"Evidence coverage stands at {photo_rows_count}/{total_rows} photo-backed record(s) and {mapped_rows_count}/{total_rows} mapped record(s).",
+            f"Review and care status: {reviewed_rows_count} record(s) already reviewed, with {maintenance_done}/{maintenance_total or 1} maintenance action(s) marked done.",
+            f"Climate metrics currently estimate {_fmt_num(summary.get('current_co2_tonnes', 0), 2)} t CO2 stored and {_fmt_num(summary.get('projected_lifetime_co2_tonnes', 0), 2)} t projected over 40 years.",
+        ]
     programme_lines = [
         f"Programme title: {programme_title}",
         f"Programme type: {_fmt_label(csr_config.get('program_type') or 'tree_planting')}",
@@ -3649,7 +3664,7 @@ def render_green_csr_programme_report_pdf(
     _draw_premium_metric(34 + (metric_w + 8) * 3, metric_y2, metric_w, 66, f"{_fmt_num(summary.get('projected_lifetime_co2_tonnes', 0), 2)} t", "40Y projection")
 
     box_y = metric_y2 - 136
-    _draw_text_box(34, box_y, 316, 124, "Board Summary", board_summary_lines, fill="#fffdf8")
+    _draw_text_box(34, box_y, 316, 124, board_summary_title, board_summary_lines, fill="#fffdf8")
     _draw_text_box(360, box_y, width - 394, 124, "Programme Mandate", programme_lines, fill="#f7f1e7")
 
     stakeholder_y = box_y - 82

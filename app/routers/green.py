@@ -71,6 +71,11 @@ from app.utils.tree_health_ai import (
     record_tree_health_check,
 )
 from app.utils.plan_reader import consume_daily_reading
+from app.utils.green_impact_narrative import (
+    IMPACT_NARRATIVE_DAILY_LIMIT,
+    ImpactNarrativeError,
+    generate_impact_narrative,
+)
 from app.utils.r2_exports import upload_export_file_best_effort, _build_export_r2_settings
 from app.utils.activity_logger import ensure_activity_log_table, safe_log_activity
 from app.utils.auth_security import (
@@ -447,6 +452,7 @@ class GreenReportExportJobPayload(BaseModel):
     bearing: float | None = 0.0
     pitch: float | None = 0.0
     requested_by: str | None = None
+    ai_narrative: str | None = None
 
 
 class MobilePushTokenPayload(BaseModel):
@@ -34386,6 +34392,7 @@ def _render_csr_programme_pdf_with_fallback(
     context: dict,
     *,
     include_photos: bool,
+    ai_narrative: str | None = None,
 ) -> None:
     map_png = context.get("overview_map_png")
     map_view = context.get("overview_map_view")
@@ -34431,6 +34438,7 @@ def _render_csr_programme_pdf_with_fallback(
                 stakeholder_rows=[dict(row) for row in (context.get("stakeholder_rows") or [])],
                 timeline_rows=[dict(row) for row in (context.get("timeline_rows") or [])],
                 csr_report_profile=dict(context.get("csr_report_profile") or {}),
+                ai_narrative=ai_narrative,
             )
             return
         except Exception as exc:
@@ -34452,6 +34460,63 @@ def _require_csr_workflow_project(project_id: int, db: Session) -> dict:
             detail="The sustainability disclosure export is only available for CSR programme projects.",
         )
     return project
+
+
+@router.post("/projects/{project_id}/impact-narrative")
+async def generate_project_impact_narrative(project_id: int, request: Request, db: Session = Depends(get_db)):
+    """Drafts the short 'Board Summary' paragraph for the CSR Programme Impact Report from this
+    project's already-computed metrics (no field data or photos sent to the model - purely the
+    same numbers _build_csr_programme_export_context assembles for the PDF itself, so the narrative
+    can never claim anything the report's own figures don't already show). Advisory only: the
+    frontend shows this as editable text for a human to review/adjust before it's baked into a
+    board-facing PDF, same 'flag for review, don't silently pass off AI output as verified fact'
+    discipline as the Plan Reader and Green photo-evidence checks.
+    """
+    session = require_authenticated_session(db, request, auth_modes={"partner_user", "env_admin"})
+    project = _require_csr_workflow_project(project_id, db)
+    if not session.is_super_admin and int(session.organization_id or 0) != int(project.get("organization_id") or 0):
+        raise HTTPException(status_code=403, detail="Session organization does not match this project")
+
+    identity_key = f"impactnarrative:user:{session.user_id}" if session.user_id else f"impactnarrative:envadmin:{session.session_uid}"
+    remaining_count = consume_daily_reading(db, identity_key, limit=IMPACT_NARRATIVE_DAILY_LIMIT)
+    if remaining_count is None:
+        raise HTTPException(
+            status_code=429,
+            detail=f"You've used all {IMPACT_NARRATIVE_DAILY_LIMIT} AI impact narratives for today - resets tomorrow.",
+        )
+
+    context = _build_csr_programme_export_context(project_id, db, include_map=False)
+    summary = dict(context.get("summary") or {})
+    csr_config = context["project"].get("csr_config") or {}
+    total_trees = int(summary.get("total_existing_trees", 0) or 0)
+    metrics = {
+        "CSR client": str(csr_config.get("client_name") or context["project"].get("organization_name") or "").strip() or None,
+        "Programme location": context["project"].get("location_text"),
+        "Reporting cycle": csr_config.get("reporting_cycle"),
+        "Total implementation trees": total_trees,
+        "Healthy/alive trees": summary.get("alive_trees"),
+        "Trees needing attention": summary.get("attention_trees"),
+        "Dead/removed trees": summary.get("dead_trees"),
+        "Survival rate": f"{round((float(summary.get('alive_trees') or 0) / total_trees) * 100.0, 1)}%" if total_trees > 0 else None,
+        "Photo-backed records": f"{summary.get('rows_with_photos', 0)}/{summary.get('total_existing_rows', 0)}",
+        "Mapped records": f"{summary.get('rows_with_map', 0)}/{summary.get('total_existing_rows', 0)}",
+        "Records already reviewed": summary.get("rows_with_review_activity"),
+        "Maintenance actions done": f"{summary.get('maintenance_done', 0)}/{summary.get('maintenance_total', 0)}",
+        "Current CO2 stored (tonnes)": summary.get("current_co2_tonnes"),
+        "Projected lifetime CO2 (tonnes, 40yr)": summary.get("projected_lifetime_co2_tonnes"),
+        "Stakeholder/site groupings": summary.get("stakeholder_count"),
+    }
+
+    try:
+        narrative = await run_in_threadpool(generate_impact_narrative, metrics)
+    except ImpactNarrativeError as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+
+    return {
+        "narrative": narrative,
+        "reads_used_today": remaining_count,
+        "reads_remaining_today": max(0, IMPACT_NARRATIVE_DAILY_LIMIT - remaining_count),
+    }
 
 
 @router.get("/projects/{project_id}/sustainability-disclosure/pdf")
@@ -35156,6 +35221,7 @@ def export_agric_farmers_sheet_pdf(project_id: int, db: Session = Depends(get_db
 def export_existing_trees_pdf(
     project_id: int,
     include_photos: bool = False,
+    ai_narrative: str | None = None,
     db: Session = Depends(get_db),
 ):
     project = get_project(project_id, db)
@@ -35167,7 +35233,10 @@ def export_existing_trees_pdf(
         tmp_pdf = tempfile.NamedTemporaryFile(suffix="_csr_programme.pdf", delete=False)
         pdf_path = tmp_pdf.name
         tmp_pdf.close()
-        _render_csr_programme_pdf_with_fallback(pdf_path, context, include_photos=include_photos)
+        _render_csr_programme_pdf_with_fallback(
+            pdf_path, context, include_photos=include_photos,
+            ai_narrative=(ai_narrative or "").strip() or None,
+        )
         filename = f"project_{project_id}_csr_programme_report.pdf"
         return _pdf_response_with_r2(
             pdf_path,
@@ -36136,6 +36205,7 @@ def _run_green_file_export_job(job_id: str):
             response = export_existing_trees_pdf(
                 project_id=project_id,
                 include_photos=bool(payload.get("include_photos")),
+                ai_narrative=payload.get("ai_narrative"),
                 db=db,
             )
             category = "green-existing-trees-report"
@@ -36224,6 +36294,7 @@ def create_green_report_export_job(
         "zoom": payload.zoom,
         "bearing": payload.bearing,
         "pitch": payload.pitch,
+        "ai_narrative": (payload.ai_narrative or "").strip() or None,
     }
     cache_key = _build_green_report_cache_key(
         db,
