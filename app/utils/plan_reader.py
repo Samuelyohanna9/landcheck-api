@@ -18,7 +18,9 @@ logger = logging.getLogger(__name__)
 # this far) - protects the shared Gemini quota (as few as 20 requests/day on a free-tier key, see
 # the V3.1-style permanent-record discipline this session already applies elsewhere) from one
 # enthusiastic user consuming the whole team's daily budget alone.
-DAILY_READING_LIMIT = 3
+# Temporarily raised for the AI Field-to-Survey-Plan flow testing pass - restore to a real daily
+# cap (e.g. 3) before this ships.
+DAILY_READING_LIMIT = 1000
 
 
 def ensure_plan_reader_usage_schema(db: Session) -> None:

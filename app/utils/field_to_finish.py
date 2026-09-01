@@ -16,7 +16,9 @@ logger = logging.getLogger(__name__)
 GEMINI_API_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
 
 MAX_UPLOAD_BYTES = 2 * 1024 * 1024  # 2 MB - a raw text coordinate file is small; this is generous
-DAILY_IMPORT_LIMIT = 3
+# Temporarily raised for the AI Field-to-Survey-Plan flow testing pass - restore to a real daily
+# cap (e.g. 3) before this ships, same as the Plan Reader's DAILY_READING_LIMIT.
+DAILY_IMPORT_LIMIT = 1000
 
 # Feature-code categories this app recognizes today. This is a NEW vocabulary (nothing in the
 # codebase classified points beyond boundary-vs-spot-height before this) - deliberately small and
