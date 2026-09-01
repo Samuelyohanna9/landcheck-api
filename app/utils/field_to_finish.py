@@ -148,11 +148,14 @@ def parse_field_data(raw_text: str) -> Dict[str, Any]:
     }
     url = f"{GEMINI_API_BASE_URL}/models/{_gemini_model()}:generateContent"
 
-    max_attempts = 3
+    # 45s read timeout, 2 attempts - see plan_reader.py's identical retry block for why (a 25s
+    # cutoff was firing on structured-JSON extractions that genuinely needed longer, especially
+    # with many points). Worst case ~91s - CoordinateInput.tsx's request timeout must stay above it.
+    max_attempts = 2
     last_error: Optional[str] = None
     for attempt in range(1, max_attempts + 1):
         try:
-            response = requests.post(url, params={"key": api_key}, json=request_body, timeout=(6, 25))
+            response = requests.post(url, params={"key": api_key}, json=request_body, timeout=(6, 45))
         except requests.RequestException as exc:
             last_error = f"Could not reach the AI service ({exc})."
             logger.warning("Field-to-finish Gemini call failed to reach the API (attempt %s/%s): %s", attempt, max_attempts, exc)

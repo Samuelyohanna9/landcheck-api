@@ -261,14 +261,21 @@ def extract_survey_plan(file_bytes: bytes, content_type: str) -> Dict[str, Any]:
     # this call runs in a background thread (see plan_reader.py's router) rather than blocking the
     # event loop, so a slightly longer worst case here no longer risks a gunicorn worker-timeout
     # kill the way it would have before that fix.
-    max_attempts = 3
+    #
+    # 45s read timeout, 2 attempts (not 3x25s) - confirmed live that a structured-JSON extraction
+    # with many beacons can genuinely take longer than 25s on a billed key with no rate-limit
+    # throttling slowing it down artificially, so a 25s cutoff was firing on requests that would
+    # have succeeded given a few more seconds. Worst case here is ~91s (45+1+45) - the caller's own
+    # HTTP timeout (CoordinateInput.tsx) must stay comfortably above that or the frontend gives up
+    # first and the user never sees the backend's actual (successful or cleanly-failed) result.
+    max_attempts = 2
     last_error: Optional[str] = None
     for attempt in range(1, max_attempts + 1):
         try:
-            # Explicit (connect, read) tuple, not one combined 60s figure - a genuinely blocked/
+            # Explicit (connect, read) tuple, not one combined figure - a genuinely blocked/
             # unreachable network path should fail in a few seconds, not hang for a minute; a real
             # but slow Gemini response still gets a generous read window.
-            response = requests.post(url, params={"key": api_key}, json=request_body, timeout=(6, 25))
+            response = requests.post(url, params={"key": api_key}, json=request_body, timeout=(6, 45))
         except requests.RequestException as exc:
             last_error = f"Could not reach the AI service ({exc})."
             logger.warning("Plan reader Gemini call failed to reach the API (attempt %s/%s): %s", attempt, max_attempts, exc)
