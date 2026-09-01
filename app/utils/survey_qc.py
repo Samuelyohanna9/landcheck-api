@@ -16,6 +16,11 @@ _NIGERIA_PROJECTED_EASTING_RANGE = (60000.0, 940000.0)
 _NIGERIA_PROJECTED_NORTHING_RANGE = (350000.0, 1600000.0)
 _NIGERIA_LATLON_RANGE = {"lng": (1.0, 16.0), "lat": (2.0, 15.0)}
 
+# The exact default a freshly-added, never-touched point gets (see SurveyPlan.tsx's addPoint()) -
+# (0, 0) is nowhere near Nigeria in any coordinate system this app supports, so treating it as "not
+# yet edited" rather than a real coordinate is always safe, never a false positive on legitimate data.
+_UNEDITED_DEFAULT_TOLERANCE = 1e-6
+
 # Two boundary stations this close together are almost certainly the same point entered twice, not
 # two legitimately adjacent corners.
 DUPLICATE_COORDINATE_TOLERANCE_M = 0.05
@@ -67,6 +72,38 @@ def check_plot_survey_quality(
             "closure_error_m": None, "closure_ratio": None, "review_count": 1, "overall_status": "review",
         }
     items.append({"severity": "ok", "code": "station_count", "message": f"{station_count} boundary station(s) detected."})
+
+    # Split out stations still sitting at the freshly-added default (0, 0) - flagging these the same
+    # way as a genuine coincident-coordinate warning below is confusing (it reads as "your real data
+    # is broken" when actually nothing has been typed in yet). Called out on their own, then excluded
+    # from every check below so a still-blank draft doesn't produce a nonsensical "0.00 sqm, closes
+    # exactly" result that looks like a false all-clear.
+    is_unedited = [
+        abs(p["x"]) < _UNEDITED_DEFAULT_TOLERANCE and abs(p["y"]) < _UNEDITED_DEFAULT_TOLERANCE for p in points
+    ]
+    unedited_points = [p for p, unedited in zip(points, is_unedited) if unedited]
+    if unedited_points:
+        names = [str(p["station"]) for p in unedited_points]
+        items.append({
+            "severity": "warning", "code": "unedited_coordinates",
+            "message": (
+                f'{len(unedited_points)} station(s) still have the default (0, 0) coordinate - enter real '
+                f'coordinates before this check is meaningful: {", ".join(names)}.'
+            ),
+        })
+    points = [p for p, unedited in zip(points, is_unedited) if not unedited]
+    station_count = len(points)
+    if station_count < 3:
+        if station_count > 0:
+            items.append({
+                "severity": "error", "code": "too_few_edited_stations",
+                "message": f"Only {station_count} station(s) have real coordinates entered - at least 3 are needed to check closure and area.",
+            })
+        review_count = sum(1 for item in items if item["severity"] in ("warning", "error"))
+        return {
+            "items": items, "station_count": len(unedited_points) + station_count, "area_m2": None, "perimeter_m": None,
+            "closure_error_m": None, "closure_ratio": None, "review_count": review_count, "overall_status": "review",
+        }
 
     # Union-find clustering, not a pairwise report - with several points at the same spot (e.g. a
     # batch of freshly-added, still-unedited stations), a plain pairwise loop would emit one warning
