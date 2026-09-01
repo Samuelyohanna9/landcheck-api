@@ -19,6 +19,7 @@ from pydantic import BaseModel, Field, model_validator
 from pyproj import Transformer
 from sqlalchemy import text
 from sqlalchemy.orm import Session
+from starlette.concurrency import run_in_threadpool
 
 from app.db import SessionLocal
 from app.routers.plots import COORDINATE_SYSTEMS, get_db, _safe_filename_fragment
@@ -26,6 +27,12 @@ from app.utils.survey_auth_security import require_survey_session, resolve_surve
 from app.utils.survey_activity import ensure_survey_activity_table, log_survey_activity
 from app.utils.coordinate_converter import is_nigeria_auto_utm_coordinate_system, resolve_coordinate_system_key
 from app.utils.r2_objects import build_r2_settings, create_r2_client, delete_object_best_effort, upload_bytes
+from app.utils.plan_reader import consume_daily_reading
+from app.utils.georeference_ai_digitize import (
+    AI_DIGITIZE_DAILY_LIMIT,
+    GeoreferenceAiDigitizeError,
+    detect_digitized_points,
+)
 
 
 router = APIRouter(prefix="/survey-georeference", tags=["survey-georeference"])
@@ -1481,6 +1488,125 @@ def save_georeference_features(session_id: str, payload: SaveDigitizedFeaturesRe
         details={"feature_count": len(features)},
     )
     return {"ok": True, "session": _session_to_payload(updated)}
+
+
+def _ai_digitize_rate_limit_identity(request: Request, db: Session) -> str:
+    """Same identity resolution as plan_reader.py's/field_to_finish.py's routers - signed-in
+    surveyor's user id when available, otherwise the caller's IP as a soft per-machine limit. The
+    "georefdigitize:" prefix keeps this feature's daily-usage bucket separate from every other AI
+    feature's, even though they all share the same plan_reader_usage table/consume_daily_reading
+    helper - without it, an "AI Digitize" run and a "Plan Reader" run from the same user would
+    silently draw from and deplete the same counter instead of their own independent 2/day caps.
+    """
+    try:
+        survey_session = resolve_survey_session(db, request)
+    except Exception:
+        survey_session = None
+    if survey_session:
+        return f"georefdigitize:user:{survey_session.user_id}"
+    client_host = request.client.host if request.client else "unknown"
+    return f"georefdigitize:ip:{client_host}"
+
+
+@router.post("/sessions/{session_id}/ai-digitize")
+async def ai_digitize_georeference_session(session_id: str, request: Request, db: Session = Depends(get_db)):
+    """Sends the session's anchored raster to Gemini vision to visually locate boundary-corner and
+    stake markers, then runs each detected point through the exact same pixel->coordinate
+    conversion (_feature_to_saved_payload) the manual digitizing tool already uses. Returns draft
+    features only - nothing is written to the session here; the surveyor reviews/edits them using
+    the existing digitizing tools and saves via the existing /features endpoint, same "AI proposes,
+    human confirms" discipline as every other AI feature in this app.
+    """
+    row = _load_session_row(db, session_id)
+    transform = _normalize_session_transform(row, _safe_json_load(row.get("transform_json"), None))
+    if not isinstance(transform, dict):
+        raise HTTPException(status_code=400, detail="Anchor the raster (solve a transform) before running AI Digitize.")
+
+    identity_key = _ai_digitize_rate_limit_identity(request, db)
+    new_count = consume_daily_reading(db, identity_key, AI_DIGITIZE_DAILY_LIMIT)
+    if new_count is None:
+        raise HTTPException(
+            status_code=429,
+            detail=f"You've used all {AI_DIGITIZE_DAILY_LIMIT} AI digitize runs for today. Please try again tomorrow.",
+        )
+
+    settings = _build_r2()
+    object_key = str(row.get("source_object_key") or "")
+    if not object_key:
+        raise HTTPException(status_code=404, detail="Raster source is no longer available.")
+
+    try:
+        raster_bytes = _download_r2_bytes(settings, object_key)
+    except Exception as exc:
+        raise HTTPException(status_code=404, detail=f"Unable to load the raster from storage: {exc}") from exc
+
+    try:
+        # Blocking requests.post call - same event-loop-blocking risk plan_reader.py's router
+        # comment documents, so it's offloaded to a thread the same way.
+        result = await run_in_threadpool(
+            detect_digitized_points, raster_bytes, str(row.get("source_content_type") or "image/jpeg")
+        )
+    except GeoreferenceAiDigitizeError as exc:
+        logger.warning("AI digitize failed for session %s: %s", session_id, exc)
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    width = int(row.get("source_width") or 0)
+    height = int(row.get("source_height") or 0)
+    raw_points = result.get("points") or []
+
+    boundary_pixels: list[PixelPointInput] = []
+    other_features: list[DigitizedFeatureInput] = []
+    stake_counter = 0
+    for point in raw_points:
+        try:
+            pixel = PixelPointInput(
+                x=float(point.get("x_frac") or 0.0) * width,
+                y=float(point.get("y_frac") or 0.0) * height,
+            )
+        except (TypeError, ValueError):
+            continue
+        feature_type = str(point.get("feature_type") or "").strip().lower()
+        if feature_type == "boundary_corner":
+            boundary_pixels.append(pixel)
+        else:
+            stake_counter += 1
+            other_features.append(
+                DigitizedFeatureInput(
+                    label=str(point.get("label") or f"AI Stake {stake_counter}").strip(),
+                    feature_type="point",
+                    pixels=[pixel],
+                    is_primary=False,
+                )
+            )
+
+    draft_inputs: list[DigitizedFeatureInput] = []
+    if len(boundary_pixels) >= 3:
+        draft_inputs.append(
+            DigitizedFeatureInput(
+                label="AI Detected Boundary",
+                feature_type="polygon",
+                pixels=boundary_pixels,
+                is_primary=True,
+            )
+        )
+    draft_inputs.extend(other_features)
+
+    draft_features = [_feature_to_saved_payload(feature, transform) for feature in draft_inputs]
+
+    log_survey_activity(
+        db,
+        event_type="georeference_ai_digitize",
+        workflow="georeference",
+        request=request,
+        georeference_session_id=session_id,
+        details={"detected_point_count": len(raw_points), "draft_feature_count": len(draft_features)},
+    )
+
+    return {
+        "draft_features": draft_features,
+        "notes": result.get("notes") or [],
+        "digitize_runs_remaining_today": max(0, AI_DIGITIZE_DAILY_LIMIT - new_count),
+    }
 
 
 def _format_coordinate_number(value: float, decimals: int) -> str:

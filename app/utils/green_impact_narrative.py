@@ -13,10 +13,9 @@ logger = logging.getLogger(__name__)
 # key so this feature's quota/billing isn't shared with, or taken down by, the other AI features.
 GEMINI_API_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
 
-# Report generation is an admin/supervisor action, not a per-field-photo action, so it happens far
-# less often than the Plan Reader or Tree Health checks - but it still shares the same free-tier
-# daily request budget, so it still gets a modest cap rather than being unlimited.
-IMPACT_NARRATIVE_DAILY_LIMIT = 5
+# Real launch cap, matching every other AI feature's per-user daily limit (Plan Reader,
+# Field-to-Finish, Tree Health) - see each module's own constant.
+IMPACT_NARRATIVE_DAILY_LIMIT = 2
 
 # The PDF's "Board Summary" box is a small, fixed-size panel (see green_pdf.py's
 # render_green_csr_programme_report_pdf) that today holds ~5 short bullet sentences - roughly this
