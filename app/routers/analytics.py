@@ -13,6 +13,8 @@ from app.utils.auth_security import require_super_admin_request
 from app.utils.survey_auth_security import ensure_survey_auth_schema
 from app.utils.survey_activity import ensure_survey_activity_table
 from app.utils.plan_reader import DAILY_READING_LIMIT, ensure_plan_reader_usage_schema
+from app.utils.field_to_finish import DAILY_IMPORT_LIMIT
+from app.utils.georeference_ai_digitize import AI_DIGITIZE_DAILY_LIMIT
 
 router = APIRouter(prefix="/analytics", tags=["analytics"])
 
@@ -671,14 +673,19 @@ def get_survey_users(request: Request, db: Session = Depends(get_db)):
     ]
 
 
-@router.get("/plan-reader-usage")
-def get_plan_reader_usage(request: Request, db: Session = Depends(get_db)):
-    """Who has used the AI Plan Reader (identified surveyors resolved by email/name, anonymous
-    callers shown by IP - see plan_reader.py's _rate_limit_identity for why identity_key is either
-    'user:<id>' or 'ip:<address>'), with total reads, today's count against the shared daily cap,
-    and when they last used it. Real PII (email) is in here, same as get_survey_users, so this
-    enforces the same real auth check rather than being open like the anonymous-friendly endpoints
-    in this file.
+@router.get("/ai-feature-usage")
+def get_ai_feature_usage(request: Request, db: Session = Depends(get_db)):
+    """Who has used every Survey-side AI feature that shares plan_reader_usage's daily-cap table
+    and consume_daily_reading (Plan Reader, Field-to-Finish, AI Digitize) - identified surveyors
+    resolved by email/name, anonymous callers shown by IP. Each feature writes identity_key with
+    its own prefix (plan_reader.py's is unprefixed 'user:<id>'/'ip:<address>'; the others prefix
+    with their feature name, e.g. 'fieldimport:user:<id>' - see each router's own _rate_limit_
+    identity/_ai_digitize_rate_limit_identity) specifically so their daily-cap counters never
+    collide with each other despite sharing one table. Tree Health and Impact Narrative (LC Green)
+    are deliberately NOT included - they track usage against Green's own env-admin session ids,
+    not Survey user accounts, so they don't join cleanly here and belong in a Green-side admin view
+    instead. Real PII (email) is in here, same as get_survey_users, so this enforces the same real
+    auth check rather than being open like the anonymous-friendly endpoints in this file.
     """
     require_super_admin_request(db, request)
     ensure_plan_reader_usage_schema(db)
@@ -686,33 +693,68 @@ def get_plan_reader_usage(request: Request, db: Session = Depends(get_db)):
     rows = db.execute(text(r"""
         SELECT
             pru.identity_key,
-            u.id AS user_id,
-            u.email,
-            u.full_name,
+            CASE
+                WHEN pru.identity_key ~ '^fieldimport:' THEN 'field_to_finish'
+                WHEN pru.identity_key ~ '^georefdigitize:' THEN 'ai_digitize'
+                ELSE 'plan_reader'
+            END AS feature,
+            COALESCE(
+                substring(pru.identity_key FROM '^user:(\d+)$'),
+                substring(pru.identity_key FROM '^fieldimport:user:(\d+)$'),
+                substring(pru.identity_key FROM '^georefdigitize:user:(\d+)$')
+            )::INTEGER AS user_id,
             SUM(pru.count) AS total_reads,
             MAX(pru.count) FILTER (WHERE pru.usage_date = CURRENT_DATE) AS reads_today,
             MAX(pru.usage_date) AS last_used_date
         FROM plan_reader_usage pru
-        LEFT JOIN survey_users u
-            ON u.id = substring(pru.identity_key FROM '^user:(\d+)$')::INTEGER
-        GROUP BY pru.identity_key, u.id, u.email, u.full_name
+        GROUP BY pru.identity_key
         ORDER BY MAX(pru.usage_date) DESC, total_reads DESC
     """)).mappings().all()
 
+    user_ids = sorted({int(row["user_id"]) for row in rows if row["user_id"] is not None})
+    users_by_id: dict[int, dict] = {}
+    if user_ids:
+        user_rows = db.execute(
+            text("SELECT id, email, full_name FROM survey_users WHERE id = ANY(:ids)"),
+            {"ids": user_ids},
+        ).mappings().all()
+        users_by_id = {int(u["id"]): u for u in user_rows}
+
+    daily_limits = {
+        "plan_reader": DAILY_READING_LIMIT,
+        "field_to_finish": DAILY_IMPORT_LIMIT,
+        "ai_digitize": AI_DIGITIZE_DAILY_LIMIT,
+    }
+    feature_labels = {
+        "plan_reader": "AI Plan Reader",
+        "field_to_finish": "AI Field-to-Finish",
+        "ai_digitize": "AI Digitize",
+    }
+
+    usage_by_feature: dict[str, list[dict]] = {feature: [] for feature in daily_limits}
+    for row in rows:
+        user_id = int(row["user_id"]) if row["user_id"] is not None else None
+        user = users_by_id.get(user_id) if user_id is not None else None
+        usage_by_feature[row["feature"]].append({
+            "identity_key": row["identity_key"],
+            "user_id": user_id,
+            "email": user["email"] if user else None,
+            "full_name": user["full_name"] if user else None,
+            "is_anonymous": user_id is None,
+            "total_reads": int(row["total_reads"] or 0),
+            "reads_today": int(row["reads_today"] or 0),
+            "last_used_date": row["last_used_date"].isoformat() if row["last_used_date"] else None,
+        })
+
     return {
-        "daily_limit": DAILY_READING_LIMIT,
-        "users": [
+        "features": [
             {
-                "identity_key": row["identity_key"],
-                "user_id": int(row["user_id"]) if row["user_id"] is not None else None,
-                "email": row["email"],
-                "full_name": row["full_name"],
-                "is_anonymous": row["user_id"] is None,
-                "total_reads": int(row["total_reads"] or 0),
-                "reads_today": int(row["reads_today"] or 0),
-                "last_used_date": row["last_used_date"].isoformat() if row["last_used_date"] else None,
+                "feature": feature,
+                "label": feature_labels[feature],
+                "daily_limit": daily_limits[feature],
+                "users": usage_by_feature[feature],
             }
-            for row in rows
+            for feature in daily_limits
         ],
     }
 
