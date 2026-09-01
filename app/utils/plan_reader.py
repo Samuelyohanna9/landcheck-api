@@ -114,7 +114,10 @@ _RESPONSE_SCHEMA = {
         "stated_area_m2": {"type": "NUMBER", "nullable": True},
         "coordinate_system_guess": {
             "type": "STRING",
-            "enum": ["wgs84", "minna_31", "minna_32", "minna_33", "utm_31n", "utm_32n", "utm_33n", "unknown"],
+            "enum": [
+                "wgs84", "minna_31", "minna_32", "minna_33", "utm_31n", "utm_32n", "utm_33n",
+                "nigeria_west_belt", "nigeria_mid_belt", "nigeria_east_belt", "unknown",
+            ],
         },
         "coordinate_system_evidence": {
             "type": "STRING", "nullable": True,
@@ -204,12 +207,16 @@ beacon/station coordinate and the plan's identifying details EXACTLY as printed 
 invent a value you cannot actually read. If a specific digit is unclear, give your best reading and \
 lower that beacon's confidence score accordingly rather than omitting it.
 
-Nigerian survey plans commonly show coordinates in one of: WGS84 latitude/longitude (degrees), or a \
+Nigerian survey plans commonly show coordinates in one of: WGS84 latitude/longitude (degrees), a \
 projected Easting/Northing in metres on the Minna Datum or WGS84 UTM, in zone 31N, 32N, or 33N \
-(Nigeria spans all three - zone boundaries are at 6 deg E and 12 deg E). Look for an explicit label \
-(e.g. "MINNA DATUM ZONE 32", "UTM ZONE 31N", "ORIGIN...") before guessing from coordinate magnitude \
-alone, and quote that label in coordinate_system_evidence. If nothing on the plan indicates the \
-system, use "unknown" rather than assuming.
+(Nigeria spans all three - zone boundaries are at 6 deg E and 12 deg E), or the older Nigeria Belt/ \
+NTM system (West/Mid/East Belt) still used on some cadastral plans, especially older ones - its \
+eastings sit on a distinctly different false-easting baseline (~230000 West Belt, ~670000 Mid Belt, \
+~1110000 East Belt) than a standard UTM zone's ~500000 central-zone easting, which is the main way \
+to tell them apart from magnitude alone when no label is printed. Look for an explicit label (e.g. \
+"MINNA DATUM ZONE 32", "UTM ZONE 31N", "WEST BELT", "NTM", "ORIGIN...") before guessing from \
+coordinate magnitude alone, and quote that label in coordinate_system_evidence. If nothing on the \
+plan indicates the system, use "unknown" rather than assuming.
 
 List beacons in the order they appear in the plan's coordinate table (this is usually also their \
 boundary traverse order). Use the station names/numbers exactly as labelled (e.g. "PB1", "SC/AK/L \
@@ -331,11 +338,16 @@ def _shoelace_area_and_perimeter(points: List[Dict[str, float]]) -> Dict[str, Op
     return {"area_m2": abs(area) / 2.0, "perimeter_m": perimeter}
 
 
-_PROJECTED_SYSTEMS = {"minna_31", "minna_32", "minna_33", "utm_31n", "utm_32n", "utm_33n"}
-# Loose bounding box covering every Nigerian UTM/Minna zone with generous margin - not a precise
-# zone check (that needs a real projection), just enough to catch an obvious OCR digit slip (a
-# dropped/extra digit typically throws a coordinate off by 10-100x, far outside this box).
-_NIGERIA_PROJECTED_EASTING_RANGE = (60000.0, 940000.0)
+_PROJECTED_SYSTEMS = {
+    "minna_31", "minna_32", "minna_33", "utm_31n", "utm_32n", "utm_33n",
+    "nigeria_west_belt", "nigeria_mid_belt", "nigeria_east_belt",
+}
+# Loose bounding box covering every Nigerian UTM/Minna zone AND the Belt/NTM system (whose East
+# Belt false easting of ~1110000 pushes real values well past a plain UTM zone's ~940000 ceiling)
+# with generous margin - not a precise zone check (that needs a real projection), just enough to
+# catch an obvious OCR digit slip (a dropped/extra digit typically throws a coordinate off by
+# 10-100x, far outside this box).
+_NIGERIA_PROJECTED_EASTING_RANGE = (60000.0, 1450000.0)
 _NIGERIA_PROJECTED_NORTHING_RANGE = (350000.0, 1600000.0)
 _NIGERIA_LATLON_RANGE = {"lng": (1.0, 16.0), "lat": (2.0, 15.0)}
 

@@ -79,8 +79,20 @@ _RESPONSE_SCHEMA = {
         },
         "coordinate_system_guess": {
             "type": "STRING",
-            "enum": ["wgs84", "minna_31", "minna_32", "minna_33", "utm_31n", "utm_32n", "utm_33n", "unknown"],
-            "description": "Guessed from coordinate magnitude/format (small decimal degrees ~2-15 range => wgs84; large 6-7 digit metre values => a projected system) and any explicit datum/zone label in the file. Use 'unknown' rather than guessing a specific zone with no real evidence.",
+            "enum": [
+                "wgs84", "minna_31", "minna_32", "minna_33", "utm_31n", "utm_32n", "utm_33n",
+                "nigeria_west_belt", "nigeria_mid_belt", "nigeria_east_belt", "unknown",
+            ],
+            "description": (
+                "Guessed from coordinate magnitude/format (small decimal degrees ~2-15 range => wgs84; "
+                "large 6-7 digit metre values => a projected system) and any explicit datum/zone label in "
+                "the file. The projected false-easting offset is a strong tell for WHICH projected system: "
+                "values clustered near a 100000-900000 easting with no unusual offset => a UTM zone or its "
+                "Minna-datum equivalent (31N/32N/33N); an easting baseline distinctly near 230000, 670000, "
+                "or 1110000 (the West/Mid/East Belt false eastings) => the older Nigeria Belt/NTM system, "
+                "still used on some cadastral plans. Use 'unknown' rather than guessing a specific zone with "
+                "no real evidence."
+            ),
         },
         "coordinate_system_evidence": {
             "type": "STRING", "nullable": True,
@@ -119,8 +131,12 @@ Also determine the coordinate system from the x/y magnitudes across the whole fi
 in the 2-15 range for x and 4-15 for y are WGS84 latitude/longitude (degrees); values in the tens or \
 hundreds of thousands to low millions are a projected Easting/Northing in metres, on the Minna Datum \
 or WGS84 UTM, zone 31N, 32N, or 33N (Nigeria spans all three - zone boundaries at 6 deg E and 12 deg \
-E). Prefer an explicit datum/zone label in the file over guessing from magnitude alone, and quote it \
-in coordinate_system_evidence. Use "unknown" if there's genuinely no basis to tell.
+E), OR the older Nigeria Belt/NTM system (West/Mid/East Belt) still seen on some cadastral plans - \
+its eastings sit on a distinctly different false-easting baseline (~230000 West, ~670000 Mid, \
+~1110000 East) than a standard UTM zone's ~500000 central-zone easting, which is the main way to \
+tell them apart from magnitude alone. Prefer an explicit datum/zone/belt label in the file (e.g. \
+"MINNA DATUM ZONE 32", "WEST BELT", "NTM") over guessing from magnitude alone, and quote it in \
+coordinate_system_evidence. Use "unknown" if there's genuinely no basis to tell.
 
 Raw file content:
 {raw_text}
