@@ -398,6 +398,42 @@ def _make_transformers(target_epsg: int):
     )
 
 
+MIN_GCP_BBOX_COVERAGE_RATIO = 0.15
+MAX_GCP_CENTERED_CONDITION_NUMBER = 1e6
+
+
+def _evaluate_gcp_pixel_geometry(gcps: list[GroundControlPointInput], width: int, height: int) -> None:
+    """Reject control-point configurations too collinear or too clustered to trust.
+
+    An affine fit from 3 points is always mathematically exact at those 3 points
+    regardless of how poorly they're placed, so a near-zero RMS alone can't catch a
+    bad configuration. Two independent, scale/translation-invariant checks are used
+    instead: (1) bounding-box coverage - do the points span a meaningful fraction of
+    the raster, and (2) condition number of the *centered* design matrix - are the
+    points meaningfully non-collinear. Thresholds were derived empirically against
+    synthetic well-spread/collinear/clustered point sets across several raster sizes.
+    """
+    xs = np.asarray([float(g.image_x) for g in gcps], dtype=float)
+    ys = np.asarray([float(g.image_y) for g in gcps], dtype=float)
+
+    bbox_diag = float(math.hypot(float(xs.max() - xs.min()), float(ys.max() - ys.min())))
+    raster_diag = float(math.hypot(max(width, 1), max(height, 1)))
+    coverage_ratio = bbox_diag / raster_diag if raster_diag > 0 else 0.0
+
+    centered_matrix = np.column_stack([np.ones_like(xs), xs - xs.mean(), ys - ys.mean()])
+    try:
+        condition_number = float(np.linalg.cond(centered_matrix))
+    except np.linalg.LinAlgError:
+        condition_number = float("inf")
+
+    if coverage_ratio < MIN_GCP_BBOX_COVERAGE_RATIO or condition_number > MAX_GCP_CENTERED_CONDITION_NUMBER:
+        raise HTTPException(
+            status_code=400,
+            detail="Control points are too close together or nearly in a line. Spread them across "
+            "different parts of the plan - including areas near opposite corners - and try again.",
+        )
+
+
 def _solve_planar_model(
     gcps: list[GroundControlPointInput],
     world_pairs: list[tuple[float, float]],
@@ -495,6 +531,8 @@ def _solve_affine(width: int, height: int, coordinate_system_key: str, gcps: lis
         raise HTTPException(status_code=400, detail="At least 3 control points are required.")
     if len(gcps) > MAX_GCP_COUNT:
         raise HTTPException(status_code=400, detail=f"Use at most {MAX_GCP_COUNT} control points per raster.")
+
+    _evaluate_gcp_pixel_geometry(gcps, width, height)
 
     resolved_coordinate_system = _resolve_target_coordinate_system(coordinate_system_key, gcps)
     target_epsg = _coordinate_system_to_epsg(resolved_coordinate_system)
@@ -611,6 +649,7 @@ def _solve_affine(width: int, height: int, coordinate_system_key: str, gcps: lis
         else None,
         "rms_error_m": round(float(rms_error), 3),
         "condition_number": round(float(target_model["condition_number"]), 4),
+        "exact_fit": len(gcps) < 4,
         "quality": quality,
         "points_used": len(gcps),
         "residuals": residuals,
