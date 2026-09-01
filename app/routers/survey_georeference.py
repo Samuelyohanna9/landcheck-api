@@ -338,10 +338,14 @@ def _touch_session(db: Session, session_id: str):
     db.commit()
 
 
-def _ensure_overlay_preview_for_row(db: Session, row: dict[str, Any]) -> dict[str, Any]:
-    overlay_payload = _safe_json_load(row.get("overlay_json"), {}) or {}
-    if str((overlay_payload or {}).get("preview_object_key") or "").strip():
-        return row
+def _rebuild_overlay_preview(db: Session, row: dict[str, Any]) -> dict[str, Any]:
+    """Regenerates and persists the warped overlay preview unconditionally - used both when no
+    preview has ever been built (_ensure_overlay_preview_for_row's job) and when a previously
+    recorded preview object can no longer be fetched from storage (stream_georeference_overlay_
+    raster's self-heal path). Splitting this out means overlay_json's corners always describe
+    whatever raster bytes actually end up getting streamed back, never a stale/mismatched
+    footprint left over from a preview object that has since gone missing.
+    """
     ground_control_points = [
         GroundControlPointInput.model_validate(item)
         for item in list(_safe_json_load(row.get("gcps_json"), []))
@@ -374,8 +378,15 @@ def _ensure_overlay_preview_for_row(db: Session, row: dict[str, Any]) -> dict[st
         db.commit()
         return _load_session_row(db, str(row.get("id") or ""))
     except Exception as exc:
-        logger.warning("Unable to auto-heal overlay preview for session %s: %s", row.get("id"), exc)
+        logger.warning("Unable to rebuild overlay preview for session %s: %s", row.get("id"), exc)
         return row
+
+
+def _ensure_overlay_preview_for_row(db: Session, row: dict[str, Any]) -> dict[str, Any]:
+    overlay_payload = _safe_json_load(row.get("overlay_json"), {}) or {}
+    if str((overlay_payload or {}).get("preview_object_key") or "").strip():
+        return row
+    return _rebuild_overlay_preview(db, row)
 
 
 def _make_transformers(target_epsg: int):
@@ -1377,29 +1388,47 @@ def stream_georeference_raster(session_id: str, db: Session = Depends(get_db)):
 def stream_georeference_overlay_raster(session_id: str, db: Session = Depends(get_db)):
     row = _load_session_row(db, session_id)
     settings = _build_r2()
+
+    def _stream_object(object_key: str, media_type: str) -> StreamingResponse:
+        client = create_r2_client(settings)
+        obj = client.get_object(Bucket=settings["bucket"], Key=object_key)
+        _touch_session(db, session_id)
+        return StreamingResponse(obj["Body"].iter_chunks(chunk_size=1024 * 512), media_type=media_type)
+
     overlay_payload = _safe_json_load(row.get("overlay_json"), {}) or {}
     preview_object_key = str(overlay_payload.get("preview_object_key") or "").strip()
     preview_content_type = str(overlay_payload.get("preview_content_type") or "image/png").strip() or "image/png"
-    candidates: list[tuple[str, str]] = []
+
     if preview_object_key:
-        candidates.append((preview_object_key, preview_content_type))
+        try:
+            return _stream_object(preview_object_key, preview_content_type)
+        except Exception as exc:
+            # The recorded preview object is missing/unreachable in storage even though
+            # overlay_json's corners describe a footprint sized and rotated specifically for THAT
+            # warped preview - silently falling back to the raw, unwarped source raster here would
+            # still get drawn into that same corner box, stretching/squashing a rotated plan into
+            # something that can look like a narrow strip. Rebuild the preview (and its matching
+            # corners together) instead of streaming raster bytes that no longer match them.
+            logger.warning("Overlay preview object missing for session %s, rebuilding: %s", session_id, exc)
+            healed_row = _rebuild_overlay_preview(db, row)
+            healed_overlay = _safe_json_load(healed_row.get("overlay_json"), {}) or {}
+            healed_key = str(healed_overlay.get("preview_object_key") or "").strip()
+            if healed_key and healed_key != preview_object_key:
+                try:
+                    return _stream_object(
+                        healed_key,
+                        str(healed_overlay.get("preview_content_type") or "image/png").strip() or "image/png",
+                    )
+                except Exception as retry_exc:
+                    logger.warning("Rebuilt overlay preview still unreachable for session %s: %s", session_id, retry_exc)
+
     source_object_key = str(row.get("source_object_key") or "").strip()
     if source_object_key:
-        candidates.append((source_object_key, str(row.get("source_content_type") or "application/octet-stream")))
-    if not candidates:
-        raise HTTPException(status_code=404, detail="Raster overlay preview is no longer available.")
-
-    last_error: Exception | None = None
-    for object_key, media_type in candidates:
         try:
-            client = create_r2_client(settings)
-            obj = client.get_object(Bucket=settings["bucket"], Key=object_key)
-            body = obj["Body"]
-            _touch_session(db, session_id)
-            return StreamingResponse(body.iter_chunks(chunk_size=1024 * 512), media_type=media_type)
+            return _stream_object(source_object_key, str(row.get("source_content_type") or "application/octet-stream"))
         except Exception as exc:
-            last_error = exc
-    raise HTTPException(status_code=404, detail=f"Unable to stream overlay raster from storage: {last_error}")
+            raise HTTPException(status_code=404, detail=f"Unable to stream overlay raster from storage: {exc}") from exc
+    raise HTTPException(status_code=404, detail="Raster overlay preview is no longer available.")
 
 
 @router.post("/sessions/{session_id}/solve")
