@@ -1046,10 +1046,15 @@ def add_scalebar(ax, length_m, segments=4, font_scale=1.0):
     seg = bar_w / segments
 
     for i in range(segments):
-        face = "black" if i % 2 == 0 else "white"
+        top_face = "black" if i % 2 == 0 else "white"
+        bottom_face = "white" if i % 2 == 0 else "black"
         ax.add_patch(patches.Rectangle(
-            (x0 + i * seg, y0), seg, bar_h,
-            transform=trans, facecolor=face, edgecolor="black", lw=0.8*font_scale, clip_on=False, zorder=15
+            (x0 + i * seg, y0 + bar_h / 2.0), seg, bar_h / 2.0,
+            transform=trans, facecolor=top_face, edgecolor="black", lw=0.5*font_scale, clip_on=False, zorder=15
+        ))
+        ax.add_patch(patches.Rectangle(
+            (x0 + i * seg, y0), seg, bar_h / 2.0,
+            transform=trans, facecolor=bottom_face, edgecolor="black", lw=0.5*font_scale, clip_on=False, zorder=15
         ))
 
     ax.add_patch(patches.Rectangle(

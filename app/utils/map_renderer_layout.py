@@ -1225,16 +1225,29 @@ def add_scalebar(ax, length_m: float, segments: int = 4, font_scale=1.0):
 
     for i in range(segments):
         xi = x0 + i * seg_w
-        face = "black" if i % 2 == 0 else "white"
+        top_face = "black" if i % 2 == 0 else "white"
+        bottom_face = "white" if i % 2 == 0 else "black"
+        ax.add_patch(
+            patches.Rectangle(
+                (xi, y0 + bar_h / 2.0),
+                seg_w,
+                bar_h / 2.0,
+                transform=ax.transAxes,
+                facecolor=top_face,
+                edgecolor="black",
+                linewidth=0.5*font_scale,
+                clip_on=False,
+            )
+        )
         ax.add_patch(
             patches.Rectangle(
                 (xi, y0),
                 seg_w,
-                bar_h,
+                bar_h / 2.0,
                 transform=ax.transAxes,
-                facecolor=face,
+                facecolor=bottom_face,
                 edgecolor="black",
-                linewidth=0.8*font_scale,
+                linewidth=0.5*font_scale,
                 clip_on=False,
             )
         )
@@ -3780,15 +3793,20 @@ def _draw_cadastral_scale_bar(fig, cx: float, top_y: float, scale_text: str, fon
     y0 = top_y - bar_h
     lw = 0.8 * font_scale
 
-    def seg(x0, face):
+    def seg(x0, top_face, bottom_face):
         fig.add_artist(patches.Rectangle(
-            (x0, y0), segment_w, bar_h, transform=fig.transFigure,
-            facecolor=face, edgecolor="black", lw=lw,
+            (x0, y0 + bar_h / 2.0), segment_w, bar_h / 2.0, transform=fig.transFigure,
+            facecolor=top_face, edgecolor="black", lw=0.5 * lw,
+        ))
+        fig.add_artist(patches.Rectangle(
+            (x0, y0), segment_w, bar_h / 2.0, transform=fig.transFigure,
+            facecolor=bottom_face, edgecolor="black", lw=0.5 * lw,
         ))
 
     x0 = cx - bar_w / 2.0
     for index in range(4):
-        seg(x0 + index * segment_w, "black" if index % 2 == 0 else "white")
+        top_face = "black" if index % 2 == 0 else "white"
+        seg(x0 + index * segment_w, top_face, "white" if top_face == "black" else "black")
     fig.add_artist(patches.Rectangle(
         (x0, y0), bar_w, bar_h, transform=fig.transFigure,
         fill=False, edgecolor="black", lw=1.1 * font_scale,
