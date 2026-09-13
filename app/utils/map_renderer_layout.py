@@ -1252,35 +1252,27 @@ def add_scalebar(ax, length_m: float, segments: int = 4, font_scale=1.0):
         )
     )
 
-    ax.text(
-        x0,
-        y0 - 0.03,
-        "0",
-        transform=ax.transAxes,
-        ha="center",
-        va="top",
-        fontsize=int(7*font_scale),
-        clip_on=False,
-    )
-    for i in range(1, segments + 1):
+    label_y = y0 + bar_h + 0.010
+    for i in range(segments + 1):
         value = int(round((length_m / segments) * i))
         ax.text(
             x0 + i * seg_w,
-            y0 - 0.03,
+            label_y,
             f"{value}",
             transform=ax.transAxes,
             ha="center",
-            va="top",
+            va="bottom",
             fontsize=int(7*font_scale),
             clip_on=False,
         )
 
     ax.text(
         x0 + total_w / 2.0,
-        y0 + 0.025,
-        "meters",
+        y0 - 0.022,
+        "Meters",
         transform=ax.transAxes,
         ha="center",
+        va="top",
         fontsize=int(7*font_scale),
         clip_on=False,
     )
@@ -3778,49 +3770,45 @@ def _resolve_cadastral_coordinate_system_text(coordinate_system: str, display_ep
 
 
 def _draw_cadastral_scale_bar(fig, cx: float, top_y: float, scale_text: str, font_scale: float = 1.0) -> float:
-    """A center-zero bar scale with a subdivided left extension (e.g. "5  2.5  0     5      10m"),
-    matching the convention used on real Nigerian cadastral plans. Returns the y-coordinate just
-    below the bar's number labels so callers can keep stacking header content beneath it.
-    """
+    """Draw the shared alternating drafting scale-bar style in a cadastral header."""
     ratio = parse_scale_ratio(scale_text)
-    candidates = [1, 2, 2.5, 5, 10, 20, 25, 50, 100, 200, 250, 500, 1000, 2000, 2500, 5000]
-    target_m = max(1.0, ratio * 0.018)
-    unit = min(candidates, key=lambda c: abs(c - target_m))
-    half_unit = unit / 2.0
-    half_w = 0.085
+    metres_per_fig_fraction = ratio * fig.get_figwidth() * 25.4 / 1000.0
+    bar_length_m = _nice_scalebar_length_m(max(1.0, metres_per_fig_fraction * 0.15))
+    bar_w = max(0.06, min(0.19, bar_length_m / max(metres_per_fig_fraction, 1e-9)))
+    segment_w = bar_w / 4.0
     bar_h = 0.007
     y0 = top_y - bar_h
     lw = 0.8 * font_scale
 
-    def seg(x0, w, face):
+    def seg(x0, face):
         fig.add_artist(patches.Rectangle(
-            (x0, y0), w, bar_h, transform=fig.transFigure,
+            (x0, y0), segment_w, bar_h, transform=fig.transFigure,
             facecolor=face, edgecolor="black", lw=lw,
         ))
 
-    seg(cx - half_w, half_w / 2.0, "white")
-    seg(cx - half_w / 2.0, half_w / 2.0, "black")
-    seg(cx, half_w, "black")
-    seg(cx + half_w, half_w, "white")
+    x0 = cx - bar_w / 2.0
+    for index in range(4):
+        seg(x0 + index * segment_w, "black" if index % 2 == 0 else "white")
+    fig.add_artist(patches.Rectangle(
+        (x0, y0), bar_w, bar_h, transform=fig.transFigure,
+        fill=False, edgecolor="black", lw=1.1 * font_scale,
+    ))
 
-    tick_h = 0.0045
-    for tx in (cx - half_w, cx - half_w / 2.0, cx, cx + half_w, cx + 2 * half_w):
-        fig.add_artist(mlines.Line2D(
-            [tx, tx], [y0, y0 + bar_h + tick_h], transform=fig.transFigure,
-            color="black", lw=lw,
-        ))
-
-    label_y = y0 - 0.009
+    label_y = y0 + bar_h + 0.005
     fs = max(5, int(6 * font_scale))
-    for x, label in (
-        (cx - half_w, f"{unit:g}"),
-        (cx - half_w / 2.0, f"{half_unit:g}"),
-        (cx, "0"),
-        (cx + half_w, f"{unit:g}"),
-        (cx + 2 * half_w, f"{2 * unit:g}m"),
-    ):
-        fig.text(x, label_y, label, ha="center", va="top", fontsize=fs, fontfamily=CADASTRAL_FONT_FAMILY)
-    return label_y - 0.008
+    for index in range(5):
+        fig.text(
+            x0 + index * segment_w,
+            label_y,
+            f"{int(round(bar_length_m * index / 4.0))}",
+            ha="center",
+            va="bottom",
+            fontsize=fs,
+            fontfamily=CADASTRAL_FONT_FAMILY,
+        )
+    meters_y = y0 - 0.006
+    fig.text(cx, meters_y, "Meters", ha="center", va="top", fontsize=fs, fontfamily=CADASTRAL_FONT_FAMILY)
+    return meters_y - 0.010
 
 
 def _draw_cadastral_header(

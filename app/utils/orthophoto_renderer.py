@@ -1057,11 +1057,11 @@ def add_scalebar(ax, length_m, segments=4, font_scale=1.0):
         transform=trans, fill=False, edgecolor="black", lw=1.2*font_scale, clip_on=False, zorder=16
     ))
 
-    ax.text(x0, y0 - 0.04, "0", transform=trans, ha="center", fontsize=int(8*font_scale))
-    for i in range(1, segments + 1):
-        ax.text(x0 + i * seg, y0 - 0.04, f"{int(length_m * i / segments)}",
-                transform=trans, ha="center", fontsize=int(8*font_scale))
-    ax.text(x0 + bar_w / 2.0, y0 + bar_h + 0.02, "meters", transform=trans, ha="center", fontsize=int(8*font_scale))
+    label_y = y0 + bar_h + 0.012
+    for i in range(segments + 1):
+        ax.text(x0 + i * seg, label_y, f"{int(round(length_m * i / segments))}",
+                transform=trans, ha="center", va="bottom", fontsize=int(8*font_scale))
+    ax.text(x0 + bar_w / 2.0, y0 - 0.024, "Meters", transform=trans, ha="center", va="top", fontsize=int(8*font_scale))
 
 
 def draw_grid(ax, minor, major, font_scale=1.0):
