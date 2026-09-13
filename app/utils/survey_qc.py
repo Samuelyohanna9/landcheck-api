@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 from typing import Any, Dict, List, Optional
+from pyproj import Transformer
 
 # Deterministic, no-AI quality-control pass over a plot's own boundary coordinates - the surveyor's
 # "✨ AI CHECK" button. Same discipline as plan_reader.py's check_survey_plan: closure/area/
@@ -44,6 +45,30 @@ def _shoelace_area_and_perimeter(points: List[Dict[str, float]]) -> Dict[str, fl
         area += x1 * y2 - x2 * y1
         perimeter += math.hypot(x2 - x1, y2 - y1)
     return {"area_m2": abs(area) / 2.0, "perimeter_m": perimeter}
+
+
+def _metric_points_for_quality_checks(points: List[Dict[str, Any]], coordinate_system: str) -> List[Dict[str, Any]]:
+    """Return metre-based points for distance, area, and closure checks.
+
+    WGS84 input is longitude/latitude in degrees. Applying a 0.05 metre duplicate tolerance or
+    shoelace area directly to degrees turns that tolerance into several kilometres and reports an
+    area near zero. Project it once to the local UTM zone; already-projected survey coordinates
+    remain untouched.
+    """
+    if str(coordinate_system or "").strip().lower() != "wgs84":
+        return [dict(point) for point in points]
+
+    longitude = sum(float(point["x"]) for point in points) / len(points)
+    latitude = sum(float(point["y"]) for point in points) / len(points)
+    zone = max(1, min(60, int((longitude + 180.0) / 6.0) + 1))
+    epsg = (32600 + zone) if latitude >= 0 else (32700 + zone)
+    transformer = Transformer.from_crs("EPSG:4326", f"EPSG:{epsg}", always_xy=True)
+
+    metric_points: List[Dict[str, Any]] = []
+    for point in points:
+        easting, northing = transformer.transform(float(point["x"]), float(point["y"]))
+        metric_points.append({**point, "x": float(easting), "y": float(northing)})
+    return metric_points
 
 
 def check_plot_survey_quality(
@@ -105,6 +130,8 @@ def check_plot_survey_quality(
             "closure_error_m": None, "closure_ratio": None, "review_count": review_count, "overall_status": "review",
         }
 
+    metric_points = _metric_points_for_quality_checks(points, system)
+
     # Union-find clustering, not a pairwise report - with several points at the same spot (e.g. a
     # batch of freshly-added, still-unedited stations), a plain pairwise loop would emit one warning
     # per PAIR (N points at the same spot => N*(N-1)/2 near-identical messages, 15 for just 6 points).
@@ -124,7 +151,10 @@ def check_plot_survey_quality(
 
     for i in range(station_count):
         for j in range(i + 1, station_count):
-            dist = math.hypot(points[i]["x"] - points[j]["x"], points[i]["y"] - points[j]["y"])
+            dist = math.hypot(
+                metric_points[i]["x"] - metric_points[j]["x"],
+                metric_points[i]["y"] - metric_points[j]["y"],
+            )
             if dist <= DUPLICATE_COORDINATE_TOLERANCE_M:
                 _union(i, j)
 
@@ -171,14 +201,14 @@ def check_plot_survey_quality(
     if range_ok:
         items.append({"severity": "ok", "code": "format_consistent", "message": f"Coordinate format consistent for {system}."})
 
-    geometry = _shoelace_area_and_perimeter(points)
+    geometry = _shoelace_area_and_perimeter(metric_points)
     area_m2 = geometry["area_m2"]
     perimeter_m = geometry["perimeter_m"]
 
     closure_dx = 0.0
     closure_dy = 0.0
     for i in range(station_count):
-        p1, p2 = points[i], points[(i + 1) % station_count]
+        p1, p2 = metric_points[i], metric_points[(i + 1) % station_count]
         closure_dx += p2["x"] - p1["x"]
         closure_dy += p2["y"] - p1["y"]
     closure_error_m = math.hypot(closure_dx, closure_dy)
@@ -198,7 +228,7 @@ def check_plot_survey_quality(
 
     edge_distances: List[tuple[str, str, float]] = []
     for i in range(station_count):
-        p1, p2 = points[i], points[(i + 1) % station_count]
+        p1, p2 = metric_points[i], metric_points[(i + 1) % station_count]
         edge_distances.append((str(p1["station"]), str(p2["station"]), math.hypot(p2["x"] - p1["x"], p2["y"] - p1["y"])))
     if len(edge_distances) >= 4:
         sorted_d = sorted(d for _, _, d in edge_distances)
