@@ -1213,10 +1213,10 @@ def add_scalebar(ax, length_m: float, segments: int = 4, font_scale=1.0):
     xlim = ax.get_xlim()
     axes_ground_width_m = abs(xlim[1] - xlim[0]) or 1.0
     frac = length_m / axes_ground_width_m
-    if not (0.15 <= frac <= 0.65):
-        length_m = _nice_scalebar_length_m(axes_ground_width_m * 0.40)
+    if not (0.12 <= frac <= 0.38):
+        length_m = _nice_scalebar_length_m(axes_ground_width_m * 0.28)
         frac = length_m / axes_ground_width_m
-    total_w = max(0.05, min(0.65, frac))
+    total_w = max(0.05, min(0.38, frac))
     # Centered under the map rather than anchored to a fixed left offset - the bar's width now
     # varies with the map's real scale/extent (see above), so a fixed x0 would only look centered
     # by coincidence at whichever width it was originally tuned for.
@@ -1252,7 +1252,7 @@ def add_scalebar(ax, length_m: float, segments: int = 4, font_scale=1.0):
         )
     )
 
-    label_y = y0 + bar_h + 0.010
+    label_y = y0 + bar_h + 0.004
     for i in range(segments + 1):
         value = int(round((length_m / segments) * i))
         ax.text(
@@ -1268,7 +1268,7 @@ def add_scalebar(ax, length_m: float, segments: int = 4, font_scale=1.0):
 
     ax.text(
         x0 + total_w / 2.0,
-        y0 - 0.022,
+        y0 - 0.014,
         "Meters",
         transform=ax.transAxes,
         ha="center",

@@ -1035,10 +1035,10 @@ def add_scalebar(ax, length_m, segments=4, font_scale=1.0):
     xlim = ax.get_xlim()
     axes_ground_width_m = abs(xlim[1] - xlim[0]) or 1.0
     frac = length_m / axes_ground_width_m
-    if not (0.15 <= frac <= 0.55):
-        length_m = _nice_scalebar_length_m(axes_ground_width_m * 0.35)
+    if not (0.12 <= frac <= 0.38):
+        length_m = _nice_scalebar_length_m(axes_ground_width_m * 0.28)
         frac = length_m / axes_ground_width_m
-    bar_w = max(0.05, min(0.55, frac))
+    bar_w = max(0.05, min(0.38, frac))
     # Centered under the map rather than anchored to a fixed left offset - the bar's width now
     # varies with the map's real scale/extent (see above), so a fixed x0 would only look centered
     # by coincidence at whichever width it was originally tuned for.
@@ -1057,11 +1057,11 @@ def add_scalebar(ax, length_m, segments=4, font_scale=1.0):
         transform=trans, fill=False, edgecolor="black", lw=1.2*font_scale, clip_on=False, zorder=16
     ))
 
-    label_y = y0 + bar_h + 0.012
+    label_y = y0 + bar_h + 0.005
     for i in range(segments + 1):
         ax.text(x0 + i * seg, label_y, f"{int(round(length_m * i / segments))}",
                 transform=trans, ha="center", va="bottom", fontsize=int(8*font_scale))
-    ax.text(x0 + bar_w / 2.0, y0 - 0.024, "Meters", transform=trans, ha="center", va="top", fontsize=int(8*font_scale))
+    ax.text(x0 + bar_w / 2.0, y0 - 0.016, "Meters", transform=trans, ha="center", va="top", fontsize=int(8*font_scale))
 
 
 def draw_grid(ax, minor, major, font_scale=1.0):
