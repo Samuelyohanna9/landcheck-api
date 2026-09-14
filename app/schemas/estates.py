@@ -44,6 +44,10 @@ class EstateSubdivisionCreate(BaseModel):
     split_count: int = Field(default=2, ge=2, le=100)
 
 
+class PlotGeometryUpdate(BaseModel):
+    geometry: dict[str, Any]
+
+
 class EstateLayoutCriteria(BaseModel):
     """Editable planning assumptions used to generate a concept layout.
 
@@ -68,6 +72,13 @@ class EstateLayoutCriteria(BaseModel):
 class EstateLayoutDecision(BaseModel):
     status: str = Field(pattern="^(approved|rejected)$")
     notes: str | None = Field(default=None, max_length=4000)
+
+
+class EstateLayoutProposalEdit(BaseModel):
+    """Lets a reviewer nudge vertices, delete a candidate plot, or edit a road/open-space shape
+    on a draft layout before approving it - the same shape the generator itself produces."""
+    plot_candidates: list[dict[str, Any]] | None = None
+    feature_candidates: list[dict[str, Any]] | None = None
 
 class DevelopmentStatusUpdate(BaseModel):
     status: str = Field(pattern="^(not_started|site_cleared|foundation|under_construction|developed)$")

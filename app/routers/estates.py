@@ -22,7 +22,7 @@ from app.routers.plots import _metric_epsg_for_wgs84_polygon, _subdivide_polygon
 from app.services.estates.authorization import list_estate_access, resolve_estate_principal
 from app.services.estates.entitlements import ESTATE_FEATURES, get_estate_entitlement
 from app.models.estate_foundation import Estate, EstateAllocation, EstateAuditEvent, EstateBlock, EstateCustomer, EstateDocument, EstateDocumentLink, EstateFieldInspection, EstateHazardAssessment, EstateImportReview, EstateLayoutProposal, EstateOrganization, EstateOrganizationMember, EstatePayment, EstatePaymentRule, EstatePlot, EstateSpatialFeature, EstateSurveyRequest, EstateStakingTask
-from app.schemas.estates import AllocationAction, BlockCreate, BlockUpdate, CustomerCreate, DevelopmentStatusUpdate, EstateCreate, EstateLayoutCriteria, EstateLayoutDecision, EstateSubdivisionCreate, EstateUpdate, FieldInspectionCreate, GeoreferenceSessionLink, ImportFromGeoreference, ImportReviewCreate, ImportReviewDecision, ImportReviewFromGeoreferenceSession, MemberCreate, MemberUpdate, PlotCreate, PaymentCreate, SpatialFeatureCreate, SpatialFeatureUpdate, SurveyEligibilityUpdate, VoidAction
+from app.schemas.estates import AllocationAction, BlockCreate, BlockUpdate, CustomerCreate, DevelopmentStatusUpdate, EstateCreate, EstateLayoutCriteria, EstateLayoutDecision, EstateLayoutProposalEdit, EstateSubdivisionCreate, EstateUpdate, FieldInspectionCreate, GeoreferenceSessionLink, ImportFromGeoreference, ImportReviewCreate, ImportReviewDecision, ImportReviewFromGeoreferenceSession, MemberCreate, MemberUpdate, PlotCreate, PlotGeometryUpdate, PaymentCreate, SpatialFeatureCreate, SpatialFeatureUpdate, SurveyEligibilityUpdate, VoidAction
 from app.services.estates.payments import confirm_payment, financial_summary, record_payment, void_payment
 from app.services.estates.documents import read_private_estate_file, store_private_estate_file
 from app.services.estates.permissions import has_permission
@@ -801,6 +801,52 @@ def list_layout_proposals(estate_id: int, request: Request, db: Session = Depend
     return [_layout_proposal_payload(row) for row in db.query(EstateLayoutProposal).filter(EstateLayoutProposal.estate_id == estate_id).order_by(EstateLayoutProposal.created_at.desc()).all()]
 
 
+@router.patch("/layout-proposals/{proposal_id}")
+def edit_layout_proposal(proposal_id: int, payload: EstateLayoutProposalEdit, request: Request, db: Session = Depends(get_db)):
+    """Lets a reviewer nudge vertices, delete a candidate plot, or edit a road/open-space shape on
+    a draft layout - before it is approved into real plots and spatial features."""
+    row = db.get(EstateLayoutProposal, proposal_id)
+    if not row:
+        raise HTTPException(404, "Layout proposal not found")
+    access = _require_layout_approval_access(db, request, row.organization_id)
+    if row.status != "review_required":
+        raise HTTPException(409, "This layout has already been decided and can no longer be edited")
+    if payload.plot_candidates is not None:
+        cleaned_plots: list[dict] = []
+        for index, candidate in enumerate(payload.plot_candidates, 1):
+            geometry = candidate.get("geometry") or {}
+            area, issues = validate_polygon(geometry)
+            if any(issue.severity == "error" for issue in issues):
+                raise HTTPException(422, f"Plot {candidate.get('plot_number') or index}: {issues[0].message if issues else 'invalid geometry'}")
+            cleaned_plots.append({
+                "plot_number": str(candidate.get("plot_number") or f"P-{index:03d}").strip(),
+                "block_label": candidate.get("block_label"),
+                "geometry": geometry,
+                "area_sqm": round(float(area), 2),
+                "valid": True,
+                "issues": [],
+            })
+        row.plot_candidates = cleaned_plots
+        diagnostics = dict(row.diagnostics or {})
+        diagnostics["estimated_plot_count"] = len(cleaned_plots)
+        diagnostics["total_plot_area_sqm"] = round(sum(float(c["area_sqm"]) for c in cleaned_plots), 2)
+        row.diagnostics = diagnostics
+    if payload.feature_candidates is not None:
+        cleaned_features: list[dict] = []
+        for candidate in payload.feature_candidates:
+            geometry = candidate.get("geometry") or {}
+            _geojson_geometry(geometry)
+            cleaned_features.append({
+                "feature_type": str(candidate.get("feature_type") or "infrastructure"),
+                "name": str(candidate.get("name") or "Generated layout feature"),
+                "geometry": geometry,
+            })
+        row.feature_candidates = cleaned_features
+    append_estate_audit_event(db, organization_id=row.organization_id, actor=access.principal, action="layout_proposal.edited", entity_type="estate_layout_proposal", entity_id=row.id, after_data={"plot_count": len(row.plot_candidates or []), "feature_count": len(row.feature_candidates or [])})
+    db.commit()
+    return _layout_proposal_payload(row)
+
+
 @router.post("/layout-proposals/{proposal_id}/decision")
 def decide_layout_proposal(
     proposal_id: int,
@@ -1091,6 +1137,26 @@ def create_plot(estate_id: int, payload: PlotCreate, request: Request, db: Sessi
     plot = EstatePlot(estate_id=estate_id, block_id=payload.block_id, plot_number=payload.plot_number.strip(), plot_number_normalized=normalized, geometry=from_shape(shape(payload.geometry), srid=4326), area_sqm=area, land_use=payload.land_use, geometry_status=payload.geometry_status, created_by_subject_type=access.principal.subject_type, created_by_subject_id=access.principal.subject_id)
     db.add(plot); db.flush(); append_estate_audit_event(db, organization_id=estate.organization_id, actor=access.principal, action="plot.created", entity_type="estate_plot", entity_id=plot.id, after_data={"plot_number": plot.plot_number, "area_sqm": area, "geometry_status": plot.geometry_status})
     db.commit(); return {"id": plot.id, "uid": plot.plot_uid, "area_sqm": area, "qc": [{"severity": issue.severity, "code": issue.code, "message": issue.message} for issue in issues]}
+
+
+@router.patch("/{estate_id}/plots/{plot_id}/geometry")
+def update_plot_geometry(estate_id: int, plot_id: int, payload: PlotGeometryUpdate, request: Request, db: Session = Depends(get_db)):
+    estate = db.get(Estate, estate_id)
+    if not estate: raise HTTPException(404, "Estate not found")
+    plot = db.get(EstatePlot, plot_id)
+    if not plot or plot.estate_id != estate_id: raise HTTPException(404, "Plot not found")
+    access = require_estate_access(db, request, estate.organization_id, permission="plot.manage")
+    if plot.commercial_status != "available":
+        raise HTTPException(409, "Only available plots can have their boundary edited - reserved, allocated or developed plots are locked.")
+    area, issues = validate_polygon(payload.geometry)
+    if any(issue.severity == "error" for issue in issues):
+        raise HTTPException(422, detail=[issue.message for issue in issues])
+    before_area = float(plot.area_sqm)
+    plot.geometry = from_shape(shape(payload.geometry), srid=4326)
+    plot.area_sqm = area
+    append_estate_audit_event(db, organization_id=estate.organization_id, actor=access.principal, action="plot.geometry_updated", entity_type="estate_plot", entity_id=plot.id, before_data={"area_sqm": before_area}, after_data={"area_sqm": area})
+    db.commit()
+    return {"id": plot.id, "area_sqm": area, "qc": [{"severity": issue.severity, "code": issue.code, "message": issue.message} for issue in issues]}
 
 
 @router.delete("/{estate_id}/plots/{plot_id}")
