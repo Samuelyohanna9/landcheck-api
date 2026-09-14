@@ -7,6 +7,7 @@ import re
 import tempfile
 import os
 import math
+from datetime import datetime, timezone
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import Response
 from geoalchemy2.shape import from_shape, to_shape
@@ -19,8 +20,8 @@ from sqlalchemy.orm import Session
 from app.routers.plots import _metric_epsg_for_wgs84_polygon, _subdivide_polygon_equal_count, get_db
 from app.services.estates.authorization import list_estate_access, resolve_estate_principal
 from app.services.estates.entitlements import ESTATE_FEATURES, get_estate_entitlement
-from app.models.estate_foundation import Estate, EstateAllocation, EstateAuditEvent, EstateBlock, EstateCustomer, EstateDocument, EstateDocumentLink, EstateFieldInspection, EstateHazardAssessment, EstateImportReview, EstateOrganization, EstateOrganizationMember, EstatePayment, EstatePaymentRule, EstatePlot, EstateSpatialFeature, EstateSurveyRequest, EstateStakingTask
-from app.schemas.estates import AllocationAction, BlockCreate, BlockUpdate, CustomerCreate, DevelopmentStatusUpdate, EstateCreate, EstateSubdivisionCreate, EstateUpdate, FieldInspectionCreate, ImportReviewCreate, ImportReviewDecision, MemberCreate, MemberUpdate, PlotCreate, PaymentCreate, SpatialFeatureCreate, SpatialFeatureUpdate, SurveyEligibilityUpdate, VoidAction
+from app.models.estate_foundation import Estate, EstateAllocation, EstateAuditEvent, EstateBlock, EstateCustomer, EstateDocument, EstateDocumentLink, EstateFieldInspection, EstateHazardAssessment, EstateImportReview, EstateLayoutProposal, EstateOrganization, EstateOrganizationMember, EstatePayment, EstatePaymentRule, EstatePlot, EstateSpatialFeature, EstateSurveyRequest, EstateStakingTask
+from app.schemas.estates import AllocationAction, BlockCreate, BlockUpdate, CustomerCreate, DevelopmentStatusUpdate, EstateCreate, EstateLayoutCriteria, EstateLayoutDecision, EstateSubdivisionCreate, EstateUpdate, FieldInspectionCreate, ImportReviewCreate, ImportReviewDecision, MemberCreate, MemberUpdate, PlotCreate, PaymentCreate, SpatialFeatureCreate, SpatialFeatureUpdate, SurveyEligibilityUpdate, VoidAction
 from app.services.estates.payments import confirm_payment, financial_summary, record_payment, void_payment
 from app.services.estates.documents import read_private_estate_file, store_private_estate_file
 from app.services.estates.permissions import has_permission
@@ -33,6 +34,7 @@ from app.services.estates.survey_adapter import materialize_estate_plot_for_surv
 from app.schemas.estate_survey import SurveyorAssignment
 from app.services.estates.survey_eligibility import survey_eligibility
 from app.services.estates.qc import validate_polygon
+from app.services.estates.layout_generation import generate_estate_layout
 from app.services.survey.dgps import alpha_station, render_dgps_staking_csv
 from app.utils.coordinate_converter import COORDINATE_SYSTEMS, resolve_coordinate_system_key
 
@@ -97,6 +99,32 @@ def _import_candidate(*, row_number: int, plot_number: str, geometry: dict) -> d
         "valid": not errors,
         "issues": errors,
     }
+
+
+def _layout_proposal_payload(row: EstateLayoutProposal) -> dict:
+    return {
+        "id": row.id,
+        "uid": row.proposal_uid,
+        "estate_id": row.estate_id,
+        "status": row.status,
+        "criteria": row.criteria or {},
+        "diagnostics": row.diagnostics or {},
+        "candidates": row.plot_candidates or [],
+        "features": row.feature_candidates or [],
+        "created_at": row.created_at,
+        "reviewed_at": row.reviewed_at,
+    }
+
+
+def _require_layout_approval_access(db: Session, request: Request, organization_id: int):
+    """Allow the existing plot managers or survey managers to approve a concept layout."""
+    principal = resolve_estate_principal(db, request)
+    access = next((item for item in list_estate_access(db, principal) if item.organization_id == int(organization_id)), None)
+    if access is None:
+        raise HTTPException(status_code=404, detail="Estate organization was not found")
+    if not (has_permission(access.role_key, "plot.manage") or has_permission(access.role_key, "survey.manage")):
+        raise HTTPException(status_code=403, detail="You do not have permission to approve this Estate layout")
+    return access
 
 
 @router.get("")
@@ -547,6 +575,165 @@ def decide_import_review(review_id:int,payload:ImportReviewDecision,request:Requ
     row.status=payload.status
     append_estate_audit_event(db,organization_id=row.organization_id,actor=access.principal,action=f"import_review.{row.status}",entity_type="estate_import_review",entity_id=row.id,after_data={"status":row.status}); db.commit()
     return {"id":row.id,"status":row.status,"created_plots":created}
+
+
+@router.post("/{estate_id}/layout-proposals")
+def generate_layout_proposal(
+    estate_id: int,
+    payload: EstateLayoutCriteria,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    """Generate a reviewable concept layout from the Estate boundary."""
+    estate = db.get(Estate, estate_id)
+    if not estate:
+        raise HTTPException(404, "Estate not found")
+    access = require_estate_access(db, request, estate.organization_id, permission="plot.manage")
+    _enabled(db, estate.organization_id)
+    if not estate.boundary:
+        raise HTTPException(409, "Add a valid Estate boundary before creating a layout")
+    try:
+        generated = generate_estate_layout(to_shape(estate.boundary), payload)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    row = EstateLayoutProposal(
+        organization_id=estate.organization_id,
+        estate_id=estate.id,
+        criteria=generated["criteria"],
+        diagnostics=generated["diagnostics"],
+        plot_candidates=generated["plot_candidates"],
+        feature_candidates=generated["feature_candidates"],
+        created_by_subject_type=access.principal.subject_type,
+        created_by_subject_id=access.principal.subject_id,
+    )
+    db.add(row)
+    db.flush()
+    append_estate_audit_event(
+        db,
+        organization_id=estate.organization_id,
+        actor=access.principal,
+        action="layout_proposal.created",
+        entity_type="estate_layout_proposal",
+        entity_id=row.id,
+        after_data={"proposal_uid": row.proposal_uid, "plot_count": len(row.plot_candidates), "feature_count": len(row.feature_candidates)},
+    )
+    db.commit()
+    return _layout_proposal_payload(row)
+
+
+@router.get("/{estate_id}/layout-proposals")
+def list_layout_proposals(estate_id: int, request: Request, db: Session = Depends(get_db)):
+    estate = db.get(Estate, estate_id)
+    if not estate:
+        raise HTTPException(404, "Estate not found")
+    require_estate_access(db, request, estate.organization_id, permission="plot.read")
+    return [_layout_proposal_payload(row) for row in db.query(EstateLayoutProposal).filter(EstateLayoutProposal.estate_id == estate_id).order_by(EstateLayoutProposal.created_at.desc()).all()]
+
+
+@router.post("/layout-proposals/{proposal_id}/decision")
+def decide_layout_proposal(
+    proposal_id: int,
+    payload: EstateLayoutDecision,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    """Approve generated candidates into the Estate register, or reject the proposal."""
+    row = db.get(EstateLayoutProposal, proposal_id)
+    if not row:
+        raise HTTPException(404, "Layout proposal not found")
+    access = _require_layout_approval_access(db, request, row.organization_id)
+    _enabled(db, row.organization_id)
+    if row.status != "review_required":
+        raise HTTPException(409, "Layout proposal has already been decided")
+    if payload.status == "rejected":
+        row.status = "rejected"
+        row.reviewed_by_subject_type = access.principal.subject_type
+        row.reviewed_by_subject_id = access.principal.subject_id
+        row.reviewed_at = datetime.now(timezone.utc)
+        append_estate_audit_event(db, organization_id=row.organization_id, actor=access.principal, action="layout_proposal.rejected", entity_type="estate_layout_proposal", entity_id=row.id, after_data={"status": row.status, "notes": payload.notes})
+        db.commit()
+        return {"id": row.id, "status": row.status, "created_plots": 0, "created_features": 0}
+
+    estate = db.get(Estate, row.estate_id)
+    candidates = row.plot_candidates or []
+    if not candidates:
+        raise HTTPException(409, "This layout contains no usable plot candidates")
+    candidate_numbers = [_normalized(str(candidate.get("plot_number") or "")) for candidate in candidates]
+    if any(not value for value in candidate_numbers) or len(candidate_numbers) != len(set(candidate_numbers)):
+        raise HTTPException(409, "The generated layout contains duplicate or blank plot numbers")
+    existing_numbers = {value for (value,) in db.query(EstatePlot.plot_number_normalized).filter(EstatePlot.estate_id == row.estate_id).all()}
+    if existing_numbers.intersection(candidate_numbers):
+        raise HTTPException(409, "Some generated plot numbers already exist. Reject this proposal or use a different prefix.")
+
+    block_ids: dict[str, int] = {}
+    for candidate in candidates:
+        label = str(candidate.get("block_label") or "").strip()
+        if not label or label in block_ids:
+            continue
+        block = db.query(EstateBlock).filter(EstateBlock.estate_id == row.estate_id, EstateBlock.label == label).one_or_none()
+        if block is None:
+            block = EstateBlock(estate_id=row.estate_id, label=label, name=f"Block {label}")
+            db.add(block)
+            db.flush()
+        block_ids[label] = block.id
+
+    created_plots: list[EstatePlot] = []
+    for candidate in candidates:
+        geometry = candidate.get("geometry") or {}
+        area, issues = validate_polygon(geometry)
+        if any(issue.severity == "error" for issue in issues):
+            raise HTTPException(409, "The generated layout contains an invalid plot candidate")
+        label = str(candidate.get("block_label") or "").strip()
+        plot = EstatePlot(
+            estate_id=row.estate_id,
+            block_id=block_ids.get(label),
+            plot_number=str(candidate["plot_number"]).strip(),
+            plot_number_normalized=_normalized(str(candidate["plot_number"])),
+            geometry=from_shape(shape(geometry), srid=4326),
+            area_sqm=area,
+            land_use="residential",
+            commercial_status="available",
+            development_status="not_started",
+            geometry_status="approved",
+            source_type="generated",
+            source_reference=row.proposal_uid,
+            created_by_subject_type=access.principal.subject_type,
+            created_by_subject_id=access.principal.subject_id,
+        )
+        db.add(plot)
+        created_plots.append(plot)
+
+    created_features: list[EstateSpatialFeature] = []
+    for candidate in row.feature_candidates or []:
+        geometry = _geojson_geometry(candidate.get("geometry") or {})
+        feature = EstateSpatialFeature(
+            organization_id=row.organization_id,
+            estate_id=row.estate_id,
+            feature_type=str(candidate.get("feature_type") or "infrastructure"),
+            name=str(candidate.get("name") or "Generated layout feature"),
+            geometry=from_shape(geometry, srid=4326),
+            created_by_subject_type=access.principal.subject_type,
+            created_by_subject_id=access.principal.subject_id,
+        )
+        db.add(feature)
+        created_features.append(feature)
+
+    row.status = "approved"
+    row.reviewed_by_subject_type = access.principal.subject_type
+    row.reviewed_by_subject_id = access.principal.subject_id
+    row.reviewed_at = datetime.now(timezone.utc)
+    db.flush()
+    append_estate_audit_event(
+        db,
+        organization_id=row.organization_id,
+        actor=access.principal,
+        action="layout_proposal.approved",
+        entity_type="estate_layout_proposal",
+        entity_id=row.id,
+        after_data={"status": row.status, "created_plot_ids": [plot.id for plot in created_plots], "created_feature_ids": [feature.id for feature in created_features]},
+    )
+    db.commit()
+    return {"id": row.id, "status": row.status, "created_plots": len(created_plots), "created_features": len(created_features), "estate_id": estate.id}
 
 @router.post("/{estate_id}/layers")
 def create_estate_layer(estate_id:int,payload:SpatialFeatureCreate,request:Request,db:Session=Depends(get_db)):

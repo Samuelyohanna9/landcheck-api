@@ -345,3 +345,30 @@ class EstateImportReview(Base):
     created_by_subject_type = Column(String(64), nullable=False)
     created_by_subject_id = Column(String(128), nullable=False)
     created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+
+class EstateLayoutProposal(Base):
+    """A generated concept layout awaiting surveyor/manager approval."""
+
+    __tablename__ = "estate_layout_proposals"
+
+    id = Column(Integer, primary_key=True)
+    proposal_uid = Column(String(36), nullable=False, unique=True, default=lambda: str(uuid.uuid4()))
+    organization_id = Column(Integer, ForeignKey("estate_organizations.id", ondelete="CASCADE"), nullable=False)
+    estate_id = Column(Integer, ForeignKey("estate_estates.id", ondelete="CASCADE"), nullable=False)
+    status = Column(String(32), nullable=False, default="review_required")
+    criteria = Column(JSON, nullable=False, default=dict)
+    diagnostics = Column(JSON, nullable=False, default=dict)
+    plot_candidates = Column(JSON, nullable=False, default=list)
+    feature_candidates = Column(JSON, nullable=False, default=list)
+    created_by_subject_type = Column(String(64), nullable=False)
+    created_by_subject_id = Column(String(128), nullable=False)
+    reviewed_by_subject_type = Column(String(64), nullable=True)
+    reviewed_by_subject_id = Column(String(128), nullable=True)
+    reviewed_at = Column(DateTime(timezone=True), nullable=True)
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
+
+    __table_args__ = (
+        CheckConstraint("status IN ('review_required', 'approved', 'rejected')", name="ck_estate_layout_proposals_status"),
+    )
