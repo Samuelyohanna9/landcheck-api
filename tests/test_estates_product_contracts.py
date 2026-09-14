@@ -37,6 +37,16 @@ def test_estate_workflow_uses_web_development_lifecycle_and_map_publication():
     assert "payment_plan=payment_plan" in allocation_service
 
 
+def test_estate_plot_subdivision_creates_allocatable_estate_children():
+    source = (Path(__file__).parents[1] / "app" / "routers" / "estates.py").read_text(encoding="utf-8")
+    schema = (Path(__file__).parents[1] / "app" / "schemas" / "estates.py").read_text(encoding="utf-8")
+    assert '@router.post("/{estate_id}/plots/{plot_id}/subdivide")' in source
+    assert "permission=\"plot.manage\"" in source
+    assert 'commercial_status="available"' in source
+    assert 'source_type="subdivision"' in source
+    assert "class EstateSubdivisionCreate" in schema
+
+
 def test_estate_project_metadata_migration_is_reversible():
     migration = (Path(__file__).parents[1] / "alembic" / "versions" / "20260914_0012_estate_project_metadata_and_development_lifecycle.py").read_text(encoding="utf-8")
     assert "def upgrade" in migration

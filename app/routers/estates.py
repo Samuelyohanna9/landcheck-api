@@ -6,19 +6,21 @@ import json
 import re
 import tempfile
 import os
+import math
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import Response
 from geoalchemy2.shape import from_shape, to_shape
 from pyproj import Transformer
 import ezdxf
 from shapely.geometry import mapping, shape
+from shapely.ops import transform as shapely_transform
 from sqlalchemy.orm import Session
 
-from app.routers.plots import get_db
+from app.routers.plots import _metric_epsg_for_wgs84_polygon, _subdivide_polygon_equal_count, get_db
 from app.services.estates.authorization import list_estate_access, resolve_estate_principal
 from app.services.estates.entitlements import ESTATE_FEATURES, get_estate_entitlement
 from app.models.estate_foundation import Estate, EstateAllocation, EstateAuditEvent, EstateBlock, EstateCustomer, EstateDocument, EstateDocumentLink, EstateFieldInspection, EstateHazardAssessment, EstateImportReview, EstateOrganization, EstateOrganizationMember, EstatePayment, EstatePaymentRule, EstatePlot, EstateSpatialFeature, EstateSurveyRequest, EstateStakingTask
-from app.schemas.estates import AllocationAction, BlockCreate, BlockUpdate, CustomerCreate, DevelopmentStatusUpdate, EstateCreate, EstateUpdate, FieldInspectionCreate, ImportReviewCreate, ImportReviewDecision, MemberCreate, MemberUpdate, PlotCreate, PaymentCreate, SpatialFeatureCreate, SpatialFeatureUpdate, SurveyEligibilityUpdate, VoidAction
+from app.schemas.estates import AllocationAction, BlockCreate, BlockUpdate, CustomerCreate, DevelopmentStatusUpdate, EstateCreate, EstateSubdivisionCreate, EstateUpdate, FieldInspectionCreate, ImportReviewCreate, ImportReviewDecision, MemberCreate, MemberUpdate, PlotCreate, PaymentCreate, SpatialFeatureCreate, SpatialFeatureUpdate, SurveyEligibilityUpdate, VoidAction
 from app.services.estates.payments import confirm_payment, financial_summary, record_payment, void_payment
 from app.services.estates.documents import read_private_estate_file, store_private_estate_file
 from app.services.estates.permissions import has_permission
@@ -731,6 +733,99 @@ def create_plot(estate_id: int, payload: PlotCreate, request: Request, db: Sessi
     plot = EstatePlot(estate_id=estate_id, block_id=payload.block_id, plot_number=payload.plot_number.strip(), plot_number_normalized=normalized, geometry=from_shape(shape(payload.geometry), srid=4326), area_sqm=area, land_use=payload.land_use, geometry_status=payload.geometry_status, created_by_subject_type=access.principal.subject_type, created_by_subject_id=access.principal.subject_id)
     db.add(plot); db.flush(); append_estate_audit_event(db, organization_id=estate.organization_id, actor=access.principal, action="plot.created", entity_type="estate_plot", entity_id=plot.id, after_data={"plot_number": plot.plot_number, "area_sqm": area, "geometry_status": plot.geometry_status})
     db.commit(); return {"id": plot.id, "uid": plot.plot_uid, "area_sqm": area, "qc": [{"severity": issue.severity, "code": issue.code, "message": issue.message} for issue in issues]}
+
+
+@router.post("/{estate_id}/plots/{plot_id}/subdivide")
+def subdivide_estate_plot(
+    estate_id: int,
+    plot_id: int,
+    payload: EstateSubdivisionCreate,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    """Replace an available Estate plot with approved, allocatable child plots.
+
+    Estate subdivision is intentionally separate from Survey subdivision: the resulting records
+    remain EstatePlot rows and can immediately enter the Estate reservation/allocation workflow.
+    """
+    estate = db.get(Estate, estate_id)
+    plot = db.get(EstatePlot, plot_id)
+    if not estate or not plot or plot.estate_id != estate_id:
+        raise HTTPException(404, "Plot not found")
+    access = require_estate_access(db, request, estate.organization_id, permission="plot.manage")
+    _enabled(db, estate.organization_id)
+    if plot.geometry_status != "approved":
+        raise HTTPException(409, "Only an approved plot can be subdivided")
+    if plot.commercial_status != "available":
+        raise HTTPException(409, "Only an available plot can be subdivided")
+
+    parent = to_shape(plot.geometry)
+    if parent is None or parent.is_empty or not parent.is_valid:
+        raise HTTPException(409, "This plot has invalid geometry and cannot be subdivided")
+    metric_epsg = _metric_epsg_for_wgs84_polygon(parent)
+    forward = Transformer.from_crs("EPSG:4326", f"EPSG:{metric_epsg}", always_xy=True).transform
+    backward = Transformer.from_crs(f"EPSG:{metric_epsg}", "EPSG:4326", always_xy=True).transform
+    metric_parent = shapely_transform(forward, parent)
+    orientation = 0.0
+    if len(metric_parent.exterior.coords) > 2:
+        first = metric_parent.exterior.coords[0]
+        second = metric_parent.exterior.coords[1]
+        orientation = math.degrees(math.atan2(second[1] - first[1], second[0] - first[0]))
+    pieces = _subdivide_polygon_equal_count(metric_parent, payload.split_count, orientation)
+
+    child_numbers = [f"{plot.plot_number}-{index:02d}" for index in range(1, len(pieces) + 1)]
+    existing_numbers = {
+        value
+        for (value,) in db.query(EstatePlot.plot_number_normalized)
+        .filter(EstatePlot.estate_id == estate_id, EstatePlot.plot_number_normalized.in_([_normalized(number) for number in child_numbers]))
+        .all()
+    }
+    if existing_numbers:
+        raise HTTPException(409, "Some child plot numbers already exist. Choose a different source plot number.")
+
+    created: list[EstatePlot] = []
+    for index, (number, piece) in enumerate(zip(child_numbers, pieces), 1):
+        child = shapely_transform(backward, piece)
+        area, issues = validate_polygon(mapping(child))
+        if any(issue.severity == "error" for issue in issues):
+            raise HTTPException(400, "Subdivision produced an invalid child plot")
+        row = EstatePlot(
+            estate_id=estate_id,
+            block_id=plot.block_id,
+            plot_number=number,
+            plot_number_normalized=_normalized(number),
+            geometry=from_shape(child, srid=4326),
+            area_sqm=area,
+            land_use=plot.land_use,
+            commercial_status="available",
+            development_status="not_started",
+            geometry_status="approved",
+            source_type="subdivision",
+            source_reference=plot.plot_uid,
+            created_by_subject_type=access.principal.subject_type,
+            created_by_subject_id=access.principal.subject_id,
+        )
+        db.add(row)
+        created.append(row)
+
+    plot.commercial_status = "on_hold"
+    db.flush()
+    append_estate_audit_event(
+        db,
+        organization_id=estate.organization_id,
+        actor=access.principal,
+        action="plot.subdivided",
+        entity_type="estate_plot",
+        entity_id=plot.id,
+        before_data={"plot_number": plot.plot_number, "commercial_status": "available"},
+        after_data={"commercial_status": "on_hold", "child_plot_ids": [child.id for child in created], "split_count": len(created)},
+    )
+    db.commit()
+    return {
+        "parent": {"id": plot.id, "plot_number": plot.plot_number, "commercial_status": plot.commercial_status},
+        "created_count": len(created),
+        "plots": [{"id": child.id, "plot_number": child.plot_number, "area_sqm": str(child.area_sqm), "commercial_status": child.commercial_status} for child in created],
+    }
 
 @router.patch("/plots/{plot_id}/development-status")
 def update_development_status(plot_id:int, payload:DevelopmentStatusUpdate, request:Request, db:Session=Depends(get_db)):

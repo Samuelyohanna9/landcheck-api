@@ -39,6 +39,10 @@ class PlotCreate(BaseModel):
     land_use: str | None = None
     geometry_status: str = "draft"
 
+
+class EstateSubdivisionCreate(BaseModel):
+    split_count: int = Field(default=2, ge=2, le=100)
+
 class DevelopmentStatusUpdate(BaseModel):
     status: str = Field(pattern="^(not_started|site_cleared|foundation|under_construction|developed)$")
 
