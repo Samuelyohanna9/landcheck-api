@@ -124,6 +124,9 @@ class ImportReviewDecision(BaseModel):
     status: str = Field(pattern="^(approved|rejected)$")
     notes: str | None = Field(default=None, max_length=4000)
     candidate_data: list[dict[str, Any]] | None = None
+    # When true, the single approved candidate becomes the Estate's boundary (for subdividing or
+    # designing a layout next) instead of being created as an individual operational plot.
+    as_boundary: bool = False
 
 class ImportReviewFromGeoreferenceSession(BaseModel):
     survey_georeference_session_id: str = Field(min_length=1, max_length=128)

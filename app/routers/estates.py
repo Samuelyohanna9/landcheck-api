@@ -610,8 +610,19 @@ def decide_import_review(review_id:int,payload:ImportReviewDecision,request:Requ
     created=0
     if payload.status == "approved":
         estate=db.get(Estate,row.estate_id)
-        created=_create_plots_from_candidates(db,estate=estate,candidates=row.candidate_data or [],source_type=row.source_type,source_reference=str(row.id),actor=access.principal)
-        row.notes=(payload.notes or row.notes or "") + f"; {created} operational plot(s) created"
+        if payload.as_boundary:
+            usable = [candidate for candidate in (row.candidate_data or []) if candidate.get("valid") and candidate.get("geometry")]
+            if len(usable) != 1:
+                raise HTTPException(422, "A boundary import needs exactly one usable shape - approve it as individual plots instead, or fix the file so it contains a single outline.")
+            geometry = usable[0]["geometry"]
+            _, issues = validate_polygon(geometry)
+            if any(issue.severity == "error" for issue in issues):
+                raise HTTPException(422, detail=[issue.message for issue in issues])
+            estate.boundary = from_shape(shape(geometry), srid=4326)
+            row.notes=(payload.notes or row.notes or "") + "; set as the Estate boundary"
+        else:
+            created=_create_plots_from_candidates(db,estate=estate,candidates=row.candidate_data or [],source_type=row.source_type,source_reference=str(row.id),actor=access.principal)
+            row.notes=(payload.notes or row.notes or "") + f"; {created} operational plot(s) created"
     else: row.notes=payload.notes or row.notes
     row.status=payload.status
     append_estate_audit_event(db,organization_id=row.organization_id,actor=access.principal,action=f"import_review.{row.status}",entity_type="estate_import_review",entity_id=row.id,after_data={"status":row.status}); db.commit()
@@ -1080,6 +1091,42 @@ def create_plot(estate_id: int, payload: PlotCreate, request: Request, db: Sessi
     plot = EstatePlot(estate_id=estate_id, block_id=payload.block_id, plot_number=payload.plot_number.strip(), plot_number_normalized=normalized, geometry=from_shape(shape(payload.geometry), srid=4326), area_sqm=area, land_use=payload.land_use, geometry_status=payload.geometry_status, created_by_subject_type=access.principal.subject_type, created_by_subject_id=access.principal.subject_id)
     db.add(plot); db.flush(); append_estate_audit_event(db, organization_id=estate.organization_id, actor=access.principal, action="plot.created", entity_type="estate_plot", entity_id=plot.id, after_data={"plot_number": plot.plot_number, "area_sqm": area, "geometry_status": plot.geometry_status})
     db.commit(); return {"id": plot.id, "uid": plot.plot_uid, "area_sqm": area, "qc": [{"severity": issue.severity, "code": issue.code, "message": issue.message} for issue in issues]}
+
+
+@router.delete("/{estate_id}/plots/{plot_id}")
+def delete_estate_plot(estate_id: int, plot_id: int, request: Request, db: Session = Depends(get_db)):
+    estate = db.get(Estate, estate_id)
+    if not estate: raise HTTPException(404, "Estate not found")
+    plot = db.get(EstatePlot, plot_id)
+    if not plot or plot.estate_id != estate_id: raise HTTPException(404, "Plot not found")
+    access = require_estate_access(db, request, estate.organization_id, permission="plot.manage")
+    if db.query(EstateAllocation).filter(EstateAllocation.plot_id == plot_id).first():
+        raise HTTPException(409, "This plot has a customer reservation or allocation on record - remove that first before deleting the plot.")
+    plot_number = plot.plot_number
+    db.delete(plot)
+    append_estate_audit_event(db, organization_id=estate.organization_id, actor=access.principal, action="plot.deleted", entity_type="estate_plot", entity_id=plot_id, before_data={"plot_number": plot_number})
+    db.commit()
+    return {"deleted": True, "id": plot_id}
+
+
+@router.delete("/{estate_id}/layout")
+def reset_estate_layout(estate_id: int, request: Request, db: Session = Depends(get_db)):
+    """Deletes every plot in this Estate and clears its boundary so the layout workflow can start
+    over from scratch. Blocked if any plot already carries a customer reservation or allocation."""
+    estate = db.get(Estate, estate_id)
+    if not estate: raise HTTPException(404, "Estate not found")
+    access = require_estate_access(db, request, estate.organization_id, permission="estate.manage")
+    plots = db.query(EstatePlot).filter(EstatePlot.estate_id == estate_id).all()
+    allocated_count = db.query(EstateAllocation).join(EstatePlot, EstateAllocation.plot_id == EstatePlot.id).filter(EstatePlot.estate_id == estate_id).count()
+    if allocated_count:
+        raise HTTPException(409, f"{allocated_count} plot(s) in this Estate already have a customer reservation or allocation - remove those first before resetting the layout.")
+    plot_count = len(plots)
+    for plot in plots:
+        db.delete(plot)
+    estate.boundary = None
+    append_estate_audit_event(db, organization_id=estate.organization_id, actor=access.principal, action="layout.reset", entity_type="estate", entity_id=estate.id, after_data={"plots_deleted": plot_count})
+    db.commit()
+    return {"deleted_plots": plot_count}
 
 
 @router.post("/{estate_id}/plots/{plot_id}/subdivide")
