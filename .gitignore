@@ -2,6 +2,8 @@
 .env
 .env.*
 *.env
+!.env.example
+!.env.production.example
 
 # Python specific
 __pycache__/
@@ -24,4 +26,6 @@ Thumbs.db
 
 # Local artifacts
 app/reports/
+cache/
+scratch/
 *.log

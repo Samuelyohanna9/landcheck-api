@@ -25,6 +25,8 @@ services:
         condition: service_healthy
     ports:
       - "8000:8000"
+    environment:
+      ESTATES_ENABLED: ${ESTATES_ENABLED:-true}
     restart: unless-stopped
     stop_grace_period: 20s
     healthcheck:
