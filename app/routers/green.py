@@ -549,7 +549,7 @@ class SponsorGuestClaimPayload(BaseModel):
 class SponsorOrderReviewPayload(BaseModel):
     payment_status: str
     reviewed_by: str | None = None
-    reviewer_name: str | None = None  # legacy alias – prefer reviewed_by
+    reviewer_name: str | None = None  # legacy alias â€“ prefer reviewed_by
     review_notes: str | None = None
 
     @property
@@ -3001,7 +3001,7 @@ def _send_merchant_welcome_email(
         "Your API key (for a direct integration):\n"
         f"{api_key}\n\n"
         f"{webhook_line}"
-        "Keep your API key and webhook secret private — they authenticate requests as your organization. "
+        "Keep your API key and webhook secret private â€” they authenticate requests as your organization. "
         "Once you've set your password, sign in at the usual LandCheck Green login page to see your live "
         "dashboard: trees sponsored, planted, survival rate, and a downloadable impact report.\n\n"
         "Regards,\n"
@@ -3025,19 +3025,19 @@ def _send_merchant_welcome_email(
       <div style="font-size:12.5px;font-weight:800;letter-spacing:0.06em;text-transform:uppercase;color:#5c7a68;">Your API key</div>
       <div style="margin-top:8px;font-size:13px;font-family:monospace;color:#173624;word-break:break-all;">{html.escape(api_key)}</div>
       {f'<div style="margin-top:14px;font-size:12.5px;font-weight:800;letter-spacing:0.06em;text-transform:uppercase;color:#5c7a68;">Shopify webhook URL</div><div style="margin-top:8px;font-size:13px;font-family:monospace;color:#173624;word-break:break-all;">{html.escape(webhook_url_shopify)}</div>' if webhook_url_shopify else ''}
-      <div style="margin-top:14px;font-size:13px;color:#a9bdb0;">Keep these private — they authenticate requests as {html.escape(org_name)}.</div>
+      <div style="margin-top:14px;font-size:13px;color:#a9bdb0;">Keep these private â€” they authenticate requests as {html.escape(org_name)}.</div>
     </div>
-    <p style="margin:0;font-size:14px;line-height:1.7;color:#5c7a68;">Once you've set your password, sign in at the usual LandCheck Green login page to see your live dashboard — trees sponsored, planted, survival rate, and a downloadable impact report.</p>
+    <p style="margin:0;font-size:14px;line-height:1.7;color:#5c7a68;">Once you've set your password, sign in at the usual LandCheck Green login page to see your live dashboard â€” trees sponsored, planted, survival rate, and a downloadable impact report.</p>
     """
     html_body = _render_premium_email_shell(
-        kicker="LandCheck Green — Merchant",
+        kicker="LandCheck Green â€” Merchant",
         title=f"Welcome, {html.escape(org_name)}",
         subtitle="Your merchant sponsorship integration is ready.",
         body_html=body_html,
     )
     _send_html_email(
         to_email=to_email,
-        subject=f"Welcome to LandCheck Green — {org_name} merchant integration",
+        subject=f"Welcome to LandCheck Green â€” {org_name} merchant integration",
         text_body=body,
         html_body=html_body,
     )
@@ -4313,7 +4313,7 @@ def _verify_flutterwave_webhook_signature(raw_body: bytes, signature: str | None
 
 
 def _verify_hmac_sha256_signature(secret: str | None, raw_body: bytes, signature_b64: str | None) -> bool:
-    """Shared base64 HMAC-SHA256 verification — same shape Shopify/WooCommerce webhook
+    """Shared base64 HMAC-SHA256 verification â€” same shape Shopify/WooCommerce webhook
     signing uses, and identical to _verify_flutterwave_webhook_signature above but for an
     arbitrary per-merchant secret instead of the single platform-wide Flutterwave one."""
     secret_value = str(secret or "").strip()
@@ -4336,7 +4336,7 @@ def _generate_merchant_webhook_secret() -> str:
 def _hash_merchant_api_key(api_key: str) -> str:
     # A fast deterministic hash (not the slow salted PBKDF2 used for human passwords) is the
     # right fit here: the key itself is already 256 bits of randomness, so brute-forcing the
-    # hash isn't the threat model — and a deterministic hash lets us look the merchant up
+    # hash isn't the threat model â€” and a deterministic hash lets us look the merchant up
     # directly by hash equality instead of scanning every merchant row on every API call.
     return hashlib.sha256(str(api_key or "").strip().encode("utf-8")).hexdigest()
 
@@ -6544,120 +6544,124 @@ def ensure_green_tables(db: Session):
             created_at TIMESTAMP DEFAULT NOW()
         )
     """))
+    # Keep required Green foundation tables durable before best-effort compatibility alters.
+    # A failed optional alter rolls back only its own migration work, not tree_projects and the
+    # other tables later compatibility statements depend on.
+    db.commit()
     try:
-        db.execute(text("ALTER TABLE green_users ADD COLUMN IF NOT EXISTS user_uid TEXT"))
-        db.execute(text("ALTER TABLE green_users ADD COLUMN IF NOT EXISTS email TEXT"))
-        db.execute(text("ALTER TABLE green_users ADD COLUMN IF NOT EXISTS phone TEXT"))
-        db.execute(text("ALTER TABLE green_users ADD COLUMN IF NOT EXISTS organization_id INTEGER"))
-        db.execute(text("ALTER TABLE green_users ADD COLUMN IF NOT EXISTS role_id INTEGER"))
-        db.execute(text("ALTER TABLE green_users ADD COLUMN IF NOT EXISTS allow_green BOOLEAN NOT NULL DEFAULT TRUE"))
-        db.execute(text("ALTER TABLE green_users ADD COLUMN IF NOT EXISTS allow_work BOOLEAN NOT NULL DEFAULT FALSE"))
-        db.execute(text("ALTER TABLE green_users ADD COLUMN IF NOT EXISTS work_username TEXT"))
-        db.execute(text("ALTER TABLE green_users ADD COLUMN IF NOT EXISTS work_password_hash TEXT"))
-        db.execute(text("ALTER TABLE green_users ADD COLUMN IF NOT EXISTS notes TEXT"))
-        db.execute(text("ALTER TABLE green_users ADD COLUMN IF NOT EXISTS is_active BOOLEAN NOT NULL DEFAULT TRUE"))
-        db.execute(text("ALTER TABLE green_users ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW()"))
-        db.execute(text("ALTER TABLE green_users ADD COLUMN IF NOT EXISTS profile_photo_url TEXT"))
-        db.execute(text("ALTER TABLE green_sponsor_accounts ADD COLUMN IF NOT EXISTS sponsor_uid TEXT"))
-        db.execute(text("ALTER TABLE green_sponsor_accounts ADD COLUMN IF NOT EXISTS account_type TEXT NOT NULL DEFAULT 'individual'"))
-        db.execute(text("ALTER TABLE green_sponsor_accounts ADD COLUMN IF NOT EXISTS organization_name TEXT"))
-        db.execute(text("ALTER TABLE green_sponsor_accounts ADD COLUMN IF NOT EXISTS phone TEXT"))
-        db.execute(text("ALTER TABLE green_sponsor_accounts ADD COLUMN IF NOT EXISTS is_active BOOLEAN NOT NULL DEFAULT TRUE"))
-        db.execute(text("ALTER TABLE green_sponsor_accounts ADD COLUMN IF NOT EXISTS last_welcome_email_at TIMESTAMP"))
-        db.execute(text("ALTER TABLE green_sponsor_accounts ADD COLUMN IF NOT EXISTS password_reset_token_hash TEXT"))
-        db.execute(text("ALTER TABLE green_sponsor_accounts ADD COLUMN IF NOT EXISTS password_reset_token_expires_at TIMESTAMP"))
-        db.execute(text("ALTER TABLE green_sponsor_accounts ADD COLUMN IF NOT EXISTS password_reset_requested_at TIMESTAMP"))
-        db.execute(text("ALTER TABLE green_sponsor_accounts ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW()"))
-        db.execute(text("ALTER TABLE green_sponsor_accounts ADD COLUMN IF NOT EXISTS green_points INTEGER NOT NULL DEFAULT 0"))
-        db.execute(text("ALTER TABLE green_sponsor_accounts ADD COLUMN IF NOT EXISTS lifetime_points INTEGER NOT NULL DEFAULT 0"))
-        db.execute(text("ALTER TABLE green_sponsor_accounts ADD COLUMN IF NOT EXISTS referral_code TEXT"))
-        db.execute(text("ALTER TABLE green_sponsor_accounts ADD COLUMN IF NOT EXISTS referred_by_id INTEGER REFERENCES green_sponsor_accounts(id)"))
-        db.execute(text("ALTER TABLE green_sponsor_accounts ADD COLUMN IF NOT EXISTS point_booster_multiplier NUMERIC NOT NULL DEFAULT 1.0"))
-        db.execute(text("ALTER TABLE green_sponsor_accounts ADD COLUMN IF NOT EXISTS point_booster_remaining_uses INTEGER NOT NULL DEFAULT 0"))
-        db.execute(text("ALTER TABLE green_sponsor_accounts ADD COLUMN IF NOT EXISTS profile_photo_url TEXT"))
-        db.execute(text("ALTER TABLE green_sponsor_accounts ADD COLUMN IF NOT EXISTS unlocked_species JSONB NOT NULL DEFAULT '[]'"))
-        db.execute(text("ALTER TABLE green_sponsor_accounts ADD COLUMN IF NOT EXISTS unlocked_avatars JSONB NOT NULL DEFAULT '[]'"))
-        db.execute(text("ALTER TABLE green_sponsor_accounts ADD COLUMN IF NOT EXISTS unlocked_map_icons JSONB NOT NULL DEFAULT '[]'"))
-        db.execute(text("ALTER TABLE green_sponsor_accounts ADD COLUMN IF NOT EXISTS current_avatar_border TEXT"))
-        db.execute(text("ALTER TABLE green_sponsor_accounts ADD COLUMN IF NOT EXISTS current_map_icon TEXT"))
-        db.execute(text("ALTER TABLE green_sponsor_accounts ADD COLUMN IF NOT EXISTS legacy_order_points_reconciled_at TIMESTAMP"))
-        db.execute(text("ALTER TABLE green_sponsor_accounts ADD COLUMN IF NOT EXISTS is_guest BOOLEAN NOT NULL DEFAULT FALSE"))
-        db.execute(text("ALTER TABLE green_sponsor_accounts ADD COLUMN IF NOT EXISTS claimed_at TIMESTAMP"))
-        db.execute(text("ALTER TABLE green_sponsor_accounts ADD COLUMN IF NOT EXISTS api_key_hash TEXT"))
-        db.execute(text("ALTER TABLE green_sponsor_accounts ADD COLUMN IF NOT EXISTS webhook_secret TEXT"))
-        db.execute(text("ALTER TABLE green_sponsor_accounts ADD COLUMN IF NOT EXISTS default_project_id INTEGER REFERENCES tree_projects(id) ON DELETE SET NULL"))
-        db.execute(text("ALTER TABLE green_sponsor_accounts ADD COLUMN IF NOT EXISTS agreed_price_per_tree NUMERIC"))
-        db.execute(text("ALTER TABLE green_sponsor_accounts ADD COLUMN IF NOT EXISTS date_of_birth DATE"))
-        db.execute(text("ALTER TABLE green_sponsorship_orders ADD COLUMN IF NOT EXISTS points_awarded BOOLEAN NOT NULL DEFAULT FALSE"))
-        db.execute(text("ALTER TABLE green_sponsorship_orders ADD COLUMN IF NOT EXISTS birthday_send_date DATE"))
-        db.execute(text("ALTER TABLE green_sponsorship_orders ADD COLUMN IF NOT EXISTS birthday_email_sent_at TIMESTAMP"))
-        db.execute(text("ALTER TABLE green_sponsorship_orders ADD COLUMN IF NOT EXISTS birthday_announcement_sent_at TIMESTAMP"))
-        db.execute(text("ALTER TABLE green_sponsor_accounts ADD COLUMN IF NOT EXISTS last_engagement_email_at TIMESTAMP"))
-        db.execute(text("ALTER TABLE green_sponsor_accounts ADD COLUMN IF NOT EXISTS engagement_emails_opt_out BOOLEAN NOT NULL DEFAULT FALSE"))
-        db.execute(text("ALTER TABLE green_sponsor_accounts ADD COLUMN IF NOT EXISTS engagement_emails_opt_out_at TIMESTAMP"))
-        db.execute(text("ALTER TABLE green_push_tokens ADD COLUMN IF NOT EXISTS organization_id INTEGER"))
-        db.execute(text("ALTER TABLE green_push_tokens ADD COLUMN IF NOT EXISTS platform TEXT"))
-        db.execute(text("ALTER TABLE green_push_tokens ADD COLUMN IF NOT EXISTS app_version TEXT"))
-        db.execute(text("ALTER TABLE green_push_tokens ADD COLUMN IF NOT EXISTS expo_project_id TEXT"))
-        db.execute(text("ALTER TABLE green_push_tokens ADD COLUMN IF NOT EXISTS device_label TEXT"))
-        db.execute(text("ALTER TABLE green_push_tokens ADD COLUMN IF NOT EXISTS is_active BOOLEAN NOT NULL DEFAULT TRUE"))
-        db.execute(text("ALTER TABLE green_push_tokens ADD COLUMN IF NOT EXISTS last_seen_at TIMESTAMP DEFAULT NOW()"))
-        db.execute(text("ALTER TABLE green_push_tokens ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW()"))
-        db.execute(text("ALTER TABLE green_organizations ADD COLUMN IF NOT EXISTS logo_url TEXT"))
-        db.execute(text("ALTER TABLE green_roles ADD COLUMN IF NOT EXISTS role_uid TEXT"))
-        db.execute(text("ALTER TABLE green_roles ADD COLUMN IF NOT EXISTS role_key TEXT"))
-        db.execute(text("ALTER TABLE green_roles ADD COLUMN IF NOT EXISTS role_name TEXT"))
-        db.execute(text("ALTER TABLE green_roles ADD COLUMN IF NOT EXISTS description TEXT"))
-        db.execute(text("ALTER TABLE green_roles ADD COLUMN IF NOT EXISTS scope TEXT NOT NULL DEFAULT 'platform'"))
-        db.execute(text("ALTER TABLE green_roles ADD COLUMN IF NOT EXISTS is_system BOOLEAN NOT NULL DEFAULT FALSE"))
-        db.execute(text("ALTER TABLE green_roles ADD COLUMN IF NOT EXISTS is_active BOOLEAN NOT NULL DEFAULT TRUE"))
-        db.execute(text("ALTER TABLE green_roles ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW()"))
-        db.execute(text("ALTER TABLE tree_projects ADD COLUMN IF NOT EXISTS organization_id INTEGER"))
-        db.execute(text("ALTER TABLE tree_projects ADD COLUMN IF NOT EXISTS workflow_profile TEXT NOT NULL DEFAULT 'green'"))
-        db.execute(text("ALTER TABLE tree_projects ADD COLUMN IF NOT EXISTS access_model TEXT NOT NULL DEFAULT 'partner_org'"))
-        db.execute(text("ALTER TABLE tree_projects ADD COLUMN IF NOT EXISTS public_sponsor_enabled BOOLEAN NOT NULL DEFAULT FALSE"))
-        db.execute(text("ALTER TABLE tree_projects ADD COLUMN IF NOT EXISTS public_sponsor_title TEXT"))
-        db.execute(text("ALTER TABLE tree_projects ADD COLUMN IF NOT EXISTS public_sponsor_description TEXT"))
-        db.execute(text("ALTER TABLE tree_projects ADD COLUMN IF NOT EXISTS public_sponsor_agent_user_ids JSONB"))
-        db.execute(text("ALTER TABLE tree_projects ADD COLUMN IF NOT EXISTS sponsor_price_per_tree_ngn NUMERIC"))
-        db.execute(text("ALTER TABLE tree_projects ADD COLUMN IF NOT EXISTS sponsor_price_per_tree_usd NUMERIC"))
-        db.execute(text("ALTER TABLE tree_projects ADD COLUMN IF NOT EXISTS sponsor_price_per_tree NUMERIC"))
-        db.execute(text("ALTER TABLE tree_projects ADD COLUMN IF NOT EXISTS sponsor_currency TEXT NOT NULL DEFAULT 'NGN'"))
-        db.execute(text("ALTER TABLE tree_projects ADD COLUMN IF NOT EXISTS sponsor_capacity INTEGER"))
-        db.execute(text("ALTER TABLE tree_projects ADD COLUMN IF NOT EXISTS sponsor_max_per_order INTEGER NOT NULL DEFAULT 100"))
-        db.execute(text("ALTER TABLE tree_projects ADD COLUMN IF NOT EXISTS sponsor_dedication_enabled BOOLEAN NOT NULL DEFAULT TRUE"))
-        db.execute(text("ALTER TABLE tree_projects ADD COLUMN IF NOT EXISTS sponsor_payment_instructions TEXT"))
-        db.execute(text("ALTER TABLE tree_projects ADD COLUMN IF NOT EXISTS sponsor_agent_planting_fee NUMERIC"))
-        db.execute(text("ALTER TABLE tree_projects ADD COLUMN IF NOT EXISTS sponsor_agent_maintenance_fee NUMERIC"))
-        db.execute(text("ALTER TABLE tree_projects ADD COLUMN IF NOT EXISTS agric_config JSONB"))
-        db.execute(text("ALTER TABLE tree_projects ADD COLUMN IF NOT EXISTS relief_config JSONB"))
-        db.execute(text("ALTER TABLE tree_projects ADD COLUMN IF NOT EXISTS csr_config JSONB"))
-        db.execute(text("ALTER TABLE tree_projects ADD COLUMN IF NOT EXISTS planting_model TEXT NOT NULL DEFAULT 'direct'"))
-        db.execute(text("ALTER TABLE tree_projects ADD COLUMN IF NOT EXISTS allow_existing_tree_link BOOLEAN NOT NULL DEFAULT FALSE"))
+        db.execute(text("ALTER TABLE IF EXISTS green_users ADD COLUMN IF NOT EXISTS user_uid TEXT"))
+        db.execute(text("ALTER TABLE IF EXISTS green_users ADD COLUMN IF NOT EXISTS email TEXT"))
+        db.execute(text("ALTER TABLE IF EXISTS green_users ADD COLUMN IF NOT EXISTS phone TEXT"))
+        db.execute(text("ALTER TABLE IF EXISTS green_users ADD COLUMN IF NOT EXISTS organization_id INTEGER"))
+        db.execute(text("ALTER TABLE IF EXISTS green_users ADD COLUMN IF NOT EXISTS role_id INTEGER"))
+        db.execute(text("ALTER TABLE IF EXISTS green_users ADD COLUMN IF NOT EXISTS allow_green BOOLEAN NOT NULL DEFAULT TRUE"))
+        db.execute(text("ALTER TABLE IF EXISTS green_users ADD COLUMN IF NOT EXISTS allow_work BOOLEAN NOT NULL DEFAULT FALSE"))
+        db.execute(text("ALTER TABLE IF EXISTS green_users ADD COLUMN IF NOT EXISTS work_username TEXT"))
+        db.execute(text("ALTER TABLE IF EXISTS green_users ADD COLUMN IF NOT EXISTS work_password_hash TEXT"))
+        db.execute(text("ALTER TABLE IF EXISTS green_users ADD COLUMN IF NOT EXISTS notes TEXT"))
+        db.execute(text("ALTER TABLE IF EXISTS green_users ADD COLUMN IF NOT EXISTS is_active BOOLEAN NOT NULL DEFAULT TRUE"))
+        db.execute(text("ALTER TABLE IF EXISTS green_users ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW()"))
+        db.execute(text("ALTER TABLE IF EXISTS green_users ADD COLUMN IF NOT EXISTS profile_photo_url TEXT"))
+        db.execute(text("ALTER TABLE IF EXISTS green_sponsor_accounts ADD COLUMN IF NOT EXISTS sponsor_uid TEXT"))
+        db.execute(text("ALTER TABLE IF EXISTS green_sponsor_accounts ADD COLUMN IF NOT EXISTS account_type TEXT NOT NULL DEFAULT 'individual'"))
+        db.execute(text("ALTER TABLE IF EXISTS green_sponsor_accounts ADD COLUMN IF NOT EXISTS organization_name TEXT"))
+        db.execute(text("ALTER TABLE IF EXISTS green_sponsor_accounts ADD COLUMN IF NOT EXISTS phone TEXT"))
+        db.execute(text("ALTER TABLE IF EXISTS green_sponsor_accounts ADD COLUMN IF NOT EXISTS is_active BOOLEAN NOT NULL DEFAULT TRUE"))
+        db.execute(text("ALTER TABLE IF EXISTS green_sponsor_accounts ADD COLUMN IF NOT EXISTS last_welcome_email_at TIMESTAMP"))
+        db.execute(text("ALTER TABLE IF EXISTS green_sponsor_accounts ADD COLUMN IF NOT EXISTS password_reset_token_hash TEXT"))
+        db.execute(text("ALTER TABLE IF EXISTS green_sponsor_accounts ADD COLUMN IF NOT EXISTS password_reset_token_expires_at TIMESTAMP"))
+        db.execute(text("ALTER TABLE IF EXISTS green_sponsor_accounts ADD COLUMN IF NOT EXISTS password_reset_requested_at TIMESTAMP"))
+        db.execute(text("ALTER TABLE IF EXISTS green_sponsor_accounts ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW()"))
+        db.execute(text("ALTER TABLE IF EXISTS green_sponsor_accounts ADD COLUMN IF NOT EXISTS green_points INTEGER NOT NULL DEFAULT 0"))
+        db.execute(text("ALTER TABLE IF EXISTS green_sponsor_accounts ADD COLUMN IF NOT EXISTS lifetime_points INTEGER NOT NULL DEFAULT 0"))
+        db.execute(text("ALTER TABLE IF EXISTS green_sponsor_accounts ADD COLUMN IF NOT EXISTS referral_code TEXT"))
+        db.execute(text("ALTER TABLE IF EXISTS green_sponsor_accounts ADD COLUMN IF NOT EXISTS referred_by_id INTEGER REFERENCES green_sponsor_accounts(id)"))
+        db.execute(text("ALTER TABLE IF EXISTS green_sponsor_accounts ADD COLUMN IF NOT EXISTS point_booster_multiplier NUMERIC NOT NULL DEFAULT 1.0"))
+        db.execute(text("ALTER TABLE IF EXISTS green_sponsor_accounts ADD COLUMN IF NOT EXISTS point_booster_remaining_uses INTEGER NOT NULL DEFAULT 0"))
+        db.execute(text("ALTER TABLE IF EXISTS green_sponsor_accounts ADD COLUMN IF NOT EXISTS profile_photo_url TEXT"))
+        db.execute(text("ALTER TABLE IF EXISTS green_sponsor_accounts ADD COLUMN IF NOT EXISTS unlocked_species JSONB NOT NULL DEFAULT '[]'"))
+        db.execute(text("ALTER TABLE IF EXISTS green_sponsor_accounts ADD COLUMN IF NOT EXISTS unlocked_avatars JSONB NOT NULL DEFAULT '[]'"))
+        db.execute(text("ALTER TABLE IF EXISTS green_sponsor_accounts ADD COLUMN IF NOT EXISTS unlocked_map_icons JSONB NOT NULL DEFAULT '[]'"))
+        db.execute(text("ALTER TABLE IF EXISTS green_sponsor_accounts ADD COLUMN IF NOT EXISTS current_avatar_border TEXT"))
+        db.execute(text("ALTER TABLE IF EXISTS green_sponsor_accounts ADD COLUMN IF NOT EXISTS current_map_icon TEXT"))
+        db.execute(text("ALTER TABLE IF EXISTS green_sponsor_accounts ADD COLUMN IF NOT EXISTS legacy_order_points_reconciled_at TIMESTAMP"))
+        db.execute(text("ALTER TABLE IF EXISTS green_sponsor_accounts ADD COLUMN IF NOT EXISTS is_guest BOOLEAN NOT NULL DEFAULT FALSE"))
+        db.execute(text("ALTER TABLE IF EXISTS green_sponsor_accounts ADD COLUMN IF NOT EXISTS claimed_at TIMESTAMP"))
+        db.execute(text("ALTER TABLE IF EXISTS green_sponsor_accounts ADD COLUMN IF NOT EXISTS api_key_hash TEXT"))
+        db.execute(text("ALTER TABLE IF EXISTS green_sponsor_accounts ADD COLUMN IF NOT EXISTS webhook_secret TEXT"))
+        db.execute(text("ALTER TABLE IF EXISTS green_sponsor_accounts ADD COLUMN IF NOT EXISTS default_project_id INTEGER REFERENCES tree_projects(id) ON DELETE SET NULL"))
+        db.execute(text("ALTER TABLE IF EXISTS green_sponsor_accounts ADD COLUMN IF NOT EXISTS agreed_price_per_tree NUMERIC"))
+        db.execute(text("ALTER TABLE IF EXISTS green_sponsor_accounts ADD COLUMN IF NOT EXISTS date_of_birth DATE"))
+        db.execute(text("ALTER TABLE IF EXISTS IF EXISTS green_sponsorship_orders ADD COLUMN IF NOT EXISTS points_awarded BOOLEAN NOT NULL DEFAULT FALSE"))
+        db.execute(text("ALTER TABLE IF EXISTS green_sponsorship_orders ADD COLUMN IF NOT EXISTS birthday_send_date DATE"))
+        db.execute(text("ALTER TABLE IF EXISTS green_sponsorship_orders ADD COLUMN IF NOT EXISTS birthday_email_sent_at TIMESTAMP"))
+        db.execute(text("ALTER TABLE IF EXISTS green_sponsorship_orders ADD COLUMN IF NOT EXISTS birthday_announcement_sent_at TIMESTAMP"))
+        db.execute(text("ALTER TABLE IF EXISTS green_sponsor_accounts ADD COLUMN IF NOT EXISTS last_engagement_email_at TIMESTAMP"))
+        db.execute(text("ALTER TABLE IF EXISTS green_sponsor_accounts ADD COLUMN IF NOT EXISTS engagement_emails_opt_out BOOLEAN NOT NULL DEFAULT FALSE"))
+        db.execute(text("ALTER TABLE IF EXISTS green_sponsor_accounts ADD COLUMN IF NOT EXISTS engagement_emails_opt_out_at TIMESTAMP"))
+        db.execute(text("ALTER TABLE IF EXISTS green_push_tokens ADD COLUMN IF NOT EXISTS organization_id INTEGER"))
+        db.execute(text("ALTER TABLE IF EXISTS green_push_tokens ADD COLUMN IF NOT EXISTS platform TEXT"))
+        db.execute(text("ALTER TABLE IF EXISTS green_push_tokens ADD COLUMN IF NOT EXISTS app_version TEXT"))
+        db.execute(text("ALTER TABLE IF EXISTS green_push_tokens ADD COLUMN IF NOT EXISTS expo_project_id TEXT"))
+        db.execute(text("ALTER TABLE IF EXISTS green_push_tokens ADD COLUMN IF NOT EXISTS device_label TEXT"))
+        db.execute(text("ALTER TABLE IF EXISTS green_push_tokens ADD COLUMN IF NOT EXISTS is_active BOOLEAN NOT NULL DEFAULT TRUE"))
+        db.execute(text("ALTER TABLE IF EXISTS green_push_tokens ADD COLUMN IF NOT EXISTS last_seen_at TIMESTAMP DEFAULT NOW()"))
+        db.execute(text("ALTER TABLE IF EXISTS green_push_tokens ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW()"))
+        db.execute(text("ALTER TABLE IF EXISTS green_organizations ADD COLUMN IF NOT EXISTS logo_url TEXT"))
+        db.execute(text("ALTER TABLE IF EXISTS green_roles ADD COLUMN IF NOT EXISTS role_uid TEXT"))
+        db.execute(text("ALTER TABLE IF EXISTS green_roles ADD COLUMN IF NOT EXISTS role_key TEXT"))
+        db.execute(text("ALTER TABLE IF EXISTS green_roles ADD COLUMN IF NOT EXISTS role_name TEXT"))
+        db.execute(text("ALTER TABLE IF EXISTS green_roles ADD COLUMN IF NOT EXISTS description TEXT"))
+        db.execute(text("ALTER TABLE IF EXISTS green_roles ADD COLUMN IF NOT EXISTS scope TEXT NOT NULL DEFAULT 'platform'"))
+        db.execute(text("ALTER TABLE IF EXISTS green_roles ADD COLUMN IF NOT EXISTS is_system BOOLEAN NOT NULL DEFAULT FALSE"))
+        db.execute(text("ALTER TABLE IF EXISTS green_roles ADD COLUMN IF NOT EXISTS is_active BOOLEAN NOT NULL DEFAULT TRUE"))
+        db.execute(text("ALTER TABLE IF EXISTS green_roles ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW()"))
+        db.execute(text("ALTER TABLE IF EXISTS tree_projects ADD COLUMN IF NOT EXISTS organization_id INTEGER"))
+        db.execute(text("ALTER TABLE IF EXISTS tree_projects ADD COLUMN IF NOT EXISTS workflow_profile TEXT NOT NULL DEFAULT 'green'"))
+        db.execute(text("ALTER TABLE IF EXISTS tree_projects ADD COLUMN IF NOT EXISTS access_model TEXT NOT NULL DEFAULT 'partner_org'"))
+        db.execute(text("ALTER TABLE IF EXISTS tree_projects ADD COLUMN IF NOT EXISTS public_sponsor_enabled BOOLEAN NOT NULL DEFAULT FALSE"))
+        db.execute(text("ALTER TABLE IF EXISTS tree_projects ADD COLUMN IF NOT EXISTS public_sponsor_title TEXT"))
+        db.execute(text("ALTER TABLE IF EXISTS tree_projects ADD COLUMN IF NOT EXISTS public_sponsor_description TEXT"))
+        db.execute(text("ALTER TABLE IF EXISTS tree_projects ADD COLUMN IF NOT EXISTS public_sponsor_agent_user_ids JSONB"))
+        db.execute(text("ALTER TABLE IF EXISTS tree_projects ADD COLUMN IF NOT EXISTS sponsor_price_per_tree_ngn NUMERIC"))
+        db.execute(text("ALTER TABLE IF EXISTS tree_projects ADD COLUMN IF NOT EXISTS sponsor_price_per_tree_usd NUMERIC"))
+        db.execute(text("ALTER TABLE IF EXISTS tree_projects ADD COLUMN IF NOT EXISTS sponsor_price_per_tree NUMERIC"))
+        db.execute(text("ALTER TABLE IF EXISTS tree_projects ADD COLUMN IF NOT EXISTS sponsor_currency TEXT NOT NULL DEFAULT 'NGN'"))
+        db.execute(text("ALTER TABLE IF EXISTS tree_projects ADD COLUMN IF NOT EXISTS sponsor_capacity INTEGER"))
+        db.execute(text("ALTER TABLE IF EXISTS tree_projects ADD COLUMN IF NOT EXISTS sponsor_max_per_order INTEGER NOT NULL DEFAULT 100"))
+        db.execute(text("ALTER TABLE IF EXISTS tree_projects ADD COLUMN IF NOT EXISTS sponsor_dedication_enabled BOOLEAN NOT NULL DEFAULT TRUE"))
+        db.execute(text("ALTER TABLE IF EXISTS tree_projects ADD COLUMN IF NOT EXISTS sponsor_payment_instructions TEXT"))
+        db.execute(text("ALTER TABLE IF EXISTS tree_projects ADD COLUMN IF NOT EXISTS sponsor_agent_planting_fee NUMERIC"))
+        db.execute(text("ALTER TABLE IF EXISTS tree_projects ADD COLUMN IF NOT EXISTS sponsor_agent_maintenance_fee NUMERIC"))
+        db.execute(text("ALTER TABLE IF EXISTS tree_projects ADD COLUMN IF NOT EXISTS agric_config JSONB"))
+        db.execute(text("ALTER TABLE IF EXISTS tree_projects ADD COLUMN IF NOT EXISTS relief_config JSONB"))
+        db.execute(text("ALTER TABLE IF EXISTS tree_projects ADD COLUMN IF NOT EXISTS csr_config JSONB"))
+        db.execute(text("ALTER TABLE IF EXISTS tree_projects ADD COLUMN IF NOT EXISTS planting_model TEXT NOT NULL DEFAULT 'direct'"))
+        db.execute(text("ALTER TABLE IF EXISTS tree_projects ADD COLUMN IF NOT EXISTS allow_existing_tree_link BOOLEAN NOT NULL DEFAULT FALSE"))
         db.execute(
             text(
-                "ALTER TABLE tree_projects ADD COLUMN IF NOT EXISTS default_existing_tree_scope TEXT NOT NULL DEFAULT 'exclude_from_planting_kpi'"
+                "ALTER TABLE IF EXISTS tree_projects ADD COLUMN IF NOT EXISTS default_existing_tree_scope TEXT NOT NULL DEFAULT 'exclude_from_planting_kpi'"
             )
         )
-        db.execute(text("ALTER TABLE trees ADD COLUMN IF NOT EXISTS tree_origin TEXT NOT NULL DEFAULT 'new_planting'"))
-        db.execute(text("ALTER TABLE trees ADD COLUMN IF NOT EXISTS custodian_id INTEGER"))
-        db.execute(text("ALTER TABLE trees ADD COLUMN IF NOT EXISTS custody_started_at DATE"))
-        db.execute(text("ALTER TABLE trees ADD COLUMN IF NOT EXISTS attribution_scope TEXT NOT NULL DEFAULT 'full'"))
-        db.execute(text("ALTER TABLE trees ADD COLUMN IF NOT EXISTS count_in_planting_kpis BOOLEAN NOT NULL DEFAULT TRUE"))
-        db.execute(text("ALTER TABLE trees ADD COLUMN IF NOT EXISTS count_in_carbon_scope BOOLEAN NOT NULL DEFAULT TRUE"))
-        db.execute(text("ALTER TABLE trees ADD COLUMN IF NOT EXISTS source_project_id INTEGER"))
-        db.execute(text("ALTER TABLE trees ADD COLUMN IF NOT EXISTS tree_height_m NUMERIC"))
-        db.execute(text("ALTER TABLE trees ADD COLUMN IF NOT EXISTS tree_age_months NUMERIC"))
-        db.execute(text("ALTER TABLE trees ADD COLUMN IF NOT EXISTS project_tree_no INTEGER"))
-        db.execute(text("ALTER TABLE trees ADD COLUMN IF NOT EXISTS photo_urls JSONB"))
-        db.execute(text("ALTER TABLE trees ADD COLUMN IF NOT EXISTS inventory_tree_count INTEGER NOT NULL DEFAULT 1"))
-        db.execute(text("ALTER TABLE trees ADD COLUMN IF NOT EXISTS existing_area_geojson JSONB"))
-        db.execute(text("ALTER TABLE trees ADD COLUMN IF NOT EXISTS existing_area_sqm NUMERIC"))
-        db.execute(text("ALTER TABLE trees ADD COLUMN IF NOT EXISTS record_profile_data JSONB"))
-        db.execute(text("ALTER TABLE green_users ADD COLUMN IF NOT EXISTS email TEXT"))
-        db.execute(text("ALTER TABLE green_users ADD COLUMN IF NOT EXISTS password_reset_token_hash TEXT"))
-        db.execute(text("ALTER TABLE green_users ADD COLUMN IF NOT EXISTS password_reset_token_expires_at TIMESTAMP"))
-        db.execute(text("ALTER TABLE green_users ADD COLUMN IF NOT EXISTS password_reset_requested_at TIMESTAMP"))
+        db.execute(text("ALTER TABLE IF EXISTS trees ADD COLUMN IF NOT EXISTS tree_origin TEXT NOT NULL DEFAULT 'new_planting'"))
+        db.execute(text("ALTER TABLE IF EXISTS trees ADD COLUMN IF NOT EXISTS custodian_id INTEGER"))
+        db.execute(text("ALTER TABLE IF EXISTS trees ADD COLUMN IF NOT EXISTS custody_started_at DATE"))
+        db.execute(text("ALTER TABLE IF EXISTS trees ADD COLUMN IF NOT EXISTS attribution_scope TEXT NOT NULL DEFAULT 'full'"))
+        db.execute(text("ALTER TABLE IF EXISTS trees ADD COLUMN IF NOT EXISTS count_in_planting_kpis BOOLEAN NOT NULL DEFAULT TRUE"))
+        db.execute(text("ALTER TABLE IF EXISTS trees ADD COLUMN IF NOT EXISTS count_in_carbon_scope BOOLEAN NOT NULL DEFAULT TRUE"))
+        db.execute(text("ALTER TABLE IF EXISTS trees ADD COLUMN IF NOT EXISTS source_project_id INTEGER"))
+        db.execute(text("ALTER TABLE IF EXISTS trees ADD COLUMN IF NOT EXISTS tree_height_m NUMERIC"))
+        db.execute(text("ALTER TABLE IF EXISTS trees ADD COLUMN IF NOT EXISTS tree_age_months NUMERIC"))
+        db.execute(text("ALTER TABLE IF EXISTS trees ADD COLUMN IF NOT EXISTS project_tree_no INTEGER"))
+        db.execute(text("ALTER TABLE IF EXISTS trees ADD COLUMN IF NOT EXISTS photo_urls JSONB"))
+        db.execute(text("ALTER TABLE IF EXISTS trees ADD COLUMN IF NOT EXISTS inventory_tree_count INTEGER NOT NULL DEFAULT 1"))
+        db.execute(text("ALTER TABLE IF EXISTS trees ADD COLUMN IF NOT EXISTS existing_area_geojson JSONB"))
+        db.execute(text("ALTER TABLE IF EXISTS trees ADD COLUMN IF NOT EXISTS existing_area_sqm NUMERIC"))
+        db.execute(text("ALTER TABLE IF EXISTS trees ADD COLUMN IF NOT EXISTS record_profile_data JSONB"))
+        db.execute(text("ALTER TABLE IF EXISTS green_users ADD COLUMN IF NOT EXISTS email TEXT"))
+        db.execute(text("ALTER TABLE IF EXISTS green_users ADD COLUMN IF NOT EXISTS password_reset_token_hash TEXT"))
+        db.execute(text("ALTER TABLE IF EXISTS green_users ADD COLUMN IF NOT EXISTS password_reset_token_expires_at TIMESTAMP"))
+        db.execute(text("ALTER TABLE IF EXISTS green_users ADD COLUMN IF NOT EXISTS password_reset_requested_at TIMESTAMP"))
         db.execute(text("""
             CREATE TABLE IF NOT EXISTS green_impact_comments (
                 id          SERIAL PRIMARY KEY,
@@ -6672,7 +6676,7 @@ def ensure_green_tables(db: Session):
         db.execute(text(
             "CREATE INDEX IF NOT EXISTS idx_green_impact_comments_slug ON green_impact_comments(org_slug)"
         ))
-        db.execute(text("ALTER TABLE green_impact_comments ADD COLUMN IF NOT EXISTS project_name TEXT"))
+        db.execute(text("ALTER TABLE IF EXISTS green_impact_comments ADD COLUMN IF NOT EXISTS project_name TEXT"))
     except Exception:
         db.rollback()
     try:
@@ -7348,6 +7352,18 @@ def ensure_green_tables(db: Session):
     db.execute(text("ALTER TABLE green_export_jobs ADD COLUMN IF NOT EXISTS cache_key TEXT"))
     db.execute(text("ALTER TABLE green_export_jobs ADD COLUMN IF NOT EXISTS request_payload JSONB"))
     db.execute(text("ALTER TABLE green_export_jobs ADD COLUMN IF NOT EXISTS result_payload JSONB"))
+    # These indexes are required below even when an earlier legacy compatibility batch was
+    # rolled back because an old optional table was absent.
+    db.execute(text("ALTER TABLE green_users ADD COLUMN IF NOT EXISTS user_uid TEXT"))
+    db.execute(text("ALTER TABLE green_users ADD COLUMN IF NOT EXISTS work_username TEXT"))
+    db.execute(text("ALTER TABLE green_users ADD COLUMN IF NOT EXISTS organization_id INTEGER"))
+    db.execute(text("ALTER TABLE green_users ADD COLUMN IF NOT EXISTS role_id INTEGER"))
+    db.execute(text("ALTER TABLE green_users ADD COLUMN IF NOT EXISTS allow_green BOOLEAN NOT NULL DEFAULT TRUE"))
+    db.execute(text("ALTER TABLE green_users ADD COLUMN IF NOT EXISTS allow_work BOOLEAN NOT NULL DEFAULT FALSE"))
+    db.execute(text("ALTER TABLE green_sponsor_accounts ADD COLUMN IF NOT EXISTS sponsor_uid TEXT"))
+    db.execute(text("ALTER TABLE green_roles ADD COLUMN IF NOT EXISTS role_uid TEXT"))
+    db.execute(text("ALTER TABLE green_roles ADD COLUMN IF NOT EXISTS role_key TEXT"))
+    db.commit()
     db.execute(text("CREATE INDEX IF NOT EXISTS idx_trees_project_id ON trees(project_id)"))
     db.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS idx_trees_project_tree_no ON trees(project_id, project_tree_no)"))
     db.execute(text("CREATE INDEX IF NOT EXISTS idx_trees_geom ON trees USING GIST (geom)"))
@@ -9442,7 +9458,7 @@ def _collect_public_sponsor_agent_user_ids_for_project(
     seen = set(collected)
     # Prefer the direct assignee/assigned foreign-key columns over name matching wherever
     # they're already populated (e.g. agents assigned via the sponsor-donor flow, which sets
-    # assignee_user_id/assigned_user_id directly) — assignee_name text matching below is
+    # assignee_user_id/assigned_user_id directly) â€” assignee_name text matching below is
     # fragile (casing/whitespace/duplicate-name mismatches) and could silently drop a real
     # agent from this roster even though they were assigned correctly.
     try:
@@ -10924,7 +10940,7 @@ def _build_sponsor_agent_earning_rows(
             {"project_ids": project_ids, "aliases": aliases, "user_id": normalized_user_id},
         ).mappings().all()
     except Exception:
-        # A failed query leaves the whole session's transaction "aborted" in Postgres —
+        # A failed query leaves the whole session's transaction "aborted" in Postgres â€”
         # every later query on this same db session (e.g. the next agent processed in the
         # admin payout roster loop) would then fail too unless we roll back right here.
         _rollback_quietly(db)
@@ -13562,7 +13578,7 @@ def get_public_impact_stats(db: Session = Depends(get_db)):
 @router.get("/public/sponsor-impact-stats")
 def get_public_sponsor_impact_stats(db: Session = Depends(get_db)):
     """Real, verified-payment-only totals for the public sponsor page's impact
-    band. Grows automatically as guest/account sponsorships are confirmed —
+    band. Grows automatically as guest/account sponsorships are confirmed â€”
     no invented numbers."""
     row = db.execute(
         text(
@@ -14286,7 +14302,7 @@ def _issue_sponsor_password_reset_token(db: Session, *, sponsor_id: int, request
     (used for the forgot-password flow, and reused to send a new merchant their first
     "set your password" link right at account creation). Returns (reset_url, expires_at),
     or None if a reset URL couldn't be built (no public base URL configured).
-    Note: expires_at is a naive UTC datetime — the reset-password endpoint compares it
+    Note: expires_at is a naive UTC datetime â€” the reset-password endpoint compares it
     against (NOW() AT TIME ZONE 'UTC'), not bare NOW(), so this stays correct regardless
     of the database session's configured timezone."""
     token = secrets.token_urlsafe(32)
@@ -14417,7 +14433,7 @@ def sponsor_auth_reset_password(payload: SponsorResetPasswordPayload, db: Sessio
 def _ensure_guest_sponsor_account(db: Session, *, full_name: str, email: str, phone: str | None) -> dict:
     """Find or transparently create an unclaimed sponsor account for guest checkout.
 
-    Guests never see or set a password at this step — a random one is hashed and
+    Guests never see or set a password at this step â€” a random one is hashed and
     stored so the row satisfies the NOT NULL password_hash constraint but cannot be
     logged into until the sponsor claims the account (see /sponsor/guest/claim).
     """
@@ -14703,7 +14719,7 @@ def create_sponsor_order(
 
 
 ##################################################################
-# MERCHANT INTEGRATION — automated tree sponsorship on behalf of a
+# MERCHANT INTEGRATION â€” automated tree sponsorship on behalf of a
 # merchant's end customers, via direct API call or platform webhook.
 # See _create_merchant_sponsorship for the single shared creation path
 # both entry points call.
@@ -14781,7 +14797,7 @@ def _create_merchant_sponsorship(
         raise HTTPException(status_code=400, detail="external_order_id is required")
 
     # Idempotent by design: a webhook redelivery or an accidental duplicate API call for the
-    # same merchant + external order must never create a second tree — return the original
+    # same merchant + external order must never create a second tree â€” return the original
     # result instead of erroring, so retries are always safe.
     existing_order = db.execute(
         text(
@@ -14818,7 +14834,7 @@ def _create_merchant_sponsorship(
 
     default_project_id = int(merchant_row.get("default_project_id") or 0)
     if default_project_id <= 0:
-        raise HTTPException(status_code=409, detail="This merchant has no default project configured yet — set one in LandCheck Work before integrating.")
+        raise HTTPException(status_code=409, detail="This merchant has no default project configured yet â€” set one in LandCheck Work before integrating.")
     project = get_project(project_id=default_project_id, db=db, assignee_name=None)
     if not _is_public_sponsorship_project(project):
         raise HTTPException(status_code=409, detail="This merchant's default project is not open for sponsorship")
@@ -14868,7 +14884,7 @@ def _create_merchant_sponsorship(
                 "amount_total": amount_total,
                 "currency": checkout_currency,
                 "dedication_message": _clean_text(dedication_message, 500),
-                "purchaser_note": f"Merchant order via {str(merchant_row.get('organization_name') or merchant_row.get('full_name') or 'merchant').strip()} — external order {external_order_id_clean}",
+                "purchaser_note": f"Merchant order via {str(merchant_row.get('organization_name') or merchant_row.get('full_name') or 'merchant').strip()} â€” external order {external_order_id_clean}",
                 "consent_version": SPONSOR_TERMS_VERSION,
                 "merchant_account_id": merchant_id,
                 "external_order_id": external_order_id_clean,
@@ -15022,7 +15038,7 @@ def create_admin_merchant(payload: AdminCreateMerchantPayload, request: Request,
     ).mappings().first()
     db.commit()
     result = _serialize_merchant_account(dict(row))
-    # The plaintext API key and webhook secret are only ever returned here, at creation time —
+    # The plaintext API key and webhook secret are only ever returned here, at creation time â€”
     # only the hash is retained afterward, matching how every other credential in this codebase
     # (passwords, reset tokens) is stored.
     result["api_key"] = api_key
@@ -15042,7 +15058,7 @@ def create_admin_merchant(payload: AdminCreateMerchantPayload, request: Request,
             reset_expires_at=reset_result[1] if reset_result else None,
         )
     except Exception:
-        # Merchant creation itself already succeeded and committed above — a failed welcome
+        # Merchant creation itself already succeeded and committed above â€” a failed welcome
         # email shouldn't undo that or fail this request. "Send Login Invite" in the Merchants
         # tab re-sends the set-password link if this email didn't arrive.
         _rollback_quietly(db)
@@ -15086,10 +15102,10 @@ def _send_birthday_gift_announcement_email(*, to_email: str, full_name: str, pro
     )
     body = (
         f"Hello {recipient_name},\n\n"
-        "Congratulations — your birthday is coming up, and we couldn't let it pass without doing something a little "
+        "Congratulations â€” your birthday is coming up, and we couldn't let it pass without doing something a little "
         "different. Instead of a card that gets tucked in a drawer, LandCheck Green is preparing a living gift: a real "
         f"tree, planted in your name, completely free of charge, at {project_name}.\n\n"
-        "Keep an eye on your inbox — on your actual birthday we'll send you the full details of your tree, "
+        "Keep an eye on your inbox â€” on your actual birthday we'll send you the full details of your tree, "
         "including exactly where it's being planted.\n\n"
         f"In the meantime, get the LandCheck Green app so you're ready to see it: {android_apk_url}\n\n"
         "Regards,\n"
@@ -15097,10 +15113,10 @@ def _send_birthday_gift_announcement_email(*, to_email: str, full_name: str, pro
     )
     body_html = f"""
     <p style="margin:0 0 16px;font-size:15px;line-height:1.7;color:#173624;">Hello {html.escape(recipient_name)},</p>
-    <p style="margin:0 0 20px;font-size:15px;line-height:1.7;color:#173624;">Congratulations — your birthday is coming up, and we couldn't let it pass without doing something a little different. Instead of a card that gets tucked in a drawer, LandCheck Green is preparing a living gift: a real tree, planted in your name, completely free of charge, at <strong>{html.escape(project_name)}</strong>.</p>
-    <p style="margin:0 0 20px;font-size:15px;line-height:1.7;color:#173624;">Keep an eye on your inbox — on your actual birthday we'll send you the full details of your tree, including exactly where it's being planted.</p>
+    <p style="margin:0 0 20px;font-size:15px;line-height:1.7;color:#173624;">Congratulations â€” your birthday is coming up, and we couldn't let it pass without doing something a little different. Instead of a card that gets tucked in a drawer, LandCheck Green is preparing a living gift: a real tree, planted in your name, completely free of charge, at <strong>{html.escape(project_name)}</strong>.</p>
+    <p style="margin:0 0 20px;font-size:15px;line-height:1.7;color:#173624;">Keep an eye on your inbox â€” on your actual birthday we'll send you the full details of your tree, including exactly where it's being planted.</p>
     <a href="{html.escape(android_apk_url, quote=True)}" style="display:inline-block;padding:14px 22px;border-radius:999px;background:linear-gradient(135deg,#1f8c58,#0f6f39);color:#ffffff;font-size:15px;font-weight:800;text-decoration:none;box-shadow:0 10px 22px rgba(15,111,57,0.28);">Get the LandCheck Green app</a>
-    <p style="margin:20px 0 0;font-size:13px;line-height:1.7;color:#5c7a68;">Get ready — you'll be able to see your tree here once it's planted.</p>
+    <p style="margin:20px 0 0;font-size:13px;line-height:1.7;color:#5c7a68;">Get ready â€” you'll be able to see your tree here once it's planted.</p>
     """
     html_body = _render_premium_email_shell(
         kicker="A gift is on the way",
@@ -15137,7 +15153,7 @@ def _send_birthday_gift_celebration_email(
     tree_word = "tree" if int(quantity or 1) == 1 else "trees"
     dedication_block = f"{dedication_message}\n\n" if dedication_message else ""
     birthday_wish = (
-        "Another year older, another beautiful chapter written. But this birthday leaves behind more than memories — "
+        "Another year older, another beautiful chapter written. But this birthday leaves behind more than memories â€” "
         "instead of candles that flicker and fade, you're leaving a living, growing legacy. Somewhere in the soil, "
         "roots are about to take hold that will still be standing long after today, quietly cleaning the air, holding "
         "the ground, and sheltering life for decades to come. That's the kind of gift that keeps giving back."
@@ -15147,25 +15163,25 @@ def _send_birthday_gift_celebration_email(
         f"Happy Birthday from all of us at LandCheck Green!\n\n"
         f"{birthday_wish}\n\n"
         f"To celebrate you, we're planting {quantity} {tree_word} in your name "
-        f"at {project_name}{f', {location_text}' if location_text else ''} — completely free of charge.\n\n"
+        f"at {project_name}{f', {location_text}' if location_text else ''} â€” completely free of charge.\n\n"
         f"{dedication_block}"
         "You'll receive a notification and email the moment our field agents plant and verify your tree(s).\n\n"
-        f"Set up your free LandCheck Green account (your name and email are already on file — just choose a password) here: {claim_url}\n\n"
+        f"Set up your free LandCheck Green account (your name and email are already on file â€” just choose a password) here: {claim_url}\n\n"
         f"Or get the app directly: {android_apk_url}\n\n"
-        "Happy Birthday, once again — here's to another year of growth, in every sense of the word.\n\n"
+        "Happy Birthday, once again â€” here's to another year of growth, in every sense of the word.\n\n"
         "Warmly,\n"
         "The LandCheck Green Team"
     )
     body_html = f"""
     <p style="margin:0 0 16px;font-size:15px;line-height:1.7;color:#173624;">Hello {html.escape(recipient_name)},</p>
-    <p style="margin:0 0 18px;font-size:15px;line-height:1.7;color:#173624;">Happy Birthday from all of us at LandCheck Green! 🎉</p>
+    <p style="margin:0 0 18px;font-size:15px;line-height:1.7;color:#173624;">Happy Birthday from all of us at LandCheck Green! ðŸŽ‰</p>
     <p style="margin:0 0 20px;font-size:15px;line-height:1.8;color:#173624;font-style:italic;">{html.escape(birthday_wish)}</p>
-    <p style="margin:0 0 20px;font-size:15px;line-height:1.7;color:#173624;">To celebrate you, we're planting <strong>{quantity} {html.escape(tree_word)}</strong> in your name at <strong>{html.escape(project_name)}</strong>{f', {html.escape(location_text)}' if location_text else ''} — completely free of charge.</p>
+    <p style="margin:0 0 20px;font-size:15px;line-height:1.7;color:#173624;">To celebrate you, we're planting <strong>{quantity} {html.escape(tree_word)}</strong> in your name at <strong>{html.escape(project_name)}</strong>{f', {html.escape(location_text)}' if location_text else ''} â€” completely free of charge.</p>
     {f'<div style="border:1px solid #dbece0;border-radius:16px;background:#f8fcf9;padding:20px;margin:0 0 20px;"><p style="margin:0;font-size:14.5px;font-style:italic;line-height:1.7;color:#173624;">{html.escape(dedication_message)}</p></div>' if dedication_message else ''}
     <p style="margin:0 0 20px;font-size:15px;line-height:1.7;color:#173624;">You'll receive a notification and email the moment our field agents plant and verify your tree(s).</p>
     <a href="{html.escape(claim_url, quote=True)}" style="display:inline-block;padding:14px 22px;border-radius:999px;background:linear-gradient(135deg,#1f8c58,#0f6f39);color:#ffffff;font-size:15px;font-weight:800;text-decoration:none;box-shadow:0 10px 22px rgba(15,111,57,0.28);">Set up your account &amp; see your tree</a>
     <p style="margin:20px 0 0;font-size:13px;line-height:1.7;color:#5c7a68;">Or get the app directly: <a href="{html.escape(android_apk_url, quote=True)}" style="color:#1f8c58;font-weight:700;text-decoration:none;">{html.escape(android_apk_url)}</a></p>
-    <p style="margin:22px 0 0;font-size:14px;line-height:1.7;color:#173624;">Happy Birthday, once again — here's to another year of growth, in every sense of the word.</p>
+    <p style="margin:22px 0 0;font-size:14px;line-height:1.7;color:#173624;">Happy Birthday, once again â€” here's to another year of growth, in every sense of the word.</p>
     """
     html_body = _render_premium_email_shell(
         kicker="Happy Birthday",
@@ -15244,7 +15260,7 @@ def create_admin_birthday_gift_sponsorship(payload: AdminCreateBirthdayGiftPaylo
                 "currency": checkout_currency,
                 "dedication_name": full_name_clean,
                 "dedication_message": dedication_message_clean,
-                "purchaser_note": "LandCheck birthday gift — added by superadmin",
+                "purchaser_note": "LandCheck birthday gift â€” added by superadmin",
                 "consent_version": SPONSOR_TERMS_VERSION,
                 "birthday_send_date": birthday_send_date,
             },
@@ -15368,7 +15384,7 @@ def list_admin_birthday_gifts(db: Session = Depends(get_db)):
 def _run_birthday_gift_celebration_check(db: Session, request: Request | None = None) -> int:
     """Fires the birthday celebration email for any birthday-gift order whose scheduled date is
     today (Africa/Lagos). Safe to call more than once concurrently (e.g. the daily scheduler and
-    a manual trigger firing close together) — each order is atomically claimed via the
+    a manual trigger firing close together) â€” each order is atomically claimed via the
     UPDATE ... WHERE birthday_email_sent_at IS NULL below before its email is sent, so only one
     caller ever wins per order even without a global lock.
     """
@@ -15478,7 +15494,7 @@ def _send_sponsor_engagement_prospect_email(
     body = (
         f"Hello {recipient_name},\n\n"
         "Climate action starts with a single tree. Your LandCheck Green account is ready whenever you'd like to sponsor "
-        "your first tree — every sponsorship is verified with GPS, photo evidence, and ongoing maintenance updates.\n\n"
+        "your first tree â€” every sponsorship is verified with GPS, photo evidence, and ongoing maintenance updates.\n\n"
         f"See projects open for sponsorship: {sponsor_storefront_url}\n\n"
         "Regards,\n"
         "LandCheck Green\n\n"
@@ -15486,7 +15502,7 @@ def _send_sponsor_engagement_prospect_email(
     )
     body_html = f"""
     <p style="margin:0 0 16px;font-size:15px;line-height:1.7;color:#173624;">Hello {html.escape(recipient_name)},</p>
-    <p style="margin:0 0 20px;font-size:15px;line-height:1.7;color:#173624;">Climate action starts with a single tree. Your LandCheck Green account is ready whenever you'd like to sponsor your first tree — every sponsorship is verified with GPS, photo evidence, and ongoing maintenance updates.</p>
+    <p style="margin:0 0 20px;font-size:15px;line-height:1.7;color:#173624;">Climate action starts with a single tree. Your LandCheck Green account is ready whenever you'd like to sponsor your first tree â€” every sponsorship is verified with GPS, photo evidence, and ongoing maintenance updates.</p>
     {_render_sponsor_engagement_projects_html(projects)}
     <a href="{html.escape(sponsor_storefront_url, quote=True)}" style="display:inline-block;padding:14px 22px;border-radius:999px;background:linear-gradient(135deg,#1f8c58,#0f6f39);color:#ffffff;font-size:15px;font-weight:800;text-decoration:none;box-shadow:0 10px 22px rgba(15,111,57,0.28);">Sponsor your first tree</a>
     <p style="margin:24px 0 0;font-size:12px;line-height:1.7;color:#a9bdb0;">No longer want these emails? <a href="{html.escape(unsubscribe_url, quote=True)}" style="color:#a9bdb0;">Unsubscribe</a></p>
@@ -15521,7 +15537,7 @@ def _send_sponsor_engagement_thankyou_email(
     unsubscribe_url = _build_sponsor_engagement_unsubscribe_url(sponsor_id, to_email, request)
     body = (
         f"Hello {recipient_name},\n\n"
-        f"Thank you for sponsoring {total_trees} {tree_word} with LandCheck Green at {project_names} — your support is "
+        f"Thank you for sponsoring {total_trees} {tree_word} with LandCheck Green at {project_names} â€” your support is "
         "directly funding verified planting, maintenance, and field evidence.\n\n"
         "If you'd like to grow your impact, here are projects currently open for sponsorship:\n"
         f"{sponsor_storefront_url}\n\n"
@@ -15531,7 +15547,7 @@ def _send_sponsor_engagement_thankyou_email(
     )
     body_html = f"""
     <p style="margin:0 0 16px;font-size:15px;line-height:1.7;color:#173624;">Hello {html.escape(recipient_name)},</p>
-    <p style="margin:0 0 20px;font-size:15px;line-height:1.7;color:#173624;">Thank you for sponsoring <strong>{total_trees} {html.escape(tree_word)}</strong> with LandCheck Green at <strong>{html.escape(project_names)}</strong> — your support is directly funding verified planting, maintenance, and field evidence.</p>
+    <p style="margin:0 0 20px;font-size:15px;line-height:1.7;color:#173624;">Thank you for sponsoring <strong>{total_trees} {html.escape(tree_word)}</strong> with LandCheck Green at <strong>{html.escape(project_names)}</strong> â€” your support is directly funding verified planting, maintenance, and field evidence.</p>
     <p style="margin:0 0 20px;font-size:15px;line-height:1.7;color:#173624;">If you'd like to grow your impact, here are projects currently open for sponsorship:</p>
     {_render_sponsor_engagement_projects_html(projects)}
     <a href="{html.escape(sponsor_storefront_url, quote=True)}" style="display:inline-block;padding:14px 22px;border-radius:999px;background:linear-gradient(135deg,#1f8c58,#0f6f39);color:#ffffff;font-size:15px;font-weight:800;text-decoration:none;box-shadow:0 10px 22px rgba(15,111,57,0.28);">Sponsor another tree</a>
@@ -16036,7 +16052,7 @@ async def shopify_merchant_webhook(merchant_uid: str, request: Request, db: Sess
         )
         db.commit()
         # Still return 200: Shopify treats non-2xx as "retry forever," but a payload we can't
-        # process (e.g. missing customer email) will never succeed on retry either — the error
+        # process (e.g. missing customer email) will never succeed on retry either â€” the error
         # is recorded in green_merchant_webhook_events for an admin to investigate instead.
         return {"ok": False, "error": str(exc.detail or exc)}
 
@@ -16216,7 +16232,7 @@ def public_sponsor_order_lookup(
 ):
     """Let a guest (or any sponsor) see their full order history without logging in.
 
-    Requires the exact order_uid + the email on that order's account — this pairing
+    Requires the exact order_uid + the email on that order's account â€” this pairing
     can't be guessed/enumerated the way a bare email lookup could.
     """
     clean_email = _normalize_email_address(email)
@@ -16566,44 +16582,44 @@ def _calculate_sponsor_achievement(db: Session, sponsor_id: int) -> dict:
     
     level = "Seed Supporter"
     badge_code = "seed_supporter"
-    badge_emoji = "🌱"
+    badge_emoji = "ðŸŒ±"
     next_level = "Green Supporter"
     next_level_threshold = 10
     
     if total_trees >= 500:
         level = "Earth Guardian"
         badge_code = "earth_guardian"
-        badge_emoji = "🌍"
+        badge_emoji = "ðŸŒ"
         next_level = None
         next_level_threshold = None
     elif total_trees >= 100:
         level = "Climate Champion"
         badge_code = "climate_champion"
-        badge_emoji = "🌲"
+        badge_emoji = "ðŸŒ²"
         next_level = "Earth Guardian"
         next_level_threshold = 500
     elif total_trees >= 50:
         level = "Forest Builder"
         badge_code = "forest_builder"
-        badge_emoji = "🌳"
+        badge_emoji = "ðŸŒ³"
         next_level = "Climate Champion"
         next_level_threshold = 100
     elif total_trees >= 10:
         level = "Green Supporter"
         badge_code = "green_supporter"
-        badge_emoji = "🌿"
+        badge_emoji = "ðŸŒ¿"
         next_level = "Forest Builder"
         next_level_threshold = 50
     elif total_trees >= 1:
         level = "Seed Supporter"
         badge_code = "seed_supporter"
-        badge_emoji = "🌱"
+        badge_emoji = "ðŸŒ±"
         next_level = "Green Supporter"
         next_level_threshold = 10
     else:
         level = "Climate Contributor"
         badge_code = "climate_contributor"
-        badge_emoji = "🌱"
+        badge_emoji = "ðŸŒ±"
         next_level = "Seed Supporter"
         next_level_threshold = 1
         
@@ -17036,17 +17052,17 @@ def _render_sponsor_leaderboard_html(data: dict) -> str:
 <body>
   <header>
     <div class="header-content">
-      <div class="header-badge">🏆 Climate Action</div>
+      <div class="header-badge">ðŸ† Climate Action</div>
       <h1>Monthly Leaderboard</h1>
       <p>Top supporters sponsoring forest restoration and climate action under LandCheck Green restoration initiative this month.</p>
     </div>
   </header>
   <div class="container">
     <div class="tabs">
-      <button class="tab-button active" onclick="switchTab('top_overall')">🌍 Overall</button>
-      <button class="tab-button" onclick="switchTab('top_schools')">🏫 Schools</button>
-      <button class="tab-button" onclick="switchTab('top_communities')">👥 Communities</button>
-      <button class="tab-button" onclick="switchTab('top_companies')">🏢 Companies</button>
+      <button class="tab-button active" onclick="switchTab('top_overall')">ðŸŒ Overall</button>
+      <button class="tab-button" onclick="switchTab('top_schools')">ðŸ« Schools</button>
+      <button class="tab-button" onclick="switchTab('top_communities')">ðŸ‘¥ Communities</button>
+      <button class="tab-button" onclick="switchTab('top_companies')">ðŸ¢ Companies</button>
     </div>
     
     <div class="leaderboard-card">
@@ -17075,11 +17091,11 @@ def _render_sponsor_leaderboard_html(data: dict) -> str:
     
     function getBadgeEmoji(level) {{
       const l = String(level || "").toLowerCase();
-      if (l.includes("guardian")) return "🌍";
-      if (l.includes("champion")) return "🌲";
-      if (l.includes("builder")) return "🌳";
-      if (l.includes("green")) return "🌿";
-      return "🌱";
+      if (l.includes("guardian")) return "ðŸŒ";
+      if (l.includes("champion")) return "ðŸŒ²";
+      if (l.includes("builder")) return "ðŸŒ³";
+      if (l.includes("green")) return "ðŸŒ¿";
+      return "ðŸŒ±";
     }}
     
     function renderList(listKey) {{
@@ -17089,7 +17105,7 @@ def _render_sponsor_leaderboard_html(data: dict) -> str:
       if (items.length === 0) {{
         container.innerHTML = `
           <div class="empty-state">
-            <div class="empty-icon">🌱</div>
+            <div class="empty-icon">ðŸŒ±</div>
             <h3>No entries this month</h3>
             <p>Be the first to sponsor a tree in this category this month!</p>
           </div>
@@ -18264,7 +18280,7 @@ def resolve_admin_complaint(
     return {"ok": True}
 
 
-# ─── "Planty" sponsor assistant — FAQ matching + escalation to a human ────────
+# â”€â”€â”€ "Planty" sponsor assistant â€” FAQ matching + escalation to a human â”€â”€â”€â”€â”€â”€â”€â”€
 # Rule-based, not an LLM: a fixed keyword-scored knowledge base covering the
 # questions guest sponsors actually ask. Anything it can't confidently answer
 # is escalated into green_assistant_escalations, which surfaces in the
@@ -18281,7 +18297,7 @@ ASSISTANT_FAQ_INTENTS: list[dict] = [
         "key": "pricing",
         "sample_question": "How much does it cost to sponsor a tree?",
         "keywords": ["price", "cost", "how much", "fee", "charge", "expensive", "cheap"],
-        "answer": "Sponsorship pricing varies by project and is shown in Naira (NGN) or US Dollars (USD) on each project card before you check out — you pick whichever currency works best for you at checkout.",
+        "answer": "Sponsorship pricing varies by project and is shown in Naira (NGN) or US Dollars (USD) on each project card before you check out â€” you pick whichever currency works best for you at checkout.",
     },
     {
         "key": "guest_checkout",
@@ -18293,7 +18309,7 @@ ASSISTANT_FAQ_INTENTS: list[dict] = [
         "key": "tracking",
         "sample_question": "How do I track my sponsored tree?",
         "keywords": ["track", "order status", "where is my tree", "find my order", "order id"],
-        "answer": "You can track your sponsorship any time using \"Track Order\" at the top of this page — just enter the order ID from your confirmation email and the email address you sponsored with.",
+        "answer": "You can track your sponsorship any time using \"Track Order\" at the top of this page â€” just enter the order ID from your confirmation email and the email address you sponsored with.",
     },
     {
         "key": "certificate",
@@ -18311,7 +18327,7 @@ ASSISTANT_FAQ_INTENTS: list[dict] = [
         "key": "currency_international",
         "sample_question": "Can I sponsor from outside Nigeria?",
         "keywords": ["dollar", "usd", "naira", "ngn", "outside nigeria", "abroad", "diaspora", "another country", "foreign", "overseas"],
-        "answer": "Yes — you can sponsor a tree from anywhere in the world. Just choose USD as your checkout currency if you're paying from outside Nigeria (NGN is also available).",
+        "answer": "Yes â€” you can sponsor a tree from anywhere in the world. Just choose USD as your checkout currency if you're paying from outside Nigeria (NGN is also available).",
     },
     {
         "key": "climate_impact",
@@ -18323,7 +18339,7 @@ ASSISTANT_FAQ_INTENTS: list[dict] = [
         "key": "project_verification",
         "sample_question": "Are these projects verified and legit?",
         "keywords": ["verified", "legit", "real", "scam", "trust", "genuine"],
-        "answer": "Every project is GPS-mapped and field-monitored by LandCheck officers, with photo evidence and location data recorded at every stage — from planting through maturity.",
+        "answer": "Every project is GPS-mapped and field-monitored by LandCheck officers, with photo evidence and location data recorded at every stage â€” from planting through maturity.",
     },
     {
         "key": "land_rights",
@@ -18335,7 +18351,7 @@ ASSISTANT_FAQ_INTENTS: list[dict] = [
         "key": "refund_cancel",
         "sample_question": "Can I get a refund or cancel my order?",
         "keywords": ["refund", "cancel", "money back"],
-        "answer": "If you have an issue with your order, our support team can help — please share your order ID and we'll look into it personally.",
+        "answer": "If you have an issue with your order, our support team can help â€” please share your order ID and we'll look into it personally.",
     },
     {
         "key": "payment_pending",
@@ -18347,7 +18363,7 @@ ASSISTANT_FAQ_INTENTS: list[dict] = [
         "key": "dedication_gift",
         "sample_question": "Can I gift or dedicate a tree to someone?",
         "keywords": ["gift", "dedicate", "memory of", "birthday", "anniversary", "honour", "honor"],
-        "answer": "Yes! At checkout you can dedicate your tree to someone — for a birthday, anniversary, memorial, or just to celebrate them — and add a personal message.",
+        "answer": "Yes! At checkout you can dedicate your tree to someone â€” for a birthday, anniversary, memorial, or just to celebrate them â€” and add a personal message.",
     },
     {
         "key": "bulk_organization",
@@ -18359,7 +18375,7 @@ ASSISTANT_FAQ_INTENTS: list[dict] = [
         "key": "updates_frequency",
         "sample_question": "How often will I get updates on my tree?",
         "keywords": ["how often", "updates", "photos", "hear from you"],
-        "answer": "You'll receive email updates with GPS location and photo evidence as your tree is planted and maintained — no account required to check on it.",
+        "answer": "You'll receive email updates with GPS location and photo evidence as your tree is planted and maintained â€” no account required to check on it.",
     },
     {
         "key": "planting_timeline",
@@ -18377,13 +18393,13 @@ ASSISTANT_FAQ_INTENTS: list[dict] = [
         "key": "app_download",
         "sample_question": "Is there a mobile app?",
         "keywords": ["app", "download", "android", "mobile app", "play store"],
-        "answer": "Yes — LandCheck Green has a free Android app where you can track your sponsored trees, see your certificate, and view your impact. The download link is available after your first sponsorship.",
+        "answer": "Yes â€” LandCheck Green has a free Android app where you can track your sponsored trees, see your certificate, and view your impact. The download link is available after your first sponsorship.",
     },
     {
         "key": "multiple_trees",
         "sample_question": "How many trees should I sponsor?",
         "keywords": ["more than one", "multiple trees", "several trees", "how many can i", "how many should", "how many trees", "how many can", "sponsor more than"],
-        "answer": "You can sponsor as many trees as you'd like in a single order — just adjust the quantity before checkout. If you want a personalized recommendation, try the CO2 footprint calculator linked above the project list.",
+        "answer": "You can sponsor as many trees as you'd like in a single order â€” just adjust the quantity before checkout. If you want a personalized recommendation, try the CO2 footprint calculator linked above the project list.",
     },
 ]
 
@@ -18402,12 +18418,12 @@ def _match_assistant_intent(message: str) -> dict | None:
     return best_intent if best_score > 0 else None
 
 
-# ─── Gemini free-tier fallback ─────────────────────────────────────────────
+# â”€â”€â”€ Gemini free-tier fallback â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # When the keyword matcher above misses, we optionally ask Gemini's free tier
 # to answer using ONLY the FAQ knowledge base as context (grounded, not open
 # web knowledge), so it can't confidently invent pricing/impact claims. If
 # GEMINI_API_KEY isn't set, or the call fails or times out, this returns None
-# and the caller falls back to human escalation exactly as before — the
+# and the caller falls back to human escalation exactly as before â€” the
 # feature is fully optional and the bot works without it.
 
 GEMINI_API_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
@@ -18435,7 +18451,7 @@ def _ask_gemini_assistant(message: str) -> str | None:
         return None
     prompt = (
         "You are Planty, a friendly assistant on LandCheck Green's public tree-sponsorship page. "
-        "Answer the visitor's question using ONLY the information in the FAQ knowledge base below — "
+        "Answer the visitor's question using ONLY the information in the FAQ knowledge base below â€” "
         "never invent prices, policies, or claims that aren't there. Keep the answer short (2-3 sentences) and warm. "
         f"If the knowledge base does not clearly cover the question, reply with exactly the single word {GEMINI_ESCALATE_SENTINEL} and nothing else.\n\n"
         f"FAQ knowledge base:\n{_build_assistant_faq_context()}\n\n"
@@ -18458,7 +18474,7 @@ def _ask_gemini_assistant(message: str) -> str | None:
             retry_after_header = str(response.headers.get("Retry-After") or "").strip()
             wait_seconds = float(retry_after_header) if retry_after_header.replace(".", "", 1).isdigit() else 1.5
             logger.warning(
-                "Gemini assistant hit 429 rate limit (attempt %s/%s) — check quota at aistudio.google.com",
+                "Gemini assistant hit 429 rate limit (attempt %s/%s) â€” check quota at aistudio.google.com",
                 attempt, max_attempts,
             )
             if attempt < max_attempts:
@@ -18546,7 +18562,7 @@ def sponsor_assistant_escalate(payload: AssistantEscalatePayload, db: Session = 
         },
     )
     db.commit()
-    return {"ok": True, "message": "Thanks — our team will review this and email you back soon."}
+    return {"ok": True, "message": "Thanks â€” our team will review this and email you back soon."}
 
 
 @router.get("/admin/assistant-escalations")
@@ -19873,7 +19889,7 @@ def _render_sponsor_public_terms_html(request: Request | None = None) -> str:
             <li>LandCheck processes sponsor account and checkout information in line with its privacy policy and operational privacy controls. Review the privacy policy here: <a href="{privacy_url}" target="_blank" rel="noopener noreferrer">{privacy_url}</a>.</li>
             <li>Public sponsor checkout records may include account details, project choices, payment status, IP address, and field evidence linked to funded trees for service delivery, audit, fraud prevention, and support handling.</li>
             <li>These terms are designed to align with LandCheck operational data handling under the Nigeria Data Protection Act 2023 and fair information handling expectations for platform users.</li>
-            <li>Consumer-facing disclosures, price display, and complaint handling are intended to remain consistent with basic transparency and redress expectations under Nigeria’s consumer protection framework.</li>
+            <li>Consumer-facing disclosures, price display, and complaint handling are intended to remain consistent with basic transparency and redress expectations under Nigeriaâ€™s consumer protection framework.</li>
             <li>Online payments are processed through integrated third-party payment providers. LandCheck does not ask sponsors to bypass the secure payment flow for card payments inside the public route.</li>
           </ul>
         </section>
@@ -19916,7 +19932,7 @@ def _render_sponsor_public_reset_password_html(token: str) -> str:
     safe_token = html.escape(str(token or "").strip(), quote=True)
     # Two possible destinations after saving: individual/organization sponsors go to the
     # shared sponsor login form; merchants go to their own dedicated login page (never the
-    # bare /green/login selector, which only offers "Sponsor Trees" / "Perform Field Work" —
+    # bare /green/login selector, which only offers "Sponsor Trees" / "Perform Field Work" â€”
     # neither reads as "I just reset my password"). The reset-password response tells us
     # which account type this was, so the redirect is chosen at save time, not render time.
     configured_green_url = str(os.getenv("LANDCHECK_GREEN_URL") or "").strip()
@@ -20401,7 +20417,7 @@ def export_sponsorship_unit_qr_tag_pdf(
         carbon = _build_tree_carbon_summary(item)
         item["annual_co2_kg"] = carbon.get("annual_co2_kg", 21.0)
     else:
-        # Not planted yet — the tag is printed ahead of fieldwork, so a real
+        # Not planted yet â€” the tag is printed ahead of fieldwork, so a real
         # planting_date/status don't exist. Show the print date and "Alive"
         # (the tree is expected to be planted and alive by the time this tag
         # is actually attached) rather than a blank or stale placeholder.
@@ -20417,7 +20433,7 @@ def export_sponsorship_unit_qr_tag_pdf(
         pdf_bytes = render_green_tree_qr_tag_pdf(item, verification_url)
     except Exception:
         logger.exception("QR tag PDF render failed for unit_id=%s", int(unit_id))
-        raise HTTPException(status_code=500, detail="Failed to generate QR tag PDF — please retry or contact support.")
+        raise HTTPException(status_code=500, detail="Failed to generate QR tag PDF â€” please retry or contact support.")
     downloader_name = str(user_row.get("full_name") or user_row.get("work_username") or "").strip() or None
     _mark_sponsor_unit_qr_download(
         db,
@@ -20518,7 +20534,7 @@ def export_agent_sponsor_qr_sheet_pdf(
     for row in rows:
         item = dict(row)
         item["verification_url"] = _build_sponsor_public_story_url(item.get("unit_uid"), request)
-        # Every unit here is pre-plant by definition (query filters tree_id IS NULL) — show
+        # Every unit here is pre-plant by definition (query filters tree_id IS NULL) â€” show
         # the print date and "Alive" rather than a blank/stale placeholder, same as the
         # single pre-plant tag endpoint.
         item["planting_date"] = date.today().isoformat()
@@ -21007,10 +21023,10 @@ def create_sponsor_agent_payout_request(payload: SponsorAgentPayoutRequestPayloa
 
     updated_row = dict(row) if row else None
     transfer_error: str | None = None
-    # Automatically attempt the Flutterwave payout right here — no super admin click
+    # Automatically attempt the Flutterwave payout right here â€” no super admin click
     # required. If Flutterwave isn't configured, or the attempt fails for any reason (bad
     # bank details, gateway down, IP not whitelisted, transfers not enabled on the account,
-    # etc.), this must NOT fail or block the agent's request — it just falls back to the
+    # etc.), this must NOT fail or block the agent's request â€” it just falls back to the
     # existing pending/failed state, which the admin can review or retry manually exactly as
     # before (the "Retry Auto Payout" button already handles a failed transfer_status).
     if updated_row and _flutterwave_secret_key():
@@ -21495,10 +21511,10 @@ def reissue_admin_sponsor_qr_status_bulk(
     }
 
 
-# ─── Per-sponsor planting assignment (public-sponsor-route projects only) ──
+# â”€â”€â”€ Per-sponsor planting assignment (public-sponsor-route projects only) â”€â”€
 # Lets a super admin pick a specific PAID sponsor, see how many of that
 # sponsor's trees are already assigned (and to whom), and assign some/all of
-# the remaining unassigned ones to an agent — or cancel an assignment that
+# the remaining unassigned ones to an agent â€” or cancel an assignment that
 # hasn't been planted yet. This is the donor-scoped alternative to typing a
 # flat target_trees number into a work order.
 
@@ -21589,8 +21605,8 @@ class AssignSponsorDonorTreesPayload(BaseModel):
     sponsor_account_id: int
     agent_user_id: int
     count: int | None = None  # omit or <=0 to mean "all remaining"; ignored if species_allocations is set
-    species: str | None = None  # single species applied to the whole batch — optional
-    species_allocations: list[dict] | None = None  # e.g. [{"species": "Mahogany", "count": 10}] — optional, overrides count/species
+    species: str | None = None  # single species applied to the whole batch â€” optional
+    species_allocations: list[dict] | None = None  # e.g. [{"species": "Mahogany", "count": 10}] â€” optional, overrides count/species
 
 
 @router.post("/admin/public-sponsor-donors/assign")
@@ -21756,7 +21772,7 @@ def assign_public_sponsor_donor_trees(payload: AssignSponsorDonorTreesPayload, d
 
     if new_species_entries:
         # QR exports re-derive each unit's allocated_species from this work order's own
-        # species_allocations column (_sync_sponsor_unit_allocations_for_agent) — without
+        # species_allocations column (_sync_sponsor_unit_allocations_for_agent) â€” without
         # persisting the species here too, that sync overwrites what we just wrote above
         # back to NULL ("Unknown species") on the next tag download.
         existing_species_row = db.execute(
@@ -22142,7 +22158,7 @@ def list_admin_sponsorship_orders(
     sync: bool = Query(default=False),
     db: Session = Depends(get_db),
 ):
-    # sync_gateway=False by default – avoids blocking on Flutterwave API calls during listing.
+    # sync_gateway=False by default â€“ avoids blocking on Flutterwave API calls during listing.
     # Pass ?sync=1 to explicitly trigger gateway sync for the returned orders.
     return _list_admin_sponsorship_orders(db, project_id=project_id, sync_gateway=sync)
 
@@ -22277,7 +22293,7 @@ def list_admin_sponsor_agent_payouts(
     # request aggregates ALL of an agent's earnings org-wide (see _build_sponsor_agent_dashboard)
     # regardless of which project is currently selected here. Scoping the agent roster to just
     # the one selected project meant agents who only earned on a different project in this same
-    # organization never appeared in this tab — so collect the roster across every public-sponsor
+    # organization never appeared in this tab â€” so collect the roster across every public-sponsor
     # project in the organization instead of just this one.
     if organization_id > 0:
         org_project_rows = db.execute(
@@ -22298,7 +22314,7 @@ def list_admin_sponsor_agent_payouts(
             {"organization_id": organization_id},
         ).mappings().all()
     else:
-        # No organization set on this project — treat every other org-less public-sponsor
+        # No organization set on this project â€” treat every other org-less public-sponsor
         # project as part of the same shared pool instead of falling back to just this one
         # project (which would silently reproduce the single-project bug for any deployment
         # that doesn't populate organization_id).
@@ -22347,7 +22363,7 @@ def list_admin_sponsor_agent_payouts(
         agent_id_set.update(_normalize_positive_int_list(proj_agent_ids))
 
     # Safety net: an agent who already has a payout request row must always show up here
-    # regardless of whether the roster-matching above (name/assignment based) found them —
+    # regardless of whether the roster-matching above (name/assignment based) found them â€”
     # otherwise a submitted request can silently vanish from this tab even though it exists.
     try:
         existing_requester_ids = db.execute(
@@ -22418,7 +22434,7 @@ def list_admin_sponsor_agent_payouts(
         try:
             # No organization_id filter here: this project's own public_sponsor_agent_user_ids
             # (or a direct assignee/assigned-user match) is already the authorization for "is
-            # this a valid agent on this project" — re-checking the agent's own green_users
+            # this a valid agent on this project" â€” re-checking the agent's own green_users
             # organization_id for strict equality against the project's organization_id was
             # silently 404'ing (and hiding) agents whose account organization_id happens to be
             # unset or set differently from the project's, even though they were explicitly
@@ -22437,7 +22453,7 @@ def list_admin_sponsor_agent_payouts(
                 str(exc.detail or exc),
             )
             diagnostics["agent_errors"].append({"agent_id": int(agent_id), "error": str(exc.detail or exc)})
-            # Fall back to the agent's raw payout requests directly — an account-state issue
+            # Fall back to the agent's raw payout requests directly â€” an account-state issue
             # (inactive account, suspended org, etc.) shouldn't make an already-submitted
             # payout request invisible to the admin; it still needs a decision.
             try:
@@ -22458,7 +22474,7 @@ def list_admin_sponsor_agent_payouts(
             continue
         # Always surface this agent's payout requests for admin review/action, even if they
         # are no longer considered a currently "eligible" agent (e.g. removed from the
-        # project's agent roster after applying) — a submitted request still needs a decision
+        # project's agent roster after applying) â€” a submitted request still needs a decision
         # and must never silently disappear from this tab.
         for request_item in dashboard.get("requests") or []:
             request_id = int(request_item.get("id") or 0)
@@ -22467,8 +22483,8 @@ def list_admin_sponsor_agent_payouts(
         # Deliberately NOT gating on dashboard.get("eligible") here: that flag depends on a
         # separate, org-matching-sensitive project lookup (_list_public_sponsor_projects_for_agent)
         # meant for the AGENT's own mobile session. Here, membership in agent_ids already IS
-        # the authorization — this admin explicitly selected this user for this exact project
-        # (or the user has a direct assignment/payout request on it) — so re-deriving eligibility
+        # the authorization â€” this admin explicitly selected this user for this exact project
+        # (or the user has a direct assignment/payout request on it) â€” so re-deriving eligibility
         # a second time only risks re-excluding a correctly-registered agent over an unrelated
         # organization_id mismatch, which is exactly what was happening before this fix.
         summary = dashboard.get("summary") or {}
@@ -31189,7 +31205,7 @@ def create_work_order(
                 detail="No paid sponsor trees are currently awaiting planting in this project. Capture payment-backed sponsor trees first, then assign planting work.",
             )
         # The backlog above is shared across every agent's active planting order on this
-        # project — a brand-new assignment must not promise trees that are already spoken
+        # project â€” a brand-new assignment must not promise trees that are already spoken
         # for by another agent's still-outstanding (unplanted) quota, or two agents can each
         # pass this check individually while jointly over-committing the same backlog.
         committed_to_other_orders = db.execute(

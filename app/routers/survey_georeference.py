@@ -1,4 +1,3 @@
-import csv
 import hashlib
 import io
 import json
@@ -33,6 +32,7 @@ from app.utils.georeference_ai_digitize import (
     GeoreferenceAiDigitizeError,
     detect_digitized_points,
 )
+from app.services.survey.dgps import render_dgps_staking_csv
 
 
 router = APIRouter(prefix="/survey-georeference", tags=["survey-georeference"])
@@ -1677,16 +1677,6 @@ async def ai_digitize_georeference_session(session_id: str, request: Request, db
     }
 
 
-def _format_coordinate_number(value: float, decimals: int) -> str:
-    # Plain "." decimal formatting, no thousands separator and no Excel formula-forcing wrapper -
-    # this file's whole purpose is DGPS/GIS ingestion (QGIS, AutoCAD Civil 3D, DGPS receivers,
-    # etc.), and every one of those expects a bare numeric token like "211213.1260". A
-    # comma-grouped "211,213.1260" or an ="..." formula string is not a valid number to any of
-    # them - it would only ever have helped Excel specifically, at the cost of breaking the export
-    # for the software it's actually meant for.
-    return f"{float(value):.{decimals}f}"
-
-
 @router.get("/sessions/{session_id}/exports/staking.csv")
 def export_georeference_staking_csv(session_id: str, request: Request, raw: bool = False, db: Session = Depends(get_db)):
     row = _load_session_row(db, session_id)
@@ -1711,29 +1701,9 @@ def export_georeference_staking_csv(session_id: str, request: Request, raw: bool
     if not rows:
         raise HTTPException(status_code=400, detail="Add ground control points or digitized features before exporting CSV.")
 
-    csv_buffer = io.StringIO(newline="")
-    # "sep=," as the literal first line forces Excel to parse this as comma-delimited on
-    # double-click regardless of the machine's regional list separator - the fix for "everything
-    # lands in column A" that most LandCheck Survey users hit, since most open this in Excel, not
-    # GIS software. A GIS/DGPS import tool that needs the strict form (no hint line, since some
-    # CSV readers treat it as a malformed data row) can pass ?raw=1.
-    if not raw:
-        csv_buffer.write("sep=,\r\n")
-    writer = csv.writer(csv_buffer, lineterminator="\r\n")
-    writer.writerow(["Type", "Station", "Feature", "Coordinate System", "Easting (m)", "Northing (m)", "Longitude", "Latitude"])
-    for item in rows:
-        writer.writerow(
-            [
-                item.get("point_type", ""),
-                item["station"],
-                item["feature"],
-                str(item["coordinate_system"]).upper(),
-                _format_coordinate_number(item["easting"], 4),
-                _format_coordinate_number(item["northing"], 4),
-                _format_coordinate_number(item["longitude"], 8),
-                _format_coordinate_number(item["latitude"], 8),
-            ]
-        )
+    # This is shared with Estate staking so the same receiver-safe columns and Excel delimiter
+    # behavior are used irrespective of how the coordinates entered LandCheck.
+    csv_content = render_dgps_staking_csv(rows, raw=raw)
     _touch_session(db, session_id)
     # Mirrors the frontend's own georeference identity fallback chain (SurveyPlan.tsx): session
     # title, then the originally-uploaded raster's filename (extension stripped), then a short
@@ -1752,7 +1722,7 @@ def export_georeference_staking_csv(session_id: str, request: Request, raw: bool
         details={"export_type": "staking.csv", "row_count": len(rows)},
     )
     return Response(
-        content="\ufeff" + csv_buffer.getvalue(),
+        content=csv_content,
         media_type="text/csv; charset=utf-8",
         headers={
             "Content-Disposition": f'attachment; filename="{identity}_DGPS_Staking.csv"',

@@ -1,0 +1,1235 @@
+from __future__ import annotations
+
+import csv
+import io
+import json
+import re
+import tempfile
+import os
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
+from fastapi.responses import Response
+from geoalchemy2.shape import from_shape, to_shape
+from pyproj import Transformer
+import ezdxf
+from shapely.geometry import mapping, shape
+from sqlalchemy.orm import Session
+
+from app.routers.plots import get_db
+from app.services.estates.authorization import list_estate_access, resolve_estate_principal
+from app.services.estates.entitlements import ESTATE_FEATURES, get_estate_entitlement
+from app.models.estate_foundation import Estate, EstateAllocation, EstateAuditEvent, EstateBlock, EstateCustomer, EstateDocument, EstateDocumentLink, EstateFieldInspection, EstateHazardAssessment, EstateImportReview, EstateOrganization, EstateOrganizationMember, EstatePayment, EstatePaymentRule, EstatePlot, EstateSpatialFeature, EstateSurveyRequest, EstateStakingTask
+from app.schemas.estates import AllocationAction, BlockCreate, BlockUpdate, CustomerCreate, DevelopmentStatusUpdate, EstateCreate, EstateUpdate, FieldInspectionCreate, ImportReviewCreate, ImportReviewDecision, MemberCreate, MemberUpdate, PlotCreate, PaymentCreate, SpatialFeatureCreate, SpatialFeatureUpdate, SurveyEligibilityUpdate, VoidAction
+from app.services.estates.payments import confirm_payment, financial_summary, record_payment, void_payment
+from app.services.estates.documents import read_private_estate_file, store_private_estate_file
+from app.services.estates.permissions import has_permission
+from sqlalchemy import func
+from app.services.estates.allocations import release_allocation, reserve_or_allocate
+from app.services.estates.audit import append_estate_audit_event
+from app.services.estates.authorization import require_estate_access
+from app.services.estates.survey_requests import transition
+from app.services.estates.survey_adapter import materialize_estate_plot_for_survey
+from app.schemas.estate_survey import SurveyorAssignment
+from app.services.estates.survey_eligibility import survey_eligibility
+from app.services.estates.qc import validate_polygon
+from app.services.survey.dgps import alpha_station, render_dgps_staking_csv
+from app.utils.coordinate_converter import COORDINATE_SYSTEMS, resolve_coordinate_system_key
+
+
+router = APIRouter(prefix="/estates", tags=["estates"])
+
+def _survey_payload(db, row):
+    plot=db.get(EstatePlot,row.plot_id); estate=db.get(Estate,row.estate_id)
+    allocation = db.get(EstateAllocation, row.allocation_id) if row.allocation_id else None
+    return {"id":row.id,"reference":row.request_uid,"status":row.status,"estate":{"id":estate.id,"name":estate.name},"plot":{"id":plot.id,"number":plot.plot_number},"assigned_surveyor":row.assigned_surveyor_subject_id,"survey_reference":row.survey_reference,"survey_working_plot_id":row.survey_working_plot_id,"materialized":bool(row.survey_working_plot_id),"eligibility":survey_eligibility(db, allocation),"created_at":row.created_at}
+
+
+def _normalized(value: str) -> str:
+    return re.sub(r"\s+", " ", str(value or "").strip()).upper()
+
+
+def _estate_metadata_snapshot(estate: Estate) -> dict:
+    return {
+        "name": estate.name,
+        "state": estate.state,
+        "locality": estate.locality,
+        "location_text": estate.location_text,
+        "description": estate.description,
+        "crs": estate.crs,
+        "datum": estate.datum,
+        "approximate_area_sqm": str(estate.approximate_area_sqm) if estate.approximate_area_sqm is not None else None,
+        "project_reference": estate.project_reference,
+        "project_owner": estate.project_owner,
+        "ownership_details": estate.ownership_details,
+    }
+
+
+def _enabled(db: Session, org_id: int) -> None:
+    if not get_estate_entitlement(db, org_id, "ESTATES_ENABLED").is_enabled:
+        raise HTTPException(status_code=404, detail="LandCheck Estates is not enabled")
+
+
+def _geojson_geometry(value: dict, *, allow_polygon: bool = True):
+    try:
+        geometry = shape(value)
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail="Geometry is invalid GeoJSON") from exc
+    allowed = {"Polygon", "MultiPolygon", "LineString", "MultiLineString", "Point"}
+    if not allow_polygon:
+        allowed.discard("Polygon")
+        allowed.discard("MultiPolygon")
+    if geometry.is_empty or not geometry.is_valid or geometry.geom_type not in allowed:
+        raise HTTPException(status_code=422, detail="Geometry is empty, invalid, or unsupported")
+    return geometry
+
+
+def _import_candidate(*, row_number: int, plot_number: str, geometry: dict) -> dict:
+    try:
+        _, issues = validate_polygon(geometry)
+        errors = [issue.message for issue in issues if issue.severity == "error"]
+    except Exception:
+        errors = ["geometry must be a valid GeoJSON Polygon"]
+    return {
+        "row": row_number,
+        "plot_number": plot_number.strip(),
+        "geometry": geometry,
+        "valid": not errors,
+        "issues": errors,
+    }
+
+
+@router.get("")
+def list_estates(request: Request, db: Session = Depends(get_db)):
+    principal = resolve_estate_principal(db, request)
+    access = list_estate_access(db, principal)
+    rows = []
+    for item in access:
+        if not get_estate_entitlement(db, item.organization_id, "ESTATES_ENABLED").is_enabled:
+            continue
+        rows.extend(db.query(Estate).filter(Estate.organization_id == item.organization_id, Estate.archived_at.is_(None)).all())
+    return [{"id": row.id, "uid": row.estate_uid, "name": row.name, "status": row.status, "organization_id": row.organization_id, "location": row.location_text, "crs": row.crs, "project_reference": row.project_reference, "project_owner": row.project_owner} for row in rows]
+
+
+@router.post("/organizations/{organization_id}")
+def create_estate(organization_id: int, payload: EstateCreate, request: Request, db: Session = Depends(get_db)):
+    access = require_estate_access(db, request, organization_id, permission="estate.manage")
+    _enabled(db, organization_id)
+    boundary = None
+    if payload.boundary:
+        _, issues = validate_polygon(payload.boundary)
+        if any(issue.severity == "error" for issue in issues):
+            raise HTTPException(status_code=422, detail=[issue.message for issue in issues])
+        boundary = from_shape(shape(payload.boundary), srid=4326)
+    estate = Estate(
+        organization_id=organization_id,
+        name=payload.name.strip(),
+        description=payload.description,
+        state=payload.state,
+        locality=payload.locality,
+        location_text=payload.location_text,
+        crs=payload.crs.strip(),
+        datum=payload.datum,
+        approximate_area_sqm=payload.approximate_area_sqm,
+        project_reference=payload.project_reference,
+        project_owner=payload.project_owner,
+        ownership_details=payload.ownership_details,
+        boundary=boundary,
+        created_by_subject_type=access.principal.subject_type,
+        created_by_subject_id=access.principal.subject_id,
+    )
+    db.add(estate); db.flush()
+    append_estate_audit_event(db, organization_id=organization_id, actor=access.principal, action="estate.created", entity_type="estate", entity_id=estate.id, after_data={"name": estate.name, "boundary_present": bool(boundary)})
+    db.commit()
+    return {
+        "id": estate.id,
+        "uid": estate.estate_uid,
+        "name": estate.name,
+        "status": estate.status,
+        "crs": estate.crs,
+        "project_reference": estate.project_reference,
+    }
+
+
+@router.patch("/{estate_id}")
+def update_estate(estate_id: int, payload: EstateUpdate, request: Request, db: Session = Depends(get_db)):
+    estate = db.get(Estate, estate_id)
+    if not estate:
+        raise HTTPException(404, "Estate not found")
+    access = require_estate_access(db, request, estate.organization_id, permission="estate.manage")
+    before = _estate_metadata_snapshot(estate)
+    values = payload.model_dump(exclude_unset=True)
+    if "boundary" in values:
+        if values["boundary"] is None:
+            estate.boundary = None
+        else:
+            _, issues = validate_polygon(values["boundary"])
+            if any(issue.severity == "error" for issue in issues):
+                raise HTTPException(422, detail=[issue.message for issue in issues])
+            estate.boundary = from_shape(shape(values["boundary"]), srid=4326)
+    values.pop("boundary", None)
+    for key, value in values.items():
+        setattr(estate, key, value.strip() if isinstance(value, str) else value)
+    append_estate_audit_event(
+        db,
+        organization_id=estate.organization_id,
+        actor=access.principal,
+        action="estate.updated",
+        entity_type="estate",
+        entity_id=estate.id,
+        before_data=before,
+        after_data=_estate_metadata_snapshot(estate),
+    )
+    db.commit()
+    return estate_detail(estate_id, request, db)
+
+
+@router.post("/{estate_id}/approve-map")
+def approve_estate_map(estate_id: int, request: Request, db: Session = Depends(get_db)):
+    estate = db.get(Estate, estate_id)
+    if not estate:
+        raise HTTPException(404, "Estate not found")
+    access = require_estate_access(db, request, estate.organization_id, permission="estate.manage")
+    quality = estate_quality_check(estate_id, request, db)
+    if not quality["plot_count"]:
+        raise HTTPException(409, "Add at least one approved plot before publishing the Estate map")
+    if quality["review_required"]:
+        raise HTTPException(409, "Resolve geometry issues before publishing the Estate map")
+    previous = estate.status
+    estate.status = "active"
+    append_estate_audit_event(
+        db,
+        organization_id=estate.organization_id,
+        actor=access.principal,
+        action="estate.map_approved",
+        entity_type="estate",
+        entity_id=estate.id,
+        before_data={"status": previous},
+        after_data={"status": estate.status, "plot_count": quality["plot_count"]},
+    )
+    db.commit()
+    return {"id": estate.id, "status": estate.status, "plot_count": quality["plot_count"], "published": True}
+
+
+@router.get("/{estate_id}/dashboard")
+def estate_dashboard(estate_id: int, request: Request, db: Session = Depends(get_db)):
+    estate = db.get(Estate, estate_id)
+    if not estate: raise HTTPException(404, "Estate not found")
+    require_estate_access(db, request, estate.organization_id, permission="estate.read"); _enabled(db, estate.organization_id)
+    plots = db.query(EstatePlot).filter(EstatePlot.estate_id == estate_id).all()
+    counts = {key: sum(1 for plot in plots if plot.commercial_status == key) for key in ("available", "reserved", "allocated", "on_hold")}
+    development = {key: sum(1 for plot in plots if plot.development_status == key) for key in ("not_started", "site_cleared", "foundation", "under_construction", "developed")}
+    allocations = db.query(EstateAllocation).filter(EstateAllocation.estate_id == estate_id).all()
+    summaries = [financial_summary(db, allocation) for allocation in allocations]
+    staked_plot_ids = {task.plot_id for task in db.query(EstateStakingTask).filter(EstateStakingTask.estate_id == estate_id, EstateStakingTask.status == "completed").all()}
+    awaiting_survey = sum(1 for plot in plots if plot.commercial_status == "allocated" and not db.query(EstateSurveyRequest).filter(EstateSurveyRequest.plot_id == plot.id, EstateSurveyRequest.status.in_(("in_progress", "ready_for_review", "approved", "completed"))).first())
+    survey_completed = sum(1 for plot in plots if db.query(EstateSurveyRequest).filter(EstateSurveyRequest.plot_id == plot.id, EstateSurveyRequest.status.in_(("approved", "completed"))).first())
+    return {
+        "estate": {"id": estate.id, "name": estate.name, "status": estate.status},
+        "total_plots": len(plots),
+        "statuses": {**counts, "sold": counts["allocated"]},
+        "development": development,
+        "staked_plots": len(staked_plot_ids),
+        "awaiting_survey": awaiting_survey,
+        "survey_completed": survey_completed,
+        "awaiting_staking": sum(1 for plot in plots if plot.commercial_status == "allocated" and plot.id not in staked_plot_ids),
+        "geometry_issues": sum(1 for plot in plots if plot.geometry_status != "approved"),
+        "mapped_area_sqm": float(sum(float(plot.area_sqm) for plot in plots)),
+        "financial": {
+            "contracted_sales_value": str(sum((summary.agreed_price for summary in summaries), 0)),
+            "confirmed_collections": str(sum((summary.confirmed_paid for summary in summaries), 0)),
+            "pending_collections": str(sum((summary.pending_paid for summary in summaries), 0)),
+            "outstanding_balance": str(sum((summary.outstanding for summary in summaries), 0)),
+        },
+    }
+
+@router.get("/{estate_id}/plots.geojson")
+def estate_plots_geojson(estate_id: int, request: Request, db: Session = Depends(get_db)):
+    estate=db.get(Estate,estate_id)
+    if not estate: raise HTTPException(404,"Estate not found")
+    require_estate_access(db,request,estate.organization_id,permission="plot.read")
+    rows=db.query(EstatePlot).filter(EstatePlot.estate_id==estate_id).all()
+    return {"type":"FeatureCollection","features":[{"type":"Feature","id":plot.id,"properties":{"id":plot.id,"plot_number":plot.plot_number,"commercial_status":plot.commercial_status,"development_status":plot.development_status,"geometry_status":plot.geometry_status,"area_sqm":float(plot.area_sqm),"block_id":plot.block_id},"geometry":mapping(to_shape(plot.geometry))} for plot in rows if plot.geometry]}
+
+@router.get("/{estate_id}/layers.geojson")
+def estate_layers_geojson(estate_id:int, request:Request, db:Session=Depends(get_db)):
+    estate=db.get(Estate,estate_id)
+    if not estate: raise HTTPException(404,"Estate not found")
+    require_estate_access(db,request,estate.organization_id,permission="infrastructure.read")
+    rows=db.query(EstateSpatialFeature).filter(EstateSpatialFeature.estate_id==estate_id, EstateSpatialFeature.status=="active").all()
+    return {"type":"FeatureCollection","features":[{"type":"Feature","id":row.id,"properties":{"id":row.id,"type":row.feature_type,"name":row.name,"status":row.status},"geometry":mapping(to_shape(row.geometry))} for row in rows]}
+
+
+@router.get("/{estate_id}/blocks")
+def list_estate_blocks(estate_id: int, request: Request, db: Session = Depends(get_db)):
+    estate = db.get(Estate, estate_id)
+    if not estate:
+        raise HTTPException(404, "Estate not found")
+    require_estate_access(db, request, estate.organization_id, permission="plot.read")
+    rows = db.query(EstateBlock).filter(EstateBlock.estate_id == estate_id).order_by(EstateBlock.label.asc()).all()
+    return [{"id": row.id, "label": row.label, "name": row.name, "notes": row.notes, "geometry": mapping(to_shape(row.geometry)) if row.geometry else None} for row in rows]
+
+
+@router.post("/{estate_id}/blocks")
+def create_estate_block(estate_id: int, payload: BlockCreate, request: Request, db: Session = Depends(get_db)):
+    estate = db.get(Estate, estate_id)
+    if not estate:
+        raise HTTPException(404, "Estate not found")
+    access = require_estate_access(db, request, estate.organization_id, permission="infrastructure.manage")
+    if db.query(EstateBlock).filter(EstateBlock.estate_id == estate_id, EstateBlock.label == payload.label.strip()).first():
+        raise HTTPException(409, "Block label already exists in this estate")
+    geometry = _geojson_geometry(payload.geometry) if payload.geometry else None
+    if geometry is not None and geometry.geom_type not in {"Polygon", "MultiPolygon"}:
+        raise HTTPException(422, "Block geometry must be a polygon")
+    row = EstateBlock(estate_id=estate_id, label=payload.label.strip(), name=payload.name, notes=payload.notes, geometry=from_shape(geometry, srid=4326) if geometry else None)
+    db.add(row)
+    db.flush()
+    append_estate_audit_event(db, organization_id=estate.organization_id, actor=access.principal, action="estate_block.created", entity_type="estate_block", entity_id=row.id, after_data={"label": row.label})
+    db.commit()
+    return {"id": row.id, "label": row.label, "name": row.name}
+
+
+@router.patch("/{estate_id}/blocks/{block_id}")
+def update_estate_block(estate_id: int, block_id: int, payload: BlockUpdate, request: Request, db: Session = Depends(get_db)):
+    estate = db.get(Estate, estate_id)
+    row = db.get(EstateBlock, block_id)
+    if not estate or not row or row.estate_id != estate_id:
+        raise HTTPException(404, "Block not found")
+    access = require_estate_access(db, request, estate.organization_id, permission="infrastructure.manage")
+    before = {"label": row.label, "name": row.name, "notes": row.notes}
+    values = payload.model_dump(exclude_unset=True)
+    if "label" in values:
+        duplicate = db.query(EstateBlock).filter(EstateBlock.estate_id == estate_id, EstateBlock.label == values["label"].strip(), EstateBlock.id != row.id).first()
+        if duplicate:
+            raise HTTPException(409, "Block label already exists in this estate")
+        row.label = values["label"].strip()
+    for key in ("name", "notes"):
+        if key in values:
+            setattr(row, key, values[key])
+    if "geometry" in values and values["geometry"] is not None:
+        geometry = _geojson_geometry(values["geometry"])
+        if geometry.geom_type not in {"Polygon", "MultiPolygon"}:
+            raise HTTPException(422, "Block geometry must be a polygon")
+        row.geometry = from_shape(geometry, srid=4326)
+    append_estate_audit_event(db, organization_id=estate.organization_id, actor=access.principal, action="estate_block.updated", entity_type="estate_block", entity_id=row.id, before_data=before, after_data={"label": row.label, "name": row.name, "notes": row.notes})
+    db.commit()
+    return {"id": row.id, "label": row.label, "name": row.name}
+
+@router.post("/{estate_id}/import-reviews")
+def create_import_review(estate_id:int,payload:ImportReviewCreate,request:Request,db:Session=Depends(get_db)):
+    estate=db.get(Estate,estate_id)
+    if not estate: raise HTTPException(404,"Estate not found")
+    access=require_estate_access(db,request,estate.organization_id,permission="plot.manage")
+    row=EstateImportReview(organization_id=estate.organization_id,estate_id=estate.id,source_type=payload.source_type,survey_georeference_session_id=payload.survey_georeference_session_id,notes=payload.notes,created_by_subject_type=access.principal.subject_type,created_by_subject_id=access.principal.subject_id)
+    db.add(row); db.flush(); append_estate_audit_event(db,organization_id=estate.organization_id,actor=access.principal,action="import_review.created",entity_type="estate_import_review",entity_id=row.id,after_data={"source_type":row.source_type}); db.commit()
+    return {"id":row.id,"status":row.status}
+
+@router.post("/{estate_id}/import-reviews/csv")
+async def import_estate_csv(estate_id: int, request: Request, source_crs: str | None = None, file: UploadFile = File(...), db: Session = Depends(get_db)):
+    estate=db.get(Estate,estate_id)
+    if not estate: raise HTTPException(404,"Estate not found")
+    access=require_estate_access(db,request,estate.organization_id,permission="plot.manage")
+    try: records=list(csv.DictReader(io.StringIO((await file.read()).decode("utf-8-sig"))))
+    except Exception as exc: raise HTTPException(422,"CSV could not be read") from exc
+    candidates = []
+    has_geometry = any(str(record.get("geometry") or "").strip() for record in records)
+    if has_geometry:
+        for index, record in enumerate(records, 1):
+            try:
+                geometry = json.loads(record.get("geometry") or "")
+                candidates.append(_import_candidate(row_number=index, plot_number=str(record.get("plot_number") or ""), geometry=geometry))
+            except Exception:
+                candidates.append({"row": index, "plot_number": str(record.get("plot_number") or "").strip(), "valid": False, "issues": ["geometry must be a GeoJSON Polygon"]})
+    else:
+        grouped: dict[str, list[list[float]]] = {}
+        first_rows: dict[str, int] = {}
+        try:
+            coordinate_transformer = Transformer.from_crs((source_crs or "EPSG:4326").strip(), "EPSG:4326", always_xy=True)
+        except Exception as exc:
+            raise HTTPException(status_code=422, detail="CSV source_crs is invalid") from exc
+        for index, record in enumerate(records, 1):
+            number = str(record.get("plot_number") or record.get("plot") or "").strip()
+            x_value = record.get("longitude") or record.get("lng") or record.get("lon") or record.get("easting") or record.get("x")
+            y_value = record.get("latitude") or record.get("lat") or record.get("northing") or record.get("y")
+            try:
+                if not number or x_value in (None, "") or y_value in (None, ""):
+                    raise ValueError
+                x, y = coordinate_transformer.transform(float(x_value), float(y_value))
+                grouped.setdefault(number, []).append([x, y])
+                first_rows.setdefault(number, index)
+            except (TypeError, ValueError):
+                candidates.append({"row": index, "plot_number": number, "valid": False, "issues": ["CSV rows require plot_number, longitude/latitude (or x/y) coordinates"]})
+        for number, points in grouped.items():
+            if len(points) >= 3:
+                ring = points if points[0] == points[-1] else points + [points[0]]
+                candidates.append(_import_candidate(row_number=first_rows[number], plot_number=number, geometry={"type": "Polygon", "coordinates": [ring]}))
+            else:
+                candidates.append({"row": first_rows[number], "plot_number": number, "valid": False, "issues": ["A parcel requires at least three coordinate rows"]})
+    if not candidates: raise HTTPException(422,"CSV contains no rows")
+    row=EstateImportReview(organization_id=estate.organization_id,estate_id=estate.id,source_type="csv",notes=f"{len(candidates)} candidate parcel(s) imported from {file.filename or 'CSV'}",candidate_data=candidates,created_by_subject_type=access.principal.subject_type,created_by_subject_id=access.principal.subject_id)
+    db.add(row); db.flush(); append_estate_audit_event(db,organization_id=estate.organization_id,actor=access.principal,action="import_review.csv_uploaded",entity_type="estate_import_review",entity_id=row.id,after_data={"candidate_count":len(candidates),"valid_count":sum(1 for candidate in candidates if candidate["valid"])}) ; db.commit()
+    return {"id":row.id,"status":row.status,"candidate_count":len(candidates),"valid_count":sum(1 for candidate in candidates if candidate["valid"]),"source_crs":source_crs or "EPSG:4326"}
+
+@router.post("/{estate_id}/import-reviews/geojson")
+async def import_estate_geojson(estate_id:int,request:Request,file:UploadFile=File(...),db:Session=Depends(get_db)):
+    estate=db.get(Estate,estate_id)
+    if not estate: raise HTTPException(404,"Estate not found")
+    access=require_estate_access(db,request,estate.organization_id,permission="plot.manage")
+    try: document=json.loads((await file.read()).decode("utf-8-sig")); features=document.get("features",[]) if document.get("type")=="FeatureCollection" else [document]
+    except Exception as exc: raise HTTPException(422,"GeoJSON could not be read") from exc
+    candidates=[]
+    for index,feature in enumerate(features,1):
+        geometry=feature.get("geometry") or {}; properties=feature.get("properties") or {}; number=str(properties.get("plot_number") or properties.get("name") or f"Imported-{index}").strip()
+        try: _,issues=validate_polygon(geometry); errors=[issue.message for issue in issues if issue.severity=="error"]
+        except Exception: errors=["geometry must be a GeoJSON Polygon"]
+        candidates.append({"row":index,"plot_number":number,"geometry":geometry,"valid":not errors,"issues":errors})
+    if not candidates: raise HTTPException(422,"GeoJSON contains no features")
+    row=EstateImportReview(organization_id=estate.organization_id,estate_id=estate.id,source_type="gis",notes=f"{len(candidates)} candidate parcel(s) imported from {file.filename or 'GeoJSON'}",candidate_data=candidates,created_by_subject_type=access.principal.subject_type,created_by_subject_id=access.principal.subject_id)
+    db.add(row); db.flush(); append_estate_audit_event(db,organization_id=estate.organization_id,actor=access.principal,action="import_review.geojson_uploaded",entity_type="estate_import_review",entity_id=row.id,after_data={"candidate_count":len(candidates)}); db.commit()
+    return {"id":row.id,"status":row.status,"candidate_count":len(candidates),"valid_count":sum(1 for candidate in candidates if candidate["valid"])}
+
+@router.post("/{estate_id}/import-reviews/dxf")
+async def import_estate_dxf(estate_id:int,source_crs:str,request:Request,file:UploadFile=File(...),db:Session=Depends(get_db)):
+    estate=db.get(Estate,estate_id)
+    if not estate: raise HTTPException(404,"Estate not found")
+    access=require_estate_access(db,request,estate.organization_id,permission="plot.manage")
+    handle=None
+    try: src=source_crs.strip().upper(); transformer=Transformer.from_crs(src,"EPSG:4326",always_xy=True); content=await file.read(); handle=tempfile.NamedTemporaryFile(suffix=".dxf",delete=False); handle.write(content); handle.close(); document=ezdxf.readfile(handle.name)
+    except Exception as exc: raise HTTPException(422,"DXF could not be read; provide a valid source CRS") from exc
+    finally:
+        try: os.unlink(handle.name if handle else "")
+        except Exception: pass
+    candidates=[]
+    for index,entity in enumerate(document.modelspace().query("LWPOLYLINE POLYLINE"),1):
+        try:
+            closed = getattr(entity, "is_closed", False)
+            if callable(closed):
+                closed = closed()
+            if not bool(closed):
+                continue
+            if entity.dxftype() == "LWPOLYLINE":
+                raw_points = entity.get_points()
+            else:
+                vertices = entity.vertices() if callable(getattr(entity, "vertices", None)) else entity.vertices
+                raw_points = [(vertex.dxf.location.x, vertex.dxf.location.y) for vertex in vertices]
+            points=[transformer.transform(float(point[0]),float(point[1])) for point in raw_points]
+            if len(points)<3: continue
+            geometry={"type":"Polygon","coordinates":[[list(point) for point in points+[points[0]]]]}
+            _,issues=validate_polygon(geometry); errors=[issue.message for issue in issues if issue.severity=="error"]
+            layer_name = str(entity.dxf.layer or "CAD").strip() or "CAD"
+            candidates.append({"row":index,"plot_number":layer_name if index == 1 else f"{layer_name}-{index}","geometry":geometry,"valid":not errors,"issues":errors})
+        except Exception: continue
+    if not candidates: raise HTTPException(422,"DXF contains no closed polygon polylines")
+    row=EstateImportReview(organization_id=estate.organization_id,estate_id=estate.id,source_type="cad",notes=f"{len(candidates)} candidate parcel(s) imported from {file.filename or 'DXF'} using {src}",candidate_data=candidates,created_by_subject_type=access.principal.subject_type,created_by_subject_id=access.principal.subject_id)
+    db.add(row); db.flush(); append_estate_audit_event(db,organization_id=estate.organization_id,actor=access.principal,action="import_review.dxf_uploaded",entity_type="estate_import_review",entity_id=row.id,after_data={"candidate_count":len(candidates),"source_crs":src}); db.commit()
+    return {"id":row.id,"status":row.status,"candidate_count":len(candidates),"valid_count":sum(1 for candidate in candidates if candidate["valid"]),"source_crs":src}
+
+
+@router.post("/{estate_id}/import-reviews/scanned-layout")
+async def import_scanned_layout(
+    estate_id: int,
+    request: Request,
+    survey_georeference_session_id: str | None = Form(default=None),
+    candidate_data: str | None = Form(default=None),
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+):
+    """Keep a private scanned plan in the review queue until geometry is verified.
+
+    Optional candidate_data is a JSON array of the same polygon candidates produced by CSV/GIS
+    intake. This lets a surveyor attach verified digitisation results to the scan without treating
+    OCR or image recognition as authoritative parcel geometry.
+    """
+    estate = db.get(Estate, estate_id)
+    if not estate:
+        raise HTTPException(404, "Estate not found")
+    access = require_estate_access(db, request, estate.organization_id, permission="plot.manage")
+    candidates = []
+    if candidate_data:
+        try:
+            raw_candidates = json.loads(candidate_data)
+            if not isinstance(raw_candidates, list):
+                raise ValueError
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise HTTPException(422, "candidate_data must be a JSON array") from exc
+        for index, item in enumerate(raw_candidates, 1):
+            if not isinstance(item, dict):
+                candidates.append({"row": index, "plot_number": "", "valid": False, "issues": ["Candidate must be an object"]})
+                continue
+            geometry = item.get("geometry") or {}
+            candidates.append(_import_candidate(row_number=index, plot_number=str(item.get("plot_number") or ""), geometry=geometry))
+    review = EstateImportReview(
+        organization_id=estate.organization_id,
+        estate_id=estate.id,
+        source_type="raster" if (file.content_type or "").lower().startswith("image/") else "pdf",
+        survey_georeference_session_id=survey_georeference_session_id.strip() if survey_georeference_session_id else None,
+        notes=f"Private scanned layout uploaded from {file.filename or 'layout'}; geometry requires surveyor review.",
+        candidate_data=candidates,
+        created_by_subject_type=access.principal.subject_type,
+        created_by_subject_id=access.principal.subject_id,
+    )
+    db.add(review)
+    db.flush()
+    organization = db.get(EstateOrganization, estate.organization_id)
+    stored = store_private_estate_file(
+        organization_uid=organization.organization_uid,
+        category="imports",
+        entity_uid=f"import_review_{review.id}",
+        filename=file.filename or "scanned-layout",
+        content_type=file.content_type or "",
+        data=await file.read(),
+    )
+    document = EstateDocument(
+        organization_id=estate.organization_id,
+        object_key=stored.object_key,
+        original_filename=stored.filename,
+        mime_type=stored.mime_type,
+        size_bytes=stored.size_bytes,
+        checksum=stored.checksum,
+        document_type="layout_import",
+        description="Private source scan for Estate geometry review",
+        uploaded_by_subject_type=access.principal.subject_type,
+        uploaded_by_subject_id=access.principal.subject_id,
+    )
+    db.add(document)
+    db.flush()
+    db.add(EstateDocumentLink(document_id=document.id, entity_type="import_review", entity_id=str(review.id)))
+    append_estate_audit_event(
+        db,
+        organization_id=estate.organization_id,
+        actor=access.principal,
+        action="import_review.scanned_layout_uploaded",
+        entity_type="estate_import_review",
+        entity_id=review.id,
+        after_data={"document_id": document.id, "filename": stored.filename, "candidate_count": len(candidates)},
+    )
+    db.commit()
+    return {"id": review.id, "status": review.status, "document_id": document.id, "candidate_count": len(candidates)}
+
+
+@router.get("/{estate_id}/import-reviews")
+def list_import_reviews(estate_id:int,request:Request,db:Session=Depends(get_db)):
+    estate=db.get(Estate,estate_id)
+    if not estate: raise HTTPException(404,"Estate not found")
+    require_estate_access(db,request,estate.organization_id,permission="plot.read")
+    rows=db.query(EstateImportReview).filter(EstateImportReview.estate_id==estate_id).order_by(EstateImportReview.created_at.desc()).all()
+    result = []
+    for row in rows:
+        linked_document = db.query(EstateDocument).join(EstateDocumentLink, EstateDocumentLink.document_id == EstateDocument.id).filter(EstateDocumentLink.entity_type == "import_review", EstateDocumentLink.entity_id == str(row.id)).first()
+        result.append({"id": row.id, "source_type": row.source_type, "session_id": row.survey_georeference_session_id, "status": row.status, "notes": row.notes, "candidate_count": len(row.candidate_data or []), "candidates": row.candidate_data or [], "document_id": linked_document.id if linked_document else None, "created_at": row.created_at})
+    return result
+
+@router.post("/import-reviews/{review_id}/decision")
+def decide_import_review(review_id:int,payload:ImportReviewDecision,request:Request,db:Session=Depends(get_db)):
+    row=db.get(EstateImportReview,review_id)
+    if not row: raise HTTPException(404,"Import review not found")
+    access=require_estate_access(db,request,row.organization_id,permission="survey.manage")
+    if row.status != "review_required": raise HTTPException(409,"Import review has already been decided")
+    if payload.candidate_data is not None:
+        normalized_candidates = []
+        for index, candidate in enumerate(payload.candidate_data, 1):
+            normalized_candidates.append(_import_candidate(row_number=index, plot_number=str(candidate.get("plot_number") or ""), geometry=candidate.get("geometry") or {}))
+        row.candidate_data = normalized_candidates
+    created=0
+    if payload.status == "approved":
+        estate=db.get(Estate,row.estate_id)
+        for candidate in row.candidate_data or []:
+            number=str(candidate.get("plot_number") or "").strip(); geometry=candidate.get("geometry")
+            if not candidate.get("valid") or not number or not geometry: continue
+            normalized=_normalized(number)
+            if db.query(EstatePlot).filter(EstatePlot.estate_id==estate.id,EstatePlot.plot_number_normalized==normalized).first(): continue
+            area,issues=validate_polygon(geometry)
+            if any(issue.severity=="error" for issue in issues): continue
+            plot=EstatePlot(estate_id=estate.id,plot_number=number,plot_number_normalized=normalized,geometry=from_shape(shape(geometry),srid=4326),area_sqm=area,geometry_status="approved",source_type=row.source_type,source_reference=str(row.id),created_by_subject_type=access.principal.subject_type,created_by_subject_id=access.principal.subject_id)
+            db.add(plot); created+=1
+        row.notes=(payload.notes or row.notes or "") + f"; {created} operational plot(s) created"
+    else: row.notes=payload.notes or row.notes
+    row.status=payload.status
+    append_estate_audit_event(db,organization_id=row.organization_id,actor=access.principal,action=f"import_review.{row.status}",entity_type="estate_import_review",entity_id=row.id,after_data={"status":row.status}); db.commit()
+    return {"id":row.id,"status":row.status,"created_plots":created}
+
+@router.post("/{estate_id}/layers")
+def create_estate_layer(estate_id:int,payload:SpatialFeatureCreate,request:Request,db:Session=Depends(get_db)):
+    estate=db.get(Estate,estate_id)
+    if not estate: raise HTTPException(404,"Estate not found")
+    access=require_estate_access(db,request,estate.organization_id,permission="infrastructure.manage")
+    try: geometry=from_shape(shape(payload.geometry),srid=4326)
+    except Exception: raise HTTPException(422,"Layer geometry is invalid")
+    row=EstateSpatialFeature(organization_id=estate.organization_id,estate_id=estate.id,feature_type=payload.feature_type,name=(payload.name or "").strip() or None,geometry=geometry,created_by_subject_type=access.principal.subject_type,created_by_subject_id=access.principal.subject_id)
+    db.add(row); db.flush(); append_estate_audit_event(db,organization_id=estate.organization_id,actor=access.principal,action="spatial_layer.created",entity_type="estate_spatial_feature",entity_id=row.id,after_data={"type":row.feature_type,"name":row.name}); db.commit()
+    return {"id":row.id,"type":row.feature_type,"name":row.name}
+
+
+@router.patch("/{estate_id}/layers/{feature_id}")
+def update_estate_layer(estate_id: int, feature_id: int, payload: SpatialFeatureUpdate, request: Request, db: Session = Depends(get_db)):
+    estate = db.get(Estate, estate_id)
+    row = db.get(EstateSpatialFeature, feature_id)
+    if not estate or not row or row.estate_id != estate_id:
+        raise HTTPException(404, "Spatial layer was not found")
+    access = require_estate_access(db, request, estate.organization_id, permission="infrastructure.manage")
+    before = {"feature_type": row.feature_type, "name": row.name, "status": row.status}
+    values = payload.model_dump(exclude_unset=True)
+    if "feature_type" in values:
+        row.feature_type = values["feature_type"]
+    if "name" in values:
+        row.name = (values["name"] or "").strip() or None
+    if "status" in values:
+        row.status = values["status"]
+    if "geometry" in values and values["geometry"] is not None:
+        row.geometry = from_shape(_geojson_geometry(values["geometry"]), srid=4326)
+    append_estate_audit_event(db, organization_id=estate.organization_id, actor=access.principal, action="spatial_layer.updated", entity_type="estate_spatial_feature", entity_id=row.id, before_data=before, after_data={"feature_type": row.feature_type, "name": row.name, "status": row.status})
+    db.commit()
+    return {"id": row.id, "type": row.feature_type, "name": row.name, "status": row.status}
+
+
+@router.delete("/{estate_id}/layers/{feature_id}")
+def archive_estate_layer(estate_id: int, feature_id: int, request: Request, db: Session = Depends(get_db)):
+    estate = db.get(Estate, estate_id)
+    row = db.get(EstateSpatialFeature, feature_id)
+    if not estate or not row or row.estate_id != estate_id:
+        raise HTTPException(404, "Spatial layer was not found")
+    access = require_estate_access(db, request, estate.organization_id, permission="infrastructure.manage")
+    if row.status != "archived":
+        row.status = "archived"
+        append_estate_audit_event(db, organization_id=estate.organization_id, actor=access.principal, action="spatial_layer.archived", entity_type="estate_spatial_feature", entity_id=row.id)
+        db.commit()
+    return {"id": row.id, "status": row.status}
+
+@router.get("/{estate_id}/quality-check")
+def estate_quality_check(estate_id:int, request:Request, db:Session=Depends(get_db)):
+    estate=db.get(Estate,estate_id)
+    if not estate: raise HTTPException(404,"Estate not found")
+    require_estate_access(db,request,estate.organization_id,permission="plot.read")
+    plots=db.query(EstatePlot).filter(EstatePlot.estate_id==estate_id).all(); issues=[]
+    seen={}
+    for plot in plots:
+        seen.setdefault(plot.plot_number_normalized,[]).append(plot.id)
+        if not plot.geometry: issues.append({"severity":"error","plot_id":plot.id,"code":"missing_geometry","message":"Plot has no geometry"}); continue
+        _, qc=validate_polygon(mapping(to_shape(plot.geometry)))
+        issues.extend({"severity":item.severity,"plot_id":plot.id,"code":item.code,"message":item.message} for item in qc)
+    for number, ids in seen.items():
+        if len(ids)>1: issues.append({"severity":"error","plot_id":ids[0],"code":"duplicate_plot_number","message":f"Duplicate plot number {number}"})
+    for index, plot in enumerate(plots):
+        if not plot.geometry: continue
+        geom=to_shape(plot.geometry)
+        for other in plots[index+1:]:
+            if other.geometry and geom.intersection(to_shape(other.geometry)).area > 1e-12: issues.append({"severity":"error","plot_id":plot.id,"related_plot_id":other.id,"code":"overlap","message":f"Overlaps plot {other.plot_number}"})
+    return {"estate_id":estate_id,"plot_count":len(plots),"issues":issues,"review_required":any(item["severity"]=="error" for item in issues)}
+
+def _calculate_plot_hazards(geometry, db: Session) -> dict:
+    from app.routers.hazards import erosion_preview, flood_preview
+    payload = {"boundary": mapping(to_shape(geometry)), "show_raster": False}
+    return {"flood": flood_preview(payload, db), "erosion": erosion_preview(payload, db)}
+
+
+def _hazard_row_payload(row: EstateHazardAssessment) -> dict:
+    return {"id": row.id, "plot_id": row.plot_id, "estate_id": row.estate_id, "hazard_type": row.hazard_type, "status": row.status, "risk_class": row.risk_class, "risk_score": float(row.risk_score) if row.risk_score is not None else None, "assessed_at": row.assessed_at, "result": row.result_payload}
+
+
+def _persist_hazard_results(db: Session, *, estate: Estate, plot_id: int | None, results: dict, access) -> list[EstateHazardAssessment]:
+    rows = []
+    for hazard_type, result in results.items():
+        if hazard_type == "flood":
+            risk_class = str((result.get("summary") or {}).get("floodplain_class") or "unavailable")
+            raw_score = (result.get("floodplain") or {}).get("risk_score")
+        else:
+            risk_class = str(result.get("risk_class") or "unavailable")
+            raw_score = result.get("risk_score")
+        try:
+            score = float(raw_score) if raw_score is not None else None
+        except (TypeError, ValueError):
+            score = None
+        row = EstateHazardAssessment(
+            organization_id=estate.organization_id,
+            estate_id=estate.id,
+            plot_id=plot_id,
+            hazard_type=hazard_type,
+            risk_class=risk_class,
+            risk_score=score,
+            result_payload=result,
+            assessed_by_subject_type=access.principal.subject_type,
+            assessed_by_subject_id=access.principal.subject_id,
+        )
+        db.add(row)
+        rows.append(row)
+    db.flush()
+    append_estate_audit_event(db, organization_id=estate.organization_id, actor=access.principal, action="hazard.assessment_completed", entity_type="estate_plot" if plot_id else "estate", entity_id=plot_id or estate.id, after_data={"hazard_types": list(results), "assessment_ids": [row.id for row in rows]})
+    return rows
+
+
+@router.get("/plots/{plot_id}/hazards")
+def plot_hazards(plot_id: int, request: Request, db: Session = Depends(get_db)):
+    """Return the latest stored result, with a read-only calculation for legacy records."""
+    plot = db.get(EstatePlot, plot_id)
+    if not plot:
+        raise HTTPException(404, "Plot not found")
+    estate = db.get(Estate, plot.estate_id)
+    require_estate_access(db, request, estate.organization_id, permission="plot.read")
+    if plot.geometry_status != "approved":
+        raise HTTPException(409, "Only approved plot geometry can be screened")
+    latest = {}
+    for row in db.query(EstateHazardAssessment).filter(EstateHazardAssessment.plot_id == plot.id).order_by(EstateHazardAssessment.assessed_at.desc()).all():
+        latest.setdefault(row.hazard_type, row)
+    if {"flood", "erosion"}.issubset(latest):
+        return {"plot_id": plot.id, "persisted": True, "flood": latest["flood"].result_payload, "erosion": latest["erosion"].result_payload}
+    return {"plot_id": plot.id, "persisted": False, **_calculate_plot_hazards(plot.geometry, db)}
+
+
+@router.post("/plots/{plot_id}/hazards/assess")
+def assess_plot_hazards(plot_id: int, request: Request, db: Session = Depends(get_db)):
+    plot = db.get(EstatePlot, plot_id)
+    if not plot:
+        raise HTTPException(404, "Plot not found")
+    estate = db.get(Estate, plot.estate_id)
+    access = require_estate_access(db, request, estate.organization_id, permission="plot.manage")
+    if plot.geometry_status != "approved":
+        raise HTTPException(409, "Only approved plot geometry can be screened")
+    results = _calculate_plot_hazards(plot.geometry, db)
+    rows = _persist_hazard_results(db, estate=estate, plot_id=plot.id, results=results, access=access)
+    db.commit()
+    return {"plot_id": plot.id, "persisted": True, "assessments": [_hazard_row_payload(row) for row in rows], **results}
+
+
+@router.get("/{estate_id}/hazards")
+def estate_hazard_dashboard(estate_id: int, request: Request, db: Session = Depends(get_db)):
+    estate = db.get(Estate, estate_id)
+    if not estate:
+        raise HTTPException(404, "Estate not found")
+    require_estate_access(db, request, estate.organization_id, permission="plot.read")
+    latest = {}
+    rows = db.query(EstateHazardAssessment).filter(EstateHazardAssessment.estate_id == estate_id).order_by(EstateHazardAssessment.assessed_at.desc()).all()
+    for row in rows:
+        latest.setdefault((row.plot_id, row.hazard_type), row)
+    plot_results = {}
+    for (plot_id, hazard_type), row in latest.items():
+        plot_results.setdefault(str(plot_id or "estate"), {"plot_id": plot_id, "hazards": {}})["hazards"][hazard_type] = _hazard_row_payload(row)
+    summaries = {}
+    for row in latest.values():
+        bucket = summaries.setdefault(row.hazard_type, {"assessed": 0, "classes": {}})
+        bucket["assessed"] += 1
+        if row.risk_class:
+            bucket["classes"][row.risk_class] = bucket["classes"].get(row.risk_class, 0) + 1
+    return {"estate": {"id": estate.id, "name": estate.name}, "assessments": list(plot_results.values()), "summary": summaries, "assessment_count": len(rows)}
+
+@router.get("/{estate_id}/activity")
+def estate_activity(estate_id:int, request:Request, limit:int=100, db:Session=Depends(get_db)):
+    estate=db.get(Estate,estate_id)
+    if not estate: raise HTTPException(404,"Estate not found")
+    require_estate_access(db,request,estate.organization_id,permission="audit.read")
+    rows=db.query(EstateAuditEvent).filter(EstateAuditEvent.organization_id==estate.organization_id).order_by(EstateAuditEvent.created_at.desc()).limit(min(max(limit,1),200)).all()
+    return [{"id":row.id,"action":row.action,"entity_type":row.entity_type,"entity_id":row.entity_id,"actor":row.actor_subject_id,"created_at":row.created_at,"details":row.after_data} for row in rows]
+
+
+@router.post("/{estate_id}/plots")
+def create_plot(estate_id: int, payload: PlotCreate, request: Request, db: Session = Depends(get_db)):
+    estate = db.get(Estate, estate_id)
+    if not estate: raise HTTPException(404, "Estate not found")
+    access = require_estate_access(db, request, estate.organization_id, permission="plot.manage"); _enabled(db, estate.organization_id)
+    area, issues = validate_polygon(payload.geometry)
+    if any(issue.severity == "error" for issue in issues): raise HTTPException(422, detail=[issue.message for issue in issues])
+    normalized = _normalized(payload.plot_number)
+    if db.query(EstatePlot).filter(EstatePlot.estate_id == estate_id, EstatePlot.plot_number_normalized == normalized).first(): raise HTTPException(409, "Plot number already exists in this estate")
+    if payload.block_id and not db.query(EstateBlock).filter(EstateBlock.id == payload.block_id, EstateBlock.estate_id == estate_id).first(): raise HTTPException(422, "Block does not belong to this estate")
+    plot = EstatePlot(estate_id=estate_id, block_id=payload.block_id, plot_number=payload.plot_number.strip(), plot_number_normalized=normalized, geometry=from_shape(shape(payload.geometry), srid=4326), area_sqm=area, land_use=payload.land_use, geometry_status=payload.geometry_status, created_by_subject_type=access.principal.subject_type, created_by_subject_id=access.principal.subject_id)
+    db.add(plot); db.flush(); append_estate_audit_event(db, organization_id=estate.organization_id, actor=access.principal, action="plot.created", entity_type="estate_plot", entity_id=plot.id, after_data={"plot_number": plot.plot_number, "area_sqm": area, "geometry_status": plot.geometry_status})
+    db.commit(); return {"id": plot.id, "uid": plot.plot_uid, "area_sqm": area, "qc": [{"severity": issue.severity, "code": issue.code, "message": issue.message} for issue in issues]}
+
+@router.patch("/plots/{plot_id}/development-status")
+def update_development_status(plot_id:int, payload:DevelopmentStatusUpdate, request:Request, db:Session=Depends(get_db)):
+    plot=db.get(EstatePlot,plot_id)
+    if not plot: raise HTTPException(404,"Plot not found")
+    estate=db.get(Estate,plot.estate_id); access=require_estate_access(db,request,estate.organization_id,permission="plot.manage")
+    previous=plot.development_status; plot.development_status=payload.status
+    append_estate_audit_event(db,organization_id=estate.organization_id,actor=access.principal,action="plot.development_status_changed",entity_type="estate_plot",entity_id=plot.id,before_data={"development_status":previous},after_data={"development_status":plot.development_status})
+    db.commit(); return {"id":plot.id,"development_status":plot.development_status}
+
+@router.post("/plots/{plot_id}/inspections")
+def create_field_inspection(plot_id:int, payload:FieldInspectionCreate, request:Request, db:Session=Depends(get_db)):
+    plot=db.get(EstatePlot,plot_id)
+    if not plot: raise HTTPException(404,"Plot not found")
+    estate=db.get(Estate,plot.estate_id); access=require_estate_access(db,request,estate.organization_id,permission="field.manage")
+    inspection=EstateFieldInspection(organization_id=estate.organization_id,estate_id=estate.id,plot_id=plot.id,inspection_type=payload.inspection_type.strip(),outcome=payload.outcome,notes=payload.notes,inspected_by_subject_type=access.principal.subject_type,inspected_by_subject_id=access.principal.subject_id)
+    db.add(inspection); db.flush(); append_estate_audit_event(db,organization_id=estate.organization_id,actor=access.principal,action="field_inspection.recorded",entity_type="estate_field_inspection",entity_id=inspection.id,after_data={"plot_id":plot.id,"outcome":inspection.outcome}); db.commit()
+    return {"id":inspection.id,"plot_id":plot.id,"outcome":inspection.outcome,"inspected_at":inspection.inspected_at}
+
+@router.get("/plots/{plot_id}/inspections")
+def list_field_inspections(plot_id:int, request:Request, db:Session=Depends(get_db)):
+    plot=db.get(EstatePlot,plot_id)
+    if not plot: raise HTTPException(404,"Plot not found")
+    estate=db.get(Estate,plot.estate_id); require_estate_access(db,request,estate.organization_id,permission="field.read")
+    rows=db.query(EstateFieldInspection).filter(EstateFieldInspection.plot_id==plot.id).order_by(EstateFieldInspection.inspected_at.desc()).all()
+    return [{"id":row.id,"type":row.inspection_type,"outcome":row.outcome,"notes":row.notes,"inspected_at":row.inspected_at,"inspected_by":row.inspected_by_subject_id} for row in rows]
+
+@router.post("/plots/{plot_id}/survey-requests")
+def create_survey_request(plot_id:int, request:Request, db:Session=Depends(get_db)):
+    plot=db.get(EstatePlot,plot_id)
+    if not plot: raise HTTPException(404,"Plot not found")
+    estate=db.get(Estate,plot.estate_id); access=require_estate_access(db,request,estate.organization_id,permission="survey.manage")
+    if plot.geometry_status != "approved": raise HTTPException(409,"Only approved plot geometry can be sent to Survey")
+    _,issues=validate_polygon(to_shape(plot.geometry).__geo_interface__)
+    if any(i.severity=="error" for i in issues): raise HTTPException(422,"Plot geometry is not valid")
+    if db.query(EstateSurveyRequest).filter(EstateSurveyRequest.plot_id==plot_id,EstateSurveyRequest.status.in_(("requested","assigned","in_progress","ready_for_review","approved","failed"))).first(): raise HTTPException(409,"An active Survey request already exists")
+    allocation=db.query(EstateAllocation).filter(EstateAllocation.plot_id==plot_id,EstateAllocation.status=="allocated").one_or_none()
+    row=EstateSurveyRequest(organization_id=estate.organization_id,estate_id=estate.id,plot_id=plot_id,allocation_id=allocation.id if allocation else None,requested_by_subject_type=access.principal.subject_type,requested_by_subject_id=access.principal.subject_id,status="requested")
+    db.add(row); db.flush(); append_estate_audit_event(db,organization_id=estate.organization_id,actor=access.principal,action="survey_request.created",entity_type="estate_survey_request",entity_id=row.id); db.commit(); return _survey_payload(db,row)
+
+@router.get("/survey-requests")
+def list_survey_requests(request:Request,db:Session=Depends(get_db)):
+    principal=resolve_estate_principal(db,request); allowed={a.organization_id for a in list_estate_access(db,principal) if has_permission(a.role_key,"survey.read")}
+    return [_survey_payload(db,row) for row in db.query(EstateSurveyRequest).filter(EstateSurveyRequest.organization_id.in_(allowed)).all()]
+
+@router.get("/survey-requests/{request_id}")
+def survey_request_detail(request_id:int,request:Request,db:Session=Depends(get_db)):
+    row=db.get(EstateSurveyRequest,request_id)
+    if not row: raise HTTPException(404,"Survey request not found")
+    require_estate_access(db,request,row.organization_id,permission="survey.read")
+    return _survey_payload(db,row)
+
+@router.post("/survey-requests/{request_id}/assign")
+def assign_survey_request(request_id:int,payload:SurveyorAssignment,request:Request,db:Session=Depends(get_db)):
+    row=db.get(EstateSurveyRequest,request_id)
+    if not row: raise HTTPException(404,"Survey request not found")
+    access=require_estate_access(db,request,row.organization_id,permission="survey.manage")
+    from app.models.estate_foundation import EstateOrganizationMember
+    member=db.query(EstateOrganizationMember).filter(EstateOrganizationMember.organization_id==row.organization_id,EstateOrganizationMember.subject_type==payload.subject_type,EstateOrganizationMember.subject_id==payload.subject_id,EstateOrganizationMember.is_active.is_(True)).one_or_none()
+    if not member or not has_permission(member.role_key,"survey.manage"): raise HTTPException(422,"Assignee is not a Survey-capable organization member")
+    transition(row,"assigned"); row.assigned_surveyor_subject_type=member.subject_type; row.assigned_surveyor_subject_id=member.subject_id
+    append_estate_audit_event(db,organization_id=row.organization_id,actor=access.principal,action="survey_request.assigned",entity_type="estate_survey_request",entity_id=row.id); db.commit(); return _survey_payload(db,row)
+
+@router.post("/survey-requests/{request_id}/cancel")
+def cancel_survey_request(request_id:int,request:Request,db:Session=Depends(get_db)):
+    row=db.get(EstateSurveyRequest,request_id)
+    if not row: raise HTTPException(404,"Survey request not found")
+    access=require_estate_access(db,request,row.organization_id,permission="survey.manage")
+    transition(row,"cancelled")
+    append_estate_audit_event(db,organization_id=row.organization_id,actor=access.principal,action="survey_request.cancelled",entity_type="estate_survey_request",entity_id=row.id)
+    db.commit(); return _survey_payload(db,row)
+
+@router.post("/survey-requests/{request_id}/start")
+def start_survey_request(request_id:int,request:Request,db:Session=Depends(get_db)):
+    row=db.get(EstateSurveyRequest,request_id)
+    if not row: raise HTTPException(404,"Survey request not found")
+    access=require_estate_access(db,request,row.organization_id,permission="survey.manage")
+    if row.survey_working_plot_id: return _survey_payload(db,row)
+    if access.principal.subject_type != "survey_user":
+        raise HTTPException(403,"Starting Survey requires an authenticated Survey user")
+    eligibility = survey_eligibility(db, db.get(EstateAllocation, row.allocation_id) if row.allocation_id else None)
+    if not eligibility["eligible"]: raise HTTPException(409, eligibility["reason"])
+    transition(row,"in_progress")
+    try:
+        result=materialize_estate_plot_for_survey(db,request=row,plot=db.get(EstatePlot,row.plot_id),survey_owner_user_id=int(access.principal.subject_id))
+        append_estate_audit_event(db,organization_id=row.organization_id,actor=access.principal,action="survey_request.started",entity_type="estate_survey_request",entity_id=row.id,after_data={"survey_plot_id":result.survey_plot_id}); db.commit()
+    except Exception:
+        db.rollback(); raise HTTPException(422,"Survey materialization failed")
+    return _survey_payload(db,row)
+
+
+@router.post("/survey-requests/{request_id}/complete")
+def complete_survey_request(request_id: int, request: Request, db: Session = Depends(get_db)):
+    row = db.get(EstateSurveyRequest, request_id)
+    if not row:
+        raise HTTPException(404, "Survey request not found")
+    access = require_estate_access(db, request, row.organization_id, permission="survey.manage")
+    if not row.survey_working_plot_id:
+        raise HTTPException(409, "Survey must be opened before it can be completed")
+    if row.status == "completed":
+        return _survey_payload(db, row)
+    transition(row, "completed")
+    append_estate_audit_event(db, organization_id=row.organization_id, actor=access.principal, action="survey_request.completed", entity_type="estate_survey_request", entity_id=row.id)
+    db.commit()
+    return _survey_payload(db, row)
+
+@router.post("/survey-requests/{request_id}/staking-tasks")
+def create_staking_task(request_id:int,request:Request,db:Session=Depends(get_db)):
+    survey=db.get(EstateSurveyRequest,request_id)
+    if not survey: raise HTTPException(404,"Survey request not found")
+    access=require_estate_access(db,request,survey.organization_id,permission="staking.manage")
+    if not survey.survey_working_plot_id: raise HTTPException(409,"Survey must be started before staking")
+    existing=db.query(EstateStakingTask).filter(EstateStakingTask.survey_request_id==survey.id,EstateStakingTask.status.in_(("pending","assigned","in_progress"))).one_or_none()
+    if existing: return {"id":existing.id,"status":existing.status}
+    task=EstateStakingTask(organization_id=survey.organization_id,estate_id=survey.estate_id,plot_id=survey.plot_id,survey_request_id=survey.id,status="pending")
+    db.add(task); db.flush(); append_estate_audit_event(db,organization_id=survey.organization_id,actor=access.principal,action="staking_task.created",entity_type="estate_staking_task",entity_id=task.id); db.commit(); return {"id":task.id,"status":task.status}
+
+@router.get("/staking-tasks")
+def list_staking_tasks(request:Request,db:Session=Depends(get_db)):
+    principal=resolve_estate_principal(db,request); allowed={item.organization_id for item in list_estate_access(db,principal) if has_permission(item.role_key,"staking.read")}
+    rows=db.query(EstateStakingTask).filter(EstateStakingTask.organization_id.in_(allowed)).all()
+    return [{"id":row.id,"status":row.status,"plot_id":row.plot_id,"survey_request_id":row.survey_request_id,"assigned_subject_id":row.assigned_subject_id,"completed_at":row.completed_at} for row in rows]
+
+@router.get("/staking-tasks/{task_id}/exports/dgps.csv")
+def export_staking_task_dgps_csv(task_id:int, request:Request, raw:bool=False, db:Session=Depends(get_db)):
+    """Export a plot's authoritative vertices for field DGPS stakeout."""
+    task=db.get(EstateStakingTask,task_id)
+    if not task: raise HTTPException(404,"Staking task not found")
+    access=require_estate_access(db,request,task.organization_id,permission="staking.read")
+    plot=db.get(EstatePlot,task.plot_id)
+    if not plot or not plot.geometry: raise HTTPException(422,"Staking task has no plot geometry")
+    if plot.geometry_status != "approved": raise HTTPException(409,"Only approved plot geometry can be exported for staking")
+    polygon=to_shape(plot.geometry)
+    _,issues=validate_polygon(polygon.__geo_interface__)
+    if any(issue.severity=="error" for issue in issues): raise HTTPException(422,"Plot geometry is not valid for staking")
+    coordinates=list(polygon.exterior.coords)
+    if coordinates and coordinates[0] == coordinates[-1]: coordinates=coordinates[:-1]
+    if len(coordinates)<3: raise HTTPException(422,"Plot geometry needs at least three vertices")
+    longitude,latitude=coordinates[0]
+    coordinate_system=resolve_coordinate_system_key("wgs84_nigeria_meters",longitude,latitude)
+    epsg=int(COORDINATE_SYSTEMS[coordinate_system]["epsg"])
+    transformer=Transformer.from_crs("EPSG:4326",f"EPSG:{epsg}",always_xy=True)
+    rows=[]
+    for index,(lng,lat) in enumerate(coordinates):
+        easting,northing=transformer.transform(float(lng),float(lat))
+        rows.append({"station":alpha_station(index),"feature":f"Plot {plot.plot_number}","coordinate_system":coordinate_system,"easting":easting,"northing":northing,"longitude":lng,"latitude":lat,"point_type":"Plot vertex"})
+    append_estate_audit_event(db,organization_id=task.organization_id,actor=access.principal,action="staking_task.dgps_exported",entity_type="estate_staking_task",entity_id=task.id,after_data={"vertex_count":len(rows),"coordinate_system":coordinate_system})
+    db.commit()
+    safe_number=re.sub(r"[^A-Za-z0-9._-]+","-",plot.plot_number).strip("-.") or f"plot-{plot.id}"
+    return Response(render_dgps_staking_csv(rows,raw=raw),media_type="text/csv; charset=utf-8",headers={"Content-Disposition":f'attachment; filename="{safe_number}_DGPS_Staking.csv"',"Cache-Control":"no-store, no-cache, must-revalidate","Pragma":"no-cache"})
+
+@router.post("/staking-tasks/{task_id}/start")
+def start_staking_task(task_id:int,request:Request,db:Session=Depends(get_db)):
+    task=db.get(EstateStakingTask,task_id)
+    if not task: raise HTTPException(404,"Staking task not found")
+    access=require_estate_access(db,request,task.organization_id,permission="staking.manage")
+    if task.status not in {"pending","assigned"}: raise HTTPException(409,"Staking task cannot be started")
+    task.status="in_progress"
+    task.assigned_subject_type = task.assigned_subject_type or access.principal.subject_type
+    task.assigned_subject_id = task.assigned_subject_id or access.principal.subject_id
+    append_estate_audit_event(db,organization_id=task.organization_id,actor=access.principal,action="staking_task.started",entity_type="estate_staking_task",entity_id=task.id); db.commit()
+    return {"id":task.id,"status":task.status}
+
+@router.post("/staking-tasks/{task_id}/complete")
+def complete_staking_task(task_id:int,request:Request,db:Session=Depends(get_db)):
+    task=db.get(EstateStakingTask,task_id)
+    if not task: raise HTTPException(404,"Staking task not found")
+    access=require_estate_access(db,request,task.organization_id,permission="staking.manage")
+    if task.status != "in_progress": raise HTTPException(409,"Only in-progress staking tasks can be completed")
+    from datetime import datetime, timezone
+    task.status="completed"; task.completed_at=datetime.now(timezone.utc)
+    task.assigned_subject_type = task.assigned_subject_type or access.principal.subject_type
+    task.assigned_subject_id = task.assigned_subject_id or access.principal.subject_id
+    append_estate_audit_event(db,organization_id=task.organization_id,actor=access.principal,action="staking_task.completed",entity_type="estate_staking_task",entity_id=task.id); db.commit()
+    return {"id":task.id,"status":task.status,"completed_at":task.completed_at}
+
+
+@router.post("/organizations/{organization_id}/customers")
+def create_customer(organization_id: int, payload: CustomerCreate, request: Request, db: Session = Depends(get_db)):
+    access = require_estate_access(db, request, organization_id, permission="customer.manage"); _enabled(db, organization_id)
+    customer = EstateCustomer(organization_id=organization_id, full_name=payload.full_name.strip(), full_name_normalized=_normalized(payload.full_name), reference_no=payload.reference_no, phone=payload.phone, email=payload.email, address=payload.address, company_name=payload.company_name, notes=payload.notes)
+    db.add(customer); db.flush(); append_estate_audit_event(db, organization_id=organization_id, actor=access.principal, action="customer.created", entity_type="estate_customer", entity_id=customer.id, after_data={"name": customer.full_name})
+    db.commit(); return {"id": customer.id, "uid": customer.customer_uid, "name": customer.full_name}
+
+
+@router.get("/organizations/{organization_id}/survey-eligibility")
+def get_survey_eligibility_rule(organization_id: int, request: Request, db: Session = Depends(get_db)):
+    require_estate_access(db, request, organization_id, permission="estate.read")
+    rule = db.query(EstatePaymentRule).filter(EstatePaymentRule.organization_id == organization_id, EstatePaymentRule.rule_key == "survey_minimum_confirmed_percentage").one_or_none()
+    return {"organization_id": organization_id, "is_enabled": bool(rule.is_enabled) if rule else False, "percentage": str(rule.percentage or 0) if rule else "0", "description": rule.description if rule else None}
+
+
+@router.put("/organizations/{organization_id}/survey-eligibility")
+def update_survey_eligibility_rule(organization_id: int, payload: SurveyEligibilityUpdate, request: Request, db: Session = Depends(get_db)):
+    access = require_estate_access(db, request, organization_id, permission="estate.manage")
+    rule = db.query(EstatePaymentRule).filter(EstatePaymentRule.organization_id == organization_id, EstatePaymentRule.rule_key == "survey_minimum_confirmed_percentage").one_or_none()
+    if rule is None:
+        rule = EstatePaymentRule(organization_id=organization_id, rule_key="survey_minimum_confirmed_percentage")
+        db.add(rule)
+    rule.is_enabled = payload.is_enabled
+    rule.percentage = payload.percentage
+    rule.description = payload.description
+    db.flush()
+    append_estate_audit_event(db, organization_id=organization_id, actor=access.principal, action="survey_eligibility.updated", entity_type="estate_payment_rule", entity_id=rule.id, after_data={"is_enabled": rule.is_enabled, "percentage": str(rule.percentage)})
+    db.commit()
+    return {"organization_id": organization_id, "is_enabled": rule.is_enabled, "percentage": str(rule.percentage), "description": rule.description}
+
+
+@router.post("/{estate_id}/plots/{plot_id}/reserve")
+def reserve_plot(estate_id: int, plot_id: int, payload: AllocationAction, request: Request, db: Session = Depends(get_db)):
+    plot = db.query(EstatePlot).filter(EstatePlot.id == plot_id, EstatePlot.estate_id == estate_id).one_or_none()
+    if not plot: raise HTTPException(404, "Plot not found")
+    access = require_estate_access(db, request, db.get(Estate, estate_id).organization_id, permission="allocation.manage")
+    customer = db.get(EstateCustomer, payload.customer_id)
+    if not customer or customer.organization_id != access.organization_id: raise HTTPException(404, "Customer not found")
+    record = reserve_or_allocate(db, plot=plot, customer=customer, actor=access.principal, allocate=False, expires_at=payload.expires_at, agreed_price=payload.agreed_price, payment_plan=payload.payment_plan, notes=payload.notes); db.commit(); return {"id": record.id, "status": record.status, "agreed_price": str(record.agreed_price) if record.agreed_price is not None else None}
+
+
+@router.post("/{estate_id}/plots/{plot_id}/allocate")
+def allocate_plot(estate_id: int, plot_id: int, payload: AllocationAction, request: Request, db: Session = Depends(get_db)):
+    plot = db.query(EstatePlot).filter(EstatePlot.id == plot_id, EstatePlot.estate_id == estate_id).one_or_none()
+    if not plot: raise HTTPException(404, "Plot not found")
+    access = require_estate_access(db, request, db.get(Estate, estate_id).organization_id, permission="allocation.manage")
+    customer = db.get(EstateCustomer, payload.customer_id)
+    if not customer or customer.organization_id != access.organization_id: raise HTTPException(404, "Customer not found")
+    record = reserve_or_allocate(db, plot=plot, customer=customer, actor=access.principal, allocate=True, agreed_price=payload.agreed_price, payment_plan=payload.payment_plan, notes=payload.notes); db.commit(); return {"id": record.id, "status": record.status, "agreed_price": str(record.agreed_price) if record.agreed_price is not None else None}
+
+
+@router.post("/allocations/{allocation_id}/release")
+def release_plot(allocation_id: int, request: Request, db: Session = Depends(get_db)):
+    record = db.get(EstateAllocation, allocation_id)
+    if not record: raise HTTPException(404, "Allocation not found")
+    access = require_estate_access(db, request, record.organization_id, permission="allocation.manage")
+    release_allocation(db, allocation=record, actor=access.principal, reason="Released by authorized user"); db.commit(); return {"id": record.id, "status": record.status}
+
+@router.post("/allocations/{allocation_id}/payments")
+def add_payment(allocation_id: int, payload: PaymentCreate, request: Request, db: Session = Depends(get_db)):
+    allocation=db.get(EstateAllocation, allocation_id)
+    if not allocation: raise HTTPException(404,"Allocation not found")
+    access=require_estate_access(db,request,allocation.organization_id,permission="payment.manage")
+    payment=record_payment(db,allocation=allocation,amount=payload.amount,payment_date=payload.payment_date,method=payload.payment_method,reference=payload.reference_no,notes=payload.notes,actor=access.principal); db.commit(); return {"id":payment.id,"status":payment.status}
+
+@router.post("/payments/{payment_id}/confirm")
+def confirm(payment_id:int, request:Request, db:Session=Depends(get_db)):
+    payment=db.get(EstatePayment,payment_id)
+    if not payment: raise HTTPException(404,"Payment not found")
+    access=require_estate_access(db,request,payment.organization_id,permission="payment.manage"); confirm_payment(db,payment=payment,actor=access.principal); db.commit(); return {"id":payment.id,"status":payment.status}
+
+@router.post("/payments/{payment_id}/void")
+def void(payment_id:int,payload:VoidAction,request:Request,db:Session=Depends(get_db)):
+    payment=db.get(EstatePayment,payment_id)
+    if not payment: raise HTTPException(404,"Payment not found")
+    access=require_estate_access(db,request,payment.organization_id,permission="payment.manage"); void_payment(db,payment=payment,actor=access.principal,reason=payload.reason); db.commit(); return {"id":payment.id,"status":payment.status}
+
+@router.get("/allocations/{allocation_id}/financial-summary")
+def allocation_summary(allocation_id:int,request:Request,db:Session=Depends(get_db)):
+    allocation=db.get(EstateAllocation,allocation_id)
+    if not allocation: raise HTTPException(404,"Allocation not found")
+    require_estate_access(db,request,allocation.organization_id,permission="payment.read"); result=financial_summary(db,allocation)
+    return {"agreed_price":str(result.agreed_price),"confirmed_paid":str(result.confirmed_paid),"pending_paid":str(result.pending_paid),"outstanding":str(result.outstanding),"percentage":str(result.percentage),"fully_paid":result.outstanding==0 and result.agreed_price>0}
+
+@router.post("/payments/{payment_id}/evidence")
+async def upload_payment_evidence(payment_id:int, request:Request, file:UploadFile=File(...), db:Session=Depends(get_db)):
+    payment=db.get(EstatePayment,payment_id)
+    if not payment: raise HTTPException(404,"Payment not found")
+    access=require_estate_access(db,request,payment.organization_id,permission="document.manage")
+    organization=db.get(EstateOrganization,payment.organization_id)
+    stored=store_private_estate_file(organization_uid=organization.organization_uid,category="payments",entity_uid=payment.payment_uid,filename=file.filename or "receipt",content_type=file.content_type or "",data=await file.read())
+    document=EstateDocument(organization_id=payment.organization_id,object_key=stored.object_key,original_filename=stored.filename,mime_type=stored.mime_type,size_bytes=stored.size_bytes,checksum=stored.checksum,document_type="receipt",uploaded_by_subject_type=access.principal.subject_type,uploaded_by_subject_id=access.principal.subject_id)
+    db.add(document); db.flush(); db.add(EstateDocumentLink(document_id=document.id,entity_type="payment",entity_id=str(payment.id))); append_estate_audit_event(db,organization_id=payment.organization_id,actor=access.principal,action="payment.evidence_uploaded",entity_type="estate_document",entity_id=document.id,after_data={"payment_id":payment.id,"filename":stored.filename}); db.commit()
+    return {"id":document.id,"filename":document.original_filename}
+
+@router.get("/payments/{payment_id}/evidence/{document_id}/download")
+def download_payment_evidence(payment_id:int,document_id:int,request:Request,db:Session=Depends(get_db)):
+    payment=db.get(EstatePayment,payment_id); document=db.get(EstateDocument,document_id)
+    if not payment or not document or document.organization_id != payment.organization_id or not db.query(EstateDocumentLink).filter(EstateDocumentLink.document_id==document_id,EstateDocumentLink.entity_type=="payment",EstateDocumentLink.entity_id==str(payment_id)).first(): raise HTTPException(404,"Evidence not found")
+    access=require_estate_access(db,request,payment.organization_id,permission="document.read"); data,mime=read_private_estate_file(document.object_key); append_estate_audit_event(db,organization_id=payment.organization_id,actor=access.principal,action="payment.evidence_downloaded",entity_type="estate_document",entity_id=document.id); db.commit()
+    return Response(data,media_type=mime,headers={"Content-Disposition":f'inline; filename="{document.original_filename}"'})
+
+def _linked_entity_organization(db: Session, entity_type: str, entity_id: int) -> int | None:
+    model = {"estate": Estate, "plot": EstatePlot, "customer": EstateCustomer, "allocation": EstateAllocation, "payment": EstatePayment, "staking_task": EstateStakingTask, "field_inspection": EstateFieldInspection, "import_review": EstateImportReview}.get(entity_type)
+    row = db.get(model, entity_id) if model else None
+    return getattr(row, "organization_id", None)
+
+@router.post("/documents")
+async def upload_document(entity_type: str, entity_id: int, document_type: str, request: Request, file: UploadFile = File(...), description: str | None = None, db: Session = Depends(get_db)):
+    organization_id = _linked_entity_organization(db, entity_type, entity_id)
+    if not organization_id: raise HTTPException(404, "Linked Estate entity was not found")
+    access = require_estate_access(db, request, organization_id, permission="document.manage")
+    organization = db.get(EstateOrganization, organization_id)
+    stored = store_private_estate_file(organization_uid=organization.organization_uid, category="documents", entity_uid=f"{entity_type}_{entity_id}", filename=file.filename or "document", content_type=file.content_type or "", data=await file.read())
+    document = EstateDocument(organization_id=organization_id, object_key=stored.object_key, original_filename=stored.filename, mime_type=stored.mime_type, size_bytes=stored.size_bytes, checksum=stored.checksum, document_type=document_type.lower(), description=description, uploaded_by_subject_type=access.principal.subject_type, uploaded_by_subject_id=access.principal.subject_id)
+    db.add(document); db.flush(); db.add(EstateDocumentLink(document_id=document.id, entity_type=entity_type, entity_id=str(entity_id))); append_estate_audit_event(db, organization_id=organization_id, actor=access.principal, action="document.uploaded", entity_type="estate_document", entity_id=document.id, after_data={"linked_entity":entity_type,"linked_id":entity_id}); db.commit()
+    return {"id":document.id,"filename":document.original_filename}
+
+@router.get("/documents/{document_id}/download")
+def download_document(document_id:int, request:Request, db:Session=Depends(get_db)):
+    document=db.get(EstateDocument,document_id)
+    if not document: raise HTTPException(404,"Document not found")
+    access=require_estate_access(db,request,document.organization_id,permission="document.read"); data,mime=read_private_estate_file(document.object_key); append_estate_audit_event(db,organization_id=document.organization_id,actor=access.principal,action="document.downloaded",entity_type="estate_document",entity_id=document.id); db.commit()
+    return Response(data,media_type=mime,headers={"Content-Disposition":f'inline; filename="{document.original_filename}"'})
+
+@router.get("/customers/{customer_id}/statement")
+def customer_statement(customer_id:int, request:Request, estate_id:int|None=None, allocation_id:int|None=None, db:Session=Depends(get_db)):
+    customer=db.get(EstateCustomer,customer_id)
+    if not customer: raise HTTPException(404,"Customer not found")
+    access=require_estate_access(db,request,customer.organization_id,permission="payment.read")
+    allocations=db.query(EstateAllocation).filter(EstateAllocation.customer_id==customer_id, EstateAllocation.organization_id==customer.organization_id)
+    if estate_id: allocations=allocations.filter(EstateAllocation.estate_id==estate_id)
+    if allocation_id: allocations=allocations.filter(EstateAllocation.id==allocation_id)
+    allocations=allocations.all()
+    rows=[]
+    for allocation in allocations:
+        summary=financial_summary(db,allocation); plot=db.get(EstatePlot,allocation.plot_id); estate=db.get(Estate,allocation.estate_id)
+        payments=db.query(EstatePayment).filter(EstatePayment.allocation_id==allocation.id).order_by(EstatePayment.payment_date).all()
+        rows.append({"allocation_id":allocation.id,"allocation_date":allocation.allocation_date,"estate":estate.name if estate else None,"plot":plot.plot_number if plot else None,"payment_plan":allocation.payment_plan,"agreed_price":str(summary.agreed_price),"confirmed_paid":str(summary.confirmed_paid),"pending_paid":str(summary.pending_paid),"outstanding":str(summary.outstanding),"transactions":[{"date":p.payment_date,"reference":p.reference_no,"method":p.payment_method,"amount":str(p.amount),"status":p.status} for p in payments]})
+    organization=db.get(EstateOrganization,customer.organization_id)
+    return {"statement_date":__import__("datetime").datetime.utcnow().isoformat()+"Z","organization":{"id":customer.organization_id,"name":organization.name if organization else access.organization_name},"customer":{"id":customer.id,"name":customer.full_name,"reference":customer.reference_no},"allocations":rows}
+
+@router.get("/allocations/{allocation_id}/financial-detail")
+def allocation_financial_detail(allocation_id:int,request:Request,db:Session=Depends(get_db)):
+    allocation=db.get(EstateAllocation,allocation_id)
+    if not allocation: raise HTTPException(404,"Allocation not found")
+    require_estate_access(db,request,allocation.organization_id,permission="payment.read")
+    summary=financial_summary(db,allocation); customer=db.get(EstateCustomer,allocation.customer_id); plot=db.get(EstatePlot,allocation.plot_id); estate=db.get(Estate,allocation.estate_id)
+    payments=db.query(EstatePayment).filter(EstatePayment.allocation_id==allocation.id).order_by(EstatePayment.payment_date.desc()).all()
+    return {"allocation":{"id":allocation.id,"status":allocation.status,"allocation_date":allocation.allocation_date,"payment_plan":allocation.payment_plan},"customer":{"id":customer.id,"name":customer.full_name,"reference":customer.reference_no,"phone":customer.phone,"email":customer.email},"estate":{"id":estate.id,"name":estate.name},"plot":{"id":plot.id,"number":plot.plot_number},"financial":{"agreed_price":str(summary.agreed_price),"confirmed_paid":str(summary.confirmed_paid),"pending_paid":str(summary.pending_paid),"outstanding":str(summary.outstanding),"percentage":str(summary.percentage),"fully_paid":summary.agreed_price>0 and summary.outstanding==0},"payments":[{"id":p.id,"date":p.payment_date,"amount":str(p.amount),"status":p.status,"method":p.payment_method,"reference":p.reference_no} for p in payments]}
+
+@router.get("/customers/{customer_id}/financial-detail")
+def customer_financial_detail(customer_id:int,request:Request,db:Session=Depends(get_db)):
+    customer=db.get(EstateCustomer,customer_id)
+    if not customer: raise HTTPException(404,"Customer not found")
+    require_estate_access(db,request,customer.organization_id,permission="payment.read")
+    allocations=db.query(EstateAllocation).filter(EstateAllocation.customer_id==customer_id, EstateAllocation.organization_id==customer.organization_id).all(); rows=[]
+    for allocation in allocations:
+        summary=financial_summary(db,allocation); estate=db.get(Estate,allocation.estate_id); plot=db.get(EstatePlot,allocation.plot_id)
+        rows.append({"allocation_id":allocation.id,"allocation_date":allocation.allocation_date,"payment_plan":allocation.payment_plan,"estate":{"id":estate.id,"name":estate.name},"plot":{"id":plot.id,"number":plot.plot_number},"agreed_price":str(summary.agreed_price),"confirmed":str(summary.confirmed_paid),"pending":str(summary.pending_paid),"outstanding":str(summary.outstanding),"percentage":str(summary.percentage),"payment_count":db.query(EstatePayment).filter(EstatePayment.allocation_id==allocation.id).count()})
+    return {"customer":{"id":customer.id,"name":customer.full_name,"reference":customer.reference_no,"phone":customer.phone,"email":customer.email},"allocations":rows}
+
+@router.get("/{estate_id}/financial-summary")
+def estate_financial_summary(estate_id:int,request:Request,db:Session=Depends(get_db)):
+    estate=db.get(Estate,estate_id)
+    if not estate: raise HTTPException(404,"Estate not found")
+    require_estate_access(db,request,estate.organization_id,permission="payment.read")
+    allocations=db.query(EstateAllocation).filter(EstateAllocation.estate_id==estate_id).all(); summaries=[financial_summary(db,a) for a in allocations]
+    return {"estate":{"id":estate.id,"name":estate.name},"contracted_sales":str(sum((s.agreed_price for s in summaries),0)),"confirmed_collections":str(sum((s.confirmed_paid for s in summaries),0)),"pending_collections":str(sum((s.pending_paid for s in summaries),0)),"outstanding_balance":str(sum((s.outstanding for s in summaries),0)),"fully_paid_allocations":sum(1 for s in summaries if s.agreed_price>0 and s.outstanding==0),"allocations_with_outstanding":sum(1 for s in summaries if s.outstanding>0)}
+
+@router.get("/financial-summary")
+def organization_financial_summary(request:Request, db:Session=Depends(get_db)):
+    principal=resolve_estate_principal(db,request); access=list_estate_access(db,principal); result=[]
+    for item in access:
+        allocations=db.query(EstateAllocation).filter(EstateAllocation.organization_id==item.organization_id).all()
+        summaries=[financial_summary(db,a) for a in allocations]
+        result.append({"organization_id":item.organization_id,"contracted_sales_value":str(sum((s.agreed_price for s in summaries),0)),"confirmed_collections":str(sum((s.confirmed_paid for s in summaries),0)),"pending_collections":str(sum((s.pending_paid for s in summaries),0)),"outstanding_balance":str(sum((s.outstanding for s in summaries),0)),"fully_paid_allocations":sum(1 for s in summaries if s.agreed_price>0 and s.outstanding==0)})
+    return result
+
+@router.get("/payments")
+def list_payments(request: Request, page: int = 1, page_size: int = 25, search: str | None = None, status: str | None = None, estate_id: int | None = None, customer_id: int | None = None, method: str | None = None, date_from: str | None = None, date_to: str | None = None, db: Session = Depends(get_db)):
+    principal=resolve_estate_principal(db,request); memberships={a.organization_id:a for a in list_estate_access(db,principal)}; allowed=set(memberships)
+    query=db.query(EstatePayment,EstateCustomer,Estate,EstatePlot).join(EstateCustomer,EstateCustomer.id==EstatePayment.customer_id).join(EstatePlot,EstatePlot.id==EstatePayment.plot_id).join(Estate,Estate.id==EstatePlot.estate_id).filter(EstatePayment.organization_id.in_(allowed))
+    if estate_id: query=query.filter(Estate.id==estate_id)
+    if customer_id: query=query.filter(EstateCustomer.id==customer_id)
+    if status: query=query.filter(EstatePayment.status==status)
+    if method: query=query.filter(EstatePayment.payment_method==method)
+    if date_from: query=query.filter(EstatePayment.payment_date>=date_from)
+    if date_to: query=query.filter(EstatePayment.payment_date<=date_to)
+    if search:
+        term=f"%{search.strip()}%"; query=query.filter((EstateCustomer.full_name.ilike(term)) | (EstatePlot.plot_number.ilike(term)) | (EstatePayment.reference_no.ilike(term)))
+    total=query.count(); rows=query.order_by(EstatePayment.payment_date.desc()).offset(max(page-1,0)*min(max(page_size,1),100)).limit(min(max(page_size,1),100)).all()
+    return {"page":page,"page_size":min(max(page_size,1),100),"total":total,"items":[{"id":p.id,"date":p.payment_date,"amount":str(p.amount),"currency":p.currency,"status":p.status,"method":p.payment_method,"reference":p.reference_no,"customer":{"id":c.id,"name":c.full_name},"estate":{"id":e.id,"name":e.name},"plot":{"id":plot.id,"number":plot.plot_number},"allocation_id":p.allocation_id,"recorded_by":p.recorded_by_subject_id,"confirmed_by":p.confirmed_by_subject_id,"can_confirm":has_permission(memberships[p.organization_id].role_key,"payment.manage") and p.status in {"recorded","pending_confirmation"},"can_void":has_permission(memberships[p.organization_id].role_key,"payment.manage") and p.status not in {"voided","reversed"},"can_view_receipt":has_permission(memberships[p.organization_id].role_key,"document.read")} for p,c,e,plot in rows]}
+
+@router.get("/payments/{payment_id}")
+def payment_detail(payment_id:int,request:Request,db:Session=Depends(get_db)):
+    payment=db.get(EstatePayment,payment_id)
+    if not payment: raise HTTPException(404,"Payment not found")
+    access=require_estate_access(db,request,payment.organization_id,permission="payment.read")
+    allocation=db.get(EstateAllocation,payment.allocation_id); customer=db.get(EstateCustomer,payment.customer_id); plot=db.get(EstatePlot,payment.plot_id); estate=db.get(Estate,allocation.estate_id); summary=financial_summary(db,allocation)
+    evidence=db.query(EstateDocument).join(EstateDocumentLink,EstateDocumentLink.document_id==EstateDocument.id).filter(EstateDocumentLink.entity_type=="payment",EstateDocumentLink.entity_id==str(payment_id)).all()
+    return {"payment":{"id":payment.id,"amount":str(payment.amount),"currency":payment.currency,"date":payment.payment_date,"method":payment.payment_method,"reference":payment.reference_no,"notes":payment.notes,"status":payment.status,"recorded_by":payment.recorded_by_subject_id,"confirmed_by":payment.confirmed_by_subject_id,"confirmed_at":payment.confirmed_at,"void_reason":payment.void_reason},"customer":{"id":customer.id,"name":customer.full_name},"estate":{"id":estate.id,"name":estate.name},"plot":{"id":plot.id,"number":plot.plot_number},"allocation_id":allocation.id,"financial":{"agreed_price":str(summary.agreed_price),"confirmed":str(summary.confirmed_paid),"pending":str(summary.pending_paid),"outstanding":str(summary.outstanding)},"capabilities":{"can_confirm":has_permission(access.role_key,"payment.manage") and payment.status in {"recorded","pending_confirmation"},"can_void":has_permission(access.role_key,"payment.manage") and payment.status not in {"voided","reversed"},"can_view_receipt":has_permission(access.role_key,"document.read")},"evidence":[{"id":d.id,"filename":d.original_filename,"mime_type":d.mime_type} for d in evidence]}
+
+@router.get("/documents")
+def list_documents(request:Request,page:int=1,page_size:int=25,document_type:str|None=None,entity_type:str|None=None,entity_id:int|None=None,db:Session=Depends(get_db)):
+    principal=resolve_estate_principal(db,request); allowed={a.organization_id for a in list_estate_access(db,principal)}
+    query=db.query(EstateDocument,EstateDocumentLink).join(EstateDocumentLink,EstateDocumentLink.document_id==EstateDocument.id).filter(EstateDocument.organization_id.in_(allowed))
+    if document_type: query=query.filter(EstateDocument.document_type==document_type.lower())
+    if entity_type: query=query.filter(EstateDocumentLink.entity_type==entity_type)
+    if entity_id is not None: query=query.filter(EstateDocumentLink.entity_id==str(entity_id))
+    total=query.count(); rows=query.order_by(EstateDocument.created_at.desc()).offset(max(page-1,0)*min(max(page_size,1),100)).limit(min(max(page_size,1),100)).all()
+    return {"page":page,"page_size":min(max(page_size,1),100),"total":total,"items":[{"id":d.id,"filename":d.original_filename,"type":d.document_type,"description":d.description,"entity_type":link.entity_type,"entity_id":link.entity_id,"mime_type":d.mime_type,"size":d.size_bytes,"uploaded_at":d.created_at} for d,link in rows]}
+
+@router.get("/selectors")
+def estate_selectors(request:Request, estate_id:int|None=None, customer_id:int|None=None, plot_id:int|None=None, status:str|None=None, db:Session=Depends(get_db)):
+    principal=resolve_estate_principal(db,request); access=list_estate_access(db,principal); allowed={a.organization_id for a in access}
+    estates=db.query(Estate).filter(Estate.organization_id.in_(allowed),Estate.archived_at.is_(None)).all()
+    customers=db.query(EstateCustomer).filter(EstateCustomer.organization_id.in_(allowed)).all()
+    plots=db.query(EstatePlot,Estate).join(Estate,Estate.id==EstatePlot.estate_id).filter(Estate.organization_id.in_(allowed))
+    if estate_id: plots=plots.filter(EstatePlot.estate_id==estate_id)
+    plots=plots.all()
+    allocations=db.query(EstateAllocation,Estate,EstatePlot,EstateCustomer).join(Estate,Estate.id==EstateAllocation.estate_id).join(EstatePlot,EstatePlot.id==EstateAllocation.plot_id).join(EstateCustomer,EstateCustomer.id==EstateAllocation.customer_id).filter(EstateAllocation.organization_id.in_(allowed))
+    if estate_id: allocations=allocations.filter(EstateAllocation.estate_id==estate_id)
+    if customer_id: allocations=allocations.filter(EstateAllocation.customer_id==customer_id)
+    if plot_id: allocations=allocations.filter(EstateAllocation.plot_id==plot_id)
+    if status: allocations=allocations.filter(EstateAllocation.status==status)
+    allocation_items=[]
+    for allocation,estate,plot,customer in allocations.all():
+        summary=financial_summary(db,allocation); allocation_items.append({"id":allocation.id,"estate_id":estate.id,"estate_name":estate.name,"plot_id":plot.id,"plot_number":plot.plot_number,"customer_id":customer.id,"customer_name":customer.full_name,"status":allocation.status,"allocation_date":allocation.allocation_date,"payment_plan":allocation.payment_plan,"agreed_price":str(summary.agreed_price),"currency":"NGN","confirmed":str(summary.confirmed_paid),"pending":str(summary.pending_paid),"outstanding":str(summary.outstanding)})
+    return {"estates":[{"id":e.id,"name":e.name} for e in estates],"customers":[{"id":c.id,"name":c.full_name,"reference":c.reference_no} for c in customers],"plots":[{"id":p.id,"plot_number":p.plot_number,"estate_id":e.id,"estate_name":e.name,"commercial_status":p.commercial_status,"development_status":p.development_status} for p,e in plots],"allocations":allocation_items}
+
+
+@router.get("/{estate_id}")
+def estate_detail(estate_id: int, request: Request, db: Session = Depends(get_db)):
+    estate = db.get(Estate, estate_id)
+    if not estate:
+        raise HTTPException(404, "Estate not found")
+    require_estate_access(db, request, estate.organization_id, permission="estate.read")
+    return {
+        "id": estate.id,
+        "uid": estate.estate_uid,
+        "organization_id": estate.organization_id,
+        "name": estate.name,
+        "status": estate.status,
+        "description": estate.description,
+        "state": estate.state,
+        "locality": estate.locality,
+        "location_text": estate.location_text,
+        "crs": estate.crs,
+        "datum": estate.datum,
+        "approximate_area_sqm": str(estate.approximate_area_sqm) if estate.approximate_area_sqm is not None else None,
+        "project_reference": estate.project_reference,
+        "project_owner": estate.project_owner,
+        "ownership_details": estate.ownership_details,
+        "boundary": mapping(to_shape(estate.boundary)) if estate.boundary else None,
+    }
+
+
+@router.get("/organizations/{organization_id}/members")
+def list_organization_members(organization_id: int, request: Request, db: Session = Depends(get_db)):
+    require_estate_access(db, request, organization_id, permission="estate.manage")
+    rows = db.query(EstateOrganizationMember).filter(EstateOrganizationMember.organization_id == organization_id).order_by(EstateOrganizationMember.created_at.asc()).all()
+    return [{"id": row.id, "subject_type": row.subject_type, "subject_id": row.subject_id, "role": row.role_key, "is_active": row.is_active} for row in rows]
+
+
+@router.post("/organizations/{organization_id}/members")
+def add_organization_member(organization_id: int, payload: MemberCreate, request: Request, db: Session = Depends(get_db)):
+    access = require_estate_access(db, request, organization_id, permission="estate.manage")
+    existing = db.query(EstateOrganizationMember).filter(EstateOrganizationMember.organization_id == organization_id, EstateOrganizationMember.subject_type == payload.subject_type.strip(), EstateOrganizationMember.subject_id == payload.subject_id.strip()).one_or_none()
+    if existing:
+        raise HTTPException(409, "This identity is already an organization member")
+    row = EstateOrganizationMember(organization_id=organization_id, subject_type=payload.subject_type.strip().lower(), subject_id=payload.subject_id.strip(), role_key=payload.role_key)
+    db.add(row)
+    db.flush()
+    append_estate_audit_event(db, organization_id=organization_id, actor=access.principal, action="organization_member.added", entity_type="estate_organization_member", entity_id=row.id, after_data={"subject_type": row.subject_type, "subject_id": row.subject_id, "role": row.role_key})
+    db.commit()
+    return {"id": row.id, "subject_type": row.subject_type, "subject_id": row.subject_id, "role": row.role_key, "is_active": row.is_active}
+
+
+@router.patch("/organizations/{organization_id}/members/{member_id}")
+def update_organization_member(organization_id: int, member_id: int, payload: MemberUpdate, request: Request, db: Session = Depends(get_db)):
+    access = require_estate_access(db, request, organization_id, permission="estate.manage")
+    row = db.query(EstateOrganizationMember).filter(EstateOrganizationMember.id == member_id, EstateOrganizationMember.organization_id == organization_id).one_or_none()
+    if not row:
+        raise HTTPException(404, "Organization member not found")
+    values = payload.model_dump(exclude_unset=True)
+    next_role = values.get("role_key", row.role_key)
+    next_active = values.get("is_active", row.is_active)
+    if row.role_key == "owner" and (next_role != "owner" or not next_active):
+        owner_count = db.query(EstateOrganizationMember).filter(EstateOrganizationMember.organization_id == organization_id, EstateOrganizationMember.role_key == "owner", EstateOrganizationMember.is_active.is_(True)).count()
+        if owner_count <= 1:
+            raise HTTPException(409, "An organization must retain at least one active owner")
+    before = {"role": row.role_key, "is_active": row.is_active}
+    row.role_key = next_role
+    row.is_active = next_active
+    append_estate_audit_event(db, organization_id=organization_id, actor=access.principal, action="organization_member.updated", entity_type="estate_organization_member", entity_id=row.id, before_data=before, after_data={"role": row.role_key, "is_active": row.is_active})
+    db.commit()
+    return {"id": row.id, "subject_type": row.subject_type, "subject_id": row.subject_id, "role": row.role_key, "is_active": row.is_active}
+
+
+@router.get("/foundation/access")
+def estate_foundation_access(request: Request, db: Session = Depends(get_db)):
+    principal = resolve_estate_principal(db, request)
+    access = list_estate_access(db, principal)
+    if not access:
+        raise HTTPException(status_code=403, detail="No active Estate organization membership")
+    organizations = []
+    for item in access:
+        entitlements = {
+            feature: get_estate_entitlement(db, item.organization_id, feature).is_enabled
+            for feature in sorted(ESTATE_FEATURES)
+        }
+        organizations.append(
+            {
+                "id": item.organization_id,
+                "name": item.organization_name,
+                "slug": item.organization_slug,
+                "role": item.role_key,
+                "entitlements": entitlements,
+            }
+        )
+    return {
+        "principal": {"subject_type": principal.subject_type, "subject_id": principal.subject_id, "display_name": principal.display_name},
+        "organizations": organizations,
+    }

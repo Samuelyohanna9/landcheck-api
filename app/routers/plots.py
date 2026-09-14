@@ -39,6 +39,8 @@ import matplotlib.patches as patches
 
 from app.db import SessionLocal
 from app.models.plot import Plot
+from app.services.survey.plots import create_survey_plot
+from app.services.survey.dgps import alpha_station
 from app.models.plot_buffer import PlotBuffer
 from app.utils.pdf import generate_plot_report_pdf
 from app.utils.survey_auth_security import require_survey_session, resolve_survey_session
@@ -5877,20 +5879,6 @@ def create_plot(
 
     ensure_plots_created_at(db)
 
-    if client_request_id:
-        # A resend of the same client-generated attempt id (e.g. after a dropped response on a
-        # flaky connection) returns the plot already created for it instead of creating a
-        # duplicate - see ensure_plot_idempotency_columns for the backing unique index.
-        existing_plot = db.execute(
-            text("SELECT id FROM plots WHERE client_request_id = :client_request_id LIMIT 1"),
-            {"client_request_id": client_request_id},
-        ).mappings().first()
-        if existing_plot:
-            return {"plot_id": int(existing_plot["id"])}
-
-    polygon = Polygon(coords)
-    geom = from_shape(polygon, srid=4326)
-
     # Anonymous creation stays fully supported (the "value first" gate-free flow) - this only
     # stamps ownership when the request happens to already carry a signed-in Survey session.
     owner_user_id = None
@@ -5900,8 +5888,15 @@ def create_plot(
     except Exception:
         owner_user_id = None
 
-    plot = Plot(geom=geom, client_request_id=client_request_id or None, owner_user_id=owner_user_id)
-    db.add(plot)
+    creation = create_survey_plot(
+        db,
+        coordinates=coords,
+        owner_user_id=owner_user_id,
+        client_request_id=client_request_id,
+    )
+    if creation.already_exists:
+        return {"plot_id": int(creation.plot.id)}
+    plot = creation.plot
     db.commit()
     db.refresh(plot)
 
@@ -6030,6 +6025,28 @@ def list_my_plots(request: Request, db: Session = Depends(get_db)):
             }
             for row in rows
         ]
+    }
+
+
+@router.get("/{plot_id}/workspace")
+def load_owned_plot_workspace(plot_id: int, request: Request, db: Session = Depends(get_db)):
+    """Load an owned Survey plot into the existing drafting workspace."""
+    session = require_survey_session(db, request)
+    plot = db.get(Plot, plot_id)
+    if not plot or plot.owner_user_id != session.user_id:
+        raise HTTPException(status_code=404, detail="Plot not found")
+    polygon = _load_plot_polygon_wgs84(db, plot_id)
+    coordinates = list(polygon.exterior.coords)
+    if coordinates and coordinates[0] == coordinates[-1]:
+        coordinates = coordinates[:-1]
+    meta = get_plot_meta(db, plot_id)
+    return {
+        "plot_id": plot.id,
+        "coordinates": [
+            {"station": alpha_station(index), "lng": float(lng), "lat": float(lat), "is_boundary": True}
+            for index, (lng, lat) in enumerate(coordinates)
+        ],
+        "meta": meta,
     }
 
 
