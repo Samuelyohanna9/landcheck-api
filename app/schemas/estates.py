@@ -125,6 +125,16 @@ class ImportReviewDecision(BaseModel):
     notes: str | None = Field(default=None, max_length=4000)
     candidate_data: list[dict[str, Any]] | None = None
 
+class ImportReviewFromGeoreferenceSession(BaseModel):
+    survey_georeference_session_id: str = Field(min_length=1, max_length=128)
+    notes: str | None = Field(default=None, max_length=4000)
+
+class GeoreferenceSessionLink(BaseModel):
+    survey_georeference_session_id: str = Field(min_length=1, max_length=128)
+
+class ImportFromGeoreference(BaseModel):
+    plot_prefix: str = Field(default="P", max_length=20)
+
 class CustomerCreate(BaseModel):
     full_name: str
     reference_no: str | None = None

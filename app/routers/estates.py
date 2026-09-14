@@ -15,13 +15,14 @@ from pyproj import Transformer
 import ezdxf
 from shapely.geometry import mapping, shape
 from shapely.ops import transform as shapely_transform
+from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from app.routers.plots import _metric_epsg_for_wgs84_polygon, _subdivide_polygon_equal_count, get_db
 from app.services.estates.authorization import list_estate_access, resolve_estate_principal
 from app.services.estates.entitlements import ESTATE_FEATURES, get_estate_entitlement
 from app.models.estate_foundation import Estate, EstateAllocation, EstateAuditEvent, EstateBlock, EstateCustomer, EstateDocument, EstateDocumentLink, EstateFieldInspection, EstateHazardAssessment, EstateImportReview, EstateLayoutProposal, EstateOrganization, EstateOrganizationMember, EstatePayment, EstatePaymentRule, EstatePlot, EstateSpatialFeature, EstateSurveyRequest, EstateStakingTask
-from app.schemas.estates import AllocationAction, BlockCreate, BlockUpdate, CustomerCreate, DevelopmentStatusUpdate, EstateCreate, EstateLayoutCriteria, EstateLayoutDecision, EstateSubdivisionCreate, EstateUpdate, FieldInspectionCreate, ImportReviewCreate, ImportReviewDecision, MemberCreate, MemberUpdate, PlotCreate, PaymentCreate, SpatialFeatureCreate, SpatialFeatureUpdate, SurveyEligibilityUpdate, VoidAction
+from app.schemas.estates import AllocationAction, BlockCreate, BlockUpdate, CustomerCreate, DevelopmentStatusUpdate, EstateCreate, EstateLayoutCriteria, EstateLayoutDecision, EstateSubdivisionCreate, EstateUpdate, FieldInspectionCreate, GeoreferenceSessionLink, ImportFromGeoreference, ImportReviewCreate, ImportReviewDecision, ImportReviewFromGeoreferenceSession, MemberCreate, MemberUpdate, PlotCreate, PaymentCreate, SpatialFeatureCreate, SpatialFeatureUpdate, SurveyEligibilityUpdate, VoidAction
 from app.services.estates.payments import confirm_payment, financial_summary, record_payment, void_payment
 from app.services.estates.documents import read_private_estate_file, store_private_estate_file
 from app.services.estates.permissions import has_permission
@@ -99,6 +100,39 @@ def _import_candidate(*, row_number: int, plot_number: str, geometry: dict) -> d
         "valid": not errors,
         "issues": errors,
     }
+
+
+def _create_plots_from_candidates(db: Session, *, estate: Estate, candidates: list[dict], source_type: str, source_reference: str, actor) -> int:
+    """Shared by the CSV/GIS/DXF import-review approval path and the georeference import path -
+    both end up with the same shape of reviewed candidate rows (plot_number + geometry + valid),
+    just produced by a different intake method."""
+    created = 0
+    for candidate in candidates or []:
+        number = str(candidate.get("plot_number") or "").strip()
+        geometry = candidate.get("geometry")
+        if not candidate.get("valid") or not number or not geometry:
+            continue
+        normalized = _normalized(number)
+        if db.query(EstatePlot).filter(EstatePlot.estate_id == estate.id, EstatePlot.plot_number_normalized == normalized).first():
+            continue
+        area, issues = validate_polygon(geometry)
+        if any(issue.severity == "error" for issue in issues):
+            continue
+        plot = EstatePlot(
+            estate_id=estate.id,
+            plot_number=number,
+            plot_number_normalized=normalized,
+            geometry=from_shape(shape(geometry), srid=4326),
+            area_sqm=area,
+            geometry_status="approved",
+            source_type=source_type,
+            source_reference=source_reference,
+            created_by_subject_type=actor.subject_type,
+            created_by_subject_id=actor.subject_id,
+        )
+        db.add(plot)
+        created += 1
+    return created
 
 
 def _layout_proposal_payload(row: EstateLayoutProposal) -> dict:
@@ -352,22 +386,37 @@ def create_import_review(estate_id:int,payload:ImportReviewCreate,request:Reques
     db.add(row); db.flush(); append_estate_audit_event(db,organization_id=estate.organization_id,actor=access.principal,action="import_review.created",entity_type="estate_import_review",entity_id=row.id,after_data={"source_type":row.source_type}); db.commit()
     return {"id":row.id,"status":row.status}
 
+def _normalize_csv_header(name: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", str(name or "").strip().lower())
+
+
+def _normalize_csv_records(raw_records: list[dict]) -> list[dict]:
+    """Real spreadsheet exports rarely use our exact lowercase column names (Excel/QGIS/AutoCAD
+    commonly ship "Plot Number", "Longitude", "Easting (m)", etc.) - matching only on the raw
+    header silently dropped every row and reported "no usable plots" with no indication why.
+    Normalizing each row's keys once (lowercased, trimmed, non-alphanumerics stripped) lets the
+    same handful of `record.get(...)` calls the caller uses match the header spelling people
+    actually use."""
+    return [{_normalize_csv_header(key): value for key, value in record.items()} for record in raw_records]
+
+
 @router.post("/{estate_id}/import-reviews/csv")
 async def import_estate_csv(estate_id: int, request: Request, source_crs: str | None = None, file: UploadFile = File(...), db: Session = Depends(get_db)):
     estate=db.get(Estate,estate_id)
     if not estate: raise HTTPException(404,"Estate not found")
     access=require_estate_access(db,request,estate.organization_id,permission="plot.manage")
-    try: records=list(csv.DictReader(io.StringIO((await file.read()).decode("utf-8-sig"))))
+    try: raw_records=list(csv.DictReader(io.StringIO((await file.read()).decode("utf-8-sig"))))
     except Exception as exc: raise HTTPException(422,"CSV could not be read") from exc
+    records = _normalize_csv_records(raw_records)
     candidates = []
     has_geometry = any(str(record.get("geometry") or "").strip() for record in records)
     if has_geometry:
         for index, record in enumerate(records, 1):
             try:
                 geometry = json.loads(record.get("geometry") or "")
-                candidates.append(_import_candidate(row_number=index, plot_number=str(record.get("plot_number") or ""), geometry=geometry))
+                candidates.append(_import_candidate(row_number=index, plot_number=str(record.get("plotnumber") or ""), geometry=geometry))
             except Exception:
-                candidates.append({"row": index, "plot_number": str(record.get("plot_number") or "").strip(), "valid": False, "issues": ["geometry must be a GeoJSON Polygon"]})
+                candidates.append({"row": index, "plot_number": str(record.get("plotnumber") or "").strip(), "valid": False, "issues": ["geometry must be a GeoJSON Polygon"]})
     else:
         grouped: dict[str, list[list[float]]] = {}
         first_rows: dict[str, int] = {}
@@ -376,9 +425,9 @@ async def import_estate_csv(estate_id: int, request: Request, source_crs: str | 
         except Exception as exc:
             raise HTTPException(status_code=422, detail="CSV source_crs is invalid") from exc
         for index, record in enumerate(records, 1):
-            number = str(record.get("plot_number") or record.get("plot") or "").strip()
-            x_value = record.get("longitude") or record.get("lng") or record.get("lon") or record.get("easting") or record.get("x")
-            y_value = record.get("latitude") or record.get("lat") or record.get("northing") or record.get("y")
+            number = str(record.get("plotnumber") or record.get("plot") or record.get("plotno") or record.get("plotid") or "").strip()
+            x_value = record.get("longitude") or record.get("lng") or record.get("lon") or record.get("easting") or record.get("eastingm") or record.get("x")
+            y_value = record.get("latitude") or record.get("lat") or record.get("northing") or record.get("northingm") or record.get("y")
             try:
                 if not number or x_value in (None, "") or y_value in (None, ""):
                     raise ValueError
@@ -561,20 +610,131 @@ def decide_import_review(review_id:int,payload:ImportReviewDecision,request:Requ
     created=0
     if payload.status == "approved":
         estate=db.get(Estate,row.estate_id)
-        for candidate in row.candidate_data or []:
-            number=str(candidate.get("plot_number") or "").strip(); geometry=candidate.get("geometry")
-            if not candidate.get("valid") or not number or not geometry: continue
-            normalized=_normalized(number)
-            if db.query(EstatePlot).filter(EstatePlot.estate_id==estate.id,EstatePlot.plot_number_normalized==normalized).first(): continue
-            area,issues=validate_polygon(geometry)
-            if any(issue.severity=="error" for issue in issues): continue
-            plot=EstatePlot(estate_id=estate.id,plot_number=number,plot_number_normalized=normalized,geometry=from_shape(shape(geometry),srid=4326),area_sqm=area,geometry_status="approved",source_type=row.source_type,source_reference=str(row.id),created_by_subject_type=access.principal.subject_type,created_by_subject_id=access.principal.subject_id)
-            db.add(plot); created+=1
+        created=_create_plots_from_candidates(db,estate=estate,candidates=row.candidate_data or [],source_type=row.source_type,source_reference=str(row.id),actor=access.principal)
         row.notes=(payload.notes or row.notes or "") + f"; {created} operational plot(s) created"
     else: row.notes=payload.notes or row.notes
     row.status=payload.status
     append_estate_audit_event(db,organization_id=row.organization_id,actor=access.principal,action=f"import_review.{row.status}",entity_type="estate_import_review",entity_id=row.id,after_data={"status":row.status}); db.commit()
     return {"id":row.id,"status":row.status,"created_plots":created}
+
+
+def _plot_number_from_georeference_feature(feature: dict, index: int, prefix: str) -> str:
+    """A digitized feature's label is whatever the surveyor typed while digitizing (often left at
+    the tool's generic default) - only promote it to a plot number when it looks intentional,
+    otherwise fall back to a sequential prefix so two auto-generated plots never collide."""
+    label = str(feature.get("label") or "").strip()
+    generic_label = label.lower() in {"", "polygon", f"polygon {index}"}
+    return f"{prefix}{index}" if generic_label else label
+
+
+def _polygon_geometry_from_georeference_feature(feature: dict) -> dict:
+    ring = feature.get("wgs84_coordinates") or []
+    return {"type": "Polygon", "coordinates": [ring]}
+
+
+def _load_georeference_session_features(db: Session, session_id: str) -> list[dict]:
+    """Reads straight from survey_georeference_sessions - the session carries only raster/pixel/
+    geometry data (no estate, customer or payment data), so a cross-domain read here is safe; it
+    mirrors the read-only cross-reference the Survey side already makes into estate_plots via
+    estate_survey_requests.survey_working_plot_id."""
+    row = db.execute(text("SELECT features_json FROM survey_georeference_sessions WHERE id = :id"), {"id": session_id}).mappings().first()
+    if not row:
+        raise HTTPException(404, "The linked georeference session no longer exists")
+    features = row["features_json"] or []
+    if isinstance(features, str):
+        features = json.loads(features)
+    return features
+
+
+@router.post("/{estate_id}/import-reviews/from-georeference-session")
+def create_import_review_from_georeference_session(estate_id: int, payload: ImportReviewFromGeoreferenceSession, request: Request, db: Session = Depends(get_db)):
+    """Starts a review from a raster the surveyor already georeferenced in the Survey product's
+    own tool (POST /survey-georeference/sessions, unauthenticated by session id like a plot draft)
+    - no re-upload here, this just remembers which session belongs to which Estate."""
+    estate = db.get(Estate, estate_id)
+    if not estate:
+        raise HTTPException(404, "Estate not found")
+    access = require_estate_access(db, request, estate.organization_id, permission="plot.manage")
+    session_id = payload.survey_georeference_session_id.strip()
+    exists = db.execute(text("SELECT 1 FROM survey_georeference_sessions WHERE id = :id"), {"id": session_id}).scalar()
+    if not exists:
+        raise HTTPException(404, "Georeference session not found")
+    if db.query(EstateImportReview).filter(EstateImportReview.survey_georeference_session_id == session_id).first():
+        raise HTTPException(409, "This georeference session is already linked to an import review")
+    review = EstateImportReview(
+        organization_id=estate.organization_id,
+        estate_id=estate.id,
+        source_type="raster",
+        survey_georeference_session_id=session_id,
+        notes=payload.notes or "Layout is being georeferenced and digitized before its plots are reviewed.",
+        candidate_data=[],
+        created_by_subject_type=access.principal.subject_type,
+        created_by_subject_id=access.principal.subject_id,
+    )
+    db.add(review)
+    db.flush()
+    append_estate_audit_event(db, organization_id=estate.organization_id, actor=access.principal, action="import_review.georeference_started", entity_type="estate_import_review", entity_id=review.id, after_data={"session_id": session_id})
+    db.commit()
+    return {"id": review.id, "status": review.status, "survey_georeference_session_id": review.survey_georeference_session_id}
+
+
+@router.post("/import-reviews/{review_id}/georeference-session")
+def link_import_review_georeference_session(review_id: int, payload: GeoreferenceSessionLink, request: Request, db: Session = Depends(get_db)):
+    """Attaches (or replaces) the georeference session behind an already-created review - for the
+    case where the scan was uploaded through the older file-upload path first and georeferenced
+    afterward."""
+    row = db.get(EstateImportReview, review_id)
+    if not row:
+        raise HTTPException(404, "Import review not found")
+    access = require_estate_access(db, request, row.organization_id, permission="plot.manage")
+    if row.status != "review_required":
+        raise HTTPException(409, "Import review has already been decided")
+    session_id = payload.survey_georeference_session_id.strip()
+    exists = db.execute(text("SELECT 1 FROM survey_georeference_sessions WHERE id = :id"), {"id": session_id}).scalar()
+    if not exists:
+        raise HTTPException(404, "Georeference session not found")
+    conflict = db.query(EstateImportReview).filter(EstateImportReview.survey_georeference_session_id == session_id, EstateImportReview.id != review_id).first()
+    if conflict:
+        raise HTTPException(409, "This georeference session is already linked to another import review")
+    row.survey_georeference_session_id = session_id
+    append_estate_audit_event(db, organization_id=row.organization_id, actor=access.principal, action="import_review.georeference_linked", entity_type="estate_import_review", entity_id=row.id, after_data={"session_id": session_id})
+    db.commit()
+    return {"id": row.id, "survey_georeference_session_id": row.survey_georeference_session_id}
+
+
+@router.post("/import-reviews/{review_id}/import-from-georeference")
+def import_plots_from_georeference(review_id: int, payload: ImportFromGeoreference, request: Request, db: Session = Depends(get_db)):
+    """Approves a georeference-linked review: pulls the polygons the surveyor digitized and
+    solved in the Survey georeference tool (already in WGS84 - see _feature_to_saved_payload in
+    survey_georeference.py) straight into the Estate's operational plot register, the same way
+    approving a CSV/GIS review does."""
+    row = db.get(EstateImportReview, review_id)
+    if not row:
+        raise HTTPException(404, "Import review not found")
+    access = require_estate_access(db, request, row.organization_id, permission="survey.manage")
+    if row.status != "review_required":
+        raise HTTPException(409, "Import review has already been decided")
+    session_id = str(row.survey_georeference_session_id or "").strip()
+    if not session_id:
+        raise HTTPException(409, "Link a georeference session to this review first")
+    features = _load_georeference_session_features(db, session_id)
+    polygons = [feature for feature in features if str(feature.get("feature_type") or "") == "polygon"]
+    if not polygons:
+        raise HTTPException(422, "No digitized polygons were saved in this georeference session yet")
+    prefix = (payload.plot_prefix or "P").strip() or "P"
+    candidates = []
+    for index, feature in enumerate(polygons, 1):
+        geometry = _polygon_geometry_from_georeference_feature(feature)
+        plot_number = _plot_number_from_georeference_feature(feature, index, prefix)
+        candidates.append(_import_candidate(row_number=index, plot_number=plot_number, geometry=geometry))
+    row.candidate_data = candidates
+    estate = db.get(Estate, row.estate_id)
+    created = _create_plots_from_candidates(db, estate=estate, candidates=candidates, source_type=row.source_type, source_reference=str(row.id), actor=access.principal)
+    row.notes = (row.notes or "") + f"; {created} operational plot(s) created from the georeferenced layout"
+    row.status = "approved"
+    append_estate_audit_event(db, organization_id=row.organization_id, actor=access.principal, action="import_review.approved", entity_type="estate_import_review", entity_id=row.id, after_data={"status": row.status, "source": "georeference", "created_plots": created})
+    db.commit()
+    return {"id": row.id, "status": row.status, "created_plots": created}
 
 
 @router.post("/{estate_id}/layout-proposals")
