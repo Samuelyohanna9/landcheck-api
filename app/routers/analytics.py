@@ -1,6 +1,6 @@
 # app/routers/analytics.py
 
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, Request, Response
 from sqlalchemy.orm import Session
 from sqlalchemy import text, func, bindparam
 from datetime import datetime, timedelta
@@ -263,6 +263,14 @@ def get_analytics_overview(db: Session = Depends(get_db)):
         "features_by_type": features_by_type,
         "generated_at": now.isoformat()
     }
+
+
+@router.get("/public-proof")
+def get_public_survey_proof(response: Response, db: Session = Depends(get_db)):
+    """Return only the aggregate Survey plot count used as public product proof."""
+    response.headers["Cache-Control"] = "no-store"
+    total_plots = db.execute(text("SELECT COUNT(*) FROM plots")).scalar() or 0
+    return {"total_plots_generated": int(total_plots)}
 
 
 @router.get("/plots/daily")
