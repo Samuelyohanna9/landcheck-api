@@ -33,6 +33,7 @@ from sqlalchemy import func
 from app.services.estates.allocations import release_allocation, reserve_or_allocate
 from app.services.estates.audit import append_estate_audit_event
 from app.services.estates.authorization import require_estate_access
+from app.services.estates.subscriptions import get_subscription, has_hazard_access
 from app.services.estates.survey_requests import transition
 from app.services.estates.survey_adapter import materialize_estate_plot_for_survey
 from app.schemas.estate_survey import SurveyorAssignment
@@ -1307,6 +1308,14 @@ def _persist_hazard_results(db: Session, *, estate: Estate, plot_id: int | None,
     return rows
 
 
+def _require_hazard_plan(db: Session, organization_id: int) -> None:
+    """Flood/erosion hazard analysis is a Plus-plan feature - Basic-plan organizations (already
+    confirmed to have an active subscription by require_estate_access) get a clear upgrade message
+    instead of the underlying data."""
+    if not has_hazard_access(get_subscription(db, organization_id)):
+        raise HTTPException(status_code=402, detail={"code": "upgrade_required", "message": "Hazard analysis (flood and erosion) is available on the Plus plan. Upgrade to unlock it."})
+
+
 @router.get("/plots/{plot_id}/hazards")
 def plot_hazards(plot_id: int, request: Request, db: Session = Depends(get_db)):
     """Return the latest stored result, with a read-only calculation for legacy records."""
@@ -1315,6 +1324,7 @@ def plot_hazards(plot_id: int, request: Request, db: Session = Depends(get_db)):
         raise HTTPException(404, "Plot not found")
     estate = db.get(Estate, plot.estate_id)
     require_estate_access(db, request, estate.organization_id, permission="plot.read")
+    _require_hazard_plan(db, estate.organization_id)
     if plot.geometry_status != "approved":
         raise HTTPException(409, "Only approved plot geometry can be screened")
     latest = {}
@@ -1332,6 +1342,7 @@ def assess_plot_hazards(plot_id: int, request: Request, db: Session = Depends(ge
         raise HTTPException(404, "Plot not found")
     estate = db.get(Estate, plot.estate_id)
     access = require_estate_access(db, request, estate.organization_id, permission="plot.manage")
+    _require_hazard_plan(db, estate.organization_id)
     if plot.geometry_status != "approved":
         raise HTTPException(409, "Only approved plot geometry can be screened")
     results = _calculate_plot_hazards(plot.geometry, db)
@@ -1400,6 +1411,7 @@ def assess_estate_hazards(estate_id: int, request: Request, db: Session = Depend
     if not estate:
         raise HTTPException(404, "Estate not found")
     access = require_estate_access(db, request, estate.organization_id, permission="plot.manage")
+    _require_hazard_plan(db, estate.organization_id)
     has_screenable_plot = db.query(EstatePlot.id).filter(EstatePlot.estate_id == estate_id, EstatePlot.geometry_status == "approved").first()
     if not has_screenable_plot:
         raise HTTPException(422, "This Estate has no approved plot geometry to screen yet")
@@ -1436,6 +1448,7 @@ def estate_hazard_dashboard(estate_id: int, request: Request, db: Session = Depe
     if not estate:
         raise HTTPException(404, "Estate not found")
     require_estate_access(db, request, estate.organization_id, permission="plot.read")
+    _require_hazard_plan(db, estate.organization_id)
     return _estate_hazard_dashboard_payload(db, estate)
 
 @router.get("/{estate_id}/activity")

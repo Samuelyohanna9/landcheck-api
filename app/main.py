@@ -30,6 +30,7 @@ from app.routers import (
     field_to_finish,
     estates,
     estate_auth,
+    estate_billing,
 )
 from app.db_init import init_db
 from app.utils.activity_logger import ensure_activity_log_table, log_request_activity, should_skip_request_logging
@@ -156,6 +157,20 @@ def _run_stale_plot_export_job_sweep():
         session_db.close()
 
 
+def _run_estate_subscription_billing_job():
+    from app.services.estates import subscriptions as estate_subscriptions
+
+    session_db = SessionLocal()
+    try:
+        estate_subscriptions.process_due_billing(session_db)
+        session_db.commit()
+    except Exception:
+        session_db.rollback()
+        raise
+    finally:
+        session_db.close()
+
+
 # ✅ Create tables on startup
 @app.on_event("startup")
 def startup_event():
@@ -201,6 +216,14 @@ def startup_event():
         _run_stale_plot_export_job_sweep,
         trigger=CronTrigger(minute="*/5"),
         id="stale_plot_export_job_sweep",
+        replace_existing=True,
+    )
+    # Converts due trials, charges due renewals, retries due dunning attempts, and finalizes
+    # cancellations whose paid period has ended - see subscriptions.process_due_billing.
+    scheduler.add_job(
+        _run_estate_subscription_billing_job,
+        trigger=CronTrigger(hour=6, minute=0),
+        id="estate_subscription_billing",
         replace_existing=True,
     )
     scheduler.start()
@@ -305,6 +328,7 @@ app.include_router(plan_reader.router)
 app.include_router(field_to_finish.router)
 app.include_router(estates.router)
 app.include_router(estate_auth.router)
+app.include_router(estate_billing.router)
 
 @app.get("/")
 def root():

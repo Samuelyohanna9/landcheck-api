@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session
 from app.models.estate_foundation import EstateOrganization, EstateOrganizationMember
 from app.services.estates.permissions import has_permission
 from app.services.estates.identity import resolve_session
+from app.services.estates.subscriptions import get_subscription, is_access_active
 from app.utils.auth_security import resolve_request_session
 from app.utils.survey_auth_security import resolve_survey_session
 
@@ -96,11 +97,17 @@ def require_estate_access(
     organization_id: int,
     *,
     permission: str | None = None,
+    require_subscription: bool = True,
 ) -> EstateAccess:
     """Authorize a target organization selected by a trusted route/resource lookup.
 
     A request payload's organization ID is never a trust boundary: callers must pass the target
     resource's persisted organization ID here and this function derives membership from identity.
+
+    `require_subscription` gates the whole product on having a trialing/active subscription - the
+    handful of billing endpoints (status, checkout, cancel, change-plan) pass False so an unpaid
+    organization can still reach the screen that lets it pay. Every other Estates endpoint uses
+    the default, since this is the one choke point nearly all of them already call.
     """
     principal = resolve_estate_principal(db, request)
     access = next((item for item in list_estate_access(db, principal) if item.organization_id == int(organization_id)), None)
@@ -108,4 +115,8 @@ def require_estate_access(
         raise HTTPException(status_code=404, detail="Estate organization was not found")
     if permission and not has_permission(access.role_key, permission):
         raise HTTPException(status_code=403, detail="You do not have permission for this Estate action")
+    if require_subscription:
+        subscription = get_subscription(db, organization_id)
+        if not is_access_active(subscription):
+            raise HTTPException(status_code=402, detail={"code": "subscription_required", "message": "Choose a plan to continue using LandCheck Estates."})
     return access

@@ -1,16 +1,22 @@
 from __future__ import annotations
 
-from datetime import datetime
+import hashlib
+import os
+import secrets
+from datetime import datetime, timedelta, timezone
 import re
 
 from fastapi import APIRouter, Depends, HTTPException, Request
+from pydantic import BaseModel, Field
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app.models.estate_auth import EstateAccount
+from app.models.estate_auth import EstateAccount, EstateAuthSession
+from app.models.estate_billing import EstatePasswordResetToken
 from app.models.estate_foundation import EstateOrganization, EstateOrganizationEntitlement, EstateOrganizationMember
 from app.routers.plots import get_db
 from app.schemas.estate_auth import EstateLogin, EstateRegister
+from app.services.estates import estate_email
 from app.services.estates.identity import (
     hash_password,
     issue_session,
@@ -20,6 +26,22 @@ from app.services.estates.identity import (
     slugify,
     verify_password,
 )
+
+
+class ForgotPasswordRequest(BaseModel):
+    email: str
+
+
+class ResetPasswordRequest(BaseModel):
+    token: str
+    new_password: str = Field(min_length=8, max_length=200)
+
+
+RESET_TOKEN_TTL_HOURS = 1
+
+
+def _hash_reset_token(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
 
 router = APIRouter(prefix="/estates/auth", tags=["estate-auth"])
@@ -105,6 +127,7 @@ def register(payload: EstateRegister, request: Request, db: Session = Depends(ge
     except IntegrityError as exc:
         db.rollback()
         raise HTTPException(status_code=409, detail="This Estate company or account already exists") from exc
+    estate_email.send_welcome_email(organization=organization, account=account)
     return {**session, "user": _account_payload(db, account), "organization": {"id": organization.id, "name": organization.name, "slug": organization.slug}}
 
 
@@ -141,3 +164,52 @@ def me(request: Request, db: Session = Depends(get_db)):
     if not account:
         return {"authed": False}
     return {"authed": True, "user": _account_payload(db, account), "expires_at": session.expires_at}
+
+
+@router.post("/forgot-password")
+def forgot_password(payload: ForgotPasswordRequest, db: Session = Depends(get_db)):
+    """Always returns the same generic message regardless of whether the email exists, so this
+    endpoint can't be used to discover which company emails have an Estate account."""
+    generic_response = {"status": "ok", "message": "If an account exists for that email, a reset link has been sent."}
+    email = normalize_email(payload.email)
+    account = db.query(EstateAccount).filter(EstateAccount.email_normalized == email, EstateAccount.status == "active").one_or_none()
+    if not account:
+        return generic_response
+    raw_token = secrets.token_urlsafe(32)
+    db.add(
+        EstatePasswordResetToken(
+            account_id=account.id,
+            token_hash=_hash_reset_token(raw_token),
+            expires_at=datetime.now(timezone.utc) + timedelta(hours=RESET_TOKEN_TTL_HOURS),
+        )
+    )
+    db.commit()
+    web_url = str(os.getenv("LANDCHECK_WEB_URL") or "https://landcheck.online").rstrip("/")
+    reset_link = f"{web_url}/estates/reset-password?token={raw_token}"
+    estate_email.send_password_reset_email(account=account, reset_link=reset_link)
+    return generic_response
+
+
+@router.post("/reset-password")
+def reset_password(payload: ResetPasswordRequest, db: Session = Depends(get_db)):
+    token_hash = _hash_reset_token(str(payload.token or ""))
+    row = db.query(EstatePasswordResetToken).filter(EstatePasswordResetToken.token_hash == token_hash).one_or_none()
+    now = datetime.now(timezone.utc)
+    expires_at = row.expires_at if row and row.expires_at.tzinfo else (row.expires_at.replace(tzinfo=timezone.utc) if row else None)
+    if not row or row.used_at is not None or (expires_at and expires_at <= now):
+        raise HTTPException(status_code=400, detail="This reset link is invalid or has expired. Request a new one.")
+    account = db.get(EstateAccount, row.account_id)
+    if not account:
+        raise HTTPException(status_code=400, detail="This reset link is invalid or has expired. Request a new one.")
+    try:
+        account.password_hash = hash_password(payload.new_password)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    row.used_at = now
+    # Force re-login everywhere after a password change - standard practice, and it also covers
+    # the case where the password was reset because a session/device was compromised.
+    db.query(EstateAuthSession).filter(EstateAuthSession.account_id == account.id, EstateAuthSession.session_state == "active").update(
+        {"session_state": "revoked", "revoked_at": now, "revoke_reason": "password_reset"}
+    )
+    db.commit()
+    return {"status": "ok"}

@@ -201,6 +201,164 @@ def public_plot_url(share_token: str | None) -> str | None:
     return f"{base.rstrip('/')}/estates/plot/{share_token}"
 
 
+def _account_wrap_html(*, heading: str, message_html: str, button_html: str = "") -> str:
+    """Same visual shell as _wrap_html, but for emails about the company's own LandCheck Estates
+    account (welcome, billing, password reset) rather than a customer-facing plot update - so it
+    isn't signed with a specific estate's org_name, which wouldn't apply here."""
+    return f"""
+    <html>
+      <body style="margin:0;padding:0;background:#eef4f0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;color:#173624;">
+        <div style="max-width:560px;margin:0 auto;padding:32px 16px;">
+          <div style="background:#ffffff;border-radius:18px;overflow:hidden;box-shadow:0 18px 46px rgba(14,46,28,0.14);border:1px solid #dceee0;padding:32px;">
+            <div style="font-size:12.5px;font-weight:800;letter-spacing:0.06em;text-transform:uppercase;color:#5c7a68;margin:0 0 10px;">LandCheck Estates</div>
+            <h1 style="margin:0 0 16px;font-size:21px;color:#173624;">{html.escape(heading)}</h1>
+            <div style="font-size:14.5px;line-height:1.75;color:#345542;">{message_html}</div>
+            {button_html}
+            <p style="margin:26px 0 0;font-size:12px;line-height:1.6;color:#8199a5;">If you didn't expect this email, you can safely ignore it, or contact us at landchecktech@gmail.com.</p>
+          </div>
+          <p style="text-align:center;font-size:11px;color:#9fb0a4;margin:16px 0 0;">Sent via LandCheck Estates &middot; Secure &middot; Private &middot; For a more certain tomorrow</p>
+        </div>
+      </body>
+    </html>
+    """
+
+
+def _account_button_html(*, label: str, url: str) -> str:
+    return f"""
+    <div style="margin:24px 0 0;text-align:center;">
+      <a href="{html.escape(url)}" style="display:inline-block;padding:13px 26px;background:#1d8a49;color:#ffffff;font-size:14px;font-weight:700;text-decoration:none;border-radius:10px;">{html.escape(label)}</a>
+    </div>
+    """
+
+
+def _account_plain_text(heading: str, message_html: str, url: str | None = None) -> str:
+    import re
+
+    text = re.sub(r"<[^>]+>", " ", message_html)
+    text = re.sub(r"\s+", " ", text).strip()
+    lines = [heading, "", text]
+    if url:
+        lines += ["", url]
+    return "\n".join(lines)
+
+
+def send_welcome_email(*, organization, account) -> bool:
+    """Sent right after a new company registers - the first email a customer ever gets from us,
+    so it doubles as a mini product tour and pricing reference rather than a bare "you're in"."""
+    to_email = str(getattr(account, "email", "") or "").strip()
+    if not to_email:
+        return False
+    first_name = str(getattr(account, "full_name", "") or "there").split(" ")[0]
+    web_url = os.getenv("LANDCHECK_WEB_URL") or "https://landcheck.online"
+    message_html = f"""
+    <p>Welcome to LandCheck Estates, {html.escape(first_name)} - your workspace for
+    <strong>{html.escape(str(getattr(organization, "name", "") or "your company"))}</strong> is ready.</p>
+    <p>Here's what you can do once you pick a plan:</p>
+    <ul style="padding-left:18px;line-height:1.9;">
+      <li>Bring in a layout (survey coordinates, CAD, CSV, or a scanned plan) and manage every plot from one map</li>
+      <li>Track customers, reservations, allocations, payments and receipts</li>
+      <li>Run a tiered sales-agent commission ladder with payout tracking</li>
+      <li>Produce survey plans, staking coordinates and DGPS exports</li>
+      <li>Screen flood and erosion risk for a whole layout (Plus plan)</li>
+    </ul>
+    <p><strong>Basic</strong> is &#8358;19,500/month (or &#8358;220,000/year) - everything except flood and erosion hazard analysis.<br/>
+    <strong>Plus</strong> is &#8358;24,500/month (or &#8358;285,000/year) - everything, including hazard analysis.</p>
+    <p>Both plans start with a 3-day free trial, and you can cancel anytime.</p>
+    """
+    body_html = _account_wrap_html(heading=f"Welcome to LandCheck Estates, {first_name}!", message_html=message_html, button_html=_account_button_html(label="Choose your plan", url=f"{web_url.rstrip('/')}/estates/choose-plan"))
+    try:
+        _send_email(to_email=to_email, from_display_name="LandCheck Estates", subject="Welcome to LandCheck Estates", body_text=_account_plain_text("Welcome to LandCheck Estates", message_html), body_html=body_html)
+        return True
+    except Exception:
+        logger.exception("Estate welcome email failed (to=%s)", to_email)
+        return False
+
+
+def _subscription_org_email(organization) -> str | None:
+    value = str(getattr(organization, "contact_email", "") or "").strip()
+    return value or None
+
+
+def send_trial_started_email(*, organization, subscription) -> bool:
+    to_email = _subscription_org_email(organization)
+    if not to_email:
+        return False
+    plan_label = "Plus" if subscription.plan_key == "plus" else "Basic"
+    trial_ends = subscription.trial_ends_at.strftime("%d %b %Y") if subscription.trial_ends_at else "in 3 days"
+    message_html = f"<p>Your {html.escape(plan_label)} plan trial has started - you have full access until <strong>{html.escape(trial_ends)}</strong>.</p><p>We'll automatically charge {html.escape(format_naira(subscription.amount))} to your card on file when the trial ends, unless you cancel first. You can cancel anytime from Settings &rarr; Billing.</p>"
+    body_html = _account_wrap_html(heading="Your free trial has started", message_html=message_html)
+    try:
+        _send_email(to_email=to_email, from_display_name="LandCheck Estates", subject=f"Your {plan_label} plan trial has started", body_text=_account_plain_text("Your free trial has started", message_html), body_html=body_html)
+        return True
+    except Exception:
+        logger.exception("Estate trial-started email failed (org=%s)", organization.id)
+        return False
+
+
+def send_payment_receipt_email(*, organization, subscription) -> bool:
+    to_email = _subscription_org_email(organization)
+    if not to_email:
+        return False
+    plan_label = "Plus" if subscription.plan_key == "plus" else "Basic"
+    period_end = subscription.current_period_end.strftime("%d %b %Y") if subscription.current_period_end else ""
+    message_html = f"<p>We've charged {html.escape(format_naira(subscription.amount))} for your {html.escape(plan_label)} plan ({html.escape(subscription.billing_cycle)}).</p><p>Your subscription is active through <strong>{html.escape(period_end)}</strong>.</p>"
+    body_html = _account_wrap_html(heading="Payment received", message_html=message_html)
+    try:
+        _send_email(to_email=to_email, from_display_name="LandCheck Estates", subject="LandCheck Estates - payment receipt", body_text=_account_plain_text("Payment received", message_html), body_html=body_html)
+        return True
+    except Exception:
+        logger.exception("Estate payment receipt email failed (org=%s)", organization.id)
+        return False
+
+
+def send_payment_failed_email(*, organization, subscription) -> bool:
+    to_email = _subscription_org_email(organization)
+    if not to_email:
+        return False
+    web_url = os.getenv("LANDCHECK_WEB_URL") or "https://landcheck.online"
+    message_html = f"<p>We couldn't charge your card on file for {html.escape(format_naira(subscription.amount))}. We'll try again shortly, but please update your payment method to avoid losing access.</p>"
+    body_html = _account_wrap_html(heading="Your payment didn't go through", message_html=message_html, button_html=_account_button_html(label="Update payment method", url=f"{web_url.rstrip('/')}/estates/billing"))
+    try:
+        _send_email(to_email=to_email, from_display_name="LandCheck Estates", subject="Action needed - LandCheck Estates payment failed", body_text=_account_plain_text("Your payment didn't go through", message_html), body_html=body_html)
+        return True
+    except Exception:
+        logger.exception("Estate payment-failed email failed (org=%s)", organization.id)
+        return False
+
+
+def send_subscription_canceled_email(*, organization, subscription, reason: str) -> bool:
+    to_email = _subscription_org_email(organization)
+    if not to_email:
+        return False
+    if reason == "payment_failed":
+        message_html = "<p>After several failed attempts, we've cancelled your subscription and access has been suspended. You can resubscribe anytime from your workspace.</p>"
+        subject = "Your LandCheck Estates subscription was cancelled"
+    else:
+        message_html = "<p>Your cancellation is confirmed. You'll keep full access until the end of your current billing period, and you won't be charged again.</p>" if subscription.cancel_at_period_end else "<p>Your subscription has been cancelled.</p>"
+        subject = "Your LandCheck Estates subscription has been cancelled"
+    body_html = _account_wrap_html(heading="Subscription cancelled", message_html=message_html)
+    try:
+        _send_email(to_email=to_email, from_display_name="LandCheck Estates", subject=subject, body_text=_account_plain_text("Subscription cancelled", message_html), body_html=body_html)
+        return True
+    except Exception:
+        logger.exception("Estate subscription-cancelled email failed (org=%s)", organization.id)
+        return False
+
+
+def send_password_reset_email(*, account, reset_link: str) -> bool:
+    to_email = str(getattr(account, "email", "") or "").strip()
+    if not to_email:
+        return False
+    message_html = "<p>We received a request to reset your LandCheck Estates password. This link expires in 1 hour.</p>"
+    body_html = _account_wrap_html(heading="Reset your password", message_html=message_html, button_html=_account_button_html(label="Reset password", url=reset_link))
+    try:
+        _send_email(to_email=to_email, from_display_name="LandCheck Estates", subject="Reset your LandCheck Estates password", body_text=_account_plain_text("Reset your password", message_html, reset_link), body_html=body_html)
+        return True
+    except Exception:
+        logger.exception("Estate password reset email failed (to=%s)", to_email)
+        return False
+
+
 def notify_customer(
     *,
     to_email: str | None,
