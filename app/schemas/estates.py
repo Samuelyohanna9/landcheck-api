@@ -190,6 +190,11 @@ class AllocationAction(BaseModel):
     agreed_price: Decimal | None = Field(default=None, gt=0)
     payment_plan: str | None = Field(default=None, max_length=4000)
     notes: str | None = None
+    # Lets a reviewer capture money already received at the same time they reserve/allocate the
+    # plot, instead of a separate follow-up step - recorded as a confirmed payment immediately
+    # since it represents an already-received amount the org is attesting to, not a pending claim.
+    initial_payment_amount: Decimal | None = Field(default=None, gt=0)
+    initial_payment_method: str | None = Field(default=None, max_length=64)
 
 class PaymentCreate(BaseModel):
     amount: Decimal = Field(gt=0)
