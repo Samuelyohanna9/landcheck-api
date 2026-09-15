@@ -72,6 +72,11 @@ class EstateLayoutCriteria(BaseModel):
 class EstateLayoutDecision(BaseModel):
     status: str = Field(pattern="^(approved|rejected)$")
     notes: str | None = Field(default=None, max_length=4000)
+    # Approving a fresh draft over an Estate that already has an approved layout would otherwise
+    # fail outright on the first clashing plot number - this lets the caller explicitly replace
+    # the existing plots/features with the new draft's, after the frontend has warned the user and
+    # gotten their confirmation. Ignored when status is "rejected".
+    replace_existing: bool = False
 
 
 class EstateLayoutProposalEdit(BaseModel):

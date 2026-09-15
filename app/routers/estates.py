@@ -1084,9 +1084,34 @@ def decide_layout_proposal(
     candidate_numbers = [_normalized(str(candidate.get("plot_number") or "")) for candidate in candidates]
     if any(not value for value in candidate_numbers) or len(candidate_numbers) != len(set(candidate_numbers)):
         raise HTTPException(409, "The generated layout contains duplicate or blank plot numbers")
+
+    replaced_plot_count = 0
+    replaced_feature_count = 0
+    if payload.replace_existing:
+        # The frontend only sets this after the user has explicitly confirmed replacing their
+        # previously approved layout - still re-checked here rather than trusted blindly, since a
+        # plot already reserved/allocated to a real customer must never be silently deleted.
+        allocated_count = (
+            db.query(EstateAllocation)
+            .join(EstatePlot, EstateAllocation.plot_id == EstatePlot.id)
+            .filter(EstatePlot.estate_id == row.estate_id, EstateAllocation.status.in_(("reserved", "allocated")))
+            .count()
+        )
+        if allocated_count:
+            raise HTTPException(409, f"{allocated_count} plot(s) in this Estate already have a customer reservation or allocation - remove those first before replacing the layout.")
+        existing_plots = db.query(EstatePlot).filter(EstatePlot.estate_id == row.estate_id).all()
+        replaced_plot_count = len(existing_plots)
+        for plot in existing_plots:
+            db.delete(plot)
+        existing_features = db.query(EstateSpatialFeature).filter(EstateSpatialFeature.estate_id == row.estate_id).all()
+        replaced_feature_count = len(existing_features)
+        for feature in existing_features:
+            db.delete(feature)
+        db.flush()
+
     existing_numbers = {value for (value,) in db.query(EstatePlot.plot_number_normalized).filter(EstatePlot.estate_id == row.estate_id).all()}
     if existing_numbers.intersection(candidate_numbers):
-        raise HTTPException(409, "Some generated plot numbers already exist. Reject this proposal or use a different prefix.")
+        raise HTTPException(409, "Some generated plot numbers already exist. Reject this proposal or use a different prefix, or replace the existing layout.")
 
     block_ids: dict[str, int] = {}
     for candidate in candidates:
@@ -1153,10 +1178,10 @@ def decide_layout_proposal(
         action="layout_proposal.approved",
         entity_type="estate_layout_proposal",
         entity_id=row.id,
-        after_data={"status": row.status, "created_plot_ids": [plot.id for plot in created_plots], "created_feature_ids": [feature.id for feature in created_features]},
+        after_data={"status": row.status, "created_plot_ids": [plot.id for plot in created_plots], "created_feature_ids": [feature.id for feature in created_features], "replaced_plot_count": replaced_plot_count, "replaced_feature_count": replaced_feature_count},
     )
     db.commit()
-    return {"id": row.id, "status": row.status, "created_plots": len(created_plots), "created_features": len(created_features), "estate_id": estate.id}
+    return {"id": row.id, "status": row.status, "created_plots": len(created_plots), "created_features": len(created_features), "replaced_plots": replaced_plot_count, "replaced_features": replaced_feature_count, "estate_id": estate.id}
 
 _LAYER_TYPE_LABELS = {"road": "Road", "drainage": "Drainage", "open_space": "Open space", "infrastructure": "Infrastructure"}
 
