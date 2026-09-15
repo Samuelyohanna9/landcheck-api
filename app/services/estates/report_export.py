@@ -55,28 +55,33 @@ def _naira(value: Any) -> str:
 
 
 def _styles() -> dict[str, ParagraphStyle]:
+    # Times-Roman throughout (not just headings) for one consistent, classic report typeface -
+    # reportlab's closest built-in match to Times New Roman, and legible at every size used here.
     base = getSampleStyleSheet()
     return {
-        "org": ParagraphStyle("org", parent=base["Normal"], fontName="Helvetica", fontSize=8.5, textColor=MUTED, leading=11),
-        "meta": ParagraphStyle("meta", parent=base["Normal"], fontName="Helvetica", fontSize=8.5, textColor=MUTED, alignment=TA_RIGHT, leading=11),
+        "org": ParagraphStyle("org", parent=base["Normal"], fontName="Times-Roman", fontSize=9, textColor=MUTED, leading=11),
+        "meta": ParagraphStyle("meta", parent=base["Normal"], fontName="Times-Roman", fontSize=9, textColor=MUTED, alignment=TA_RIGHT, leading=11),
         "title": ParagraphStyle("title", parent=base["Normal"], fontName="Times-Bold", fontSize=23, textColor=INK, leading=27),
         "subtitle": ParagraphStyle("subtitle", parent=base["Normal"], fontName="Times-Italic", fontSize=11, textColor=MUTED),
-        "section": ParagraphStyle("section", parent=base["Normal"], fontName="Times-Bold", fontSize=13, textColor=INK, spaceBefore=2, spaceAfter=1),
-        "section_note": ParagraphStyle("section_note", parent=base["Normal"], fontName="Helvetica-Oblique", fontSize=8.5, textColor=MUTED, spaceAfter=8),
-        "metric_label": ParagraphStyle("metric_label", parent=base["Normal"], fontName="Helvetica", fontSize=7.6, textColor=MUTED, alignment=TA_CENTER),
+        "section": ParagraphStyle("section", parent=base["Normal"], fontName="Times-Bold", fontSize=13.5, textColor=INK, spaceBefore=2, spaceAfter=5),
+        "section_note": ParagraphStyle("section_note", parent=base["Normal"], fontName="Times-Italic", fontSize=9, textColor=MUTED, spaceAfter=8),
+        "metric_label": ParagraphStyle("metric_label", parent=base["Normal"], fontName="Times-Roman", fontSize=8, textColor=MUTED, alignment=TA_CENTER),
         "metric_value": ParagraphStyle("metric_value", parent=base["Normal"], fontName="Times-Bold", fontSize=17, textColor=INK, alignment=TA_CENTER),
         "metric_value_sm": ParagraphStyle("metric_value_sm", parent=base["Normal"], fontName="Times-Bold", fontSize=13, textColor=INK, alignment=TA_CENTER),
-        "body": ParagraphStyle("body", parent=base["Normal"], fontName="Helvetica", fontSize=9, textColor=INK, leading=13),
-        "body_muted": ParagraphStyle("body_muted", parent=base["Normal"], fontName="Helvetica", fontSize=8.5, textColor=MUTED, leading=12),
-        "th": ParagraphStyle("th", parent=base["Normal"], fontName="Helvetica-Bold", fontSize=8.3, textColor=INK),
-        "td": ParagraphStyle("td", parent=base["Normal"], fontName="Helvetica", fontSize=8.7, textColor=INK),
-        "td_muted": ParagraphStyle("td_muted", parent=base["Normal"], fontName="Helvetica", fontSize=8, textColor=MUTED),
+        "body": ParagraphStyle("body", parent=base["Normal"], fontName="Times-Roman", fontSize=9.5, textColor=INK, leading=13.5),
+        "body_muted": ParagraphStyle("body_muted", parent=base["Normal"], fontName="Times-Roman", fontSize=9, textColor=MUTED, leading=12.5),
+        "th": ParagraphStyle("th", parent=base["Normal"], fontName="Times-Bold", fontSize=8.8, textColor=INK),
+        "td": ParagraphStyle("td", parent=base["Normal"], fontName="Times-Roman", fontSize=9.2, textColor=INK),
+        "td_muted": ParagraphStyle("td_muted", parent=base["Normal"], fontName="Times-Roman", fontSize=8.5, textColor=MUTED),
     }
 
 
 def _section(title: str, styles: dict, note: str | None = None) -> list:
+    # The rule sits a few points below the heading's own spaceAfter, rather than hugging its
+    # baseline - flush against the text it reads as an underline; with room to breathe it reads as
+    # a section divider instead.
     flow: list = [Paragraph(title, styles["section"])]
-    flow.append(HRFlowable(width="100%", thickness=0.75, color=RULE, spaceAfter=7))
+    flow.append(HRFlowable(width="100%", thickness=0.6, color=RULE, spaceAfter=7))
     if note:
         flow.append(Paragraph(note, styles["section_note"]))
     return flow
@@ -134,7 +139,7 @@ def _footer(canvas, doc, *, estate_name: str, organization_name: str) -> None:
     canvas.setStrokeColor(HAIRLINE)
     canvas.setLineWidth(0.5)
     canvas.line(20 * mm, 14 * mm, doc.pagesize[0] - 20 * mm, 14 * mm)
-    canvas.setFont("Helvetica", 7.5)
+    canvas.setFont("Times-Roman", 8)
     canvas.setFillColor(MUTED)
     canvas.drawString(20 * mm, 10 * mm, f"{organization_name or 'LandCheck Estates'} · {estate_name}")
     canvas.drawRightString(doc.pagesize[0] - 20 * mm, 10 * mm, f"Page {doc.page}")
