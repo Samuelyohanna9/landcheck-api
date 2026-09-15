@@ -246,6 +246,29 @@ def update_estate(estate_id: int, payload: EstateUpdate, request: Request, db: S
     return estate_detail(estate_id, request, db)
 
 
+@router.delete("/{estate_id}")
+def delete_estate(estate_id: int, request: Request, db: Session = Depends(get_db)):
+    """Archives an Estate so it disappears from the picker and every listing. This does not hard-
+    delete its plots, payments, customers or documents - a cascade across that much linked
+    financial/customer history is too risky to offer from a single confirm dialog, and archiving
+    (the same mechanism list_estates already filters on) is reversible from the database if this
+    was a mistake. Blocked if any plot in the Estate has ever carried a customer reservation or
+    allocation, since that represents a real commercial commitment that must be resolved first."""
+    estate = db.get(Estate, estate_id)
+    if not estate:
+        raise HTTPException(404, "Estate not found")
+    access = require_estate_access(db, request, estate.organization_id, permission="estate.manage")
+    if estate.archived_at is not None:
+        raise HTTPException(409, "This Estate has already been deleted")
+    allocated_count = db.query(EstateAllocation).join(EstatePlot, EstateAllocation.plot_id == EstatePlot.id).filter(EstatePlot.estate_id == estate_id).count()
+    if allocated_count:
+        raise HTTPException(409, f"{allocated_count} plot(s) in this Estate have a customer reservation or allocation - remove those first before deleting the Estate.")
+    estate.archived_at = datetime.now(timezone.utc)
+    append_estate_audit_event(db, organization_id=estate.organization_id, actor=access.principal, action="estate.deleted", entity_type="estate", entity_id=estate.id, after_data={"name": estate.name})
+    db.commit()
+    return {"id": estate.id, "deleted": True}
+
+
 @router.post("/{estate_id}/approve-map")
 def approve_estate_map(estate_id: int, request: Request, db: Session = Depends(get_db)):
     estate = db.get(Estate, estate_id)
