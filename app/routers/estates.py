@@ -37,7 +37,7 @@ from app.services.estates.survey_eligibility import survey_eligibility
 from app.services.estates.qc import validate_polygon
 from app.services.estates.layout_generation import generate_estate_layout
 from app.services.survey.dgps import alpha_station, render_dgps_staking_csv
-from app.utils.coordinate_converter import COORDINATE_SYSTEMS, resolve_coordinate_system_key
+from app.utils.coordinate_converter import COORDINATE_SYSTEMS, resolve_coordinate_system_key, convert_coordinates
 from app.models.estate_auth import EstateAccount
 from app.utils.survey_auth_security import find_or_create_survey_user
 from app.services.estates import estate_email
@@ -1678,6 +1678,51 @@ def export_staking_task_dgps_csv(task_id:int, request:Request, raw:bool=False, d
     db.commit()
     safe_number=re.sub(r"[^A-Za-z0-9._-]+","-",plot.plot_number).strip("-.") or f"plot-{plot.id}"
     return Response(render_dgps_staking_csv(rows,raw=raw),media_type="text/csv; charset=utf-8",headers={"Content-Disposition":f'attachment; filename="{safe_number}_DGPS_Staking.csv"',"Cache-Control":"no-store, no-cache, must-revalidate","Pragma":"no-cache"})
+
+
+@router.get("/{estate_id}/plots/{plot_id}/exports/dgps.csv")
+def export_plot_dgps_csv(estate_id: int, plot_id: int, request: Request, coordinate_system: str = "wgs84_nigeria_meters", raw: bool = False, db: Session = Depends(get_db)):
+    """Export any plot's known boundary vertices as a DGPS CSV, in whichever coordinate system the
+    caller chooses - not gated on a staking task existing. A plot that's already been subdivided
+    already has every coordinate this needs; requiring a separate staking task first (the older
+    /staking-tasks/{id}/exports/dgps.csv endpoint above, kept for that specific field-staking
+    record) was an unnecessary block for someone who just wants this plot's points."""
+    plot = db.query(EstatePlot).filter(EstatePlot.id == plot_id, EstatePlot.estate_id == estate_id).one_or_none()
+    if not plot: raise HTTPException(404, "Plot not found")
+    estate = db.get(Estate, estate_id)
+    access = require_estate_access(db, request, estate.organization_id, permission="plot.read")
+    if not plot.geometry: raise HTTPException(422, "Plot has no geometry to export")
+    if plot.geometry_status != "approved": raise HTTPException(409, "Only approved plot geometry can be exported")
+    polygon = to_shape(plot.geometry)
+    _, issues = validate_polygon(polygon.__geo_interface__)
+    if any(issue.severity == "error" for issue in issues): raise HTTPException(422, "Plot geometry is not valid for export")
+    coordinates = list(polygon.exterior.coords)
+    if coordinates and coordinates[0] == coordinates[-1]: coordinates = coordinates[:-1]
+    if len(coordinates) < 3: raise HTTPException(422, "Plot geometry needs at least three vertices")
+    sample_lng, sample_lat = coordinates[0]
+    resolved_coordinate_system = resolve_coordinate_system_key(coordinate_system, sample_lng, sample_lat)
+    target_points = convert_coordinates([[float(lng), float(lat)] for lng, lat in coordinates], "wgs84", resolved_coordinate_system)
+    rows = [
+        {
+            "station": alpha_station(index),
+            "feature": f"Plot {plot.plot_number}",
+            "coordinate_system": resolved_coordinate_system,
+            "easting": target_points[index][0],
+            "northing": target_points[index][1],
+            "longitude": lng,
+            "latitude": lat,
+            "point_type": "Plot vertex",
+        }
+        for index, (lng, lat) in enumerate(coordinates)
+    ]
+    append_estate_audit_event(db, organization_id=estate.organization_id, actor=access.principal, action="plot.dgps_exported", entity_type="estate_plot", entity_id=plot.id, after_data={"vertex_count": len(rows), "coordinate_system": resolved_coordinate_system})
+    db.commit()
+    safe_number = re.sub(r"[^A-Za-z0-9._-]+", "-", plot.plot_number).strip("-.") or f"plot-{plot.id}"
+    return Response(
+        render_dgps_staking_csv(rows, raw=raw),
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{safe_number}_DGPS.csv"', "Cache-Control": "no-store, no-cache, must-revalidate", "Pragma": "no-cache"},
+    )
 
 @router.post("/staking-tasks/{task_id}/start")
 def start_staking_task(task_id:int,request:Request,db:Session=Depends(get_db)):
