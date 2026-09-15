@@ -80,6 +80,19 @@ class EstateLayoutProposalEdit(BaseModel):
     plot_candidates: list[dict[str, Any]] | None = None
     feature_candidates: list[dict[str, Any]] | None = None
 
+
+class EstateLayoutFeatureAdd(BaseModel):
+    """Adds one hand-drawn road or open-space shape to a draft layout. The server carves the
+    resulting footprint out of every plot candidate it overlaps, so the draft reflects the new
+    infrastructure instead of showing plots that overlap it. plot_candidates lets the caller pass
+    along any vertex edits made in the same session that haven't been saved yet, so they aren't
+    lost when this call replaces the candidate list with the carved result."""
+    feature_type: str = Field(pattern="^(road|open_space)$")
+    geometry: dict[str, Any]
+    width_m: float | None = Field(default=None, ge=1, le=60)
+    name: str | None = Field(default=None, max_length=160)
+    plot_candidates: list[dict[str, Any]] | None = None
+
 class DevelopmentStatusUpdate(BaseModel):
     status: str = Field(pattern="^(not_started|site_cleared|foundation|under_construction|developed)$")
 
