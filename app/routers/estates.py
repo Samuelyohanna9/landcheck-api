@@ -247,13 +247,15 @@ def update_estate(estate_id: int, payload: EstateUpdate, request: Request, db: S
 
 
 @router.delete("/{estate_id}")
-def delete_estate(estate_id: int, request: Request, db: Session = Depends(get_db)):
+def delete_estate(estate_id: int, request: Request, db: Session = Depends(get_db), force: bool = False):
     """Archives an Estate so it disappears from the picker and every listing. This does not hard-
     delete its plots, payments, customers or documents - a cascade across that much linked
     financial/customer history is too risky to offer from a single confirm dialog, and archiving
     (the same mechanism list_estates already filters on) is reversible from the database if this
-    was a mistake. Blocked if any plot in the Estate has ever carried a customer reservation or
-    allocation, since that represents a real commercial commitment that must be resolved first."""
+    was a mistake. If any plot in the Estate carries a customer reservation or allocation, that is
+    surfaced as a 409 with the count so the caller can warn the user - passing force=true proceeds
+    anyway (the allocations/payments/customers themselves are untouched, only the Estate record is
+    archived), for an operator who has confirmed they still want it gone."""
     estate = db.get(Estate, estate_id)
     if not estate:
         raise HTTPException(404, "Estate not found")
@@ -261,12 +263,12 @@ def delete_estate(estate_id: int, request: Request, db: Session = Depends(get_db
     if estate.archived_at is not None:
         raise HTTPException(409, "This Estate has already been deleted")
     allocated_count = db.query(EstateAllocation).join(EstatePlot, EstateAllocation.plot_id == EstatePlot.id).filter(EstatePlot.estate_id == estate_id).count()
-    if allocated_count:
-        raise HTTPException(409, f"{allocated_count} plot(s) in this Estate have a customer reservation or allocation - remove those first before deleting the Estate.")
+    if allocated_count and not force:
+        raise HTTPException(409, {"message": f"{allocated_count} plot(s) in this Estate have a customer reservation or allocation.", "allocated_count": allocated_count, "requires_force": True})
     estate.archived_at = datetime.now(timezone.utc)
-    append_estate_audit_event(db, organization_id=estate.organization_id, actor=access.principal, action="estate.deleted", entity_type="estate", entity_id=estate.id, after_data={"name": estate.name})
+    append_estate_audit_event(db, organization_id=estate.organization_id, actor=access.principal, action="estate.deleted", entity_type="estate", entity_id=estate.id, after_data={"name": estate.name, "forced": bool(force and allocated_count), "allocated_plot_count": allocated_count})
     db.commit()
-    return {"id": estate.id, "deleted": True}
+    return {"id": estate.id, "deleted": True, "forced": bool(force and allocated_count)}
 
 
 @router.post("/{estate_id}/approve-map")
