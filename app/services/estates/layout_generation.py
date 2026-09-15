@@ -100,13 +100,17 @@ def generate_estate_layout(boundary_wgs84: Polygon, criteria: EstateLayoutCriter
     min_x, min_y, max_x, max_y = rotated.bounds
     width = max_x - min_x
     height = max_y - min_y
+    # Plots stand side by side within a row, sharing frontage boundaries directly (zero gap) just
+    # like an actual subdivided block - the road only runs between rows, so each row fronts the
+    # road on one side and backs onto the next row's road on the other, the standard double-loaded
+    # street layout. An earlier version put a full road-width gap between every column too, which
+    # meant no two plots ever touched - not how a real layout reads.
     ideal_width = float(criteria.frontage_m or math.sqrt(criteria.target_plot_area_sqm * 1.25))
     ideal_height = float(criteria.target_plot_area_sqm / ideal_width)
-    columns = _safe_grid_count(width, ideal_width, criteria.road_width_m)
+    columns = _safe_grid_count(width, ideal_width, 0)
     rows = _safe_grid_count(height, ideal_height, criteria.road_width_m)
-    available_width = width - max(0, columns - 1) * criteria.road_width_m
+    cell_width = width / columns
     available_height = height - max(0, rows - 1) * criteria.road_width_m
-    cell_width = available_width / columns
     cell_height = available_height / rows
     if cell_width <= 0 or cell_height <= 0:
         raise ValueError("The selected road width leaves no room for plots")
@@ -115,7 +119,7 @@ def generate_estate_layout(boundary_wgs84: Polygon, criteria: EstateLayoutCriter
     for row_index in range(rows):
         y0 = min_y + row_index * (cell_height + criteria.road_width_m)
         for column_index in range(columns):
-            x0 = min_x + column_index * (cell_width + criteria.road_width_m)
+            x0 = min_x + column_index * cell_width
             clipped = _clean_polygon(box(x0, y0, x0 + cell_width, y0 + cell_height).intersection(rotated))
             if clipped is not None and clipped.area >= max(criteria.target_plot_area_sqm * 0.35, 25):
                 cells.append((row_index, column_index, clipped))
@@ -170,9 +174,6 @@ def generate_estate_layout(boundary_wgs84: Polygon, criteria: EstateLayoutCriter
     feature_candidates: list[dict[str, Any]] = []
     if criteria.include_roads:
         road_lines: list[Any] = []
-        for column_index in range(1, columns):
-            x = min_x + column_index * cell_width + (column_index - 0.5) * criteria.road_width_m
-            road_lines.extend(_line_parts(rotated.intersection(LineString([(x, min_y), (x, max_y)]))))
         for row_index in range(1, rows):
             y = min_y + row_index * cell_height + (row_index - 0.5) * criteria.road_width_m
             road_lines.extend(_line_parts(rotated.intersection(LineString([(min_x, y), (max_x, y)]))))
