@@ -8,6 +8,7 @@ import tempfile
 import os
 import math
 from datetime import datetime, timezone
+from decimal import Decimal
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import Response
 from geoalchemy2.shape import from_shape, to_shape
@@ -1844,12 +1845,28 @@ def reserve_plot(estate_id: int, plot_id: int, payload: AllocationAction, reques
 
 @router.post("/{estate_id}/plots/{plot_id}/allocate")
 def allocate_plot(estate_id: int, plot_id: int, payload: AllocationAction, request: Request, db: Session = Depends(get_db)):
+    """Marks a plot Allocated - the official, title-bearing status a Nigerian estate normally only
+    grants once a plot is fully paid for (a signed reservation typically comes first, on a deposit
+    or nothing at all; full allocation and its paperwork follow full payment). Enforced here rather
+    than left to operator discretion: this call is refused unless the confirmed payments already on
+    record, plus any initial payment submitted in this same call, cover the full agreed price."""
     plot = db.query(EstatePlot).filter(EstatePlot.id == plot_id, EstatePlot.estate_id == estate_id).one_or_none()
     if not plot: raise HTTPException(404, "Plot not found")
     estate = db.get(Estate, estate_id)
     access = require_estate_access(db, request, estate.organization_id, permission="allocation.manage")
     customer = db.get(EstateCustomer, payload.customer_id)
     if not customer or customer.organization_id != access.organization_id: raise HTTPException(404, "Customer not found")
+    existing = db.query(EstateAllocation).filter(EstateAllocation.plot_id == plot.id, EstateAllocation.status.in_(("reserved", "allocated"))).one_or_none()
+    effective_agreed_price = payload.agreed_price if payload.agreed_price is not None else (existing.agreed_price if existing else None)
+    already_confirmed = financial_summary(db, existing).confirmed_paid if existing else Decimal("0")
+    incoming = payload.initial_payment_amount or Decimal("0")
+    if effective_agreed_price and (already_confirmed + incoming) < effective_agreed_price:
+        raise HTTPException(
+            409,
+            f"This plot cannot be marked Allocated until it is fully paid. Confirmed so far: "
+            f"{estate_email.format_naira(already_confirmed + incoming)} of {estate_email.format_naira(effective_agreed_price)} agreed. "
+            f"Reserve it instead, or record the remaining payment first.",
+        )
     record = reserve_or_allocate(db, plot=plot, customer=customer, actor=access.principal, allocate=True, agreed_price=payload.agreed_price, payment_plan=payload.payment_plan, notes=payload.notes)
     _apply_initial_payment(db, record=record, payload=payload, actor=access.principal)
     db.commit()
@@ -1884,7 +1901,17 @@ def confirm(payment_id:int, request:Request, db:Session=Depends(get_db)):
     allocation = db.get(EstateAllocation, payment.allocation_id)
     if allocation:
         summary = financial_summary(db, allocation)
-        _notify_allocation_customer(db, allocation=allocation, org_name=access.organization_name, event="payment_completed" if summary.outstanding <= 0 else "payment_recorded", amount_just_paid=payment.amount)
+        fully_paid = summary.agreed_price > 0 and summary.outstanding <= 0
+        # Mirrors how a Nigerian estate normally works: a reservation is held on a deposit (or
+        # nothing), and full Allocation - the official, title-bearing status - follows automatically
+        # once the price is fully paid, rather than requiring staff to remember to flip it by hand.
+        if fully_paid and allocation.status == "reserved":
+            plot = db.get(EstatePlot, allocation.plot_id)
+            customer = db.get(EstateCustomer, allocation.customer_id)
+            if plot and customer:
+                reserve_or_allocate(db, plot=plot, customer=customer, actor=access.principal, allocate=True)
+                db.commit()
+        _notify_allocation_customer(db, allocation=allocation, org_name=access.organization_name, event="payment_completed" if fully_paid else "payment_recorded", amount_just_paid=payment.amount)
     return {"id":payment.id,"status":payment.status}
 
 @router.post("/payments/{payment_id}/void")
@@ -1954,7 +1981,13 @@ def customer_statement(customer_id:int, request:Request, estate_id:int|None=None
     for allocation in allocations:
         summary=financial_summary(db,allocation); plot=db.get(EstatePlot,allocation.plot_id); estate=db.get(Estate,allocation.estate_id)
         payments=db.query(EstatePayment).filter(EstatePayment.allocation_id==allocation.id).order_by(EstatePayment.payment_date).all()
-        rows.append({"allocation_id":allocation.id,"allocation_date":allocation.allocation_date,"estate":estate.name if estate else None,"plot":plot.plot_number if plot else None,"payment_plan":allocation.payment_plan,"agreed_price":str(summary.agreed_price),"confirmed_paid":str(summary.confirmed_paid),"pending_paid":str(summary.pending_paid),"outstanding":str(summary.outstanding),"transactions":[{"date":p.payment_date,"reference":p.reference_no,"method":p.payment_method,"amount":str(p.amount),"status":p.status} for p in payments]})
+        evidence_by_payment: dict[str, list[dict]] = {}
+        payment_ids=[str(p.id) for p in payments]
+        if payment_ids:
+            evidence_rows=db.query(EstateDocument,EstateDocumentLink.entity_id).join(EstateDocumentLink,EstateDocumentLink.document_id==EstateDocument.id).filter(EstateDocumentLink.entity_type=="payment",EstateDocumentLink.entity_id.in_(payment_ids)).all()
+            for document,entity_id in evidence_rows:
+                evidence_by_payment.setdefault(entity_id,[]).append({"id":document.id,"filename":document.original_filename})
+        rows.append({"allocation_id":allocation.id,"allocation_date":allocation.allocation_date,"estate":estate.name if estate else None,"plot":plot.plot_number if plot else None,"payment_plan":allocation.payment_plan,"agreed_price":str(summary.agreed_price),"confirmed_paid":str(summary.confirmed_paid),"pending_paid":str(summary.pending_paid),"outstanding":str(summary.outstanding),"transactions":[{"id":p.id,"date":p.payment_date,"reference":p.reference_no,"method":p.payment_method,"amount":str(p.amount),"status":p.status,"receipts":evidence_by_payment.get(str(p.id),[])} for p in payments]})
     organization=db.get(EstateOrganization,customer.organization_id)
     return {"statement_date":__import__("datetime").datetime.utcnow().isoformat()+"Z","organization":{"id":customer.organization_id,"name":organization.name if organization else access.organization_name},"customer":{"id":customer.id,"name":customer.full_name,"reference":customer.reference_no},"allocations":rows}
 
