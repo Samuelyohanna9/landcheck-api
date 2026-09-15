@@ -1,10 +1,11 @@
 from __future__ import annotations
 
-"""Generates the Estate Performance Report - a premium, print-ready PDF pulling together the
-figures already shown on the Reports page (inventory, financial, geometry/hazard, activity) plus a
-snapshot of the actual layout, into one branded document. This is deliberately a generated PDF
-(not "print the web page"), so it reads like something you would hand to an investor or a board,
-not a screenshot of a dashboard."""
+"""Generates the Estate Performance Report - a plain, print-ready PDF pulling together the figures
+already shown on the Reports page (inventory, financial, geometry/hazard, activity) plus a snapshot
+of the actual layout, into one document. Styled like a classic consulting/audit report - plain
+white pages, thin rules, tables - rather than a boxy dashboard screenshot: no coloured cover band,
+no shadowed tiles, no zebra-striped rows. This is deliberately a generated PDF (not "print the web
+page"), so it reads like something you would hand to an investor or a board."""
 
 import io
 from datetime import datetime, timezone
@@ -19,7 +20,6 @@ from reportlab.lib.units import mm
 from reportlab.platypus import (
     HRFlowable,
     Image,
-    KeepTogether,
     ListFlowable,
     ListItem,
     Paragraph,
@@ -31,14 +31,13 @@ from reportlab.platypus import (
 
 from app.services.estates.layout_export import render_estate_layout_thumbnail_png
 
-INK = colors.HexColor("#101827")
-MUTED = colors.HexColor("#6b7685")
-ACCENT = colors.HexColor("#d1332b")
-FAINT_LINE = colors.HexColor("#e3e6ea")
-TILE_BG = colors.HexColor("#f6f7f9")
-GOOD = colors.HexColor("#1f9d63")
-WARN = colors.HexColor("#b8860b")
-BAD = colors.HexColor("#c23b3b")
+INK = colors.HexColor("#1a1a1a")
+MUTED = colors.HexColor("#6e6e6e")
+RULE = colors.HexColor("#1a1a1a")
+HAIRLINE = colors.HexColor("#d9d9d9")
+GOOD = colors.HexColor("#1f6b3f")
+WARN = colors.HexColor("#8a6414")
+BAD = colors.HexColor("#9c2b2b")
 
 STATUS_LABELS = {"available": "Available", "reserved": "Reserved", "allocated": "Allocated", "on_hold": "On hold"}
 DEVELOPMENT_LABELS = {"not_started": "Not started", "site_cleared": "Site cleared", "foundation": "Foundation", "under_construction": "Under construction", "developed": "Developed"}
@@ -58,50 +57,47 @@ def _naira(value: Any) -> str:
 def _styles() -> dict[str, ParagraphStyle]:
     base = getSampleStyleSheet()
     return {
-        "cover_org": ParagraphStyle("cover_org", parent=base["Normal"], fontName="Helvetica-Bold", fontSize=10.5, textColor=colors.white, spaceAfter=2),
-        "cover_title": ParagraphStyle("cover_title", parent=base["Normal"], fontName="Helvetica-Bold", fontSize=22, textColor=colors.white, leading=26),
-        "cover_sub": ParagraphStyle("cover_sub", parent=base["Normal"], fontName="Helvetica", fontSize=10, textColor=colors.HexColor("#d7dbe1")),
-        "cover_meta": ParagraphStyle("cover_meta", parent=base["Normal"], fontName="Helvetica", fontSize=9, textColor=colors.HexColor("#d7dbe1"), alignment=TA_RIGHT),
-        "section": ParagraphStyle("section", parent=base["Normal"], fontName="Helvetica-Bold", fontSize=13, textColor=INK, spaceBefore=4, spaceAfter=2),
-        "section_note": ParagraphStyle("section_note", parent=base["Normal"], fontName="Helvetica", fontSize=8.5, textColor=MUTED, spaceAfter=8),
-        "tile_label": ParagraphStyle("tile_label", parent=base["Normal"], fontName="Helvetica", fontSize=8, textColor=MUTED, alignment=TA_CENTER),
-        "tile_value": ParagraphStyle("tile_value", parent=base["Normal"], fontName="Helvetica-Bold", fontSize=15, textColor=INK, alignment=TA_CENTER, spaceBefore=2),
-        "tile_value_sm": ParagraphStyle("tile_value_sm", parent=base["Normal"], fontName="Helvetica-Bold", fontSize=11.5, textColor=INK, alignment=TA_CENTER, spaceBefore=2),
+        "org": ParagraphStyle("org", parent=base["Normal"], fontName="Helvetica", fontSize=8.5, textColor=MUTED, leading=11),
+        "meta": ParagraphStyle("meta", parent=base["Normal"], fontName="Helvetica", fontSize=8.5, textColor=MUTED, alignment=TA_RIGHT, leading=11),
+        "title": ParagraphStyle("title", parent=base["Normal"], fontName="Times-Bold", fontSize=23, textColor=INK, leading=27),
+        "subtitle": ParagraphStyle("subtitle", parent=base["Normal"], fontName="Times-Italic", fontSize=11, textColor=MUTED),
+        "section": ParagraphStyle("section", parent=base["Normal"], fontName="Times-Bold", fontSize=13, textColor=INK, spaceBefore=2, spaceAfter=1),
+        "section_note": ParagraphStyle("section_note", parent=base["Normal"], fontName="Helvetica-Oblique", fontSize=8.5, textColor=MUTED, spaceAfter=8),
+        "metric_label": ParagraphStyle("metric_label", parent=base["Normal"], fontName="Helvetica", fontSize=7.6, textColor=MUTED, alignment=TA_CENTER),
+        "metric_value": ParagraphStyle("metric_value", parent=base["Normal"], fontName="Times-Bold", fontSize=17, textColor=INK, alignment=TA_CENTER),
+        "metric_value_sm": ParagraphStyle("metric_value_sm", parent=base["Normal"], fontName="Times-Bold", fontSize=13, textColor=INK, alignment=TA_CENTER),
         "body": ParagraphStyle("body", parent=base["Normal"], fontName="Helvetica", fontSize=9, textColor=INK, leading=13),
         "body_muted": ParagraphStyle("body_muted", parent=base["Normal"], fontName="Helvetica", fontSize=8.5, textColor=MUTED, leading=12),
-        "th": ParagraphStyle("th", parent=base["Normal"], fontName="Helvetica-Bold", fontSize=8.5, textColor=colors.white),
+        "th": ParagraphStyle("th", parent=base["Normal"], fontName="Helvetica-Bold", fontSize=8.3, textColor=INK),
         "td": ParagraphStyle("td", parent=base["Normal"], fontName="Helvetica", fontSize=8.7, textColor=INK),
-        "td_muted": ParagraphStyle("td_muted", parent=base["Normal"], fontName="Helvetica", fontSize=8.2, textColor=MUTED),
+        "td_muted": ParagraphStyle("td_muted", parent=base["Normal"], fontName="Helvetica", fontSize=8, textColor=MUTED),
     }
-
-
-def _tile(label: str, value: str, styles: dict, *, value_style: str = "tile_value") -> Table:
-    inner = Table([[Paragraph(value, styles[value_style])], [Paragraph(label.upper(), styles["tile_label"])]], colWidths=[None])
-    inner.setStyle(TableStyle([
-        ("BACKGROUND", (0, 0), (-1, -1), TILE_BG),
-        ("BOX", (0, 0), (-1, -1), 0.6, FAINT_LINE),
-        ("LINEABOVE", (0, 0), (-1, 0), 2.2, ACCENT),
-        ("TOPPADDING", (0, 0), (-1, 0), 10),
-        ("BOTTOMPADDING", (0, 0), (-1, 0), 2),
-        ("TOPPADDING", (0, 1), (-1, 1), 0),
-        ("BOTTOMPADDING", (0, 1), (-1, 1), 10),
-    ]))
-    return inner
-
-
-def _tile_row(items: list[tuple[str, str]], styles: dict, col_width: float, *, value_style: str = "tile_value") -> Table:
-    row = [_tile(label, value, styles, value_style=value_style) for label, value in items]
-    table = Table([row], colWidths=[col_width] * len(row))
-    table.setStyle(TableStyle([("LEFTPADDING", (0, 0), (-1, -1), 3), ("RIGHTPADDING", (0, 0), (-1, -1), 3), ("TOPPADDING", (0, 0), (-1, -1), 0), ("BOTTOMPADDING", (0, 0), (-1, -1), 0)]))
-    return table
 
 
 def _section(title: str, styles: dict, note: str | None = None) -> list:
     flow: list = [Paragraph(title, styles["section"])]
-    flow.append(HRFlowable(width="100%", thickness=1.4, color=ACCENT, spaceAfter=6))
+    flow.append(HRFlowable(width="100%", thickness=0.75, color=RULE, spaceAfter=7))
     if note:
         flow.append(Paragraph(note, styles["section_note"]))
     return flow
+
+
+def _metric_strip(items: list[tuple[str, str]], styles: dict, col_width: float, *, value_style: str = "metric_value") -> Table:
+    """A plain row of figures - a label line over a value line, separated by a single hairline
+    rule - rather than boxed/shadowed tiles. Reads like a printed statistics table."""
+    label_row = [Paragraph(label.upper(), styles["metric_label"]) for label, _ in items]
+    value_row = [Paragraph(value, styles[value_style]) for _, value in items]
+    table = Table([label_row, value_row], colWidths=[col_width] * len(items))
+    table.setStyle(TableStyle([
+        ("TOPPADDING", (0, 0), (-1, 0), 0),
+        ("BOTTOMPADDING", (0, 0), (-1, 0), 3),
+        ("TOPPADDING", (0, 1), (-1, 1), 1),
+        ("BOTTOMPADDING", (0, 1), (-1, 1), 6),
+        ("LINEBELOW", (0, 1), (-1, 1), 0.5, HAIRLINE),
+        ("LEFTPADDING", (0, 0), (-1, -1), 4),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 4),
+    ]))
+    return table
 
 
 def _data_table(header: list[str], rows: list[list[str]], styles: dict, col_widths: list[float] | None = None) -> Table:
@@ -109,15 +105,14 @@ def _data_table(header: list[str], rows: list[list[str]], styles: dict, col_widt
     body_rows = [[Paragraph(str(cell), styles["td"]) for cell in row] for row in rows]
     table = Table([head] + body_rows, colWidths=col_widths, repeatRows=1)
     style = [
-        ("BACKGROUND", (0, 0), (-1, 0), INK),
-        ("TOPPADDING", (0, 0), (-1, 0), 6),
-        ("BOTTOMPADDING", (0, 0), (-1, 0), 6),
-        ("TOPPADDING", (0, 1), (-1, -1), 5),
-        ("BOTTOMPADDING", (0, 1), (-1, -1), 5),
-        ("LINEBELOW", (0, 1), (-1, -1), 0.5, FAINT_LINE),
-        ("LEFTPADDING", (0, 0), (-1, -1), 8),
-        ("RIGHTPADDING", (0, 0), (-1, -1), 8),
-        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#fafbfc")]),
+        ("LINEBELOW", (0, 0), (-1, 0), 0.9, RULE),
+        ("TOPPADDING", (0, 0), (-1, 0), 4),
+        ("BOTTOMPADDING", (0, 0), (-1, 0), 5),
+        ("TOPPADDING", (0, 1), (-1, -1), 5.5),
+        ("BOTTOMPADDING", (0, 1), (-1, -1), 5.5),
+        ("LINEBELOW", (0, 1), (-1, -2), 0.4, HAIRLINE),
+        ("LEFTPADDING", (0, 0), (-1, -1), 2),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 2),
     ]
     table.setStyle(TableStyle(style))
     return table
@@ -136,13 +131,13 @@ def _risk_color(risk_class: str | None) -> colors.Color:
 
 def _footer(canvas, doc, *, estate_name: str, organization_name: str) -> None:
     canvas.saveState()
-    canvas.setStrokeColor(FAINT_LINE)
-    canvas.setLineWidth(0.6)
-    canvas.line(18 * mm, 14 * mm, doc.pagesize[0] - 18 * mm, 14 * mm)
+    canvas.setStrokeColor(HAIRLINE)
+    canvas.setLineWidth(0.5)
+    canvas.line(20 * mm, 14 * mm, doc.pagesize[0] - 20 * mm, 14 * mm)
     canvas.setFont("Helvetica", 7.5)
     canvas.setFillColor(MUTED)
-    canvas.drawString(18 * mm, 10 * mm, f"{organization_name or 'LandCheck Estates'} · {estate_name}")
-    canvas.drawRightString(doc.pagesize[0] - 18 * mm, 10 * mm, f"Page {doc.page}")
+    canvas.drawString(20 * mm, 10 * mm, f"{organization_name or 'LandCheck Estates'} · {estate_name}")
+    canvas.drawRightString(doc.pagesize[0] - 20 * mm, 10 * mm, f"Page {doc.page}")
     canvas.restoreState()
 
 
@@ -160,30 +155,24 @@ def render_estate_report_pdf(
     output_path: str,
 ) -> dict:
     styles = _styles()
-    doc = SimpleDocTemplate(output_path, pagesize=A4, topMargin=0, bottomMargin=20 * mm, leftMargin=18 * mm, rightMargin=18 * mm)
-    usable_width = A4[0] - 36 * mm
+    doc = SimpleDocTemplate(output_path, pagesize=A4, topMargin=20 * mm, bottomMargin=20 * mm, leftMargin=20 * mm, rightMargin=20 * mm)
+    usable_width = A4[0] - 40 * mm
     story: list = []
 
-    # --- Cover band -------------------------------------------------------------------------
+    # --- Plain letterhead, no cover band ------------------------------------------------------
     generated_at = datetime.now(timezone.utc).strftime("%d %b %Y, %H:%M UTC")
-    cover_inner = Table(
-        [[Paragraph((organization_name or "LandCheck Estates").upper(), styles["cover_org"]), Paragraph(f"Generated {generated_at}", styles["cover_meta"])],
-         [Paragraph(f"{estate.name or 'Estate'}", styles["cover_title"]), ""],
-         [Paragraph("Estate Performance Report", styles["cover_sub"]), ""]],
-        colWidths=[usable_width * 0.7, usable_width * 0.3],
+    header = Table(
+        [[Paragraph((organization_name or "LandCheck Estates").upper(), styles["org"]), Paragraph(f"Generated {generated_at}", styles["meta"])]],
+        colWidths=[usable_width * 0.6, usable_width * 0.4],
     )
-    cover_inner.setStyle(TableStyle([("SPAN", (0, 1), (1, 1)), ("SPAN", (0, 2), (1, 2)), ("VALIGN", (0, 0), (-1, -1), "TOP"), ("TOPPADDING", (0, 0), (-1, 0), 0), ("BOTTOMPADDING", (0, 2), (-1, 2), 0)]))
-    cover = Table([[cover_inner]], colWidths=[usable_width + 36 * mm])
-    cover.setStyle(TableStyle([
-        ("BACKGROUND", (0, 0), (-1, -1), INK),
-        ("LINEBELOW", (0, 0), (-1, -1), 3, ACCENT),
-        ("TOPPADDING", (0, 0), (-1, -1), 22),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 18),
-        ("LEFTPADDING", (0, 0), (-1, -1), 18 * mm),
-        ("RIGHTPADDING", (0, 0), (-1, -1), 18 * mm),
-    ]))
-    story.append(cover)
-    story.append(Spacer(1, 14))
+    header.setStyle(TableStyle([("VALIGN", (0, 0), (-1, -1), "TOP"), ("LEFTPADDING", (0, 0), (-1, -1), 0), ("RIGHTPADDING", (0, 0), (-1, -1), 0), ("TOPPADDING", (0, 0), (-1, -1), 0), ("BOTTOMPADDING", (0, 0), (-1, -1), 0)]))
+    story.append(header)
+    story.append(Spacer(1, 8))
+    story.append(Paragraph(estate.name or "Estate", styles["title"]))
+    story.append(Paragraph("Estate Performance Report", styles["subtitle"]))
+    story.append(Spacer(1, 8))
+    story.append(HRFlowable(width="100%", thickness=1.1, color=RULE))
+    story.append(Spacer(1, 16))
 
     # --- Executive summary --------------------------------------------------------------------
     total_plots = int(dashboard.get("total_plots") or 0)
@@ -196,19 +185,19 @@ def render_estate_report_pdf(
     collection_rate = f"{(confirmed / contracted * 100):.0f}%" if contracted > 0 else "–"
 
     story += _section("Executive summary", styles)
-    story.append(_tile_row([
+    story.append(_metric_strip([
         ("Total plots", f"{total_plots:,}"),
         ("Available", f"{int(statuses.get('available') or 0):,}"),
         ("Allocated", f"{int(statuses.get('allocated') or 0):,}"),
         ("Reserved", f"{int(statuses.get('reserved') or 0):,}"),
     ], styles, usable_width / 4))
-    story.append(Spacer(1, 8))
-    story.append(_tile_row([
+    story.append(Spacer(1, 6))
+    story.append(_metric_strip([
         ("Contracted value", _naira(contracted)),
         ("Confirmed collected", _naira(confirmed)),
         ("Outstanding", _naira(outstanding)),
         ("Collection rate", collection_rate),
-    ], styles, usable_width / 4, value_style="tile_value_sm"))
+    ], styles, usable_width / 4, value_style="metric_value_sm"))
     story.append(Spacer(1, 16))
 
     # --- Layout snapshot ----------------------------------------------------------------------
@@ -229,13 +218,13 @@ def render_estate_report_pdf(
             ]
             legend_row = []
             for label, swatch_color in legend_items:
-                swatch = Table([[""]], colWidths=[8], rowHeights=[8])
-                swatch.setStyle(TableStyle([("BACKGROUND", (0, 0), (-1, -1), swatch_color), ("BOX", (0, 0), (-1, -1), 0.5, MUTED)]))
+                swatch = Table([[""]], colWidths=[7], rowHeights=[7])
+                swatch.setStyle(TableStyle([("BACKGROUND", (0, 0), (-1, -1), swatch_color)]))
                 legend_row.append(swatch)
                 legend_row.append(Paragraph(label, styles["td_muted"]))
             legend_table = Table([legend_row], colWidths=None)
             legend_table.setStyle(TableStyle([("VALIGN", (0, 0), (-1, -1), "MIDDLE"), ("LEFTPADDING", (0, 0), (-1, -1), 3), ("RIGHTPADDING", (0, 0), (-1, -1), 3)]))
-            story.append(Spacer(1, 4))
+            story.append(Spacer(1, 6))
             story.append(legend_table)
         except ValueError:
             story.append(Paragraph("No plottable geometry available yet.", styles["body_muted"]))
