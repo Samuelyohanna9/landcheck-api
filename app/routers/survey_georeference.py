@@ -1423,6 +1423,52 @@ def stream_georeference_raster(session_id: str, db: Session = Depends(get_db)):
         raise HTTPException(status_code=404, detail=f"Unable to stream raster from storage: {exc}") from exc
 
 
+@router.get("/sessions/{session_id}/digitize-preview")
+def get_georeference_digitize_preview(session_id: str, db: Session = Depends(get_db)):
+    """Serve a screen-sized source preview while retaining source-pixel coordinates."""
+    row = _load_session_row(db, session_id)
+    settings = _build_r2()
+    object_key = str(row.get("source_object_key") or "").strip()
+    if not object_key:
+        raise HTTPException(status_code=404, detail="Raster source is no longer available.")
+
+    try:
+        payload = _download_r2_bytes(settings, object_key)
+        image = ImageOps.exif_transpose(Image.open(io.BytesIO(payload)))
+        image.load()
+        source_width, source_height = image.size
+        resampling = getattr(Image, "Resampling", Image).LANCZOS
+        image.thumbnail((3200, 3200), resampling)
+
+        output = io.BytesIO()
+        source_type = str(row.get("source_content_type") or "image/jpeg").strip().lower()
+        if source_type == "image/png":
+            image.save(output, format="PNG", optimize=True)
+            media_type = "image/png"
+        elif source_type == "image/webp":
+            image.save(output, format="WEBP", quality=92, method=5)
+            media_type = "image/webp"
+        else:
+            if image.mode not in ("RGB", "L"):
+                image = image.convert("RGB")
+            image.save(output, format="JPEG", quality=92, optimize=True, progressive=True)
+            media_type = "image/jpeg"
+        _touch_session(db, session_id)
+        return Response(
+            content=output.getvalue(),
+            media_type=media_type,
+            headers={
+                "Cache-Control": "private, max-age=300",
+                "X-Source-Width": str(source_width),
+                "X-Source-Height": str(source_height),
+            },
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=404, detail=f"Unable to prepare raster preview: {exc}") from exc
+
+
 @router.get("/sessions/{session_id}/overlay-raster")
 def stream_georeference_overlay_raster(session_id: str, db: Session = Depends(get_db)):
     row = _load_session_row(db, session_id)
