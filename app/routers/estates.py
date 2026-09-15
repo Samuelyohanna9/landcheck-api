@@ -42,6 +42,7 @@ from app.utils.coordinate_converter import COORDINATE_SYSTEMS, resolve_coordinat
 from app.models.estate_auth import EstateAccount
 from app.utils.survey_auth_security import find_or_create_survey_user
 from app.services.estates import estate_email
+from app.services.estates.layout_export import render_estate_layout_pdf
 
 
 router = APIRouter(prefix="/estates", tags=["estates"])
@@ -1724,6 +1725,90 @@ def export_plot_dgps_csv(estate_id: int, plot_id: int, request: Request, coordin
         media_type="text/csv; charset=utf-8",
         headers={"Content-Disposition": f'attachment; filename="{safe_number}_DGPS.csv"', "Cache-Control": "no-store, no-cache, must-revalidate", "Pragma": "no-cache"},
     )
+
+
+@router.get("/{estate_id}/exports/layout-dgps.csv")
+def export_estate_layout_dgps_csv(estate_id: int, request: Request, coordinate_system: str = "wgs84_nigeria_meters", raw: bool = False, db: Session = Depends(get_db)):
+    """Exports every approved plot's boundary vertices in this Estate as one combined DGPS CSV for
+    a whole-layout stakeout, instead of exporting and carrying one file per plot. Station labels are
+    prefixed with the plot number (e.g. P-004-A) so points stay unambiguous once every plot's
+    vertices are mixed into a single job."""
+    estate = db.get(Estate, estate_id)
+    if not estate: raise HTTPException(404, "Estate not found")
+    access = require_estate_access(db, request, estate.organization_id, permission="plot.read")
+    plots = db.query(EstatePlot).filter(EstatePlot.estate_id == estate_id, EstatePlot.geometry_status == "approved").order_by(EstatePlot.plot_number).all()
+    plots = [plot for plot in plots if plot.geometry]
+    if not plots:
+        raise HTTPException(422, "This Estate has no approved plot geometry to export")
+    sample_polygon = to_shape(plots[0].geometry)
+    sample_lng, sample_lat = list(sample_polygon.exterior.coords)[0]
+    resolved_coordinate_system = resolve_coordinate_system_key(coordinate_system, sample_lng, sample_lat)
+    rows: list[dict] = []
+    skipped: list[str] = []
+    for plot in plots:
+        polygon = to_shape(plot.geometry)
+        _, issues = validate_polygon(polygon.__geo_interface__)
+        if any(issue.severity == "error" for issue in issues):
+            skipped.append(plot.plot_number)
+            continue
+        coordinates = list(polygon.exterior.coords)
+        if coordinates and coordinates[0] == coordinates[-1]: coordinates = coordinates[:-1]
+        if len(coordinates) < 3:
+            skipped.append(plot.plot_number)
+            continue
+        target_points = convert_coordinates([[float(lng), float(lat)] for lng, lat in coordinates], "wgs84", resolved_coordinate_system)
+        for index, (lng, lat) in enumerate(coordinates):
+            rows.append({
+                "station": f"{plot.plot_number}-{alpha_station(index)}",
+                "feature": f"Plot {plot.plot_number}",
+                "coordinate_system": resolved_coordinate_system,
+                "easting": target_points[index][0],
+                "northing": target_points[index][1],
+                "longitude": lng,
+                "latitude": lat,
+                "point_type": "Plot vertex",
+            })
+    if not rows:
+        raise HTTPException(422, "No plots had exportable geometry")
+    append_estate_audit_event(db, organization_id=estate.organization_id, actor=access.principal, action="estate.layout_dgps_exported", entity_type="estate", entity_id=estate.id, after_data={"plot_count": len(plots) - len(skipped), "vertex_count": len(rows), "coordinate_system": resolved_coordinate_system, "skipped_plots": skipped})
+    db.commit()
+    safe_name = re.sub(r"[^A-Za-z0-9._-]+", "-", estate.name).strip("-.") or f"estate-{estate.id}"
+    return Response(
+        render_dgps_staking_csv(rows, raw=raw),
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{safe_name}_Layout_DGPS.csv"', "Cache-Control": "no-store, no-cache, must-revalidate", "Pragma": "no-cache"},
+    )
+
+
+@router.get("/{estate_id}/exports/layout.pdf")
+def export_estate_layout_pdf(estate_id: int, request: Request, db: Session = Depends(get_db)):
+    """Renders every plot, road, drainage reserve and open space in this Estate as one clean,
+    single-page site layout plan PDF - the whole subdivision at once, not one plot at a time."""
+    estate = db.get(Estate, estate_id)
+    if not estate: raise HTTPException(404, "Estate not found")
+    access = require_estate_access(db, request, estate.organization_id, permission="plot.read")
+    plots = db.query(EstatePlot).filter(EstatePlot.estate_id == estate_id, EstatePlot.geometry_status == "approved").order_by(EstatePlot.plot_number).all()
+    plots = [plot for plot in plots if plot.geometry]
+    features = db.query(EstateSpatialFeature).filter(EstateSpatialFeature.estate_id == estate_id, EstateSpatialFeature.status == "active").all()
+    if not plots and estate.boundary is None:
+        raise HTTPException(422, "This Estate has no plots or boundary to draw yet")
+    tmp_path: str | None = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp_file:
+            tmp_path = tmp_file.name
+        result = render_estate_layout_pdf(estate=estate, organization_name=access.organization_name, plots=plots, features=features, to_shape_fn=to_shape, output_path=tmp_path)
+        with open(tmp_path, "rb") as handle:
+            pdf_bytes = handle.read()
+    except ValueError as error:
+        raise HTTPException(422, str(error))
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            os.remove(tmp_path)
+    append_estate_audit_event(db, organization_id=estate.organization_id, actor=access.principal, action="estate.layout_pdf_exported", entity_type="estate", entity_id=estate.id, after_data=result)
+    db.commit()
+    safe_name = re.sub(r"[^A-Za-z0-9._-]+", "-", estate.name).strip("-.") or f"estate-{estate.id}"
+    return Response(pdf_bytes, media_type="application/pdf", headers={"Content-Disposition": f'attachment; filename="{safe_name}_Layout_Plan.pdf"'})
+
 
 @router.post("/staking-tasks/{task_id}/start")
 def start_staking_task(task_id:int,request:Request,db:Session=Depends(get_db)):
