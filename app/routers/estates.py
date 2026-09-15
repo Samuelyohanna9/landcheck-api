@@ -44,7 +44,7 @@ from app.models.estate_auth import EstateAccount
 from app.utils.survey_auth_security import find_or_create_survey_user
 from app.services.estates import estate_email
 from app.services.estates.layout_export import render_estate_layout_pdf
-from app.services.estates.report_export import render_estate_report_pdf
+from app.services.estates.report_export import render_customer_statement_pdf, render_estate_report_pdf
 from app.services.estates import commissions
 from app.db import SessionLocal
 from app.utils.hazard_jobs import get_hazard_job, insert_hazard_job, serialize_hazard_job, set_hazard_job_status
@@ -2495,6 +2495,31 @@ def customer_statement(customer_id:int, request:Request, estate_id:int|None=None
         rows.append({"allocation_id":allocation.id,"allocation_date":allocation.allocation_date,"estate":estate.name if estate else None,"plot":plot.plot_number if plot else None,"payment_plan":allocation.payment_plan,"agreed_price":str(summary.agreed_price),"confirmed_paid":str(summary.confirmed_paid),"pending_paid":str(summary.pending_paid),"outstanding":str(summary.outstanding),"transactions":[{"id":p.id,"date":p.payment_date,"reference":p.reference_no,"method":p.payment_method,"amount":str(p.amount),"status":p.status,"receipts":evidence_by_payment.get(str(p.id),[])} for p in payments]})
     organization=db.get(EstateOrganization,customer.organization_id)
     return {"statement_date":__import__("datetime").datetime.utcnow().isoformat()+"Z","organization":{"id":customer.organization_id,"name":organization.name if organization else access.organization_name},"customer":{"id":customer.id,"name":customer.full_name,"reference":customer.reference_no},"allocations":rows}
+
+
+@router.get("/customers/{customer_id}/statement.pdf")
+def customer_statement_pdf(customer_id: int, request: Request, estate_id: int | None = None, allocation_id: int | None = None, db: Session = Depends(get_db)):
+    """The same statement as GET .../statement, as a plain generated PDF - same letterhead/table
+    style as the Estate Performance Report - rather than a browser Print of the on-screen modal."""
+    data = customer_statement(customer_id, request, estate_id, allocation_id, db)
+    tmp_path: str | None = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp_file:
+            tmp_path = tmp_file.name
+        render_customer_statement_pdf(
+            organization_name=data["organization"]["name"],
+            customer_name=data["customer"]["name"],
+            customer_reference=data["customer"]["reference"],
+            allocations=data["allocations"],
+            output_path=tmp_path,
+        )
+        with open(tmp_path, "rb") as handle:
+            pdf_bytes = handle.read()
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            os.remove(tmp_path)
+    safe_name = re.sub(r"[^A-Za-z0-9._-]+", "-", data["customer"]["name"] or "customer").strip("-.") or f"customer-{customer_id}"
+    return Response(pdf_bytes, media_type="application/pdf", headers={"Content-Disposition": f'attachment; filename="{safe_name}_Payment_Statement.pdf"'})
 
 @router.get("/allocations/{allocation_id}/financial-detail")
 def allocation_financial_detail(allocation_id:int,request:Request,db:Session=Depends(get_db)):

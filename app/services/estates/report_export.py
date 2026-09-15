@@ -124,11 +124,14 @@ def _metric_strip(items: list[tuple[str, str]], styles: dict, col_width: float, 
     return table
 
 
-def _data_table(header: list[str], rows: list[list[str]], styles: dict, col_widths: list[float] | None = None):
+def _data_table(header: list[str], rows: list[list[str]], styles: dict, col_widths: list[float] | None = None, *, keep_together: bool = True):
     # KeepTogether rather than a plain Table: reportlab splits a Table across a page break by
     # default (repeating the header row on the continuation), which for a short table like these
     # just reads as an arbitrarily broken table with one or two orphaned rows on the next page.
     # KeepTogether instead pushes the whole table onto the next page if it doesn't fit where it is.
+    # Nesting a KeepTogether inside another KeepTogether (as callers combining a heading with its
+    # table do) confuses reportlab's height calculation and triggers spurious page breaks - those
+    # callers pass keep_together=False and wrap the combined flowables themselves instead.
     head = [Paragraph(text, styles["th"]) for text in header]
     body_rows = [[Paragraph(str(cell), styles["td"]) for cell in row] for row in rows]
     table = Table([head] + body_rows, colWidths=col_widths, repeatRows=1)
@@ -143,7 +146,7 @@ def _data_table(header: list[str], rows: list[list[str]], styles: dict, col_widt
         ("RIGHTPADDING", (0, 0), (-1, -1), 2),
     ]
     table.setStyle(TableStyle(style))
-    return KeepTogether([table])
+    return KeepTogether([table]) if keep_together else table
 
 
 def _risk_color(risk_class: str | None) -> colors.Color:
@@ -157,14 +160,14 @@ def _risk_color(risk_class: str | None) -> colors.Color:
     return MUTED
 
 
-def _footer(canvas, doc, *, estate_name: str, organization_name: str) -> None:
+def _footer(canvas, doc, *, left_text: str) -> None:
     canvas.saveState()
     canvas.setStrokeColor(HAIRLINE)
     canvas.setLineWidth(0.5)
     canvas.line(20 * mm, 14 * mm, doc.pagesize[0] - 20 * mm, 14 * mm)
     canvas.setFont(FONT_SERIF, 8)
     canvas.setFillColor(MUTED)
-    canvas.drawString(20 * mm, 10 * mm, f"{organization_name or 'LandCheck Estates'} · {estate_name}")
+    canvas.drawString(20 * mm, 10 * mm, left_text)
     canvas.drawRightString(doc.pagesize[0] - 20 * mm, 10 * mm, f"Page {doc.page}")
     canvas.restoreState()
 
@@ -317,7 +320,93 @@ def render_estate_report_pdf(
         story.append(_data_table(["When", "Action"], activity_rows, styles, [usable_width * 0.3, usable_width * 0.7]))
 
     def _on_page(canvas, doc_):
-        _footer(canvas, doc_, estate_name=estate.name or "Estate", organization_name=organization_name)
+        _footer(canvas, doc_, left_text=f"{organization_name or 'LandCheck Estates'} · {estate.name or 'Estate'}")
 
     doc.build(story, onFirstPage=_on_page, onLaterPages=_on_page)
     return {"plot_count": len(plots), "feature_count": len(features), "generated_at": generated_at}
+
+
+def render_customer_statement_pdf(
+    *,
+    organization_name: str,
+    customer_name: str,
+    customer_reference: str | None,
+    allocations: list[dict],
+    output_path: str,
+) -> dict:
+    """A plain, table-driven payment statement for one customer - same letterhead/table language as
+    the Estate Performance Report, generated rather than relying on a browser's Print of an on-screen
+    modal (which carries page chrome, unformatted timestamps and no real pagination control)."""
+    styles = _styles()
+    doc = SimpleDocTemplate(output_path, pagesize=A4, topMargin=20 * mm, bottomMargin=20 * mm, leftMargin=20 * mm, rightMargin=20 * mm)
+    usable_width = A4[0] - 40 * mm
+    story: list = []
+
+    generated_at = datetime.now(timezone.utc).strftime("%d %b %Y, %H:%M UTC")
+    header = Table(
+        [[Paragraph((organization_name or "LandCheck Estates").upper(), styles["org"]), Paragraph(f"Generated {generated_at}", styles["meta"])]],
+        colWidths=[usable_width * 0.6, usable_width * 0.4],
+    )
+    header.setStyle(TableStyle([("VALIGN", (0, 0), (-1, -1), "TOP"), ("LEFTPADDING", (0, 0), (-1, -1), 0), ("RIGHTPADDING", (0, 0), (-1, -1), 0), ("TOPPADDING", (0, 0), (-1, -1), 0), ("BOTTOMPADDING", (0, 0), (-1, -1), 0)]))
+    story.append(header)
+    story.append(Spacer(1, 8))
+    story.append(Paragraph(customer_name or "Customer", styles["title"]))
+    story.append(Paragraph(f"Payment Statement{f' · Ref. {customer_reference}' if customer_reference else ''}", styles["subtitle"]))
+    story.append(Spacer(1, 8))
+    story.append(HRFlowable(width="100%", thickness=1.1, color=RULE))
+    story.append(Spacer(1, 16))
+
+    if not allocations:
+        story.append(Paragraph("No plots are allocated or reserved to this customer yet.", styles["body_muted"]))
+
+    total_agreed = Decimal("0")
+    total_confirmed = Decimal("0")
+    total_outstanding = Decimal("0")
+    for allocation in allocations:
+        total_agreed += Decimal(allocation.get("agreed_price") or 0)
+        total_confirmed += Decimal(allocation.get("confirmed_paid") or 0)
+        total_outstanding += Decimal(allocation.get("outstanding") or 0)
+
+    if allocations:
+        story.append(_metric_strip([
+            ("Plots", str(len(allocations))),
+            ("Agreed total", _naira(total_agreed)),
+            ("Confirmed total", _naira(total_confirmed)),
+            ("Outstanding", _naira(total_outstanding)),
+        ], styles, usable_width / 4, value_style="metric_value_sm"))
+        story.append(Spacer(1, 18))
+
+    for allocation in allocations:
+        heading = f"{allocation.get('estate') or 'Estate'} / {allocation.get('plot') or ''}".strip(" /")
+        allocation_date = allocation.get("allocation_date")
+        allocation_date_text = allocation_date.strftime("%d %b %Y") if hasattr(allocation_date, "strftime") else (str(allocation_date) if allocation_date else "Not yet allocated")
+        detail_line = f"Allocation date: {allocation_date_text} · Agreed price: {_naira(allocation.get('agreed_price'))}"
+        if allocation.get("payment_plan"):
+            detail_line += f" · Payment plan: {allocation['payment_plan']}"
+
+        block: list = [Paragraph(heading, styles["section"])]
+        block.append(HRFlowable(width="100%", thickness=0.6, color=RULE, spaceAfter=6))
+        block.append(Paragraph(detail_line, styles["body_muted"]))
+        block.append(Spacer(1, 6))
+
+        transactions = allocation.get("transactions") or []
+        if transactions:
+            rows = []
+            for transaction in transactions:
+                when = transaction.get("date")
+                when_text = when.strftime("%d %b %Y") if hasattr(when, "strftime") else str(when or "")
+                receipts = transaction.get("receipts") or []
+                receipt_text = "Attached" if receipts else "–"
+                rows.append([when_text, transaction.get("reference") or "-", str(transaction.get("method") or "").replace("_", " ").title(), _naira(transaction.get("amount")), str(transaction.get("status") or "").replace("_", " ").title(), receipt_text])
+            table = _data_table(["Date", "Reference", "Method", "Amount", "Status", "Receipt"], rows, styles, [usable_width * 0.16, usable_width * 0.16, usable_width * 0.2, usable_width * 0.18, usable_width * 0.18, usable_width * 0.12], keep_together=False)
+            story.append(KeepTogether(block + [table]))
+        else:
+            block.append(Paragraph("No payments recorded against this plot yet.", styles["body_muted"]))
+            story.append(KeepTogether(block))
+        story.append(Spacer(1, 16))
+
+    def _on_page(canvas, doc_):
+        _footer(canvas, doc_, left_text=f"{organization_name or 'LandCheck Estates'} · {customer_name or 'Customer'}")
+
+    doc.build(story, onFirstPage=_on_page, onLaterPages=_on_page)
+    return {"allocation_count": len(allocations), "generated_at": generated_at}
