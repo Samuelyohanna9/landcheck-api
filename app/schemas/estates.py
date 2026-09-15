@@ -195,6 +195,18 @@ class AllocationAction(BaseModel):
     # since it represents an already-received amount the org is attesting to, not a pending claim.
     initial_payment_amount: Decimal | None = Field(default=None, gt=0)
     initial_payment_method: str | None = Field(default=None, max_length=64)
+    # Credits an org member with this sale for commission tracking - optional, and only ever
+    # priced (tier/rate/amount) once the allocation actually reaches "allocated" (fully paid).
+    sales_agent_subject_type: str | None = Field(default=None, max_length=64)
+    sales_agent_subject_id: str | None = Field(default=None, max_length=128)
+
+class CommissionTierItem(BaseModel):
+    label: str = Field(min_length=1, max_length=120)
+    min_cumulative_sales: Decimal = Field(ge=0)
+    rate_percent: Decimal = Field(ge=0, le=100)
+
+class CommissionTiersUpdate(BaseModel):
+    tiers: list[CommissionTierItem] = Field(min_length=1, max_length=20)
 
 class PaymentCreate(BaseModel):
     amount: Decimal = Field(gt=0)

@@ -182,6 +182,32 @@ class EstateAllocation(Base):
     cancellation_reason = Column(Text, nullable=True)
     created_by_subject_type = Column(String(64), nullable=False)
     created_by_subject_id = Column(String(128), nullable=False)
+    # The org member credited with bringing in this sale - optional, tagged at reserve/allocate
+    # time. Commission fields are only ever filled in once the sale is fully Allocated (paid),
+    # snapshotting the tier/rate/amount that applied at that moment so a later tier-table edit
+    # never silently rewrites a commission already earned.
+    sales_agent_subject_type = Column(String(64), nullable=True)
+    sales_agent_subject_id = Column(String(128), nullable=True)
+    commission_tier_label = Column(String(120), nullable=True)
+    commission_rate_percent = Column(Numeric(5, 2), nullable=True)
+    commission_amount = Column(Numeric(16, 2), nullable=True)
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
+
+
+class EstateCommissionTier(Base):
+    """A per-organization commission ladder: a sales agent's commission rate on a sale is set by
+    their cumulative Allocated (fully paid) sales volume *before* that sale, mirroring how Nigerian
+    real estate firms commonly run this (e.g. 5% until N40m in verified sales, 7.5% until N80m,
+    10% beyond) - the rate steps up automatically from the next transaction, it never recalculates
+    past ones."""
+
+    __tablename__ = "estate_commission_tiers"
+    id = Column(Integer, primary_key=True)
+    organization_id = Column(Integer, ForeignKey("estate_organizations.id", ondelete="CASCADE"), nullable=False)
+    label = Column(String(120), nullable=False)
+    min_cumulative_sales = Column(Numeric(16, 2), nullable=False, default=0)
+    rate_percent = Column(Numeric(5, 2), nullable=False)
     created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
     updated_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
 

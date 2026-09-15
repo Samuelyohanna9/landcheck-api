@@ -22,8 +22,8 @@ from sqlalchemy.orm import Session
 from app.routers.plots import _metric_epsg_for_wgs84_polygon, _subdivide_polygon_equal_count, get_db
 from app.services.estates.authorization import list_estate_access, resolve_estate_principal
 from app.services.estates.entitlements import ESTATE_FEATURES, get_estate_entitlement
-from app.models.estate_foundation import Estate, EstateAllocation, EstateAuditEvent, EstateBlock, EstateCustomer, EstateDocument, EstateDocumentLink, EstateFieldInspection, EstateHazardAssessment, EstateImportReview, EstateLayoutProposal, EstateOrganization, EstateOrganizationMember, EstatePayment, EstatePaymentRule, EstatePlot, EstateSpatialFeature, EstateSurveyRequest, EstateStakingTask
-from app.schemas.estates import AllocationAction, BlockCreate, BlockUpdate, CustomerCreate, DevelopmentStatusUpdate, EstateCreate, EstateLayoutCriteria, EstateLayoutDecision, EstateLayoutFeatureAdd, EstateLayoutFeatureRemove, EstateLayoutProposalEdit, EstateSubdivisionCreate, EstateUpdate, FieldInspectionCreate, GeoreferenceSessionLink, ImportFromGeoreference, ImportReviewCreate, ImportReviewDecision, ImportReviewFromGeoreferenceSession, MemberCreate, MemberUpdate, PlotCreate, PlotGeometryUpdate, PaymentCreate, SpatialFeatureCreate, SpatialFeatureUpdate, SurveyEligibilityUpdate, VoidAction
+from app.models.estate_foundation import Estate, EstateAllocation, EstateAuditEvent, EstateBlock, EstateCommissionTier, EstateCustomer, EstateDocument, EstateDocumentLink, EstateFieldInspection, EstateHazardAssessment, EstateImportReview, EstateLayoutProposal, EstateOrganization, EstateOrganizationMember, EstatePayment, EstatePaymentRule, EstatePlot, EstateSpatialFeature, EstateSurveyRequest, EstateStakingTask
+from app.schemas.estates import AllocationAction, BlockCreate, BlockUpdate, CommissionTiersUpdate, CustomerCreate, DevelopmentStatusUpdate, EstateCreate, EstateLayoutCriteria, EstateLayoutDecision, EstateLayoutFeatureAdd, EstateLayoutFeatureRemove, EstateLayoutProposalEdit, EstateSubdivisionCreate, EstateUpdate, FieldInspectionCreate, GeoreferenceSessionLink, ImportFromGeoreference, ImportReviewCreate, ImportReviewDecision, ImportReviewFromGeoreferenceSession, MemberCreate, MemberUpdate, PlotCreate, PlotGeometryUpdate, PaymentCreate, SpatialFeatureCreate, SpatialFeatureUpdate, SurveyEligibilityUpdate, VoidAction
 from app.services.estates.payments import confirm_payment, financial_summary, record_payment, void_payment
 from app.services.estates.documents import read_private_estate_file, store_private_estate_file
 from app.services.estates.permissions import has_permission
@@ -43,6 +43,7 @@ from app.models.estate_auth import EstateAccount
 from app.utils.survey_auth_security import find_or_create_survey_user
 from app.services.estates import estate_email
 from app.services.estates.layout_export import render_estate_layout_pdf
+from app.services.estates import commissions
 
 
 router = APIRouter(prefix="/estates", tags=["estates"])
@@ -1890,6 +1891,84 @@ def update_survey_eligibility_rule(organization_id: int, payload: SurveyEligibil
     return {"organization_id": organization_id, "is_enabled": rule.is_enabled, "percentage": str(rule.percentage), "description": rule.description}
 
 
+@router.get("/organizations/{organization_id}/sales-agents")
+def list_sales_agents(organization_id: int, request: Request, db: Session = Depends(get_db)):
+    """Any active org member can be tagged as the sales agent on a reservation/allocation - not
+    just members with the "sales" role, since a manager or owner closing a deal directly should be
+    creditable too."""
+    require_estate_access(db, request, organization_id, permission="allocation.manage")
+    rows = db.query(EstateOrganizationMember).filter(EstateOrganizationMember.organization_id == organization_id, EstateOrganizationMember.is_active.is_(True)).all()
+    results = []
+    for row in rows:
+        display_name = row.subject_id
+        if row.subject_type == "estate_account":
+            account = db.get(EstateAccount, int(row.subject_id)) if row.subject_id.isdigit() else None
+            if account:
+                display_name = account.full_name
+        results.append({"subject_type": row.subject_type, "subject_id": row.subject_id, "role": row.role_key, "display_name": display_name})
+    return results
+
+
+@router.get("/organizations/{organization_id}/commission-tiers")
+def get_commission_tiers_endpoint(organization_id: int, request: Request, db: Session = Depends(get_db)):
+    require_estate_access(db, request, organization_id, permission="estate.read")
+    rows = commissions.get_commission_tiers(db, organization_id)
+    if not rows:
+        return {"organization_id": organization_id, "tiers": [{"label": t["label"], "min_cumulative_sales": str(t["min_cumulative_sales"]), "rate_percent": str(t["rate_percent"])} for t in commissions.DEFAULT_TIERS], "using_defaults": True}
+    return {"organization_id": organization_id, "tiers": [{"id": row.id, "label": row.label, "min_cumulative_sales": str(row.min_cumulative_sales), "rate_percent": str(row.rate_percent)} for row in rows], "using_defaults": False}
+
+
+@router.put("/organizations/{organization_id}/commission-tiers")
+def set_commission_tiers_endpoint(organization_id: int, payload: CommissionTiersUpdate, request: Request, db: Session = Depends(get_db)):
+    """Replaces the whole tier ladder at once - simpler to reason about than per-row CRUD for a
+    short, always-fully-visible list. Past commissions already locked into an allocation are
+    untouched; only sales priced after this call see the new ladder."""
+    access = require_estate_access(db, request, organization_id, permission="estate.manage")
+    db.query(EstateCommissionTier).filter(EstateCommissionTier.organization_id == organization_id).delete()
+    for tier in payload.tiers:
+        db.add(EstateCommissionTier(organization_id=organization_id, label=tier.label.strip(), min_cumulative_sales=tier.min_cumulative_sales, rate_percent=tier.rate_percent))
+    db.flush()
+    append_estate_audit_event(db, organization_id=organization_id, actor=access.principal, action="commission_tiers.updated", entity_type="estate_commission_tier", entity_id=organization_id, after_data={"tier_count": len(payload.tiers)})
+    db.commit()
+    return get_commission_tiers_endpoint(organization_id, request, db)
+
+
+@router.get("/organizations/{organization_id}/commissions")
+def commission_report(organization_id: int, request: Request, db: Session = Depends(get_db)):
+    require_estate_access(db, request, organization_id, permission="payment.read")
+    rows = db.query(EstateAllocation).filter(
+        EstateAllocation.organization_id == organization_id,
+        EstateAllocation.status == "allocated",
+        EstateAllocation.sales_agent_subject_id.isnot(None),
+    ).all()
+    by_agent: dict[tuple, dict] = {}
+    for row in rows:
+        key = (row.sales_agent_subject_type, row.sales_agent_subject_id)
+        bucket = by_agent.setdefault(key, {"subject_type": row.sales_agent_subject_type, "subject_id": row.sales_agent_subject_id, "sale_count": 0, "total_volume": Decimal("0"), "total_commission": Decimal("0"), "current_tier": None})
+        bucket["sale_count"] += 1
+        bucket["total_volume"] += Decimal(row.agreed_price or 0)
+        bucket["total_commission"] += Decimal(row.commission_amount or 0)
+        bucket["current_tier"] = row.commission_tier_label
+    results = []
+    for (subject_type, subject_id), bucket in by_agent.items():
+        display_name = subject_id
+        if subject_type == "estate_account":
+            account = db.get(EstateAccount, int(subject_id)) if subject_id.isdigit() else None
+            if account:
+                display_name = account.full_name
+        results.append({
+            "subject_type": subject_type,
+            "subject_id": subject_id,
+            "display_name": display_name,
+            "sale_count": bucket["sale_count"],
+            "total_volume": str(bucket["total_volume"]),
+            "total_commission": str(bucket["total_commission"]),
+            "current_tier": bucket["current_tier"],
+        })
+    results.sort(key=lambda item: float(item["total_commission"]), reverse=True)
+    return {"organization_id": organization_id, "agents": results}
+
+
 def _apply_initial_payment(db: Session, *, record: EstateAllocation, payload: AllocationAction, actor) -> None:
     """An initial payment entered in the same reserve/allocate call is recorded AND immediately
     confirmed - unlike a normal payment, this represents money the org is directly attesting it
@@ -1942,6 +2021,9 @@ def reserve_plot(estate_id: int, plot_id: int, payload: AllocationAction, reques
     customer = db.get(EstateCustomer, payload.customer_id)
     if not customer or customer.organization_id != access.organization_id: raise HTTPException(404, "Customer not found")
     record = reserve_or_allocate(db, plot=plot, customer=customer, actor=access.principal, allocate=False, expires_at=payload.expires_at, agreed_price=payload.agreed_price, payment_plan=payload.payment_plan, notes=payload.notes)
+    if payload.sales_agent_subject_type and payload.sales_agent_subject_id:
+        record.sales_agent_subject_type = payload.sales_agent_subject_type
+        record.sales_agent_subject_id = payload.sales_agent_subject_id
     _apply_initial_payment(db, record=record, payload=payload, actor=access.principal)
     db.commit()
     _notify_allocation_customer(db, allocation=record, org_name=access.organization_name, event="reserved")
@@ -1973,7 +2055,11 @@ def allocate_plot(estate_id: int, plot_id: int, payload: AllocationAction, reque
             f"Reserve it instead, or record the remaining payment first.",
         )
     record = reserve_or_allocate(db, plot=plot, customer=customer, actor=access.principal, allocate=True, agreed_price=payload.agreed_price, payment_plan=payload.payment_plan, notes=payload.notes)
+    if payload.sales_agent_subject_type and payload.sales_agent_subject_id:
+        record.sales_agent_subject_type = payload.sales_agent_subject_type
+        record.sales_agent_subject_id = payload.sales_agent_subject_id
     _apply_initial_payment(db, record=record, payload=payload, actor=access.principal)
+    commissions.apply_commission(db, allocation=record)
     db.commit()
     _notify_allocation_customer(db, allocation=record, org_name=access.organization_name, event="allocated")
     return {"id": record.id, "status": record.status, "agreed_price": str(record.agreed_price) if record.agreed_price is not None else None}
@@ -2015,6 +2101,7 @@ def confirm(payment_id:int, request:Request, db:Session=Depends(get_db)):
             customer = db.get(EstateCustomer, allocation.customer_id)
             if plot and customer:
                 reserve_or_allocate(db, plot=plot, customer=customer, actor=access.principal, allocate=True)
+                commissions.apply_commission(db, allocation=allocation)
                 db.commit()
         _notify_allocation_customer(db, allocation=allocation, org_name=access.organization_name, event="payment_completed" if fully_paid else "payment_recorded", amount_just_paid=payment.amount)
     return {"id":payment.id,"status":payment.status}
