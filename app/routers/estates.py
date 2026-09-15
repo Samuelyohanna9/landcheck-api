@@ -38,6 +38,8 @@ from app.services.estates.qc import validate_polygon
 from app.services.estates.layout_generation import generate_estate_layout
 from app.services.survey.dgps import alpha_station, render_dgps_staking_csv
 from app.utils.coordinate_converter import COORDINATE_SYSTEMS, resolve_coordinate_system_key
+from app.models.estate_auth import EstateAccount
+from app.utils.survey_auth_security import find_or_create_survey_user
 
 
 router = APIRouter(prefix="/estates", tags=["estates"])
@@ -1572,19 +1574,35 @@ def cancel_survey_request(request_id:int,request:Request,db:Session=Depends(get_
     append_estate_audit_event(db,organization_id=row.organization_id,actor=access.principal,action="survey_request.cancelled",entity_type="estate_survey_request",entity_id=row.id)
     db.commit(); return _survey_payload(db,row)
 
+def _resolve_survey_owner_user_id(db: Session, principal) -> int:
+    """A Survey working plot is owned by an actual Survey-product account, a separate identity
+    domain from Estates. A caller already authenticated as a Survey user owns it directly; an
+    Estate-account caller (the common case - an org manager acting from the Estates dashboard, not
+    signed into Survey separately) is linked by their verified Estate email instead, using the same
+    find-or-create-by-email lookup Survey's own passwordless login already uses - so the resulting
+    plot is still owned by a real, identifiable account tied to who actually triggered this, not an
+    anonymous or shared owner."""
+    if principal.subject_type == "survey_user":
+        return int(principal.subject_id)
+    if principal.subject_type == "estate_account":
+        account = db.get(EstateAccount, int(principal.subject_id))
+        if account and account.email:
+            return find_or_create_survey_user(db, email=account.email, full_name=account.full_name)
+    raise HTTPException(403, "Starting Survey requires an authenticated Survey user")
+
+
 @router.post("/survey-requests/{request_id}/start")
 def start_survey_request(request_id:int,request:Request,db:Session=Depends(get_db)):
     row=db.get(EstateSurveyRequest,request_id)
     if not row: raise HTTPException(404,"Survey request not found")
     access=require_estate_access(db,request,row.organization_id,permission="survey.manage")
     if row.survey_working_plot_id: return _survey_payload(db,row)
-    if access.principal.subject_type != "survey_user":
-        raise HTTPException(403,"Starting Survey requires an authenticated Survey user")
+    survey_owner_user_id = _resolve_survey_owner_user_id(db, access.principal)
     eligibility = survey_eligibility(db, db.get(EstateAllocation, row.allocation_id) if row.allocation_id else None)
     if not eligibility["eligible"]: raise HTTPException(409, eligibility["reason"])
     transition(row,"in_progress")
     try:
-        result=materialize_estate_plot_for_survey(db,request=row,plot=db.get(EstatePlot,row.plot_id),survey_owner_user_id=int(access.principal.subject_id))
+        result=materialize_estate_plot_for_survey(db,request=row,plot=db.get(EstatePlot,row.plot_id),survey_owner_user_id=survey_owner_user_id)
         append_estate_audit_event(db,organization_id=row.organization_id,actor=access.principal,action="survey_request.started",entity_type="estate_survey_request",entity_id=row.id,after_data={"survey_plot_id":result.survey_plot_id}); db.commit()
     except Exception:
         db.rollback(); raise HTTPException(422,"Survey materialization failed")
