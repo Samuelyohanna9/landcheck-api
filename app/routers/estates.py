@@ -9,6 +9,7 @@ import os
 import math
 from datetime import datetime, timezone
 from decimal import Decimal
+from types import SimpleNamespace
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import Response
 from geoalchemy2.shape import from_shape, to_shape
@@ -45,6 +46,8 @@ from app.services.estates import estate_email
 from app.services.estates.layout_export import render_estate_layout_pdf
 from app.services.estates.report_export import render_estate_report_pdf
 from app.services.estates import commissions
+from app.db import SessionLocal
+from app.utils.hazard_jobs import get_hazard_job, insert_hazard_job, serialize_hazard_job, set_hazard_job_status
 
 
 router = APIRouter(prefix="/estates", tags=["estates"])
@@ -1336,36 +1339,82 @@ def assess_plot_hazards(plot_id: int, request: Request, db: Session = Depends(ge
     return {"plot_id": plot.id, "persisted": True, "assessments": [_hazard_row_payload(row) for row in rows], **results}
 
 
+def _run_estate_hazard_assessment_job(job_id: str) -> None:
+    """Background worker for the whole-layout "assess-all" button. Flood/erosion screening makes
+    slow external calls per plot (see the ASYNC JOBS note in hazards.py, which is why single-plot
+    screening already runs this way) - running that in a loop synchronously inside the HTTP
+    request, as this endpoint originally did, ties up one request thread and its DB connection for
+    the whole estate's runtime. Under concurrent use (or a client retrying a slow request) that was
+    enough to exhaust the connection pool for the entire API. Moving the loop into its own
+    short-lived daemon thread with its own session fixes that: the HTTP endpoint now only enqueues
+    the job and returns immediately."""
+    db = SessionLocal()
+    try:
+        job = get_hazard_job(db, job_id)
+        if not job:
+            return
+        payload = job.get("request_payload") or {}
+        if isinstance(payload, str):
+            payload = json.loads(payload)
+        estate_id = int(payload["estate_id"])
+        access_principal = SimpleNamespace(subject_type=payload.get("subject_type"), subject_id=payload.get("subject_id"))
+        access = SimpleNamespace(principal=access_principal)
+
+        set_hazard_job_status(db, job_id, status="running", stage="Starting analysis...", progress_pct=1, started=True)
+        estate = db.get(Estate, estate_id)
+        if not estate:
+            set_hazard_job_status(db, job_id, status="failed", stage="Failed", error_text="Estate not found", completed=True)
+            return
+        plots = db.query(EstatePlot).filter(EstatePlot.estate_id == estate_id, EstatePlot.geometry_status == "approved").all()
+        plots = [plot for plot in plots if plot.geometry]
+        if not plots:
+            set_hazard_job_status(db, job_id, status="failed", stage="Failed", error_text="This Estate has no approved plot geometry to screen yet", completed=True)
+            return
+
+        for index, plot in enumerate(plots):
+            set_hazard_job_status(db, job_id, status="running", stage=f"Screening plot {index + 1} of {len(plots)}...", progress_pct=int(5 + 90 * index / len(plots)))
+            results = _calculate_plot_hazards(plot.geometry, db)
+            _persist_hazard_results(db, estate=estate, plot_id=plot.id, results=results, access=access)
+            db.commit()
+
+        append_estate_audit_event(db, organization_id=estate.organization_id, actor=access.principal, action="hazard.estate_assessment_completed", entity_type="estate", entity_id=estate.id, after_data={"plots_screened": len(plots)})
+        db.commit()
+        result_payload = _estate_hazard_dashboard_payload(db, estate)
+        set_hazard_job_status(db, job_id, status="completed", stage="Complete", progress_pct=100, result_payload=result_payload, completed=True)
+    except Exception as exc:
+        db.rollback()
+        set_hazard_job_status(db, job_id, status="failed", stage="Failed", error_text=str(exc), completed=True)
+    finally:
+        db.close()
+
+
 @router.post("/{estate_id}/hazards/assess-all")
 def assess_estate_hazards(estate_id: int, request: Request, db: Session = Depends(get_db)):
-    """Runs flood + erosion screening for every approved plot in this Estate in one action - the
-    whole-layout equivalent of running it one plot at a time from each plot's drawer. Returns the
-    same aggregate shape as GET .../hazards so both this page and the Dashboard's Risk Overview
-    card (which reads that same endpoint) reflect the fresh run immediately."""
+    """Kicks off flood + erosion screening for every approved plot in this Estate as a background
+    job and returns immediately - the whole-layout equivalent of running it one plot at a time from
+    each plot's drawer, without blocking a request thread/DB connection for the whole estate's
+    runtime. Poll GET /hazards/jobs/{job_id} for progress; its result payload matches GET
+    .../hazards so the caller can apply it directly once complete."""
     estate = db.get(Estate, estate_id)
     if not estate:
         raise HTTPException(404, "Estate not found")
     access = require_estate_access(db, request, estate.organization_id, permission="plot.manage")
-    plots = db.query(EstatePlot).filter(EstatePlot.estate_id == estate_id, EstatePlot.geometry_status == "approved").all()
-    plots = [plot for plot in plots if plot.geometry]
-    if not plots:
+    has_screenable_plot = db.query(EstatePlot.id).filter(EstatePlot.estate_id == estate_id, EstatePlot.geometry_status == "approved").first()
+    if not has_screenable_plot:
         raise HTTPException(422, "This Estate has no approved plot geometry to screen yet")
-    for plot in plots:
-        results = _calculate_plot_hazards(plot.geometry, db)
-        _persist_hazard_results(db, estate=estate, plot_id=plot.id, results=results, access=access)
-    append_estate_audit_event(db, organization_id=estate.organization_id, actor=access.principal, action="hazard.estate_assessment_completed", entity_type="estate", entity_id=estate.id, after_data={"plots_screened": len(plots)})
-    db.commit()
-    return estate_hazard_dashboard(estate_id, request, db)
+    job = insert_hazard_job(
+        db,
+        hazard_type="estate_all",
+        output_type="preview",
+        request_payload={"estate_id": estate_id, "subject_type": access.principal.subject_type, "subject_id": access.principal.subject_id},
+        worker=_run_estate_hazard_assessment_job,
+    )
+    return serialize_hazard_job(job)
 
 
-@router.get("/{estate_id}/hazards")
-def estate_hazard_dashboard(estate_id: int, request: Request, db: Session = Depends(get_db)):
-    estate = db.get(Estate, estate_id)
-    if not estate:
-        raise HTTPException(404, "Estate not found")
-    require_estate_access(db, request, estate.organization_id, permission="plot.read")
+def _estate_hazard_dashboard_payload(db: Session, estate: Estate) -> dict:
     latest = {}
-    rows = db.query(EstateHazardAssessment).filter(EstateHazardAssessment.estate_id == estate_id).order_by(EstateHazardAssessment.assessed_at.desc()).all()
+    rows = db.query(EstateHazardAssessment).filter(EstateHazardAssessment.estate_id == estate.id).order_by(EstateHazardAssessment.assessed_at.desc()).all()
     for row in rows:
         latest.setdefault((row.plot_id, row.hazard_type), row)
     plot_results = {}
@@ -1378,6 +1427,15 @@ def estate_hazard_dashboard(estate_id: int, request: Request, db: Session = Depe
         if row.risk_class:
             bucket["classes"][row.risk_class] = bucket["classes"].get(row.risk_class, 0) + 1
     return {"estate": {"id": estate.id, "name": estate.name}, "assessments": list(plot_results.values()), "summary": summaries, "assessment_count": len(rows)}
+
+
+@router.get("/{estate_id}/hazards")
+def estate_hazard_dashboard(estate_id: int, request: Request, db: Session = Depends(get_db)):
+    estate = db.get(Estate, estate_id)
+    if not estate:
+        raise HTTPException(404, "Estate not found")
+    require_estate_access(db, request, estate.organization_id, permission="plot.read")
+    return _estate_hazard_dashboard_payload(db, estate)
 
 @router.get("/{estate_id}/activity")
 def estate_activity(estate_id:int, request:Request, limit:int=100, db:Session=Depends(get_db)):
