@@ -14,7 +14,7 @@ from geoalchemy2.shape import from_shape, to_shape
 from pyproj import Transformer
 import ezdxf
 from shapely.geometry import mapping, shape
-from shapely.ops import transform as shapely_transform
+from shapely.ops import transform as shapely_transform, unary_union
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
@@ -22,7 +22,7 @@ from app.routers.plots import _metric_epsg_for_wgs84_polygon, _subdivide_polygon
 from app.services.estates.authorization import list_estate_access, resolve_estate_principal
 from app.services.estates.entitlements import ESTATE_FEATURES, get_estate_entitlement
 from app.models.estate_foundation import Estate, EstateAllocation, EstateAuditEvent, EstateBlock, EstateCustomer, EstateDocument, EstateDocumentLink, EstateFieldInspection, EstateHazardAssessment, EstateImportReview, EstateLayoutProposal, EstateOrganization, EstateOrganizationMember, EstatePayment, EstatePaymentRule, EstatePlot, EstateSpatialFeature, EstateSurveyRequest, EstateStakingTask
-from app.schemas.estates import AllocationAction, BlockCreate, BlockUpdate, CustomerCreate, DevelopmentStatusUpdate, EstateCreate, EstateLayoutCriteria, EstateLayoutDecision, EstateLayoutFeatureAdd, EstateLayoutProposalEdit, EstateSubdivisionCreate, EstateUpdate, FieldInspectionCreate, GeoreferenceSessionLink, ImportFromGeoreference, ImportReviewCreate, ImportReviewDecision, ImportReviewFromGeoreferenceSession, MemberCreate, MemberUpdate, PlotCreate, PlotGeometryUpdate, PaymentCreate, SpatialFeatureCreate, SpatialFeatureUpdate, SurveyEligibilityUpdate, VoidAction
+from app.schemas.estates import AllocationAction, BlockCreate, BlockUpdate, CustomerCreate, DevelopmentStatusUpdate, EstateCreate, EstateLayoutCriteria, EstateLayoutDecision, EstateLayoutFeatureAdd, EstateLayoutFeatureRemove, EstateLayoutProposalEdit, EstateSubdivisionCreate, EstateUpdate, FieldInspectionCreate, GeoreferenceSessionLink, ImportFromGeoreference, ImportReviewCreate, ImportReviewDecision, ImportReviewFromGeoreferenceSession, MemberCreate, MemberUpdate, PlotCreate, PlotGeometryUpdate, PaymentCreate, SpatialFeatureCreate, SpatialFeatureUpdate, SurveyEligibilityUpdate, VoidAction
 from app.services.estates.payments import confirm_payment, financial_summary, record_payment, void_payment
 from app.services.estates.documents import read_private_estate_file, store_private_estate_file
 from app.services.estates.permissions import has_permission
@@ -946,6 +946,78 @@ def add_layout_proposal_feature(proposal_id: int, payload: EstateLayoutFeatureAd
     row.diagnostics = diagnostics
 
     append_estate_audit_event(db, organization_id=row.organization_id, actor=access.principal, action="layout_proposal.feature_added", entity_type="estate_layout_proposal", entity_id=row.id, after_data={"feature_type": payload.feature_type, "name": new_feature["name"], "plots_removed": removed, "plots_remaining": len(updated_candidates)})
+    db.commit()
+    return _layout_proposal_payload(row)
+
+
+@router.post("/layout-proposals/{proposal_id}/remove-feature")
+def remove_layout_proposal_feature(proposal_id: int, payload: EstateLayoutFeatureRemove, request: Request, db: Session = Depends(get_db)):
+    """Removes a road or open-space shape and gives the vacated space back to the plots that
+    fronted it - see EstateLayoutFeatureRemove for the two ways that happens."""
+    row = db.get(EstateLayoutProposal, proposal_id)
+    if not row:
+        raise HTTPException(404, "Layout proposal not found")
+    access = _require_layout_approval_access(db, request, row.organization_id)
+    if row.status != "review_required":
+        raise HTTPException(409, "This layout has already been decided and can no longer be edited")
+
+    features = payload.feature_candidates if payload.feature_candidates is not None else (row.feature_candidates or [])
+    if payload.feature_index >= len(features):
+        raise HTTPException(404, "Feature not found on this layout")
+    feature = features[payload.feature_index]
+
+    source_candidates = payload.plot_candidates if payload.plot_candidates is not None else (row.plot_candidates or [])
+    candidates_by_number = {str(candidate.get("plot_number")): dict(candidate) for candidate in source_candidates}
+
+    carved_plots = feature.get("carved_plots") or []
+    if carved_plots:
+        # This feature carved these plots when it was added - hand each one back exactly as it
+        # was, regardless of what shape it holds right now.
+        for entry in carved_plots:
+            candidates_by_number[str(entry.get("plot_number"))] = dict(entry)
+    elif feature.get("feature_type") == "road":
+        try:
+            road_shape = shape(feature.get("geometry") or {})
+        except Exception:
+            road_shape = None
+        if road_shape is not None and not road_shape.is_empty and road_shape.geom_type in {"LineString", "MultiLineString"}:
+            metric_epsg = _metric_epsg_for_wgs84_polygon(road_shape)
+            forward = Transformer.from_crs("EPSG:4326", f"EPSG:{metric_epsg}", always_xy=True).transform
+            backward = Transformer.from_crs(f"EPSG:{metric_epsg}", "EPSG:4326", always_xy=True).transform
+            road_metric = shapely_transform(forward, road_shape)
+            width_m = float(feature.get("width_m") or (row.criteria or {}).get("road_width_m") or 9.0)
+            # A plain generated road has no "before" shape to restore to - it was part of the grid
+            # from the start. Instead, split the vacated corridor along its centreline (Shapely's
+            # single_sided buffer gives exactly one side at a time) and merge each half into
+            # whichever plots actually front it, so the road's old footprint doesn't become
+            # nobody's land.
+            for half in (road_metric.buffer(width_m / 2, single_sided=True), road_metric.buffer(-(width_m / 2), single_sided=True)):
+                if half.is_empty:
+                    continue
+                margin = width_m / 2 + 0.05
+                for plot_number, candidate in list(candidates_by_number.items()):
+                    try:
+                        plot_metric = shapely_transform(forward, shape(candidate.get("geometry") or {}))
+                    except Exception:
+                        continue
+                    shadow = half.intersection(plot_metric.buffer(margin))
+                    if shadow.is_empty:
+                        continue
+                    grown = _largest_polygon_piece(unary_union([plot_metric, shadow])) or plot_metric
+                    grown_wgs84 = shapely_transform(backward, grown)
+                    area_sqm, issues = validate_polygon(mapping(grown_wgs84))
+                    if any(issue.severity == "error" for issue in issues):
+                        continue
+                    candidates_by_number[plot_number] = {**candidate, "geometry": mapping(grown_wgs84), "area_sqm": round(float(area_sqm), 2), "valid": True, "issues": []}
+
+    row.plot_candidates = list(candidates_by_number.values())
+    row.feature_candidates = [item for index, item in enumerate(features) if index != payload.feature_index]
+    diagnostics = dict(row.diagnostics or {})
+    diagnostics["estimated_plot_count"] = len(row.plot_candidates)
+    diagnostics["total_plot_area_sqm"] = round(sum(float(candidate.get("area_sqm") or 0) for candidate in row.plot_candidates), 2)
+    row.diagnostics = diagnostics
+
+    append_estate_audit_event(db, organization_id=row.organization_id, actor=access.principal, action="layout_proposal.feature_removed", entity_type="estate_layout_proposal", entity_id=row.id, after_data={"feature_type": feature.get("feature_type"), "name": feature.get("name"), "plots_remaining": len(row.plot_candidates)})
     db.commit()
     return _layout_proposal_payload(row)
 
