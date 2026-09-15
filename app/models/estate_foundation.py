@@ -212,6 +212,29 @@ class EstateCommissionTier(Base):
     updated_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
 
 
+class EstateCommissionPayout(Base):
+    """A record of the org actually paying out (some or all of) a locked-in commission to the
+    agent who earned it - separate from EstateAllocation.commission_amount, which is only ever
+    what was *earned*. Modeled on EstatePayment (customer -> org) but in the other direction (org
+    -> agent); a receipt/proof of payment attaches the same way, via EstateDocument + a
+    entity_type="commission_payout" EstateDocumentLink, reusing the existing generic upload."""
+
+    __tablename__ = "estate_commission_payouts"
+    id = Column(Integer, primary_key=True)
+    organization_id = Column(Integer, ForeignKey("estate_organizations.id", ondelete="CASCADE"), nullable=False)
+    allocation_id = Column(Integer, ForeignKey("estate_allocations.id", ondelete="CASCADE"), nullable=False)
+    sales_agent_subject_type = Column(String(64), nullable=False)
+    sales_agent_subject_id = Column(String(128), nullable=False)
+    amount = Column(Numeric(16, 2), nullable=False)
+    payment_date = Column(DateTime(timezone=True), nullable=False)
+    payment_method = Column(String(80), nullable=False)
+    reference_no = Column(String(160), nullable=True)
+    notes = Column(Text, nullable=True)
+    paid_by_subject_type = Column(String(64), nullable=False)
+    paid_by_subject_id = Column(String(128), nullable=False)
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+
 class EstatePayment(Base):
     __tablename__ = "estate_payments"
     id = Column(Integer, primary_key=True)

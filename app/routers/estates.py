@@ -23,8 +23,8 @@ from sqlalchemy.orm import Session
 from app.routers.plots import _metric_epsg_for_wgs84_polygon, _subdivide_polygon_equal_count, get_db
 from app.services.estates.authorization import list_estate_access, resolve_estate_principal
 from app.services.estates.entitlements import ESTATE_FEATURES, get_estate_entitlement
-from app.models.estate_foundation import Estate, EstateAllocation, EstateAuditEvent, EstateBlock, EstateCommissionTier, EstateCustomer, EstateDocument, EstateDocumentLink, EstateFieldInspection, EstateHazardAssessment, EstateImportReview, EstateLayoutProposal, EstateOrganization, EstateOrganizationMember, EstatePayment, EstatePaymentRule, EstatePlot, EstateSpatialFeature, EstateSurveyRequest, EstateStakingTask
-from app.schemas.estates import AllocationAction, BlockCreate, BlockUpdate, CommissionTiersUpdate, CustomerCreate, DevelopmentStatusUpdate, EstateCreate, EstateLayoutCriteria, EstateLayoutDecision, EstateLayoutFeatureAdd, EstateLayoutFeatureRemove, EstateLayoutProposalEdit, EstateSubdivisionCreate, EstateUpdate, FieldInspectionCreate, GeoreferenceSessionLink, ImportFromGeoreference, ImportReviewCreate, ImportReviewDecision, ImportReviewFromGeoreferenceSession, MemberCreate, MemberUpdate, PlotCreate, PlotGeometryUpdate, PaymentCreate, SpatialFeatureCreate, SpatialFeatureUpdate, SurveyEligibilityUpdate, VoidAction
+from app.models.estate_foundation import Estate, EstateAllocation, EstateAuditEvent, EstateBlock, EstateCommissionPayout, EstateCommissionTier, EstateCustomer, EstateDocument, EstateDocumentLink, EstateFieldInspection, EstateHazardAssessment, EstateImportReview, EstateLayoutProposal, EstateOrganization, EstateOrganizationMember, EstatePayment, EstatePaymentRule, EstatePlot, EstateSpatialFeature, EstateSurveyRequest, EstateStakingTask
+from app.schemas.estates import AllocationAction, BlockCreate, BlockUpdate, CommissionPayoutCreate, CommissionTiersUpdate, CustomerCreate, DevelopmentStatusUpdate, EstateCreate, EstateLayoutCriteria, EstateLayoutDecision, EstateLayoutFeatureAdd, EstateLayoutFeatureRemove, EstateLayoutProposalEdit, EstateSubdivisionCreate, EstateUpdate, FieldInspectionCreate, GeoreferenceSessionLink, ImportFromGeoreference, ImportReviewCreate, ImportReviewDecision, ImportReviewFromGeoreferenceSession, MemberCreate, MemberUpdate, PlotCreate, PlotGeometryUpdate, PaymentCreate, SpatialFeatureCreate, SpatialFeatureUpdate, SurveyEligibilityUpdate, VoidAction
 from app.services.estates.payments import confirm_payment, financial_summary, record_payment, void_payment
 from app.services.estates.documents import read_private_estate_file, store_private_estate_file
 from app.services.estates.permissions import has_permission
@@ -2063,6 +2063,7 @@ def list_sales_agents(organization_id: int, request: Request, db: Session = Depe
     creditable too."""
     require_estate_access(db, request, organization_id, permission="allocation.manage")
     rows = db.query(EstateOrganizationMember).filter(EstateOrganizationMember.organization_id == organization_id, EstateOrganizationMember.is_active.is_(True)).all()
+    tiers = commissions._tier_dicts(commissions.get_commission_tiers(db, organization_id))
     results = []
     for row in rows:
         display_name = row.subject_id
@@ -2070,7 +2071,16 @@ def list_sales_agents(organization_id: int, request: Request, db: Session = Depe
             account = db.get(EstateAccount, int(row.subject_id)) if row.subject_id.isdigit() else None
             if account:
                 display_name = account.full_name
-        results.append({"subject_type": row.subject_type, "subject_id": row.subject_id, "role": row.role_key, "display_name": display_name})
+        # The tier that would apply to this agent's NEXT sale, given what they've already closed -
+        # shown up front so it's never a surprise what rate a deal will earn them.
+        cumulative_volume = commissions.cumulative_sales_before(db, organization_id=organization_id, subject_type=row.subject_type, subject_id=row.subject_id)
+        current_tier = commissions.resolve_tier(tiers, cumulative_volume)
+        results.append({
+            "subject_type": row.subject_type, "subject_id": row.subject_id, "role": row.role_key, "display_name": display_name,
+            "cumulative_volume": str(cumulative_volume),
+            "current_tier_label": current_tier["label"],
+            "current_tier_rate_percent": str(current_tier["rate_percent"]),
+        })
     return results
 
 
@@ -2114,6 +2124,11 @@ def commission_report(organization_id: int, request: Request, db: Session = Depe
         bucket["total_volume"] += Decimal(row.agreed_price or 0)
         bucket["total_commission"] += Decimal(row.commission_amount or 0)
         bucket["current_tier"] = row.commission_tier_label
+    allocation_ids = [row.id for row in rows]
+    paid_out_by_agent: dict[tuple, Decimal] = {}
+    if allocation_ids:
+        for subject_type, subject_id, total in db.query(EstateCommissionPayout.sales_agent_subject_type, EstateCommissionPayout.sales_agent_subject_id, func.sum(EstateCommissionPayout.amount)).filter(EstateCommissionPayout.allocation_id.in_(allocation_ids)).group_by(EstateCommissionPayout.sales_agent_subject_type, EstateCommissionPayout.sales_agent_subject_id).all():
+            paid_out_by_agent[(subject_type, subject_id)] = Decimal(total or 0)
     results = []
     for (subject_type, subject_id), bucket in by_agent.items():
         display_name = subject_id
@@ -2121,6 +2136,7 @@ def commission_report(organization_id: int, request: Request, db: Session = Depe
             account = db.get(EstateAccount, int(subject_id)) if subject_id.isdigit() else None
             if account:
                 display_name = account.full_name
+        paid_out = paid_out_by_agent.get((subject_type, subject_id), Decimal("0"))
         results.append({
             "subject_type": subject_type,
             "subject_id": subject_id,
@@ -2128,9 +2144,11 @@ def commission_report(organization_id: int, request: Request, db: Session = Depe
             "sale_count": bucket["sale_count"],
             "total_volume": str(bucket["total_volume"]),
             "total_commission": str(bucket["total_commission"]),
+            "total_paid_out": str(paid_out),
+            "total_outstanding": str(max(Decimal("0"), bucket["total_commission"] - paid_out)),
             "current_tier": bucket["current_tier"],
         })
-    results.sort(key=lambda item: float(item["total_commission"]), reverse=True)
+    results.sort(key=lambda item: float(item["total_outstanding"]), reverse=True)
     return {"organization_id": organization_id, "agents": results}
 
 
@@ -2157,22 +2175,36 @@ def sales_agent_detail(organization_id: int, subject_type: str, subject_id: str,
         EstateAllocation.status.in_(("reserved", "allocated")),
     ).order_by(EstateAllocation.allocation_date.desc()).all()
 
+    tiers = commissions._tier_dicts(commissions.get_commission_tiers(db, organization_id))
+    next_tier = commissions.resolve_tier(tiers, commissions.cumulative_sales_before(db, organization_id=organization_id, subject_type=subject_type, subject_id=subject_id))
+
     plots = []
     total_volume = Decimal("0")
-    total_commission_paid = Decimal("0")
+    total_commission_earned = Decimal("0")
+    total_commission_paid_out = Decimal("0")
     pending_commission_count = 0
-    current_tier = None
     for row in rows:
         plot = db.get(EstatePlot, row.plot_id)
         estate = db.get(Estate, row.estate_id)
         customer = db.get(EstateCustomer, row.customer_id)
         summary = financial_summary(db, row)
         total_volume += summary.agreed_price
+        payout_rows = db.query(EstateCommissionPayout).filter(EstateCommissionPayout.allocation_id == row.id).order_by(EstateCommissionPayout.payment_date.desc()).all()
+        paid_out = sum((Decimal(p.amount) for p in payout_rows), Decimal("0"))
+        earned = Decimal(row.commission_amount or 0) if row.status == "allocated" else Decimal("0")
         if row.status == "allocated":
-            total_commission_paid += Decimal(row.commission_amount or 0)
-            current_tier = row.commission_tier_label or current_tier
+            total_commission_earned += earned
+            total_commission_paid_out += paid_out
         else:
             pending_commission_count += 1
+        payouts_payload = []
+        for payout in payout_rows:
+            receipt = db.query(EstateDocument).join(EstateDocumentLink, EstateDocumentLink.document_id == EstateDocument.id).filter(EstateDocumentLink.entity_type == "commission_payout", EstateDocumentLink.entity_id == str(payout.id)).first()
+            payouts_payload.append({
+                "id": payout.id, "amount": str(payout.amount), "payment_date": payout.payment_date,
+                "payment_method": payout.payment_method, "reference_no": payout.reference_no, "notes": payout.notes,
+                "receipt_document_id": receipt.id if receipt else None, "receipt_filename": receipt.original_filename if receipt else None,
+            })
         plots.append({
             "allocation_id": row.id,
             "plot_id": row.plot_id,
@@ -2187,7 +2219,10 @@ def sales_agent_detail(organization_id: int, subject_type: str, subject_id: str,
             "allocation_date": row.allocation_date,
             "commission_tier_label": row.commission_tier_label,
             "commission_rate_percent": str(row.commission_rate_percent) if row.commission_rate_percent is not None else None,
-            "commission_amount": str(row.commission_amount) if row.status == "allocated" else None,
+            "commission_amount": str(earned) if row.status == "allocated" else None,
+            "commission_paid_out": str(paid_out),
+            "commission_outstanding": str(max(Decimal("0"), earned - paid_out)) if row.status == "allocated" else None,
+            "payouts": payouts_payload,
         })
 
     return {
@@ -2199,12 +2234,50 @@ def sales_agent_detail(organization_id: int, subject_type: str, subject_id: str,
         "summary": {
             "plot_count": len(plots),
             "total_volume": str(total_volume),
-            "total_commission_paid": str(total_commission_paid),
+            "total_commission_earned": str(total_commission_earned),
+            "total_commission_paid_out": str(total_commission_paid_out),
+            "total_commission_outstanding": str(max(Decimal("0"), total_commission_earned - total_commission_paid_out)),
             "pending_commission_count": pending_commission_count,
-            "current_tier": current_tier,
+            "current_tier": next_tier["label"],
+            "current_tier_rate_percent": str(next_tier["rate_percent"]),
         },
         "plots": plots,
     }
+
+
+@router.post("/allocations/{allocation_id}/commission-payout")
+def pay_commission(allocation_id: int, payload: CommissionPayoutCreate, request: Request, db: Session = Depends(get_db)):
+    """Records the org actually paying an agent the commission they earned on this sale - separate
+    from the commission being *earned* (which happens automatically once the sale is Allocated).
+    Defaults to paying the full remaining balance when no amount is given; over-payment beyond
+    what's still owed is rejected the same way an over-payment on a customer payment would be."""
+    allocation = db.get(EstateAllocation, allocation_id)
+    if not allocation:
+        raise HTTPException(404, "Allocation not found")
+    access = require_estate_access(db, request, allocation.organization_id, permission="payment.manage")
+    if allocation.status != "allocated" or not allocation.commission_amount:
+        raise HTTPException(409, "This sale has no earned commission to pay out yet - it becomes payable once the plot is fully Allocated.")
+    if not allocation.sales_agent_subject_type or not allocation.sales_agent_subject_id:
+        raise HTTPException(409, "This sale has no sales agent tagged.")
+    already_paid = Decimal(db.query(func.coalesce(func.sum(EstateCommissionPayout.amount), 0)).filter(EstateCommissionPayout.allocation_id == allocation_id).scalar() or 0)
+    outstanding = Decimal(allocation.commission_amount) - already_paid
+    amount = payload.amount if payload.amount is not None else outstanding
+    if amount <= 0:
+        raise HTTPException(409, "This agent's commission on this sale has already been paid in full.")
+    if amount > outstanding:
+        raise HTTPException(409, f"Amount exceeds the outstanding commission balance of {outstanding}.")
+    payout = EstateCommissionPayout(
+        organization_id=allocation.organization_id, allocation_id=allocation.id,
+        sales_agent_subject_type=allocation.sales_agent_subject_type, sales_agent_subject_id=allocation.sales_agent_subject_id,
+        amount=amount, payment_date=payload.payment_date, payment_method=payload.payment_method,
+        reference_no=payload.reference_no, notes=payload.notes,
+        paid_by_subject_type=access.principal.subject_type, paid_by_subject_id=access.principal.subject_id,
+    )
+    db.add(payout)
+    db.flush()
+    append_estate_audit_event(db, organization_id=allocation.organization_id, actor=access.principal, action="commission.paid", entity_type="estate_commission_payout", entity_id=payout.id, after_data={"allocation_id": allocation.id, "amount": str(amount), "sales_agent_subject_id": allocation.sales_agent_subject_id})
+    db.commit()
+    return {"id": payout.id, "allocation_id": allocation.id, "amount": str(amount), "payment_date": payout.payment_date, "payment_method": payout.payment_method}
 
 
 def _apply_initial_payment(db: Session, *, record: EstateAllocation, payload: AllocationAction, actor) -> EstatePayment | None:
@@ -2378,7 +2451,7 @@ def download_payment_evidence(payment_id:int,document_id:int,request:Request,db:
     return Response(data,media_type=mime,headers={"Content-Disposition":f'inline; filename="{document.original_filename}"'})
 
 def _linked_entity_organization(db: Session, entity_type: str, entity_id: int) -> int | None:
-    model = {"estate": Estate, "plot": EstatePlot, "customer": EstateCustomer, "allocation": EstateAllocation, "payment": EstatePayment, "staking_task": EstateStakingTask, "field_inspection": EstateFieldInspection, "import_review": EstateImportReview}.get(entity_type)
+    model = {"estate": Estate, "plot": EstatePlot, "customer": EstateCustomer, "allocation": EstateAllocation, "payment": EstatePayment, "staking_task": EstateStakingTask, "field_inspection": EstateFieldInspection, "import_review": EstateImportReview, "commission_payout": EstateCommissionPayout}.get(entity_type)
     row = db.get(model, entity_id) if model else None
     return getattr(row, "organization_id", None)
 

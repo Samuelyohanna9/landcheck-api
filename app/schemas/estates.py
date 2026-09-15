@@ -213,6 +213,13 @@ class CommissionTierItem(BaseModel):
 class CommissionTiersUpdate(BaseModel):
     tiers: list[CommissionTierItem] = Field(min_length=1, max_length=20)
 
+class CommissionPayoutCreate(BaseModel):
+    amount: Decimal | None = Field(default=None, gt=0)  # defaults to the full outstanding balance when omitted
+    payment_date: datetime
+    payment_method: str
+    reference_no: str | None = None
+    notes: str | None = None
+
 class PaymentCreate(BaseModel):
     amount: Decimal = Field(gt=0)
     payment_date: datetime
