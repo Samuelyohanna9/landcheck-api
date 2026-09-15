@@ -1352,8 +1352,12 @@ def delete_estate_plot(estate_id: int, plot_id: int, request: Request, db: Sessi
 
 @router.delete("/{estate_id}/layout")
 def reset_estate_layout(estate_id: int, request: Request, db: Session = Depends(get_db)):
-    """Deletes every plot in this Estate and clears its boundary so the layout workflow can start
-    over from scratch. Blocked if any plot already carries a customer reservation or allocation."""
+    """Deletes every plot AND every road/open-space/drainage layer in this Estate, clears its
+    boundary, and discards any layout draft still awaiting review - a full "start the layout over
+    from scratch". Blocked if any plot already carries a customer reservation or allocation.
+    Blocks (labels like "Block A") are left alone since they're a reusable naming convention, not
+    part of the generated geometry, and a pending draft is marked rejected rather than hard-deleted
+    so it still shows up in its own history."""
     estate = db.get(Estate, estate_id)
     if not estate: raise HTTPException(404, "Estate not found")
     access = require_estate_access(db, request, estate.organization_id, permission="estate.manage")
@@ -1364,10 +1368,20 @@ def reset_estate_layout(estate_id: int, request: Request, db: Session = Depends(
     plot_count = len(plots)
     for plot in plots:
         db.delete(plot)
+    features = db.query(EstateSpatialFeature).filter(EstateSpatialFeature.estate_id == estate_id).all()
+    feature_count = len(features)
+    for feature in features:
+        db.delete(feature)
+    pending_proposals = db.query(EstateLayoutProposal).filter(EstateLayoutProposal.estate_id == estate_id, EstateLayoutProposal.status == "review_required").all()
+    for proposal in pending_proposals:
+        proposal.status = "rejected"
+        proposal.reviewed_by_subject_type = access.principal.subject_type
+        proposal.reviewed_by_subject_id = access.principal.subject_id
+        proposal.reviewed_at = datetime.now(timezone.utc)
     estate.boundary = None
-    append_estate_audit_event(db, organization_id=estate.organization_id, actor=access.principal, action="layout.reset", entity_type="estate", entity_id=estate.id, after_data={"plots_deleted": plot_count})
+    append_estate_audit_event(db, organization_id=estate.organization_id, actor=access.principal, action="layout.reset", entity_type="estate", entity_id=estate.id, after_data={"plots_deleted": plot_count, "features_deleted": feature_count, "proposals_discarded": len(pending_proposals)})
     db.commit()
-    return {"deleted_plots": plot_count}
+    return {"deleted_plots": plot_count, "deleted_features": feature_count}
 
 
 @router.post("/{estate_id}/plots/{plot_id}/subdivide")
