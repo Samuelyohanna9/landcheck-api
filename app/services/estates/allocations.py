@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import uuid
 from datetime import datetime, timezone
 
 from fastapi import HTTPException
@@ -30,7 +31,7 @@ def reserve_or_allocate(db: Session, *, plot: EstatePlot, customer: EstateCustom
         plot.commercial_status = "allocated"
         append_estate_audit_event(db, organization_id=active.organization_id, actor=actor, action="allocation.allocated", entity_type="estate_allocation", entity_id=active.id, before_data={"status": "reserved"}, after_data={"status": "allocated"})
         return active
-    allocation = EstateAllocation(organization_id=customer.organization_id, estate_id=plot.estate_id, plot_id=plot.id, customer_id=customer.id, status="allocated" if allocate else "reserved", reservation_date=None if allocate else now, reservation_expires_at=None if allocate else expires_at, allocation_date=now if allocate else None, agreed_price=agreed_price, payment_plan=payment_plan, notes=notes, created_by_subject_type=actor.subject_type, created_by_subject_id=actor.subject_id)
+    allocation = EstateAllocation(organization_id=customer.organization_id, estate_id=plot.estate_id, plot_id=plot.id, customer_id=customer.id, status="allocated" if allocate else "reserved", reservation_date=None if allocate else now, reservation_expires_at=None if allocate else expires_at, allocation_date=now if allocate else None, agreed_price=agreed_price, payment_plan=payment_plan, notes=notes, created_by_subject_type=actor.subject_type, created_by_subject_id=actor.subject_id, share_token=uuid.uuid4().hex)
     plot.commercial_status = allocation.status
     db.add(allocation)
     db.flush()

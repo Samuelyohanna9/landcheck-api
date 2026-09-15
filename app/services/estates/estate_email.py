@@ -74,7 +74,17 @@ def _send_email(*, to_email: str, from_display_name: str, subject: str, body_tex
         server.send_message(msg)
 
 
-def _wrap_html(*, org_name: str, heading: str, message_html: str, financial_html: str) -> str:
+def _plot_link_html(plot_link: str | None) -> str:
+    if not plot_link:
+        return ""
+    return f"""
+    <div style="margin:22px 0 0;text-align:center;">
+      <a href="{html.escape(plot_link)}" style="display:inline-block;padding:13px 26px;background:#1d8a49;color:#ffffff;font-size:14px;font-weight:700;text-decoration:none;border-radius:10px;">View your plot on satellite map</a>
+    </div>
+    """
+
+
+def _wrap_html(*, org_name: str, heading: str, message_html: str, financial_html: str, plot_link_html: str = "") -> str:
     return f"""
     <html>
       <body style="margin:0;padding:0;background:#eef4f0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;color:#173624;">
@@ -83,6 +93,7 @@ def _wrap_html(*, org_name: str, heading: str, message_html: str, financial_html
             <div style="font-size:12.5px;font-weight:800;letter-spacing:0.06em;text-transform:uppercase;color:#5c7a68;margin:0 0 10px;">{html.escape(org_name)}</div>
             <h1 style="margin:0 0 16px;font-size:21px;color:#173624;">{html.escape(heading)}</h1>
             <div style="font-size:14.5px;line-height:1.75;color:#345542;">{message_html}</div>
+            {plot_link_html}
             {financial_html}
             <p style="margin:26px 0 0;font-size:12px;line-height:1.6;color:#8199a5;">This is an automated update from {html.escape(org_name)} about your property. If anything here looks wrong, please contact {html.escape(org_name)} directly.</p>
           </div>
@@ -169,16 +180,25 @@ def _event_copy(event: str, *, org_name: str, estate_name: str, plot_number: str
     return (f"Update on Plot {plot_number}", "An update on your plot", "<p>There is an update on your plot.</p>")
 
 
-def _plain_text(heading: str, message_html_stripped: str, financial: tuple[Decimal, Decimal, Decimal] | None) -> str:
+def _plain_text(heading: str, message_html_stripped: str, financial: tuple[Decimal, Decimal, Decimal] | None, plot_link: str | None = None) -> str:
     import re
 
     text = re.sub(r"<[^>]+>", " ", message_html_stripped)
     text = re.sub(r"\s+", " ", text).strip()
     lines = [heading, "", text]
+    if plot_link:
+        lines += ["", f"View your plot on satellite map: {plot_link}"]
     if financial:
         agreed, confirmed, outstanding = financial
         lines += ["", f"Agreed price: {format_naira(agreed)}", f"Total paid so far: {format_naira(confirmed)}", f"Outstanding balance: {format_naira(outstanding)}"]
     return "\n".join(lines)
+
+
+def public_plot_url(share_token: str | None) -> str | None:
+    if not share_token:
+        return None
+    base = str(os.getenv("LANDCHECK_WEB_URL") or "").strip() or "https://landcheck.online"
+    return f"{base.rstrip('/')}/estates/plot/{share_token}"
 
 
 def notify_customer(
@@ -193,18 +213,23 @@ def notify_customer(
     confirmed_paid: Decimal | None = None,
     outstanding: Decimal | None = None,
     amount_just_paid: Decimal | None = None,
-) -> None:
+    share_token: str | None = None,
+) -> bool:
+    """Returns True once the email has actually been sent (not merely queued/attempted) - False if
+    there was no address to send to, or delivery failed. Callers use this to tell the person acting
+    in the dashboard whether a customer really was notified, rather than assuming it silently."""
     to_email = str(to_email or "").strip()
     if not to_email:
-        return
+        return False
     try:
         subject, heading, message_html = _event_copy(
             event, org_name=org_name, estate_name=estate_name, plot_number=plot_number, customer_name=customer_name, amount_just_paid=amount_just_paid
         )
         has_financials = agreed_price is not None and confirmed_paid is not None and outstanding is not None
         financial_html = _financial_block_html(agreed_price, confirmed_paid, outstanding) if has_financials else ""
-        body_html = _wrap_html(org_name=org_name, heading=heading, message_html=message_html, financial_html=financial_html)
-        body_text = _plain_text(heading, message_html, (agreed_price, confirmed_paid, outstanding) if has_financials else None)
+        plot_link = public_plot_url(share_token)
+        body_html = _wrap_html(org_name=org_name, heading=heading, message_html=message_html, financial_html=financial_html, plot_link_html=_plot_link_html(plot_link))
+        body_text = _plain_text(heading, message_html, (agreed_price, confirmed_paid, outstanding) if has_financials else None, plot_link)
         _send_email(
             to_email=to_email,
             from_display_name=f"{org_name} (via LandCheck Estates)",
@@ -212,5 +237,7 @@ def notify_customer(
             body_text=body_text,
             body_html=body_html,
         )
+        return True
     except Exception:
         logger.exception("Estate customer notification email failed (event=%s, to=%s)", event, to_email)
+        return False

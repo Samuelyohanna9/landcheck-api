@@ -7,6 +7,7 @@ import re
 import tempfile
 import os
 import math
+import uuid
 from datetime import datetime, timezone
 from decimal import Decimal
 from types import SimpleNamespace
@@ -1658,11 +1659,12 @@ def update_development_status(plot_id:int, payload:DevelopmentStatusUpdate, requ
     previous=plot.development_status; plot.development_status=payload.status
     append_estate_audit_event(db,organization_id=estate.organization_id,actor=access.principal,action="plot.development_status_changed",entity_type="estate_plot",entity_id=plot.id,before_data={"development_status":previous},after_data={"development_status":plot.development_status})
     db.commit()
+    customer_notified = False
     if plot.development_status == "developed" and previous != "developed":
         active_allocation = db.query(EstateAllocation).filter(EstateAllocation.plot_id == plot.id, EstateAllocation.status.in_(("reserved", "allocated"))).one_or_none()
         if active_allocation:
-            _notify_allocation_customer(db, allocation=active_allocation, org_name=access.organization_name, event="land_developed")
-    return {"id":plot.id,"development_status":plot.development_status}
+            customer_notified = _notify_allocation_customer(db, allocation=active_allocation, org_name=access.organization_name, event="land_developed")
+    return {"id":plot.id,"development_status":plot.development_status,"customer_notified":customer_notified}
 
 @router.post("/plots/{plot_id}/inspections")
 def create_field_inspection(plot_id:int, payload:FieldInspectionCreate, request:Request, db:Session=Depends(get_db)):
@@ -1774,11 +1776,12 @@ def complete_survey_request(request_id: int, request: Request, db: Session = Dep
     transition(row, "completed")
     append_estate_audit_event(db, organization_id=row.organization_id, actor=access.principal, action="survey_request.completed", entity_type="estate_survey_request", entity_id=row.id)
     db.commit()
+    customer_notified = False
     if row.allocation_id:
         allocation = db.get(EstateAllocation, row.allocation_id)
         if allocation:
-            _notify_allocation_customer(db, allocation=allocation, org_name=access.organization_name, event="survey_ready")
-    return _survey_payload(db, row)
+            customer_notified = _notify_allocation_customer(db, allocation=allocation, org_name=access.organization_name, event="survey_ready")
+    return {**_survey_payload(db, row), "customer_notified": customer_notified}
 
 @router.post("/survey-requests/{request_id}/staking-tasks")
 def create_staking_task(request_id:int,request:Request,db:Session=Depends(get_db)):
@@ -2020,9 +2023,10 @@ def complete_staking_task(task_id:int,request:Request,db:Session=Depends(get_db)
     task.assigned_subject_id = task.assigned_subject_id or access.principal.subject_id
     append_estate_audit_event(db,organization_id=task.organization_id,actor=access.principal,action="staking_task.completed",entity_type="estate_staking_task",entity_id=task.id); db.commit()
     active_allocation = db.query(EstateAllocation).filter(EstateAllocation.plot_id == task.plot_id, EstateAllocation.status.in_(("reserved", "allocated"))).one_or_none()
+    customer_notified = False
     if active_allocation:
-        _notify_allocation_customer(db, allocation=active_allocation, org_name=access.organization_name, event="staked")
-    return {"id":task.id,"status":task.status,"completed_at":task.completed_at}
+        customer_notified = _notify_allocation_customer(db, allocation=active_allocation, org_name=access.organization_name, event="staked")
+    return {"id":task.id,"status":task.status,"completed_at":task.completed_at,"customer_notified":customer_notified}
 
 
 @router.post("/organizations/{organization_id}/customers")
@@ -2302,16 +2306,22 @@ def _apply_initial_payment(db: Session, *, record: EstateAllocation, payload: Al
     return payment
 
 
-def _notify_allocation_customer(db: Session, *, allocation: EstateAllocation, org_name: str, event: str, amount_just_paid=None) -> None:
+def _notify_allocation_customer(db: Session, *, allocation: EstateAllocation, org_name: str, event: str, amount_just_paid=None) -> bool:
     customer = db.get(EstateCustomer, allocation.customer_id)
     if not customer or not customer.email:
-        return
+        return False
     plot = db.get(EstatePlot, allocation.plot_id)
     estate = db.get(Estate, allocation.estate_id)
     if not plot or not estate:
-        return
+        return False
+    # Allocations created before the share-token column existed have none yet - generate one on
+    # first use rather than requiring a separate backfill migration, so every customer who gets a
+    # future email also gets a working "view your plot" link.
+    if not allocation.share_token:
+        allocation.share_token = uuid.uuid4().hex
+        db.commit()
     summary = financial_summary(db, allocation)
-    estate_email.notify_customer(
+    return estate_email.notify_customer(
         to_email=customer.email,
         customer_name=customer.full_name,
         org_name=org_name,
@@ -2322,7 +2332,35 @@ def _notify_allocation_customer(db: Session, *, allocation: EstateAllocation, or
         confirmed_paid=summary.confirmed_paid,
         outstanding=summary.outstanding,
         amount_just_paid=amount_just_paid,
+        share_token=allocation.share_token,
     )
+
+
+@router.get("/public/plots/{share_token}")
+def public_plot_view(share_token: str, db: Session = Depends(get_db)):
+    """Powers the customer-facing "view your plot on satellite map" link sent in lifecycle emails -
+    deliberately unauthenticated (customers have no LandCheck login) and deliberately minimal: only
+    what's needed to show the plot on a map, nothing financial or otherwise private, since the link
+    itself is the only thing gating access and could be forwarded on."""
+    allocation = db.query(EstateAllocation).filter(EstateAllocation.share_token == share_token, EstateAllocation.status.in_(("reserved", "allocated"))).one_or_none()
+    if not allocation:
+        raise HTTPException(404, "This link is no longer valid.")
+    plot = db.get(EstatePlot, allocation.plot_id)
+    if not plot or not plot.geometry:
+        raise HTTPException(404, "This plot's boundary is not available yet.")
+    estate = db.get(Estate, allocation.estate_id)
+    customer = db.get(EstateCustomer, allocation.customer_id)
+    organization = db.get(EstateOrganization, allocation.organization_id)
+    return {
+        "customer_name": customer.full_name if customer else None,
+        "plot_number": plot.plot_number,
+        "area_sqm": float(plot.area_sqm) if plot.area_sqm is not None else None,
+        "status": allocation.status,
+        "estate_name": estate.name if estate else None,
+        "organization_name": organization.name if organization else None,
+        "geometry": mapping(to_shape(plot.geometry)),
+        "boundary": mapping(to_shape(estate.boundary)) if estate and estate.boundary is not None else None,
+    }
 
 
 @router.post("/{estate_id}/plots/{plot_id}/reserve")
@@ -2339,8 +2377,8 @@ def reserve_plot(estate_id: int, plot_id: int, payload: AllocationAction, reques
         record.sales_agent_subject_id = payload.sales_agent_subject_id
     initial_payment = _apply_initial_payment(db, record=record, payload=payload, actor=access.principal)
     db.commit()
-    _notify_allocation_customer(db, allocation=record, org_name=access.organization_name, event="reserved")
-    return {"id": record.id, "status": record.status, "agreed_price": str(record.agreed_price) if record.agreed_price is not None else None, "initial_payment_id": initial_payment.id if initial_payment else None}
+    customer_notified = _notify_allocation_customer(db, allocation=record, org_name=access.organization_name, event="reserved")
+    return {"id": record.id, "status": record.status, "agreed_price": str(record.agreed_price) if record.agreed_price is not None else None, "initial_payment_id": initial_payment.id if initial_payment else None, "customer_notified": customer_notified}
 
 
 @router.post("/{estate_id}/plots/{plot_id}/allocate")
@@ -2374,8 +2412,8 @@ def allocate_plot(estate_id: int, plot_id: int, payload: AllocationAction, reque
     initial_payment = _apply_initial_payment(db, record=record, payload=payload, actor=access.principal)
     commissions.apply_commission(db, allocation=record)
     db.commit()
-    _notify_allocation_customer(db, allocation=record, org_name=access.organization_name, event="allocated")
-    return {"id": record.id, "status": record.status, "agreed_price": str(record.agreed_price) if record.agreed_price is not None else None, "initial_payment_id": initial_payment.id if initial_payment else None}
+    customer_notified = _notify_allocation_customer(db, allocation=record, org_name=access.organization_name, event="allocated")
+    return {"id": record.id, "status": record.status, "agreed_price": str(record.agreed_price) if record.agreed_price is not None else None, "initial_payment_id": initial_payment.id if initial_payment else None, "customer_notified": customer_notified}
 
 
 @router.post("/allocations/{allocation_id}/release")
@@ -2392,8 +2430,8 @@ def add_payment(allocation_id: int, payload: PaymentCreate, request: Request, db
     access=require_estate_access(db,request,allocation.organization_id,permission="payment.manage")
     payment=record_payment(db,allocation=allocation,amount=payload.amount,payment_date=payload.payment_date,method=payload.payment_method,reference=payload.reference_no,notes=payload.notes,actor=access.principal)
     db.commit()
-    _notify_allocation_customer(db, allocation=allocation, org_name=access.organization_name, event="payment_recorded", amount_just_paid=payload.amount)
-    return {"id":payment.id,"status":payment.status}
+    customer_notified = _notify_allocation_customer(db, allocation=allocation, org_name=access.organization_name, event="payment_recorded", amount_just_paid=payload.amount)
+    return {"id":payment.id,"status":payment.status,"customer_notified":customer_notified}
 
 @router.post("/payments/{payment_id}/confirm")
 def confirm(payment_id:int, request:Request, db:Session=Depends(get_db)):
@@ -2403,6 +2441,7 @@ def confirm(payment_id:int, request:Request, db:Session=Depends(get_db)):
     confirm_payment(db,payment=payment,actor=access.principal)
     db.commit()
     allocation = db.get(EstateAllocation, payment.allocation_id)
+    customer_notified = False
     if allocation:
         summary = financial_summary(db, allocation)
         fully_paid = summary.agreed_price > 0 and summary.outstanding <= 0
@@ -2416,8 +2455,8 @@ def confirm(payment_id:int, request:Request, db:Session=Depends(get_db)):
                 reserve_or_allocate(db, plot=plot, customer=customer, actor=access.principal, allocate=True)
                 commissions.apply_commission(db, allocation=allocation)
                 db.commit()
-        _notify_allocation_customer(db, allocation=allocation, org_name=access.organization_name, event="payment_completed" if fully_paid else "payment_recorded", amount_just_paid=payment.amount)
-    return {"id":payment.id,"status":payment.status}
+        customer_notified = _notify_allocation_customer(db, allocation=allocation, org_name=access.organization_name, event="payment_completed" if fully_paid else "payment_recorded", amount_just_paid=payment.amount)
+    return {"id":payment.id,"status":payment.status,"customer_notified":customer_notified}
 
 @router.post("/payments/{payment_id}/void")
 def void(payment_id:int,payload:VoidAction,request:Request,db:Session=Depends(get_db)):

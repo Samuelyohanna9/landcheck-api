@@ -191,6 +191,10 @@ class EstateAllocation(Base):
     commission_tier_label = Column(String(120), nullable=True)
     commission_rate_percent = Column(Numeric(5, 2), nullable=True)
     commission_amount = Column(Numeric(16, 2), nullable=True)
+    # An unguessable per-allocation token used for the customer-facing "view your plot on satellite
+    # map" link sent in lifecycle emails - deliberately not the numeric id, since that's guessable/
+    # enumerable and this link needs no login.
+    share_token = Column(String(64), nullable=True, unique=True)
     created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
     updated_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
 
