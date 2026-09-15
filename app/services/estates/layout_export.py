@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 """Renders a whole Estate's approved layout - every plot, road, drainage reserve and open space -
-as one clean, single-page technical plan PDF. This is deliberately separate from the per-plot
-Survey Plan renderer (app/utils/map_renderer_layout.py), which draws one plot's own title-block
-plan; this one draws the whole subdivision at once, the way a developer would hand out a site
-layout plan to a buyer or a field team.
+as one clean, single-page technical plan PDF, styled after a conventional Nigerian survey/site
+plan (red parent boundary, black subdivision lines, a chequered graphical scale, a two-tone north
+arrow). This is deliberately separate from the per-plot Survey Plan renderer
+(app/utils/map_renderer_layout.py), which draws one plot's own title-block plan; this one draws
+the whole subdivision at once, the way a developer would hand out a site layout plan to a buyer or
+a field team.
 """
 
 import math
@@ -24,14 +26,28 @@ from shapely.ops import transform as shapely_transform
 from app.routers.plots import _metric_epsg_for_wgs84_polygon
 
 PLOT_FACE = "#fdfdfb"
-PLOT_EDGE = "#2b2b2b"
+PLOT_EDGE = "#000000"
 ROAD_FILL = "#c9cdd2"
 ROAD_LINE = "#8a9099"
 DRAINAGE_FILL = "#bcdcee"
 OPEN_SPACE_FILL = "#cdeedb"
-BOUNDARY_LINE = "#1a8f5a"
+BOUNDARY_LINE = "#d1332b"  # red parent-parcel boundary, per surveying convention
 INK = "#101827"
 MUTED = "#6b7685"
+
+# ISO paper sizes, landscape (width mm, height mm).
+PAPER_SIZES_MM: dict[str, tuple[float, float]] = {
+    "A0": (1189, 841),
+    "A1": (841, 594),
+    "A2": (594, 420),
+    "A3": (420, 297),
+    "A4": (297, 210),
+}
+
+
+def _figsize_inches(paper_size: str) -> tuple[float, float]:
+    width_mm, height_mm = PAPER_SIZES_MM.get(str(paper_size or "A3").strip().upper(), PAPER_SIZES_MM["A3"])
+    return (width_mm / 25.4, height_mm / 25.4)
 
 
 def _round_scale_length(target_m: float) -> float:
@@ -45,35 +61,62 @@ def _round_scale_length(target_m: float) -> float:
 
 
 def _draw_scale_bar(ax, *, minx: float, miny: float, span_x: float) -> None:
-    length = _round_scale_length(span_x * 0.18)
+    """A chequered (alternating black/white) graphical scale bar, the conventional survey-plan
+    style - unlike a stated "Scale 1:N" ratio, it stays accurate even if the sheet is later
+    resized or photocopied, since it's measured directly off the same drawing."""
+    total_length = _round_scale_length(span_x * 0.22)
+    segments = 4
+    seg_length = total_length / segments
+    bar_height = span_x * 0.011
     x0 = minx + span_x * 0.02
-    y0 = miny - span_x * 0.04
-    ax.plot([x0, x0 + length], [y0, y0], color=INK, linewidth=1.6, solid_capstyle="butt", clip_on=False)
-    for x in (x0, x0 + length / 2, x0 + length):
-        ax.plot([x, x], [y0 - span_x * 0.004, y0 + span_x * 0.004], color=INK, linewidth=1.2, clip_on=False)
-    ax.text(x0 + length / 2, y0 - span_x * 0.018, f"{length:,.0f} m", ha="center", va="top", fontsize=7, color=INK, clip_on=False)
+    y0 = miny - span_x * 0.055
+    for i in range(segments):
+        color = "black" if i % 2 == 0 else "white"
+        ax.add_patch(mpatches.Rectangle((x0 + i * seg_length, y0), seg_length, bar_height, facecolor=color, edgecolor="black", linewidth=0.7, clip_on=False, zorder=9))
+    for i in range(segments + 1):
+        x = x0 + i * seg_length
+        ax.plot([x, x], [y0 - bar_height * 0.25, y0 + bar_height * 1.25], color="black", linewidth=0.7, clip_on=False, zorder=9)
+        ax.text(x, y0 - bar_height * 1.6, f"{i * seg_length:,.0f}", ha="center", va="top", fontsize=5.5, color=INK, clip_on=False, zorder=9)
+    ax.text(x0 + total_length / 2, y0 + bar_height * 2.4, "SCALE (METRES)", ha="center", va="bottom", fontsize=6, fontweight="bold", color=INK, clip_on=False, zorder=9)
 
 
 def _draw_north_arrow(ax) -> None:
-    ax.annotate(
-        "N",
-        xy=(0.965, 0.90), xycoords="axes fraction",
-        xytext=(0.965, 0.80), textcoords="axes fraction",
-        ha="center", va="center", fontsize=10, fontweight="bold", color=INK,
-        arrowprops=dict(arrowstyle="-|>", color=INK, lw=1.6),
-    )
+    """A two-tone kite north arrow (left half solid, right half outline) - the conventional
+    surveying symbol, rather than a plain annotate() arrow."""
+    cx, cy = 0.965, 0.885
+    h, w = 0.052, 0.016
+    top = (cx, cy + h)
+    bottom = (cx, cy - h * 0.35)
+    mid_left = (cx - w, cy)
+    mid_right = (cx + w, cy)
+    left_half = plt.Polygon([top, mid_left, bottom], closed=True, transform=ax.transAxes, facecolor=INK, edgecolor=INK, linewidth=0.8, clip_on=False, zorder=12)
+    right_half = plt.Polygon([top, mid_right, bottom], closed=True, transform=ax.transAxes, facecolor="white", edgecolor=INK, linewidth=0.8, clip_on=False, zorder=12)
+    ax.add_patch(left_half)
+    ax.add_patch(right_half)
+    ax.text(cx, cy - h * 0.35 - 0.018, "N", transform=ax.transAxes, ha="center", va="top", fontsize=10, fontweight="bold", color=INK, clip_on=False, zorder=12)
 
 
-def _legend_swatch(ax, x: float, y: float, size: float, *, facecolor: str, edgecolor: str, label: str) -> float:
-    ax.add_patch(mpatches.Rectangle((x, y), size, size, transform=ax.transAxes, facecolor=facecolor, edgecolor=edgecolor, linewidth=0.8, clip_on=False, zorder=11))
-    ax.text(x + size * 1.5, y + size / 2, label, transform=ax.transAxes, ha="left", va="center", fontsize=7.5, color=INK, clip_on=False, zorder=11)
-    return y
+def _legend_swatch(ax, x: float, y: float, size: float, *, facecolor: str, label: str) -> None:
+    ax.add_patch(mpatches.Rectangle((x, y), size, size, transform=ax.transAxes, facecolor=facecolor, edgecolor=INK, linewidth=0.7, clip_on=False, zorder=11))
+    ax.text(x + size * 1.6, y + size / 2, label, transform=ax.transAxes, ha="left", va="center", fontsize=7.5, color=INK, clip_on=False, zorder=11)
 
 
-def render_estate_layout_pdf(*, estate: Any, organization_name: str, plots: list[Any], features: list[Any], to_shape_fn, output_path: str) -> dict:
+def render_estate_layout_pdf(
+    *,
+    estate: Any,
+    organization_name: str,
+    plots: list[Any],
+    features: list[Any],
+    to_shape_fn,
+    output_path: str,
+    paper_size: str = "A3",
+    customer_names_by_plot_id: dict[int, str] | None = None,
+) -> dict:
     """plots: list of EstatePlot rows (geometry present). features: list of EstateSpatialFeature
     rows (status active). to_shape_fn: geoalchemy2.shape.to_shape, passed in to avoid importing
-    the DB layer twice. Returns a small dict of counts for the caller to log/audit."""
+    the DB layer twice. customer_names_by_plot_id: when given, each plot with an entry gets the
+    customer's name printed under its area - omit (None/empty) for a clean, name-free plan suited
+    to marketing/PR use. Returns a small dict of counts for the caller to log/audit."""
     all_polygons_wgs84: list[Polygon] = [to_shape_fn(plot.geometry) for plot in plots]
     if estate.boundary is not None:
         all_polygons_wgs84.append(to_shape_fn(estate.boundary))
@@ -97,7 +140,7 @@ def render_estate_layout_pdf(*, estate: Any, organization_name: str, plots: list
     span_y = metric_maxy - metric_miny
     label_step = max(span_x, span_y) * 0.014
 
-    fig, ax = plt.subplots(figsize=(16.5, 11.7))  # A3 landscape at 72dpi proportions
+    fig, ax = plt.subplots(figsize=_figsize_inches(paper_size))
 
     for feature in features:
         geometry = to_shape_fn(feature.geometry)
@@ -122,19 +165,25 @@ def render_estate_layout_pdf(*, estate: Any, organization_name: str, plots: list
     for plot in plots:
         polygon_wgs84 = to_shape_fn(plot.geometry)
         metric_polygon = shapely_transform(forward, polygon_wgs84)
-        ax.add_patch(mpatches.Polygon(list(metric_polygon.exterior.coords), closed=True, facecolor=PLOT_FACE, edgecolor=PLOT_EDGE, linewidth=0.7, zorder=2))
+        # Black subdivision lines - only the outer parent boundary is drawn in red, below.
+        ax.add_patch(mpatches.Polygon(list(metric_polygon.exterior.coords), closed=True, facecolor=PLOT_FACE, edgecolor=PLOT_EDGE, linewidth=0.8, zorder=2))
         centroid = metric_polygon.centroid
         area_label = f"{float(plot.area_sqm):,.0f} m²" if plot.area_sqm is not None else ""
-        ax.text(centroid.x, centroid.y + label_step * 0.9, str(plot.plot_number), fontsize=6.5, fontweight="bold", color=INK, ha="center", va="center", zorder=3)
+        customer_name = (customer_names_by_plot_id or {}).get(plot.id)
+        ax.text(centroid.x, centroid.y + label_step * (1.0 if customer_name else 0.9), str(plot.plot_number), fontsize=6.5, fontweight="bold", color=INK, ha="center", va="center", zorder=3)
         if area_label:
-            ax.text(centroid.x, centroid.y - label_step * 0.9, area_label, fontsize=5.2, color=MUTED, ha="center", va="center", zorder=3)
+            ax.text(centroid.x, centroid.y - label_step * (0.55 if customer_name else 0.9), area_label, fontsize=5.2, color=MUTED, ha="center", va="center", zorder=3)
+        if customer_name:
+            ax.text(centroid.x, centroid.y - label_step * 1.7, customer_name, fontsize=5, color=MUTED, ha="center", va="center", zorder=3, style="italic")
 
     if estate.boundary is not None:
         boundary_metric = shapely_transform(forward, to_shape_fn(estate.boundary))
-        ax.add_patch(mpatches.Polygon(list(boundary_metric.exterior.coords), closed=True, facecolor="none", edgecolor=BOUNDARY_LINE, linewidth=1.8, linestyle=(0, (6, 3)), zorder=5))
+        # The parent parcel boundary - solid red, per surveying convention, drawn over every
+        # subdivision line so the overall extent always reads clearly.
+        ax.add_patch(mpatches.Polygon(list(boundary_metric.exterior.coords), closed=True, facecolor="none", edgecolor=BOUNDARY_LINE, linewidth=2.2, zorder=5))
 
     pad_x = span_x * 0.08 + 1
-    pad_y = span_y * 0.16 + 1
+    pad_y = span_y * 0.18 + 1
     ax.set_xlim(metric_minx - pad_x, metric_maxx + pad_x)
     ax.set_ylim(metric_miny - pad_y, metric_maxy + pad_y)
     ax.set_aspect("equal")
@@ -144,18 +193,20 @@ def render_estate_layout_pdf(*, estate: Any, organization_name: str, plots: list
     _draw_north_arrow(ax)
 
     legend_box = mpatches.FancyBboxPatch(
-        (0.008, 0.865), 0.155, 0.125, transform=ax.transAxes,
-        boxstyle="round,pad=0.006,rounding_size=0.006", facecolor="white", edgecolor="#e4e8ec", linewidth=0.8, zorder=10,
+        (0.008, 0.86), 0.155, 0.13, transform=ax.transAxes,
+        boxstyle="round,pad=0.006,rounding_size=0.006", facecolor="white", edgecolor=INK, linewidth=0.8, zorder=10,
     )
     ax.add_patch(legend_box)
     legend_x = 0.02
     legend_y = 0.958
     step = 0.021
     ax.text(legend_x, legend_y, "LEGEND", transform=ax.transAxes, fontsize=7.5, fontweight="bold", color=INK, zorder=11)
-    _legend_swatch(ax, legend_x, legend_y - step * 1.3, 0.012, facecolor=PLOT_FACE, edgecolor=PLOT_EDGE, label="Plot")
-    _legend_swatch(ax, legend_x, legend_y - step * 2.3, 0.012, facecolor=ROAD_FILL, edgecolor="none", label="Road")
-    _legend_swatch(ax, legend_x, legend_y - step * 3.3, 0.012, facecolor=OPEN_SPACE_FILL, edgecolor="none", label="Open space")
-    _legend_swatch(ax, legend_x, legend_y - step * 4.3, 0.012, facecolor=DRAINAGE_FILL, edgecolor="none", label="Drainage")
+    _legend_swatch(ax, legend_x, legend_y - step * 1.3, 0.012, facecolor=PLOT_FACE, label="Plot")
+    _legend_swatch(ax, legend_x, legend_y - step * 2.3, 0.012, facecolor=ROAD_FILL, label="Road")
+    _legend_swatch(ax, legend_x, legend_y - step * 3.3, 0.012, facecolor=OPEN_SPACE_FILL, label="Open space")
+    _legend_swatch(ax, legend_x, legend_y - step * 4.3, 0.012, facecolor=DRAINAGE_FILL, label="Drainage")
+    ax.plot([legend_x, legend_x + 0.012], [legend_y - step * 5.1, legend_y - step * 5.1], color=BOUNDARY_LINE, linewidth=2.2, transform=ax.transAxes, clip_on=False, zorder=11)
+    ax.text(legend_x + 0.012 * 1.6, legend_y - step * 5.1, "Estate boundary", transform=ax.transAxes, ha="left", va="center", fontsize=7.5, color=INK, clip_on=False, zorder=11)
 
     generated_at = datetime.now(timezone.utc).strftime("%d %b %Y")
     title_text = (
@@ -167,10 +218,10 @@ def render_estate_layout_pdf(*, estate: Any, organization_name: str, plots: list
     ax.text(
         0.985, 0.025, title_text, transform=ax.transAxes, ha="right", va="bottom",
         fontsize=8, color=INK, linespacing=1.7, zorder=11,
-        bbox=dict(boxstyle="round,pad=0.5", facecolor="white", edgecolor="#e4e8ec", linewidth=0.8),
+        bbox=dict(boxstyle="round,pad=0.5", facecolor="white", edgecolor=INK, linewidth=0.8),
     )
 
     with PdfPages(output_path) as pdf:
         pdf.savefig(fig, bbox_inches="tight")
     plt.close(fig)
-    return {"plot_count": len(plots), "feature_count": len(features), "coordinate_epsg": metric_epsg}
+    return {"plot_count": len(plots), "feature_count": len(features), "coordinate_epsg": metric_epsg, "paper_size": str(paper_size or "A3").upper(), "included_customer_names": bool(customer_names_by_plot_id)}

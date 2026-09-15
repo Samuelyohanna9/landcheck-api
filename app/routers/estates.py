@@ -1157,6 +1157,9 @@ def decide_layout_proposal(
     db.commit()
     return {"id": row.id, "status": row.status, "created_plots": len(created_plots), "created_features": len(created_features), "estate_id": estate.id}
 
+_LAYER_TYPE_LABELS = {"road": "Road", "drainage": "Drainage", "open_space": "Open space", "infrastructure": "Infrastructure"}
+
+
 @router.post("/{estate_id}/layers")
 def create_estate_layer(estate_id:int,payload:SpatialFeatureCreate,request:Request,db:Session=Depends(get_db)):
     estate=db.get(Estate,estate_id)
@@ -1164,7 +1167,14 @@ def create_estate_layer(estate_id:int,payload:SpatialFeatureCreate,request:Reque
     access=require_estate_access(db,request,estate.organization_id,permission="infrastructure.manage")
     try: geometry=from_shape(shape(payload.geometry),srid=4326)
     except Exception: raise HTTPException(422,"Layer geometry is invalid")
-    row=EstateSpatialFeature(organization_id=estate.organization_id,estate_id=estate.id,feature_type=payload.feature_type,name=(payload.name or "").strip() or None,geometry=geometry,created_by_subject_type=access.principal.subject_type,created_by_subject_id=access.principal.subject_id)
+    name=(payload.name or "").strip()
+    if not name:
+        # "Layer name" is an optional field in the UI - a manually added road left unnamed still
+        # needs a real name so it actually shows a label on the map, not just get displayed as an
+        # unmarked shape (the older behavior here, storing NULL, is what let that happen).
+        existing_count = db.query(EstateSpatialFeature).filter(EstateSpatialFeature.estate_id == estate.id, EstateSpatialFeature.feature_type == payload.feature_type).count()
+        name = f"{_LAYER_TYPE_LABELS.get(payload.feature_type, payload.feature_type.title())} {existing_count + 1}"
+    row=EstateSpatialFeature(organization_id=estate.organization_id,estate_id=estate.id,feature_type=payload.feature_type,name=name,geometry=geometry,created_by_subject_type=access.principal.subject_type,created_by_subject_id=access.principal.subject_id)
     db.add(row); db.flush(); append_estate_audit_event(db,organization_id=estate.organization_id,actor=access.principal,action="spatial_layer.created",entity_type="estate_spatial_feature",entity_id=row.id,after_data={"type":row.feature_type,"name":row.name}); db.commit()
     return {"id":row.id,"type":row.feature_type,"name":row.name}
 
@@ -1781,9 +1791,13 @@ def export_estate_layout_dgps_csv(estate_id: int, request: Request, coordinate_s
 
 
 @router.get("/{estate_id}/exports/layout.pdf")
-def export_estate_layout_pdf(estate_id: int, request: Request, db: Session = Depends(get_db)):
+def export_estate_layout_pdf(estate_id: int, request: Request, paper_size: str = "A3", include_customer_names: bool = False, db: Session = Depends(get_db)):
     """Renders every plot, road, drainage reserve and open space in this Estate as one clean,
-    single-page site layout plan PDF - the whole subdivision at once, not one plot at a time."""
+    single-page site layout plan PDF - the whole subdivision at once, not one plot at a time.
+    paper_size: A0-A4. include_customer_names: adds each allocated/reserved plot's customer name
+    under its area - leave off for a clean, name-free plan suited to marketing/PR use."""
+    if paper_size.strip().upper() not in {"A0", "A1", "A2", "A3", "A4"}:
+        raise HTTPException(422, "paper_size must be one of A0, A1, A2, A3, A4")
     estate = db.get(Estate, estate_id)
     if not estate: raise HTTPException(404, "Estate not found")
     access = require_estate_access(db, request, estate.organization_id, permission="plot.read")
@@ -1792,11 +1806,17 @@ def export_estate_layout_pdf(estate_id: int, request: Request, db: Session = Dep
     features = db.query(EstateSpatialFeature).filter(EstateSpatialFeature.estate_id == estate_id, EstateSpatialFeature.status == "active").all()
     if not plots and estate.boundary is None:
         raise HTTPException(422, "This Estate has no plots or boundary to draw yet")
+    customer_names_by_plot_id: dict[int, str] = {}
+    if include_customer_names:
+        allocations = db.query(EstateAllocation).filter(EstateAllocation.estate_id == estate_id, EstateAllocation.status.in_(("reserved", "allocated"))).all()
+        customer_ids = {allocation.customer_id for allocation in allocations}
+        customers_by_id = {customer.id: customer.full_name for customer in db.query(EstateCustomer).filter(EstateCustomer.id.in_(customer_ids)).all()} if customer_ids else {}
+        customer_names_by_plot_id = {allocation.plot_id: customers_by_id[allocation.customer_id] for allocation in allocations if allocation.customer_id in customers_by_id}
     tmp_path: str | None = None
     try:
         with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp_file:
             tmp_path = tmp_file.name
-        result = render_estate_layout_pdf(estate=estate, organization_name=access.organization_name, plots=plots, features=features, to_shape_fn=to_shape, output_path=tmp_path)
+        result = render_estate_layout_pdf(estate=estate, organization_name=access.organization_name, plots=plots, features=features, to_shape_fn=to_shape, output_path=tmp_path, paper_size=paper_size, customer_names_by_plot_id=customer_names_by_plot_id or None)
         with open(tmp_path, "rb") as handle:
             pdf_bytes = handle.read()
     except ValueError as error:
