@@ -2134,6 +2134,79 @@ def commission_report(organization_id: int, request: Request, db: Session = Depe
     return {"organization_id": organization_id, "agents": results}
 
 
+@router.get("/organizations/{organization_id}/sales-agents/detail")
+def sales_agent_detail(organization_id: int, subject_type: str, subject_id: str, request: Request, db: Session = Depends(get_db)):
+    """Everything tied to one sales agent - every plot they're attached to (reserved or
+    allocated), each one's own payment status, and the commission it has actually earned (locked
+    in only once a sale reaches Allocated - see commissions.py) versus still pending that."""
+    require_estate_access(db, request, organization_id, permission="payment.read")
+    display_name = subject_id
+    role = None
+    if subject_type == "estate_account":
+        account = db.get(EstateAccount, int(subject_id)) if subject_id.isdigit() else None
+        if account:
+            display_name = account.full_name
+    member = db.query(EstateOrganizationMember).filter(EstateOrganizationMember.organization_id == organization_id, EstateOrganizationMember.subject_type == subject_type, EstateOrganizationMember.subject_id == subject_id).one_or_none()
+    if member:
+        role = member.role_key
+
+    rows = db.query(EstateAllocation).filter(
+        EstateAllocation.organization_id == organization_id,
+        EstateAllocation.sales_agent_subject_type == subject_type,
+        EstateAllocation.sales_agent_subject_id == subject_id,
+        EstateAllocation.status.in_(("reserved", "allocated")),
+    ).order_by(EstateAllocation.allocation_date.desc()).all()
+
+    plots = []
+    total_volume = Decimal("0")
+    total_commission_paid = Decimal("0")
+    pending_commission_count = 0
+    current_tier = None
+    for row in rows:
+        plot = db.get(EstatePlot, row.plot_id)
+        estate = db.get(Estate, row.estate_id)
+        customer = db.get(EstateCustomer, row.customer_id)
+        summary = financial_summary(db, row)
+        total_volume += summary.agreed_price
+        if row.status == "allocated":
+            total_commission_paid += Decimal(row.commission_amount or 0)
+            current_tier = row.commission_tier_label or current_tier
+        else:
+            pending_commission_count += 1
+        plots.append({
+            "allocation_id": row.id,
+            "plot_id": row.plot_id,
+            "plot_number": plot.plot_number if plot else None,
+            "estate_id": row.estate_id,
+            "estate_name": estate.name if estate else None,
+            "customer_name": customer.full_name if customer else None,
+            "status": row.status,
+            "agreed_price": str(summary.agreed_price),
+            "confirmed_paid": str(summary.confirmed_paid),
+            "outstanding": str(summary.outstanding),
+            "allocation_date": row.allocation_date,
+            "commission_tier_label": row.commission_tier_label,
+            "commission_rate_percent": str(row.commission_rate_percent) if row.commission_rate_percent is not None else None,
+            "commission_amount": str(row.commission_amount) if row.status == "allocated" else None,
+        })
+
+    return {
+        "organization_id": organization_id,
+        "subject_type": subject_type,
+        "subject_id": subject_id,
+        "display_name": display_name,
+        "role": role,
+        "summary": {
+            "plot_count": len(plots),
+            "total_volume": str(total_volume),
+            "total_commission_paid": str(total_commission_paid),
+            "pending_commission_count": pending_commission_count,
+            "current_tier": current_tier,
+        },
+        "plots": plots,
+    }
+
+
 def _apply_initial_payment(db: Session, *, record: EstateAllocation, payload: AllocationAction, actor) -> EstatePayment | None:
     """An initial payment entered in the same reserve/allocate call is recorded AND immediately
     confirmed - unlike a normal payment, this represents money the org is directly attesting it
