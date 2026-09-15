@@ -3,9 +3,18 @@ import os
 from urllib.parse import quote, urlparse
 
 import boto3
+from botocore.config import Config
 
 
 logger = logging.getLogger("r2_objects")
+
+# boto3's own defaults (60s connect + 60s read, with the default retry mode's built-in retries on
+# top) mean a slow or unresponsive R2 endpoint can leave a request hanging for minutes before it
+# ever raises - from the caller's perspective, indistinguishable from a genuine infinite hang (this
+# is what made the georeference digitize-preview endpoint appear permanently stuck rather than
+# quickly failing). Bounding it here makes every R2 call fail fast enough to surface as a real
+# error the caller can retry, instead of a silent, unbounded wait.
+_R2_CLIENT_CONFIG = Config(connect_timeout=10, read_timeout=30, retries={"max_attempts": 2})
 
 
 def _env_bool(name: str, default: bool = True) -> bool:
@@ -72,6 +81,7 @@ def create_r2_client(settings: dict):
         aws_access_key_id=settings["access_key"],
         aws_secret_access_key=settings["secret_key"],
         region_name=settings["region"],
+        config=_R2_CLIENT_CONFIG,
     )
 
 
