@@ -8,15 +8,19 @@ no shadowed tiles, no zebra-striped rows. This is deliberately a generated PDF (
 page"), so it reads like something you would hand to an investor or a board."""
 
 import io
+import os
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
+import matplotlib
 from reportlab.lib import colors
 from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_RIGHT
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
 from reportlab.lib.units import mm
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.platypus import (
     HRFlowable,
     Image,
@@ -30,6 +34,21 @@ from reportlab.platypus import (
 )
 
 from app.services.estates.layout_export import render_estate_layout_thumbnail_png
+
+# reportlab's built-in "Times-Roman" etc. are the 14 standard PDF fonts, which are NEVER embedded -
+# every viewer substitutes its own local font for the name, and that substitute can render with
+# poor hinting/antialiasing ("blurry" text) depending on the OS and viewer. Embedding a real TTF
+# instead guarantees the exact same crisp glyphs everywhere. DejaVu Serif ships with matplotlib
+# (already a hard dependency here for the layout snapshot render), so it's reliably available
+# without adding a new package or bundling a font file of our own.
+FONT_SERIF = "ReportSerif"
+FONT_SERIF_BOLD = "ReportSerif-Bold"
+FONT_SERIF_ITALIC = "ReportSerif-Italic"
+if FONT_SERIF not in pdfmetrics.getRegisteredFontNames():
+    _font_dir = os.path.join(matplotlib.get_data_path(), "fonts", "ttf")
+    pdfmetrics.registerFont(TTFont(FONT_SERIF, os.path.join(_font_dir, "DejaVuSerif.ttf")))
+    pdfmetrics.registerFont(TTFont(FONT_SERIF_BOLD, os.path.join(_font_dir, "DejaVuSerif-Bold.ttf")))
+    pdfmetrics.registerFont(TTFont(FONT_SERIF_ITALIC, os.path.join(_font_dir, "DejaVuSerif-Italic.ttf")))
 
 INK = colors.HexColor("#1a1a1a")
 MUTED = colors.HexColor("#6e6e6e")
@@ -55,24 +74,23 @@ def _naira(value: Any) -> str:
 
 
 def _styles() -> dict[str, ParagraphStyle]:
-    # Times-Roman throughout (not just headings) for one consistent, classic report typeface -
-    # reportlab's closest built-in match to Times New Roman, and legible at every size used here.
+    # One consistent embedded serif throughout (not just headings) for a classic report typeface.
     base = getSampleStyleSheet()
     return {
-        "org": ParagraphStyle("org", parent=base["Normal"], fontName="Times-Roman", fontSize=9, textColor=MUTED, leading=11),
-        "meta": ParagraphStyle("meta", parent=base["Normal"], fontName="Times-Roman", fontSize=9, textColor=MUTED, alignment=TA_RIGHT, leading=11),
-        "title": ParagraphStyle("title", parent=base["Normal"], fontName="Times-Bold", fontSize=23, textColor=INK, leading=27),
-        "subtitle": ParagraphStyle("subtitle", parent=base["Normal"], fontName="Times-Italic", fontSize=11, textColor=MUTED),
-        "section": ParagraphStyle("section", parent=base["Normal"], fontName="Times-Bold", fontSize=13.5, textColor=INK, spaceBefore=2, spaceAfter=5),
-        "section_note": ParagraphStyle("section_note", parent=base["Normal"], fontName="Times-Italic", fontSize=9, textColor=MUTED, spaceAfter=8),
-        "metric_label": ParagraphStyle("metric_label", parent=base["Normal"], fontName="Times-Roman", fontSize=8, textColor=MUTED, alignment=TA_CENTER),
-        "metric_value": ParagraphStyle("metric_value", parent=base["Normal"], fontName="Times-Bold", fontSize=17, textColor=INK, alignment=TA_CENTER),
-        "metric_value_sm": ParagraphStyle("metric_value_sm", parent=base["Normal"], fontName="Times-Bold", fontSize=13, textColor=INK, alignment=TA_CENTER),
-        "body": ParagraphStyle("body", parent=base["Normal"], fontName="Times-Roman", fontSize=9.5, textColor=INK, leading=13.5),
-        "body_muted": ParagraphStyle("body_muted", parent=base["Normal"], fontName="Times-Roman", fontSize=9, textColor=MUTED, leading=12.5),
-        "th": ParagraphStyle("th", parent=base["Normal"], fontName="Times-Bold", fontSize=8.8, textColor=INK),
-        "td": ParagraphStyle("td", parent=base["Normal"], fontName="Times-Roman", fontSize=9.2, textColor=INK),
-        "td_muted": ParagraphStyle("td_muted", parent=base["Normal"], fontName="Times-Roman", fontSize=8.5, textColor=MUTED),
+        "org": ParagraphStyle("org", parent=base["Normal"], fontName=FONT_SERIF, fontSize=9, textColor=MUTED, leading=11),
+        "meta": ParagraphStyle("meta", parent=base["Normal"], fontName=FONT_SERIF, fontSize=9, textColor=MUTED, alignment=TA_RIGHT, leading=11),
+        "title": ParagraphStyle("title", parent=base["Normal"], fontName=FONT_SERIF_BOLD, fontSize=23, textColor=INK, leading=27),
+        "subtitle": ParagraphStyle("subtitle", parent=base["Normal"], fontName=FONT_SERIF_ITALIC, fontSize=11, textColor=MUTED),
+        "section": ParagraphStyle("section", parent=base["Normal"], fontName=FONT_SERIF_BOLD, fontSize=13.5, textColor=INK, spaceBefore=2, spaceAfter=5),
+        "section_note": ParagraphStyle("section_note", parent=base["Normal"], fontName=FONT_SERIF_ITALIC, fontSize=9, textColor=MUTED, spaceAfter=8),
+        "metric_label": ParagraphStyle("metric_label", parent=base["Normal"], fontName=FONT_SERIF, fontSize=8, textColor=MUTED, alignment=TA_CENTER),
+        "metric_value": ParagraphStyle("metric_value", parent=base["Normal"], fontName=FONT_SERIF_BOLD, fontSize=17, textColor=INK, alignment=TA_CENTER),
+        "metric_value_sm": ParagraphStyle("metric_value_sm", parent=base["Normal"], fontName=FONT_SERIF_BOLD, fontSize=13, textColor=INK, alignment=TA_CENTER),
+        "body": ParagraphStyle("body", parent=base["Normal"], fontName=FONT_SERIF, fontSize=9.5, textColor=INK, leading=13.5),
+        "body_muted": ParagraphStyle("body_muted", parent=base["Normal"], fontName=FONT_SERIF, fontSize=9, textColor=MUTED, leading=12.5),
+        "th": ParagraphStyle("th", parent=base["Normal"], fontName=FONT_SERIF_BOLD, fontSize=8.8, textColor=INK),
+        "td": ParagraphStyle("td", parent=base["Normal"], fontName=FONT_SERIF, fontSize=9.2, textColor=INK),
+        "td_muted": ParagraphStyle("td_muted", parent=base["Normal"], fontName=FONT_SERIF, fontSize=8.5, textColor=MUTED),
     }
 
 
@@ -139,7 +157,7 @@ def _footer(canvas, doc, *, estate_name: str, organization_name: str) -> None:
     canvas.setStrokeColor(HAIRLINE)
     canvas.setLineWidth(0.5)
     canvas.line(20 * mm, 14 * mm, doc.pagesize[0] - 20 * mm, 14 * mm)
-    canvas.setFont("Times-Roman", 8)
+    canvas.setFont(FONT_SERIF, 8)
     canvas.setFillColor(MUTED)
     canvas.drawString(20 * mm, 10 * mm, f"{organization_name or 'LandCheck Estates'} · {estate_name}")
     canvas.drawRightString(doc.pagesize[0] - 20 * mm, 10 * mm, f"Page {doc.page}")
