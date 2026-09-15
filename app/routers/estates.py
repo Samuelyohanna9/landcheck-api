@@ -17,7 +17,7 @@ from pyproj import Transformer
 import ezdxf
 from shapely.geometry import mapping, shape
 from shapely.ops import transform as shapely_transform, unary_union
-from sqlalchemy import text
+from sqlalchemy import and_, or_, text
 from sqlalchemy.orm import Session
 
 from app.routers.plots import _metric_epsg_for_wgs84_polygon, _subdivide_polygon_equal_count, get_db
@@ -1444,6 +1444,33 @@ def estate_activity(estate_id:int, request:Request, limit:int=100, db:Session=De
     require_estate_access(db,request,estate.organization_id,permission="audit.read")
     rows=db.query(EstateAuditEvent).filter(EstateAuditEvent.organization_id==estate.organization_id).order_by(EstateAuditEvent.created_at.desc()).limit(min(max(limit,1),200)).all()
     return [{"id":row.id,"action":row.action,"entity_type":row.entity_type,"entity_id":row.entity_id,"actor":row.actor_subject_id,"created_at":row.created_at,"details":row.after_data} for row in rows]
+
+
+@router.get("/plots/{plot_id}/timeline")
+def plot_timeline(plot_id: int, request: Request, db: Session = Depends(get_db)):
+    """A single plot's own history, assembled across every entity type an audit event can be
+    logged against for it - the plot record itself (created/geometry edited/subdivided/...), its
+    reservation/allocation, its payments, its Survey request and its Staking task - since none of
+    those share one common entity_id, a plain `entity_id == plot_id` filter would only ever surface
+    the plot's own direct events and miss everything else that happened to it."""
+    plot = db.get(EstatePlot, plot_id)
+    if not plot:
+        raise HTTPException(404, "Plot not found")
+    estate = db.get(Estate, plot.estate_id)
+    require_estate_access(db, request, estate.organization_id, permission="audit.read")
+
+    allocation_ids = [str(row.id) for row in db.query(EstateAllocation.id).filter(EstateAllocation.plot_id == plot_id).all()]
+    payment_ids = [str(row.id) for row in db.query(EstatePayment.id).filter(EstatePayment.plot_id == plot_id).all()]
+    survey_ids = [str(row.id) for row in db.query(EstateSurveyRequest.id).filter(EstateSurveyRequest.plot_id == plot_id).all()]
+    staking_ids = [str(row.id) for row in db.query(EstateStakingTask.id).filter(EstateStakingTask.plot_id == plot_id).all()]
+
+    conditions = [and_(EstateAuditEvent.entity_type == "estate_plot", EstateAuditEvent.entity_id == str(plot_id))]
+    for entity_type, ids in (("estate_allocation", allocation_ids), ("estate_payment", payment_ids), ("estate_survey_request", survey_ids), ("estate_staking_task", staking_ids)):
+        if ids:
+            conditions.append(and_(EstateAuditEvent.entity_type == entity_type, EstateAuditEvent.entity_id.in_(ids)))
+
+    rows = db.query(EstateAuditEvent).filter(EstateAuditEvent.organization_id == estate.organization_id, or_(*conditions)).order_by(EstateAuditEvent.created_at.desc()).limit(100).all()
+    return [{"id": row.id, "action": row.action, "entity_type": row.entity_type, "actor": row.actor_subject_id, "created_at": row.created_at, "details": row.after_data} for row in rows]
 
 
 @router.post("/{estate_id}/plots")
