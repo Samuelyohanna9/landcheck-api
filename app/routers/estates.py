@@ -843,6 +843,8 @@ def edit_layout_proposal(proposal_id: int, payload: EstateLayoutProposalEdit, re
             }
             if candidate.get("width_m"):
                 cleaned_feature["width_m"] = float(candidate["width_m"])
+            if candidate.get("carved_plots"):
+                cleaned_feature["carved_plots"] = candidate["carved_plots"]
             cleaned_features.append(cleaned_feature)
         row.feature_candidates = cleaned_features
     append_estate_audit_event(db, organization_id=row.organization_id, actor=access.principal, action="layout_proposal.edited", entity_type="estate_layout_proposal", entity_id=row.id, after_data={"plot_count": len(row.plot_candidates or []), "feature_count": len(row.feature_candidates or [])})
@@ -899,6 +901,14 @@ def add_layout_proposal_feature(proposal_id: int, payload: EstateLayoutFeatureAd
     target_area = float((row.criteria or {}).get("target_plot_area_sqm") or 100)
     min_area_sqm = max(target_area * 0.35, 25)
     updated_candidates: list[dict] = []
+    # Every plot this feature actually touches gets snapshotted here in its pre-carve form, so that
+    # deleting this road/open space later can restore exactly what it took - a plot it only
+    # trimmed goes back to its original shape, and a plot it consumed entirely comes back too.
+    # This is a per-feature undo record, not a general recompute: if a second feature later also
+    # carves the same plot, deleting the first one restores this snapshot regardless of what the
+    # second one did, so overlapping carves on the same plot don't compose perfectly - flagged
+    # rather than silently assumed away.
+    carved_plots: list[dict] = []
     removed = 0
     for candidate in source_candidates:
         try:
@@ -909,6 +919,7 @@ def add_layout_proposal_feature(proposal_id: int, payload: EstateLayoutFeatureAd
         if not plot_metric.intersects(footprint_metric):
             updated_candidates.append(candidate)
             continue
+        carved_plots.append(dict(candidate))
         remainder = _largest_polygon_piece(plot_metric.difference(footprint_metric))
         if remainder is None or remainder.is_empty or remainder.area < min_area_sqm:
             removed += 1
@@ -923,7 +934,7 @@ def add_layout_proposal_feature(proposal_id: int, payload: EstateLayoutFeatureAd
     footprint_wgs84 = shapely_transform(backward, footprint_metric)
     existing_count = sum(1 for feature in (row.feature_candidates or []) if feature.get("feature_type") == payload.feature_type)
     default_name = f"Road {existing_count + 1}" if payload.feature_type == "road" else (f"Open space {existing_count + 1}" if existing_count else "Open space")
-    new_feature = {"feature_type": payload.feature_type, "name": (payload.name or "").strip() or default_name, "geometry": mapping(footprint_wgs84)}
+    new_feature = {"feature_type": payload.feature_type, "name": (payload.name or "").strip() or default_name, "geometry": mapping(footprint_wgs84), "carved_plots": carved_plots}
     if width_m:
         new_feature["width_m"] = width_m
 
