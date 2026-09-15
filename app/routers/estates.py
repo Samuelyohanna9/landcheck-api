@@ -836,11 +836,14 @@ def edit_layout_proposal(proposal_id: int, payload: EstateLayoutProposalEdit, re
         for candidate in payload.feature_candidates:
             geometry = candidate.get("geometry") or {}
             _geojson_geometry(geometry)
-            cleaned_features.append({
+            cleaned_feature = {
                 "feature_type": str(candidate.get("feature_type") or "infrastructure"),
                 "name": str(candidate.get("name") or "Generated layout feature"),
                 "geometry": geometry,
-            })
+            }
+            if candidate.get("width_m"):
+                cleaned_feature["width_m"] = float(candidate["width_m"])
+            cleaned_features.append(cleaned_feature)
         row.feature_candidates = cleaned_features
     append_estate_audit_event(db, organization_id=row.organization_id, actor=access.principal, action="layout_proposal.edited", entity_type="estate_layout_proposal", entity_id=row.id, after_data={"plot_count": len(row.plot_candidates or []), "feature_count": len(row.feature_candidates or [])})
     db.commit()
@@ -921,6 +924,8 @@ def add_layout_proposal_feature(proposal_id: int, payload: EstateLayoutFeatureAd
     existing_count = sum(1 for feature in (row.feature_candidates or []) if feature.get("feature_type") == payload.feature_type)
     default_name = f"Road {existing_count + 1}" if payload.feature_type == "road" else (f"Open space {existing_count + 1}" if existing_count else "Open space")
     new_feature = {"feature_type": payload.feature_type, "name": (payload.name or "").strip() or default_name, "geometry": mapping(footprint_wgs84)}
+    if width_m:
+        new_feature["width_m"] = width_m
 
     row.plot_candidates = updated_candidates
     row.feature_candidates = [*(row.feature_candidates or []), new_feature]

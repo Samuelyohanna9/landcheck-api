@@ -101,23 +101,34 @@ def generate_estate_layout(boundary_wgs84: Polygon, criteria: EstateLayoutCriter
     width = max_x - min_x
     height = max_y - min_y
     # Plots stand side by side within a row, sharing frontage boundaries directly (zero gap) just
-    # like an actual subdivided block - the road only runs between rows, so each row fronts the
-    # road on one side and backs onto the next row's road on the other, the standard double-loaded
-    # street layout. An earlier version put a full road-width gap between every column too, which
-    # meant no two plots ever touched - not how a real layout reads.
+    # like an actual subdivided block. Rows are then paired back-to-back (row 0 backs onto row 1,
+    # row 2 backs onto row 3, ...) sharing a common rear boundary with no road between them -
+    # a road only runs between PAIRS, since each row already fronts a road on its own outer edge.
+    # Putting a road between every single row (an earlier version of this generator did, and before
+    # that, between every column too) wastes land no real layout gives up and doesn't match how an
+    # actual subdivision reads.
     ideal_width = float(criteria.frontage_m or math.sqrt(criteria.target_plot_area_sqm * 1.25))
     ideal_height = float(criteria.target_plot_area_sqm / ideal_width)
     columns = _safe_grid_count(width, ideal_width, 0)
-    rows = _safe_grid_count(height, ideal_height, criteria.road_width_m)
+    rows = _safe_grid_count(height, ideal_height, criteria.road_width_m / 2)
     cell_width = width / columns
-    available_height = height - max(0, rows - 1) * criteria.road_width_m
+    row_pairs = math.ceil(rows / 2)
+    road_gaps = max(0, row_pairs - 1)
+    available_height = height - road_gaps * criteria.road_width_m
     cell_height = available_height / rows
     if cell_width <= 0 or cell_height <= 0:
         raise ValueError("The selected road width leaves no room for plots")
 
-    cells: list[tuple[int, int, Polygon]] = []
+    row_starts: list[float] = []
+    y_cursor = min_y
     for row_index in range(rows):
-        y0 = min_y + row_index * (cell_height + criteria.road_width_m)
+        if row_index > 0 and row_index % 2 == 0:
+            y_cursor += criteria.road_width_m
+        row_starts.append(y_cursor)
+        y_cursor += cell_height
+
+    cells: list[tuple[int, int, Polygon]] = []
+    for row_index, y0 in enumerate(row_starts):
         for column_index in range(columns):
             x0 = min_x + column_index * cell_width
             clipped = _clean_polygon(box(x0, y0, x0 + cell_width, y0 + cell_height).intersection(rotated))
@@ -161,7 +172,7 @@ def generate_estate_layout(boundary_wgs84: Polygon, criteria: EstateLayoutCriter
         plot_candidates.append(
             {
                 "plot_number": f"{criteria.plot_prefix}-{len(plot_candidates) + 1:03d}",
-                "block_label": chr(65 + (row_index % 26)),
+                "block_label": chr(65 + ((row_index // 2) % 26)),
                 "geometry": _json_geometry(plot_wgs84),
                 "area_sqm": round(abs(float(area_sqm)), 2),
                 "valid": True,
@@ -175,7 +186,9 @@ def generate_estate_layout(boundary_wgs84: Polygon, criteria: EstateLayoutCriter
     if criteria.include_roads:
         road_lines: list[Any] = []
         for row_index in range(1, rows):
-            y = min_y + row_index * cell_height + (row_index - 0.5) * criteria.road_width_m
+            if row_index % 2 != 0:
+                continue  # this boundary is a back-to-back pair join, not a road
+            y = (row_starts[row_index - 1] + cell_height + row_starts[row_index]) / 2
             road_lines.extend(_line_parts(rotated.intersection(LineString([(min_x, y), (max_x, y)]))))
         for index, road in enumerate(road_lines, 1):
             oriented = shapely_transform(
@@ -186,7 +199,7 @@ def generate_estate_layout(boundary_wgs84: Polygon, criteria: EstateLayoutCriter
                 road,
             )
             if not oriented.is_empty and oriented.length > 1:
-                feature_candidates.append({"feature_type": "road", "name": f"Road {index}", "geometry": _json_geometry(shapely_transform(backward, oriented))})
+                feature_candidates.append({"feature_type": "road", "name": f"Road {index}", "width_m": float(criteria.road_width_m), "geometry": _json_geometry(shapely_transform(backward, oriented))})
 
     if open_space_geometries:
         open_space = unary_union(open_space_geometries)
