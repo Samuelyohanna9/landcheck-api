@@ -5,6 +5,7 @@ import os
 from decimal import Decimal
 
 from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi.responses import RedirectResponse
 from sqlalchemy.orm import Session
 
 from app.models.estate_billing import EstateSubscription, EstateSubscriptionCharge
@@ -179,18 +180,22 @@ def _complete_verification(db: Session, verify_data: dict) -> dict:
 
 
 @router.get("/checkout/return")
-def checkout_return(transaction_id: str, tx_ref: str, status: str, db: Session = Depends(get_db)):
+def checkout_return(transaction_id: str | None = None, tx_ref: str | None = None, status: str | None = None, db: Session = Depends(get_db)):
+    """Flutterwave sends the CUSTOMER'S BROWSER here after checkout - this must answer with a real
+    HTTP redirect back into the web app, never a JSON body (nothing reads it as an API response;
+    a person is looking at whatever this returns)."""
+    web_url = str(os.getenv("LANDCHECK_WEB_URL") or "https://landcheck.online").rstrip("/")
     # `status` is Flutterwave's own claim from the redirect query string - always re-verified
     # server-side below rather than trusted directly, same as the webhook path.
-    try:
-        verify_data = flw.verify_transaction(transaction_id) if transaction_id else flw.verify_transaction_by_reference(tx_ref)
-        result = _complete_verification(db, verify_data)
-    except Exception:
-        logger.exception("Estate billing checkout-return verification failed (tx_ref=%s)", tx_ref)
-        result = {"ok": False, "message": "We could not confirm this payment. Please contact support."}
-    web_url = str(os.getenv("LANDCHECK_WEB_URL") or "https://landcheck.online").rstrip("/")
-    outcome = "success" if result.get("ok") else "failed"
-    return {"redirect": f"{web_url}/estates/choose-plan?result={outcome}"}
+    outcome = "failed"
+    if str(status or "").lower() != "cancelled" and (transaction_id or tx_ref):
+        try:
+            verify_data = flw.verify_transaction(transaction_id) if transaction_id else flw.verify_transaction_by_reference(tx_ref)  # type: ignore[arg-type]
+            result = _complete_verification(db, verify_data)
+            outcome = "success" if result.get("ok") else "failed"
+        except Exception:
+            logger.exception("Estate billing checkout-return verification failed (tx_ref=%s)", tx_ref)
+    return RedirectResponse(f"{web_url}/estates/choose-plan?result={outcome}", status_code=302)
 
 
 @router.post("/webhook")
