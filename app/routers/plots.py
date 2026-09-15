@@ -9,7 +9,7 @@ from shapely import wkt as shapely_wkt
 from shapely.affinity import rotate
 from shapely.ops import unary_union, snap
 from sqlalchemy import text
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from app.schemas.plot_create import PlotCreateRequest
 from typing import Optional, Union, List, Any
 
@@ -40,7 +40,7 @@ import matplotlib.patches as patches
 from app.db import SessionLocal
 from app.models.plot import Plot
 from app.services.survey.plots import create_survey_plot
-from app.services.survey.dgps import alpha_station
+from app.services.survey.dgps import alpha_station, render_dgps_staking_csv
 from app.models.plot_buffer import PlotBuffer
 from app.utils.pdf import generate_plot_report_pdf
 from app.utils.survey_auth_security import require_survey_session, resolve_survey_session
@@ -63,7 +63,7 @@ from app.utils.map_renderer_layout import (
 from app.utils.back_computation import compute_back_computation
 from app.utils.survey_qc import check_plot_survey_quality
 from app.utils.back_computation_pdf import render_back_computation_pdf
-from app.utils.coordinate_converter import resolve_coordinate_system_key, validate_nigeria_bounds
+from app.utils.coordinate_converter import resolve_coordinate_system_key, validate_nigeria_bounds, convert_coordinates
 from shapely import wkb
 from shapely.errors import GEOSException
 import geopandas as gpd
@@ -6048,6 +6048,50 @@ def load_owned_plot_workspace(plot_id: int, request: Request, db: Session = Depe
         ],
         "meta": meta,
     }
+
+
+@router.get("/{plot_id}/exports/dgps.csv")
+def export_plot_dgps_csv(plot_id: int, request: Request, coordinate_system: str = "wgs84", raw: bool = False, db: Session = Depends(get_db)):
+    """Export any owned Survey plot's boundary vertices as a DGPS-format CSV, in whatever
+    coordinate system the caller asks for. Deliberately not gated behind Estate staking or the
+    georeference workflow - a plot whose points were typed in manually or drawn straight onto the
+    satellite map has exactly the same boundary data as one digitized from a georeferenced raster,
+    so there's no reason it can't be handed to a DGPS receiver the same way."""
+    session = require_survey_session(db, request)
+    plot = db.get(Plot, plot_id)
+    if not plot or plot.owner_user_id != session.user_id:
+        raise HTTPException(status_code=404, detail="Plot not found")
+    polygon = _load_plot_polygon_wgs84(db, plot_id)
+    coordinates = list(polygon.exterior.coords)
+    if coordinates and coordinates[0] == coordinates[-1]:
+        coordinates = coordinates[:-1]
+    if len(coordinates) < 3:
+        raise HTTPException(status_code=400, detail="This plot has no usable boundary coordinates to export.")
+    sample_lng, sample_lat = coordinates[0]
+    resolved_coordinate_system = resolve_coordinate_system_key(coordinate_system, sample_lng, sample_lat)
+    target_points = convert_coordinates([[float(lng), float(lat)] for lng, lat in coordinates], "wgs84", resolved_coordinate_system)
+    meta = get_plot_meta(db, plot_id) or {}
+    plot_label = str(meta.get("title_text") or "").strip() or f"Plot {plot.id}"
+    rows = [
+        {
+            "station": alpha_station(index),
+            "feature": plot_label,
+            "coordinate_system": resolved_coordinate_system,
+            "easting": target_points[index][0],
+            "northing": target_points[index][1],
+            "longitude": lng,
+            "latitude": lat,
+            "point_type": "Boundary",
+        }
+        for index, (lng, lat) in enumerate(coordinates)
+    ]
+    log_survey_activity(db, event_type="export_downloaded", workflow="survey", request=request, plot_id=plot.id, details={"export_type": "dgps_csv", "coordinate_system": resolved_coordinate_system, "vertex_count": len(rows)})
+    safe_label = _safe_filename_fragment(plot_label, f"Plot_{plot.id}")
+    return Response(
+        render_dgps_staking_csv(rows, raw=raw),
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{safe_label}_DGPS.csv"', "Cache-Control": "no-store, no-cache, must-revalidate", "Pragma": "no-cache"},
+    )
 
 
 @router.post("/bulk-delete")
