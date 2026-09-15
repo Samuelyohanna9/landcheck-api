@@ -3,8 +3,16 @@ from __future__ import annotations
 import os
 from logging.config import fileConfig
 
+from dotenv import load_dotenv
+
 from alembic import context
 from sqlalchemy import engine_from_config, pool
+
+# app/db.py resolves DATABASE_URL the same way (load_dotenv() then os.getenv) - alembic runs as
+# its own standalone process (e.g. `docker compose exec api alembic ...`), so without this it never
+# sees the .env file the app itself reads, and silently falls back to the placeholder URL in
+# alembic.ini instead (which pointed at localhost, not the "db" container).
+load_dotenv()
 
 from app.db_base import Base
 from app.models import estate_foundation  # noqa: F401 - register Estate tables for autogeneration.
