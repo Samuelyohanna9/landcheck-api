@@ -221,21 +221,32 @@ def render_estate_layout_pdf(
     _draw_scale_bar(ax, minx=metric_minx, miny=metric_miny, span_x=span_x, scale=scale)
     _draw_north_arrow(ax, scale=scale)
 
+    # Row pitch and box height are both derived from the same scaled font size used for the
+    # legend text, instead of a fixed axes-fraction guess - the earlier fixed 0.021 step was tuned
+    # for a smaller legend font and started overlapping once that font size was bumped up.
+    legend_x = 0.02
+    box_top = 0.99
+    title_y = box_top - 0.028
+    step = 0.034
+    entries = [
+        (PLOT_FACE, "Plot"),
+        (ROAD_FILL, "Road"),
+        (OPEN_SPACE_FILL, "Open space"),
+        (DRAINAGE_FILL, "Drainage"),
+    ]
+    row_ys = [title_y - step * (index + 1.15) for index in range(len(entries) + 1)]  # +1 for the boundary row
+    box_bottom = row_ys[-1] - step * 0.55
     legend_box = mpatches.FancyBboxPatch(
-        (0.008, 0.86), 0.17, 0.13, transform=ax.transAxes,
+        (0.008, box_bottom), 0.175, box_top - box_bottom, transform=ax.transAxes,
         boxstyle="round,pad=0.006,rounding_size=0.006", facecolor="white", edgecolor=INK, linewidth=0.9 * scale, zorder=10,
     )
     ax.add_patch(legend_box)
-    legend_x = 0.02
-    legend_y = 0.958
-    step = 0.021
-    ax.text(legend_x, legend_y, "LEGEND", transform=ax.transAxes, fontsize=8.5 * scale, fontweight="bold", color=INK, zorder=11)
-    _legend_swatch(ax, legend_x, legend_y - step * 1.3, 0.012, facecolor=PLOT_FACE, label="Plot", scale=scale)
-    _legend_swatch(ax, legend_x, legend_y - step * 2.3, 0.012, facecolor=ROAD_FILL, label="Road", scale=scale)
-    _legend_swatch(ax, legend_x, legend_y - step * 3.3, 0.012, facecolor=OPEN_SPACE_FILL, label="Open space", scale=scale)
-    _legend_swatch(ax, legend_x, legend_y - step * 4.3, 0.012, facecolor=DRAINAGE_FILL, label="Drainage", scale=scale)
-    ax.plot([legend_x, legend_x + 0.012], [legend_y - step * 5.1, legend_y - step * 5.1], color=BOUNDARY_LINE, linewidth=2.6 * scale, transform=ax.transAxes, clip_on=False, zorder=11)
-    ax.text(legend_x + 0.012 * 1.6, legend_y - step * 5.1, "Estate boundary", transform=ax.transAxes, ha="left", va="center", fontsize=8.5 * scale, color=INK, clip_on=False, zorder=11)
+    ax.text(legend_x, title_y, "LEGEND", transform=ax.transAxes, fontsize=8.5 * scale, fontweight="bold", color=INK, zorder=11)
+    for (facecolor, label), row_y in zip(entries, row_ys):
+        _legend_swatch(ax, legend_x, row_y, 0.012, facecolor=facecolor, label=label, scale=scale)
+    boundary_row_y = row_ys[-1]
+    ax.plot([legend_x, legend_x + 0.012], [boundary_row_y + 0.006, boundary_row_y + 0.006], color=BOUNDARY_LINE, linewidth=2.6 * scale, transform=ax.transAxes, clip_on=False, zorder=11)
+    ax.text(legend_x + 0.012 * 1.6, boundary_row_y + 0.006, "Estate boundary", transform=ax.transAxes, ha="left", va="center", fontsize=8.5 * scale, color=INK, clip_on=False, zorder=11)
 
     generated_at = datetime.now(timezone.utc).strftime("%d %b %Y")
     title_text = (
