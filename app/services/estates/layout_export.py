@@ -111,6 +111,88 @@ def _legend_swatch(ax, x: float, y: float, size: float, *, facecolor: str, label
     ax.text(x + size * 1.6, y + size / 2, label, transform=ax.transAxes, ha="left", va="center", fontsize=8.5 * scale, color=INK, clip_on=False, zorder=11)
 
 
+PLOT_STATUS_FACE = {
+    "available": PLOT_FACE,
+    "reserved": "#fff4cc",
+    "allocated": "#d9f2e3",
+    "on_hold": "#eeeeee",
+}
+
+
+def render_estate_layout_thumbnail_png(
+    *,
+    estate: Any,
+    plots: list[Any],
+    features: list[Any],
+    to_shape_fn,
+    output_path: Any,
+    figsize_inches: tuple[float, float] = (7.6, 4.7),
+    dpi: int = 170,
+) -> None:
+    """A simplified, chrome-free snapshot of the layout (no legend/scale bar/north arrow, plots
+    tinted by commercial status) sized for embedding inside another document - e.g. the Estate
+    Performance Report - rather than standing alone as a survey plan in its own right.
+    output_path accepts anything matplotlib's savefig does, including a BytesIO buffer."""
+    all_polygons_wgs84: list[Polygon] = [to_shape_fn(plot.geometry) for plot in plots if plot.geometry]
+    if estate.boundary is not None:
+        all_polygons_wgs84.append(to_shape_fn(estate.boundary))
+    if not all_polygons_wgs84:
+        raise ValueError("Nothing to draw - this Estate has no plot or boundary geometry yet")
+
+    minx = min(poly.bounds[0] for poly in all_polygons_wgs84)
+    miny = min(poly.bounds[1] for poly in all_polygons_wgs84)
+    maxx = max(poly.bounds[2] for poly in all_polygons_wgs84)
+    maxy = max(poly.bounds[3] for poly in all_polygons_wgs84)
+    envelope = Polygon([(minx, miny), (maxx, miny), (maxx, maxy), (minx, maxy)])
+    metric_epsg = _metric_epsg_for_wgs84_polygon(envelope)
+    forward = Transformer.from_crs("EPSG:4326", f"EPSG:{metric_epsg}", always_xy=True).transform
+
+    fig, ax = plt.subplots(figsize=figsize_inches)
+
+    for feature in features:
+        geometry = to_shape_fn(feature.geometry)
+        metric_geometry = shapely_transform(forward, geometry)
+        kind = str(feature.feature_type or "")
+        face = DRAINAGE_FILL if kind == "drainage" else OPEN_SPACE_FILL if kind == "open_space" else ROAD_FILL
+        geoms = list(metric_geometry.geoms) if metric_geometry.geom_type.startswith("Multi") or metric_geometry.geom_type == "GeometryCollection" else [metric_geometry]
+        for part in geoms:
+            if part.geom_type == "Polygon":
+                ax.add_patch(mpatches.Polygon(list(part.exterior.coords), closed=True, facecolor=face, edgecolor="none", linewidth=0, zorder=1))
+            elif part.geom_type == "LineString" and kind == "road":
+                xs, ys = zip(*part.coords)
+                ax.plot(xs, ys, color=ROAD_LINE, linewidth=2.4, solid_capstyle="round", zorder=1)
+
+    metric_plot_polygons = []
+    for plot in plots:
+        if not plot.geometry:
+            continue
+        metric_polygon = shapely_transform(forward, to_shape_fn(plot.geometry))
+        metric_plot_polygons.append(metric_polygon)
+        face = PLOT_STATUS_FACE.get(str(plot.commercial_status or ""), PLOT_FACE)
+        ax.add_patch(mpatches.Polygon(list(metric_polygon.exterior.coords), closed=True, facecolor=face, edgecolor=PLOT_EDGE, linewidth=0.6, zorder=2))
+
+    if estate.boundary is not None:
+        boundary_metric = shapely_transform(forward, to_shape_fn(estate.boundary))
+        ax.add_patch(mpatches.Polygon(list(boundary_metric.exterior.coords), closed=True, facecolor="none", edgecolor=BOUNDARY_LINE, linewidth=1.8, zorder=5))
+
+    metric_polys_for_bounds = [shapely_transform(forward, poly) for poly in all_polygons_wgs84]
+    metric_minx = min(poly.bounds[0] for poly in metric_polys_for_bounds)
+    metric_miny = min(poly.bounds[1] for poly in metric_polys_for_bounds)
+    metric_maxx = max(poly.bounds[2] for poly in metric_polys_for_bounds)
+    metric_maxy = max(poly.bounds[3] for poly in metric_polys_for_bounds)
+    span_x = metric_maxx - metric_minx
+    span_y = metric_maxy - metric_miny
+    pad_x = span_x * 0.06 + 1
+    pad_y = span_y * 0.06 + 1
+    ax.set_xlim(metric_minx - pad_x, metric_maxx + pad_x)
+    ax.set_ylim(metric_miny - pad_y, metric_maxy + pad_y)
+    ax.set_aspect("equal")
+    ax.axis("off")
+    fig.tight_layout(pad=0.2)
+    fig.savefig(output_path, dpi=dpi, bbox_inches="tight", facecolor="white")
+    plt.close(fig)
+
+
 def render_estate_layout_pdf(
     *,
     estate: Any,

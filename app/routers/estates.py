@@ -43,6 +43,7 @@ from app.models.estate_auth import EstateAccount
 from app.utils.survey_auth_security import find_or_create_survey_user
 from app.services.estates import estate_email
 from app.services.estates.layout_export import render_estate_layout_pdf
+from app.services.estates.report_export import render_estate_report_pdf
 from app.services.estates import commissions
 
 
@@ -1335,6 +1336,28 @@ def assess_plot_hazards(plot_id: int, request: Request, db: Session = Depends(ge
     return {"plot_id": plot.id, "persisted": True, "assessments": [_hazard_row_payload(row) for row in rows], **results}
 
 
+@router.post("/{estate_id}/hazards/assess-all")
+def assess_estate_hazards(estate_id: int, request: Request, db: Session = Depends(get_db)):
+    """Runs flood + erosion screening for every approved plot in this Estate in one action - the
+    whole-layout equivalent of running it one plot at a time from each plot's drawer. Returns the
+    same aggregate shape as GET .../hazards so both this page and the Dashboard's Risk Overview
+    card (which reads that same endpoint) reflect the fresh run immediately."""
+    estate = db.get(Estate, estate_id)
+    if not estate:
+        raise HTTPException(404, "Estate not found")
+    access = require_estate_access(db, request, estate.organization_id, permission="plot.manage")
+    plots = db.query(EstatePlot).filter(EstatePlot.estate_id == estate_id, EstatePlot.geometry_status == "approved").all()
+    plots = [plot for plot in plots if plot.geometry]
+    if not plots:
+        raise HTTPException(422, "This Estate has no approved plot geometry to screen yet")
+    for plot in plots:
+        results = _calculate_plot_hazards(plot.geometry, db)
+        _persist_hazard_results(db, estate=estate, plot_id=plot.id, results=results, access=access)
+    append_estate_audit_event(db, organization_id=estate.organization_id, actor=access.principal, action="hazard.estate_assessment_completed", entity_type="estate", entity_id=estate.id, after_data={"plots_screened": len(plots)})
+    db.commit()
+    return estate_hazard_dashboard(estate_id, request, db)
+
+
 @router.get("/{estate_id}/hazards")
 def estate_hazard_dashboard(estate_id: int, request: Request, db: Session = Depends(get_db)):
     estate = db.get(Estate, estate_id)
@@ -1856,6 +1879,38 @@ def export_estate_layout_pdf(estate_id: int, request: Request, paper_size: str =
     return Response(pdf_bytes, media_type="application/pdf", headers={"Content-Disposition": f'attachment; filename="{safe_name}_Layout_Plan.pdf"'})
 
 
+@router.get("/{estate_id}/exports/report.pdf")
+def export_estate_report_pdf(estate_id: int, request: Request, db: Session = Depends(get_db)):
+    """A generated, print-ready Estate Performance Report - inventory, financial, geometry/hazard
+    and recent-activity figures plus a layout snapshot, all in one branded PDF - rather than a
+    browser Print of the on-screen Reports page."""
+    estate = db.get(Estate, estate_id)
+    if not estate: raise HTTPException(404, "Estate not found")
+    access = require_estate_access(db, request, estate.organization_id, permission="estate.read")
+    dashboard = estate_dashboard(estate_id, request, db)
+    quality = estate_quality_check(estate_id, request, db)
+    hazard_data = estate_hazard_dashboard(estate_id, request, db)
+    activity = estate_activity(estate_id, request, limit=10, db=db)
+    plots = db.query(EstatePlot).filter(EstatePlot.estate_id == estate_id, EstatePlot.geometry_status == "approved").order_by(EstatePlot.plot_number).all()
+    features = db.query(EstateSpatialFeature).filter(EstateSpatialFeature.estate_id == estate_id, EstateSpatialFeature.status == "active").all()
+    tmp_path: str | None = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp_file:
+            tmp_path = tmp_file.name
+        result = render_estate_report_pdf(estate=estate, organization_name=access.organization_name, dashboard=dashboard, quality=quality, hazards=hazard_data, activity=activity, plots=plots, features=features, to_shape_fn=to_shape, output_path=tmp_path)
+        with open(tmp_path, "rb") as handle:
+            pdf_bytes = handle.read()
+    except ValueError as error:
+        raise HTTPException(422, str(error))
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            os.remove(tmp_path)
+    append_estate_audit_event(db, organization_id=estate.organization_id, actor=access.principal, action="estate.report_pdf_exported", entity_type="estate", entity_id=estate.id, after_data=result)
+    db.commit()
+    safe_name = re.sub(r"[^A-Za-z0-9._-]+", "-", estate.name).strip("-.") or f"estate-{estate.id}"
+    return Response(pdf_bytes, media_type="application/pdf", headers={"Content-Disposition": f'attachment; filename="{safe_name}_Performance_Report.pdf"'})
+
+
 @router.post("/staking-tasks/{task_id}/start")
 def start_staking_task(task_id:int,request:Request,db:Session=Depends(get_db)):
     task=db.get(EstateStakingTask,task_id)
@@ -2295,7 +2350,7 @@ def estate_selectors(request:Request, estate_id:int|None=None, customer_id:int|N
     allocation_items=[]
     for allocation,estate,plot,customer in allocations.all():
         summary=financial_summary(db,allocation); allocation_items.append({"id":allocation.id,"estate_id":estate.id,"estate_name":estate.name,"plot_id":plot.id,"plot_number":plot.plot_number,"customer_id":customer.id,"customer_name":customer.full_name,"status":allocation.status,"allocation_date":allocation.allocation_date,"payment_plan":allocation.payment_plan,"agreed_price":str(summary.agreed_price),"currency":"NGN","confirmed":str(summary.confirmed_paid),"pending":str(summary.pending_paid),"outstanding":str(summary.outstanding)})
-    return {"estates":[{"id":e.id,"name":e.name} for e in estates],"customers":[{"id":c.id,"name":c.full_name,"reference":c.reference_no} for c in customers],"plots":[{"id":p.id,"plot_number":p.plot_number,"estate_id":e.id,"estate_name":e.name,"commercial_status":p.commercial_status,"development_status":p.development_status} for p,e in plots],"allocations":allocation_items}
+    return {"estates":[{"id":e.id,"name":e.name} for e in estates],"customers":[{"id":c.id,"name":c.full_name,"reference":c.reference_no} for c in customers],"plots":[{"id":p.id,"plot_number":p.plot_number,"estate_id":e.id,"estate_name":e.name,"commercial_status":p.commercial_status,"development_status":p.development_status,"geometry_status":p.geometry_status,"block_id":p.block_id,"area_sqm":float(p.area_sqm) if p.area_sqm is not None else 0.0} for p,e in plots],"allocations":allocation_items}
 
 
 @router.get("/{estate_id}")
