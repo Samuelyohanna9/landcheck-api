@@ -24,6 +24,7 @@ from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.platypus import (
     HRFlowable,
     Image,
+    KeepTogether,
     ListFlowable,
     ListItem,
     Paragraph,
@@ -123,7 +124,11 @@ def _metric_strip(items: list[tuple[str, str]], styles: dict, col_width: float, 
     return table
 
 
-def _data_table(header: list[str], rows: list[list[str]], styles: dict, col_widths: list[float] | None = None) -> Table:
+def _data_table(header: list[str], rows: list[list[str]], styles: dict, col_widths: list[float] | None = None):
+    # KeepTogether rather than a plain Table: reportlab splits a Table across a page break by
+    # default (repeating the header row on the continuation), which for a short table like these
+    # just reads as an arbitrarily broken table with one or two orphaned rows on the next page.
+    # KeepTogether instead pushes the whole table onto the next page if it doesn't fit where it is.
     head = [Paragraph(text, styles["th"]) for text in header]
     body_rows = [[Paragraph(str(cell), styles["td"]) for cell in row] for row in rows]
     table = Table([head] + body_rows, colWidths=col_widths, repeatRows=1)
@@ -138,7 +143,7 @@ def _data_table(header: list[str], rows: list[list[str]], styles: dict, col_widt
         ("RIGHTPADDING", (0, 0), (-1, -1), 2),
     ]
     table.setStyle(TableStyle(style))
-    return table
+    return KeepTogether([table])
 
 
 def _risk_color(risk_class: str | None) -> colors.Color:

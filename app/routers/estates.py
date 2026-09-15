@@ -2107,12 +2107,13 @@ def commission_report(organization_id: int, request: Request, db: Session = Depe
     return {"organization_id": organization_id, "agents": results}
 
 
-def _apply_initial_payment(db: Session, *, record: EstateAllocation, payload: AllocationAction, actor) -> None:
+def _apply_initial_payment(db: Session, *, record: EstateAllocation, payload: AllocationAction, actor) -> EstatePayment | None:
     """An initial payment entered in the same reserve/allocate call is recorded AND immediately
     confirmed - unlike a normal payment, this represents money the org is directly attesting it
-    already received, not a pending customer claim awaiting confirmation."""
+    already received, not a pending customer claim awaiting confirmation. Returns the created
+    payment (or None if no initial amount was given) so the caller can attach a receipt to it."""
     if not payload.initial_payment_amount:
-        return
+        return None
     payment = record_payment(
         db,
         allocation=record,
@@ -2125,6 +2126,7 @@ def _apply_initial_payment(db: Session, *, record: EstateAllocation, payload: Al
         confirmation_required=False,
     )
     confirm_payment(db, payment=payment, actor=actor)
+    return payment
 
 
 def _notify_allocation_customer(db: Session, *, allocation: EstateAllocation, org_name: str, event: str, amount_just_paid=None) -> None:
@@ -2162,10 +2164,10 @@ def reserve_plot(estate_id: int, plot_id: int, payload: AllocationAction, reques
     if payload.sales_agent_subject_type and payload.sales_agent_subject_id:
         record.sales_agent_subject_type = payload.sales_agent_subject_type
         record.sales_agent_subject_id = payload.sales_agent_subject_id
-    _apply_initial_payment(db, record=record, payload=payload, actor=access.principal)
+    initial_payment = _apply_initial_payment(db, record=record, payload=payload, actor=access.principal)
     db.commit()
     _notify_allocation_customer(db, allocation=record, org_name=access.organization_name, event="reserved")
-    return {"id": record.id, "status": record.status, "agreed_price": str(record.agreed_price) if record.agreed_price is not None else None}
+    return {"id": record.id, "status": record.status, "agreed_price": str(record.agreed_price) if record.agreed_price is not None else None, "initial_payment_id": initial_payment.id if initial_payment else None}
 
 
 @router.post("/{estate_id}/plots/{plot_id}/allocate")
@@ -2196,11 +2198,11 @@ def allocate_plot(estate_id: int, plot_id: int, payload: AllocationAction, reque
     if payload.sales_agent_subject_type and payload.sales_agent_subject_id:
         record.sales_agent_subject_type = payload.sales_agent_subject_type
         record.sales_agent_subject_id = payload.sales_agent_subject_id
-    _apply_initial_payment(db, record=record, payload=payload, actor=access.principal)
+    initial_payment = _apply_initial_payment(db, record=record, payload=payload, actor=access.principal)
     commissions.apply_commission(db, allocation=record)
     db.commit()
     _notify_allocation_customer(db, allocation=record, org_name=access.organization_name, event="allocated")
-    return {"id": record.id, "status": record.status, "agreed_price": str(record.agreed_price) if record.agreed_price is not None else None}
+    return {"id": record.id, "status": record.status, "agreed_price": str(record.agreed_price) if record.agreed_price is not None else None, "initial_payment_id": initial_payment.id if initial_payment else None}
 
 
 @router.post("/allocations/{allocation_id}/release")
