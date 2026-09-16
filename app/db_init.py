@@ -11,4 +11,7 @@ from app.models import estate_auth  # noqa: F401 - register Estate identity mode
 
 
 def init_db():
-    Base.metadata.create_all(bind=engine)
+    # Estate tables are versioned by Alembic and must not be created or altered
+    # implicitly during application startup.
+    legacy_tables = [table for table in Base.metadata.sorted_tables if not table.name.startswith("estate_")]
+    Base.metadata.create_all(bind=engine, tables=legacy_tables)

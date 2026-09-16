@@ -42,3 +42,10 @@ def test_container_startup_applies_migrations_before_serving_api():
     assert "alembic upgrade head" in compose
     assert "exec uvicorn app.main:app" in compose
     assert compose.index("alembic upgrade head") < compose.index("exec uvicorn app.main:app")
+
+
+def test_schema_is_owned_by_alembic_not_runtime_create_all():
+    db_init = (ROOT / "app" / "db_init.py").read_text(encoding="utf-8")
+    migration = (ROOT / "alembic" / "versions" / "20260916_0021_estate_public_showcase.py").read_text(encoding="utf-8")
+    assert 'table.name.startswith("estate_")' in db_init
+    assert "has_table(\"estate_public_reservation_requests\")" in migration

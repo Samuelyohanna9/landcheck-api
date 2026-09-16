@@ -171,7 +171,7 @@ def _run_estate_subscription_billing_job():
         session_db.close()
 
 
-# ✅ Create tables on startup
+# Preserve the legacy Survey/Green bootstrap; Estate schema is managed by Alembic.
 @app.on_event("startup")
 def startup_event():
     init_db()
