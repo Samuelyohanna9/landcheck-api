@@ -6054,10 +6054,11 @@ def load_owned_plot_workspace(plot_id: int, request: Request, db: Session = Depe
     if coordinates and coordinates[0] == coordinates[-1]:
         coordinates = coordinates[:-1]
     meta = get_plot_meta(db, plot_id)
+    saved_station_names = _station_names_from_survey_input_coordinates(meta.get("survey_input_coordinates"))
     return {
         "plot_id": plot.id,
         "coordinates": [
-            {"station": alpha_station(index), "lng": float(lng), "lat": float(lat), "is_boundary": True}
+            {"station": saved_station_names[index] if index < len(saved_station_names) else alpha_station(index), "lng": float(lng), "lat": float(lat), "is_boundary": True}
             for index, (lng, lat) in enumerate(coordinates)
         ],
         "meta": meta,
