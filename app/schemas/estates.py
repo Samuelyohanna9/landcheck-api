@@ -34,12 +34,25 @@ class EstateUpdate(BaseModel):
     approximate_area_sqm: Decimal | None = Field(default=None, gt=0)
     boundary: dict[str, Any] | None = None
 
+
+class PublicEstateSettingsUpdate(BaseModel):
+    public_enabled: bool = False
+    public_slug: str | None = Field(default=None, min_length=3, max_length=140, pattern="^[a-z0-9]+(?:-[a-z0-9]+)*$")
+    public_description: str | None = Field(default=None, max_length=4000)
+    public_contact_phone: str | None = Field(default=None, max_length=64)
+    public_show_prices: bool = True
+
 class PlotCreate(BaseModel):
     plot_number: str
     geometry: dict[str, Any]
     block_id: int | None = None
     land_use: str | None = None
     geometry_status: str = "draft"
+    asking_price: Decimal | None = Field(default=None, gt=0)
+
+
+class PlotPriceUpdate(BaseModel):
+    asking_price: Decimal | None = Field(default=None, gt=0)
 
 
 class EstateSubdivisionCreate(BaseModel):
@@ -231,3 +244,15 @@ class PaymentCreate(BaseModel):
 
 class VoidAction(BaseModel):
     reason: str = Field(min_length=1)
+
+
+class PublicReservationCreate(BaseModel):
+    full_name: str = Field(min_length=2, max_length=255)
+    phone: str = Field(min_length=5, max_length=64)
+    email: str | None = Field(default=None, max_length=255)
+    message: str | None = Field(default=None, max_length=2000)
+
+
+class PublicReservationUpdate(BaseModel):
+    status: str = Field(pattern="^(new|contacted|converted|declined)$")
+    staff_notes: str | None = Field(default=None, max_length=4000)

@@ -104,6 +104,11 @@ class Estate(Base):
     project_owner = Column(String(255), nullable=True)
     ownership_details = Column(Text, nullable=True)
     boundary = Column(Geometry("POLYGON", srid=4326), nullable=True)
+    public_slug = Column(String(140), nullable=True, unique=True)
+    public_enabled = Column(Boolean, nullable=False, default=False)
+    public_description = Column(Text, nullable=True)
+    public_contact_phone = Column(String(64), nullable=True)
+    public_show_prices = Column(Boolean, nullable=False, default=True)
     created_by_subject_type = Column(String(64), nullable=False)
     created_by_subject_id = Column(String(128), nullable=False)
     created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
@@ -134,6 +139,7 @@ class EstatePlot(Base):
     plot_number_normalized = Column(String(120), nullable=False)
     geometry = Column(Geometry("POLYGON", srid=4326), nullable=False)
     area_sqm = Column(Numeric(16, 2), nullable=False)
+    asking_price = Column(Numeric(16, 2), nullable=True)
     land_use = Column(String(120), nullable=True)
     commercial_status = Column(String(32), nullable=False, default="available")
     development_status = Column(String(32), nullable=False, default="not_started")
@@ -145,6 +151,32 @@ class EstatePlot(Base):
     created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
     updated_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
     __table_args__ = (UniqueConstraint("estate_id", "plot_number_normalized", name="uq_estate_plot_number"),)
+
+
+class EstatePublicReservationRequest(Base):
+    """A public sales lead for a plot, separate from an internal allocation/customer record."""
+
+    __tablename__ = "estate_public_reservation_requests"
+
+    id = Column(Integer, primary_key=True)
+    request_uid = Column(String(36), nullable=False, unique=True, default=lambda: str(uuid.uuid4()))
+    organization_id = Column(Integer, ForeignKey("estate_organizations.id", ondelete="CASCADE"), nullable=False)
+    estate_id = Column(Integer, ForeignKey("estate_estates.id", ondelete="CASCADE"), nullable=False)
+    plot_id = Column(Integer, ForeignKey("estate_plots.id", ondelete="CASCADE"), nullable=False)
+    full_name = Column(String(255), nullable=False)
+    phone = Column(String(64), nullable=False)
+    email = Column(String(255), nullable=True)
+    message = Column(Text, nullable=True)
+    status = Column(String(32), nullable=False, default="new")
+    staff_notes = Column(Text, nullable=True)
+    contacted_at = Column(DateTime(timezone=True), nullable=True)
+    resolved_at = Column(DateTime(timezone=True), nullable=True)
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
+
+    __table_args__ = (
+        CheckConstraint("status IN ('new', 'contacted', 'converted', 'declined')", name="ck_estate_public_reservation_status"),
+    )
 
 
 class EstateCustomer(Base):

@@ -78,11 +78,11 @@ def test_organization_scope_is_derived_from_membership_not_client_input(db_sessi
     principal = EstatePrincipal("survey_user", "42", "Survey User")
     monkeypatch.setattr(authorization, "resolve_estate_principal", lambda *_: principal)
 
-    allowed = require_estate_access(db_session, _request(), first.id, permission="estate.manage")
+    allowed = require_estate_access(db_session, _request(), first.id, permission="estate.manage", require_subscription=False)
     assert allowed.organization_id == first.id
 
     with pytest.raises(HTTPException) as error:
-        require_estate_access(db_session, _request(), second.id, permission="estate.read")
+        require_estate_access(db_session, _request(), second.id, permission="estate.read", require_subscription=False)
     assert error.value.status_code == 404
 
 

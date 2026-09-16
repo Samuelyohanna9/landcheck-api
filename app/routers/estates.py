@@ -23,9 +23,10 @@ from sqlalchemy.orm import Session
 
 from app.routers.plots import _metric_epsg_for_wgs84_polygon, _subdivide_polygon_equal_count, get_db
 from app.services.estates.authorization import list_estate_access, resolve_estate_principal
+from app.services.estates.identity import slugify
 from app.services.estates.entitlements import ESTATE_FEATURES, get_estate_entitlement
-from app.models.estate_foundation import Estate, EstateAllocation, EstateAuditEvent, EstateBlock, EstateCommissionPayout, EstateCommissionTier, EstateCustomer, EstateDocument, EstateDocumentLink, EstateFieldInspection, EstateHazardAssessment, EstateImportReview, EstateLayoutProposal, EstateOrganization, EstateOrganizationMember, EstatePayment, EstatePaymentRule, EstatePlot, EstateSpatialFeature, EstateSurveyRequest, EstateStakingTask
-from app.schemas.estates import AllocationAction, BlockCreate, BlockUpdate, CommissionPayoutCreate, CommissionTiersUpdate, CustomerCreate, DevelopmentStatusUpdate, EstateCreate, EstateLayoutCriteria, EstateLayoutDecision, EstateLayoutFeatureAdd, EstateLayoutFeatureRemove, EstateLayoutProposalEdit, EstateSubdivisionCreate, EstateUpdate, FieldInspectionCreate, GeoreferenceSessionLink, ImportFromGeoreference, ImportReviewCreate, ImportReviewDecision, ImportReviewFromGeoreferenceSession, MemberCreate, MemberUpdate, PlotCreate, PlotGeometryUpdate, PaymentCreate, SpatialFeatureCreate, SpatialFeatureUpdate, SurveyEligibilityUpdate, VoidAction
+from app.models.estate_foundation import Estate, EstateAllocation, EstateAuditEvent, EstateBlock, EstateCommissionPayout, EstateCommissionTier, EstateCustomer, EstateDocument, EstateDocumentLink, EstateFieldInspection, EstateHazardAssessment, EstateImportReview, EstateLayoutProposal, EstateOrganization, EstateOrganizationMember, EstatePayment, EstatePaymentRule, EstatePlot, EstatePublicReservationRequest, EstateSpatialFeature, EstateSurveyRequest, EstateStakingTask
+from app.schemas.estates import AllocationAction, BlockCreate, BlockUpdate, CommissionPayoutCreate, CommissionTiersUpdate, CustomerCreate, DevelopmentStatusUpdate, EstateCreate, EstateLayoutCriteria, EstateLayoutDecision, EstateLayoutFeatureAdd, EstateLayoutFeatureRemove, EstateLayoutProposalEdit, EstateSubdivisionCreate, EstateUpdate, FieldInspectionCreate, GeoreferenceSessionLink, ImportFromGeoreference, ImportReviewCreate, ImportReviewDecision, ImportReviewFromGeoreferenceSession, MemberCreate, MemberUpdate, PlotCreate, PlotGeometryUpdate, PlotPriceUpdate, PublicEstateSettingsUpdate, PublicReservationCreate, PublicReservationUpdate, PaymentCreate, SpatialFeatureCreate, SpatialFeatureUpdate, SurveyEligibilityUpdate, VoidAction
 from app.services.estates.payments import confirm_payment, financial_summary, record_payment, void_payment
 from app.services.estates.documents import read_private_estate_file, store_private_estate_file
 from app.services.estates.permissions import has_permission
@@ -43,7 +44,8 @@ from app.services.estates.layout_generation import generate_estate_layout
 from app.services.survey.dgps import alpha_station, render_dgps_staking_csv
 from app.utils.coordinate_converter import COORDINATE_SYSTEMS, resolve_coordinate_system_key, convert_coordinates
 from app.models.estate_auth import EstateAccount
-from app.utils.survey_auth_security import find_or_create_survey_user
+from app.utils.survey_auth_security import find_or_create_survey_user, issue_survey_session
+from app.models.plot import Plot
 from app.services.estates import estate_email
 from app.services.estates.layout_export import render_estate_layout_pdf
 from app.services.estates.report_export import render_customer_statement_pdf, render_estate_report_pdf
@@ -86,6 +88,76 @@ def _enabled(db: Session, org_id: int) -> None:
         raise HTTPException(status_code=404, detail="LandCheck Estates is not enabled")
 
 
+def _public_estate(db: Session, slug: str) -> Estate:
+    estate = db.query(Estate).filter(Estate.public_slug == str(slug or "").strip().lower()).one_or_none()
+    if not estate or estate.archived_at is not None or not estate.public_enabled or estate.status != "active":
+        raise HTTPException(status_code=404, detail="This Estate is not available.")
+    if not get_estate_entitlement(db, estate.organization_id, "ESTATE_PUBLIC_MAP").is_enabled:
+        raise HTTPException(status_code=404, detail="This Estate is not available.")
+    return estate
+
+
+def _public_reservation_payload(db: Session, row: EstatePublicReservationRequest) -> dict:
+    estate = db.get(Estate, row.estate_id)
+    plot = db.get(EstatePlot, row.plot_id)
+    return {
+        "id": row.id,
+        "uid": row.request_uid,
+        "estate_id": row.estate_id,
+        "estate_name": estate.name if estate else None,
+        "plot_id": row.plot_id,
+        "plot_number": plot.plot_number if plot else None,
+        "full_name": row.full_name,
+        "phone": row.phone,
+        "email": row.email,
+        "message": row.message,
+        "status": row.status,
+        "staff_notes": row.staff_notes,
+        "created_at": row.created_at,
+        "contacted_at": row.contacted_at,
+        "resolved_at": row.resolved_at,
+    }
+
+
+def _public_estate_payload(db: Session, estate: Estate) -> dict:
+    plots = (
+        db.query(EstatePlot)
+        .filter(EstatePlot.estate_id == estate.id, EstatePlot.geometry_status == "approved")
+        .order_by(EstatePlot.plot_number_normalized.asc())
+        .all()
+    )
+    blocks = {block.id: block.label for block in db.query(EstateBlock).filter(EstateBlock.estate_id == estate.id).all()}
+    visible_statuses = {"available", "reserved", "allocated", "on_hold", "under_survey", "under_staking", "developed"}
+    public_plots = [
+        {
+            "id": plot.id,
+            "plot_number": plot.plot_number,
+            "block": blocks.get(plot.block_id),
+            "area_sqm": float(plot.area_sqm) if plot.area_sqm is not None else None,
+            "status": plot.commercial_status if plot.commercial_status in visible_statuses else "on_hold",
+            "price": str(plot.asking_price) if estate.public_show_prices and plot.asking_price is not None else None,
+            "geometry": mapping(to_shape(plot.geometry)),
+        }
+        for plot in plots
+        if plot.geometry and plot.commercial_status in visible_statuses
+    ]
+    counts = {status: sum(1 for plot in public_plots if plot["status"] == status) for status in sorted(visible_statuses)}
+    organization = db.get(EstateOrganization, estate.organization_id)
+    return {
+        "id": estate.id,
+        "name": estate.name,
+        "slug": estate.public_slug,
+        "organization_name": organization.name if organization else None,
+        "description": estate.public_description or estate.description,
+        "location": estate.location_text or ", ".join(filter(None, [estate.locality, estate.state])) or None,
+        "contact_phone": estate.public_contact_phone,
+        "show_prices": bool(estate.public_show_prices),
+        "boundary": mapping(to_shape(estate.boundary)) if estate.boundary else None,
+        "plots": public_plots,
+        "counts": counts,
+    }
+
+
 def _geojson_geometry(value: dict, *, allow_polygon: bool = True):
     try:
         geometry = shape(value)
@@ -98,6 +170,65 @@ def _geojson_geometry(value: dict, *, allow_polygon: bool = True):
     if geometry.is_empty or not geometry.is_valid or geometry.geom_type not in allowed:
         raise HTTPException(status_code=422, detail="Geometry is empty, invalid, or unsupported")
     return geometry
+
+
+@router.get("/public/{slug}")
+def public_estate_showcase(slug: str, db: Session = Depends(get_db)):
+    """Return only the approved, public-safe inventory for a published Estate."""
+    return _public_estate_payload(db, _public_estate(db, slug))
+
+
+@router.post("/public/{slug}/plots/{plot_id}/reservation", status_code=201)
+def create_public_reservation(slug: str, plot_id: int, payload: PublicReservationCreate, db: Session = Depends(get_db)):
+    """Create a sales lead without creating a customer or changing plot ownership."""
+    estate = _public_estate(db, slug)
+    plot = (
+        db.query(EstatePlot)
+        .filter(EstatePlot.id == plot_id, EstatePlot.estate_id == estate.id, EstatePlot.geometry_status == "approved")
+        .one_or_none()
+    )
+    if not plot:
+        raise HTTPException(status_code=404, detail="Plot not found")
+    if plot.commercial_status != "available":
+        raise HTTPException(status_code=409, detail="This plot is no longer available")
+    email = str(payload.email or "").strip().lower() or None
+    if email and not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email):
+        raise HTTPException(status_code=422, detail="Enter a valid email address or leave it blank")
+    row = EstatePublicReservationRequest(
+        organization_id=estate.organization_id,
+        estate_id=estate.id,
+        plot_id=plot.id,
+        full_name=payload.full_name.strip(),
+        phone=payload.phone.strip(),
+        email=email,
+        message=payload.message.strip() if payload.message else None,
+        status="new",
+    )
+    db.add(row)
+    db.flush()
+    append_estate_audit_event(
+        db,
+        organization_id=estate.organization_id,
+        actor=None,
+        action="public_reservation.created",
+        entity_type="estate_public_reservation_request",
+        entity_id=row.id,
+        after_data={"estate_id": estate.id, "plot_id": plot.id, "plot_number": plot.plot_number, "full_name": row.full_name, "phone": row.phone, "email": row.email},
+        metadata={"source": "public_estate_showcase"},
+    )
+    db.commit()
+    organization = db.get(EstateOrganization, estate.organization_id)
+    notification_sent = estate_email.notify_reservation_request(
+        to_email=organization.contact_email if organization else None,
+        organization_name=organization.name if organization else "Estate team",
+        estate_name=estate.name,
+        plot_number=plot.plot_number,
+        full_name=row.full_name,
+        phone=row.phone,
+        email=row.email,
+        message=row.message,
+    )
+    return {"status": "received", "request_id": row.request_uid, "notification_sent": notification_sent}
 
 
 def _import_candidate(*, row_number: int, plot_number: str, geometry: dict) -> dict:
@@ -183,7 +314,7 @@ def list_estates(request: Request, db: Session = Depends(get_db)):
         if not get_estate_entitlement(db, item.organization_id, "ESTATES_ENABLED").is_enabled:
             continue
         rows.extend(db.query(Estate).filter(Estate.organization_id == item.organization_id, Estate.archived_at.is_(None)).all())
-    return [{"id": row.id, "uid": row.estate_uid, "name": row.name, "status": row.status, "organization_id": row.organization_id, "location": row.location_text, "crs": row.crs, "unit_system": row.unit_system, "project_reference": row.project_reference, "project_owner": row.project_owner} for row in rows]
+    return [{"id": row.id, "uid": row.estate_uid, "name": row.name, "status": row.status, "organization_id": row.organization_id, "location": row.location_text, "crs": row.crs, "unit_system": row.unit_system, "project_reference": row.project_reference, "project_owner": row.project_owner, "public_enabled": bool(row.public_enabled), "public_slug": row.public_slug} for row in rows]
 
 
 @router.post("/organizations/{organization_id}")
@@ -345,13 +476,114 @@ def estate_dashboard(estate_id: int, request: Request, db: Session = Depends(get
         },
     }
 
+
+@router.get("/{estate_id}/public-settings")
+def get_public_estate_settings(estate_id: int, request: Request, db: Session = Depends(get_db)):
+    estate = db.get(Estate, estate_id)
+    if not estate:
+        raise HTTPException(404, "Estate not found")
+    require_estate_access(db, request, estate.organization_id, permission="estate.read")
+    _enabled(db, estate.organization_id)
+    return {
+        "estate_id": estate.id,
+        "public_enabled": bool(estate.public_enabled),
+        "public_slug": estate.public_slug,
+        "public_url_path": f"/estates/public/{estate.public_slug}" if estate.public_slug else None,
+        "public_description": estate.public_description,
+        "public_contact_phone": estate.public_contact_phone,
+        "public_show_prices": bool(estate.public_show_prices),
+        "can_publish": estate.status == "active" and db.query(EstatePlot).filter(EstatePlot.estate_id == estate.id, EstatePlot.geometry_status == "approved").count() > 0,
+    }
+
+
+@router.patch("/{estate_id}/public-settings")
+def update_public_estate_settings(estate_id: int, payload: PublicEstateSettingsUpdate, request: Request, db: Session = Depends(get_db)):
+    estate = db.get(Estate, estate_id)
+    if not estate:
+        raise HTTPException(404, "Estate not found")
+    access = require_estate_access(db, request, estate.organization_id, permission="estate.manage")
+    _enabled(db, estate.organization_id)
+    approved_plot_count = db.query(EstatePlot).filter(EstatePlot.estate_id == estate.id, EstatePlot.geometry_status == "approved").count()
+    if payload.public_enabled and (estate.status != "active" or approved_plot_count == 0):
+        raise HTTPException(status_code=409, detail="Approve the Estate map before publishing it publicly")
+    requested_slug = str(payload.public_slug or estate.public_slug or slugify(estate.name)).strip().lower()
+    if not requested_slug:
+        raise HTTPException(status_code=422, detail="Add a public web address for this Estate")
+    conflict = db.query(Estate).filter(Estate.public_slug == requested_slug, Estate.id != estate.id).first()
+    if conflict:
+        raise HTTPException(status_code=409, detail="That public web address is already in use")
+    before = {"public_enabled": estate.public_enabled, "public_slug": estate.public_slug, "public_show_prices": estate.public_show_prices}
+    estate.public_enabled = payload.public_enabled
+    estate.public_slug = requested_slug
+    estate.public_description = payload.public_description.strip() if payload.public_description else None
+    estate.public_contact_phone = payload.public_contact_phone.strip() if payload.public_contact_phone else None
+    estate.public_show_prices = payload.public_show_prices
+    append_estate_audit_event(
+        db,
+        organization_id=estate.organization_id,
+        actor=access.principal,
+        action="estate.public_settings.updated",
+        entity_type="estate",
+        entity_id=estate.id,
+        before_data=before,
+        after_data={"public_enabled": estate.public_enabled, "public_slug": estate.public_slug, "public_show_prices": estate.public_show_prices},
+    )
+    db.commit()
+    return get_public_estate_settings(estate_id, request, db)
+
+
+@router.get("/{estate_id}/reservation-requests")
+def list_public_reservation_requests(estate_id: int, request: Request, status: str | None = None, db: Session = Depends(get_db)):
+    estate = db.get(Estate, estate_id)
+    if not estate:
+        raise HTTPException(404, "Estate not found")
+    require_estate_access(db, request, estate.organization_id, permission="allocation.read")
+    query = db.query(EstatePublicReservationRequest).filter(EstatePublicReservationRequest.estate_id == estate.id)
+    if status and status != "all":
+        if status not in {"new", "contacted", "converted", "declined"}:
+            raise HTTPException(status_code=422, detail="Unknown reservation request status")
+        query = query.filter(EstatePublicReservationRequest.status == status)
+    rows = query.order_by(EstatePublicReservationRequest.created_at.desc()).limit(200).all()
+    return [_public_reservation_payload(db, row) for row in rows]
+
+
+@router.patch("/reservation-requests/{request_id}")
+def update_public_reservation_request(request_id: int, payload: PublicReservationUpdate, request: Request, db: Session = Depends(get_db)):
+    row = db.get(EstatePublicReservationRequest, request_id)
+    if not row:
+        raise HTTPException(404, "Reservation request not found")
+    access = require_estate_access(db, request, row.organization_id, permission="allocation.manage")
+    previous = row.status
+    row.status = payload.status
+    if "staff_notes" in payload.model_fields_set:
+        row.staff_notes = payload.staff_notes.strip() if payload.staff_notes else None
+    now = datetime.now(timezone.utc)
+    if payload.status == "contacted" and row.contacted_at is None:
+        row.contacted_at = now
+    if payload.status in {"converted", "declined"}:
+        row.resolved_at = row.resolved_at or now
+    elif payload.status in {"new", "contacted"}:
+        row.resolved_at = None
+    append_estate_audit_event(
+        db,
+        organization_id=row.organization_id,
+        actor=access.principal,
+        action="public_reservation.updated",
+        entity_type="estate_public_reservation_request",
+        entity_id=row.id,
+        before_data={"status": previous},
+        after_data={"status": row.status, "staff_notes": row.staff_notes},
+    )
+    db.commit()
+    return _public_reservation_payload(db, row)
+
 @router.get("/{estate_id}/plots.geojson")
 def estate_plots_geojson(estate_id: int, request: Request, db: Session = Depends(get_db)):
     estate=db.get(Estate,estate_id)
     if not estate: raise HTTPException(404,"Estate not found")
     require_estate_access(db,request,estate.organization_id,permission="plot.read")
     rows=db.query(EstatePlot).filter(EstatePlot.estate_id==estate_id).all()
-    return {"type":"FeatureCollection","features":[{"type":"Feature","id":plot.id,"properties":{"id":plot.id,"plot_number":plot.plot_number,"commercial_status":plot.commercial_status,"development_status":plot.development_status,"geometry_status":plot.geometry_status,"area_sqm":float(plot.area_sqm),"block_id":plot.block_id},"geometry":mapping(to_shape(plot.geometry))} for plot in rows if plot.geometry]}
+    return {"type":"FeatureCollection","features":[{"type":"Feature","id":plot.id,"properties":{"id":plot.id,"plot_number":plot.plot_number,"commercial_status":plot.commercial_status,"development_status":plot.development_status,"geometry_status":plot.geometry_status,"area_sqm":float(plot.area_sqm),"asking_price":str(plot.asking_price) if plot.asking_price is not None else None,"block_id":plot.block_id},"geometry":mapping(to_shape(plot.geometry))} for plot in rows if plot.geometry]}
 
 @router.get("/{estate_id}/layers.geojson")
 def estate_layers_geojson(estate_id:int, request:Request, db:Session=Depends(get_db)):
@@ -1554,9 +1786,32 @@ def create_plot(estate_id: int, payload: PlotCreate, request: Request, db: Sessi
     normalized = _normalized(payload.plot_number)
     if db.query(EstatePlot).filter(EstatePlot.estate_id == estate_id, EstatePlot.plot_number_normalized == normalized).first(): raise HTTPException(409, "Plot number already exists in this estate")
     if payload.block_id and not db.query(EstateBlock).filter(EstateBlock.id == payload.block_id, EstateBlock.estate_id == estate_id).first(): raise HTTPException(422, "Block does not belong to this estate")
-    plot = EstatePlot(estate_id=estate_id, block_id=payload.block_id, plot_number=payload.plot_number.strip(), plot_number_normalized=normalized, geometry=from_shape(shape(payload.geometry), srid=4326), area_sqm=area, land_use=payload.land_use, geometry_status=payload.geometry_status, created_by_subject_type=access.principal.subject_type, created_by_subject_id=access.principal.subject_id)
+    plot = EstatePlot(estate_id=estate_id, block_id=payload.block_id, plot_number=payload.plot_number.strip(), plot_number_normalized=normalized, geometry=from_shape(shape(payload.geometry), srid=4326), area_sqm=area, asking_price=payload.asking_price, land_use=payload.land_use, geometry_status=payload.geometry_status, created_by_subject_type=access.principal.subject_type, created_by_subject_id=access.principal.subject_id)
     db.add(plot); db.flush(); append_estate_audit_event(db, organization_id=estate.organization_id, actor=access.principal, action="plot.created", entity_type="estate_plot", entity_id=plot.id, after_data={"plot_number": plot.plot_number, "area_sqm": area, "geometry_status": plot.geometry_status})
     db.commit(); return {"id": plot.id, "uid": plot.plot_uid, "area_sqm": area, "qc": [{"severity": issue.severity, "code": issue.code, "message": issue.message} for issue in issues]}
+
+
+@router.patch("/plots/{plot_id}/public-price")
+def update_plot_public_price(plot_id: int, payload: PlotPriceUpdate, request: Request, db: Session = Depends(get_db)):
+    plot = db.get(EstatePlot, plot_id)
+    if not plot:
+        raise HTTPException(404, "Plot not found")
+    estate = db.get(Estate, plot.estate_id)
+    access = require_estate_access(db, request, estate.organization_id, permission="plot.manage")
+    previous = str(plot.asking_price) if plot.asking_price is not None else None
+    plot.asking_price = payload.asking_price
+    append_estate_audit_event(
+        db,
+        organization_id=estate.organization_id,
+        actor=access.principal,
+        action="plot.public_price_updated",
+        entity_type="estate_plot",
+        entity_id=plot.id,
+        before_data={"asking_price": previous},
+        after_data={"asking_price": str(plot.asking_price) if plot.asking_price is not None else None},
+    )
+    db.commit()
+    return {"id": plot.id, "asking_price": str(plot.asking_price) if plot.asking_price is not None else None}
 
 
 @router.patch("/{estate_id}/plots/{plot_id}/geometry")
@@ -1831,6 +2086,25 @@ def start_survey_request(request_id:int,request:Request,db:Session=Depends(get_d
     except Exception:
         db.rollback(); raise HTTPException(422,"Survey materialization failed")
     return _survey_payload(db,row)
+
+@router.post("/survey-requests/{request_id}/survey-session")
+def issue_survey_request_session(request_id:int,request:Request,db:Session=Depends(get_db)):
+    """The Survey working plot behind an Estate survey request is owned by a real Survey account
+    (see _resolve_survey_owner_user_id), not shared/anonymous - so opening it from the Estates
+    dashboard only works if the browser's Survey-side session already belongs to that exact
+    account. That's rarely true: the request may have been started by a different team member, on
+    a different device, or the browser's existing Survey session (if any) may simply be for
+    someone else's unrelated work. Rather than surface that mismatch as an error, anyone with
+    Estate access to this survey request gets a fresh Survey session for the plot's actual owner
+    here, and the frontend swaps it in before handing off - so opening always just works,
+    regardless of who started it or what Survey session happened to already be active."""
+    row=db.get(EstateSurveyRequest,request_id)
+    if not row: raise HTTPException(404,"Survey request not found")
+    require_estate_access(db,request,row.organization_id,permission="survey.manage")
+    if not row.survey_working_plot_id: raise HTTPException(409,"Survey has not been started for this request yet")
+    plot=db.get(Plot,row.survey_working_plot_id)
+    if not plot or not plot.owner_user_id: raise HTTPException(404,"Survey working plot not found")
+    return {"survey_session": issue_survey_session(db, user_id=plot.owner_user_id)}
 
 
 @router.post("/survey-requests/{request_id}/complete")

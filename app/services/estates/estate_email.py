@@ -242,6 +242,55 @@ def _account_plain_text(heading: str, message_html: str, url: str | None = None)
     return "\n".join(lines)
 
 
+def notify_reservation_request(
+    *,
+    to_email: str | None,
+    organization_name: str,
+    estate_name: str,
+    plot_number: str,
+    full_name: str,
+    phone: str,
+    email: str | None = None,
+    message: str | None = None,
+) -> bool:
+    """Notify the developer that a public visitor requested a plot reservation.
+
+    This is deliberately separate from ``notify_customer``: a public reservation is a sales lead,
+    not an internal customer or allocation until the team verifies and converts it.
+    """
+    to_email = str(to_email or "").strip()
+    if not to_email:
+        return False
+    safe_message = html.escape(str(message or "").strip())
+    contact_line = f"<p><strong>Phone:</strong> {html.escape(phone)}</p>"
+    if email:
+        contact_line += f"<p><strong>Email:</strong> {html.escape(email)}</p>"
+    if safe_message:
+        contact_line += f"<p><strong>Message:</strong><br/>{safe_message}</p>"
+    message_html = (
+        f"<p><strong>{html.escape(full_name)}</strong> requested a reservation for "
+        f"<strong>Plot {html.escape(plot_number)}</strong> at "
+        f"<strong>{html.escape(estate_name)}</strong> from the public Estate page.</p>"
+        f"{contact_line}"
+        "<p>Open your Estate workspace to follow up and convert the lead into a customer allocation "
+        "when the details are confirmed.</p>"
+    )
+    body_html = _account_wrap_html(heading="New plot reservation request", message_html=message_html)
+    body_text = _account_plain_text("New plot reservation request", message_html)
+    try:
+        _send_email(
+            to_email=to_email,
+            from_display_name="LandCheck Estates",
+            subject=f"New reservation request - Plot {plot_number}",
+            body_text=body_text,
+            body_html=body_html,
+        )
+        return True
+    except Exception:
+        logger.exception("Estate reservation notification failed (estate=%s, plot=%s)", estate_name, plot_number)
+        return False
+
+
 def send_welcome_email(*, organization, account) -> bool:
     """Sent right after a new company registers - the first email a customer ever gets from us,
     so it doubles as a mini product tour and pricing reference rather than a bare "you're in"."""

@@ -13,6 +13,7 @@ from app.models.estate_foundation import (
     EstateOrganizationEntitlement,
     EstateOrganizationMember,
 )
+from app.models.estate_billing import EstateSubscription
 
 
 def _test_database_url() -> str:
@@ -33,6 +34,7 @@ def db_session() -> Session:
         EstateOrganization.__table__,
         EstateOrganizationMember.__table__,
         EstateOrganizationEntitlement.__table__,
+        EstateSubscription.__table__,
         EstateAuditEvent.__table__,
     ]
     for table in tables:
