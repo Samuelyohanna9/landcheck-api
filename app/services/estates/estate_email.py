@@ -74,12 +74,12 @@ def _send_email(*, to_email: str, from_display_name: str, subject: str, body_tex
         server.send_message(msg)
 
 
-def _plot_link_html(plot_link: str | None) -> str:
+def _plot_link_html(plot_link: str | None, *, label: str = "View your plot on satellite map") -> str:
     if not plot_link:
         return ""
     return f"""
     <div style="margin:22px 0 0;text-align:center;">
-      <a href="{html.escape(plot_link)}" style="display:inline-block;padding:13px 26px;background:#1d8a49;color:#ffffff;font-size:14px;font-weight:700;text-decoration:none;border-radius:10px;">View your plot on satellite map</a>
+      <a href="{html.escape(plot_link)}" style="display:inline-block;padding:13px 26px;background:#1d8a49;color:#ffffff;font-size:14px;font-weight:700;text-decoration:none;border-radius:10px;">{html.escape(label)}</a>
     </div>
     """
 
@@ -288,6 +288,74 @@ def notify_reservation_request(
         return True
     except Exception:
         logger.exception("Estate reservation notification failed (estate=%s, plot=%s)", estate_name, plot_number)
+        return False
+
+
+def send_public_reservation_welcome(
+    *,
+    to_email: str | None,
+    organization_name: str,
+    estate_name: str,
+    plot_number: str,
+    plot_address: str | None = None,
+    area_sqm: Decimal | float | None = None,
+    price: Decimal | float | None = None,
+    payment_plan: list[dict] | None = None,
+    contact_phone: str | None = None,
+    contact_email: str | None = None,
+    public_page_url: str | None = None,
+) -> bool:
+    """Welcome a buyer who submitted a reservation request from the public Estate page."""
+    to_email = str(to_email or "").strip()
+    if not to_email:
+        return False
+    details = [f"<p><strong>Plot:</strong> {html.escape(plot_number)}</p>"]
+    if plot_address:
+        details.append(f"<p><strong>Address:</strong> {html.escape(plot_address)}</p>")
+    if area_sqm is not None:
+        details.append(f"<p><strong>Land area:</strong> {html.escape(f'{Decimal(area_sqm):,.2f} sq m')}</p>")
+    if price is not None:
+        details.append(f"<p><strong>Advertised price:</strong> {html.escape(format_naira(price))}</p>")
+    plan_html = ""
+    if payment_plan:
+        plan_rows = "".join(
+            f"<li>{html.escape(str(item.get('label') or 'Payment'))}: <strong>{html.escape(str(item.get('percentage') or '0'))}%</strong></li>"
+            for item in payment_plan
+        )
+        plan_html = f"<p><strong>Payment plan shown by the Estate:</strong></p><ul style=\"padding-left:20px;line-height:1.8;\">{plan_rows}</ul>"
+    contact_bits = []
+    if contact_phone:
+        contact_bits.append(f"<a href=\"tel:{html.escape(contact_phone)}\">{html.escape(contact_phone)}</a>")
+    if contact_email:
+        contact_bits.append(f"<a href=\"mailto:{html.escape(contact_email)}\">{html.escape(contact_email)}</a>")
+    contact_suffix = f": {' or '.join(contact_bits)}" if contact_bits else "."
+    message_html = (
+        f"<p>Thank you for believing in <strong>{html.escape(organization_name)}</strong>. We have received your request for "
+        f"<strong>Plot {html.escape(plot_number)}</strong> at <strong>{html.escape(estate_name)}</strong>.</p>"
+        + "".join(details)
+        + plan_html
+        + "<p>Our team will call you shortly to discuss availability, documentation and the next steps for completing your reservation.</p>"
+        + f"<p>If you have any questions, please contact {html.escape(organization_name)}{contact_suffix}</p>"
+    )
+    body_html = _wrap_html(
+        org_name=organization_name,
+        heading=f"Welcome to {estate_name}",
+        message_html=message_html,
+        financial_html="",
+        plot_link_html=_plot_link_html(public_page_url, label="View the Estate page"),
+    )
+    body_text = _plain_text(f"Welcome to {estate_name}", message_html, None, public_page_url)
+    try:
+        _send_email(
+            to_email=to_email,
+            from_display_name=organization_name,
+            subject=f"Welcome to {estate_name} - Plot {plot_number}",
+            body_text=body_text,
+            body_html=body_html,
+        )
+        return True
+    except Exception:
+        logger.exception("Public Estate reservation welcome email failed (estate=%s, plot=%s)", estate_name, plot_number)
         return False
 
 

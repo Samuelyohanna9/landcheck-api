@@ -111,6 +111,7 @@ class Estate(Base):
     public_contact_phone = Column(String(64), nullable=True)
     public_logo_object_key = Column(String(512), nullable=True)
     public_show_prices = Column(Boolean, nullable=False, default=True)
+    public_payment_plan = Column(JSON, nullable=True)
     created_by_subject_type = Column(String(64), nullable=False)
     created_by_subject_id = Column(String(128), nullable=False)
     created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
@@ -174,6 +175,8 @@ class EstatePublicReservationRequest(Base):
     staff_notes = Column(Text, nullable=True)
     contacted_at = Column(DateTime(timezone=True), nullable=True)
     resolved_at = Column(DateTime(timezone=True), nullable=True)
+    customer_id = Column(Integer, ForeignKey("estate_customers.id", ondelete="SET NULL"), nullable=True)
+    allocation_id = Column(Integer, ForeignKey("estate_allocations.id", ondelete="SET NULL"), nullable=True)
     created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
     updated_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
 

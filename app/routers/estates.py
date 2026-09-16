@@ -26,7 +26,7 @@ from app.services.estates.authorization import list_estate_access, resolve_estat
 from app.services.estates.identity import slugify
 from app.services.estates.entitlements import ESTATE_FEATURES, get_estate_entitlement
 from app.models.estate_foundation import Estate, EstateAllocation, EstateAuditEvent, EstateBlock, EstateCommissionPayout, EstateCommissionTier, EstateCustomer, EstateDocument, EstateDocumentLink, EstateFieldInspection, EstateHazardAssessment, EstateImportReview, EstateLayoutProposal, EstateOrganization, EstateOrganizationMember, EstatePayment, EstatePaymentRule, EstatePlot, EstatePublicReservationRequest, EstateSpatialFeature, EstateSurveyRequest, EstateStakingTask
-from app.schemas.estates import AllocationAction, BlockCreate, BlockUpdate, CommissionPayoutCreate, CommissionTiersUpdate, CustomerCreate, DevelopmentStatusUpdate, EstateCreate, EstateLayoutCriteria, EstateLayoutDecision, EstateLayoutFeatureAdd, EstateLayoutFeatureRemove, EstateLayoutProposalEdit, EstateSubdivisionCreate, EstateUpdate, FieldInspectionCreate, GeoreferenceSessionLink, ImportFromGeoreference, ImportReviewCreate, ImportReviewDecision, ImportReviewFromGeoreferenceSession, MemberCreate, MemberUpdate, PlotCreate, PlotAddressUpdate, PlotGeometryUpdate, PlotListingDefaultsUpdate, PlotPriceUpdate, PublicEstateSettingsUpdate, PublicReservationCreate, PublicReservationUpdate, PaymentCreate, SpatialFeatureCreate, SpatialFeatureUpdate, SurveyEligibilityUpdate, VoidAction
+from app.schemas.estates import AllocationAction, BlockCreate, BlockUpdate, CommissionPayoutCreate, CommissionTiersUpdate, CustomerCreate, DevelopmentStatusUpdate, EstateCreate, EstateLayoutCriteria, EstateLayoutDecision, EstateLayoutFeatureAdd, EstateLayoutFeatureRemove, EstateLayoutProposalEdit, EstateSubdivisionCreate, EstateUpdate, FieldInspectionCreate, GeoreferenceSessionLink, ImportFromGeoreference, ImportReviewCreate, ImportReviewDecision, ImportReviewFromGeoreferenceSession, MemberCreate, MemberUpdate, PlotCreate, PlotAddressUpdate, PlotGeometryUpdate, PlotListingDefaultsUpdate, PlotPriceUpdate, PublicEstateSettingsUpdate, PublicReservationConvert, PublicReservationCreate, PublicReservationUpdate, PaymentCreate, SpatialFeatureCreate, SpatialFeatureUpdate, SurveyEligibilityUpdate, VoidAction
 from app.services.estates.payments import confirm_payment, financial_summary, record_payment, void_payment
 from app.services.estates.documents import read_private_estate_file, store_private_estate_file
 from app.utils.r2_objects import delete_object_best_effort, build_r2_settings
@@ -117,6 +117,8 @@ def _public_reservation_payload(db: Session, row: EstatePublicReservationRequest
         "created_at": row.created_at,
         "contacted_at": row.contacted_at,
         "resolved_at": row.resolved_at,
+        "customer_id": row.customer_id,
+        "allocation_id": row.allocation_id,
     }
 
 
@@ -157,6 +159,7 @@ def _public_estate_payload(db: Session, estate: Estate) -> dict:
         "location": estate.location_text or ", ".join(filter(None, [estate.locality, estate.state])) or None,
         "contact_phone": estate.public_contact_phone,
         "show_prices": bool(estate.public_show_prices),
+        "payment_plan": estate.public_payment_plan or [],
         "boundary": mapping(to_shape(estate.boundary)) if estate.boundary else None,
         "plots": public_plots,
         "counts": counts,
@@ -255,7 +258,20 @@ def create_public_reservation(slug: str, plot_id: int, payload: PublicReservatio
         email=row.email,
         message=row.message,
     )
-    return {"status": "received", "request_id": row.request_uid, "notification_sent": notification_sent}
+    welcome_email_sent = estate_email.send_public_reservation_welcome(
+        to_email=row.email,
+        organization_name=organization.name if organization else "Estate team",
+        estate_name=estate.name,
+        plot_number=plot.plot_number,
+        plot_address=plot.public_address,
+        area_sqm=plot.area_sqm,
+        price=plot.asking_price if estate.public_show_prices else None,
+        payment_plan=estate.public_payment_plan,
+        contact_phone=estate.public_contact_phone,
+        contact_email=organization.contact_email if organization else None,
+        public_page_url=f"{str(os.getenv('LANDCHECK_WEB_URL') or 'https://landcheck.online').rstrip('/')}/estates/public/{estate.public_slug}",
+    )
+    return {"status": "received", "request_id": row.request_uid, "notification_sent": notification_sent, "welcome_email_sent": welcome_email_sent}
 
 
 def _import_candidate(*, row_number: int, plot_number: str, geometry: dict) -> dict:
@@ -521,6 +537,7 @@ def get_public_estate_settings(estate_id: int, request: Request, db: Session = D
         "public_contact_phone": estate.public_contact_phone,
         "public_logo_path": f"/estates/public/{estate.public_slug}/logo" if estate.public_logo_object_key else None,
         "public_show_prices": bool(estate.public_show_prices),
+        "payment_plan": estate.public_payment_plan or [],
         "can_publish": estate.status == "active" and db.query(EstatePlot).filter(EstatePlot.estate_id == estate.id, EstatePlot.geometry_status == "approved").count() > 0,
     }
 
@@ -536,13 +553,14 @@ def update_public_estate_settings(estate_id: int, payload: PublicEstateSettingsU
     if payload.public_enabled and (estate.status != "active" or approved_plot_count == 0):
         raise HTTPException(status_code=409, detail="Approve the Estate map before publishing it publicly")
     requested_slug = estate.public_slug or _unique_public_slug(db, estate)
-    before = {"public_enabled": estate.public_enabled, "public_slug": estate.public_slug, "public_show_prices": estate.public_show_prices}
+    before = {"public_enabled": estate.public_enabled, "public_slug": estate.public_slug, "public_show_prices": estate.public_show_prices, "payment_plan": estate.public_payment_plan}
     estate.public_enabled = payload.public_enabled
     estate.public_slug = requested_slug
     estate.public_description = payload.public_description.strip() if payload.public_description else None
     estate.public_tagline = payload.public_tagline.strip() if payload.public_tagline else None
     estate.public_contact_phone = payload.public_contact_phone.strip() if payload.public_contact_phone else None
     estate.public_show_prices = payload.public_show_prices
+    estate.public_payment_plan = [{"label": item.label.strip(), "percentage": str(item.percentage)} for item in payload.payment_plan] if payload.payment_plan else None
     append_estate_audit_event(
         db,
         organization_id=estate.organization_id,
@@ -551,7 +569,7 @@ def update_public_estate_settings(estate_id: int, payload: PublicEstateSettingsU
         entity_type="estate",
         entity_id=estate.id,
         before_data=before,
-        after_data={"public_enabled": estate.public_enabled, "public_slug": estate.public_slug, "public_tagline": estate.public_tagline, "public_show_prices": estate.public_show_prices},
+        after_data={"public_enabled": estate.public_enabled, "public_slug": estate.public_slug, "public_tagline": estate.public_tagline, "public_show_prices": estate.public_show_prices, "payment_plan": estate.public_payment_plan},
     )
     db.commit()
     return get_public_estate_settings(estate_id, request, db)
@@ -620,6 +638,8 @@ def update_public_reservation_request(request_id: int, payload: PublicReservatio
     if not row:
         raise HTTPException(404, "Reservation request not found")
     access = require_estate_access(db, request, row.organization_id, permission="allocation.manage")
+    if payload.status == "converted" and not row.allocation_id:
+        raise HTTPException(status_code=409, detail="Use Migrate to customer to create the customer and reserve this plot")
     previous = row.status
     row.status = payload.status
     if "staff_notes" in payload.model_fields_set:
@@ -643,6 +663,78 @@ def update_public_reservation_request(request_id: int, payload: PublicReservatio
     )
     db.commit()
     return _public_reservation_payload(db, row)
+
+
+@router.post("/reservation-requests/{request_id}/convert")
+def convert_public_reservation_request(
+    request_id: int,
+    payload: PublicReservationConvert,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    """Turn a public sales lead into the normal Estate customer and reservation workflow."""
+    row = db.get(EstatePublicReservationRequest, request_id)
+    if not row:
+        raise HTTPException(404, "Reservation request not found")
+    access = require_estate_access(db, request, row.organization_id, permission="allocation.manage")
+    if row.allocation_id:
+        return {**_public_reservation_payload(db, row), "customer_notified": False, "already_converted": True}
+    if row.status == "declined":
+        raise HTTPException(409, detail="A declined reservation request cannot be migrated")
+    plot = db.query(EstatePlot).filter(EstatePlot.id == row.plot_id, EstatePlot.estate_id == row.estate_id).one_or_none()
+    if not plot:
+        raise HTTPException(404, "The requested plot no longer exists")
+    if plot.commercial_status != "available":
+        raise HTTPException(409, detail="This plot is no longer available to reserve")
+    estate = db.get(Estate, row.estate_id)
+    if not estate:
+        raise HTTPException(404, "Estate not found")
+    customer = EstateCustomer(
+        organization_id=row.organization_id,
+        full_name=row.full_name,
+        full_name_normalized=_normalized(row.full_name),
+        phone=row.phone,
+        email=row.email,
+        notes=row.message,
+    )
+    db.add(customer)
+    db.flush()
+    agreed_price = payload.agreed_price if payload.agreed_price is not None else plot.asking_price
+    configured_payment_plan = "; ".join(
+        f"{item.get('label')}: {item.get('percentage')}%" for item in (estate.public_payment_plan or [])
+    ) or None
+    allocation = reserve_or_allocate(
+        db,
+        plot=plot,
+        customer=customer,
+        actor=access.principal,
+        allocate=False,
+        agreed_price=agreed_price,
+        payment_plan=payload.payment_plan or configured_payment_plan,
+        notes=payload.notes or "Created from public reservation request",
+    )
+    row.customer_id = customer.id
+    row.allocation_id = allocation.id
+    row.status = "converted"
+    row.contacted_at = row.contacted_at or datetime.now(timezone.utc)
+    row.resolved_at = datetime.now(timezone.utc)
+    append_estate_audit_event(
+        db,
+        organization_id=row.organization_id,
+        actor=access.principal,
+        action="public_reservation.converted",
+        entity_type="estate_public_reservation_request",
+        entity_id=row.id,
+        after_data={"customer_id": customer.id, "allocation_id": allocation.id, "plot_id": plot.id},
+    )
+    db.commit()
+    customer_notified = _notify_allocation_customer(
+        db,
+        allocation=allocation,
+        org_name=access.organization_name,
+        event="reserved",
+    )
+    return {**_public_reservation_payload(db, row), "customer_notified": customer_notified, "already_converted": False}
 
 @router.get("/{estate_id}/plots.geojson")
 def estate_plots_geojson(estate_id: int, request: Request, db: Session = Depends(get_db)):

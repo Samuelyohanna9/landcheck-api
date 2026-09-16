@@ -1,6 +1,6 @@
 from datetime import datetime
 from typing import Any
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from decimal import Decimal
 
 class EstateCreate(BaseModel):
@@ -35,12 +35,27 @@ class EstateUpdate(BaseModel):
     boundary: dict[str, Any] | None = None
 
 
+class PublicPaymentPlanItem(BaseModel):
+    label: str = Field(min_length=1, max_length=120)
+    percentage: Decimal = Field(gt=0, le=100)
+
+
 class PublicEstateSettingsUpdate(BaseModel):
     public_enabled: bool = False
     public_description: str | None = Field(default=None, max_length=4000)
     public_tagline: str | None = Field(default=None, max_length=255)
     public_contact_phone: str | None = Field(default=None, max_length=64)
     public_show_prices: bool = True
+    payment_plan: list[PublicPaymentPlanItem] | None = Field(default=None, max_length=8)
+
+    @model_validator(mode="after")
+    def validate_payment_plan(self):
+        if self.payment_plan:
+            if any(not item.label.strip() for item in self.payment_plan):
+                raise ValueError("Payment plan stages need a name")
+            if sum((item.percentage for item in self.payment_plan), Decimal("0")) != Decimal("100"):
+                raise ValueError("Payment plan percentages must add up to 100")
+        return self
 
 class PlotCreate(BaseModel):
     plot_number: str
@@ -270,3 +285,9 @@ class PublicReservationCreate(BaseModel):
 class PublicReservationUpdate(BaseModel):
     status: str = Field(pattern="^(new|contacted|converted|declined)$")
     staff_notes: str | None = Field(default=None, max_length=4000)
+
+
+class PublicReservationConvert(BaseModel):
+    agreed_price: Decimal | None = Field(default=None, gt=0)
+    payment_plan: str | None = Field(default=None, max_length=4000)
+    notes: str | None = Field(default=None, max_length=4000)

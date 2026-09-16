@@ -60,6 +60,23 @@ def _paper_scale_factor(paper_size: str) -> float:
     return math.hypot(width_in, height_in) / math.hypot(a3_w, a3_h)
 
 
+# Rough average glyph width for a sans-serif font, as a fraction of its point size - bold runs
+# wider than regular. Good enough to keep a label from overflowing its plot without needing an
+# actual font-metrics query (this file only ever runs headless, off-screen, generating one PDF).
+_BOLD_CHAR_WIDTH = 0.62
+_REGULAR_CHAR_WIDTH = 0.54
+
+
+def _fit_fontsize(text: str, available_width_pts: float, available_height_pts: float, max_fontsize: float, *, char_width: float) -> float:
+    """Largest font size (capped at max_fontsize) that keeps `text` inside the given width/height
+    in points. Returns 0 if there's no room even at the smallest legible size, so the caller can
+    skip the label instead of drawing overlapping garbage."""
+    if not text or available_width_pts <= 0 or available_height_pts <= 0:
+        return 0.0
+    width_limited = available_width_pts / (len(text) * char_width)
+    return max(0.0, min(max_fontsize, width_limited, available_height_pts))
+
+
 def _round_scale_length(target_m: float) -> float:
     """Pick a clean round scale-bar length (1/2/5 x 10^n) near the target."""
     if target_m <= 0:
@@ -236,6 +253,19 @@ def render_estate_layout_pdf(
     scale = _paper_scale_factor(paper_size)
     fig, ax = plt.subplots(figsize=_figsize_inches(paper_size))
 
+    # Axis limits (and therefore the data-to-page scale) are fixed before anything is drawn, so the
+    # plot loop below can measure each plot's actual on-page size and skip or shrink labels that
+    # would otherwise overlap - a big Estate (hundreds of small plots on one sheet) has nowhere near
+    # enough room to print a plot number and area on every single one without them running together.
+    pad_x = span_x * 0.08 + 1
+    pad_y = span_y * 0.19 + 1
+    ax.set_xlim(metric_minx - pad_x, metric_maxx + pad_x)
+    ax.set_ylim(metric_miny - pad_y, metric_maxy + pad_y)
+    ax.set_aspect("equal")
+    fig.canvas.draw()
+    (x0_pt, _), (x1_pt, _) = ax.transData.transform((0, 0)), ax.transData.transform((1, 0))
+    points_per_meter = (x1_pt - x0_pt) * 72.0 / fig.dpi
+
     for feature in features:
         geometry = to_shape_fn(feature.geometry)
         metric_geometry = shapely_transform(forward, geometry)
@@ -279,13 +309,47 @@ def render_estate_layout_pdf(
         # Black subdivision lines - only the outer parent boundary is drawn in red, below.
         ax.add_patch(mpatches.Polygon(list(metric_polygon.exterior.coords), closed=True, facecolor=PLOT_FACE, edgecolor=PLOT_EDGE, linewidth=0.9 * scale, zorder=2))
         centroid = metric_polygon.centroid
+
+        # How much room this specific plot actually has on the printed page - not every plot on a
+        # 500-lot sheet is big enough for a bold plot number, an area line and a customer name
+        # without them overlapping the neighbouring plot's own labels. Sizing text against the
+        # plot's actual width (not just a generic small/medium/large bucket) matters because a
+        # narrow-but-tall plot and a short-but-wide one have very different room for the same text.
+        pminx, pminy, pmaxx, pmaxy = metric_polygon.bounds
+        width_pts = (pmaxx - pminx) * points_per_meter
+        height_pts = (pmaxy - pminy) * points_per_meter
+        MIN_LEGIBLE_FONT = 3.2
+
+        number_text = str(plot.plot_number)
+        number_fontsize = _fit_fontsize(number_text, width_pts * 0.9, height_pts * 0.85, 7.5 * scale, char_width=_BOLD_CHAR_WIDTH)
+        if number_fontsize < MIN_LEGIBLE_FONT:
+            continue  # no room for even the plot number without overlapping its neighbours - leave the boundary unlabeled
+
         area_label = f"{float(plot.area_sqm):,.0f} m²" if plot.area_sqm is not None else ""
         customer_name = (customer_names_by_plot_id or {}).get(plot.id)
-        ax.text(centroid.x, centroid.y + label_step * (1.0 if customer_name else 0.9), str(plot.plot_number), fontsize=7.5 * scale, fontweight="bold", color=INK, ha="center", va="center", zorder=3)
-        if area_label:
-            ax.text(centroid.x, centroid.y - label_step * (0.55 if customer_name else 0.9), area_label, fontsize=6 * scale, color=MUTED, ha="center", va="center", zorder=3)
-        if customer_name:
-            ax.text(centroid.x, centroid.y - label_step * 1.7, customer_name, fontsize=5.8 * scale, color=MUTED, ha="center", va="center", zorder=3, style="italic")
+        line_height = number_fontsize * 1.35
+
+        area_fontsize = 0.0
+        if area_label and height_pts >= line_height * 2:
+            area_fontsize = _fit_fontsize(area_label, width_pts * 0.9, height_pts * 0.4, min(6 * scale, number_fontsize * 0.9), char_width=_REGULAR_CHAR_WIDTH)
+            if area_fontsize < MIN_LEGIBLE_FONT:
+                area_fontsize = 0.0
+
+        customer_fontsize = 0.0
+        if customer_name and area_fontsize and height_pts >= line_height * 3:
+            customer_fontsize = _fit_fontsize(customer_name, width_pts * 0.9, height_pts * 0.32, min(5.8 * scale, number_fontsize * 0.85), char_width=_REGULAR_CHAR_WIDTH)
+            if customer_fontsize < MIN_LEGIBLE_FONT:
+                customer_fontsize = 0.0
+
+        if not area_fontsize:
+            ax.text(centroid.x, centroid.y, number_text, fontsize=number_fontsize, fontweight="bold", color=INK, ha="center", va="center", zorder=3)
+        elif not customer_fontsize:
+            ax.text(centroid.x, centroid.y + label_step * 0.9, number_text, fontsize=number_fontsize, fontweight="bold", color=INK, ha="center", va="center", zorder=3)
+            ax.text(centroid.x, centroid.y - label_step * 0.9, area_label, fontsize=area_fontsize, color=MUTED, ha="center", va="center", zorder=3)
+        else:
+            ax.text(centroid.x, centroid.y + label_step * 1.0, number_text, fontsize=number_fontsize, fontweight="bold", color=INK, ha="center", va="center", zorder=3)
+            ax.text(centroid.x, centroid.y - label_step * 0.55, area_label, fontsize=area_fontsize, color=MUTED, ha="center", va="center", zorder=3)
+            ax.text(centroid.x, centroid.y - label_step * 1.7, customer_name, fontsize=customer_fontsize, color=MUTED, ha="center", va="center", zorder=3, style="italic")
 
     if estate.boundary is not None:
         boundary_metric = shapely_transform(forward, to_shape_fn(estate.boundary))
@@ -293,11 +357,6 @@ def render_estate_layout_pdf(
         # subdivision line so the overall extent always reads clearly.
         ax.add_patch(mpatches.Polygon(list(boundary_metric.exterior.coords), closed=True, facecolor="none", edgecolor=BOUNDARY_LINE, linewidth=2.6 * scale, zorder=5))
 
-    pad_x = span_x * 0.08 + 1
-    pad_y = span_y * 0.19 + 1
-    ax.set_xlim(metric_minx - pad_x, metric_maxx + pad_x)
-    ax.set_ylim(metric_miny - pad_y, metric_maxy + pad_y)
-    ax.set_aspect("equal")
     ax.axis("off")
 
     _draw_scale_bar(ax, minx=metric_minx, miny=metric_miny, span_x=span_x, scale=scale)

@@ -1,7 +1,10 @@
 from pathlib import Path
+from decimal import Decimal
+from unittest.mock import patch
 
 from app.models.estate_foundation import Estate, EstatePlot, EstatePublicReservationRequest
-from app.schemas.estates import PlotListingDefaultsUpdate, PublicEstateSettingsUpdate, PublicReservationCreate, PublicReservationUpdate
+from app.schemas.estates import PlotListingDefaultsUpdate, PublicEstateSettingsUpdate, PublicPaymentPlanItem, PublicReservationCreate, PublicReservationUpdate
+from app.services.estates.estate_email import send_public_reservation_welcome
 
 
 ROOT = Path(__file__).parents[1]
@@ -17,12 +20,49 @@ def test_public_showcase_model_and_migration_are_reversible():
     assert "public_tagline" in Estate.__table__.c
     assert "asking_price" in EstatePlot.__table__.c
     assert "public_address" in EstatePlot.__table__.c
+    assert "public_payment_plan" in Estate.__table__.c
     assert EstatePublicReservationRequest.__table__.c.status is not None
     assert "def upgrade" in migration and "def downgrade" in migration
     assert "estate_public_reservation_requests" in migration
     assert "uq_estate_estates_public_slug" in migration
     assert "public_tagline" in branding_migration and "public_logo_object_key" in branding_migration
     assert "public_address" in branding_migration and "def downgrade" in branding_migration
+
+
+def test_public_payment_plan_is_bounded_and_totals_one_hundred_percent():
+    valid = PublicEstateSettingsUpdate(payment_plan=[
+        PublicPaymentPlanItem(label="Initial payment", percentage=30),
+        PublicPaymentPlanItem(label="Final payment", percentage=70),
+    ])
+    assert valid.payment_plan[0].percentage == 30
+    try:
+        PublicEstateSettingsUpdate(payment_plan=[PublicPaymentPlanItem(label="Initial payment", percentage=50)])
+    except ValueError as exc:
+        assert "add up to 100" in str(exc)
+    else:
+        raise AssertionError("An incomplete public payment plan must be rejected")
+
+
+def test_public_reservation_welcome_email_contains_plot_details_and_follow_up_message():
+    with patch("app.services.estates.estate_email._send_email") as send_email:
+        assert send_public_reservation_welcome(
+            to_email="buyer@example.com",
+            organization_name="Example Homes",
+            estate_name="Greenview Estate",
+            plot_number="B-024",
+            plot_address="Block B, Greenview Estate",
+            area_sqm=500,
+            price=Decimal("2400000"),
+            payment_plan=[{"label": "Initial payment", "percentage": "30"}, {"label": "Final payment", "percentage": "70"}],
+            contact_phone="07000000000",
+            contact_email="sales@example.com",
+        )
+    message = send_email.call_args.kwargs
+    assert message["from_display_name"] == "Example Homes"
+    assert "Plot B-024" in message["subject"]
+    assert "Greenview Estate" in message["body_text"]
+    assert "Initial payment" in message["body_text"]
+    assert "call you shortly" in message["body_text"]
 
 
 def test_public_showcase_routes_are_safe_and_separate_from_allocations():
@@ -34,6 +74,9 @@ def test_public_showcase_routes_are_safe_and_separate_from_allocations():
     assert "without creating a customer or changing plot ownership" in source
     assert "require_estate_access(db, request, estate.organization_id, permission=\"allocation.read\")" in source
     assert '@router.patch("/reservation-requests/{request_id}")' in source
+    assert '@router.post("/reservation-requests/{request_id}/convert")' in source
+    assert "public_reservation.converted" in source
+    assert "send_public_reservation_welcome" in source
 
 
 def test_public_inputs_have_bounded_validation():
