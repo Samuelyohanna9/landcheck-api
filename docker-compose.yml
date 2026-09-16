@@ -18,7 +18,7 @@ services:
   api:
     build: .
     command: >
-      sh -c "uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers ${UVICORN_WORKERS:-2} --timeout-keep-alive ${UVICORN_KEEPALIVE:-30}"
+      sh -c "alembic upgrade head && exec uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers ${UVICORN_WORKERS:-2} --timeout-keep-alive ${UVICORN_KEEPALIVE:-30}"
     init: true
     depends_on:
       db:

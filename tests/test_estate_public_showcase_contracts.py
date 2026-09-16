@@ -35,3 +35,10 @@ def test_public_inputs_have_bounded_validation():
     assert PublicReservationCreate.model_fields["full_name"].metadata
     assert PublicReservationCreate.model_fields["phone"].metadata
     assert PublicReservationUpdate.model_fields["status"].metadata
+
+
+def test_container_startup_applies_migrations_before_serving_api():
+    compose = (ROOT / "docker-compose.yml").read_text(encoding="utf-8")
+    assert "alembic upgrade head" in compose
+    assert "exec uvicorn app.main:app" in compose
+    assert compose.index("alembic upgrade head") < compose.index("exec uvicorn app.main:app")
