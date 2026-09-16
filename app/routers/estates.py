@@ -19,7 +19,7 @@ import ezdxf
 from shapely.geometry import mapping, shape
 from shapely.ops import transform as shapely_transform, unary_union
 from sqlalchemy import and_, or_, text
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, aliased
 
 from app.routers.plots import _metric_epsg_for_wgs84_polygon, _subdivide_polygon_equal_count, get_db
 from app.services.estates.authorization import list_estate_access, resolve_estate_principal
@@ -61,6 +61,83 @@ def _survey_payload(db, row):
     plot=db.get(EstatePlot,row.plot_id); estate=db.get(Estate,row.estate_id)
     allocation = db.get(EstateAllocation, row.allocation_id) if row.allocation_id else None
     return {"id":row.id,"reference":row.request_uid,"status":row.status,"estate":{"id":estate.id,"name":estate.name},"plot":{"id":plot.id,"number":plot.plot_number},"assigned_surveyor":row.assigned_surveyor_subject_id,"survey_reference":row.survey_reference,"survey_working_plot_id":row.survey_working_plot_id,"materialized":bool(row.survey_working_plot_id),"eligibility":survey_eligibility(db, allocation),"created_at":row.created_at}
+
+
+def _bulk_financial_summaries(db: Session, allocations) -> dict[int, dict[str, Decimal]]:
+    """Calculate allocation totals with one grouped payment query instead of two queries per row."""
+    allocation_list = list(allocations or [])
+    allocation_ids = [allocation.id for allocation in allocation_list]
+    payment_totals: dict[int, dict[str, Decimal]] = {}
+    if allocation_ids:
+        payment_rows = db.query(
+            EstatePayment.allocation_id,
+            EstatePayment.status,
+            func.coalesce(func.sum(EstatePayment.amount), 0),
+        ).filter(
+            EstatePayment.allocation_id.in_(allocation_ids),
+            EstatePayment.status.in_(("confirmed", "recorded", "pending_confirmation")),
+        ).group_by(EstatePayment.allocation_id, EstatePayment.status).all()
+        for allocation_id, status, total in payment_rows:
+            payment_totals.setdefault(allocation_id, {})[status] = Decimal(str(total or 0))
+    result = {}
+    for allocation in allocation_list:
+        price = Decimal(str(allocation.agreed_price or 0))
+        totals = payment_totals.get(allocation.id, {})
+        confirmed = totals.get("confirmed", Decimal(0))
+        pending = totals.get("recorded", Decimal(0)) + totals.get("pending_confirmation", Decimal(0))
+        outstanding = max(Decimal(0), price - confirmed)
+        result[allocation.id] = {
+            "agreed_price": price,
+            "confirmed_paid": confirmed,
+            "pending_paid": pending,
+            "outstanding": outstanding,
+            "percentage": confirmed / price * 100 if price else Decimal(0),
+        }
+    return result
+
+
+def _bulk_survey_payloads(db: Session, rows) -> list[dict]:
+    """Build the survey queue without a database round-trip for every request."""
+    request_rows = list(rows or [])
+    if not request_rows:
+        return []
+    plot_ids = {row.plot_id for row in request_rows}
+    estate_ids = {row.estate_id for row in request_rows}
+    allocation_ids = {row.allocation_id for row in request_rows if row.allocation_id}
+    plots = {plot.id: plot for plot in db.query(EstatePlot).filter(EstatePlot.id.in_(plot_ids)).all()}
+    estates = {estate.id: estate for estate in db.query(Estate).filter(Estate.id.in_(estate_ids)).all()}
+    allocations = {allocation.id: allocation for allocation in db.query(EstateAllocation).filter(EstateAllocation.id.in_(allocation_ids or {-1})).all()}
+    financials = _bulk_financial_summaries(db, allocations.values())
+    rules = db.query(EstatePaymentRule).filter(
+        EstatePaymentRule.organization_id.in_({allocation.organization_id for allocation in allocations.values()} or {-1}),
+        EstatePaymentRule.rule_key == "survey_minimum_confirmed_percentage",
+    ).all()
+    required_by_org = {rule.organization_id: Decimal(rule.percentage or 0) if rule.is_enabled else Decimal(0) for rule in rules}
+    return [
+        {
+            "id": row.id,
+            "reference": row.request_uid,
+            "status": row.status,
+            "estate": {"id": estates[row.estate_id].id, "name": estates[row.estate_id].name},
+            "plot": {"id": plots[row.plot_id].id, "number": plots[row.plot_id].plot_number},
+            "assigned_surveyor": row.assigned_surveyor_subject_id,
+            "survey_reference": row.survey_reference,
+            "survey_working_plot_id": row.survey_working_plot_id,
+            "materialized": bool(row.survey_working_plot_id),
+            "eligibility": (
+                {"eligible": True, "confirmed_percentage": "0", "required_percentage": "0", "reason": "No allocation is linked"}
+                if not row.allocation_id or row.allocation_id not in allocations
+                else {
+                    "eligible": financials[row.allocation_id]["percentage"] >= required_by_org.get(allocations[row.allocation_id].organization_id, Decimal(0)),
+                    "confirmed_percentage": str(financials[row.allocation_id]["percentage"]),
+                    "required_percentage": str(required_by_org.get(allocations[row.allocation_id].organization_id, Decimal(0))),
+                    "reason": "Eligible" if financials[row.allocation_id]["percentage"] >= required_by_org.get(allocations[row.allocation_id].organization_id, Decimal(0)) else "Confirmed payments are below the organization survey threshold",
+                }
+            ),
+            "created_at": row.created_at,
+        }
+        for row in request_rows
+    ]
 
 
 def _normalized(value: str) -> str:
@@ -493,30 +570,39 @@ def estate_dashboard(estate_id: int, request: Request, db: Session = Depends(get
     estate = db.get(Estate, estate_id)
     if not estate: raise HTTPException(404, "Estate not found")
     require_estate_access(db, request, estate.organization_id, permission="estate.read"); _enabled(db, estate.organization_id)
-    plots = db.query(EstatePlot).filter(EstatePlot.estate_id == estate_id).all()
-    counts = {key: sum(1 for plot in plots if plot.commercial_status == key) for key in ("available", "reserved", "allocated", "on_hold")}
-    development = {key: sum(1 for plot in plots if plot.development_status == key) for key in ("not_started", "site_cleared", "foundation", "under_construction", "developed")}
+    status_rows = db.query(EstatePlot.commercial_status, func.count(EstatePlot.id)).filter(EstatePlot.estate_id == estate_id).group_by(EstatePlot.commercial_status).all()
+    development_rows = db.query(EstatePlot.development_status, func.count(EstatePlot.id)).filter(EstatePlot.estate_id == estate_id).group_by(EstatePlot.development_status).all()
+    counts = {key: int(dict(status_rows).get(key, 0)) for key in ("available", "reserved", "allocated", "on_hold")}
+    development = {key: int(dict(development_rows).get(key, 0)) for key in ("not_started", "site_cleared", "foundation", "under_construction", "developed")}
+    total_plots = int(db.query(func.count(EstatePlot.id)).filter(EstatePlot.estate_id == estate_id).scalar() or 0)
+    mapped_area_sqm = Decimal(str(db.query(func.coalesce(func.sum(EstatePlot.area_sqm), 0)).filter(EstatePlot.estate_id == estate_id).scalar() or 0))
     allocations = db.query(EstateAllocation).filter(EstateAllocation.estate_id == estate_id).all()
-    summaries = [financial_summary(db, allocation) for allocation in allocations]
-    staked_plot_ids = {task.plot_id for task in db.query(EstateStakingTask).filter(EstateStakingTask.estate_id == estate_id, EstateStakingTask.status == "completed").all()}
-    awaiting_survey = sum(1 for plot in plots if plot.commercial_status == "allocated" and not db.query(EstateSurveyRequest).filter(EstateSurveyRequest.plot_id == plot.id, EstateSurveyRequest.status.in_(("in_progress", "ready_for_review", "approved", "completed"))).first())
-    survey_completed = sum(1 for plot in plots if db.query(EstateSurveyRequest).filter(EstateSurveyRequest.plot_id == plot.id, EstateSurveyRequest.status.in_(("approved", "completed"))).first())
+    financials = _bulk_financial_summaries(db, allocations)
+    contracted_sales = sum((summary["agreed_price"] for summary in financials.values()), Decimal(0))
+    confirmed_collections = sum((summary["confirmed_paid"] for summary in financials.values()), Decimal(0))
+    pending_collections = sum((summary["pending_paid"] for summary in financials.values()), Decimal(0))
+    outstanding_balance = sum((summary["outstanding"] for summary in financials.values()), Decimal(0))
+    staked_plot_ids = {task.plot_id for task in db.query(EstateStakingTask).filter(EstateStakingTask.estate_id == estate_id).all()}
+    allocated_plot_ids = {plot_id for (plot_id,) in db.query(EstatePlot.id).filter(EstatePlot.estate_id == estate_id, EstatePlot.commercial_status == "allocated").all()}
+    survey_rows = db.query(EstateSurveyRequest.plot_id, EstateSurveyRequest.status).filter(EstateSurveyRequest.estate_id == estate_id).all()
+    eligible_survey_plot_ids = {plot_id for plot_id, status in survey_rows if plot_id in allocated_plot_ids and status in {"in_progress", "ready_for_review", "approved", "completed"}}
+    completed_survey_plot_ids = {plot_id for plot_id, status in survey_rows if status in {"approved", "completed"}}
     return {
         "estate": {"id": estate.id, "name": estate.name, "status": estate.status},
-        "total_plots": len(plots),
+        "total_plots": total_plots,
         "statuses": {**counts, "sold": counts["allocated"]},
         "development": development,
         "staked_plots": len(staked_plot_ids),
-        "awaiting_survey": awaiting_survey,
-        "survey_completed": survey_completed,
-        "awaiting_staking": sum(1 for plot in plots if plot.commercial_status == "allocated" and plot.id not in staked_plot_ids),
-        "geometry_issues": sum(1 for plot in plots if plot.geometry_status != "approved"),
-        "mapped_area_sqm": float(sum(float(plot.area_sqm) for plot in plots)),
+        "awaiting_survey": len(allocated_plot_ids - eligible_survey_plot_ids),
+        "survey_completed": len(completed_survey_plot_ids),
+        "awaiting_staking": len(allocated_plot_ids - staked_plot_ids),
+        "geometry_issues": int(db.query(func.count(EstatePlot.id)).filter(EstatePlot.estate_id == estate_id, EstatePlot.geometry_status != "approved").scalar() or 0),
+        "mapped_area_sqm": float(mapped_area_sqm),
         "financial": {
-            "contracted_sales_value": str(sum((summary.agreed_price for summary in summaries), 0)),
-            "confirmed_collections": str(sum((summary.confirmed_paid for summary in summaries), 0)),
-            "pending_collections": str(sum((summary.pending_paid for summary in summaries), 0)),
-            "outstanding_balance": str(sum((summary.outstanding for summary in summaries), 0)),
+            "contracted_sales_value": str(contracted_sales),
+            "confirmed_collections": str(confirmed_collections),
+            "pending_collections": str(pending_collections),
+            "outstanding_balance": str(outstanding_balance),
         },
     }
 
@@ -742,8 +828,30 @@ def estate_plots_geojson(estate_id: int, request: Request, db: Session = Depends
     estate=db.get(Estate,estate_id)
     if not estate: raise HTTPException(404,"Estate not found")
     require_estate_access(db,request,estate.organization_id,permission="plot.read")
-    rows=db.query(EstatePlot).filter(EstatePlot.estate_id==estate_id).all()
-    return {"type":"FeatureCollection","features":[{"type":"Feature","id":plot.id,"properties":{"id":plot.id,"plot_number":plot.plot_number,"commercial_status":plot.commercial_status,"development_status":plot.development_status,"geometry_status":plot.geometry_status,"area_sqm":float(plot.area_sqm),"public_address":plot.public_address,"asking_price":str(plot.asking_price) if plot.asking_price is not None else None,"block_id":plot.block_id},"geometry":mapping(to_shape(plot.geometry))} for plot in rows if plot.geometry]}
+    rows = db.query(
+        EstatePlot.id,
+        EstatePlot.plot_number,
+        EstatePlot.commercial_status,
+        EstatePlot.development_status,
+        EstatePlot.geometry_status,
+        EstatePlot.area_sqm,
+        EstatePlot.public_address,
+        EstatePlot.asking_price,
+        EstatePlot.block_id,
+        # Seven decimal places is centimetre-level for the map and avoids returning a large
+        # amount of floating-point noise for every vertex in a large layout.
+        func.ST_AsGeoJSON(EstatePlot.geometry, 7).label("geometry_json"),
+    ).filter(EstatePlot.estate_id == estate_id, EstatePlot.geometry.isnot(None)).all()
+    features = []
+    for row in rows:
+        try:
+            geometry = json.loads(row.geometry_json) if isinstance(row.geometry_json, str) else row.geometry_json
+        except (TypeError, ValueError):
+            geometry = None
+        if geometry is None:
+            continue
+        features.append({"type": "Feature", "id": row.id, "properties": {"id": row.id, "plot_number": row.plot_number, "commercial_status": row.commercial_status, "development_status": row.development_status, "geometry_status": row.geometry_status, "area_sqm": float(row.area_sqm or 0), "public_address": row.public_address, "asking_price": str(row.asking_price) if row.asking_price is not None else None, "block_id": row.block_id}, "geometry": geometry})
+    return {"type": "FeatureCollection", "features": features}
 
 @router.get("/{estate_id}/layers.geojson")
 def estate_layers_geojson(estate_id:int, request:Request, db:Session=Depends(get_db)):
@@ -1702,18 +1810,41 @@ def estate_quality_check(estate_id:int, request:Request, db:Session=Depends(get_
     require_estate_access(db,request,estate.organization_id,permission="plot.read")
     plots=db.query(EstatePlot).filter(EstatePlot.estate_id==estate_id).all(); issues=[]
     seen={}
+    plot_by_id = {}
+    geometry_by_id = {}
     for plot in plots:
+        plot_by_id[plot.id] = plot
         seen.setdefault(plot.plot_number_normalized,[]).append(plot.id)
         if not plot.geometry: issues.append({"severity":"error","plot_id":plot.id,"code":"missing_geometry","message":"Plot has no geometry"}); continue
-        _, qc=validate_polygon(mapping(to_shape(plot.geometry)))
+        geometry = to_shape(plot.geometry)
+        geometry_by_id[plot.id] = geometry
+        _, qc=validate_polygon(mapping(geometry))
         issues.extend({"severity":item.severity,"plot_id":plot.id,"code":item.code,"message":item.message} for item in qc)
     for number, ids in seen.items():
         if len(ids)>1: issues.append({"severity":"error","plot_id":ids[0],"code":"duplicate_plot_number","message":f"Duplicate plot number {number}"})
-    for index, plot in enumerate(plots):
-        if not plot.geometry: continue
-        geom=to_shape(plot.geometry)
-        for other in plots[index+1:]:
-            if other.geometry and geom.intersection(to_shape(other.geometry)).area > 1e-12: issues.append({"severity":"error","plot_id":plot.id,"related_plot_id":other.id,"code":"overlap","message":f"Overlaps plot {other.plot_number}"})
+    # Use the spatial index to find possible overlaps before doing exact Shapely checks.
+    other_plot = aliased(EstatePlot)
+    candidate_pairs = db.query(EstatePlot.id, other_plot.id).join(
+        other_plot,
+        and_(
+            other_plot.estate_id == EstatePlot.estate_id,
+            other_plot.id > EstatePlot.id,
+            other_plot.geometry.isnot(None),
+            func.ST_Intersects(EstatePlot.geometry, other_plot.geometry),
+        ),
+    ).filter(EstatePlot.estate_id == estate_id, EstatePlot.geometry.isnot(None)).all()
+    for plot_id, other_id in candidate_pairs:
+        geometry = geometry_by_id.get(plot_id)
+        other_geometry = geometry_by_id.get(other_id)
+        if geometry is None or other_geometry is None:
+            continue
+        try:
+            overlap_area = geometry.intersection(other_geometry).area
+        except Exception:
+            continue
+        if overlap_area > 1e-12:
+            other = plot_by_id[other_id]
+            issues.append({"severity":"error","plot_id":plot_id,"related_plot_id":other_id,"code":"overlap","message":f"Overlaps plot {other.plot_number}"})
     return {"estate_id":estate_id,"plot_count":len(plots),"issues":issues,"review_required":any(item["severity"]=="error" for item in issues)}
 
 def _calculate_plot_hazards(geometry, db: Session) -> dict:
@@ -2248,9 +2379,12 @@ def create_survey_request(plot_id:int, request:Request, db:Session=Depends(get_d
     db.add(row); db.flush(); append_estate_audit_event(db,organization_id=estate.organization_id,actor=access.principal,action="survey_request.created",entity_type="estate_survey_request",entity_id=row.id); db.commit(); return _survey_payload(db,row)
 
 @router.get("/survey-requests")
-def list_survey_requests(request:Request,db:Session=Depends(get_db)):
+def list_survey_requests(request: Request, estate_id: int | None = None, db: Session = Depends(get_db)):
     principal=resolve_estate_principal(db,request); allowed={a.organization_id for a in list_estate_access(db,principal) if has_permission(a.role_key,"survey.read")}
-    return [_survey_payload(db,row) for row in db.query(EstateSurveyRequest).filter(EstateSurveyRequest.organization_id.in_(allowed)).all()]
+    query = db.query(EstateSurveyRequest).filter(EstateSurveyRequest.organization_id.in_(allowed))
+    if estate_id is not None:
+        query = query.filter(EstateSurveyRequest.estate_id == estate_id)
+    return _bulk_survey_payloads(db, query.all())
 
 @router.get("/survey-requests/{request_id}")
 def survey_request_detail(request_id:int,request:Request,db:Session=Depends(get_db)):
@@ -2365,9 +2499,12 @@ def create_staking_task(request_id:int,request:Request,db:Session=Depends(get_db
     db.add(task); db.flush(); append_estate_audit_event(db,organization_id=survey.organization_id,actor=access.principal,action="staking_task.created",entity_type="estate_staking_task",entity_id=task.id); db.commit(); return {"id":task.id,"status":task.status}
 
 @router.get("/staking-tasks")
-def list_staking_tasks(request:Request,db:Session=Depends(get_db)):
+def list_staking_tasks(request: Request, estate_id: int | None = None, db: Session = Depends(get_db)):
     principal=resolve_estate_principal(db,request); allowed={item.organization_id for item in list_estate_access(db,principal) if has_permission(item.role_key,"staking.read")}
-    rows=db.query(EstateStakingTask).filter(EstateStakingTask.organization_id.in_(allowed)).all()
+    query = db.query(EstateStakingTask).filter(EstateStakingTask.organization_id.in_(allowed))
+    if estate_id is not None:
+        query = query.filter(EstateStakingTask.estate_id == estate_id)
+    rows=query.all()
     return [{"id":row.id,"status":row.status,"plot_id":row.plot_id,"survey_request_id":row.survey_request_id,"assigned_subject_id":row.assigned_subject_id,"completed_at":row.completed_at} for row in rows]
 
 @router.get("/staking-tasks/{task_id}/exports/dgps.csv")
@@ -3156,8 +3293,8 @@ def estate_financial_summary(estate_id:int,request:Request,db:Session=Depends(ge
     estate=db.get(Estate,estate_id)
     if not estate: raise HTTPException(404,"Estate not found")
     require_estate_access(db,request,estate.organization_id,permission="payment.read")
-    allocations=db.query(EstateAllocation).filter(EstateAllocation.estate_id==estate_id).all(); summaries=[financial_summary(db,a) for a in allocations]
-    return {"estate":{"id":estate.id,"name":estate.name},"contracted_sales":str(sum((s.agreed_price for s in summaries),0)),"confirmed_collections":str(sum((s.confirmed_paid for s in summaries),0)),"pending_collections":str(sum((s.pending_paid for s in summaries),0)),"outstanding_balance":str(sum((s.outstanding for s in summaries),0)),"fully_paid_allocations":sum(1 for s in summaries if s.agreed_price>0 and s.outstanding==0),"allocations_with_outstanding":sum(1 for s in summaries if s.outstanding>0)}
+    allocations=db.query(EstateAllocation).filter(EstateAllocation.estate_id==estate_id).all(); summaries=_bulk_financial_summaries(db, allocations).values()
+    return {"estate":{"id":estate.id,"name":estate.name},"contracted_sales":str(sum((s["agreed_price"] for s in summaries),Decimal(0))),"confirmed_collections":str(sum((s["confirmed_paid"] for s in summaries),Decimal(0))),"pending_collections":str(sum((s["pending_paid"] for s in summaries),Decimal(0))),"outstanding_balance":str(sum((s["outstanding"] for s in summaries),Decimal(0))),"fully_paid_allocations":sum(1 for s in summaries if s["agreed_price"]>0 and s["outstanding"]==0),"allocations_with_outstanding":sum(1 for s in summaries if s["outstanding"]>0)}
 
 @router.get("/financial-summary")
 def organization_financial_summary(request:Request, db:Session=Depends(get_db)):
@@ -3215,9 +3352,11 @@ def estate_selectors(request:Request, estate_id:int|None=None, customer_id:int|N
     if customer_id: allocations=allocations.filter(EstateAllocation.customer_id==customer_id)
     if plot_id: allocations=allocations.filter(EstateAllocation.plot_id==plot_id)
     if status: allocations=allocations.filter(EstateAllocation.status==status)
+    allocation_rows = allocations.all()
+    financials = _bulk_financial_summaries(db, [allocation for allocation, _, _, _ in allocation_rows])
     allocation_items=[]
-    for allocation,estate,plot,customer in allocations.all():
-        summary=financial_summary(db,allocation); allocation_items.append({"id":allocation.id,"estate_id":estate.id,"estate_name":estate.name,"plot_id":plot.id,"plot_number":plot.plot_number,"customer_id":customer.id,"customer_name":customer.full_name,"status":allocation.status,"allocation_date":allocation.allocation_date,"payment_plan":allocation.payment_plan,"agreed_price":str(summary.agreed_price),"currency":"NGN","confirmed":str(summary.confirmed_paid),"pending":str(summary.pending_paid),"outstanding":str(summary.outstanding)})
+    for allocation,estate,plot,customer in allocation_rows:
+        summary=financials[allocation.id]; allocation_items.append({"id":allocation.id,"estate_id":estate.id,"estate_name":estate.name,"plot_id":plot.id,"plot_number":plot.plot_number,"customer_id":customer.id,"customer_name":customer.full_name,"status":allocation.status,"allocation_date":allocation.allocation_date,"payment_plan":allocation.payment_plan,"agreed_price":str(summary["agreed_price"]),"currency":"NGN","confirmed":str(summary["confirmed_paid"]),"pending":str(summary["pending_paid"]),"outstanding":str(summary["outstanding"])})
     return {"estates":[{"id":e.id,"name":e.name} for e in estates],"customers":[{"id":c.id,"name":c.full_name,"reference":c.reference_no} for c in customers],"plots":[{"id":p.id,"plot_number":p.plot_number,"estate_id":e.id,"estate_name":e.name,"commercial_status":p.commercial_status,"development_status":p.development_status,"geometry_status":p.geometry_status,"block_id":p.block_id,"area_sqm":float(p.area_sqm) if p.area_sqm is not None else 0.0} for p,e in plots],"allocations":allocation_items}
 
 
