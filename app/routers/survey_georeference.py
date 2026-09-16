@@ -97,6 +97,13 @@ class DigitizedFeatureInput(BaseModel):
     feature_type: str
     pixels: list[PixelPointInput] = Field(default_factory=list)
     is_primary: bool = False
+    # What this feature MEANS on the Estate dashboard, as opposed to feature_type (what shape it
+    # is) - same vocabulary SpatialFeatureCreate already validates (app/schemas/estates.py), since
+    # a categorized feature becomes an EstateSpatialFeature row instead of a Plot at import time
+    # (see import_plots_from_georeference in app/routers/estates.py). None/omitted preserves the
+    # original behavior: an uncategorized polygon is a plot boundary, an uncategorized point/line
+    # is discarded at import.
+    category: str | None = Field(default=None, pattern="^(road|drainage|open_space|infrastructure)$")
 
 
 class SaveDigitizedFeaturesRequest(BaseModel):
@@ -722,6 +729,7 @@ def _feature_to_saved_payload(feature: DigitizedFeatureInput, transform: dict[st
         "label": str(feature.label or feature_type.title()).strip() or feature_type.title(),
         "feature_type": feature_type,
         "is_primary": bool(feature.is_primary),
+        "category": feature.category,
         "pixels": pixels,
         "target_coordinates": target_coordinates,
         "wgs84_coordinates": wgs84_coordinates,

@@ -502,6 +502,30 @@ async def import_estate_geojson(estate_id:int,request:Request,file:UploadFile=Fi
     db.add(row); db.flush(); append_estate_audit_event(db,organization_id=estate.organization_id,actor=access.principal,action="import_review.geojson_uploaded",entity_type="estate_import_review",entity_id=row.id,after_data={"candidate_count":len(candidates)}); db.commit()
     return {"id":row.id,"status":row.status,"candidate_count":len(candidates),"valid_count":sum(1 for candidate in candidates if candidate["valid"])}
 
+def _closed_ring_points(entity, raw_points: list[tuple[float, float]]) -> list[tuple[float, float]] | None:
+    """The ring's vertices (without a duplicated closing point) if this polyline traces a closed
+    loop - either via its own DXF "closed" flag, or because its first and last vertices coincide.
+    Many real-world DXF exporters leave that flag unset even though the polyline visually closes
+    (first vertex re-drawn as the last), which previously made a perfectly good closed boundary
+    get silently dropped and reported as "no closed polygon polylines". Returns None if the
+    entity isn't closed either way."""
+    closed_flag = getattr(entity, "is_closed", False)
+    if callable(closed_flag):
+        closed_flag = closed_flag()
+    if bool(closed_flag):
+        return raw_points
+    if len(raw_points) < 3:
+        return None
+    first, last = raw_points[0], raw_points[-1]
+    xs = [point[0] for point in raw_points]
+    ys = [point[1] for point in raw_points]
+    extent = max(max(xs) - min(xs), max(ys) - min(ys), 1e-9)
+    distance = ((first[0] - last[0]) ** 2 + (first[1] - last[1]) ** 2) ** 0.5
+    if distance <= max(extent * 0.001, 1e-6):
+        return raw_points[:-1]
+    return None
+
+
 @router.post("/{estate_id}/import-reviews/dxf")
 async def import_estate_dxf(estate_id:int,source_crs:str,request:Request,file:UploadFile=File(...),db:Session=Depends(get_db)):
     estate=db.get(Estate,estate_id)
@@ -516,17 +540,15 @@ async def import_estate_dxf(estate_id:int,source_crs:str,request:Request,file:Up
     candidates=[]
     for index,entity in enumerate(document.modelspace().query("LWPOLYLINE POLYLINE"),1):
         try:
-            closed = getattr(entity, "is_closed", False)
-            if callable(closed):
-                closed = closed()
-            if not bool(closed):
-                continue
             if entity.dxftype() == "LWPOLYLINE":
-                raw_points = entity.get_points()
+                raw_points = list(entity.get_points())
             else:
                 vertices = entity.vertices() if callable(getattr(entity, "vertices", None)) else entity.vertices
                 raw_points = [(vertex.dxf.location.x, vertex.dxf.location.y) for vertex in vertices]
-            points=[transformer.transform(float(point[0]),float(point[1])) for point in raw_points]
+            ring_points = _closed_ring_points(entity, raw_points)
+            if ring_points is None:
+                continue
+            points=[transformer.transform(float(point[0]),float(point[1])) for point in ring_points]
             if len(points)<3: continue
             geometry={"type":"Polygon","coordinates":[[list(point) for point in points+[points[0]]]]}
             _,issues=validate_polygon(geometry); errors=[issue.message for issue in issues if issue.severity=="error"]
@@ -680,6 +702,18 @@ def _polygon_geometry_from_georeference_feature(feature: dict) -> dict:
     return {"type": "Polygon", "coordinates": [ring]}
 
 
+def _layer_geometry_from_georeference_feature(feature: dict) -> dict:
+    """A category-tagged (road/drainage/open_space/infrastructure) digitized feature keeps
+    whatever shape it was actually drawn as - unlike a plot, which is always a polygon."""
+    feature_type = str(feature.get("feature_type") or "")
+    coordinates = feature.get("wgs84_coordinates") or []
+    if feature_type == "polygon":
+        return _polygon_geometry_from_georeference_feature(feature)
+    if feature_type == "point":
+        return {"type": "Point", "coordinates": coordinates[0] if coordinates else []}
+    return {"type": "LineString", "coordinates": coordinates}
+
+
 def _load_georeference_session_features(db: Session, session_id: str) -> list[dict]:
     """Reads straight from survey_georeference_sessions - the session carries only raster/pixel/
     geometry data (no estate, customer or payment data), so a cross-domain read here is safe; it
@@ -766,9 +800,13 @@ def import_plots_from_georeference(review_id: int, payload: ImportFromGeoreferen
     if not session_id:
         raise HTTPException(409, "Link a georeference session to this review first")
     features = _load_georeference_session_features(db, session_id)
-    polygons = [feature for feature in features if str(feature.get("feature_type") or "") == "polygon"]
-    if not polygons:
-        raise HTTPException(422, "No digitized polygons were saved in this georeference session yet")
+    # A feature becomes a Plot only when it's a polygon with no assigned category - a category
+    # (road/drainage/open_space/infrastructure) marks it as an Estate layout feature instead,
+    # regardless of shape (see DigitizedFeatureInput.category in survey_georeference.py).
+    polygons = [feature for feature in features if str(feature.get("feature_type") or "") == "polygon" and not feature.get("category")]
+    layer_features = [feature for feature in features if feature.get("category")]
+    if not polygons and not layer_features:
+        raise HTTPException(422, "No digitized polygons or layout features were saved in this georeference session yet")
     prefix = (payload.plot_prefix or "P").strip() or "P"
     candidates = []
     for index, feature in enumerate(polygons, 1):
@@ -777,12 +815,28 @@ def import_plots_from_georeference(review_id: int, payload: ImportFromGeoreferen
         candidates.append(_import_candidate(row_number=index, plot_number=plot_number, geometry=geometry))
     row.candidate_data = candidates
     estate = db.get(Estate, row.estate_id)
-    created = _create_plots_from_candidates(db, estate=estate, candidates=candidates, source_type=row.source_type, source_reference=str(row.id), actor=access.principal)
-    row.notes = (row.notes or "") + f"; {created} operational plot(s) created from the georeferenced layout"
+    created = _create_plots_from_candidates(db, estate=estate, candidates=candidates, source_type=row.source_type, source_reference=str(row.id), actor=access.principal) if candidates else 0
+    created_features = 0
+    for feature in layer_features:
+        try:
+            geometry = _geojson_geometry(_layer_geometry_from_georeference_feature(feature), allow_polygon=True)
+        except HTTPException:
+            continue
+        db.add(EstateSpatialFeature(
+            organization_id=row.organization_id,
+            estate_id=row.estate_id,
+            feature_type=str(feature.get("category")),
+            name=str(feature.get("label") or "").strip() or None,
+            geometry=from_shape(geometry, srid=4326),
+            created_by_subject_type=access.principal.subject_type,
+            created_by_subject_id=access.principal.subject_id,
+        ))
+        created_features += 1
+    row.notes = (row.notes or "") + f"; {created} operational plot(s) and {created_features} layout feature(s) created from the georeferenced layout"
     row.status = "approved"
-    append_estate_audit_event(db, organization_id=row.organization_id, actor=access.principal, action="import_review.approved", entity_type="estate_import_review", entity_id=row.id, after_data={"status": row.status, "source": "georeference", "created_plots": created})
+    append_estate_audit_event(db, organization_id=row.organization_id, actor=access.principal, action="import_review.approved", entity_type="estate_import_review", entity_id=row.id, after_data={"status": row.status, "source": "georeference", "created_plots": created, "created_features": created_features})
     db.commit()
-    return {"id": row.id, "status": row.status, "created_plots": created}
+    return {"id": row.id, "status": row.status, "created_plots": created, "created_features": created_features}
 
 
 @router.post("/{estate_id}/layout-proposals")
