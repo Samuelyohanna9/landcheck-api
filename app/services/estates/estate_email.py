@@ -104,6 +104,31 @@ def _wrap_html(*, org_name: str, heading: str, message_html: str, financial_html
     """
 
 
+def _public_customer_wrap_html(*, organization_name: str, heading: str, message_html: str, plot_link_html: str = "") -> str:
+    """Customer-facing shell for a public reservation confirmation.
+
+    The internal lead alert deliberately uses the LandCheck account shell above. A buyer should
+    instead receive a message that reads as a direct welcome from the Estate company, without
+    internal workspace language or LandCheck support details.
+    """
+    return f"""
+    <html>
+      <body style="margin:0;padding:0;background:#f4f6f5;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;color:#14261e;">
+        <div style="max-width:560px;margin:0 auto;padding:32px 16px;">
+          <div style="background:#ffffff;border-radius:18px;overflow:hidden;box-shadow:0 18px 46px rgba(14,46,28,0.12);border:1px solid #dce8df;padding:32px;">
+            <div style="font-size:12.5px;font-weight:800;letter-spacing:0.06em;text-transform:uppercase;color:#237b49;margin:0 0 10px;">{html.escape(organization_name)}</div>
+            <h1 style="margin:0 0 16px;font-size:22px;color:#14261e;">{html.escape(heading)}</h1>
+            <div style="font-size:14.5px;line-height:1.75;color:#385247;">{message_html}</div>
+            {plot_link_html}
+            <p style="margin:26px 0 0;font-size:12px;line-height:1.6;color:#82958a;">This message confirms your enquiry with {html.escape(organization_name)}. Please contact the Estate team directly if you need any help.</p>
+          </div>
+          <p style="text-align:center;font-size:11px;color:#9aaa9f;margin:16px 0 0;">{html.escape(organization_name)}</p>
+        </div>
+      </body>
+    </html>
+    """
+
+
 def _financial_block_html(agreed_price: Decimal, confirmed_paid: Decimal, outstanding: Decimal) -> str:
     row = "display:flex;justify-content:space-between;padding:6px 0;font-size:14px;"
     return f"""
@@ -294,6 +319,7 @@ def notify_reservation_request(
 def send_public_reservation_welcome(
     *,
     to_email: str | None,
+    full_name: str | None = None,
     organization_name: str,
     estate_name: str,
     plot_number: str,
@@ -330,18 +356,19 @@ def send_public_reservation_welcome(
         contact_bits.append(f"<a href=\"mailto:{html.escape(contact_email)}\">{html.escape(contact_email)}</a>")
     contact_suffix = f": {' or '.join(contact_bits)}" if contact_bits else "."
     message_html = (
-        f"<p>Thank you for believing in <strong>{html.escape(organization_name)}</strong>. We have received your request for "
-        f"<strong>Plot {html.escape(plot_number)}</strong> at <strong>{html.escape(estate_name)}</strong>.</p>"
+        f"<p>Dear {html.escape((str(full_name or '').strip().split(' ')[0] or 'customer'))},</p>"
+        f"<p>Welcome to <strong>{html.escape(estate_name)}</strong>, and thank you for choosing "
+        f"<strong>{html.escape(organization_name)}</strong>. We have received your request for "
+        f"<strong>Plot {html.escape(plot_number)}</strong>.</p>"
         + "".join(details)
         + plan_html
-        + "<p>Our team will call you shortly to discuss availability, documentation and the next steps for completing your reservation.</p>"
-        + f"<p>If you have any questions, please contact {html.escape(organization_name)}{contact_suffix}</p>"
+        + f"<p>A member of the {html.escape(organization_name)} team will contact you shortly to confirm availability, documentation and the next steps for completing your reservation.</p>"
+        + f"<p>If you have any questions in the meantime, please contact {html.escape(organization_name)}{contact_suffix}</p>"
     )
-    body_html = _wrap_html(
-        org_name=organization_name,
+    body_html = _public_customer_wrap_html(
+        organization_name=organization_name,
         heading=f"Welcome to {estate_name}",
         message_html=message_html,
-        financial_html="",
         plot_link_html=_plot_link_html(public_page_url, label="View the Estate page"),
     )
     body_text = _plain_text(f"Welcome to {estate_name}", message_html, None, public_page_url)

@@ -47,6 +47,7 @@ def test_public_reservation_welcome_email_contains_plot_details_and_follow_up_me
     with patch("app.services.estates.estate_email._send_email") as send_email:
         assert send_public_reservation_welcome(
             to_email="buyer@example.com",
+            full_name="Jane Buyer",
             organization_name="Example Homes",
             estate_name="Greenview Estate",
             plot_number="B-024",
@@ -62,7 +63,9 @@ def test_public_reservation_welcome_email_contains_plot_details_and_follow_up_me
     assert "Plot B-024" in message["subject"]
     assert "Greenview Estate" in message["body_text"]
     assert "Initial payment" in message["body_text"]
-    assert "call you shortly" in message["body_text"]
+    assert "Dear Jane" in message["body_text"]
+    assert "member of the Example Homes team will contact you shortly" in message["body_text"]
+    assert "LandCheck Estates" not in message["body_html"]
 
 
 def test_public_showcase_routes_are_safe_and_separate_from_allocations():

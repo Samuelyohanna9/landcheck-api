@@ -260,6 +260,7 @@ def create_public_reservation(slug: str, plot_id: int, payload: PublicReservatio
     )
     welcome_email_sent = estate_email.send_public_reservation_welcome(
         to_email=row.email,
+        full_name=row.full_name,
         organization_name=organization.name if organization else "Estate team",
         estate_name=estate.name,
         plot_number=plot.plot_number,
