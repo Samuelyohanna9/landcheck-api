@@ -23425,9 +23425,60 @@ def estate_admin_overview(request: Request, db: Session = Depends(get_db)):
     """Read-only platform view for monitoring Estate customers and subscriptions."""
     require_super_admin_request(db, request)
 
+    has_public_enabled_column = bool(
+        db.execute(
+            text(
+                """
+                SELECT EXISTS (
+                    SELECT 1
+                    FROM information_schema.columns
+                    WHERE table_schema = 'public'
+                      AND table_name = 'estate_estates'
+                      AND column_name = 'public_enabled'
+                )
+                """
+            )
+        ).scalar()
+    )
+    has_public_reservation_table = bool(
+        db.execute(text("SELECT to_regclass('public.estate_public_reservation_requests') IS NOT NULL")).scalar()
+    )
+    public_estate_count_sql = (
+        """
+        (SELECT COUNT(*)
+         FROM estate_estates e
+         WHERE e.organization_id = o.id
+           AND e.public_enabled = TRUE) AS public_estate_count,
+        """
+        if has_public_enabled_column
+        else "0 AS public_estate_count,"
+    )
+    reservation_total_sql = (
+        "(SELECT COUNT(*) FROM estate_public_reservation_requests WHERE status IN ('new', 'contacted'))"
+        if has_public_reservation_table
+        else "0"
+    )
+    customer_reservation_count_sql = (
+        """
+        COALESCE((
+            SELECT COUNT(*)
+            FROM estate_public_reservation_requests r
+            WHERE r.organization_id = o.id
+        ), 0) AS reservation_count,
+        COALESCE((
+            SELECT COUNT(*)
+            FROM estate_public_reservation_requests r
+            WHERE r.organization_id = o.id
+              AND r.status IN ('new', 'contacted')
+        ), 0) AS open_reservation_count,
+        """
+        if has_public_reservation_table
+        else "0 AS reservation_count, 0 AS open_reservation_count,"
+    )
+
     totals = db.execute(
         text(
-            """
+            f"""
             SELECT
                 (SELECT COUNT(*) FROM estate_organizations) AS organizations,
                 (SELECT COUNT(*) FROM estate_organizations WHERE status = 'active') AS active_organizations,
@@ -23439,7 +23490,7 @@ def estate_admin_overview(request: Request, db: Session = Depends(get_db)):
                 (SELECT COUNT(*) FROM estate_plots WHERE commercial_status = 'available') AS available_plots,
                 (SELECT COUNT(*) FROM estate_plots WHERE commercial_status = 'reserved') AS reserved_plots,
                 (SELECT COUNT(*) FROM estate_plots WHERE commercial_status = 'allocated') AS allocated_plots,
-                (SELECT COUNT(*) FROM estate_public_reservation_requests WHERE status IN ('new', 'contacted')) AS open_reservations,
+                {reservation_total_sql} AS open_reservations,
                 (SELECT COUNT(*) FROM estate_customers) AS customers,
                 (SELECT COUNT(*) FROM estate_subscriptions WHERE status IN ('trialing', 'active')) AS subscribed_organizations,
                 (SELECT COUNT(*) FROM estate_subscriptions WHERE status = 'past_due') AS past_due_subscriptions
@@ -23449,7 +23500,7 @@ def estate_admin_overview(request: Request, db: Session = Depends(get_db)):
 
     organizations = db.execute(
         text(
-            """
+            f"""
             SELECT
                 o.id AS organization_id,
                 o.name AS company_name,
@@ -23482,12 +23533,7 @@ def estate_admin_overview(request: Request, db: Session = Depends(get_db)):
                     FROM estate_estates e
                     WHERE e.organization_id = o.id
                 ), 0) AS estate_count,
-                COALESCE((
-                    SELECT COUNT(*)
-                    FROM estate_estates e
-                    WHERE e.organization_id = o.id
-                      AND e.public_enabled = TRUE
-                ), 0) AS public_estate_count,
+                {public_estate_count_sql}
                 COALESCE((
                     SELECT COUNT(*)
                     FROM estate_plots p
@@ -23522,17 +23568,7 @@ def estate_admin_overview(request: Request, db: Session = Depends(get_db)):
                     WHERE e.organization_id = o.id
                       AND p.commercial_status = 'allocated'
                 ), 0) AS allocated_plot_count,
-                COALESCE((
-                    SELECT COUNT(*)
-                    FROM estate_public_reservation_requests r
-                    WHERE r.organization_id = o.id
-                ), 0) AS reservation_count,
-                COALESCE((
-                    SELECT COUNT(*)
-                    FROM estate_public_reservation_requests r
-                    WHERE r.organization_id = o.id
-                      AND r.status IN ('new', 'contacted')
-                ), 0) AS open_reservation_count,
+                {customer_reservation_count_sql}
                 COALESCE((
                     SELECT COUNT(*)
                     FROM estate_customers c
