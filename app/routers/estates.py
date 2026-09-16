@@ -158,6 +158,18 @@ def _public_estate_payload(db: Session, estate: Estate) -> dict:
     }
 
 
+def _unique_public_slug(db: Session, estate: Estate) -> str:
+    """Create a stable, URL-safe page address from the Estate name."""
+    base = slugify(estate.name)
+    candidate = base
+    suffix = 2
+    while db.query(Estate.id).filter(Estate.public_slug == candidate, Estate.id != estate.id).first():
+        suffix_text = f"-{suffix}"
+        candidate = f"{base[:140 - len(suffix_text)]}{suffix_text}"
+        suffix += 1
+    return candidate
+
+
 def _geojson_geometry(value: dict, *, allow_polygon: bool = True):
     try:
         geometry = shape(value)
@@ -506,12 +518,7 @@ def update_public_estate_settings(estate_id: int, payload: PublicEstateSettingsU
     approved_plot_count = db.query(EstatePlot).filter(EstatePlot.estate_id == estate.id, EstatePlot.geometry_status == "approved").count()
     if payload.public_enabled and (estate.status != "active" or approved_plot_count == 0):
         raise HTTPException(status_code=409, detail="Approve the Estate map before publishing it publicly")
-    requested_slug = str(payload.public_slug or estate.public_slug or slugify(estate.name)).strip().lower()
-    if not requested_slug:
-        raise HTTPException(status_code=422, detail="Add a public web address for this Estate")
-    conflict = db.query(Estate).filter(Estate.public_slug == requested_slug, Estate.id != estate.id).first()
-    if conflict:
-        raise HTTPException(status_code=409, detail="That public web address is already in use")
+    requested_slug = estate.public_slug or _unique_public_slug(db, estate)
     before = {"public_enabled": estate.public_enabled, "public_slug": estate.public_slug, "public_show_prices": estate.public_show_prices}
     estate.public_enabled = payload.public_enabled
     estate.public_slug = requested_slug

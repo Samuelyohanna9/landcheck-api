@@ -31,10 +31,15 @@ def test_public_showcase_routes_are_safe_and_separate_from_allocations():
 
 
 def test_public_inputs_have_bounded_validation():
-    assert PublicEstateSettingsUpdate.model_fields["public_slug"].metadata
     assert PublicReservationCreate.model_fields["full_name"].metadata
     assert PublicReservationCreate.model_fields["phone"].metadata
     assert PublicReservationUpdate.model_fields["status"].metadata
+
+
+def test_public_address_is_generated_from_estate_name():
+    source = (ROOT / "app" / "routers" / "estates.py").read_text(encoding="utf-8")
+    assert "_unique_public_slug" in source
+    assert "estate.public_slug or _unique_public_slug(db, estate)" in source
 
 
 def test_container_startup_applies_migrations_before_serving_api():

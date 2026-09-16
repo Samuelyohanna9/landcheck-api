@@ -37,7 +37,6 @@ class EstateUpdate(BaseModel):
 
 class PublicEstateSettingsUpdate(BaseModel):
     public_enabled: bool = False
-    public_slug: str | None = Field(default=None, min_length=3, max_length=140, pattern="^[a-z0-9]+(?:-[a-z0-9]+)*$")
     public_description: str | None = Field(default=None, max_length=4000)
     public_contact_phone: str | None = Field(default=None, max_length=64)
     public_show_prices: bool = True
