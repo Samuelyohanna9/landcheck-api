@@ -38,6 +38,7 @@ class EstateUpdate(BaseModel):
 class PublicEstateSettingsUpdate(BaseModel):
     public_enabled: bool = False
     public_description: str | None = Field(default=None, max_length=4000)
+    public_tagline: str | None = Field(default=None, max_length=255)
     public_contact_phone: str | None = Field(default=None, max_length=64)
     public_show_prices: bool = True
 
@@ -47,11 +48,16 @@ class PlotCreate(BaseModel):
     block_id: int | None = None
     land_use: str | None = None
     geometry_status: str = "draft"
+    public_address: str | None = Field(default=None, max_length=255)
     asking_price: Decimal | None = Field(default=None, gt=0)
 
 
 class PlotPriceUpdate(BaseModel):
     asking_price: Decimal | None = Field(default=None, gt=0)
+
+
+class PlotAddressUpdate(BaseModel):
+    public_address: str | None = Field(default=None, max_length=255)
 
 
 class EstateSubdivisionCreate(BaseModel):

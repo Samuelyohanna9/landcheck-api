@@ -10,13 +10,19 @@ ROOT = Path(__file__).parents[1]
 def test_public_showcase_model_and_migration_are_reversible():
     model = (ROOT / "app" / "models" / "estate_foundation.py").read_text(encoding="utf-8")
     migration = (ROOT / "alembic" / "versions" / "20260916_0021_estate_public_showcase.py").read_text(encoding="utf-8")
+    branding_migration = (ROOT / "alembic" / "versions" / "20260916_0022_public_estate_branding.py").read_text(encoding="utf-8")
     assert "class EstatePublicReservationRequest" in model
     assert "public_slug" in Estate.__table__.c
+    assert "public_logo_object_key" in Estate.__table__.c
+    assert "public_tagline" in Estate.__table__.c
     assert "asking_price" in EstatePlot.__table__.c
+    assert "public_address" in EstatePlot.__table__.c
     assert EstatePublicReservationRequest.__table__.c.status is not None
     assert "def upgrade" in migration and "def downgrade" in migration
     assert "estate_public_reservation_requests" in migration
     assert "uq_estate_estates_public_slug" in migration
+    assert "public_tagline" in branding_migration and "public_logo_object_key" in branding_migration
+    assert "public_address" in branding_migration and "def downgrade" in branding_migration
 
 
 def test_public_showcase_routes_are_safe_and_separate_from_allocations():
@@ -31,6 +37,7 @@ def test_public_showcase_routes_are_safe_and_separate_from_allocations():
 
 
 def test_public_inputs_have_bounded_validation():
+    assert PublicEstateSettingsUpdate.model_fields["public_tagline"].metadata
     assert PublicReservationCreate.model_fields["full_name"].metadata
     assert PublicReservationCreate.model_fields["phone"].metadata
     assert PublicReservationUpdate.model_fields["status"].metadata

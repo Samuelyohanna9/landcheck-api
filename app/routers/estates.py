@@ -26,9 +26,10 @@ from app.services.estates.authorization import list_estate_access, resolve_estat
 from app.services.estates.identity import slugify
 from app.services.estates.entitlements import ESTATE_FEATURES, get_estate_entitlement
 from app.models.estate_foundation import Estate, EstateAllocation, EstateAuditEvent, EstateBlock, EstateCommissionPayout, EstateCommissionTier, EstateCustomer, EstateDocument, EstateDocumentLink, EstateFieldInspection, EstateHazardAssessment, EstateImportReview, EstateLayoutProposal, EstateOrganization, EstateOrganizationMember, EstatePayment, EstatePaymentRule, EstatePlot, EstatePublicReservationRequest, EstateSpatialFeature, EstateSurveyRequest, EstateStakingTask
-from app.schemas.estates import AllocationAction, BlockCreate, BlockUpdate, CommissionPayoutCreate, CommissionTiersUpdate, CustomerCreate, DevelopmentStatusUpdate, EstateCreate, EstateLayoutCriteria, EstateLayoutDecision, EstateLayoutFeatureAdd, EstateLayoutFeatureRemove, EstateLayoutProposalEdit, EstateSubdivisionCreate, EstateUpdate, FieldInspectionCreate, GeoreferenceSessionLink, ImportFromGeoreference, ImportReviewCreate, ImportReviewDecision, ImportReviewFromGeoreferenceSession, MemberCreate, MemberUpdate, PlotCreate, PlotGeometryUpdate, PlotPriceUpdate, PublicEstateSettingsUpdate, PublicReservationCreate, PublicReservationUpdate, PaymentCreate, SpatialFeatureCreate, SpatialFeatureUpdate, SurveyEligibilityUpdate, VoidAction
+from app.schemas.estates import AllocationAction, BlockCreate, BlockUpdate, CommissionPayoutCreate, CommissionTiersUpdate, CustomerCreate, DevelopmentStatusUpdate, EstateCreate, EstateLayoutCriteria, EstateLayoutDecision, EstateLayoutFeatureAdd, EstateLayoutFeatureRemove, EstateLayoutProposalEdit, EstateSubdivisionCreate, EstateUpdate, FieldInspectionCreate, GeoreferenceSessionLink, ImportFromGeoreference, ImportReviewCreate, ImportReviewDecision, ImportReviewFromGeoreferenceSession, MemberCreate, MemberUpdate, PlotCreate, PlotAddressUpdate, PlotGeometryUpdate, PlotPriceUpdate, PublicEstateSettingsUpdate, PublicReservationCreate, PublicReservationUpdate, PaymentCreate, SpatialFeatureCreate, SpatialFeatureUpdate, SurveyEligibilityUpdate, VoidAction
 from app.services.estates.payments import confirm_payment, financial_summary, record_payment, void_payment
 from app.services.estates.documents import read_private_estate_file, store_private_estate_file
+from app.utils.r2_objects import delete_object_best_effort, build_r2_settings
 from app.services.estates.permissions import has_permission
 from sqlalchemy import func
 from app.services.estates.allocations import release_allocation, reserve_or_allocate
@@ -133,6 +134,7 @@ def _public_estate_payload(db: Session, estate: Estate) -> dict:
             "id": plot.id,
             "plot_number": plot.plot_number,
             "block": blocks.get(plot.block_id),
+            "address": plot.public_address,
             "area_sqm": float(plot.area_sqm) if plot.area_sqm is not None else None,
             "status": plot.commercial_status if plot.commercial_status in visible_statuses else "on_hold",
             "price": str(plot.asking_price) if estate.public_show_prices and plot.asking_price is not None else None,
@@ -148,6 +150,9 @@ def _public_estate_payload(db: Session, estate: Estate) -> dict:
         "name": estate.name,
         "slug": estate.public_slug,
         "organization_name": organization.name if organization else None,
+        "organization_email": organization.contact_email if organization else None,
+        "logo_url": f"/estates/public/{estate.public_slug}/logo" if estate.public_logo_object_key else None,
+        "tagline": estate.public_tagline,
         "description": estate.public_description or estate.description,
         "location": estate.location_text or ", ".join(filter(None, [estate.locality, estate.state])) or None,
         "contact_phone": estate.public_contact_phone,
@@ -188,6 +193,16 @@ def _geojson_geometry(value: dict, *, allow_polygon: bool = True):
 def public_estate_showcase(slug: str, db: Session = Depends(get_db)):
     """Return only the approved, public-safe inventory for a published Estate."""
     return _public_estate_payload(db, _public_estate(db, slug))
+
+
+@router.get("/public/{slug}/logo")
+def public_estate_logo(slug: str, db: Session = Depends(get_db)):
+    """Serve the deliberately public company logo without exposing its storage object key."""
+    estate = _public_estate(db, slug)
+    if not estate.public_logo_object_key:
+        raise HTTPException(status_code=404, detail="Logo not available")
+    data, mime = read_private_estate_file(estate.public_logo_object_key)
+    return Response(data, media_type=mime, headers={"Cache-Control": "public, max-age=3600"})
 
 
 @router.post("/public/{slug}/plots/{plot_id}/reservation", status_code=201)
@@ -502,7 +517,9 @@ def get_public_estate_settings(estate_id: int, request: Request, db: Session = D
         "public_slug": estate.public_slug,
         "public_url_path": f"/estates/public/{estate.public_slug}" if estate.public_slug else None,
         "public_description": estate.public_description,
+        "public_tagline": estate.public_tagline,
         "public_contact_phone": estate.public_contact_phone,
+        "public_logo_path": f"/estates/public/{estate.public_slug}/logo" if estate.public_logo_object_key else None,
         "public_show_prices": bool(estate.public_show_prices),
         "can_publish": estate.status == "active" and db.query(EstatePlot).filter(EstatePlot.estate_id == estate.id, EstatePlot.geometry_status == "approved").count() > 0,
     }
@@ -523,6 +540,7 @@ def update_public_estate_settings(estate_id: int, payload: PublicEstateSettingsU
     estate.public_enabled = payload.public_enabled
     estate.public_slug = requested_slug
     estate.public_description = payload.public_description.strip() if payload.public_description else None
+    estate.public_tagline = payload.public_tagline.strip() if payload.public_tagline else None
     estate.public_contact_phone = payload.public_contact_phone.strip() if payload.public_contact_phone else None
     estate.public_show_prices = payload.public_show_prices
     append_estate_audit_event(
@@ -533,10 +551,52 @@ def update_public_estate_settings(estate_id: int, payload: PublicEstateSettingsU
         entity_type="estate",
         entity_id=estate.id,
         before_data=before,
-        after_data={"public_enabled": estate.public_enabled, "public_slug": estate.public_slug, "public_show_prices": estate.public_show_prices},
+        after_data={"public_enabled": estate.public_enabled, "public_slug": estate.public_slug, "public_tagline": estate.public_tagline, "public_show_prices": estate.public_show_prices},
     )
     db.commit()
     return get_public_estate_settings(estate_id, request, db)
+
+
+@router.post("/{estate_id}/public-logo")
+async def upload_public_estate_logo(estate_id: int, request: Request, file: UploadFile = File(...), db: Session = Depends(get_db)):
+    estate = db.get(Estate, estate_id)
+    if not estate:
+        raise HTTPException(404, "Estate not found")
+    access = require_estate_access(db, request, estate.organization_id, permission="estate.manage")
+    _enabled(db, estate.organization_id)
+    if str(file.content_type or "").lower() not in {"image/png", "image/jpeg"}:
+        raise HTTPException(422, "Upload a PNG or JPEG logo")
+    data = await file.read()
+    if len(data) > 5 * 1024 * 1024:
+        raise HTTPException(413, "Logo must be 5 MB or smaller")
+    organization = db.get(EstateOrganization, estate.organization_id)
+    if not organization:
+        raise HTTPException(404, "Estate company not found")
+    stored = store_private_estate_file(
+        organization_uid=organization.organization_uid,
+        category="public-assets",
+        entity_uid=f"estate_{estate.estate_uid}",
+        filename=file.filename or "estate-logo.png",
+        content_type=file.content_type or "",
+        data=data,
+    )
+    previous_key = estate.public_logo_object_key
+    estate.public_logo_object_key = stored.object_key
+    append_estate_audit_event(
+        db,
+        organization_id=estate.organization_id,
+        actor=access.principal,
+        action="estate.public_logo_updated",
+        entity_type="estate",
+        entity_id=estate.id,
+        after_data={"filename": stored.filename},
+    )
+    db.commit()
+    if previous_key:
+        settings = build_r2_settings(prefix="R2")
+        if settings:
+            delete_object_best_effort(settings, previous_key)
+    return {"logo_path": f"/estates/public/{estate.public_slug}/logo" if estate.public_slug else None}
 
 
 @router.get("/{estate_id}/reservation-requests")
@@ -590,7 +650,7 @@ def estate_plots_geojson(estate_id: int, request: Request, db: Session = Depends
     if not estate: raise HTTPException(404,"Estate not found")
     require_estate_access(db,request,estate.organization_id,permission="plot.read")
     rows=db.query(EstatePlot).filter(EstatePlot.estate_id==estate_id).all()
-    return {"type":"FeatureCollection","features":[{"type":"Feature","id":plot.id,"properties":{"id":plot.id,"plot_number":plot.plot_number,"commercial_status":plot.commercial_status,"development_status":plot.development_status,"geometry_status":plot.geometry_status,"area_sqm":float(plot.area_sqm),"asking_price":str(plot.asking_price) if plot.asking_price is not None else None,"block_id":plot.block_id},"geometry":mapping(to_shape(plot.geometry))} for plot in rows if plot.geometry]}
+    return {"type":"FeatureCollection","features":[{"type":"Feature","id":plot.id,"properties":{"id":plot.id,"plot_number":plot.plot_number,"commercial_status":plot.commercial_status,"development_status":plot.development_status,"geometry_status":plot.geometry_status,"area_sqm":float(plot.area_sqm),"public_address":plot.public_address,"asking_price":str(plot.asking_price) if plot.asking_price is not None else None,"block_id":plot.block_id},"geometry":mapping(to_shape(plot.geometry))} for plot in rows if plot.geometry]}
 
 @router.get("/{estate_id}/layers.geojson")
 def estate_layers_geojson(estate_id:int, request:Request, db:Session=Depends(get_db)):
@@ -1793,7 +1853,7 @@ def create_plot(estate_id: int, payload: PlotCreate, request: Request, db: Sessi
     normalized = _normalized(payload.plot_number)
     if db.query(EstatePlot).filter(EstatePlot.estate_id == estate_id, EstatePlot.plot_number_normalized == normalized).first(): raise HTTPException(409, "Plot number already exists in this estate")
     if payload.block_id and not db.query(EstateBlock).filter(EstateBlock.id == payload.block_id, EstateBlock.estate_id == estate_id).first(): raise HTTPException(422, "Block does not belong to this estate")
-    plot = EstatePlot(estate_id=estate_id, block_id=payload.block_id, plot_number=payload.plot_number.strip(), plot_number_normalized=normalized, geometry=from_shape(shape(payload.geometry), srid=4326), area_sqm=area, asking_price=payload.asking_price, land_use=payload.land_use, geometry_status=payload.geometry_status, created_by_subject_type=access.principal.subject_type, created_by_subject_id=access.principal.subject_id)
+    plot = EstatePlot(estate_id=estate_id, block_id=payload.block_id, plot_number=payload.plot_number.strip(), plot_number_normalized=normalized, geometry=from_shape(shape(payload.geometry), srid=4326), area_sqm=area, public_address=payload.public_address.strip() if payload.public_address else None, asking_price=payload.asking_price, land_use=payload.land_use, geometry_status=payload.geometry_status, created_by_subject_type=access.principal.subject_type, created_by_subject_id=access.principal.subject_id)
     db.add(plot); db.flush(); append_estate_audit_event(db, organization_id=estate.organization_id, actor=access.principal, action="plot.created", entity_type="estate_plot", entity_id=plot.id, after_data={"plot_number": plot.plot_number, "area_sqm": area, "geometry_status": plot.geometry_status})
     db.commit(); return {"id": plot.id, "uid": plot.plot_uid, "area_sqm": area, "qc": [{"severity": issue.severity, "code": issue.code, "message": issue.message} for issue in issues]}
 
@@ -1819,6 +1879,29 @@ def update_plot_public_price(plot_id: int, payload: PlotPriceUpdate, request: Re
     )
     db.commit()
     return {"id": plot.id, "asking_price": str(plot.asking_price) if plot.asking_price is not None else None}
+
+
+@router.patch("/plots/{plot_id}/public-address")
+def update_plot_public_address(plot_id: int, payload: PlotAddressUpdate, request: Request, db: Session = Depends(get_db)):
+    plot = db.get(EstatePlot, plot_id)
+    if not plot:
+        raise HTTPException(404, "Plot not found")
+    estate = db.get(Estate, plot.estate_id)
+    access = require_estate_access(db, request, estate.organization_id, permission="plot.manage")
+    previous = plot.public_address
+    plot.public_address = payload.public_address.strip() if payload.public_address else None
+    append_estate_audit_event(
+        db,
+        organization_id=estate.organization_id,
+        actor=access.principal,
+        action="plot.public_address_updated",
+        entity_type="estate_plot",
+        entity_id=plot.id,
+        before_data={"public_address": previous},
+        after_data={"public_address": plot.public_address},
+    )
+    db.commit()
+    return {"id": plot.id, "public_address": plot.public_address}
 
 
 @router.patch("/{estate_id}/plots/{plot_id}/geometry")
