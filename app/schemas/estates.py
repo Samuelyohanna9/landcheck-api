@@ -11,6 +11,7 @@ class EstateCreate(BaseModel):
     description: str | None = None
     crs: str = Field(default="EPSG:4326", min_length=3, max_length=80)
     datum: str | None = Field(default=None, max_length=80)
+    unit_system: str = Field(default="m", pattern="^(m|ft)$")
     project_reference: str | None = Field(default=None, max_length=120)
     project_owner: str | None = Field(default=None, max_length=255)
     ownership_details: str | None = Field(default=None, max_length=4000)
@@ -26,6 +27,7 @@ class EstateUpdate(BaseModel):
     description: str | None = None
     crs: str | None = Field(default=None, min_length=3, max_length=80)
     datum: str | None = Field(default=None, max_length=80)
+    unit_system: str | None = Field(default=None, pattern="^(m|ft)$")
     project_reference: str | None = Field(default=None, max_length=120)
     project_owner: str | None = Field(default=None, max_length=255)
     ownership_details: str | None = Field(default=None, max_length=4000)

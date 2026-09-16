@@ -39,6 +39,7 @@ import matplotlib.patches as patches
 
 from app.db import SessionLocal
 from app.models.plot import Plot
+from app.models.estate_foundation import Estate, EstateSurveyRequest
 from app.services.survey.plots import create_survey_plot
 from app.services.survey.dgps import alpha_station, render_dgps_staking_csv
 from app.models.plot_buffer import PlotBuffer
@@ -831,6 +832,18 @@ def upsert_plot_meta(
     })
     if commit:
         db.commit()
+
+
+def _resolve_unit_system_for_plot(db: Session, plot_id: int) -> str:
+    """A plot rendered here may be a plain Survey Plan tool plot (no Estate at all) or the working
+    plot behind an Estate's Survey request (EstateSurveyRequest.survey_working_plot_id) - in the
+    latter case, render distances/areas in that Estate's own unit preference instead of always
+    defaulting to metres."""
+    survey_request = db.query(EstateSurveyRequest).filter(EstateSurveyRequest.survey_working_plot_id == plot_id).first()
+    if not survey_request:
+        return "m"
+    estate = db.get(Estate, survey_request.estate_id)
+    return estate.unit_system if estate and estate.unit_system == "ft" else "m"
 
 
 def get_plot_meta(db: Session, plot_id: int) -> dict:
@@ -3861,6 +3874,7 @@ def _render_survey_plan_pdf_for_plot(db: Session, plot_id: int, output_pdf_path:
         fct_origin_beacon_text=meta.get("fct_origin_beacon_text") or "",
         fct_cadastral_map_ref=meta.get("fct_cadastral_map_ref") or "",
         fct_title_prefix=meta.get("fct_title_prefix") or "",
+        unit_system=_resolve_unit_system_for_plot(db, plot_id),
     )
     report = get_plot_report(plot_id, db)
     generate_plot_report_pdf(report, output_pdf_path, map_path, paper_size=meta["paper_size"])
@@ -7026,6 +7040,7 @@ def download_plot_report_pdf(plot_id: int, db: Session = Depends(get_db), backgr
         fct_origin_beacon_text=fct_origin_beacon_text,
         fct_cadastral_map_ref=fct_cadastral_map_ref,
         fct_title_prefix=fct_title_prefix,
+        unit_system=_resolve_unit_system_for_plot(db, plot_id),
     )
 
     report = get_plot_report(plot_id, db)
@@ -7237,7 +7252,8 @@ def simple_download_pdf(plot_id: int, db: Session = Depends(get_db), background_
         station_names=None,
         coordinate_system="wgs84",
         epsg_code=4326,
-        crs_footer_text="COORDINATE SYSTEM: WGS84"
+        crs_footer_text="COORDINATE SYSTEM: WGS84",
+        unit_system=_resolve_unit_system_for_plot(db, plot_id),
     )
 
     report = get_plot_report(plot_id, db)
@@ -7628,6 +7644,7 @@ def preview_plot_map(plot_id: int, request: Request, db: Session = Depends(get_d
         fct_origin_beacon_text=fct_origin_beacon_text,
         fct_cadastral_map_ref=fct_cadastral_map_ref,
         fct_title_prefix=fct_title_prefix,
+        unit_system=_resolve_unit_system_for_plot(db, plot_id),
     )
 
     cache_path = preview_cache_path(plot_id, cache_key, variant="survey")
@@ -8169,6 +8186,7 @@ def get_saved_survey_plan_pdf(plot_id: int, refresh: bool = False, db: Session =
             fct_origin_beacon_text=meta.get("fct_origin_beacon_text") or "",
             fct_cadastral_map_ref=meta.get("fct_cadastral_map_ref") or "",
             fct_title_prefix=meta.get("fct_title_prefix") or "",
+            unit_system=_resolve_unit_system_for_plot(db, plot_id),
         )
         report = get_plot_report(plot_id, db)
         generate_plot_report_pdf(report, pdf_path, map_path, paper_size=meta["paper_size"])

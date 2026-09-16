@@ -151,13 +151,28 @@ def format_bearing_dms(bearing_deg: float) -> str:
     return f"{deg}\u00B0{minutes:02d}\u2032"
 
 
-def format_area_display(area_m2: float) -> str:
+SQFT_PER_SQM = 10.7639
+FT_PER_M = 3.28084
+
+
+def format_area_display(area_m2: float, unit_system: str = "m") -> str:
     """Below 1 hectare (10,000 sq m), express the area in square meters; at or above, switch to
     hectares - the threshold real Nigerian survey plans use, applied consistently across every
-    template's area display instead of each one hardcoding its own fixed unit."""
+    template's area display instead of each one hardcoding its own fixed unit. When the estate's
+    unit preference is "ft", express in square feet instead (no acre-threshold switch - Nigerian
+    estates working in feet still expect a single ft² figure, not fractional acres)."""
+    if unit_system == "ft":
+        return f"{area_m2 * SQFT_PER_SQM:,.2f} SQ. FT."
     if area_m2 < 10000:
         return f"{area_m2:,.3f} SQ. MTRS."
     return f"{area_m2 / 10000.0:,.4f} HA."
+
+
+def format_distance_display(distance_m: float, unit_system: str = "m") -> str:
+    """Formats a single boundary-segment distance for the plan/schedule, in metres or feet."""
+    if unit_system == "ft":
+        return f"{distance_m * FT_PER_M:.2f}"
+    return f"{distance_m:.2f}"
 
 
 def nice_grid_step(span_m: float) -> float:
@@ -365,6 +380,7 @@ def draw_title_block(
     title_font: str | None = None, title_size: int | None = None,
     area_font: str | None = None, area_size: int | None = None,
     text_color: str = "black",
+    unit_system: str = "m",
 ):
     y = 0.955
     title_fs = title_size if title_size else int(12*font_scale)
@@ -394,7 +410,7 @@ def draw_title_block(
     fig.text(0.5, y, str(state_text), ha="center", fontsize=int(9*font_scale), color=text_color)
     y -= 0.030
     fig.text(
-        0.5, y, f"AREA = {format_area_display(area_m2)}", ha="center",
+        0.5, y, f"AREA = {format_area_display(area_m2, unit_system)}", ha="center",
         fontsize=area_size if area_size else int(9*font_scale), color="red",
         **({"fontfamily": area_font} if area_font else {}),
     )
@@ -1506,6 +1522,7 @@ def annotate_vertices(
     station_size: int | None = None,
     bearing_font: str | None = None,
     bearing_size: int | None = None,
+    unit_system: str = "m",
 ):
     """
     Annotate vertices with station names and bearing/distance in RED.
@@ -1858,7 +1875,7 @@ def annotate_vertices(
             if boundary_poly.contains(test_pt):
                 label_nx, label_ny = -label_nx, -label_ny
         bearing_line = format_bearing_dms(bearing)
-        distance_line = f"{dist:.2f}m"
+        distance_line = f"{format_distance_display(dist, unit_system)}{'ft' if unit_system == 'ft' else 'm'}"
         bearing_placed = place_text(
             mx,
             my,
@@ -1945,7 +1962,7 @@ def _draw_deferred_boundary_detail(ax, entries):
         spine.set_linewidth(0.7)
 
 
-def _write_deferred_boundary_schedule_pages(fig, output_path: str, paper_size: str, dpi: int = 200) -> None:
+def _write_deferred_boundary_schedule_pages(fig, output_path: str, paper_size: str, dpi: int = 200, unit_system: str = "m") -> None:
     """Write clean companion sheets for dimensions that cannot be read on the map sheet."""
     entries = getattr(fig, "_landcheck_deferred_boundary_entries", None)
     if not entries:
@@ -1971,7 +1988,8 @@ def _write_deferred_boundary_schedule_pages(fig, output_path: str, paper_size: s
             va="top",
             fontsize=8,
         )
-        schedule_fig.text(0.055, 0.045, "All values are in metres. Refer to station letters on Sheet 1.", ha="left", va="bottom", fontsize=7)
+        units_note = "feet" if unit_system == "ft" else "metres"
+        schedule_fig.text(0.055, 0.045, f"All values are in {units_note}. Refer to station letters on Sheet 1.", ha="left", va="bottom", fontsize=7)
 
         groups = [page_entries[i:i + rows_per_group] for i in range(0, len(page_entries), rows_per_group)]
         group_count = max(1, len(groups))
@@ -1979,10 +1997,10 @@ def _write_deferred_boundary_schedule_pages(fig, output_path: str, paper_size: s
         for group_index, group in enumerate(groups):
             table = schedule_ax.table(
                 cellText=[
-                    [item["from"], item["to"], format_bearing_dms(item["bearing"]), f"{item['distance']:.2f}"]
+                    [item["from"], item["to"], format_bearing_dms(item["bearing"]), format_distance_display(item["distance"], unit_system)]
                     for item in group
                 ],
-                colLabels=["FROM", "TO", "BEARING", "DIST (m)"],
+                colLabels=["FROM", "TO", "BEARING", f"DIST ({unit_system})"],
                 cellLoc="center",
                 colLoc="center",
                 bbox=[0.02 + group_index * group_width, 0.08, group_width - 0.025, 0.78],
@@ -2000,7 +2018,7 @@ def _write_deferred_boundary_schedule_pages(fig, output_path: str, paper_size: s
         plt.close(schedule_fig)
 
 
-def draw_skipped_table(ax, entries, font_scale=1.0, poly=None, avoid_boxes=None):
+def draw_skipped_table(ax, entries, font_scale=1.0, poly=None, avoid_boxes=None, unit_system: str = "m"):
     if not entries:
         return
 
@@ -2023,7 +2041,7 @@ def draw_skipped_table(ax, entries, font_scale=1.0, poly=None, avoid_boxes=None)
         )
         return
 
-    header = ["From", "To", "Bearing", "Dist (m)"]
+    header = ["From", "To", "Bearing", f"Dist ({unit_system})"]
 
     # This path is deliberately capped by MAX_IN_MAP_DEFERRED_DIMENSIONS, so it remains a small
     # local reference rather than an overlay that obscures the drawing.
@@ -2045,7 +2063,7 @@ def draw_skipped_table(ax, entries, font_scale=1.0, poly=None, avoid_boxes=None)
             idx = group_i * rows_this_group + row_i
             if idx < len(entries):
                 e = entries[idx]
-                row_cells.extend([e["from"], e["to"], format_bearing_dms(e["bearing"]), f"{e['distance']:.2f}"])
+                row_cells.extend([e["from"], e["to"], format_bearing_dms(e["bearing"]), format_distance_display(e["distance"], unit_system)])
             else:
                 row_cells.extend(["", "", "", ""])
         cell_text.append(row_cells)
@@ -2967,7 +2985,7 @@ def _draw_center_text_with_bold_suffix(
     )
 
 
-def _build_segment_rows(poly, station_names=None):
+def _build_segment_rows(poly, station_names=None, unit_system: str = "m"):
     coords, labels = _clockwise_ring_coords_and_labels(poly, station_names=station_names)
     if len(coords) < 2:
         return []
@@ -2981,7 +2999,7 @@ def _build_segment_rows(poly, station_names=None):
         rows.append({
             "from": from_label,
             "bearing": format_bearing_dms(bearing),
-            "length": f"{p1.distance(p2):.2f}m",
+            "length": f"{format_distance_display(p1.distance(p2), unit_system)}{'ft' if unit_system == 'ft' else 'm'}",
             "to": to_label,
         })
     return rows
@@ -3383,6 +3401,7 @@ def _render_plot_map_layout_adamawa(
     area_size: int | None = None,
     measurement_polygon=None,
     measurement_area_m2: float | None = None,
+    unit_system: str = "m",
 ):
     # None means "not overridden" - fall back to this template's own established defaults
     # (which differ slightly from the general template's, e.g. its navy grid/coordinate color)
@@ -3672,12 +3691,13 @@ def _render_plot_map_layout_adamawa(
         station_size=station_size,
         bearing_font=bearing_font,
         bearing_size=bearing_size,
+        unit_system=unit_system,
     )
     # Same overflow table the general template uses when vertices are packed too tightly for
     # every bearing/distance label to fit inline - see the site_plan template's identical addition
     # for why (annotate_vertices always computed which labels got skipped; this template just
     # never drew the table those escape to).
-    draw_skipped_table(ax, skipped_entries, font_scale, poly=poly, avoid_boxes=boundary_label_boxes)
+    draw_skipped_table(ax, skipped_entries, font_scale, poly=poly, avoid_boxes=boundary_label_boxes, unit_system=unit_system)
     area_label_point = None
     try:
         # Prefer an interior visual center for label placement.
@@ -3695,7 +3715,7 @@ def _render_plot_map_layout_adamawa(
     ax.text(
         area_label_point.x,
         area_label_point.y,
-        format_area_display(area_m2),
+        format_area_display(area_m2, unit_system),
         color="red",
         fontsize=area_size if area_size else max(7, int(7 * font_scale)),
         ha="center",
@@ -3713,7 +3733,7 @@ def _render_plot_map_layout_adamawa(
         color=north_arrow_color,
     )
 
-    segment_rows = _build_segment_rows(poly, station_names=station_names)
+    segment_rows = _build_segment_rows(poly, station_names=station_names, unit_system=unit_system)
     first_coords = list(poly.exterior.coords)[0]
     control_point_name = str((station_names or ["A"])[0])
     northing_value = f"{first_coords[1]:.3f}m"
@@ -3750,7 +3770,7 @@ def _render_plot_map_layout_adamawa(
     ax.set_aspect("equal")
     ax.axis("off")
     fig.canvas.draw()
-    _write_deferred_boundary_schedule_pages(fig, output_path, paper_size, dpi=dpi)
+    _write_deferred_boundary_schedule_pages(fig, output_path, paper_size, dpi=dpi, unit_system=unit_system)
     fig.savefig(output_path, dpi=dpi)
     plt.close(fig)
 
@@ -3843,6 +3863,7 @@ def _draw_cadastral_header(
     area_m2: float,
     font_scale: float = 1.0,
     text_color: str = "black",
+    unit_system: str = "m",
 ) -> None:
     fig.add_artist(patches.Rectangle((0.03, 0.03), 0.94, 0.94, transform=fig.transFigure, fill=False, lw=1.2))
 
@@ -3888,7 +3909,7 @@ def _draw_cadastral_header(
 
     line(f"COORDINATE SYSTEM : {_safe_text(coordinate_system_text, '-').upper()}", color=CADASTRAL_BLUE)
     line(f"DATUM / ORIGIN : {_safe_text(datum_text, DEFAULT_CADASTRAL_DATUM_TEXT).upper()}", color=CADASTRAL_BLUE)
-    line(f"AREA: {format_area_display(area_m2)}", color="red")
+    line(f"AREA: {format_area_display(area_m2, unit_system)}", color="red")
 
 
 def _draw_cadastral_footer(
@@ -4349,6 +4370,7 @@ def _render_plot_map_layout_cadastral(
     area_size: int | None = None,
     measurement_polygon=None,
     measurement_area_m2: float | None = None,
+    unit_system: str = "m",
 ):
     boundary_color = boundary_color or "red"
     grid_color = grid_color or CADASTRAL_BLUE
@@ -4508,6 +4530,7 @@ def _render_plot_map_layout_cadastral(
         area_m2=float(area_m2 or 0),
         font_scale=font_scale,
         text_color=text_color,
+        unit_system=unit_system,
     )
 
     apply_true_scale(ax, poly, scale_ratio, fig_width * map_width, fig_height * map_height)
@@ -4640,12 +4663,13 @@ def _render_plot_map_layout_cadastral(
         station_size=station_size,
         bearing_font=bearing_font,
         bearing_size=bearing_size,
+        unit_system=unit_system,
     )
     # Same overflow table the general template uses when vertices are packed too tightly for
     # every bearing/distance label to fit inline - see the site_plan template's identical addition
     # for why (annotate_vertices always computed which labels got skipped; this template just
     # never drew the table those escape to).
-    draw_skipped_table(ax, skipped_entries, font_scale, poly=poly, avoid_boxes=boundary_label_boxes)
+    draw_skipped_table(ax, skipped_entries, font_scale, poly=poly, avoid_boxes=boundary_label_boxes, unit_system=unit_system)
 
     span_x = max(abs(target_xlim[1] - target_xlim[0]), 1.0)
     span_y = max(abs(target_ylim[1] - target_ylim[0]), 1.0)
@@ -4719,7 +4743,7 @@ def _render_plot_map_layout_cadastral(
     ax.set_aspect("equal")
     ax.axis("off")
     fig.canvas.draw()
-    _write_deferred_boundary_schedule_pages(fig, output_path, paper_size, dpi=dpi)
+    _write_deferred_boundary_schedule_pages(fig, output_path, paper_size, dpi=dpi, unit_system=unit_system)
     fig.savefig(output_path, dpi=dpi)
     plt.close(fig)
 
@@ -4804,6 +4828,7 @@ def _compute_fct_beacon_schedule(poly, station_names=None) -> list:
 
 def _draw_fct_beacon_table(
     fig, x0: float, y_top: float, y_bottom: float, rows: list, font_scale: float = 1.0, text_color: str = "black",
+    unit_system: str = "m",
 ) -> None:
     fs = max(6, int(7 * font_scale))
     col1_x, col2_x, col3_x = x0, x0 + 0.21, x0 + 0.30
@@ -4831,7 +4856,7 @@ def _draw_fct_beacon_table(
             continue
         fig.text(col1_x, y, f"FROM {frm} TO {to}  =",
                   fontsize=line_fs, fontfamily=FCT_FONT_FAMILY, color=text_color, ha="left", va="top")
-        fig.text(col2_x, y, f"{dist_m:.2f}m",
+        fig.text(col2_x, y, f"{format_distance_display(dist_m, unit_system)}{'ft' if unit_system == 'ft' else 'm'}",
                   fontsize=line_fs, fontfamily=FCT_FONT_FAMILY, color=text_color, ha="left", va="top")
         fig.text(col3_x, y, f"AT {format_bearing_dms(bearing)}",
                   fontsize=line_fs, fontfamily=FCT_FONT_FAMILY, color=text_color, ha="left", va="top")
@@ -4970,6 +4995,7 @@ def _render_plot_map_layout_fct(
     area_size: int | None = None,
     measurement_polygon=None,
     measurement_area_m2: float | None = None,
+    unit_system: str = "m",
 ):
     boundary_color = boundary_color or "red"
     text_color = text_color or "black"
@@ -5268,12 +5294,13 @@ def _render_plot_map_layout_fct(
         station_size=station_size,
         bearing_font=bearing_font,
         bearing_size=bearing_size,
+        unit_system=unit_system,
     )
     # Same overflow table the general template uses when vertices are packed too tightly for
     # every bearing/distance label to fit inline - see the site_plan template's identical addition
     # for why (annotate_vertices always computed which labels got skipped; this template just
     # never drew the table those escape to).
-    draw_skipped_table(ax, skipped_entries, font_scale, poly=poly, avoid_boxes=boundary_label_boxes)
+    draw_skipped_table(ax, skipped_entries, font_scale, poly=poly, avoid_boxes=boundary_label_boxes, unit_system=unit_system)
 
     area_label_point = None
     try:
@@ -5288,8 +5315,12 @@ def _render_plot_map_layout_fct(
             area_label_point = None
     if area_label_point is not None and not area_label_point.is_empty:
         # Below 1 hectare (10,000 sq m), express the area in square meters; at or above, switch
-        # to hectares - the standard convention on Nigerian cadastral plans.
-        area_text = f"{area_m2:,.2f} m²" if area_m2 < 10000 else f"{area_m2 / 10000.0:,.4f} Ha."
+        # to hectares - the standard convention on Nigerian cadastral plans. In feet, a single
+        # sq ft figure is used instead (no acre-threshold switch).
+        if unit_system == "ft":
+            area_text = f"{area_m2 * SQFT_PER_SQM:,.2f} ft²"
+        else:
+            area_text = f"{area_m2:,.2f} m²" if area_m2 < 10000 else f"{area_m2 / 10000.0:,.4f} Ha."
         ax.text(
             area_label_point.x, area_label_point.y - (target_ylim[1] - target_ylim[0]) * 0.02,
             f"{plot_no_value}\n{area_text}", ha="center", va="center",
@@ -5316,7 +5347,7 @@ def _render_plot_map_layout_fct(
     schedule_y = _draw_fct_scale_schedule(fig, 0.285, resolved_scale_text, font_scale=font_scale, text_color=text_color)
 
     beacon_rows = _compute_fct_beacon_schedule(poly, station_names=station_names)
-    _draw_fct_beacon_table(fig, 0.05, schedule_y, 0.075, beacon_rows, font_scale=font_scale, text_color=text_color)
+    _draw_fct_beacon_table(fig, 0.05, schedule_y, 0.075, beacon_rows, font_scale=font_scale, text_color=text_color, unit_system=unit_system)
     _draw_fct_note_box(
         fig, 0.55, schedule_y,
         first_station_name=first_station_name, fct_cadastral_zone=fct_cadastral_zone,
@@ -5329,7 +5360,7 @@ def _render_plot_map_layout_fct(
         font_scale=font_scale, text_color=text_color,
     )
 
-    _write_deferred_boundary_schedule_pages(fig, output_path, paper_size, dpi=dpi)
+    _write_deferred_boundary_schedule_pages(fig, output_path, paper_size, dpi=dpi, unit_system=unit_system)
     fig.savefig(output_path, dpi=dpi)
     plt.close(fig)
 
@@ -5360,10 +5391,13 @@ def _utm_zone_band_letter(lat_deg: float) -> str:
     return bands[idx]
 
 
-def _format_site_plan_area(area_m2: float) -> str:
+def _format_site_plan_area(area_m2: float, unit_system: str = "m") -> str:
     """Compact "Area=2954.52Sqm" / "Area=1.2500Ha" style matching the reference document, using
-    the same sub-1-hectare-switches-to-Sqm threshold as `format_area_display` elsewhere.
+    the same sub-1-hectare-switches-to-Sqm threshold as `format_area_display` elsewhere. In feet,
+    a single sq ft figure is used instead (no acre-threshold switch).
     """
+    if unit_system == "ft":
+        return f"Area={area_m2 * SQFT_PER_SQM:.2f}Sqft"
     if area_m2 < 10000:
         return f"Area={area_m2:.2f}Sqm"
     return f"Area={area_m2 / 10000.0:.4f}Ha"
@@ -5525,6 +5559,7 @@ def _draw_site_plan_header(
     title_size: int | None = None,
     area_font: str | None = None,
     area_size: int | None = None,
+    unit_system: str = "m",
 ) -> float:
     """Draws the reference document's title block: a single wrapped sentence ("SITE PLAN IN
     RESPECT OF ..., LOCATED AT ..., ... LOCAL GOVERNMENT AREA, ... STATE") followed by an
@@ -5553,7 +5588,7 @@ def _draw_site_plan_header(
         y -= line_h
 
     y -= 0.006
-    area_text = _format_site_plan_area(area_m2)
+    area_text = _format_site_plan_area(area_m2, unit_system)
     area_fs = area_size if area_size else max(8, int(9.5 * font_scale))
     area_family = area_font or SITE_PLAN_FONT_FAMILY
     fig.text(
@@ -5666,6 +5701,7 @@ def _render_plot_map_layout_site_plan(
     area_size: int | None = None,
     measurement_polygon=None,
     measurement_area_m2: float | None = None,
+    unit_system: str = "m",
 ):
     boundary_color = boundary_color or "red"
     grid_color = grid_color or CADASTRAL_BLUE
@@ -5804,6 +5840,7 @@ def _render_plot_map_layout_site_plan(
         title_size=title_size,
         area_font=area_font,
         area_size=area_size,
+        unit_system=unit_system,
     )
 
     map_left, map_width = 0.08, 0.84
@@ -5963,13 +6000,14 @@ def _render_plot_map_layout_site_plan(
         avoid_geom=label_avoid_geom, scale_ratio=scale_ratio, boundary_poly=poly, beacon_style=beacon_style,
         text_color=text_color, boundary_color=boundary_color, station_font=station_font, station_size=station_size,
         bearing_font=bearing_font, bearing_size=bearing_size,
+        unit_system=unit_system,
     )
     # Same overflow table the general template uses when vertices are packed too tightly for
     # every bearing/distance label to fit inline (annotate_vertices already computes which ones
     # got skipped to avoid overlap - this template just never drew the table those escape to,
     # which for a dense/many-sided boundary meant crowded/overlapping labels with no legible
     # fallback for the ones that didn't fit).
-    draw_skipped_table(ax, skipped_entries, font_scale, poly=poly, avoid_boxes=boundary_label_boxes)
+    draw_skipped_table(ax, skipped_entries, font_scale, poly=poly, avoid_boxes=boundary_label_boxes, unit_system=unit_system)
 
     axes_box = ax.get_position()
     # A touch right of the map/photo panels' shared right edge (both are map_width wide) so the
@@ -6011,7 +6049,7 @@ def _render_plot_map_layout_site_plan(
         grid_color=grid_color,
     )
 
-    _write_deferred_boundary_schedule_pages(fig, output_path, paper_size, dpi=dpi)
+    _write_deferred_boundary_schedule_pages(fig, output_path, paper_size, dpi=dpi, unit_system=unit_system)
     fig.savefig(output_path, dpi=dpi)
     plt.close(fig)
 
@@ -6090,6 +6128,7 @@ def render_plot_map_layout(
     area_size: int | None = None,
     measurement_polygon=None,
     measurement_area_m2: float | None = None,
+    unit_system: str = "m",
 ):
     normalized_template = str(template_name or "general").strip().lower()
     if normalized_template in CADASTRAL_STATE_LABELS:
@@ -6139,6 +6178,7 @@ def render_plot_map_layout(
             area_size=area_size,
             measurement_polygon=measurement_polygon,
             measurement_area_m2=measurement_area_m2,
+            unit_system=unit_system,
         )
         return
 
@@ -6190,6 +6230,7 @@ def render_plot_map_layout(
             area_size=area_size,
             measurement_polygon=measurement_polygon,
             measurement_area_m2=measurement_area_m2,
+            unit_system=unit_system,
         )
         return
 
@@ -6249,6 +6290,7 @@ def render_plot_map_layout(
             area_size=area_size,
             measurement_polygon=measurement_polygon,
             measurement_area_m2=measurement_area_m2,
+            unit_system=unit_system,
         )
         return
 
@@ -6292,6 +6334,7 @@ def render_plot_map_layout(
             area_size=area_size,
             measurement_polygon=measurement_polygon,
             measurement_area_m2=measurement_area_m2,
+            unit_system=unit_system,
         )
         return
 
@@ -6457,6 +6500,7 @@ def render_plot_map_layout(
         fig, title_text, area_m2, resolved_scale_text, location_text, lga_text, state_text, font_scale,
         title_font=title_font, title_size=title_size, area_font=area_font, area_size=area_size,
         text_color=text_color,
+        unit_system=unit_system,
     )
     draw_footer(fig, crs_footer_text, source_footer_text, surveyor_name, surveyor_rank, font_scale, text_color=text_color)
 
@@ -6727,8 +6771,9 @@ def render_plot_map_layout(
         station_size=station_size,
         bearing_font=bearing_font,
         bearing_size=bearing_size,
+        unit_system=unit_system,
     )
-    draw_skipped_table(ax, skipped_entries, font_scale, poly=poly, avoid_boxes=boundary_label_boxes)
+    draw_skipped_table(ax, skipped_entries, font_scale, poly=poly, avoid_boxes=boundary_label_boxes, unit_system=unit_system)
 
     # Road/river names (optional). Follow the path's own direction; keep clear of boundary labels.
     major_classes = {
@@ -6797,6 +6842,6 @@ def render_plot_map_layout(
 
     fig.canvas.draw()
     # Match orthophoto save behavior so the page frame fills the preview consistently.
-    _write_deferred_boundary_schedule_pages(fig, output_path, paper_size, dpi=dpi)
+    _write_deferred_boundary_schedule_pages(fig, output_path, paper_size, dpi=dpi, unit_system=unit_system)
     fig.savefig(output_path, dpi=dpi)
     plt.close(fig)

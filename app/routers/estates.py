@@ -73,6 +73,7 @@ def _estate_metadata_snapshot(estate: Estate) -> dict:
         "description": estate.description,
         "crs": estate.crs,
         "datum": estate.datum,
+        "unit_system": estate.unit_system,
         "approximate_area_sqm": str(estate.approximate_area_sqm) if estate.approximate_area_sqm is not None else None,
         "project_reference": estate.project_reference,
         "project_owner": estate.project_owner,
@@ -182,7 +183,7 @@ def list_estates(request: Request, db: Session = Depends(get_db)):
         if not get_estate_entitlement(db, item.organization_id, "ESTATES_ENABLED").is_enabled:
             continue
         rows.extend(db.query(Estate).filter(Estate.organization_id == item.organization_id, Estate.archived_at.is_(None)).all())
-    return [{"id": row.id, "uid": row.estate_uid, "name": row.name, "status": row.status, "organization_id": row.organization_id, "location": row.location_text, "crs": row.crs, "project_reference": row.project_reference, "project_owner": row.project_owner} for row in rows]
+    return [{"id": row.id, "uid": row.estate_uid, "name": row.name, "status": row.status, "organization_id": row.organization_id, "location": row.location_text, "crs": row.crs, "unit_system": row.unit_system, "project_reference": row.project_reference, "project_owner": row.project_owner} for row in rows]
 
 
 @router.post("/organizations/{organization_id}")
@@ -204,6 +205,7 @@ def create_estate(organization_id: int, payload: EstateCreate, request: Request,
         location_text=payload.location_text,
         crs=payload.crs.strip(),
         datum=payload.datum,
+        unit_system=payload.unit_system,
         approximate_area_sqm=payload.approximate_area_sqm,
         project_reference=payload.project_reference,
         project_owner=payload.project_owner,
@@ -221,6 +223,7 @@ def create_estate(organization_id: int, payload: EstateCreate, request: Request,
         "name": estate.name,
         "status": estate.status,
         "crs": estate.crs,
+        "unit_system": estate.unit_system,
         "project_reference": estate.project_reference,
     }
 
@@ -2422,6 +2425,7 @@ def public_plot_view(share_token: str, db: Session = Depends(get_db)):
         "customer_name": customer.full_name if customer else None,
         "plot_number": plot.plot_number,
         "area_sqm": float(plot.area_sqm) if plot.area_sqm is not None else None,
+        "unit_system": estate.unit_system if estate else "m",
         "status": allocation.status,
         "estate_name": estate.name if estate else None,
         "organization_name": organization.name if organization else None,
@@ -2735,6 +2739,7 @@ def estate_detail(estate_id: int, request: Request, db: Session = Depends(get_db
         "location_text": estate.location_text,
         "crs": estate.crs,
         "datum": estate.datum,
+        "unit_system": estate.unit_system,
         "approximate_area_sqm": str(estate.approximate_area_sqm) if estate.approximate_area_sqm is not None else None,
         "project_reference": estate.project_reference,
         "project_owner": estate.project_owner,

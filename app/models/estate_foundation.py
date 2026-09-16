@@ -98,6 +98,7 @@ class Estate(Base):
     status = Column(String(32), nullable=False, default="planning")
     crs = Column(String(80), nullable=False, default="EPSG:4326")
     datum = Column(String(80), nullable=True)
+    unit_system = Column(String(4), nullable=False, default="m")  # "m" | "ft" - display/entry unit for dimensions and areas
     approximate_area_sqm = Column(Numeric(16, 2), nullable=True)
     project_reference = Column(String(120), nullable=True)
     project_owner = Column(String(255), nullable=True)
