@@ -23420,6 +23420,163 @@ def admin_overview(db: Session = Depends(get_db), recent_limit: int = Query(defa
     }
 
 
+@router.get("/admin/estate-overview")
+def estate_admin_overview(request: Request, db: Session = Depends(get_db)):
+    """Read-only platform view for monitoring Estate customers and subscriptions."""
+    require_super_admin_request(db, request)
+
+    totals = db.execute(
+        text(
+            """
+            SELECT
+                (SELECT COUNT(*) FROM estate_organizations) AS organizations,
+                (SELECT COUNT(*) FROM estate_organizations WHERE status = 'active') AS active_organizations,
+                (SELECT COUNT(*) FROM estate_accounts) AS users,
+                (SELECT COUNT(*) FROM estate_accounts WHERE status = 'active') AS active_users,
+                (SELECT COUNT(*) FROM estate_estates) AS estates,
+                (SELECT COUNT(*) FROM estate_plots) AS plots,
+                (SELECT COUNT(*) FROM estate_plots WHERE geometry_status = 'approved') AS approved_plots,
+                (SELECT COUNT(*) FROM estate_plots WHERE commercial_status = 'available') AS available_plots,
+                (SELECT COUNT(*) FROM estate_plots WHERE commercial_status = 'reserved') AS reserved_plots,
+                (SELECT COUNT(*) FROM estate_plots WHERE commercial_status = 'allocated') AS allocated_plots,
+                (SELECT COUNT(*) FROM estate_public_reservation_requests WHERE status IN ('new', 'contacted')) AS open_reservations,
+                (SELECT COUNT(*) FROM estate_customers) AS customers,
+                (SELECT COUNT(*) FROM estate_subscriptions WHERE status IN ('trialing', 'active')) AS subscribed_organizations,
+                (SELECT COUNT(*) FROM estate_subscriptions WHERE status = 'past_due') AS past_due_subscriptions
+            """
+        )
+    ).mappings().one()
+
+    organizations = db.execute(
+        text(
+            """
+            SELECT
+                o.id AS organization_id,
+                o.name AS company_name,
+                o.slug,
+                o.status AS organization_status,
+                o.contact_email,
+                o.created_at,
+                o.updated_at,
+                COALESCE(s.plan_key, '') AS plan_key,
+                COALESCE(s.status, 'not_started') AS subscription_status,
+                s.billing_cycle,
+                s.amount,
+                s.currency,
+                s.trial_ends_at,
+                s.current_period_end,
+                s.next_charge_at,
+                COALESCE((
+                    SELECT COUNT(*)
+                    FROM estate_accounts a
+                    WHERE a.organization_id = o.id
+                ), 0) AS user_count,
+                COALESCE((
+                    SELECT COUNT(*)
+                    FROM estate_accounts a
+                    WHERE a.organization_id = o.id
+                      AND a.status = 'active'
+                ), 0) AS active_user_count,
+                COALESCE((
+                    SELECT COUNT(*)
+                    FROM estate_estates e
+                    WHERE e.organization_id = o.id
+                ), 0) AS estate_count,
+                COALESCE((
+                    SELECT COUNT(*)
+                    FROM estate_estates e
+                    WHERE e.organization_id = o.id
+                      AND e.public_enabled = TRUE
+                ), 0) AS public_estate_count,
+                COALESCE((
+                    SELECT COUNT(*)
+                    FROM estate_plots p
+                    JOIN estate_estates e ON e.id = p.estate_id
+                    WHERE e.organization_id = o.id
+                ), 0) AS plot_count,
+                COALESCE((
+                    SELECT COUNT(*)
+                    FROM estate_plots p
+                    JOIN estate_estates e ON e.id = p.estate_id
+                    WHERE e.organization_id = o.id
+                      AND p.geometry_status = 'approved'
+                ), 0) AS approved_plot_count,
+                COALESCE((
+                    SELECT COUNT(*)
+                    FROM estate_plots p
+                    JOIN estate_estates e ON e.id = p.estate_id
+                    WHERE e.organization_id = o.id
+                      AND p.commercial_status = 'available'
+                ), 0) AS available_plot_count,
+                COALESCE((
+                    SELECT COUNT(*)
+                    FROM estate_plots p
+                    JOIN estate_estates e ON e.id = p.estate_id
+                    WHERE e.organization_id = o.id
+                      AND p.commercial_status = 'reserved'
+                ), 0) AS reserved_plot_count,
+                COALESCE((
+                    SELECT COUNT(*)
+                    FROM estate_plots p
+                    JOIN estate_estates e ON e.id = p.estate_id
+                    WHERE e.organization_id = o.id
+                      AND p.commercial_status = 'allocated'
+                ), 0) AS allocated_plot_count,
+                COALESCE((
+                    SELECT COUNT(*)
+                    FROM estate_public_reservation_requests r
+                    WHERE r.organization_id = o.id
+                ), 0) AS reservation_count,
+                COALESCE((
+                    SELECT COUNT(*)
+                    FROM estate_public_reservation_requests r
+                    WHERE r.organization_id = o.id
+                      AND r.status IN ('new', 'contacted')
+                ), 0) AS open_reservation_count,
+                COALESCE((
+                    SELECT COUNT(*)
+                    FROM estate_customers c
+                    WHERE c.organization_id = o.id
+                ), 0) AS customer_count,
+                COALESCE((
+                    SELECT SUM(p.area_sqm)
+                    FROM estate_plots p
+                    JOIN estate_estates e ON e.id = p.estate_id
+                    WHERE e.organization_id = o.id
+                ), 0) AS total_plot_area_sqm,
+                (
+                    SELECT e.name
+                    FROM estate_estates e
+                    WHERE e.organization_id = o.id
+                    ORDER BY e.updated_at DESC NULLS LAST, e.id DESC
+                    LIMIT 1
+                ) AS latest_estate_name,
+                (
+                    SELECT COALESCE(e.location_text, NULLIF(CONCAT_WS(', ', e.locality, e.state), ''))
+                    FROM estate_estates e
+                    WHERE e.organization_id = o.id
+                    ORDER BY e.updated_at DESC NULLS LAST, e.id DESC
+                    LIMIT 1
+                ) AS latest_estate_location,
+                (
+                    SELECT MAX(GREATEST(COALESCE(e.updated_at, e.created_at), COALESCE(e.created_at, e.updated_at)))
+                    FROM estate_estates e
+                    WHERE e.organization_id = o.id
+                ) AS last_estate_activity_at
+            FROM estate_organizations o
+            LEFT JOIN estate_subscriptions s ON s.organization_id = o.id
+            ORDER BY COALESCE(o.updated_at, o.created_at) DESC, o.id DESC
+            """
+        )
+    ).mappings().all()
+
+    return {
+        "generated_at": datetime.now(timezone.utc),
+        "totals": {key: int(value or 0) for key, value in dict(totals).items()},
+        "organizations": [dict(row) for row in organizations],
+    }
+
+
 @router.get("/admin/organizations/{organization_id}/credentials/export/pdf")
 def export_admin_org_credentials_pdf(
     organization_id: int,
