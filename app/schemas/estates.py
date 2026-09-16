@@ -60,6 +60,15 @@ class PlotAddressUpdate(BaseModel):
     public_address: str | None = Field(default=None, max_length=255)
 
 
+class PlotListingDefaultsUpdate(BaseModel):
+    """Apply shared public-listing values to the plots in one Estate."""
+
+    apply_address: bool = False
+    public_address: str | None = Field(default=None, max_length=255)
+    apply_price: bool = False
+    asking_price: Decimal | None = Field(default=None, gt=0)
+
+
 class EstateSubdivisionCreate(BaseModel):
     split_count: int = Field(default=2, ge=2, le=100)
 

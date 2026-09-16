@@ -1,7 +1,7 @@
 from pathlib import Path
 
 from app.models.estate_foundation import Estate, EstatePlot, EstatePublicReservationRequest
-from app.schemas.estates import PublicEstateSettingsUpdate, PublicReservationCreate, PublicReservationUpdate
+from app.schemas.estates import PlotListingDefaultsUpdate, PublicEstateSettingsUpdate, PublicReservationCreate, PublicReservationUpdate
 
 
 ROOT = Path(__file__).parents[1]
@@ -41,6 +41,15 @@ def test_public_inputs_have_bounded_validation():
     assert PublicReservationCreate.model_fields["full_name"].metadata
     assert PublicReservationCreate.model_fields["phone"].metadata
     assert PublicReservationUpdate.model_fields["status"].metadata
+
+
+def test_plot_listing_defaults_have_explicit_bulk_controls():
+    assert PlotListingDefaultsUpdate.model_fields["apply_address"].default is False
+    assert PlotListingDefaultsUpdate.model_fields["apply_price"].default is False
+    source = (ROOT / "app" / "routers" / "estates.py").read_text(encoding="utf-8")
+    assert '@router.patch("/{estate_id}/plot-listing-defaults")' in source
+    assert 'permission="plot.manage"' in source
+    assert "estate.plot_listing_defaults_updated" in source
 
 
 def test_public_address_is_generated_from_estate_name():

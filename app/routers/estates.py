@@ -26,7 +26,7 @@ from app.services.estates.authorization import list_estate_access, resolve_estat
 from app.services.estates.identity import slugify
 from app.services.estates.entitlements import ESTATE_FEATURES, get_estate_entitlement
 from app.models.estate_foundation import Estate, EstateAllocation, EstateAuditEvent, EstateBlock, EstateCommissionPayout, EstateCommissionTier, EstateCustomer, EstateDocument, EstateDocumentLink, EstateFieldInspection, EstateHazardAssessment, EstateImportReview, EstateLayoutProposal, EstateOrganization, EstateOrganizationMember, EstatePayment, EstatePaymentRule, EstatePlot, EstatePublicReservationRequest, EstateSpatialFeature, EstateSurveyRequest, EstateStakingTask
-from app.schemas.estates import AllocationAction, BlockCreate, BlockUpdate, CommissionPayoutCreate, CommissionTiersUpdate, CustomerCreate, DevelopmentStatusUpdate, EstateCreate, EstateLayoutCriteria, EstateLayoutDecision, EstateLayoutFeatureAdd, EstateLayoutFeatureRemove, EstateLayoutProposalEdit, EstateSubdivisionCreate, EstateUpdate, FieldInspectionCreate, GeoreferenceSessionLink, ImportFromGeoreference, ImportReviewCreate, ImportReviewDecision, ImportReviewFromGeoreferenceSession, MemberCreate, MemberUpdate, PlotCreate, PlotAddressUpdate, PlotGeometryUpdate, PlotPriceUpdate, PublicEstateSettingsUpdate, PublicReservationCreate, PublicReservationUpdate, PaymentCreate, SpatialFeatureCreate, SpatialFeatureUpdate, SurveyEligibilityUpdate, VoidAction
+from app.schemas.estates import AllocationAction, BlockCreate, BlockUpdate, CommissionPayoutCreate, CommissionTiersUpdate, CustomerCreate, DevelopmentStatusUpdate, EstateCreate, EstateLayoutCriteria, EstateLayoutDecision, EstateLayoutFeatureAdd, EstateLayoutFeatureRemove, EstateLayoutProposalEdit, EstateSubdivisionCreate, EstateUpdate, FieldInspectionCreate, GeoreferenceSessionLink, ImportFromGeoreference, ImportReviewCreate, ImportReviewDecision, ImportReviewFromGeoreferenceSession, MemberCreate, MemberUpdate, PlotCreate, PlotAddressUpdate, PlotGeometryUpdate, PlotListingDefaultsUpdate, PlotPriceUpdate, PublicEstateSettingsUpdate, PublicReservationCreate, PublicReservationUpdate, PaymentCreate, SpatialFeatureCreate, SpatialFeatureUpdate, SurveyEligibilityUpdate, VoidAction
 from app.services.estates.payments import confirm_payment, financial_summary, record_payment, void_payment
 from app.services.estates.documents import read_private_estate_file, store_private_estate_file
 from app.utils.r2_objects import delete_object_best_effort, build_r2_settings
@@ -1902,6 +1902,49 @@ def update_plot_public_address(plot_id: int, payload: PlotAddressUpdate, request
     )
     db.commit()
     return {"id": plot.id, "public_address": plot.public_address}
+
+
+@router.patch("/{estate_id}/plot-listing-defaults")
+def update_plot_listing_defaults(estate_id: int, payload: PlotListingDefaultsUpdate, request: Request, db: Session = Depends(get_db)):
+    """Apply shared public address and/or price to every plot in an Estate."""
+    estate = db.get(Estate, estate_id)
+    if not estate:
+        raise HTTPException(404, "Estate not found")
+    access = require_estate_access(db, request, estate.organization_id, permission="plot.manage")
+    _enabled(db, estate.organization_id)
+    if not payload.apply_address and not payload.apply_price:
+        raise HTTPException(422, "Choose an address or price to apply")
+
+    plots_query = db.query(EstatePlot).filter(EstatePlot.estate_id == estate_id)
+    updated_count = plots_query.count()
+    address_value = payload.public_address.strip() if payload.public_address else None
+    price_value = payload.asking_price
+    changes = {}
+    if payload.apply_address:
+        changes["public_address"] = address_value
+    if payload.apply_price:
+        changes["asking_price"] = price_value
+    plots_query.update(changes, synchronize_session=False)
+    append_estate_audit_event(
+        db,
+        organization_id=estate.organization_id,
+        actor=access.principal,
+        action="estate.plot_listing_defaults_updated",
+        entity_type="estate",
+        entity_id=estate.id,
+        after_data={
+            "updated_plots": updated_count,
+            "public_address": address_value if payload.apply_address else None,
+            "asking_price": str(price_value) if payload.apply_price and price_value is not None else None,
+        },
+    )
+    db.commit()
+    return {
+        "estate_id": estate.id,
+        "updated_plots": updated_count,
+        "public_address": address_value if payload.apply_address else None,
+        "asking_price": str(price_value) if payload.apply_price and price_value is not None else None,
+    }
 
 
 @router.patch("/{estate_id}/plots/{plot_id}/geometry")
