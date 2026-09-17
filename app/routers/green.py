@@ -19759,11 +19759,13 @@ def _render_sponsor_public_terms_html(request: Request | None = None) -> str:
         --emerald: #0f6f39;
         --emerald-dark: #0b4f28;
         --shadow: 0 22px 48px rgba(12, 61, 31, 0.10);
+        --body-font: "Aptos", "Segoe UI", Arial, sans-serif;
+        --display-font: "Iowan Old Style", "Palatino Linotype", "Book Antiqua", Georgia, serif;
       }}
       * {{ box-sizing: border-box; }}
       body {{
         margin: 0;
-        font-family: Inter, "Segoe UI", system-ui, sans-serif;
+        font-family: var(--body-font);
         color: var(--text);
         background:
           radial-gradient(circle at top right, rgba(126,224,142,0.24), transparent 24rem),
@@ -19781,6 +19783,7 @@ def _render_sponsor_public_terms_html(request: Request | None = None) -> str:
       .hero p, .hero h1 {{ margin: 0; }}
       .eyebrow {{
         color: rgba(255,255,255,0.74);
+        font-family: var(--body-font);
         font-size: 12px;
         font-weight: 800;
         letter-spacing: 0.14em;
@@ -19788,7 +19791,9 @@ def _render_sponsor_public_terms_html(request: Request | None = None) -> str:
       }}
       .hero h1 {{
         margin-top: 10px;
+        font-family: var(--display-font);
         font-size: clamp(2rem, 4vw, 3.2rem);
+        font-weight: 500;
         line-height: 1.05;
         letter-spacing: -0.04em;
       }}
@@ -19808,7 +19813,9 @@ def _render_sponsor_public_terms_html(request: Request | None = None) -> str:
       }}
       .panel h2 {{
         margin: 0 0 8px;
+        font-family: var(--display-font);
         font-size: 1.3rem;
+        font-weight: 500;
         letter-spacing: -0.03em;
       }}
       .panel p {{
@@ -19836,7 +19843,9 @@ def _render_sponsor_public_terms_html(request: Request | None = None) -> str:
       .meta-card strong {{
         display: block;
         margin-top: 8px;
+        font-family: var(--display-font);
         font-size: 1rem;
+        font-weight: 500;
         color: var(--emerald-dark);
       }}
       a {{ color: var(--emerald); font-weight: 700; text-decoration: none; }}
