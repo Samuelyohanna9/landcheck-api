@@ -134,32 +134,6 @@ def _format_total_area(area_sqm: float) -> str:
     return f"{area_sqm:,.0f} m²"
 
 
-def _draw_double_boundary_line(ax, polygon, *, offset_m: float, color: str, linewidth: float, zorder: int) -> None:
-    """Two parallel strokes (one just inside, one just outside the true line) instead of a single
-    stroke - the conventional cadastral "double border" convention for a parent-parcel boundary.
-    Falls back to a single (slightly heavier) line if buffering the polygon by offset_m produces
-    nothing usable, e.g. an extremely small or degenerate boundary."""
-    def _rings(geom):
-        if geom is None or geom.is_empty:
-            return []
-        polys = list(geom.geoms) if geom.geom_type.startswith("Multi") else [geom]
-        return [p for p in polys if not p.is_empty and p.exterior is not None]
-
-    try:
-        outer_rings = _rings(polygon.buffer(offset_m))
-        inner_rings = _rings(polygon.buffer(-offset_m))
-    except Exception:
-        outer_rings, inner_rings = [], []
-
-    if outer_rings and inner_rings:
-        for poly in outer_rings + inner_rings:
-            xs, ys = poly.exterior.xy
-            ax.plot(xs, ys, color=color, linewidth=linewidth, zorder=zorder, solid_joinstyle="round", solid_capstyle="round")
-    else:
-        xs, ys = polygon.exterior.xy
-        ax.plot(xs, ys, color=color, linewidth=linewidth * 1.8, zorder=zorder, solid_joinstyle="round", solid_capstyle="round")
-
-
 PLOT_STATUS_FACE = {
     "available": PLOT_FACE,
     "reserved": "#fff4cc",
@@ -385,13 +359,11 @@ def render_estate_layout_pdf(
 
     if estate.boundary is not None:
         boundary_metric = shapely_transform(forward, to_shape_fn(estate.boundary))
-        # The parent parcel boundary - a double red line (two parallel strokes), the conventional
-        # cadastral "double border" style, drawn over every subdivision line so the overall extent
-        # always reads clearly. The gap between the two strokes is sized in real page points (not
-        # a fraction of the site's own size), so it looks the same on a 2-plot infill as on a
-        # 500-plot estate.
-        boundary_gap_m = (2.6 / points_per_meter) if points_per_meter > 0 else max(span_x, span_y) * 0.003
-        _draw_double_boundary_line(ax, boundary_metric, offset_m=boundary_gap_m, color=BOUNDARY_LINE, linewidth=1.3 * scale, zorder=5)
+        # The parent parcel boundary - a single solid red line, drawn over every subdivision line
+        # so the overall extent always reads clearly. (The double-line "drawing sheet" convention
+        # is used for the black page frame instead - this line stays a single stroke so the two
+        # never look alike.)
+        ax.add_patch(mpatches.Polygon(list(boundary_metric.exterior.coords), closed=True, facecolor="none", edgecolor=BOUNDARY_LINE, linewidth=2.6 * scale, zorder=5))
 
         # Each boundary edge's real-world length, centered on the edge and set just outside the
         # line - away from the estate's own centroid, so it sits over open page rather than the
