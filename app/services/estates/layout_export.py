@@ -436,29 +436,59 @@ def render_estate_layout_pdf(
     # dimension has "extra" room), so a fixed fraction like "start the legend at 0.30" means a
     # very different amount of real space depending on the estate's own shape.
     axes_width_pts = (span_x + 2 * pad_x) * points_per_meter if points_per_meter > 0 else 0.0
+    axes_height_pts = (span_y + 2 * pad_y) * points_per_meter if points_per_meter > 0 else 0.0
     def _pts_to_frac(pts: float) -> float:
         return (pts / axes_width_pts) if axes_width_pts > 0 else pts / 1000.0
+    def _pts_to_frac_y(pts: float) -> float:
+        return (pts / axes_height_pts) if axes_height_pts > 0 else pts / 1000.0
 
     total_area_sqm = boundary_metric.area if estate.boundary is not None else sum(float(p.area_sqm or 0) for p in plots)
     generated_at = datetime.now(timezone.utc).strftime("%d %b %Y")
-    title_text = (
-        f"Layout Plan for {estate.name or 'Estate'}\n"
-        f"{organization_name or ''}\n"
-        f"{len(plots)} plots · Total area {_format_total_area(total_area_sqm)}\n"
-        f"Generated {generated_at} · CRS EPSG:{metric_epsg}"
+
+    # Title moved to a centered, all-caps heading at the top of the sheet (was a small bordered
+    # card at bottom-right) - the double-line frame added at the very end of this function is what
+    # now visually "borders" the page, so this no longer needs its own box.
+    title_heading = f"LAYOUT PLAN FOR {(estate.name or 'ESTATE').upper()}"
+    title_org = (organization_name or "").upper()
+    title_info = (
+        f"{len(plots)} PLOTS · TOTAL AREA {_format_total_area(total_area_sqm).upper()} · "
+        f"GENERATED {generated_at.upper()} · CRS EPSG:{metric_epsg}"
     )
-    title_font_pts = 9.0 * scale
-    longest_title_line = max(title_text.split("\n"), key=len)
-    title_text_width_pts = len(longest_title_line) * title_font_pts * _REGULAR_CHAR_WIDTH
-    # Never let the title block balloon past ~42% of the sheet's own width - without this, a
-    # narrow/tall estate (few points wide) would print exactly as many characters at the same
-    # fixed font size, so the box would visually dominate the whole bottom of the page.
-    max_title_width_pts = axes_width_pts * 0.42 if axes_width_pts > 0 else title_text_width_pts
-    if title_text_width_pts > max_title_width_pts > 0:
-        title_font_pts = max(title_font_pts * (max_title_width_pts / title_text_width_pts), 5.5 * scale)
-        title_text_width_pts = len(longest_title_line) * title_font_pts * _REGULAR_CHAR_WIDTH
-    title_box_margin_pts = 22.0 * scale
-    title_start_frac = 1.0 - _pts_to_frac(title_text_width_pts + title_box_margin_pts) - 0.015
+    heading_font_pts = 13.0 * scale
+    org_font_pts = 9.5 * scale
+    info_font_pts = 8.0 * scale
+
+    def _required_shrink(text: str, font_pts: float, char_width: float, max_width_pts: float) -> float:
+        width_pts = len(text) * font_pts * char_width
+        return (max_width_pts / width_pts) if width_pts > max_width_pts > 0 else 1.0
+
+    # All three lines shrink together (never independently, so the heading stays visibly the
+    # biggest) whenever the longest of them - usually title_info, not the heading itself - would
+    # otherwise overflow the sheet's own width. Matters most for a narrow/tall estate, where the
+    # axes box is far fewer points wide than a wide one's.
+    # All-caps text (this whole title block) runs wider per character than the mixed-case text
+    # _REGULAR_CHAR_WIDTH was calibrated against elsewhere in this file, so the bold estimate is
+    # used for all three lines here, with a tighter width cap - better to shrink a bit more than
+    # strictly necessary than to let a line clip the frame.
+    max_title_line_width_pts = axes_width_pts * 0.78 if axes_width_pts > 0 else None
+    if max_title_line_width_pts:
+        shrink = min(
+            _required_shrink(title_heading, heading_font_pts, _BOLD_CHAR_WIDTH, max_title_line_width_pts),
+            _required_shrink(title_org, org_font_pts, _BOLD_CHAR_WIDTH, max_title_line_width_pts) if title_org else 1.0,
+            _required_shrink(title_info, info_font_pts, _BOLD_CHAR_WIDTH, max_title_line_width_pts),
+        )
+        if shrink < 1.0:
+            heading_font_pts = max(heading_font_pts * shrink, 7.0 * scale)
+            org_font_pts = max(org_font_pts * shrink, 6.0 * scale)
+            info_font_pts = max(info_font_pts * shrink, 5.2 * scale)
+
+    title_top_y = 0.965
+    ax.text(0.5, title_top_y, title_heading, transform=ax.transAxes, ha="center", va="top", fontsize=heading_font_pts, fontweight="bold", color=INK, clip_on=False, zorder=11)
+    next_y = title_top_y - _pts_to_frac_y(heading_font_pts * 1.5)
+    if title_org:
+        ax.text(0.5, next_y, title_org, transform=ax.transAxes, ha="center", va="top", fontsize=org_font_pts, color=INK, clip_on=False, zorder=11)
+        next_y -= _pts_to_frac_y(org_font_pts * 1.5)
+    ax.text(0.5, next_y, title_info, transform=ax.transAxes, ha="center", va="top", fontsize=info_font_pts, color=MUTED, clip_on=False, zorder=11)
 
     legend_font_pts = 8.5 * scale
     swatch_pts = 9.5 * scale
@@ -485,8 +515,8 @@ def render_estate_layout_pdf(
 
     row_y = 0.024
     legend_x = max(0.30, scale_bar_end_frac + 0.02)
-    if legend_x + legend_row_width_frac > title_start_frac:
-        # Not enough room to fit the scale bar, legend and title side by side on one row for this
+    if legend_x + legend_row_width_frac > 0.97:
+        # Not enough room to fit the scale bar and legend side by side on one row for this
         # estate's shape - the legend gets its own row above them instead, clearing whichever sits
         # higher: the base row itself, or the scale bar's own caption.
         legend_row_y = max(row_y + swatch_frac + 0.02, scale_bar_top_frac + 0.015)
@@ -506,11 +536,19 @@ def render_estate_layout_pdf(
         ax.text(text_x, legend_row_y + swatch_frac / 2, label, transform=ax.transAxes, ha="left", va="center", fontsize=legend_font_pts, color=INK, clip_on=False, zorder=11)
         cursor_x += _pts_to_frac(item_width_pts)
 
-    ax.text(
-        0.985, 0.025, title_text, transform=ax.transAxes, ha="right", va="bottom",
-        fontsize=title_font_pts, color=INK, linespacing=1.7, zorder=11,
-        bbox=dict(boxstyle="round,pad=0.5", facecolor="white", edgecolor=INK, linewidth=0.9 * scale),
-    )
+    # A double-line black frame around the entire sheet - the title heading, scale bar, legend and
+    # the site plan itself all sit inside it, the conventional bordered "drawing sheet" convention
+    # (distinct from the estate's own red boundary line drawn earlier, which traces the actual
+    # parcel, not the page). Drawn last, in axes-fraction, so it's the true outermost element -
+    # bbox_inches="tight" then sizes the saved page to it rather than to whatever happens to be
+    # widest among the title/scale/legend/labels.
+    frame_margin = 0.01
+    frame_gap = 0.007
+    for m in (frame_margin, frame_margin + frame_gap):
+        ax.add_patch(mpatches.Rectangle(
+            (m, m), 1 - 2 * m, 1 - 2 * m, transform=ax.transAxes,
+            fill=False, edgecolor="black", linewidth=1.5 * scale, clip_on=False, zorder=20,
+        ))
 
     with PdfPages(output_path) as pdf:
         pdf.savefig(fig, bbox_inches="tight")
