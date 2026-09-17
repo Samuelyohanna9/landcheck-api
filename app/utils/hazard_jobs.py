@@ -8,6 +8,8 @@ from typing import Any, Callable, Dict, Optional
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
+from app.utils.survey_auth_security import ensure_survey_auth_schema
+
 HAZARD_JOB_STATUS_VALUES = {"queued", "running", "completed", "failed"}
 
 _HAZARD_JOBS_TABLE_LOCK = threading.Lock()
@@ -24,6 +26,10 @@ def ensure_hazard_analysis_jobs_table(db: Session) -> None:
     with _HAZARD_JOBS_TABLE_LOCK:
         if _HAZARD_JOBS_TABLE_READY:
             return
+        # owner_user_id below references survey_users - make sure that table exists first,
+        # since this can run before any Survey auth endpoint ever has (e.g. the very first
+        # request the process handles is an anonymous hazard analysis).
+        ensure_survey_auth_schema()
         db.execute(text("""
             CREATE TABLE IF NOT EXISTS hazard_analysis_jobs (
                 id TEXT PRIMARY KEY,
@@ -48,6 +54,16 @@ def ensure_hazard_analysis_jobs_table(db: Session) -> None:
             "CREATE INDEX IF NOT EXISTS idx_hazard_analysis_jobs_status_created "
             "ON hazard_analysis_jobs(status, created_at DESC)"
         ))
+        # Anonymous by default (NULL) - a run only gets an owner when the caller has a valid
+        # Survey session at the moment it's created (see hazards.py's create_hazard_analysis_job),
+        # exactly like plots.py's plots.owner_user_id for anonymously-drawn plots.
+        db.execute(text(
+            "ALTER TABLE hazard_analysis_jobs ADD COLUMN IF NOT EXISTS owner_user_id BIGINT REFERENCES survey_users(id)"
+        ))
+        db.execute(text(
+            "CREATE INDEX IF NOT EXISTS idx_hazard_analysis_jobs_owner "
+            "ON hazard_analysis_jobs(owner_user_id, created_at DESC)"
+        ))
         db.commit()
         _HAZARD_JOBS_TABLE_READY = True
 
@@ -59,20 +75,22 @@ def insert_hazard_job(
     output_type: str,
     request_payload: Dict[str, Any],
     worker: Callable[[str], None],
+    owner_user_id: Optional[int] = None,
 ) -> Dict[str, Any]:
     ensure_hazard_analysis_jobs_table(db)
     job_id = uuid.uuid4().hex
     db.execute(text("""
         INSERT INTO hazard_analysis_jobs (
-            id, hazard_type, output_type, status, stage, progress_pct, request_payload, created_at, updated_at
+            id, hazard_type, output_type, status, stage, progress_pct, request_payload, owner_user_id, created_at, updated_at
         ) VALUES (
-            :id, :hazard_type, :output_type, 'queued', 'Queued', 0, CAST(:request_payload AS JSONB), NOW(), NOW()
+            :id, :hazard_type, :output_type, 'queued', 'Queued', 0, CAST(:request_payload AS JSONB), :owner_user_id, NOW(), NOW()
         )
     """), {
         "id": job_id,
         "hazard_type": hazard_type,
         "output_type": output_type,
         "request_payload": json.dumps(request_payload or {}),
+        "owner_user_id": owner_user_id,
     })
     db.commit()
     threading.Thread(target=worker, args=(job_id,), daemon=True).start()

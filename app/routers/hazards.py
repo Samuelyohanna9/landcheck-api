@@ -1,6 +1,8 @@
-from fastapi import APIRouter, Body, Depends, File, HTTPException, UploadFile
+from fastapi import APIRouter, Body, Depends, File, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, Response
+from sqlalchemy import text
 from sqlalchemy.orm import Session
+from typing import List
 import geopandas as gpd
 import json
 import os
@@ -18,6 +20,7 @@ from app.utils.hazard_lulc import compute_lulc_summary, overlay_to_data_url as l
 from app.utils.hazard_pdf import render_flood_report_pdf, render_erosion_report_pdf, render_lulc_report_pdf
 from app.utils.hazard_gis_export import build_hazard_gis_export_zip
 from app.utils.hazard_jobs import (
+    ensure_hazard_analysis_jobs_table,
     get_hazard_job,
     get_hazard_job_file,
     insert_hazard_job,
@@ -26,6 +29,7 @@ from app.utils.hazard_jobs import (
     set_hazard_job_status,
 )
 from app.utils.r2_exports import upload_export_file_best_effort
+from app.utils.survey_auth_security import require_survey_session, resolve_survey_session
 
 
 router = APIRouter(prefix="/hazards", tags=["hazards"])
@@ -1072,7 +1076,7 @@ def _run_hazard_analysis_job(job_id: str) -> None:
 
 
 @router.post("/{hazard_type}/analyze")
-def create_hazard_analysis_job(hazard_type: str, payload: dict = Body(...), db: Session = Depends(get_db)):
+def create_hazard_analysis_job(hazard_type: str, request: Request, payload: dict = Body(...), db: Session = Depends(get_db)):
     if hazard_type not in ("flood", "erosion", "lulc"):
         raise HTTPException(status_code=404, detail="Unknown hazard type")
     output_type = str(payload.get("output_type") or "preview")
@@ -1092,12 +1096,18 @@ def create_hazard_analysis_job(hazard_type: str, payload: dict = Body(...), db: 
         "engine": str(payload.get("engine") or "river"),  # flood gis-export only: "river" | "rainfall"
         **_extract_site_params(payload),
     }
+    # Anonymous runs stay anonymous (this endpoint never requires login - the frontend gate lets
+    # the first one through for free) - resolve_survey_session returns None rather than 401ing
+    # when there's no/invalid session, so an authed caller's job is tagged with an owner and an
+    # anonymous one just isn't, exactly like plots.py does for a freshly-drawn plot.
+    session = resolve_survey_session(db, request)
     job = insert_hazard_job(
         db,
         hazard_type=hazard_type,
         output_type=output_type,
         request_payload=request_payload,
         worker=_run_hazard_analysis_job,
+        owner_user_id=session.user_id if session else None,
     )
     return serialize_hazard_job(job)
 
@@ -1108,6 +1118,54 @@ def get_hazard_analysis_job(job_id: str, db: Session = Depends(get_db)):
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
     return serialize_hazard_job(job)
+
+
+@router.post("/claim")
+def claim_hazard_jobs(request: Request, job_ids: List[str] = Body(..., embed=True), db: Session = Depends(get_db)):
+    """Attaches anonymously-created hazard jobs to the now-known account, the same pattern as
+    plots.py's /plots/claim - the client is the source of truth for which job ids it created
+    before signing in, and only ever-anonymous rows (owner_user_id IS NULL) can be claimed."""
+    session = require_survey_session(db, request)
+    ensure_hazard_analysis_jobs_table(db)
+    rows = db.execute(
+        text("""
+            UPDATE hazard_analysis_jobs SET owner_user_id = :user_id
+            WHERE id = ANY(:job_ids) AND owner_user_id IS NULL
+            RETURNING id
+        """),
+        {"user_id": session.user_id, "job_ids": job_ids},
+    ).mappings().all()
+    db.commit()
+    return {"claimed": [row["id"] for row in rows]}
+
+
+@router.get("/mine")
+def list_my_hazard_jobs(request: Request, db: Session = Depends(get_db)):
+    """Lightweight listing for the Survey dashboard's Hazard Analysis category - deliberately
+    excludes result_payload, which embeds base64 overlay PNGs and can run into the hundreds of KB
+    per row (see hazard_flood.py's overlay_to_data_url)."""
+    session = require_survey_session(db, request)
+    ensure_hazard_analysis_jobs_table(db)
+    rows = db.execute(
+        text("""
+            SELECT id, hazard_type, status, created_at
+            FROM hazard_analysis_jobs
+            WHERE owner_user_id = :user_id AND output_type = 'preview'
+            ORDER BY created_at DESC
+        """),
+        {"user_id": session.user_id},
+    ).mappings().all()
+    return {
+        "jobs": [
+            {
+                "job_id": row["id"],
+                "hazard_type": row["hazard_type"],
+                "status": row["status"],
+                "created_at": row["created_at"].isoformat() if row["created_at"] else None,
+            }
+            for row in rows
+        ]
+    }
 
 
 @router.get("/jobs/{job_id}/download")
