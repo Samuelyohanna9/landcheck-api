@@ -363,7 +363,7 @@ def render_estate_layout_pdf(
         # so the overall extent always reads clearly. (The double-line "drawing sheet" convention
         # is used for the black page frame instead - this line stays a single stroke so the two
         # never look alike.)
-        ax.add_patch(mpatches.Polygon(list(boundary_metric.exterior.coords), closed=True, facecolor="none", edgecolor=BOUNDARY_LINE, linewidth=2.6 * scale, zorder=5))
+        ax.add_patch(mpatches.Polygon(list(boundary_metric.exterior.coords), closed=True, facecolor="none", edgecolor=BOUNDARY_LINE, linewidth=1.5 * scale, zorder=5))
 
         # Each boundary edge's real-world length, centered on the edge and set just outside the
         # line - away from the estate's own centroid, so it sits over open page rather than the
@@ -503,7 +503,7 @@ def render_estate_layout_pdf(
         if kind == "swatch":
             ax.add_patch(mpatches.Rectangle((cursor_x, legend_row_y), swatch_frac, swatch_frac, transform=ax.transAxes, facecolor=color, edgecolor=INK, linewidth=0.8 * scale, clip_on=False, zorder=11))
         else:
-            ax.plot([cursor_x, cursor_x + swatch_frac], [legend_row_y + swatch_frac / 2] * 2, color=color, linewidth=2.6 * scale, transform=ax.transAxes, clip_on=False, zorder=11)
+            ax.plot([cursor_x, cursor_x + swatch_frac], [legend_row_y + swatch_frac / 2] * 2, color=color, linewidth=1.5 * scale, transform=ax.transAxes, clip_on=False, zorder=11)
         text_x = cursor_x + swatch_frac * 1.4
         ax.text(text_x, legend_row_y + swatch_frac / 2, label, transform=ax.transAxes, ha="left", va="center", fontsize=legend_font_pts, color=INK, clip_on=False, zorder=11)
         cursor_x += _pts_to_frac(item_width_pts)
