@@ -15,6 +15,7 @@ from app.utils.survey_activity import ensure_survey_activity_table
 from app.utils.plan_reader import DAILY_READING_LIMIT, ensure_plan_reader_usage_schema
 from app.utils.field_to_finish import DAILY_IMPORT_LIMIT
 from app.utils.georeference_ai_digitize import AI_DIGITIZE_DAILY_LIMIT
+from app.utils.hazard_jobs import ensure_hazard_analysis_jobs_table
 
 router = APIRouter(prefix="/analytics", tags=["analytics"])
 
@@ -804,6 +805,121 @@ def get_survey_activity(request: Request, db: Session = Depends(get_db)):
         }
         for row in rows
     ]
+
+
+@router.get("/hazard-usage")
+def get_hazard_usage(request: Request, db: Session = Depends(get_db)):
+    """Hazard Analysis usage for the Survey Admin dashboard.
+
+    Hazard jobs can be created anonymously before the Survey sign-in gate, so the response keeps
+    those runs in an explicit anonymous bucket while joining identified runs to survey_users.
+    This endpoint contains user activity and is therefore protected by the same server-side admin
+    check as the other detailed Survey monitoring endpoints.
+    """
+    require_super_admin_request(db, request)
+    ensure_hazard_analysis_jobs_table(db)
+
+    summary_row = db.execute(text("""
+        SELECT
+            COUNT(*) AS total_runs,
+            COUNT(*) FILTER (WHERE status = 'completed') AS completed_runs,
+            COUNT(*) FILTER (WHERE status = 'failed') AS failed_runs,
+            COUNT(*) FILTER (WHERE status IN ('queued', 'running')) AS active_runs,
+            COUNT(*) FILTER (WHERE created_at >= CURRENT_DATE) AS today_runs
+        FROM hazard_analysis_jobs
+    """)).mappings().one()
+
+    by_hazard_rows = db.execute(text("""
+        SELECT
+            hazard_type,
+            COUNT(*) AS total_runs,
+            COUNT(*) FILTER (WHERE status = 'completed') AS completed_runs,
+            COUNT(*) FILTER (WHERE status = 'failed') AS failed_runs
+        FROM hazard_analysis_jobs
+        GROUP BY hazard_type
+        ORDER BY total_runs DESC, hazard_type ASC
+    """)).mappings().all()
+
+    user_rows = db.execute(text("""
+        SELECT
+            h.owner_user_id AS user_id,
+            u.email,
+            u.full_name,
+            COUNT(*) AS total_runs,
+            COUNT(*) FILTER (WHERE h.status = 'completed') AS completed_runs,
+            COUNT(*) FILTER (WHERE h.status = 'failed') AS failed_runs,
+            COUNT(*) FILTER (WHERE h.created_at >= CURRENT_DATE) AS today_runs,
+            MAX(h.created_at) AS last_used_at
+        FROM hazard_analysis_jobs h
+        LEFT JOIN survey_users u ON u.id = h.owner_user_id
+        GROUP BY h.owner_user_id, u.email, u.full_name
+        ORDER BY total_runs DESC, last_used_at DESC
+    """)).mappings().all()
+
+    recent_rows = db.execute(text("""
+        SELECT
+            h.id,
+            h.hazard_type,
+            h.output_type,
+            h.status,
+            h.created_at,
+            h.owner_user_id AS user_id,
+            u.email,
+            u.full_name
+        FROM hazard_analysis_jobs h
+        LEFT JOIN survey_users u ON u.id = h.owner_user_id
+        ORDER BY h.created_at DESC
+        LIMIT 100
+    """)).mappings().all()
+
+    def iso(value):
+        return value.isoformat() if value else None
+
+    return {
+        "summary": {
+            "total_runs": int(summary_row["total_runs"] or 0),
+            "completed_runs": int(summary_row["completed_runs"] or 0),
+            "failed_runs": int(summary_row["failed_runs"] or 0),
+            "active_runs": int(summary_row["active_runs"] or 0),
+            "today_runs": int(summary_row["today_runs"] or 0),
+        },
+        "by_hazard": [
+            {
+                "hazard_type": row["hazard_type"],
+                "total_runs": int(row["total_runs"] or 0),
+                "completed_runs": int(row["completed_runs"] or 0),
+                "failed_runs": int(row["failed_runs"] or 0),
+            }
+            for row in by_hazard_rows
+        ],
+        "users": [
+            {
+                "user_id": row["user_id"],
+                "email": row["email"],
+                "full_name": row["full_name"],
+                "is_anonymous": row["user_id"] is None,
+                "total_runs": int(row["total_runs"] or 0),
+                "completed_runs": int(row["completed_runs"] or 0),
+                "failed_runs": int(row["failed_runs"] or 0),
+                "today_runs": int(row["today_runs"] or 0),
+                "last_used_at": iso(row["last_used_at"]),
+            }
+            for row in user_rows
+        ],
+        "recent": [
+            {
+                "job_id": row["id"],
+                "hazard_type": row["hazard_type"],
+                "output_type": row["output_type"],
+                "status": row["status"],
+                "created_at": iso(row["created_at"]),
+                "user_id": row["user_id"],
+                "email": row["email"],
+                "full_name": row["full_name"],
+            }
+            for row in recent_rows
+        ],
+    }
 
 
 @router.get("/support-messages")
