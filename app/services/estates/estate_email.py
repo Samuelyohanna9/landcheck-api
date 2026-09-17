@@ -225,8 +225,8 @@ def _account_wrap_html(*, heading: str, message_html: str, button_html: str = ""
         title=html.escape(heading),
         subtitle="Your LandCheck Estates workspace update is ready.",
         body_html=f"{message_html}{button_html}",
-        footer_html='<div style="font-size:12.5px;color:#7c9186;line-height:1.7;">Powered by <strong style="color:#1f8c58;">LandCheck Estates</strong><br/>landchecktech@gmail.com</div>',
-        footer_note="If you didn't expect this email, you can safely ignore it, or contact us at landchecktech@gmail.com.",
+        footer_html='<div style="font-size:12.5px;color:#7c9186;line-height:1.7;">Powered by <strong style="color:#1f8c58;">LandCheck Estates</strong><br/><a href="mailto:support@landcheck.online" style="color:#1f8c58;text-decoration:none;">support@landcheck.online</a></div>',
+        footer_note="If you didn't expect this email, you can safely ignore it, or contact us at support@landcheck.online.",
     )
 
 

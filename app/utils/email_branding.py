@@ -11,7 +11,7 @@ _DEFAULT_HEADER_GRADIENT = "linear-gradient(145deg,#0c5f2e 0%,#1d8a49 55%,#2aa85
 _DEFAULT_FOOTER_HTML = """
 <div style="font-size:12.5px;color:#7c9186;line-height:1.7;">
   Powered by <strong style="color:#1f8c58;">LandCheck</strong> Geospatial Technologies Limited<br/>
-  <a href="mailto:landchecktech@gmail.com" style="color:#1f8c58;text-decoration:none;">landchecktech@gmail.com</a>
+  <a href="mailto:admin@landcheck.online" style="color:#1f8c58;text-decoration:none;">admin@landcheck.online</a>
   &nbsp;&middot;&nbsp;
   <a href="https://landcheck.online" style="color:#1f8c58;text-decoration:none;">landcheck.online</a>
 </div>
