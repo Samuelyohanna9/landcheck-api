@@ -2827,7 +2827,6 @@ def _render_premium_email_shell(
     title: str,
     subtitle: str,
     body_html: str,
-    header_gradient: str = "linear-gradient(145deg,#0c5f2e 0%,#1d8a49 55%,#2aa852 100%)",
 ) -> str:
     """Shared branded shell (logo header + card body + footer) for sponsor-facing transactional
     emails. Each template supplies only its own body_html; this keeps every email visually
@@ -2839,7 +2838,6 @@ def _render_premium_email_shell(
         subtitle=subtitle,
         body_html=body_html,
         footer_note="You are receiving this email because of an action taken on LandCheck Green.",
-        header_gradient=header_gradient,
     )
 
 
@@ -3358,7 +3356,6 @@ def _send_sponsor_payment_confirmed_email(*, order_row: dict, request: Request |
         title="Your sponsorship is now active",
         subtitle="LandCheck Green has confirmed your payment and your order is ready for verified field allocation.",
         body_html=body_html,
-        header_gradient="linear-gradient(145deg,#0b5d2d 0%,#16753d 55%,#3cb562 100%)",
     )
     _send_html_email(
         to_email=sponsor_email,
