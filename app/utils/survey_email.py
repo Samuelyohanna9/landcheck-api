@@ -6,6 +6,8 @@ import smtplib
 from email.message import EmailMessage
 from email.utils import formatdate, make_msgid
 
+from app.utils.email_branding import render_branded_email_shell
+
 
 def _env_bool(name: str, default: bool = False) -> bool:
     raw = str(os.getenv(name) or "").strip().lower()
@@ -74,24 +76,22 @@ def send_magic_link_email(*, to_email: str, link_url: str, otp_code: str) -> Non
         "Regards,\nLandCheck Survey"
     )
     body_html = f"""
-    <html>
-      <body style="margin:0;padding:0;background:#eef4f0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;color:#173624;">
-        <div style="max-width:520px;margin:0 auto;padding:32px 16px;">
-          <div style="background:#ffffff;border-radius:18px;overflow:hidden;box-shadow:0 18px 46px rgba(14,46,28,0.14);border:1px solid #dceee0;padding:28px;">
-            <div style="font-size:12.5px;font-weight:800;letter-spacing:0.06em;text-transform:uppercase;color:#5c7a68;margin:0 0 10px;">Sign in</div>
-            <h1 style="margin:0 0 14px;font-size:20px;color:#173624;">Sign in to LandCheck Survey</h1>
-            <p style="margin:0 0 20px;font-size:14.5px;line-height:1.7;color:#345542;">Click the button below to sign in, or enter the code where you requested it.</p>
-            <a href="{html.escape(link_url)}" style="display:inline-block;background:#1d8a49;color:#ffffff;text-decoration:none;font-weight:700;font-size:14.5px;padding:12px 22px;border-radius:10px;">Sign in</a>
-            <div style="margin:22px 0 0;padding:16px;background:#f4f9f5;border:1px solid #dceee0;border-radius:12px;text-align:center;">
-              <div style="font-size:11.5px;font-weight:700;letter-spacing:0.06em;text-transform:uppercase;color:#5c7a68;margin:0 0 8px;">Your sign-in code</div>
-              <div style="font-size:28px;font-weight:800;letter-spacing:0.35em;color:#173624;">{html.escape(otp_code)}</div>
-            </div>
-            <p style="margin:22px 0 0;font-size:12.5px;line-height:1.6;color:#8199a5;">Either one expires in 15 minutes and can only be used once. If you didn't request this, you can safely ignore this email.</p>
-          </div>
-        </div>
-      </body>
-    </html>
+    <p style="margin:0 0 20px;font-size:15px;line-height:1.7;color:#173624;">Click the button below to sign in, or enter the code where you requested it.</p>
+    <a href="{html.escape(link_url)}" style="display:inline-block;background:linear-gradient(135deg,#1f8c58,#0f6f39);color:#ffffff;text-decoration:none;font-weight:800;font-size:15px;padding:14px 22px;border-radius:999px;box-shadow:0 10px 22px rgba(15,111,57,0.28);">Sign in</a>
+    <div style="margin:22px 0 0;padding:16px;background:#f4f9f5;border:1px solid #dceee0;border-radius:12px;text-align:center;">
+      <div style="font-size:11.5px;font-weight:700;letter-spacing:0.06em;text-transform:uppercase;color:#5c7a68;margin:0 0 8px;">Your sign-in code</div>
+      <div style="font-size:28px;font-weight:800;letter-spacing:0.35em;color:#173624;">{html.escape(otp_code)}</div>
+    </div>
+    <p style="margin:22px 0 0;font-size:12.5px;line-height:1.6;color:#8199a5;">Either one expires in 15 minutes and can only be used once. If you didn't request this, you can safely ignore this email.</p>
     """
+    body_html = render_branded_email_shell(
+        brand_name="LandCheck Survey",
+        kicker="Secure sign in",
+        title="Sign in to LandCheck Survey",
+        subtitle="Use the secure link or one-time code below to access your workspace.",
+        body_html=body_html,
+        footer_note="You are receiving this email because a LandCheck Survey sign-in was requested.",
+    )
 
     _send_email(to_email=to_email, subject="Sign in to LandCheck Survey", body_text=body, body_html=body_html)
 
@@ -112,20 +112,18 @@ def send_support_message_email(*, subject: str, message: str, from_email: str, f
         f"{message}\n"
     )
     body_html = f"""
-    <html>
-      <body style="margin:0;padding:0;background:#eef4f0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;color:#173624;">
-        <div style="max-width:560px;margin:0 auto;padding:32px 16px;">
-          <div style="background:#ffffff;border-radius:18px;overflow:hidden;box-shadow:0 18px 46px rgba(14,46,28,0.14);border:1px solid #dceee0;padding:28px;">
-            <div style="font-size:12.5px;font-weight:800;letter-spacing:0.06em;text-transform:uppercase;color:#5c7a68;margin:0 0 10px;">Support request</div>
-            <h1 style="margin:0 0 14px;font-size:19px;color:#173624;">{html.escape(safe_subject)}</h1>
-            <p style="margin:0 0 6px;font-size:13px;color:#5c7a68;">From: {html.escape(from_name)} &lt;{html.escape(from_email)}&gt;</p>
-            <p style="margin:0 0 18px;font-size:13px;color:#5c7a68;">Page: {html.escape(page_context or "dashboard")}</p>
-            <div style="padding:16px;background:#f4f9f5;border:1px solid #dceee0;border-radius:12px;font-size:14.5px;line-height:1.7;color:#173624;white-space:pre-wrap;">{html.escape(message)}</div>
-          </div>
-        </div>
-      </body>
-    </html>
+    <p style="margin:0 0 6px;font-size:13px;color:#5c7a68;">From: {html.escape(from_name)} &lt;{html.escape(from_email)}&gt;</p>
+    <p style="margin:0 0 18px;font-size:13px;color:#5c7a68;">Page: {html.escape(page_context or "dashboard")}</p>
+    <div style="padding:16px;background:#f4f9f5;border:1px solid #dceee0;border-radius:12px;font-size:14.5px;line-height:1.7;color:#173624;white-space:pre-wrap;">{html.escape(message)}</div>
     """
+    body_html = render_branded_email_shell(
+        brand_name="LandCheck Survey",
+        kicker="Support request",
+        title=html.escape(safe_subject),
+        subtitle="A support request has been submitted from the LandCheck Survey workspace.",
+        body_html=body_html,
+        footer_note="You are receiving this email because a LandCheck Survey support request was submitted.",
+    )
     _send_email(
         to_email=notify_email,
         subject=f"[LandCheck Support] {safe_subject}",

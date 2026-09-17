@@ -17,6 +17,8 @@ from decimal import Decimal
 from email.message import EmailMessage
 from email.utils import formatdate, make_msgid
 
+from app.utils.email_branding import render_branded_email_shell
+
 logger = logging.getLogger(__name__)
 
 
@@ -79,29 +81,22 @@ def _plot_link_html(plot_link: str | None, *, label: str = "View your plot on sa
         return ""
     return f"""
     <div style="margin:22px 0 0;text-align:center;">
-      <a href="{html.escape(plot_link)}" style="display:inline-block;padding:13px 26px;background:#1d8a49;color:#ffffff;font-size:14px;font-weight:700;text-decoration:none;border-radius:10px;">{html.escape(label)}</a>
+      <a href="{html.escape(plot_link)}" style="display:inline-block;padding:14px 22px;background:linear-gradient(135deg,#1f8c58,#0f6f39);color:#ffffff;font-size:15px;font-weight:800;text-decoration:none;border-radius:999px;box-shadow:0 10px 22px rgba(15,111,57,0.28);">{html.escape(label)}</a>
     </div>
     """
 
 
 def _wrap_html(*, org_name: str, heading: str, message_html: str, financial_html: str, plot_link_html: str = "") -> str:
-    return f"""
-    <html>
-      <body style="margin:0;padding:0;background:#eef4f0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;color:#173624;">
-        <div style="max-width:560px;margin:0 auto;padding:32px 16px;">
-          <div style="background:#ffffff;border-radius:18px;overflow:hidden;box-shadow:0 18px 46px rgba(14,46,28,0.14);border:1px solid #dceee0;padding:32px;">
-            <div style="font-size:12.5px;font-weight:800;letter-spacing:0.06em;text-transform:uppercase;color:#5c7a68;margin:0 0 10px;">{html.escape(org_name)}</div>
-            <h1 style="margin:0 0 16px;font-size:21px;color:#173624;">{html.escape(heading)}</h1>
-            <div style="font-size:14.5px;line-height:1.75;color:#345542;">{message_html}</div>
-            {plot_link_html}
-            {financial_html}
-            <p style="margin:26px 0 0;font-size:12px;line-height:1.6;color:#8199a5;">This is an automated update from {html.escape(org_name)} about your property. If anything here looks wrong, please contact {html.escape(org_name)} directly.</p>
-          </div>
-          <p style="text-align:center;font-size:11px;color:#9fb0a4;margin:16px 0 0;">Sent via LandCheck Estates &middot; Secure &middot; Private &middot; For a more certain tomorrow</p>
-        </div>
-      </body>
-    </html>
-    """
+    safe_org_name = html.escape(org_name)
+    return render_branded_email_shell(
+        brand_name="LandCheck Estates",
+        kicker=safe_org_name,
+        title=html.escape(heading),
+        subtitle="A secure update about your Estate property.",
+        body_html=f"{message_html}{plot_link_html}{financial_html}",
+        footer_html=f'<div style="font-size:12.5px;color:#7c9186;line-height:1.7;">Sent via <strong style="color:#1f8c58;">LandCheck Estates</strong><br/>{safe_org_name}</div>',
+        footer_note=f"This is an automated update from {safe_org_name} about your property. If anything here looks wrong, please contact {safe_org_name} directly.",
+    )
 
 
 def _public_customer_wrap_html(*, organization_name: str, heading: str, message_html: str, plot_link_html: str = "") -> str:
@@ -111,22 +106,16 @@ def _public_customer_wrap_html(*, organization_name: str, heading: str, message_
     instead receive a message that reads as a direct welcome from the Estate company, without
     internal workspace language or LandCheck support details.
     """
-    return f"""
-    <html>
-      <body style="margin:0;padding:0;background:#f4f6f5;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;color:#14261e;">
-        <div style="max-width:560px;margin:0 auto;padding:32px 16px;">
-          <div style="background:#ffffff;border-radius:18px;overflow:hidden;box-shadow:0 18px 46px rgba(14,46,28,0.12);border:1px solid #dce8df;padding:32px;">
-            <div style="font-size:12.5px;font-weight:800;letter-spacing:0.06em;text-transform:uppercase;color:#237b49;margin:0 0 10px;">{html.escape(organization_name)}</div>
-            <h1 style="margin:0 0 16px;font-size:22px;color:#14261e;">{html.escape(heading)}</h1>
-            <div style="font-size:14.5px;line-height:1.75;color:#385247;">{message_html}</div>
-            {plot_link_html}
-            <p style="margin:26px 0 0;font-size:12px;line-height:1.6;color:#82958a;">This message confirms your enquiry with {html.escape(organization_name)}. Please contact the Estate team directly if you need any help.</p>
-          </div>
-          <p style="text-align:center;font-size:11px;color:#9aaa9f;margin:16px 0 0;">{html.escape(organization_name)}</p>
-        </div>
-      </body>
-    </html>
-    """
+    safe_org_name = html.escape(organization_name)
+    return render_branded_email_shell(
+        brand_name=safe_org_name,
+        kicker="Estate reservation",
+        title=html.escape(heading),
+        subtitle="Your reservation enquiry has been received by the Estate team.",
+        body_html=f"{message_html}{plot_link_html}",
+        footer_html=f'<div style="font-size:12.5px;color:#7c9186;line-height:1.7;"><strong style="color:#1f8c58;">{safe_org_name}</strong><br/>Estate enquiries</div>',
+        footer_note=f"This message confirms your enquiry with {safe_org_name}. Please contact the Estate team directly if you need any help.",
+    )
 
 
 def _financial_block_html(agreed_price: Decimal, confirmed_paid: Decimal, outstanding: Decimal) -> str:
@@ -230,28 +219,21 @@ def _account_wrap_html(*, heading: str, message_html: str, button_html: str = ""
     """Same visual shell as _wrap_html, but for emails about the company's own LandCheck Estates
     account (welcome, billing, password reset) rather than a customer-facing plot update - so it
     isn't signed with a specific estate's org_name, which wouldn't apply here."""
-    return f"""
-    <html>
-      <body style="margin:0;padding:0;background:#eef4f0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;color:#173624;">
-        <div style="max-width:560px;margin:0 auto;padding:32px 16px;">
-          <div style="background:#ffffff;border-radius:18px;overflow:hidden;box-shadow:0 18px 46px rgba(14,46,28,0.14);border:1px solid #dceee0;padding:32px;">
-            <div style="font-size:12.5px;font-weight:800;letter-spacing:0.06em;text-transform:uppercase;color:#5c7a68;margin:0 0 10px;">LandCheck Estates</div>
-            <h1 style="margin:0 0 16px;font-size:21px;color:#173624;">{html.escape(heading)}</h1>
-            <div style="font-size:14.5px;line-height:1.75;color:#345542;">{message_html}</div>
-            {button_html}
-            <p style="margin:26px 0 0;font-size:12px;line-height:1.6;color:#8199a5;">If you didn't expect this email, you can safely ignore it, or contact us at landchecktech@gmail.com.</p>
-          </div>
-          <p style="text-align:center;font-size:11px;color:#9fb0a4;margin:16px 0 0;">Sent via LandCheck Estates &middot; Secure &middot; Private &middot; For a more certain tomorrow</p>
-        </div>
-      </body>
-    </html>
-    """
+    return render_branded_email_shell(
+        brand_name="LandCheck Estates",
+        kicker="Estate workspace",
+        title=html.escape(heading),
+        subtitle="Your LandCheck Estates workspace update is ready.",
+        body_html=f"{message_html}{button_html}",
+        footer_html='<div style="font-size:12.5px;color:#7c9186;line-height:1.7;">Powered by <strong style="color:#1f8c58;">LandCheck Estates</strong><br/>landchecktech@gmail.com</div>',
+        footer_note="If you didn't expect this email, you can safely ignore it, or contact us at landchecktech@gmail.com.",
+    )
 
 
 def _account_button_html(*, label: str, url: str) -> str:
     return f"""
     <div style="margin:24px 0 0;text-align:center;">
-      <a href="{html.escape(url)}" style="display:inline-block;padding:13px 26px;background:#1d8a49;color:#ffffff;font-size:14px;font-weight:700;text-decoration:none;border-radius:10px;">{html.escape(label)}</a>
+      <a href="{html.escape(url)}" style="display:inline-block;padding:14px 22px;background:linear-gradient(135deg,#1f8c58,#0f6f39);color:#ffffff;font-size:15px;font-weight:800;text-decoration:none;border-radius:999px;box-shadow:0 10px 22px rgba(15,111,57,0.28);">{html.escape(label)}</a>
     </div>
     """
 

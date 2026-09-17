@@ -78,6 +78,7 @@ from app.utils.green_impact_narrative import (
 )
 from app.utils.r2_exports import upload_export_file_best_effort, _build_export_r2_settings
 from app.utils.activity_logger import ensure_activity_log_table, safe_log_activity
+from app.utils.email_branding import render_branded_email_shell
 from app.utils.auth_security import (
     allow_activity_log_reset,
     auth_session_idle_minutes,
@@ -2831,51 +2832,15 @@ def _render_premium_email_shell(
     """Shared branded shell (logo header + card body + footer) for sponsor-facing transactional
     emails. Each template supplies only its own body_html; this keeps every email visually
     consistent instead of every function hand-rolling its own header/footer from scratch."""
-    return f"""
-    <html>
-      <body style="margin:0;padding:0;background:#eef4f0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;color:#173624;">
-        <div style="max-width:640px;margin:0 auto;padding:32px 16px;">
-          <div style="background:#ffffff;border-radius:22px;overflow:hidden;box-shadow:0 18px 46px rgba(14,46,28,0.14);border:1px solid #dceee0;">
-            <div style="padding:30px 32px 28px;background:{header_gradient};">
-              <table role="presentation" cellpadding="0" cellspacing="0" style="border-collapse:collapse;">
-                <tr>
-                  <td style="vertical-align:middle;">
-                    <img src="https://landcheck.online/landcheck-email-logo.png" width="36" height="36" alt="LandCheck"
-                         style="display:block;border-radius:9px;background:#ffffff;padding:3px;" />
-                  </td>
-                  <td style="vertical-align:middle;padding-left:10px;">
-                    <span style="font-size:13px;font-weight:800;letter-spacing:0.04em;color:#ffffff;">LandCheck Green</span>
-                  </td>
-                </tr>
-              </table>
-              <div style="margin-top:20px;font-size:11.5px;font-weight:800;letter-spacing:0.16em;text-transform:uppercase;color:#d6f5df;">{kicker}</div>
-              <div style="margin-top:8px;font-size:25px;font-weight:800;line-height:1.2;color:#ffffff;">{title}</div>
-              <div style="margin-top:10px;font-size:14.5px;line-height:1.7;color:#e9fbee;">{subtitle}</div>
-            </div>
-            <div style="padding:28px 32px 8px;">
-              {body_html}
-            </div>
-            <div style="padding:20px 32px 26px;border-top:1px solid #ecf4ee;margin-top:16px;">
-              <div style="font-size:12.5px;color:#7c9186;line-height:1.7;">
-                Powered by <strong style="color:#1f8c58;">LandCheck</strong> Geospatial Technologies Limited<br/>
-                <a href="mailto:landchecktech@gmail.com" style="color:#1f8c58;text-decoration:none;">landchecktech@gmail.com</a>
-                &nbsp;&middot;&nbsp;
-                <a href="https://landcheck.online" style="color:#1f8c58;text-decoration:none;">landcheck.online</a>
-              </div>
-              <div style="margin-top:10px;font-size:11.5px;color:#a9bdb0;">
-                <a href="https://www.instagram.com/land.check/" style="color:#a9bdb0;text-decoration:none;">Instagram</a> &middot;
-                <a href="https://www.facebook.com/landcheck/" style="color:#a9bdb0;text-decoration:none;">Facebook</a> &middot;
-                <a href="https://www.youtube.com/@LandCheckGreen" style="color:#a9bdb0;text-decoration:none;">YouTube</a> &middot;
-                <a href="https://www.tiktok.com/@landcheckgeo" style="color:#a9bdb0;text-decoration:none;">TikTok</a> &middot;
-                <a href="https://www.linkedin.com/company/landcheck-geospatial/" style="color:#a9bdb0;text-decoration:none;">LinkedIn</a>
-              </div>
-            </div>
-          </div>
-          <p style="text-align:center;font-size:11px;color:#9fb2a6;margin:18px 0 0;">You are receiving this email because of an action taken on LandCheck Green.</p>
-        </div>
-      </body>
-    </html>
-    """
+    return render_branded_email_shell(
+        brand_name="LandCheck Green",
+        kicker=kicker,
+        title=title,
+        subtitle=subtitle,
+        body_html=body_html,
+        footer_note="You are receiving this email because of an action taken on LandCheck Green.",
+        header_gradient=header_gradient,
+    )
 
 
 def _load_sponsor_order_email_payload(db: Session, order_id: int):
