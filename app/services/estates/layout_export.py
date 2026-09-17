@@ -128,6 +128,38 @@ def _legend_swatch(ax, x: float, y: float, size: float, *, facecolor: str, label
     ax.text(x + size * 1.6, y + size / 2, label, transform=ax.transAxes, ha="left", va="center", fontsize=8.5 * scale, color=INK, clip_on=False, zorder=11)
 
 
+def _format_total_area(area_sqm: float) -> str:
+    if area_sqm >= 10000:
+        return f"{area_sqm / 10000:,.2f} ha"
+    return f"{area_sqm:,.0f} m²"
+
+
+def _draw_double_boundary_line(ax, polygon, *, offset_m: float, color: str, linewidth: float, zorder: int) -> None:
+    """Two parallel strokes (one just inside, one just outside the true line) instead of a single
+    stroke - the conventional cadastral "double border" convention for a parent-parcel boundary.
+    Falls back to a single (slightly heavier) line if buffering the polygon by offset_m produces
+    nothing usable, e.g. an extremely small or degenerate boundary."""
+    def _rings(geom):
+        if geom is None or geom.is_empty:
+            return []
+        polys = list(geom.geoms) if geom.geom_type.startswith("Multi") else [geom]
+        return [p for p in polys if not p.is_empty and p.exterior is not None]
+
+    try:
+        outer_rings = _rings(polygon.buffer(offset_m))
+        inner_rings = _rings(polygon.buffer(-offset_m))
+    except Exception:
+        outer_rings, inner_rings = [], []
+
+    if outer_rings and inner_rings:
+        for poly in outer_rings + inner_rings:
+            xs, ys = poly.exterior.xy
+            ax.plot(xs, ys, color=color, linewidth=linewidth, zorder=zorder, solid_joinstyle="round", solid_capstyle="round")
+    else:
+        xs, ys = polygon.exterior.xy
+        ax.plot(xs, ys, color=color, linewidth=linewidth * 1.8, zorder=zorder, solid_joinstyle="round", solid_capstyle="round")
+
+
 PLOT_STATUS_FACE = {
     "available": PLOT_FACE,
     "reserved": "#fff4cc",
@@ -353,52 +385,130 @@ def render_estate_layout_pdf(
 
     if estate.boundary is not None:
         boundary_metric = shapely_transform(forward, to_shape_fn(estate.boundary))
-        # The parent parcel boundary - solid red, per surveying convention, drawn over every
-        # subdivision line so the overall extent always reads clearly.
-        ax.add_patch(mpatches.Polygon(list(boundary_metric.exterior.coords), closed=True, facecolor="none", edgecolor=BOUNDARY_LINE, linewidth=2.6 * scale, zorder=5))
+        # The parent parcel boundary - a double red line (two parallel strokes), the conventional
+        # cadastral "double border" style, drawn over every subdivision line so the overall extent
+        # always reads clearly. The gap between the two strokes is sized in real page points (not
+        # a fraction of the site's own size), so it looks the same on a 2-plot infill as on a
+        # 500-plot estate.
+        boundary_gap_m = (2.6 / points_per_meter) if points_per_meter > 0 else max(span_x, span_y) * 0.003
+        _draw_double_boundary_line(ax, boundary_metric, offset_m=boundary_gap_m, color=BOUNDARY_LINE, linewidth=1.3 * scale, zorder=5)
+
+        # Each boundary edge's real-world length, centered on the edge and set just outside the
+        # line - away from the estate's own centroid, so it sits over open page rather than the
+        # plots it encloses - the standard survey-plan convention of dimensioning the parent
+        # parcel's own perimeter.
+        boundary_centroid = boundary_metric.centroid
+        boundary_label_offset = (16.0 / points_per_meter) if points_per_meter > 0 else max(span_x, span_y) * 0.018
+        min_edge_pts = 24.0  # too short on the page to hold "123.45m" without overlapping its neighbours
+        exterior_coords = list(boundary_metric.exterior.coords)
+        for i in range(len(exterior_coords) - 1):
+            x1, y1 = exterior_coords[i]
+            x2, y2 = exterior_coords[i + 1]
+            edge_length_m = math.hypot(x2 - x1, y2 - y1)
+            if edge_length_m * points_per_meter < min_edge_pts:
+                continue
+            mx, my = (x1 + x2) / 2, (y1 + y2) / 2
+            dx, dy = mx - boundary_centroid.x, my - boundary_centroid.y
+            dist = math.hypot(dx, dy) or 1.0
+            ox, oy = dx / dist, dy / dist
+            label_x = mx + ox * boundary_label_offset
+            label_y = my + oy * boundary_label_offset
+            # Keep the text upright (never upside down) while still running parallel to its edge.
+            angle_deg = math.degrees(math.atan2(y2 - y1, x2 - x1))
+            if angle_deg > 90:
+                angle_deg -= 180
+            elif angle_deg < -90:
+                angle_deg += 180
+            ax.text(
+                label_x, label_y, f"{edge_length_m:,.2f}m",
+                fontsize=6.5 * scale, color=BOUNDARY_LINE, ha="center", va="center",
+                rotation=angle_deg, rotation_mode="anchor", fontweight="bold", clip_on=False, zorder=6,
+            )
 
     ax.axis("off")
 
     _draw_scale_bar(ax, minx=metric_minx, miny=metric_miny, span_x=span_x, scale=scale)
     _draw_north_arrow(ax, scale=scale)
 
-    # Row pitch and box height are both derived from the same scaled font size used for the
-    # legend text, instead of a fixed axes-fraction guess - the earlier fixed 0.021 step was tuned
-    # for a smaller legend font and started overlapping once that font size was bumped up.
-    legend_x = 0.02
-    box_top = 0.99
-    title_y = box_top - 0.028
-    step = 0.034
-    entries = [
-        (PLOT_FACE, "Plot"),
-        (ROAD_FILL, "Road"),
-        (OPEN_SPACE_FILL, "Open space"),
-        (DRAINAGE_FILL, "Drainage"),
-    ]
-    row_ys = [title_y - step * (index + 1.15) for index in range(len(entries) + 1)]  # +1 for the boundary row
-    box_bottom = row_ys[-1] - step * 0.55
-    legend_box = mpatches.FancyBboxPatch(
-        (0.008, box_bottom), 0.175, box_top - box_bottom, transform=ax.transAxes,
-        boxstyle="round,pad=0.006,rounding_size=0.006", facecolor="white", edgecolor=INK, linewidth=0.9 * scale, zorder=10,
-    )
-    ax.add_patch(legend_box)
-    ax.text(legend_x, title_y, "LEGEND", transform=ax.transAxes, fontsize=8.5 * scale, fontweight="bold", color=INK, zorder=11)
-    for (facecolor, label), row_y in zip(entries, row_ys):
-        _legend_swatch(ax, legend_x, row_y, 0.012, facecolor=facecolor, label=label, scale=scale)
-    boundary_row_y = row_ys[-1]
-    ax.plot([legend_x, legend_x + 0.012], [boundary_row_y + 0.006, boundary_row_y + 0.006], color=BOUNDARY_LINE, linewidth=2.6 * scale, transform=ax.transAxes, clip_on=False, zorder=11)
-    ax.text(legend_x + 0.012 * 1.6, boundary_row_y + 0.006, "Estate boundary", transform=ax.transAxes, ha="left", va="center", fontsize=8.5 * scale, color=INK, clip_on=False, zorder=11)
+    # Bottom-row layout (scale bar, legend, title block) is worked out in real page points, then
+    # converted to axes-fraction, rather than fixed axes-fraction guesses - a tall/narrow estate's
+    # axes box is far fewer points wide than a wide one's (aspect="equal" shrinks whichever
+    # dimension has "extra" room), so a fixed fraction like "start the legend at 0.30" means a
+    # very different amount of real space depending on the estate's own shape.
+    axes_width_pts = (span_x + 2 * pad_x) * points_per_meter if points_per_meter > 0 else 0.0
+    def _pts_to_frac(pts: float) -> float:
+        return (pts / axes_width_pts) if axes_width_pts > 0 else pts / 1000.0
 
+    total_area_sqm = boundary_metric.area if estate.boundary is not None else sum(float(p.area_sqm or 0) for p in plots)
     generated_at = datetime.now(timezone.utc).strftime("%d %b %Y")
     title_text = (
-        f"{estate.name or 'Estate'}\n"
+        f"Layout Plan for {estate.name or 'Estate'}\n"
         f"{organization_name or ''}\n"
-        f"Site Layout Plan\n"
-        f"{len(plots)} plots · Generated {generated_at} · CRS EPSG:{metric_epsg}"
+        f"{len(plots)} plots · Total area {_format_total_area(total_area_sqm)}\n"
+        f"Generated {generated_at} · CRS EPSG:{metric_epsg}"
     )
+    title_font_pts = 9.0 * scale
+    longest_title_line = max(title_text.split("\n"), key=len)
+    title_text_width_pts = len(longest_title_line) * title_font_pts * _REGULAR_CHAR_WIDTH
+    # Never let the title block balloon past ~42% of the sheet's own width - without this, a
+    # narrow/tall estate (few points wide) would print exactly as many characters at the same
+    # fixed font size, so the box would visually dominate the whole bottom of the page.
+    max_title_width_pts = axes_width_pts * 0.42 if axes_width_pts > 0 else title_text_width_pts
+    if title_text_width_pts > max_title_width_pts > 0:
+        title_font_pts = max(title_font_pts * (max_title_width_pts / title_text_width_pts), 5.5 * scale)
+        title_text_width_pts = len(longest_title_line) * title_font_pts * _REGULAR_CHAR_WIDTH
+    title_box_margin_pts = 22.0 * scale
+    title_start_frac = 1.0 - _pts_to_frac(title_text_width_pts + title_box_margin_pts) - 0.015
+
+    legend_font_pts = 8.5 * scale
+    swatch_pts = 9.5 * scale
+    swatch_frac = _pts_to_frac(swatch_pts)
+    legend_items = [
+        ("swatch", PLOT_FACE, "Plot"),
+        ("swatch", ROAD_FILL, "Road"),
+        ("swatch", OPEN_SPACE_FILL, "Open space"),
+        ("swatch", DRAINAGE_FILL, "Drainage"),
+        ("line", BOUNDARY_LINE, "Estate boundary"),
+    ]
+    legend_label_pts = [len("LEGEND") * legend_font_pts * _BOLD_CHAR_WIDTH + 14 * scale]
+    legend_label_pts += [swatch_pts * 1.4 + len(label) * legend_font_pts * _REGULAR_CHAR_WIDTH + 16 * scale for _, _, label in legend_items]
+    legend_row_width_frac = _pts_to_frac(sum(legend_label_pts))
+
+    scale_bar_end_x = (metric_minx + span_x * 0.02) + _round_scale_length(span_x * 0.22)
+    scale_bar_end_frac = ((scale_bar_end_x - (metric_minx - pad_x)) / (span_x + 2 * pad_x)) if (span_x + 2 * pad_x) > 0 else 0.25
+    # The scale bar itself is positioned in data coordinates (so its size stays tied to the real
+    # drawing, not the page), which means its axes-fraction Y position - unlike everything else on
+    # this row - shifts with the estate's own aspect ratio. Its own topmost element is the "SCALE
+    # (METRES)" caption, `bar_height * 2.6` above its baseline (see _draw_scale_bar).
+    scale_bar_top_data = (metric_miny - span_x * 0.06) + (span_x * 0.011) * 2.6
+    scale_bar_top_frac = ((scale_bar_top_data - (metric_miny - pad_y)) / (span_y + 2 * pad_y)) if (span_y + 2 * pad_y) > 0 else 0.05
+
+    row_y = 0.024
+    legend_x = max(0.30, scale_bar_end_frac + 0.02)
+    if legend_x + legend_row_width_frac > title_start_frac:
+        # Not enough room to fit the scale bar, legend and title side by side on one row for this
+        # estate's shape - the legend gets its own row above them instead, clearing whichever sits
+        # higher: the base row itself, or the scale bar's own caption.
+        legend_row_y = max(row_y + swatch_frac + 0.02, scale_bar_top_frac + 0.015)
+        legend_x = 0.02
+    else:
+        legend_row_y = row_y
+
+    cursor_x = legend_x
+    ax.text(cursor_x, legend_row_y + swatch_frac / 2, "LEGEND", transform=ax.transAxes, ha="left", va="center", fontsize=legend_font_pts, fontweight="bold", color=INK, clip_on=False, zorder=11)
+    cursor_x += _pts_to_frac(legend_label_pts[0])
+    for (kind, color, label), item_width_pts in zip(legend_items, legend_label_pts[1:]):
+        if kind == "swatch":
+            ax.add_patch(mpatches.Rectangle((cursor_x, legend_row_y), swatch_frac, swatch_frac, transform=ax.transAxes, facecolor=color, edgecolor=INK, linewidth=0.8 * scale, clip_on=False, zorder=11))
+        else:
+            ax.plot([cursor_x, cursor_x + swatch_frac], [legend_row_y + swatch_frac / 2] * 2, color=color, linewidth=2.6 * scale, transform=ax.transAxes, clip_on=False, zorder=11)
+        text_x = cursor_x + swatch_frac * 1.4
+        ax.text(text_x, legend_row_y + swatch_frac / 2, label, transform=ax.transAxes, ha="left", va="center", fontsize=legend_font_pts, color=INK, clip_on=False, zorder=11)
+        cursor_x += _pts_to_frac(item_width_pts)
+
     ax.text(
         0.985, 0.025, title_text, transform=ax.transAxes, ha="right", va="bottom",
-        fontsize=9 * scale, color=INK, linespacing=1.7, zorder=11,
+        fontsize=title_font_pts, color=INK, linespacing=1.7, zorder=11,
         bbox=dict(boxstyle="round,pad=0.5", facecolor="white", edgecolor=INK, linewidth=0.9 * scale),
     )
 
