@@ -2,19 +2,23 @@ from __future__ import annotations
 
 import logging
 import os
-from decimal import Decimal
+from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import RedirectResponse
+from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
+from app.models.estate_auth import EstateAccount
 from app.models.estate_billing import EstateSubscription, EstateSubscriptionCharge
 from app.models.estate_foundation import EstateOrganization
 from app.routers.plots import get_db
 from app.schemas.estate_billing import ChangePlanRequest, ChoosePlanRequest
-from app.services.estates.authorization import require_estate_access
+from app.services.estates.authorization import EstateAccess, require_estate_access
 from app.services.estates.billing_plans import ESTATE_PLANS, TRIAL_DAYS, VERIFICATION_CHARGE_AMOUNT
 from app.services.estates.subscriptions import (
+    _handle_successful_charge,
     cancel_subscription,
     change_plan,
     get_subscription,
@@ -30,6 +34,17 @@ router = APIRouter(prefix="/estates/billing", tags=["estate-billing"])
 
 def _api_public_url() -> str:
     return str(os.getenv("LANDCHECK_API_PUBLIC_URL") or "https://api.landcheck.online").strip().rstrip("/")
+
+
+def _web_url() -> str:
+    return str(os.getenv("LANDCHECK_WEB_URL") or "https://landcheck.online").strip().rstrip("/")
+
+
+def _decimal(value: object, default: Decimal = Decimal("0")) -> Decimal:
+    try:
+        return Decimal(str(value or default))
+    except (InvalidOperation, TypeError, ValueError):
+        return default
 
 
 def _subscription_status_payload(subscription: EstateSubscription | None) -> dict:
@@ -52,6 +67,33 @@ def _subscription_status_payload(subscription: EstateSubscription | None) -> dic
     }
 
 
+def _account_for_access(db: Session, access: EstateAccess, organization_id: int) -> EstateAccount | None:
+    """Resolve the account consuming the trial, never an account id from the client."""
+    if access.principal.subject_type == "estate_account":
+        try:
+            account = db.get(EstateAccount, int(access.principal.subject_id))
+        except (TypeError, ValueError):
+            account = None
+        if account and account.organization_id == organization_id and account.status == "active":
+            return account
+    return (
+        db.query(EstateAccount)
+        .filter(EstateAccount.organization_id == organization_id, EstateAccount.status == "active")
+        .order_by(EstateAccount.created_at.asc(), EstateAccount.id.asc())
+        .first()
+    )
+
+
+def _refund_verification(verify_data: dict, organization_id: int) -> None:
+    transaction_id = str(verify_data.get("id") or "")
+    if not transaction_id:
+        return
+    try:
+        flw.refund_transaction(transaction_id, amount=VERIFICATION_CHARGE_AMOUNT)
+    except Exception:
+        logger.exception("Could not auto-refund the verification charge (org=%s)", organization_id)
+
+
 @router.get("/status")
 def billing_status(organization_id: int, request: Request, db: Session = Depends(get_db)):
     require_estate_access(db, request, organization_id, require_subscription=False)
@@ -60,8 +102,6 @@ def billing_status(organization_id: int, request: Request, db: Session = Depends
 
 @router.get("/plans")
 def billing_plans():
-    """Static plan catalogue - the same numbers the landing page's pricing section reads, so
-    pricing only ever needs to change in one place (billing_plans.py)."""
     return {
         "trial_days": TRIAL_DAYS,
         "plans": {
@@ -107,24 +147,34 @@ def start_checkout(payload: ChoosePlanRequest, organization_id: int, request: Re
     organization = db.get(EstateOrganization, organization_id)
     if not organization:
         raise HTTPException(404, "Estate organization was not found")
-    email = str(organization.contact_email or "").strip()
+    account = _account_for_access(db, access, organization_id)
+    if not account:
+        raise HTTPException(403, "An active Estate account is required to start a trial")
+
+    existing = get_subscription(db, organization_id)
+    if account.trial_claimed_at is not None or (existing and (existing.trial_ends_at is not None or existing.status in {"trialing", "active"})):
+        raise HTTPException(409, "This account has already used its free trial. Use billing recovery to pay for the subscription.")
+
+    email = str(account.email or organization.contact_email or "").strip()
     if not email:
-        raise HTTPException(422, "This organization has no billing email on file")
+        raise HTTPException(422, "This account has no billing email on file")
 
     tx_ref = new_tx_ref("VERIFY")
-    redirect_url = f"{_api_public_url()}/estates/billing/checkout/return"
     link = flw.initiate_checkout(
         tx_ref=tx_ref,
         amount=VERIFICATION_CHARGE_AMOUNT,
         currency="NGN",
         email=email,
         name=organization.name,
-        redirect_url=redirect_url,
+        redirect_url=f"{_api_public_url()}/estates/billing/checkout/return",
         title="LandCheck Estates",
         description="Card verification for your free trial - refunded immediately, not a real charge.",
+        payment_options="card",
         meta={
             "purpose": "estate_subscription_verification",
             "organization_id": str(organization_id),
+            "account_id": str(account.id),
+            "customer_email": email,
             "plan_key": plan_key,
             "billing_cycle": billing_cycle,
         },
@@ -133,69 +183,221 @@ def start_checkout(payload: ChoosePlanRequest, organization_id: int, request: Re
 
 
 def _complete_verification(db: Session, verify_data: dict) -> dict:
-    """Shared by both the webhook and the redirect-return handler, mirroring how Green's
-    integration independently triggers verification from both paths - whichever arrives first
-    wins, the other is a harmless no-op re-check."""
     meta = dict(verify_data.get("meta") or {})
     if str(meta.get("purpose") or "") != "estate_subscription_verification":
         return {"ok": True, "ignored": True}
-    organization_id = int(meta.get("organization_id") or 0)
+    try:
+        organization_id = int(meta.get("organization_id") or 0)
+        account_id = int(meta.get("account_id") or 0)
+    except (TypeError, ValueError):
+        return {"ok": False, "message": "Could not match this payment to an Estate account."}
     plan_key = str(meta.get("plan_key") or "")
     billing_cycle = str(meta.get("billing_cycle") or "")
     organization = db.get(EstateOrganization, organization_id)
-    if not organization or plan_key not in ESTATE_PLANS or billing_cycle not in {"monthly", "yearly"}:
-        return {"ok": False, "message": "Could not match this payment to an Estate organization."}
+    if account_id:
+        account = db.query(EstateAccount).filter(EstateAccount.id == account_id, EstateAccount.organization_id == organization_id).with_for_update().one_or_none()
+    else:
+        account = (
+            db.query(EstateAccount)
+            .filter(EstateAccount.organization_id == organization_id, EstateAccount.status == "active")
+            .order_by(EstateAccount.created_at.asc(), EstateAccount.id.asc())
+            .with_for_update()
+            .first()
+        )
+    if not organization or not account or plan_key not in ESTATE_PLANS or billing_cycle not in {"monthly", "yearly"}:
+        return {"ok": False, "message": "Could not match this payment to an Estate account."}
 
     status = str(verify_data.get("status") or "").lower()
-    charged_amount = Decimal(str(verify_data.get("charged_amount") or verify_data.get("amount") or 0))
-    if status not in {"successful", "succeeded"} or charged_amount + Decimal("0.01") < VERIFICATION_CHARGE_AMOUNT:
+    charged_amount = _decimal(verify_data.get("charged_amount") or verify_data.get("amount"))
+    currency = str(verify_data.get("currency") or "NGN").upper()
+    if status not in {"successful", "succeeded"} or currency != "NGN" or charged_amount + Decimal("0.01") < VERIFICATION_CHARGE_AMOUNT:
         return {"ok": False, "message": "Card verification was not successful."}
 
-    existing = get_subscription(db, organization_id)
-    if existing and existing.status in {"trialing", "active"}:
-        return {"ok": True, "already_active": True}
+    existing = db.query(EstateSubscription).filter(EstateSubscription.organization_id == organization_id).with_for_update().one_or_none()
+    if account.trial_claimed_at is not None or (existing and (existing.trial_ends_at is not None or existing.status in {"trialing", "active"})):
+        _refund_verification(verify_data, organization_id)
+        db.commit()
+        return {"ok": True, "already_used": True}
 
     card_token, card_last4, card_brand = flw.extract_card_token(verify_data)
-    email = str(verify_data.get("customer", {}).get("email") or organization.contact_email or "")
-    subscription = start_trial(
-        db,
-        organization=organization,
-        plan_key=plan_key,
-        billing_cycle=billing_cycle,
-        email=email,
-        card_token=card_token,
-        card_last4=card_last4,
-        card_brand=card_brand,
-    )
-    transaction_id = str(verify_data.get("id") or "")
-    if transaction_id:
-        try:
-            flw.refund_transaction(transaction_id, amount=VERIFICATION_CHARGE_AMOUNT)
-        except Exception:
-            # Non-fatal: the trial has already started either way. A ₦50 verification charge
-            # that fails to auto-refund is a manual-refund follow-up, not a blocker to access.
-            logger.exception("Could not auto-refund the ₦50 verification charge (org=%s)", organization_id)
+    if not card_token:
+        _refund_verification(verify_data, organization_id)
+        return {"ok": False, "message": "This card cannot be saved for recurring billing. Please use another card."}
+
+    customer = dict(verify_data.get("customer") or {})
+    email = str(meta.get("customer_email") or customer.get("email") or account.email or organization.contact_email or "").strip()
+    try:
+        subscription = start_trial(
+            db,
+            organization=organization,
+            plan_key=plan_key,
+            billing_cycle=billing_cycle,
+            email=email,
+            card_token=card_token,
+            card_last4=card_last4,
+            card_brand=card_brand,
+        )
+    except ValueError as exc:
+        _refund_verification(verify_data, organization_id)
+        return {"ok": False, "message": str(exc)}
+
+    account.trial_claimed_at = datetime.now(timezone.utc)
+    _refund_verification(verify_data, organization_id)
     db.commit()
     return {"ok": True, "status": subscription.status, "trial_ends_at": subscription.trial_ends_at}
 
 
+@router.post("/payment-checkout")
+def start_payment_checkout(organization_id: int, request: Request, db: Session = Depends(get_db)):
+    require_estate_access(db, request, organization_id, permission="billing.manage", require_subscription=False)
+    organization = db.get(EstateOrganization, organization_id)
+    subscription = get_subscription(db, organization_id)
+    if not organization or not subscription or subscription.status not in {"past_due", "canceled", "expired"}:
+        raise HTTPException(409, "There is no payment due for this organization")
+
+    existing_pending = (
+        db.query(EstateSubscriptionCharge)
+        .filter(
+            EstateSubscriptionCharge.subscription_id == subscription.id,
+            EstateSubscriptionCharge.charge_type == "retry",
+            EstateSubscriptionCharge.status == "pending",
+        )
+        .order_by(EstateSubscriptionCharge.id.desc())
+        .first()
+    )
+    if existing_pending and isinstance(existing_pending.flutterwave_payload, dict) and existing_pending.flutterwave_payload.get("checkout_url"):
+        return {"checkout_url": existing_pending.flutterwave_payload["checkout_url"], "tx_ref": existing_pending.tx_ref}
+    if existing_pending:
+        existing_pending.status = "failed"
+        existing_pending.failure_reason = "Replaced by a new customer-initiated payment checkout."
+
+    email = str(subscription.flutterwave_customer_email or organization.contact_email or "").strip()
+    if not email:
+        raise HTTPException(422, "This organization has no billing email on file")
+    tx_ref = new_tx_ref("PAY")
+    charge = EstateSubscriptionCharge(
+        subscription_id=subscription.id,
+        organization_id=organization_id,
+        charge_type="retry",
+        amount=subscription.amount,
+        currency=subscription.currency,
+        status="pending",
+        tx_ref=tx_ref,
+    )
+    db.add(charge)
+    db.flush()
+    try:
+        link = flw.initiate_checkout(
+            tx_ref=tx_ref,
+            amount=charge.amount,
+            currency=charge.currency,
+            email=email,
+            name=organization.name,
+            redirect_url=f"{_api_public_url()}/estates/billing/checkout/return",
+            title="LandCheck Estates",
+            description=f"Payment for your {subscription.plan_key.title()} plan.",
+            payment_options="card",
+            meta={
+                "purpose": "estate_subscription_payment",
+                "organization_id": str(organization_id),
+                "subscription_id": str(subscription.id),
+                "charge_id": str(charge.id),
+                "customer_email": email,
+            },
+        )
+    except Exception:
+        db.rollback()
+        raise
+    charge.flutterwave_payload = {"checkout_url": link}
+    db.commit()
+    return {"checkout_url": link, "tx_ref": tx_ref}
+
+
+def _find_charge(db: Session, verify_data: dict, tx_ref: str | None = None) -> EstateSubscriptionCharge | None:
+    reference = str(tx_ref or verify_data.get("tx_ref") or "").strip()
+    transaction_id = str(verify_data.get("id") or "").strip()
+    filters = []
+    if reference:
+        filters.append(EstateSubscriptionCharge.tx_ref == reference)
+    if transaction_id:
+        filters.append(EstateSubscriptionCharge.flutterwave_transaction_id == transaction_id)
+    if not filters:
+        return None
+    return db.query(EstateSubscriptionCharge).filter(or_(*filters)).with_for_update().first()
+
+
+def _complete_subscription_payment(db: Session, verify_data: dict, tx_ref: str | None = None) -> dict:
+    charge = _find_charge(db, verify_data, tx_ref)
+    if not charge or charge.charge_type != "retry":
+        return {"ok": False, "message": "Could not match this payment to a subscription."}
+    if charge.status == "success":
+        return {"ok": True, "already_completed": True}
+
+    subscription = db.query(EstateSubscription).filter(EstateSubscription.id == charge.subscription_id).with_for_update().one_or_none()
+    if not subscription:
+        charge.status = "failed"
+        charge.failure_reason = "Subscription no longer exists."
+        db.commit()
+        return {"ok": False, "message": "Subscription no longer exists."}
+
+    status = str(verify_data.get("status") or "").lower()
+    amount = _decimal(verify_data.get("charged_amount") or verify_data.get("amount"))
+    currency = str(verify_data.get("currency") or "").upper()
+    charge.flutterwave_transaction_id = str(verify_data.get("id") or "") or charge.flutterwave_transaction_id
+    charge.flutterwave_payload = verify_data or charge.flutterwave_payload
+    if status in {"pending", "processing", "awaiting_authorization", "queued"}:
+        charge.failure_reason = "Payment authorization is pending."
+        db.commit()
+        return {"ok": False, "pending": True}
+    if status not in {"successful", "succeeded"} or currency != str(charge.currency).upper() or amount + Decimal("0.01") < Decimal(str(charge.amount)):
+        charge.status = "failed"
+        charge.failure_reason = str(verify_data.get("processor_response") or status or "Payment was not successful")
+        db.commit()
+        return {"ok": False, "message": "Payment was not successful."}
+
+    card_token, card_last4, card_brand = flw.extract_card_token(verify_data)
+    if card_token:
+        subscription.card_token = card_token
+        subscription.card_last4 = card_last4
+        subscription.card_brand = card_brand
+    customer = dict(verify_data.get("customer") or {})
+    subscription.flutterwave_customer_email = str(customer.get("email") or subscription.flutterwave_customer_email or "").strip() or subscription.flutterwave_customer_email
+    charge.status = "success"
+    charge.failure_reason = None
+    organization = db.get(EstateOrganization, subscription.organization_id)
+    _handle_successful_charge(db, subscription, organization=organization)
+    db.commit()
+    return {"ok": True, "status": subscription.status}
+
+
 @router.get("/checkout/return")
 def checkout_return(transaction_id: str | None = None, tx_ref: str | None = None, status: str | None = None, db: Session = Depends(get_db)):
-    """Flutterwave sends the CUSTOMER'S BROWSER here after checkout - this must answer with a real
-    HTTP redirect back into the web app, never a JSON body (nothing reads it as an API response;
-    a person is looking at whatever this returns)."""
-    web_url = str(os.getenv("LANDCHECK_WEB_URL") or "https://landcheck.online").rstrip("/")
-    # `status` is Flutterwave's own claim from the redirect query string - always re-verified
-    # server-side below rather than trusted directly, same as the webhook path.
+    """Re-verify the provider transaction, then redirect to the correct billing page."""
+    is_payment = str(tx_ref or "").startswith("PAY-")
     outcome = "failed"
-    if str(status or "").lower() != "cancelled" and (transaction_id or tx_ref):
+    if str(status or "").lower() == "cancelled":
+        if is_payment and tx_ref:
+            charge = db.query(EstateSubscriptionCharge).filter(EstateSubscriptionCharge.tx_ref == tx_ref, EstateSubscriptionCharge.status == "pending").with_for_update().first()
+            if charge:
+                charge.status = "failed"
+                charge.failure_reason = "Checkout cancelled by customer."
+                db.commit()
+        target = "estates/billing" if is_payment else "estates/choose-plan"
+        query_key = "payment_result" if is_payment else "result"
+        return RedirectResponse(f"{_web_url()}/{target}?{query_key}=failed", status_code=302)
+
+    if transaction_id or tx_ref:
         try:
             verify_data = flw.verify_transaction(transaction_id) if transaction_id else flw.verify_transaction_by_reference(tx_ref)  # type: ignore[arg-type]
-            result = _complete_verification(db, verify_data)
-            outcome = "success" if result.get("ok") else "failed"
+            purpose = str((verify_data.get("meta") or {}).get("purpose") or "")
+            is_payment = is_payment or purpose == "estate_subscription_payment"
+            result = _complete_subscription_payment(db, verify_data, tx_ref) if is_payment else _complete_verification(db, verify_data)
+            outcome = "success" if result.get("ok") else ("pending" if result.get("pending") else "failed")
         except Exception:
             logger.exception("Estate billing checkout-return verification failed (tx_ref=%s)", tx_ref)
-    return RedirectResponse(f"{web_url}/estates/choose-plan?result={outcome}", status_code=302)
+    target = "estates/billing" if is_payment else "estates/choose-plan"
+    query_key = "payment_result" if is_payment else "result"
+    return RedirectResponse(f"{_web_url()}/{target}?{query_key}={outcome}", status_code=302)
 
 
 @router.post("/webhook")
@@ -213,9 +415,13 @@ async def billing_webhook(request: Request, db: Session = Depends(get_db)):
     data = dict(payload.get("data") or {})
     transaction_id = str(data.get("id") or "")
     tx_ref = str(data.get("tx_ref") or "")
+    if not transaction_id and not tx_ref:
+        return {"ok": True, "ignored": True}
     try:
         verify_data = flw.verify_transaction(transaction_id) if transaction_id else flw.verify_transaction_by_reference(tx_ref)
-        result = _complete_verification(db, verify_data)
+        purpose = str((verify_data.get("meta") or {}).get("purpose") or "")
+        is_payment = purpose == "estate_subscription_payment" or bool(_find_charge(db, verify_data, tx_ref))
+        result = _complete_subscription_payment(db, verify_data, tx_ref) if is_payment else _complete_verification(db, verify_data)
     except Exception:
         logger.exception("Estate billing webhook verification failed (tx_ref=%s)", tx_ref)
         return {"ok": False}

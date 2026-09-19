@@ -21,6 +21,7 @@ class EstateAccount(Base):
     full_name = Column(String(255), nullable=False)
     password_hash = Column(String(255), nullable=False)
     status = Column(String(32), nullable=False, default="active")
+    trial_claimed_at = Column(DateTime(timezone=True), nullable=True)
     last_login_at = Column(DateTime(timezone=True), nullable=True)
     created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
     updated_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())

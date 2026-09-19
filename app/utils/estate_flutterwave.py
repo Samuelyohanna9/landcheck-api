@@ -71,21 +71,25 @@ def initiate_checkout(
     title: str,
     description: str,
     meta: dict[str, Any] | None = None,
+    payment_options: str | None = None,
 ) -> str:
     """Creates a hosted-checkout charge and returns the link the customer is redirected to."""
+    payload: dict[str, Any] = {
+        "tx_ref": tx_ref,
+        "amount": f"{Decimal(amount):.2f}",
+        "currency": currency,
+        "redirect_url": redirect_url,
+        "customer": {"email": email, "name": name},
+        "customizations": {"title": title, "description": description},
+        "meta": meta or {},
+        "configurations": {"session_duration": 30, "max_retry_attempt": 3},
+    }
+    if payment_options:
+        payload["payment_options"] = payment_options
     response = call_flutterwave_api(
         "POST",
         "/payments",
-        payload={
-            "tx_ref": tx_ref,
-            "amount": f"{Decimal(amount):.2f}",
-            "currency": currency,
-            "redirect_url": redirect_url,
-            "customer": {"email": email, "name": name},
-            "customizations": {"title": title, "description": description},
-            "meta": meta or {},
-            "configurations": {"session_duration": 30, "max_retry_attempt": 3},
-        },
+        payload=payload,
     )
     link = str((response.get("data") or {}).get("link") or "")
     if not link:
@@ -104,14 +108,34 @@ def verify_transaction_by_reference(tx_ref: str) -> dict[str, Any]:
     return dict(response.get("data") or {})
 
 
-def charge_token(*, token: str, amount: Decimal, currency: str, email: str, tx_ref: str) -> dict[str, Any]:
+def charge_token(
+    *,
+    token: str,
+    amount: Decimal,
+    currency: str,
+    email: str,
+    tx_ref: str,
+    redirect_url: str | None = None,
+) -> dict[str, Any]:
     """Charges a previously-captured card token with no customer interaction - the mechanism
     behind trial-conversion and renewal charges. Genuinely new capability for this codebase; there
     is no existing tokenized-charge usage anywhere else to model this on."""
+    payload: dict[str, Any] = {
+        "token": token,
+        "currency": currency,
+        "amount": f"{Decimal(amount):.2f}",
+        "email": email,
+        "tx_ref": tx_ref,
+        # Flutterwave requires the billing country for tokenized charges. Without this field,
+        # recurring charges can be rejected even when the stored token and amount are valid.
+        "country": "NG",
+    }
+    if redirect_url:
+        payload["redirect_url"] = redirect_url
     response = call_flutterwave_api(
         "POST",
         "/tokenized-charges",
-        payload={"token": token, "currency": currency, "amount": f"{Decimal(amount):.2f}", "email": email, "tx_ref": tx_ref},
+        payload=payload,
     )
     return dict(response.get("data") or {})
 

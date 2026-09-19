@@ -84,7 +84,7 @@ class EstateSubscriptionCharge(Base):
             "charge_type IN ('verification', 'trial_conversion', 'renewal', 'retry', 'plan_change')",
             name="ck_estate_subscription_charges_type",
         ),
-        CheckConstraint("status IN ('success', 'failed')", name="ck_estate_subscription_charges_status"),
+        CheckConstraint("status IN ('pending', 'success', 'failed')", name="ck_estate_subscription_charges_status"),
     )
 
 

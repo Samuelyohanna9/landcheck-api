@@ -56,12 +56,14 @@ def start_trial(
     card_last4: str | None,
     card_brand: str | None,
 ) -> EstateSubscription:
-    """Called once the ₦50 verification checkout has been verified (and refunded). Creates or
-    reactivates the organization's subscription row in trial state - reused across cancel/
-    resubscribe cycles rather than inserting a new row each time."""
+    """Called after the verification checkout has been refunded; this is a single-use trial."""
+    if not card_token:
+        raise ValueError("A reusable card token is required to start the free trial")
     now = datetime.now(timezone.utc)
     trial_ends_at = now + timedelta(days=TRIAL_DAYS)
     subscription = get_subscription(db, organization.id)
+    if subscription and subscription.trial_ends_at is not None:
+        raise ValueError("This organization has already used its free trial")
     if subscription is None:
         subscription = EstateSubscription(organization_id=organization.id)
         db.add(subscription)
@@ -117,19 +119,38 @@ def _record_charge(
 
 
 def attempt_charge(db: Session, subscription: EstateSubscription, *, charge_type: str) -> bool:
-    """Charges the subscription's stored card token for its locked-in amount. Returns True on
-    success. Every attempt - success or failure - is recorded in EstateSubscriptionCharge
-    regardless of outcome, since that table is the full billing history, not just successes."""
+    """Charge the stored card exactly once for this billing attempt.
+
+    A pending row is created before contacting Flutterwave. If the provider response is lost,
+    the row remains pending instead of being retried automatically, which prevents a duplicate
+    charge against the same card.
+    """
     organization = db.get(EstateOrganization, subscription.organization_id)
-    tx_ref = new_tx_ref("SUB")
-    if not subscription.card_token:
-        _record_charge(
-            db, subscription=subscription, charge_type=charge_type, amount=subscription.amount, status="failed",
-            tx_ref=tx_ref, flutterwave_transaction_id=None, flutterwave_payload=None,
-            failure_reason="No card on file - this card was not tokenizable at signup.",
+    existing_pending = (
+        db.query(EstateSubscriptionCharge)
+        .filter(
+            EstateSubscriptionCharge.subscription_id == subscription.id,
+            EstateSubscriptionCharge.charge_type == charge_type,
+            EstateSubscriptionCharge.status == "pending",
         )
+        .order_by(EstateSubscriptionCharge.id.desc())
+        .first()
+    )
+    if existing_pending:
+        _handle_pending_charge(db, subscription, organization=organization)
+        return False
+
+    tx_ref = new_tx_ref("SUB")
+    charge = _record_charge(
+        db, subscription=subscription, charge_type=charge_type, amount=subscription.amount, status="pending",
+        tx_ref=tx_ref, flutterwave_transaction_id=None, flutterwave_payload=None, failure_reason=None,
+    )
+    if not subscription.card_token:
+        charge.status = "failed"
+        charge.failure_reason = "No card on file - this card was not tokenizable at signup."
         _handle_failed_charge(db, subscription, organization=organization)
         return False
+
     try:
         result = flw.charge_token(
             token=subscription.card_token,
@@ -138,27 +159,39 @@ def attempt_charge(db: Session, subscription: EstateSubscription, *, charge_type
             email=subscription.flutterwave_customer_email or (organization.contact_email if organization else ""),
             tx_ref=tx_ref,
         )
-        succeeded = str(result.get("status") or "").lower() in {"successful", "succeeded"}
-    except Exception as exc:  # Flutterwave errors already raise HTTPException with a message
+    except Exception as exc:  # A lost response may mean Flutterwave already accepted the charge.
         logger.exception("Estate subscription charge failed (org=%s, type=%s)", subscription.organization_id, charge_type)
-        result = {}
-        succeeded = False
-        failure_reason = str(exc)
-    else:
-        failure_reason = None if succeeded else str(result.get("processor_response") or result.get("status") or "Charge declined")
+        charge.failure_reason = "Payment provider response was not confirmed. Use the billing page to complete payment."
+        charge.flutterwave_payload = {"status": "unknown", "error": type(exc).__name__}
+        _handle_pending_charge(db, subscription, organization=organization)
+        return False
 
-    _record_charge(
-        db, subscription=subscription, charge_type=charge_type, amount=subscription.amount,
-        status="success" if succeeded else "failed", tx_ref=tx_ref,
-        flutterwave_transaction_id=str(result.get("id") or "") or None, flutterwave_payload=result or None,
-        failure_reason=failure_reason,
-    )
-
-    if succeeded:
+    provider_status = str(result.get("status") or "").lower()
+    charge.flutterwave_transaction_id = str(result.get("id") or "") or None
+    charge.flutterwave_payload = result or None
+    if provider_status in {"successful", "succeeded"}:
+        charge.status = "success"
+        charge.failure_reason = None
         _handle_successful_charge(db, subscription, organization=organization)
         return True
+    if provider_status in {"pending", "processing", "awaiting_authorization", "queued"}:
+        charge.failure_reason = "Payment authorization is pending. Complete payment from the billing page."
+        _handle_pending_charge(db, subscription, organization=organization)
+        return False
+
+    charge.status = "failed"
+    charge.failure_reason = str(result.get("processor_response") or result.get("status") or "Charge declined")
     _handle_failed_charge(db, subscription, organization=organization)
     return False
+
+
+def _handle_pending_charge(db: Session, subscription: EstateSubscription, *, organization: EstateOrganization | None) -> None:
+    """Hold access in past-due state without scheduling a blind duplicate retry."""
+    subscription.status = "past_due"
+    subscription.next_retry_at = None
+    db.flush()
+    if organization:
+        estate_email.send_payment_failed_email(organization=organization, subscription=subscription)
 
 
 def _handle_successful_charge(db: Session, subscription: EstateSubscription, *, organization: EstateOrganization | None) -> None:
@@ -169,6 +202,8 @@ def _handle_successful_charge(db: Session, subscription: EstateSubscription, *, 
     subscription.next_charge_at = period_end
     subscription.next_retry_at = None
     subscription.failed_charge_attempts = 0
+    subscription.cancel_at_period_end = False
+    subscription.canceled_at = None
     db.flush()
     if organization:
         estate_email.send_payment_receipt_email(organization=organization, subscription=subscription)
@@ -224,7 +259,12 @@ def process_due_billing(db: Session) -> dict[str, int]:
     now = datetime.now(timezone.utc)
     counts = {"trial_conversions": 0, "renewals": 0, "retries": 0, "cancellations_finalized": 0}
 
-    trialing_due = db.query(EstateSubscription).filter(EstateSubscription.status == "trialing", EstateSubscription.trial_ends_at <= now).all()
+    trialing_due = (
+        db.query(EstateSubscription)
+        .filter(EstateSubscription.status == "trialing", EstateSubscription.trial_ends_at <= now)
+        .with_for_update()
+        .all()
+    )
     for subscription in trialing_due:
         attempt_charge(db, subscription, charge_type="trial_conversion")
         counts["trial_conversions"] += 1
@@ -232,13 +272,19 @@ def process_due_billing(db: Session) -> dict[str, int]:
     renewals_due = (
         db.query(EstateSubscription)
         .filter(EstateSubscription.status == "active", EstateSubscription.cancel_at_period_end.is_(False), EstateSubscription.next_charge_at <= now)
+        .with_for_update()
         .all()
     )
     for subscription in renewals_due:
         attempt_charge(db, subscription, charge_type="renewal")
         counts["renewals"] += 1
 
-    retries_due = db.query(EstateSubscription).filter(EstateSubscription.status == "past_due", EstateSubscription.next_retry_at <= now).all()
+    retries_due = (
+        db.query(EstateSubscription)
+        .filter(EstateSubscription.status == "past_due", EstateSubscription.next_retry_at <= now)
+        .with_for_update()
+        .all()
+    )
     for subscription in retries_due:
         attempt_charge(db, subscription, charge_type="retry")
         counts["retries"] += 1
@@ -246,6 +292,7 @@ def process_due_billing(db: Session) -> dict[str, int]:
     ending_cancellations = (
         db.query(EstateSubscription)
         .filter(EstateSubscription.status == "active", EstateSubscription.cancel_at_period_end.is_(True), EstateSubscription.current_period_end <= now)
+        .with_for_update()
         .all()
     )
     for subscription in ending_cancellations:
