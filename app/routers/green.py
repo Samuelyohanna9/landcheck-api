@@ -28235,6 +28235,86 @@ def review_submitted_task(
     }
 
 
+@router.post("/tasks/review-bulk")
+def review_submitted_tasks_bulk(
+    db: Session = Depends(get_db),
+    task_ids: list[int] = Body(...),
+    reviewer_name: str = Body(default=""),
+    review_notes: dict[str, str] | None = Body(default=None),
+    season_mode: str | None = Body(default=None),
+):
+    """Approve a bounded set of submitted tasks without one large transaction.
+
+    Each task is delegated to the single-task review flow, which commits before the
+    next task starts. A bad submission therefore cannot roll back or hold locks for
+    the rest of the batch. The response reports every task independently so the UI
+    can keep successful approvals and surface only the failures.
+    """
+    normalized_ids: list[int] = []
+    seen_ids: set[int] = set()
+    for raw_task_id in task_ids or []:
+        try:
+            task_id = int(raw_task_id)
+        except (TypeError, ValueError):
+            continue
+        if task_id > 0 and task_id not in seen_ids:
+            normalized_ids.append(task_id)
+            seen_ids.add(task_id)
+
+    if not normalized_ids:
+        raise HTTPException(status_code=400, detail="At least one task id is required")
+    if len(normalized_ids) > 100:
+        raise HTTPException(status_code=413, detail="Approve at most 100 submissions per request")
+
+    approved: list[int] = []
+    failed: list[dict[str, object]] = []
+    notes_by_task = review_notes or {}
+
+    for task_id in normalized_ids:
+        task_note = str(notes_by_task.get(str(task_id)) or "").strip()
+        try:
+            review_submitted_task(
+                task_id=task_id,
+                db=db,
+                decision="approve",
+                reviewer_name=reviewer_name,
+                review_notes=task_note or "Approved by supervisor.",
+                season_mode=season_mode,
+            )
+            approved.append(task_id)
+        except HTTPException as exc:
+            db.rollback()
+            current_state = db.execute(
+                text("SELECT review_state FROM tree_tasks WHERE id = :task_id"),
+                {"task_id": task_id},
+            ).scalar()
+            if _normalize_name(current_state) == "approved":
+                # A retry after a client timeout is safe and idempotent.
+                approved.append(task_id)
+            else:
+                failed.append({"task_id": task_id, "detail": str(exc.detail)})
+        except Exception as exc:
+            db.rollback()
+            current_state = db.execute(
+                text("SELECT review_state FROM tree_tasks WHERE id = :task_id"),
+                {"task_id": task_id},
+            ).scalar()
+            if _normalize_name(current_state) == "approved":
+                approved.append(task_id)
+            else:
+                logger.exception("Bulk task approval failed for task %s", task_id)
+                failed.append({"task_id": task_id, "detail": "Approval failed; retry this submission."})
+
+    return {
+        "status": "ok" if not failed else "partial",
+        "requested_count": len(normalized_ids),
+        "approved_count": len(approved),
+        "failed_count": len(failed),
+        "approved_task_ids": approved,
+        "failed": failed,
+    }
+
+
 @router.post("/tasks/{task_id}/reopen")
 def reopen_approved_task(
     task_id: int,
