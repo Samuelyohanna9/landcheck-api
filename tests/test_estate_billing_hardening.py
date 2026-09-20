@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from decimal import Decimal
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -9,7 +10,7 @@ from app.models.estate_billing import EstateSubscription, EstateSubscriptionChar
 from app.models.estate_foundation import EstateOrganization
 from app.routers.estate_billing import _complete_subscription_payment, _complete_verification
 from app.services.estates import estate_email
-from app.services.estates.subscriptions import attempt_charge, start_trial
+from app.services.estates.subscriptions import attempt_charge, change_plan, start_trial
 from app.utils import estate_flutterwave as flw
 
 
@@ -174,4 +175,46 @@ def test_manual_recovery_payment_reactivates_subscription(monkeypatch, db_sessio
     assert result["ok"] is True
     assert subscription.status == "active"
     assert subscription.card_token == "token-new"
+    assert charge.status == "success"
+
+
+def test_active_upgrade_charges_difference_and_preserves_renewal(monkeypatch, db_session):
+    organization = _organization(db_session)
+    renewal = datetime.now(timezone.utc) + timedelta(days=18)
+    subscription = EstateSubscription(
+        organization_id=organization.id,
+        plan_key="basic",
+        billing_cycle="monthly",
+        status="active",
+        amount=Decimal("19500"),
+        currency="NGN",
+        current_period_end=renewal,
+        next_charge_at=renewal,
+        card_token="token-1",
+        flutterwave_customer_email="billing@example.com",
+    )
+    db_session.add(subscription)
+    db_session.commit()
+    monkeypatch.setattr(estate_email, "send_plan_change_receipt_email", lambda **kwargs: None)
+    captured = {}
+
+    def fake_charge(**kwargs):
+        captured.update(kwargs)
+        return {"status": "successful", "id": "plan-change-1"}
+
+    monkeypatch.setattr(flw, "charge_token", fake_charge)
+
+    result = change_plan(db_session, subscription, new_plan_key="plus", organization=organization)
+    db_session.commit()
+    db_session.refresh(subscription)
+    charge = db_session.query(EstateSubscriptionCharge).one()
+
+    assert result["payment_status"] == "success"
+    assert captured["amount"] == Decimal("5000")
+    assert subscription.plan_key == "plus"
+    assert subscription.amount == Decimal("24500")
+    assert subscription.current_period_end.replace(tzinfo=timezone.utc) == renewal
+    assert subscription.next_charge_at.replace(tzinfo=timezone.utc) == renewal
+    assert charge.charge_type == "plan_change"
+    assert charge.amount == Decimal("5000")
     assert charge.status == "success"

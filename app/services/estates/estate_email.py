@@ -437,6 +437,33 @@ def send_payment_receipt_email(*, organization, subscription) -> bool:
         return False
 
 
+def send_plan_change_receipt_email(*, organization, subscription, charged_amount) -> bool:
+    to_email = _subscription_org_email(organization)
+    if not to_email:
+        return False
+    plan_label = "Plus" if subscription.plan_key == "plus" else "Basic"
+    period_end = subscription.current_period_end.strftime("%d %b %Y") if subscription.current_period_end else ""
+    message_html = (
+        f"<p>We've charged {html.escape(format_naira(charged_amount))} for your upgrade to the "
+        f"{html.escape(plan_label)} plan ({html.escape(subscription.billing_cycle)}).</p>"
+        f"<p>Your subscription is active through <strong>{html.escape(period_end)}</strong>. "
+        f"Your next renewal will use the {html.escape(plan_label)} plan price.</p>"
+    )
+    body_html = _account_wrap_html(heading="Plan changed successfully", message_html=message_html)
+    try:
+        _send_email(
+            to_email=to_email,
+            from_display_name="LandCheck Estates",
+            subject="LandCheck Estates - plan changed",
+            body_text=_account_plain_text("Plan changed successfully", message_html),
+            body_html=body_html,
+        )
+        return True
+    except Exception:
+        logger.exception("Estate plan-change receipt email failed (org=%s)", organization.id)
+        return False
+
+
 def send_payment_failed_email(*, organization, subscription) -> bool:
     to_email = _subscription_org_email(organization)
     if not to_email:

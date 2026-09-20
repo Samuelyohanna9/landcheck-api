@@ -21,6 +21,7 @@ from app.services.estates.subscriptions import (
     _handle_successful_charge,
     cancel_subscription,
     change_plan,
+    finalize_plan_change,
     get_subscription,
     new_tx_ref,
     start_trial,
@@ -328,7 +329,7 @@ def _find_charge(db: Session, verify_data: dict, tx_ref: str | None = None) -> E
 
 def _complete_subscription_payment(db: Session, verify_data: dict, tx_ref: str | None = None) -> dict:
     charge = _find_charge(db, verify_data, tx_ref)
-    if not charge or charge.charge_type != "retry":
+    if not charge or charge.charge_type not in {"retry", "plan_change"}:
         return {"ok": False, "message": "Could not match this payment to a subscription."}
     if charge.status == "success":
         return {"ok": True, "already_completed": True}
@@ -343,8 +344,9 @@ def _complete_subscription_payment(db: Session, verify_data: dict, tx_ref: str |
     status = str(verify_data.get("status") or "").lower()
     amount = _decimal(verify_data.get("charged_amount") or verify_data.get("amount"))
     currency = str(verify_data.get("currency") or "").upper()
+    charge_metadata = dict(charge.flutterwave_payload or {}) if isinstance(charge.flutterwave_payload, dict) else {}
     charge.flutterwave_transaction_id = str(verify_data.get("id") or "") or charge.flutterwave_transaction_id
-    charge.flutterwave_payload = verify_data or charge.flutterwave_payload
+    charge.flutterwave_payload = {**charge_metadata, "provider": verify_data or charge_metadata.get("provider")}
     if status in {"pending", "processing", "awaiting_authorization", "queued"}:
         charge.failure_reason = "Payment authorization is pending."
         db.commit()
@@ -365,7 +367,22 @@ def _complete_subscription_payment(db: Session, verify_data: dict, tx_ref: str |
     charge.status = "success"
     charge.failure_reason = None
     organization = db.get(EstateOrganization, subscription.organization_id)
-    _handle_successful_charge(db, subscription, organization=organization)
+    if charge.charge_type == "plan_change":
+        new_plan_key = str(charge_metadata.get("plan_key") or "").strip().lower()
+        if new_plan_key not in ESTATE_PLANS:
+            charge.status = "failed"
+            charge.failure_reason = "The requested plan change could not be identified."
+            db.commit()
+            return {"ok": False, "message": "The requested plan change could not be identified."}
+        finalize_plan_change(
+            db,
+            subscription,
+            new_plan_key=new_plan_key,
+            organization=organization,
+            charged_amount=Decimal(str(charge.amount)),
+        )
+    else:
+        _handle_successful_charge(db, subscription, organization=organization)
     db.commit()
     return {"ok": True, "status": subscription.status}
 
@@ -448,6 +465,16 @@ def change(payload: ChangePlanRequest, organization_id: int, request: Request, d
     subscription = get_subscription(db, organization_id)
     if not subscription or subscription.status not in {"trialing", "active"}:
         raise HTTPException(409, "There is no active subscription to change")
-    change_plan(db, subscription, new_plan_key=plan_key)
+    organization = db.get(EstateOrganization, organization_id)
+    try:
+        result = change_plan(db, subscription, new_plan_key=plan_key, organization=organization)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    if result.get("payment_status") == "failed":
+        db.commit()
+        raise HTTPException(402, "The plan-change payment was not successful. Your current plan is unchanged.")
     db.commit()
-    return _subscription_status_payload(subscription)
+    response = _subscription_status_payload(subscription)
+    response["plan_change_status"] = result.get("payment_status")
+    response["plan_change_amount"] = str(result.get("charged_amount") or Decimal("0"))
+    return response

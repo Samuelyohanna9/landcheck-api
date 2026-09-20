@@ -244,13 +244,138 @@ def cancel_subscription(db: Session, subscription: EstateSubscription) -> None:
         estate_email.send_subscription_canceled_email(organization=organization, subscription=subscription, reason="user_requested")
 
 
-def change_plan(db: Session, subscription: EstateSubscription, *, new_plan_key: str) -> None:
-    """Upgrade/downgrade takes effect immediately at the new plan's price; the current billing
-    period and next charge date are left untouched - no proration math. A simple, deliberate v1
-    choice, not an oversight."""
+def _apply_plan_change(subscription: EstateSubscription, *, new_plan_key: str) -> None:
     subscription.plan_key = new_plan_key
     subscription.amount = plan_amount(new_plan_key, subscription.billing_cycle)
+
+
+def finalize_plan_change(
+    db: Session,
+    subscription: EstateSubscription,
+    *,
+    new_plan_key: str,
+    organization: EstateOrganization | None,
+    charged_amount: Decimal,
+) -> None:
+    """Apply a paid plan change without resetting the already-paid billing period."""
+    _apply_plan_change(subscription, new_plan_key=new_plan_key)
     db.flush()
+    if organization:
+        estate_email.send_plan_change_receipt_email(
+            organization=organization,
+            subscription=subscription,
+            charged_amount=charged_amount,
+        )
+
+
+def change_plan(
+    db: Session,
+    subscription: EstateSubscription,
+    *,
+    new_plan_key: str,
+    organization: EstateOrganization | None = None,
+) -> dict[str, object]:
+    """Change a plan and charge the price difference for an active paid upgrade.
+
+    Trial changes are free because the trial has not converted yet. Downgrades take effect
+    immediately without a refund; the next renewal uses the lower price. Active upgrades charge
+    only the difference for the current billing cycle, while preserving the existing renewal date.
+    """
+    if new_plan_key == subscription.plan_key:
+        return {"changed": False, "payment_status": "not_required", "charged_amount": Decimal("0")}
+
+    current_amount = Decimal(str(subscription.amount))
+    new_amount = plan_amount(new_plan_key, subscription.billing_cycle)
+    difference = new_amount - current_amount
+
+    if subscription.status == "trialing" or difference <= 0:
+        _apply_plan_change(subscription, new_plan_key=new_plan_key)
+        db.flush()
+        return {"changed": True, "payment_status": "not_required", "charged_amount": Decimal("0")}
+
+    organization = organization or db.get(EstateOrganization, subscription.organization_id)
+    if not subscription.card_token:
+        raise ValueError("A saved payment card is required to upgrade this active subscription.")
+
+    existing_pending = (
+        db.query(EstateSubscriptionCharge)
+        .filter(
+            EstateSubscriptionCharge.subscription_id == subscription.id,
+            EstateSubscriptionCharge.charge_type == "plan_change",
+            EstateSubscriptionCharge.status == "pending",
+        )
+        .order_by(EstateSubscriptionCharge.id.desc())
+        .first()
+    )
+    if existing_pending:
+        return {
+            "changed": False,
+            "payment_status": "pending",
+            "charged_amount": Decimal(str(existing_pending.amount)),
+        }
+
+    tx_ref = new_tx_ref("SUB")
+    charge = _record_charge(
+        db,
+        subscription=subscription,
+        charge_type="plan_change",
+        amount=difference,
+        status="pending",
+        tx_ref=tx_ref,
+        flutterwave_transaction_id=None,
+        flutterwave_payload={
+            "plan_key": new_plan_key,
+            "previous_plan_key": subscription.plan_key,
+        },
+        failure_reason=None,
+    )
+    email = subscription.flutterwave_customer_email or (organization.contact_email if organization else "")
+    try:
+        result = flw.charge_token(
+            token=subscription.card_token,
+            amount=difference,
+            currency=subscription.currency,
+            email=email,
+            tx_ref=tx_ref,
+        )
+    except Exception as exc:  # A lost response may mean the provider accepted the charge.
+        logger.exception("Estate plan-change charge failed (org=%s)", subscription.organization_id)
+        charge.failure_reason = "Payment provider response was not confirmed. Billing will not retry automatically."
+        charge.flutterwave_payload = {
+            "plan_key": new_plan_key,
+            "previous_plan_key": subscription.plan_key,
+            "provider": {"status": "unknown", "error": type(exc).__name__},
+        }
+        db.flush()
+        return {"changed": False, "payment_status": "pending", "charged_amount": difference}
+
+    provider_status = str(result.get("status") or "").lower()
+    charge.flutterwave_transaction_id = str(result.get("id") or "") or None
+    charge.flutterwave_payload = {
+        "plan_key": new_plan_key,
+        "previous_plan_key": subscription.plan_key,
+        "provider": result or None,
+    }
+    if provider_status in {"successful", "succeeded"}:
+        charge.status = "success"
+        charge.failure_reason = None
+        finalize_plan_change(
+            db,
+            subscription,
+            new_plan_key=new_plan_key,
+            organization=organization,
+            charged_amount=difference,
+        )
+        return {"changed": True, "payment_status": "success", "charged_amount": difference}
+    if provider_status in {"pending", "processing", "awaiting_authorization", "queued"}:
+        charge.failure_reason = "Payment authorization is pending. The plan will change when payment completes."
+        db.flush()
+        return {"changed": False, "payment_status": "pending", "charged_amount": difference}
+
+    charge.status = "failed"
+    charge.failure_reason = str(result.get("processor_response") or result.get("status") or "Charge declined")
+    db.flush()
+    return {"changed": False, "payment_status": "failed", "charged_amount": difference}
 
 
 def process_due_billing(db: Session) -> dict[str, int]:
