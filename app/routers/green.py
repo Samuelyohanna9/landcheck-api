@@ -3423,7 +3423,19 @@ def _next_project_tree_no(db: Session, project_id: int) -> int:
     # Lock the project row so concurrent inserts don't issue the same local tree number.
     db.execute(text("SELECT id FROM tree_projects WHERE id = :project_id FOR UPDATE"), {"project_id": int(project_id)})
     next_no = db.execute(
-        text("SELECT COALESCE(MAX(project_tree_no), 0) + 1 FROM trees WHERE project_id = :project_id"),
+        text(
+            """
+            SELECT COALESCE(MAX(project_tree_no), 0) + 1
+            FROM trees
+            WHERE project_id = :project_id
+              AND COALESCE(LOWER(record_profile_data->>'hidden_from_records'), 'false') <> 'true'
+              AND COALESCE(LOWER(record_profile_data->>'support_placeholder'), 'false') <> 'true'
+              AND COALESCE(LOWER(record_profile_data->>'placeholder_reason'), '') NOT IN (
+                    'support_visit_before_plot_capture',
+                    'field_capture_before_plot_capture'
+              )
+            """
+        ),
         {"project_id": int(project_id)},
     ).scalar()
     try:
@@ -4750,7 +4762,6 @@ def _get_or_create_support_placeholder_tree(
     if existing:
         return dict(existing)
 
-    project_tree_no = _next_project_tree_no(db, int(project_id))
     placeholder_species = _clean_text(event_species, 160) or labels["placeholder_species"]
     placeholder_record_profile = _normalize_tree_record_profile_data(
         {
@@ -4774,7 +4785,7 @@ def _get_or_create_support_placeholder_tree(
             )
             VALUES (
                 :project_id,
-                :project_tree_no,
+                NULL,
                 NULL,
                 :species,
                 NULL,
@@ -4802,7 +4813,6 @@ def _get_or_create_support_placeholder_tree(
         ),
         {
             "project_id": int(project_id),
-            "project_tree_no": int(project_tree_no),
             "species": placeholder_species,
             "notes": (notes or "").strip()
             or (
@@ -6642,6 +6652,7 @@ def ensure_green_tables(db: Session):
     except Exception:
         db.rollback()
     try:
+        db.execute(text("UPDATE trees SET project_tree_no = NULL WHERE project_tree_no IS NOT NULL"))
         db.execute(
             text(
                 """
@@ -6653,6 +6664,12 @@ def ensure_green_tables(db: Session):
                             ORDER BY COALESCE(created_at, NOW()), id
                         ) AS rn
                     FROM trees
+                    WHERE COALESCE(LOWER(record_profile_data->>'hidden_from_records'), 'false') <> 'true'
+                      AND COALESCE(LOWER(record_profile_data->>'support_placeholder'), 'false') <> 'true'
+                      AND COALESCE(LOWER(record_profile_data->>'placeholder_reason'), '') NOT IN (
+                            'support_visit_before_plot_capture',
+                            'field_capture_before_plot_capture'
+                      )
                 )
                 UPDATE trees t
                 SET project_tree_no = ranked.rn
@@ -25894,6 +25911,7 @@ def update_tree(
     tree_age_months: float | None = Body(default=None),
     inventory_tree_count: int | None = Body(default=None),
     existing_area_geojson: dict | str | None = Body(default=None),
+    clear_existing_area_geojson: bool = Body(default=False),
     record_profile_data: dict | None = Body(default=None),
 ):
     if (lng is None) != (lat is None):
@@ -25941,7 +25959,11 @@ def update_tree(
         if inventory_tree_count_value < 1 or inventory_tree_count_value > 1000000:
             raise HTTPException(status_code=400, detail="inventory_tree_count must be between 1 and 1000000")
 
+    clear_existing_area = bool(clear_existing_area_geojson)
+    has_existing_area_payload = existing_area_geojson is not None
     normalized_existing_area_geojson = _normalize_work_area_geojson(existing_area_geojson)
+    if has_existing_area_payload and normalized_existing_area_geojson is None and not clear_existing_area:
+        raise HTTPException(status_code=400, detail="Invalid existing_area_geojson")
 
     source_project_id_value = None
     if source_project_id is not None:
@@ -26036,26 +26058,38 @@ def update_tree(
             if inventory_tree_count_value is not None
             else max(int(existing.get("inventory_tree_count") or 1), 1)
         )
-        next_area_geojson = normalized_existing_area_geojson if existing_area_geojson is not None else existing.get("existing_area_geojson")
-        if next_inventory_count > 1 and not next_area_geojson:
+        next_area_geojson = (
+            None
+            if clear_existing_area
+            else normalized_existing_area_geojson
+            if has_existing_area_payload
+            else existing.get("existing_area_geojson")
+        )
+        if next_inventory_count > 1 and not next_area_geojson and not clear_existing_area:
             raise HTTPException(
                 status_code=400,
                 detail="Draw a polygon area when capturing more than one existing tree in a single record",
             )
 
     effective_existing_area_geojson = (
-        normalized_existing_area_geojson if existing_area_geojson is not None else existing.get("existing_area_geojson")
+        None
+        if clear_existing_area
+        else normalized_existing_area_geojson
+        if has_existing_area_payload
+        else existing.get("existing_area_geojson")
     )
     existing_area_sqm_value = (
-        _compute_existing_area_sqm(db, normalized_existing_area_geojson)
-        if existing_area_geojson is not None and normalized_existing_area_geojson is not None
+        None
+        if clear_existing_area
+        else _compute_existing_area_sqm(db, normalized_existing_area_geojson)
+        if has_existing_area_payload and normalized_existing_area_geojson is not None
         else None
     )
     next_record_profile_data = (
         _normalize_tree_record_profile_data(
             record_profile_data,
             existing_area_sqm=existing_area_sqm_value
-            if existing_area_geojson is not None
+            if has_existing_area_payload or clear_existing_area
             else (
                 float(existing.get("existing_area_sqm") or 0)
                 if existing.get("existing_area_sqm") is not None
@@ -26102,8 +26136,16 @@ def update_tree(
             tree_height_m = COALESCE(:tree_height_m, tree_height_m),
             tree_age_months = COALESCE(:tree_age_months, tree_age_months),
             inventory_tree_count = COALESCE(:inventory_tree_count, inventory_tree_count),
-            existing_area_geojson = COALESCE(CAST(:existing_area_geojson AS JSONB), existing_area_geojson),
-            existing_area_sqm = COALESCE(:existing_area_sqm, existing_area_sqm),
+            existing_area_geojson = CASE
+                WHEN :clear_existing_area_geojson THEN NULL
+                WHEN :has_existing_area_payload THEN CAST(:existing_area_geojson AS JSONB)
+                ELSE existing_area_geojson
+            END,
+            existing_area_sqm = CASE
+                WHEN :clear_existing_area_geojson THEN NULL
+                WHEN :has_existing_area_payload THEN :existing_area_sqm
+                ELSE existing_area_sqm
+            END,
             record_profile_data = CAST(:record_profile_data AS JSONB)
         WHERE id = :tree_id
     """), {
@@ -26125,7 +26167,9 @@ def update_tree(
         "tree_height_m": tree_height_value,
         "tree_age_months": tree_age_months_value,
         "inventory_tree_count": inventory_tree_count_value,
-        "existing_area_geojson": _safe_json(normalized_existing_area_geojson) if existing_area_geojson is not None else None,
+        "existing_area_geojson": _safe_json(normalized_existing_area_geojson) if has_existing_area_payload else None,
+        "clear_existing_area_geojson": clear_existing_area,
+        "has_existing_area_payload": has_existing_area_payload,
         "existing_area_sqm": existing_area_sqm_value,
         "record_profile_data": _safe_json(next_record_profile_data),
         "tree_id": tree_id,
@@ -26189,10 +26233,10 @@ def update_tree(
                     inventory_tree_count_value if inventory_tree_count is not None else existing.get("inventory_tree_count")
                 ),
                 "existing_area_geojson": (
-                    effective_existing_area_geojson if existing_area_geojson is not None else existing.get("existing_area_geojson")
+                    effective_existing_area_geojson if has_existing_area_payload or clear_existing_area else existing.get("existing_area_geojson")
                 ),
                 "existing_area_sqm": (
-                    existing_area_sqm_value if existing_area_geojson is not None else existing.get("existing_area_sqm")
+                    existing_area_sqm_value if has_existing_area_payload or clear_existing_area else existing.get("existing_area_sqm")
                 ),
                 "record_profile_data": next_record_profile_data,
             },
