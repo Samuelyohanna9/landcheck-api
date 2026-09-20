@@ -32392,6 +32392,10 @@ def update_work_order(
     db: Session = Depends(get_db),
     status: str | None = Body(default=None),
     planted_count: int | None = Body(default=None),
+    area_enabled: bool | None = Body(default=None),
+    area_label: str | None = Body(default=None),
+    area_geojson: dict | str | None = Body(default=None),
+    allow_existing_tree_area_reuse: bool | None = Body(default=None),
 ):
     # Auto-calc planted_count from trees created by assignee for planting orders.
     row = db.execute(text("""
@@ -32399,6 +32403,19 @@ def update_work_order(
         FROM green_work_orders
         WHERE id = :work_id
     """), {"work_id": work_id}).mappings().first()
+
+    clear_area = area_enabled is False
+    update_area = area_enabled is not None
+    normalized_area_geojson = None
+    if update_area:
+        if not row:
+            raise HTTPException(status_code=404, detail="Work order not found")
+        if row["work_type"] != "planting":
+            raise HTTPException(status_code=400, detail="Only planting orders can have an area polygon")
+        if not clear_area:
+            normalized_area_geojson = _normalize_polygon_area_geojson(area_geojson)
+            if normalized_area_geojson is None:
+                raise HTTPException(status_code=400, detail="A valid planting area polygon is required")
 
     planted_value = planted_count
     if row and row["work_type"] == "planting":
@@ -32415,11 +32432,33 @@ def update_work_order(
         UPDATE green_work_orders
         SET status = COALESCE(:status, status),
             planted_count = COALESCE(:planted_count, planted_count),
+            area_enabled = CASE WHEN :update_area THEN :area_enabled ELSE area_enabled END,
+            area_label = CASE
+                WHEN :clear_area THEN NULL
+                WHEN :update_area THEN COALESCE(:area_label, area_label)
+                ELSE area_label
+            END,
+            area_geojson = CASE
+                WHEN :clear_area THEN NULL
+                WHEN :update_area THEN CAST(:area_geojson AS JSONB)
+                ELSE area_geojson
+            END,
+            allow_existing_tree_area_reuse = CASE
+                WHEN :clear_area THEN FALSE
+                WHEN :update_area THEN COALESCE(:allow_existing_tree_area_reuse, allow_existing_tree_area_reuse)
+                ELSE allow_existing_tree_area_reuse
+            END,
             last_update = NOW()
         WHERE id = :work_id
     """), {
         "status": status,
         "planted_count": planted_value,
+        "update_area": update_area,
+        "clear_area": clear_area,
+        "area_enabled": bool(area_enabled) if update_area else None,
+        "area_label": (area_label or "").strip() or None,
+        "area_geojson": _safe_json(normalized_area_geojson) if normalized_area_geojson else None,
+        "allow_existing_tree_area_reuse": bool(allow_existing_tree_area_reuse) if update_area and allow_existing_tree_area_reuse is not None else None,
         "work_id": work_id,
     })
     if row:
@@ -32435,6 +32474,8 @@ def update_work_order(
                 "planted_count": planted_value,
                 "work_type": row.get("work_type"),
                 "existing_status": existing_status,
+                "area_updated": update_area,
+                "area_cleared": clear_area,
             },
         )
     db.commit()
