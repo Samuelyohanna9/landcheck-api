@@ -8397,7 +8397,9 @@ def _load_uploaded_photo_payload(
                 "webp": "image/webp",
                 "png": "image/png",
             }.get(output_format_raw, content_type)
-            return out.getvalue(), rendered_type, cache_control
+            # Upload keys are UUID-based and immutable, so transformed thumbnails can be
+            # cached independently even when an older original has no-cache metadata.
+            return out.getvalue(), rendered_type, "public, max-age=31536000, immutable"
     except HTTPException:
         raise
     except Exception:
