@@ -128,19 +128,7 @@ def _build_period_stats(
         .map(_mask_sentinel_clouds)
     )
 
-    image_count = int(collection.size().getInfo() or 0)
-    if image_count <= 0:
-        return {
-            "image_count": 0,
-            "latest_image_date": None,
-            "mean_ndvi": None,
-            "vegetation_area_sqm": None,
-            "vegetation_coverage_pct": None,
-            "vegetation_area_per_tree_sqm": None,
-            "clear_area_sqm": None,
-            "clear_coverage_pct": None,
-        }
-
+    image_count = collection.size()
     composite = collection.median()
     ndvi = composite.normalizedDifference(["B8", "B4"]).rename("ndvi")
     pixel_area = ee.Image.pixelArea().rename("pixel_area")
@@ -177,16 +165,44 @@ def _build_period_stats(
             maxPixels=1e9,
         ).get("ndvi")
     )
-    latest_image = ee.Image(collection.sort("system:time_start", False).first())
-    latest_image_date = latest_image.date().format("YYYY-MM-dd")
-
-    total_area_value = _safe_float(total_area.getInfo() if hasattr(total_area, "getInfo") else total_area)
-    clear_area_value = _safe_float(clear_area.getInfo() if hasattr(clear_area, "getInfo") else clear_area)
-    vegetation_area_value = _safe_float(
-        vegetation_area.getInfo() if hasattr(vegetation_area, "getInfo") else vegetation_area
+    latest_image = collection.sort("system:time_start", False).first()
+    latest_image_date = ee.Algorithms.If(
+        image_count.gt(0),
+        ee.Image(latest_image).date().format("YYYY-MM-dd"),
+        "",
     )
-    mean_ndvi_value = _safe_float(mean_ndvi.getInfo() if hasattr(mean_ndvi, "getInfo") else mean_ndvi)
-    latest_image_value = str(latest_image_date.getInfo() or "").strip() if hasattr(latest_image_date, "getInfo") else None
+
+    # Evaluate the period as one Earth Engine graph. The previous implementation issued a
+    # separate getInfo request for every reducer and date, which multiplied latency across the
+    # six-month series and made the UI appear stuck at 96%.
+    server_stats = ee.Dictionary(
+        {
+            "image_count": image_count,
+            "latest_image_date": latest_image_date,
+            "total_area": total_area,
+            "clear_area": clear_area,
+            "vegetation_area": vegetation_area,
+            "mean_ndvi": mean_ndvi,
+        }
+    ).getInfo() or {}
+    image_count_value = _safe_int(server_stats.get("image_count")) or 0
+    if image_count_value <= 0:
+        return {
+            "image_count": 0,
+            "latest_image_date": None,
+            "mean_ndvi": None,
+            "vegetation_area_sqm": None,
+            "vegetation_coverage_pct": None,
+            "vegetation_area_per_tree_sqm": None,
+            "clear_area_sqm": None,
+            "clear_coverage_pct": None,
+        }
+
+    total_area_value = _safe_float(server_stats.get("total_area"))
+    clear_area_value = _safe_float(server_stats.get("clear_area"))
+    vegetation_area_value = _safe_float(server_stats.get("vegetation_area"))
+    mean_ndvi_value = _safe_float(server_stats.get("mean_ndvi"))
+    latest_image_value = str(server_stats.get("latest_image_date") or "").strip() or None
 
     area_reference = polygon_area_sqm if polygon_area_sqm and polygon_area_sqm > 0 else total_area_value
     vegetation_pct = (
@@ -206,7 +222,7 @@ def _build_period_stats(
     )
 
     return {
-        "image_count": image_count,
+        "image_count": image_count_value,
         "latest_image_date": latest_image_value or None,
         "mean_ndvi": round(mean_ndvi_value, 4) if mean_ndvi_value is not None else None,
         "vegetation_area_sqm": round(vegetation_area_value, 2) if vegetation_area_value is not None else None,
