@@ -6783,6 +6783,7 @@ def ensure_green_tables(db: Session):
             task_type TEXT NOT NULL,
             assignee_name TEXT NOT NULL,
             due_date DATE,
+            assigned_at TIMESTAMP DEFAULT NOW(),
             priority TEXT DEFAULT 'normal',
             status TEXT NOT NULL DEFAULT 'pending',
             notes TEXT,
@@ -6792,6 +6793,9 @@ def ensure_green_tables(db: Session):
         )
     """))
     try:
+        db.execute(text("ALTER TABLE tree_tasks ADD COLUMN IF NOT EXISTS assigned_at TIMESTAMP"))
+        db.execute(text("UPDATE tree_tasks SET assigned_at = created_at WHERE assigned_at IS NULL"))
+        db.execute(text("ALTER TABLE tree_tasks ALTER COLUMN assigned_at SET DEFAULT NOW()"))
         db.execute(text("ALTER TABLE tree_tasks ADD COLUMN IF NOT EXISTS priority TEXT DEFAULT 'normal'"))
         db.execute(text("ALTER TABLE tree_tasks ADD COLUMN IF NOT EXISTS review_state TEXT NOT NULL DEFAULT 'none'"))
         db.execute(text("ALTER TABLE tree_tasks ADD COLUMN IF NOT EXISTS submitted_at TIMESTAMP"))
@@ -7350,6 +7354,7 @@ def ensure_green_tables(db: Session):
     db.execute(text("CREATE INDEX IF NOT EXISTS idx_tree_status_history_tree_date ON green_tree_status_history(tree_id, status_date DESC, id DESC)"))
     db.execute(text("CREATE INDEX IF NOT EXISTS idx_tree_status_history_project_date ON green_tree_status_history(project_id, status_date DESC, id DESC)"))
     db.execute(text("CREATE INDEX IF NOT EXISTS idx_tree_tasks_tree_id ON tree_tasks(tree_id)"))
+    db.execute(text("CREATE INDEX IF NOT EXISTS idx_tree_tasks_assigned_at ON tree_tasks(assigned_at DESC, id DESC)"))
     db.execute(text("CREATE INDEX IF NOT EXISTS idx_tree_tasks_review_state ON tree_tasks(review_state)"))
     db.execute(text("CREATE INDEX IF NOT EXISTS idx_tree_tasks_allocation ON tree_tasks(distribution_allocation_id, task_type, review_state)"))
     db.execute(text("CREATE INDEX IF NOT EXISTS idx_tree_tasks_custodian ON tree_tasks(custodian_id)"))
@@ -26577,7 +26582,7 @@ async def run_tree_health_check(tree_id: int, request: Request, db: Session = De
 @router.get("/trees/{tree_id}/tasks")
 def list_tree_tasks(tree_id: int, db: Session = Depends(get_db)):
     rows = db.execute(text("""
-        SELECT id, tree_id, task_type, assignee_name, due_date, priority,
+        SELECT id, tree_id, task_type, assignee_name, due_date, assigned_at, priority,
                status, notes, photo_url, photo_urls, created_at, completed_at, review_state,
                submitted_at, reviewed_at, reviewed_by, review_notes, auto_generated, model_season, source_task_id,
                reported_tree_status, activity_lng, activity_lat, activity_recorded_at,
@@ -26585,7 +26590,7 @@ def list_tree_tasks(tree_id: int, db: Session = Depends(get_db)):
         FROM tree_tasks
         WHERE tree_id = :tree_id
           AND COALESCE(auto_generated, FALSE) = FALSE
-        ORDER BY created_at DESC
+        ORDER BY assigned_at DESC NULLS LAST, created_at DESC, id DESC
     """), {"tree_id": tree_id}).mappings().all()
     return [dict(r) for r in rows]
 
@@ -26597,7 +26602,7 @@ def list_tasks(
     db: Session = Depends(get_db),
 ):
     rows = db.execute(text("""
-        SELECT t.id, t.tree_id, t.task_type, t.assignee_name, t.due_date, t.priority,
+        SELECT t.id, t.tree_id, t.task_type, t.assignee_name, t.due_date, t.assigned_at, t.priority,
                t.status, t.notes, t.photo_url, t.photo_urls, t.created_at, t.completed_at, t.review_state,
                t.submitted_at, t.reviewed_at, t.reviewed_by, t.review_notes, t.auto_generated, t.model_season, t.source_task_id,
                t.reported_tree_status, t.activity_lng, t.activity_lat, t.activity_recorded_at,
@@ -26616,7 +26621,7 @@ def list_tasks(
         WHERE tr.project_id = :project_id
           AND COALESCE(t.auto_generated, FALSE) = FALSE
           AND (:assignee_name IS NULL OR t.assignee_name = :assignee_name)
-        ORDER BY t.created_at DESC
+        ORDER BY t.assigned_at DESC NULLS LAST, t.created_at DESC, t.id DESC
     """), {"project_id": project_id, "assignee_name": assignee_name}).mappings().all()
     return [dict(r) for r in rows]
 
