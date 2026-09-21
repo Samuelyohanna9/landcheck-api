@@ -10,6 +10,7 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
 from dateutil.relativedelta import relativedelta
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.models.estate_billing import EstateSubscription, EstateSubscriptionCharge
@@ -391,8 +392,15 @@ def process_due_billing(db: Session) -> dict[str, int]:
         .all()
     )
     for subscription in trialing_due:
-        attempt_charge(db, subscription, charge_type="trial_conversion")
-        counts["trial_conversions"] += 1
+        # The DB enforces at most one trial_conversion row per subscription (see the
+        # ux_estate_subscription_charges_one_trial_conversion index). A savepoint keeps a
+        # constraint violation here from aborting the rest of this billing run.
+        try:
+            with db.begin_nested():
+                attempt_charge(db, subscription, charge_type="trial_conversion")
+            counts["trial_conversions"] += 1
+        except IntegrityError:
+            logger.warning("Duplicate trial_conversion charge attempt skipped (org=%s)", subscription.organization_id)
 
     renewals_due = (
         db.query(EstateSubscription)

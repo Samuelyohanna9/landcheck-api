@@ -6,6 +6,7 @@ from sqlalchemy import (
     Column,
     DateTime,
     ForeignKey,
+    Index,
     Integer,
     JSON,
     Numeric,
@@ -13,7 +14,7 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
 )
-from sqlalchemy.sql import func
+from sqlalchemy.sql import func, text
 
 from app.db_base import Base
 
@@ -85,6 +86,15 @@ class EstateSubscriptionCharge(Base):
             name="ck_estate_subscription_charges_type",
         ),
         CheckConstraint("status IN ('pending', 'success', 'failed')", name="ck_estate_subscription_charges_status"),
+        # A subscription's trial can only convert once - a second attempt after a failure is a
+        # dunning "retry", never a second "trial_conversion" row. Enforced in the DB, not just in
+        # application code, so a scheduler race can never double-charge a trial conversion.
+        Index(
+            "ux_estate_subscription_charges_one_trial_conversion",
+            "subscription_id",
+            unique=True,
+            postgresql_where=text("charge_type = 'trial_conversion'"),
+        ),
     )
 
 

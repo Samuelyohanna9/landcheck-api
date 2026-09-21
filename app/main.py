@@ -157,16 +157,35 @@ def _run_stale_plot_export_job_sweep():
         session_db.close()
 
 
+# Arbitrary fixed key for the estate-billing Postgres advisory lock below - any bigint works as
+# long as it's unique to this job and stable across deploys.
+_ESTATE_SUBSCRIPTION_BILLING_LOCK_KEY = 872341001
+
+
 def _run_estate_subscription_billing_job():
+    from sqlalchemy import text
+
     from app.services.estates import subscriptions as estate_subscriptions
 
     session_db = SessionLocal()
     try:
-        estate_subscriptions.process_due_billing(session_db)
-        session_db.commit()
-    except Exception:
-        session_db.rollback()
-        raise
+        # uvicorn runs multiple worker processes (UVICORN_WORKERS), each with its own
+        # APScheduler instance, so this cron can fire concurrently in more than one process.
+        # A session-level advisory lock makes sure only one of them actually runs the sweep;
+        # the rest no-op instead of racing to charge the same subscriptions.
+        got_lock = session_db.execute(
+            text("SELECT pg_try_advisory_lock(:key)"), {"key": _ESTATE_SUBSCRIPTION_BILLING_LOCK_KEY}
+        ).scalar()
+        if not got_lock:
+            return
+        try:
+            estate_subscriptions.process_due_billing(session_db)
+            session_db.commit()
+        except Exception:
+            session_db.rollback()
+            raise
+        finally:
+            session_db.execute(text("SELECT pg_advisory_unlock(:key)"), {"key": _ESTATE_SUBSCRIPTION_BILLING_LOCK_KEY})
     finally:
         session_db.close()
 
