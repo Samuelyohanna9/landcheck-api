@@ -3451,9 +3451,34 @@ def customer_statement(customer_id:int, request:Request, estate_id:int|None=None
 
 @router.get("/customers/{customer_id}/statement.pdf")
 def customer_statement_pdf(customer_id: int, request: Request, estate_id: int | None = None, allocation_id: int | None = None, db: Session = Depends(get_db)):
-    """The same statement as GET .../statement, as a plain generated PDF - same letterhead/table
-    style as the Estate Performance Report - rather than a browser Print of the on-screen modal."""
+    """Generate a clean customer packet instead of printing the dashboard modal."""
     data = customer_statement(customer_id, request, estate_id, allocation_id, db)
+    document_assets = []
+    seen_document_ids: set[int] = set()
+    for allocation_data in data.get("allocations", []):
+        document_rows = list(allocation_data.get("documents") or [])
+        for transaction in allocation_data.get("transactions", []):
+            document_rows.extend({**receipt, "type": "receipt"} for receipt in transaction.get("receipts") or [])
+        for document_row in document_rows:
+            document_id = int(document_row.get("id") or 0)
+            if not document_id or document_id in seen_document_ids:
+                continue
+            seen_document_ids.add(document_id)
+            document = db.get(EstateDocument, document_id)
+            if not document:
+                continue
+            try:
+                document_data, document_mime = read_private_estate_file(document.object_key)
+            except Exception:
+                document_data, document_mime = b"", document.mime_type
+            document_assets.append({
+                "allocation_id": allocation_data.get("allocation_id"),
+                "document_type": document.document_type or document_row.get("type") or "document",
+                "filename": document.original_filename,
+                "description": document.description,
+                "mime_type": document_mime or document.mime_type,
+                "data": document_data,
+            })
     tmp_path: str | None = None
     try:
         with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp_file:
@@ -3464,6 +3489,7 @@ def customer_statement_pdf(customer_id: int, request: Request, estate_id: int | 
             customer_reference=data["customer"]["reference"],
             allocations=data["allocations"],
             output_path=tmp_path,
+            document_assets=document_assets,
         )
         with open(tmp_path, "rb") as handle:
             pdf_bytes = handle.read()
@@ -3471,7 +3497,7 @@ def customer_statement_pdf(customer_id: int, request: Request, estate_id: int | 
         if tmp_path and os.path.exists(tmp_path):
             os.remove(tmp_path)
     safe_name = re.sub(r"[^A-Za-z0-9._-]+", "-", data["customer"]["name"] or "customer").strip("-.") or f"customer-{customer_id}"
-    return Response(pdf_bytes, media_type="application/pdf", headers={"Content-Disposition": f'attachment; filename="{safe_name}_Payment_Statement.pdf"'})
+    return Response(pdf_bytes, media_type="application/pdf", headers={"Content-Disposition": f'attachment; filename="{safe_name}_Customer_Packet.pdf"'})
 
 @router.get("/allocations/{allocation_id}/financial-detail")
 def allocation_financial_detail(allocation_id:int,request:Request,db:Session=Depends(get_db)):

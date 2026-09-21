@@ -19,6 +19,7 @@ from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_RIGHT
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
 from reportlab.lib.units import mm
+from reportlab.lib.utils import ImageReader
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.platypus import (
@@ -27,6 +28,7 @@ from reportlab.platypus import (
     KeepTogether,
     ListFlowable,
     ListItem,
+    PageBreak,
     Paragraph,
     SimpleDocTemplate,
     Spacer,
@@ -333,10 +335,13 @@ def render_customer_statement_pdf(
     customer_reference: str | None,
     allocations: list[dict],
     output_path: str,
+    document_assets: list[dict] | None = None,
 ) -> dict:
-    """A plain, table-driven payment statement for one customer - same letterhead/table language as
-    the Estate Performance Report, generated rather than relying on a browser's Print of an on-screen
-    modal (which carries page chrome, unformatted timestamps and no real pagination control)."""
+    """Generate a clean customer packet, then append rendered copies of linked documents.
+
+    The packet is deliberately generated server-side rather than printing the dashboard modal, so
+    browser chrome, sidebars, scrollbars, and clipped content can never appear in the customer PDF.
+    """
     styles = _styles()
     doc = SimpleDocTemplate(output_path, pagesize=A4, topMargin=20 * mm, bottomMargin=20 * mm, leftMargin=20 * mm, rightMargin=20 * mm)
     usable_width = A4[0] - 40 * mm
@@ -414,6 +419,35 @@ def render_customer_statement_pdf(
         else:
             block.append(Paragraph("No payments recorded against this plot yet.", styles["body_muted"]))
             story.append(KeepTogether(block))
+
+        allocation_assets = [
+            asset for asset in (document_assets or [])
+            if str(asset.get("allocation_id")) == str(allocation.get("allocation_id"))
+        ]
+        if allocation_assets:
+            story.append(PageBreak())
+            story.extend(_section("Document appendix", styles, "Rendered copies of the documents linked to this customer and plot."))
+            for asset_index, asset in enumerate(allocation_assets):
+                if asset_index:
+                    story.append(PageBreak())
+                document_type = str(asset.get("document_type") or "Document").replace("_", " ").title()
+                filename = str(asset.get("filename") or "document")
+                story.append(Paragraph(f"{document_type}: {filename}", styles["section"]))
+                if asset.get("description"):
+                    story.append(Paragraph(str(asset["description"]), styles["body_muted"]))
+                    story.append(Spacer(1, 6))
+                rendered_pages = _render_document_asset_pages(asset)
+                if not rendered_pages:
+                    story.append(Paragraph("This document could not be rendered in the packet. It remains available for download from the Estate document vault.", styles["body_muted"]))
+                    continue
+                for page_index, page_data in enumerate(rendered_pages):
+                    if page_index:
+                        story.append(PageBreak())
+                        story.append(Paragraph(f"{document_type}: {filename} - page {page_index + 1}", styles["section"]))
+                    image = Image(io.BytesIO(page_data))
+                    image._restrictSize(usable_width, 230 * mm)
+                    story.append(image)
+                    story.append(Spacer(1, 8))
         story.append(Spacer(1, 16))
 
     def _on_page(canvas, doc_):
@@ -421,3 +455,29 @@ def render_customer_statement_pdf(
 
     doc.build(story, onFirstPage=_on_page, onLaterPages=_on_page)
     return {"allocation_count": len(allocations), "generated_at": generated_at}
+
+
+def _render_document_asset_pages(asset: dict) -> list[bytes]:
+    """Return image bytes for an uploaded image or every page of an uploaded PDF."""
+    data = asset.get("data")
+    if not isinstance(data, (bytes, bytearray)) or not data:
+        return []
+    mime_type = str(asset.get("mime_type") or "").lower()
+    filename = str(asset.get("filename") or "").lower()
+    if mime_type == "application/pdf" or filename.endswith(".pdf"):
+        try:
+            import pymupdf as fitz
+
+            pages: list[bytes] = []
+            with fitz.open(stream=bytes(data), filetype="pdf") as source:
+                for page in source[:30]:
+                    pixmap = page.get_pixmap(matrix=fitz.Matrix(1.45, 1.45), alpha=False)
+                    pages.append(pixmap.tobytes("png"))
+            return pages
+        except Exception:
+            return []
+    try:
+        ImageReader(io.BytesIO(bytes(data))).getSize()
+        return [bytes(data)]
+    except Exception:
+        return []
