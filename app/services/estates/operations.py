@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import secrets
+import calendar
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
@@ -20,6 +22,7 @@ from app.models.estate_foundation import (
     EstateCommissionPayout,
     EstateDocument,
     EstateDocumentLink,
+    EstateNotificationLog,
     EstatePayment,
     EstatePaymentInbox,
     EstateOrganization,
@@ -108,6 +111,62 @@ def issue_customer_portal_token(
     return row, raw_token
 
 
+def customer_portal_url(raw_token: str) -> str:
+    base = str(os.getenv("LANDCHECK_WEB_URL") or "https://landcheck.online").rstrip("/")
+    return f"{base}/estates/buyer/{raw_token}"
+
+
+def issue_customer_portal_link(
+    db: Session,
+    *,
+    customer: EstateCustomer,
+    actor: EstatePrincipal,
+    expires_in_days: int = 90,
+) -> tuple[EstateCustomerPortalToken, str]:
+    row, raw_token = issue_customer_portal_token(
+        db,
+        customer=customer,
+        actor=actor,
+        expires_in_days=expires_in_days,
+    )
+    return row, customer_portal_url(raw_token)
+
+
+def record_notification_log(
+    db: Session,
+    *,
+    organization_id: int,
+    estate_id: int | None,
+    customer_id: int | None,
+    allocation_id: int | None,
+    event_key: str,
+    recipient_email: str | None,
+    recipient_name: str | None,
+    subject: str | None,
+    status: str,
+    error_message: str | None = None,
+    details: dict | None = None,
+) -> EstateNotificationLog:
+    row = EstateNotificationLog(
+        organization_id=organization_id,
+        estate_id=estate_id,
+        customer_id=customer_id,
+        allocation_id=allocation_id,
+        channel="email",
+        event_key=event_key,
+        recipient_email=recipient_email,
+        recipient_name=recipient_name,
+        subject=subject,
+        status=status,
+        error_message=error_message,
+        details=details,
+        sent_at=_now() if status == "sent" else None,
+    )
+    db.add(row)
+    db.flush()
+    return row
+
+
 def issue_agent_portal_token(
     db: Session,
     *,
@@ -191,6 +250,35 @@ def _payment_plan_items(value: str | None) -> list[dict]:
     if isinstance(parsed, dict):
         parsed = parsed.get("installments") or parsed.get("stages") or []
     return [item for item in parsed if isinstance(item, dict)] if isinstance(parsed, list) else []
+
+
+def advance_payment_schedule_after_payment(db: Session, *, allocation: EstateAllocation, amount: Decimal) -> bool:
+    """Move the next due date only after a full scheduled instalment is confirmed."""
+    if not allocation.payment_plan or not allocation.next_payment_due_at:
+        return False
+    current_summary = financial_summary(db, allocation)
+    if current_summary.agreed_price > 0 and current_summary.outstanding <= 0:
+        allocation.next_payment_due_at = None
+        allocation.payment_reminder_sent_for_due_at = None
+        return False
+    try:
+        parsed = json.loads(allocation.payment_plan)
+        installment_amount = Decimal(str(parsed.get("installment_amount")))
+        interval_months = int(parsed.get("interval_months"))
+    except (TypeError, ValueError, AttributeError):
+        return False
+    if installment_amount <= 0 or interval_months <= 0 or Decimal(str(amount)) < installment_amount:
+        return False
+    due_at = allocation.next_payment_due_at
+    month_index = due_at.month - 1 + interval_months
+    year = due_at.year + month_index // 12
+    month = month_index % 12 + 1
+    day = min(due_at.day, calendar.monthrange(year, month)[1])
+    allocation.next_payment_due_at = due_at.replace(year=year, month=month, day=day)
+    allocation.payment_reminder_sent_for_due_at = None
+    parsed["next_due_at"] = allocation.next_payment_due_at.isoformat()
+    allocation.payment_plan = json.dumps(parsed)
+    return True
 
 
 def _has_overdue_installment(allocation: EstateAllocation, summary, now: datetime) -> bool:
@@ -298,7 +386,21 @@ def expire_due_reservations(db: Session) -> int:
         if not customer or not customer.email or not estate or not plot:
             continue
         organization = db.get(EstateOrganization, row.organization_id)
-        if estate_email.notify_customer(to_email=customer.email, customer_name=customer.full_name, org_name=organization.name if organization else "Estate team", estate_name=estate.name, plot_number=plot.plot_number, event="reservation_expiring", share_token=row.share_token):
+        _, portal_url = issue_customer_portal_link(db, customer=customer, actor=actor)
+        sent = estate_email.notify_customer(to_email=customer.email, customer_name=customer.full_name, org_name=organization.name if organization else "Estate team", estate_name=estate.name, plot_number=plot.plot_number, event="reservation_expiring", share_token=row.share_token, portal_url=portal_url)
+        record_notification_log(
+            db,
+            organization_id=row.organization_id,
+            estate_id=row.estate_id,
+            customer_id=row.customer_id,
+            allocation_id=row.id,
+            event_key="reservation_expiring",
+            recipient_email=customer.email,
+            recipient_name=customer.full_name,
+            subject=f"Reservation deadline approaching - Plot {plot.plot_number}",
+            status="sent" if sent else "failed",
+        )
+        if sent:
             row.reservation_reminder_sent_at = now
     rows = db.query(EstateAllocation).filter(
         EstateAllocation.status == "reserved",
@@ -313,6 +415,72 @@ def expire_due_reservations(db: Session) -> int:
         except Exception:
             continue
     return count
+
+
+def send_due_payment_reminders(db: Session, *, reminder_window_days: int = 7) -> int:
+    """Send one reminder for each upcoming instalment date, safely across workers."""
+    now = _now()
+    actor = EstatePrincipal("system", "payment-reminder", "Payment reminder")
+    rows = db.query(EstateAllocation).filter(
+        EstateAllocation.status.in_(("reserved", "allocated")),
+        EstateAllocation.next_payment_due_at.isnot(None),
+        EstateAllocation.next_payment_due_at <= now + timedelta(days=reminder_window_days),
+    ).with_for_update(skip_locked=True).all()
+    sent = 0
+    for allocation in rows:
+        due_at = allocation.next_payment_due_at
+        if not due_at:
+            continue
+        if due_at.tzinfo is None:
+            due_at = due_at.replace(tzinfo=timezone.utc)
+        if allocation.payment_reminder_sent_for_due_at:
+            sent_for = allocation.payment_reminder_sent_for_due_at
+            if sent_for.tzinfo is None:
+                sent_for = sent_for.replace(tzinfo=timezone.utc)
+            if sent_for == due_at:
+                continue
+        summary = financial_summary(db, allocation)
+        if summary.outstanding <= 0:
+            continue
+        customer = db.get(EstateCustomer, allocation.customer_id)
+        estate = db.get(Estate, allocation.estate_id)
+        plot = db.get(EstatePlot, allocation.plot_id)
+        if not customer or not estate or not plot:
+            continue
+        organization = db.get(EstateOrganization, allocation.organization_id)
+        portal_url = None
+        if customer.email:
+            _, portal_url = issue_customer_portal_link(db, customer=customer, actor=actor)
+        success = bool(customer.email) and estate_email.notify_customer(
+            to_email=customer.email,
+            customer_name=customer.full_name,
+            org_name=organization.name if organization else "Estate team",
+            estate_name=estate.name,
+            plot_number=plot.plot_number,
+            event="payment_reminder",
+            agreed_price=summary.agreed_price,
+            confirmed_paid=summary.confirmed_paid,
+            outstanding=summary.outstanding,
+            portal_url=portal_url,
+            payment_due_at=due_at,
+        )
+        record_notification_log(
+            db,
+            organization_id=allocation.organization_id,
+            estate_id=allocation.estate_id,
+            customer_id=allocation.customer_id,
+            allocation_id=allocation.id,
+            event_key="payment_reminder",
+            recipient_email=customer.email,
+            recipient_name=customer.full_name,
+            subject=f"Payment reminder - Plot {plot.plot_number}, {estate.name}",
+            status="sent" if success else ("failed" if customer.email else "skipped"),
+            details={"due_at": due_at.isoformat()},
+        )
+        if success:
+            allocation.payment_reminder_sent_for_due_at = due_at
+            sent += 1
+    return sent
 
 
 def buyer_portal_payload(db: Session, token_row: EstateCustomerPortalToken) -> dict:
@@ -339,6 +507,8 @@ def buyer_portal_payload(db: Session, token_row: EstateCustomerPortalToken) -> d
             "estate": {"id": estate.id, "name": estate.name} if estate else None,
             "plot": {"id": plot.id, "number": plot.plot_number, "area_sqm": float(plot.area_sqm or 0), "geometry": __import__("shapely.geometry", fromlist=["mapping"]).mapping(to_shape(plot.geometry)) if plot and plot.geometry else None},
             "financial": {"agreed_price": str(summary.agreed_price), "confirmed_paid": str(summary.confirmed_paid), "outstanding": str(summary.outstanding), "percentage": str(summary.percentage)},
+            "payment_plan": allocation.payment_plan,
+            "next_payment_due_at": allocation.next_payment_due_at,
             "reservation_expires_at": allocation.reservation_expires_at,
             "survey_status": survey.status if survey else "not_started",
             "document_readiness": document_readiness(db, allocation),

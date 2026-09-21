@@ -237,11 +237,23 @@ class CustomerCreate(BaseModel):
     company_name: str | None = None
     notes: str | None = None
 
+
+class PaymentScheduleInput(BaseModel):
+    """Machine-readable buyer instalment schedule used by reminders."""
+
+    installment_amount: Decimal = Field(gt=0)
+    interval_months: int = Field(ge=1, le=60)
+    first_due_at: datetime
+
+
 class AllocationAction(BaseModel):
     customer_id: int
     expires_at: datetime | None = None
     agreed_price: Decimal | None = Field(default=None, gt=0)
+    # Kept for old clients; new clients should send payment_schedule below.
     payment_plan: str | None = Field(default=None, max_length=4000)
+    payment_schedule: PaymentScheduleInput | None = None
+    next_payment_due_at: datetime | None = None
     notes: str | None = None
     # Lets a reviewer capture money already received at the same time they reserve/allocate the
     # plot, instead of a separate follow-up step - recorded as a confirmed payment immediately
@@ -322,6 +334,8 @@ class PublicReservationUpdate(BaseModel):
 
 class PublicReservationConvert(BaseModel):
     agreed_price: Decimal | None = Field(default=None, gt=0)
+    # Kept for old clients; new clients should send payment_schedule below.
     payment_plan: str | None = Field(default=None, max_length=4000)
+    payment_schedule: PaymentScheduleInput | None = None
     next_payment_due_at: datetime | None = None
     notes: str | None = Field(default=None, max_length=4000)

@@ -30,7 +30,7 @@ from app.routers.plots import _metric_epsg_for_wgs84_polygon, _subdivide_polygon
 from app.services.estates.authorization import list_estate_access, resolve_estate_principal
 from app.services.estates.identity import slugify
 from app.services.estates.entitlements import ESTATE_FEATURES, get_estate_entitlement
-from app.models.estate_foundation import Estate, EstateAgentPortalToken, EstateAllocation, EstateAuditEvent, EstateBlock, EstateCommissionPayout, EstateCommissionTier, EstateCustomer, EstateCustomerPortalToken, EstateDocument, EstateDocumentLink, EstateFieldInspection, EstateHazardAssessment, EstateImportReview, EstateLayoutProposal, EstateOrganization, EstateOrganizationMember, EstatePayment, EstatePaymentInbox, EstatePaymentRule, EstatePlot, EstatePublicReservationRequest, EstateQrCampaign, EstateSpatialFeature, EstateSurveyRequest, EstateStakingTask
+from app.models.estate_foundation import Estate, EstateAgentPortalToken, EstateAllocation, EstateAuditEvent, EstateBlock, EstateCommissionPayout, EstateCommissionTier, EstateCustomer, EstateCustomerPortalToken, EstateDocument, EstateDocumentLink, EstateFieldInspection, EstateHazardAssessment, EstateImportReview, EstateLayoutProposal, EstateNotificationLog, EstateOrganization, EstateOrganizationMember, EstatePayment, EstatePaymentInbox, EstatePaymentRule, EstatePlot, EstatePublicReservationRequest, EstateQrCampaign, EstateSpatialFeature, EstateSurveyRequest, EstateStakingTask
 from app.schemas.estates import AllocationAction, BlockCreate, BlockUpdate, CommissionPayoutCreate, CommissionTiersUpdate, CustomerCreate, DevelopmentStatusUpdate, EstateCreate, EstateLayoutCriteria, EstateLayoutDecision, EstateLayoutFeatureAdd, EstateLayoutFeatureRemove, EstateLayoutProposalEdit, EstateSubdivisionCreate, EstateUpdate, FieldInspectionCreate, GeoreferenceSessionLink, ImportFromGeoreference, ImportReviewCreate, ImportReviewDecision, ImportReviewFromGeoreferenceSession, MemberCreate, MemberUpdate, PaymentInboxCreate, PaymentInboxMatch, PlotCreate, PlotAddressUpdate, PlotGeometryUpdate, PlotListingDefaultsUpdate, PlotPriceUpdate, PortalTokenCreate, PublicEstateSettingsUpdate, PublicReservationConvert, PublicReservationCreate, PublicReservationUpdate, PaymentCreate, QrCampaignCreate, SpatialFeatureCreate, SpatialFeatureUpdate, SurveyEligibilityUpdate, VoidAction
 from app.services.estates.payments import confirm_payment, financial_summary, record_payment, void_payment
 from app.services.estates.documents import read_private_estate_file, store_private_estate_file
@@ -39,7 +39,7 @@ from app.services.estates.permissions import has_permission
 from sqlalchemy import func
 from app.services.estates.allocations import release_allocation, reserve_or_allocate
 from app.services.estates.audit import append_estate_audit_event
-from app.services.estates.authorization import require_estate_access
+from app.services.estates.authorization import EstatePrincipal, require_estate_access
 from app.services.estates.subscriptions import get_subscription, has_hazard_access
 from app.services.estates.survey_requests import transition
 from app.services.estates.survey_adapter import materialize_estate_plot_for_survey
@@ -56,7 +56,7 @@ from app.services.estates import estate_email
 from app.services.estates.layout_export import render_estate_layout_pdf
 from app.services.estates.report_export import render_customer_statement_pdf, render_estate_report_pdf
 from app.services.estates import commissions
-from app.services.estates.operations import DOCUMENT_REQUIREMENTS, ESTATE_DOCUMENT_TYPES, ESTATE_DOCUMENT_TYPE_CODES, PUBLIC_DOCUMENT_TYPES, build_operations_summary, buyer_portal_payload, document_readiness, hash_portal_token, issue_agent_portal_token, issue_customer_portal_token, linked_documents
+from app.services.estates.operations import DOCUMENT_REQUIREMENTS, ESTATE_DOCUMENT_TYPES, ESTATE_DOCUMENT_TYPE_CODES, PUBLIC_DOCUMENT_TYPES, advance_payment_schedule_after_payment, build_operations_summary, buyer_portal_payload, customer_portal_url, document_readiness, hash_portal_token, issue_agent_portal_token, issue_customer_portal_link, issue_customer_portal_token, linked_documents, record_notification_log
 from app.db import SessionLocal
 from app.utils.hazard_jobs import get_hazard_job, insert_hazard_job, serialize_hazard_job, set_hazard_job_status
 
@@ -377,6 +377,19 @@ def create_public_reservation(slug: str, plot_id: int, payload: PublicReservatio
         contact_email=organization.contact_email if organization else None,
         public_page_url=f"{str(os.getenv('LANDCHECK_WEB_URL') or 'https://landcheck.online').rstrip('/')}/estates/public/{estate.public_slug}",
     )
+    record_notification_log(
+        db,
+        organization_id=estate.organization_id,
+        estate_id=estate.id,
+        customer_id=None,
+        allocation_id=None,
+        event_key="public_reservation_welcome",
+        recipient_email=row.email,
+        recipient_name=row.full_name,
+        subject=f"Welcome to {estate.name} - Plot {plot.plot_number}",
+        status="sent" if welcome_email_sent else ("failed" if row.email else "skipped"),
+    )
+    db.commit()
     return {"status": "received", "request_id": row.request_uid, "notification_sent": notification_sent, "welcome_email_sent": welcome_email_sent}
 
 
@@ -815,6 +828,10 @@ def convert_public_reservation_request(
     db.add(customer)
     db.flush()
     agreed_price = payload.agreed_price if payload.agreed_price is not None else plot.asking_price
+    scheduled_payment_plan = None
+    scheduled_next_due_at = payload.next_payment_due_at
+    if payload.payment_schedule:
+        scheduled_payment_plan, scheduled_next_due_at = _allocation_payment_fields(payload)
     configured_payment_plan = "; ".join(
         f"{item.get('label')}: {item.get('percentage')}%" for item in (estate.public_payment_plan or [])
     ) or None
@@ -825,7 +842,8 @@ def convert_public_reservation_request(
         actor=access.principal,
         allocate=False,
         agreed_price=agreed_price,
-        payment_plan=payload.payment_plan or configured_payment_plan,
+        payment_plan=scheduled_payment_plan or payload.payment_plan or configured_payment_plan,
+        next_payment_due_at=scheduled_next_due_at,
         notes=payload.notes or "Created from public reservation request",
     )
     if row.assigned_agent_subject_type and row.assigned_agent_subject_id:
@@ -3041,12 +3059,30 @@ def _apply_initial_payment(db: Session, *, record: EstateAllocation, payload: Al
         confirmation_required=False,
     )
     confirm_payment(db, payment=payment, actor=actor)
+    advance_payment_schedule_after_payment(db, allocation=record, amount=payment.amount)
     return payment
+
+
+def _allocation_payment_fields(payload) -> tuple[str | None, datetime | None]:
+    schedule = getattr(payload, "payment_schedule", None)
+    if schedule:
+        return (
+            json.dumps(
+                {
+                    "type": "installment",
+                    "installment_amount": str(schedule.installment_amount),
+                    "interval_months": schedule.interval_months,
+                    "next_due_at": schedule.first_due_at.isoformat(),
+                }
+            ),
+            schedule.first_due_at,
+        )
+    return getattr(payload, "payment_plan", None), getattr(payload, "next_payment_due_at", None)
 
 
 def _notify_allocation_customer(db: Session, *, allocation: EstateAllocation, org_name: str, event: str, amount_just_paid=None) -> bool:
     customer = db.get(EstateCustomer, allocation.customer_id)
-    if not customer or not customer.email:
+    if not customer:
         return False
     plot = db.get(EstatePlot, allocation.plot_id)
     estate = db.get(Estate, allocation.estate_id)
@@ -3057,9 +3093,15 @@ def _notify_allocation_customer(db: Session, *, allocation: EstateAllocation, or
     # future email also gets a working "view your plot" link.
     if not allocation.share_token:
         allocation.share_token = uuid.uuid4().hex
-        db.commit()
     summary = financial_summary(db, allocation)
-    return estate_email.notify_customer(
+    portal_url = None
+    if customer.email:
+        _, portal_url = issue_customer_portal_link(
+            db,
+            customer=customer,
+            actor=EstatePrincipal("system", "customer-notification", "Customer notification"),
+        )
+    notified = bool(customer.email) and estate_email.notify_customer(
         to_email=customer.email,
         customer_name=customer.full_name,
         org_name=org_name,
@@ -3071,7 +3113,23 @@ def _notify_allocation_customer(db: Session, *, allocation: EstateAllocation, or
         outstanding=summary.outstanding,
         amount_just_paid=amount_just_paid,
         share_token=allocation.share_token,
+        portal_url=portal_url,
     )
+    record_notification_log(
+        db,
+        organization_id=allocation.organization_id,
+        estate_id=allocation.estate_id,
+        customer_id=allocation.customer_id,
+        allocation_id=allocation.id,
+        event_key=event,
+        recipient_email=customer.email,
+        recipient_name=customer.full_name,
+        subject=f"LandCheck Estate update: {event.replace('_', ' ')}",
+        status="sent" if notified else ("failed" if customer.email else "skipped"),
+    )
+    # Notification delivery is best-effort and must not roll back the allocation/payment action.
+    db.commit()
+    return notified
 
 
 @router.get("/public/plots/{share_token}")
@@ -3110,7 +3168,8 @@ def reserve_plot(estate_id: int, plot_id: int, payload: AllocationAction, reques
     access = require_estate_access(db, request, estate.organization_id, permission="allocation.manage")
     customer = db.get(EstateCustomer, payload.customer_id)
     if not customer or customer.organization_id != access.organization_id: raise HTTPException(404, "Customer not found")
-    record = reserve_or_allocate(db, plot=plot, customer=customer, actor=access.principal, allocate=False, expires_at=payload.expires_at, agreed_price=payload.agreed_price, payment_plan=payload.payment_plan, next_payment_due_at=payload.next_payment_due_at, notes=payload.notes)
+    payment_plan, next_payment_due_at = _allocation_payment_fields(payload)
+    record = reserve_or_allocate(db, plot=plot, customer=customer, actor=access.principal, allocate=False, expires_at=payload.expires_at, agreed_price=payload.agreed_price, payment_plan=payment_plan, next_payment_due_at=next_payment_due_at, notes=payload.notes)
     if payload.sales_agent_subject_type and payload.sales_agent_subject_id:
         record.sales_agent_subject_type = payload.sales_agent_subject_type
         record.sales_agent_subject_id = payload.sales_agent_subject_id
@@ -3144,7 +3203,8 @@ def allocate_plot(estate_id: int, plot_id: int, payload: AllocationAction, reque
             f"{estate_email.format_naira(already_confirmed + incoming)} of {estate_email.format_naira(effective_agreed_price)} agreed. "
             f"Reserve it instead, or record the remaining payment first.",
         )
-    record = reserve_or_allocate(db, plot=plot, customer=customer, actor=access.principal, allocate=True, agreed_price=payload.agreed_price, payment_plan=payload.payment_plan, next_payment_due_at=payload.next_payment_due_at, notes=payload.notes)
+    payment_plan, next_payment_due_at = _allocation_payment_fields(payload)
+    record = reserve_or_allocate(db, plot=plot, customer=customer, actor=access.principal, allocate=True, agreed_price=payload.agreed_price, payment_plan=payment_plan, next_payment_due_at=next_payment_due_at, notes=payload.notes)
     if payload.sales_agent_subject_type and payload.sales_agent_subject_id:
         record.sales_agent_subject_type = payload.sales_agent_subject_type
         record.sales_agent_subject_id = payload.sales_agent_subject_id
@@ -3178,8 +3238,10 @@ def confirm(payment_id:int, request:Request, db:Session=Depends(get_db)):
     if not payment: raise HTTPException(404,"Payment not found")
     access=require_estate_access(db,request,payment.organization_id,permission="payment.manage")
     confirm_payment(db,payment=payment,actor=access.principal)
-    db.commit()
     allocation = db.get(EstateAllocation, payment.allocation_id)
+    if allocation:
+        advance_payment_schedule_after_payment(db, allocation=allocation, amount=payment.amount)
+    db.commit()
     customer_notified = False
     if allocation:
         summary = financial_summary(db, allocation)
@@ -3558,6 +3620,53 @@ def estate_document_readiness(estate_id: int, request: Request, db: Session = De
     return {"requirements": list(DOCUMENT_REQUIREMENTS), "items": result}
 
 
+@router.get("/{estate_id}/notifications")
+def estate_notification_log(estate_id: int, request: Request, limit: int = 100, status: str | None = None, db: Session = Depends(get_db)):
+    estate = db.get(Estate, estate_id)
+    if not estate:
+        raise HTTPException(404, "Estate not found")
+    require_estate_access(db, request, estate.organization_id, permission="estate.read")
+    safe_limit = max(1, min(limit, 250))
+    base_query = db.query(EstateNotificationLog).filter(
+        EstateNotificationLog.estate_id == estate_id,
+        EstateNotificationLog.organization_id == estate.organization_id,
+    )
+    if status in {"sent", "failed", "skipped"}:
+        base_query = base_query.filter(EstateNotificationLog.status == status)
+    rows = base_query.order_by(EstateNotificationLog.created_at.desc()).limit(safe_limit).all()
+    def status_count(value: str) -> int:
+        return int(
+            db.query(func.count(EstateNotificationLog.id)).filter(
+                EstateNotificationLog.estate_id == estate_id,
+                EstateNotificationLog.organization_id == estate.organization_id,
+                EstateNotificationLog.status == value,
+            ).scalar() or 0
+        )
+    return {
+        "items": [
+            {
+                "id": row.id,
+                "event_key": row.event_key,
+                "channel": row.channel,
+                "recipient_email": row.recipient_email,
+                "recipient_name": row.recipient_name,
+                "subject": row.subject,
+                "status": row.status,
+                "error_message": row.error_message,
+                "details": row.details or {},
+                "sent_at": row.sent_at,
+                "created_at": row.created_at,
+            }
+            for row in rows
+        ],
+        "counts": {
+            "sent": status_count("sent"),
+            "failed": status_count("failed"),
+            "skipped": status_count("skipped"),
+        },
+    }
+
+
 @router.post("/customers/{customer_id}/portal-token")
 def create_customer_portal_token(customer_id: int, payload: PortalTokenCreate, request: Request, db: Session = Depends(get_db)):
     customer = db.get(EstateCustomer, customer_id)
@@ -3566,8 +3675,32 @@ def create_customer_portal_token(customer_id: int, payload: PortalTokenCreate, r
     access = require_estate_access(db, request, customer.organization_id, permission="customer.manage")
     row, raw_token = issue_customer_portal_token(db, customer=customer, actor=access.principal, expires_in_days=payload.expires_in_days)
     db.commit()
-    web_url = str(os.getenv("LANDCHECK_WEB_URL") or "https://landcheck.online").rstrip("/")
-    return {"token": raw_token, "expires_at": row.expires_at, "url": f"{web_url}/estates/buyer/{raw_token}"}
+    portal_url = customer_portal_url(raw_token)
+    organization = db.get(EstateOrganization, customer.organization_id)
+    customer_allocation = db.query(EstateAllocation).filter(
+        EstateAllocation.customer_id == customer.id,
+        EstateAllocation.status.in_(("reserved", "allocated")),
+    ).order_by(EstateAllocation.created_at.desc()).first()
+    email_sent = estate_email.send_customer_portal_link(
+        to_email=customer.email,
+        customer_name=customer.full_name,
+        org_name=organization.name if organization else "Estate team",
+        portal_url=portal_url,
+    )
+    record_notification_log(
+        db,
+        organization_id=customer.organization_id,
+        estate_id=customer_allocation.estate_id if customer_allocation else None,
+        customer_id=customer.id,
+        allocation_id=customer_allocation.id if customer_allocation else None,
+        event_key="customer_portal_issued",
+        recipient_email=customer.email,
+        recipient_name=customer.full_name,
+        subject=f"Your buyer portal - {organization.name if organization else 'Estate team'}",
+        status="sent" if email_sent else ("failed" if customer.email else "skipped"),
+    )
+    db.commit()
+    return {"token": raw_token, "expires_at": row.expires_at, "url": portal_url, "email_sent": email_sent}
 
 
 @router.get("/buyer/{token}")

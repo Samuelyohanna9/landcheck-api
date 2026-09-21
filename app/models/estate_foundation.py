@@ -224,6 +224,7 @@ class EstateAllocation(Base):
     agreed_price = Column(Numeric(16, 2), nullable=True)
     payment_plan = Column(Text, nullable=True)
     next_payment_due_at = Column(DateTime(timezone=True), nullable=True)
+    payment_reminder_sent_for_due_at = Column(DateTime(timezone=True), nullable=True)
     notes = Column(Text, nullable=True)
     cancelled_at = Column(DateTime(timezone=True), nullable=True)
     cancellation_reason = Column(Text, nullable=True)
@@ -315,6 +316,32 @@ class EstatePayment(Base):
     reconciled_by_subject_type = Column(String(64), nullable=True)
     reconciled_by_subject_id = Column(String(128), nullable=True)
     created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+
+class EstateNotificationLog(Base):
+    """Delivery audit for customer-facing Estate email notifications."""
+
+    __tablename__ = "estate_notification_logs"
+
+    id = Column(Integer, primary_key=True)
+    organization_id = Column(Integer, ForeignKey("estate_organizations.id", ondelete="CASCADE"), nullable=False)
+    estate_id = Column(Integer, ForeignKey("estate_estates.id", ondelete="SET NULL"), nullable=True)
+    customer_id = Column(Integer, ForeignKey("estate_customers.id", ondelete="SET NULL"), nullable=True)
+    allocation_id = Column(Integer, ForeignKey("estate_allocations.id", ondelete="SET NULL"), nullable=True)
+    channel = Column(String(32), nullable=False, default="email")
+    event_key = Column(String(80), nullable=False)
+    recipient_email = Column(String(255), nullable=True)
+    recipient_name = Column(String(255), nullable=True)
+    subject = Column(String(255), nullable=True)
+    status = Column(String(32), nullable=False)
+    error_message = Column(Text, nullable=True)
+    details = Column("metadata", JSON, nullable=True)
+    sent_at = Column(DateTime(timezone=True), nullable=True)
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+    __table_args__ = (
+        CheckConstraint("status IN ('sent', 'failed', 'skipped')", name="ck_estate_notification_logs_status"),
+    )
 
 
 class EstatePaymentInbox(Base):

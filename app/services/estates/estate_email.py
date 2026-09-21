@@ -136,7 +136,16 @@ _CREDIBILITY_BLURB = (
 )
 
 
-def _event_copy(event: str, *, org_name: str, estate_name: str, plot_number: str, customer_name: str, amount_just_paid: Decimal | None) -> tuple[str, str, str]:
+def _event_copy(
+    event: str,
+    *,
+    org_name: str,
+    estate_name: str,
+    plot_number: str,
+    customer_name: str,
+    amount_just_paid: Decimal | None,
+    payment_due_at=None,
+) -> tuple[str, str, str]:
     """Returns (subject, heading, message_html) for one lifecycle event."""
     first_name = (customer_name or "there").split(" ")[0]
     credibility = _CREDIBILITY_BLURB.format(org_name=html.escape(org_name))
@@ -177,6 +186,15 @@ def _event_copy(event: str, *, org_name: str, estate_name: str, plot_number: str
             f"<p>Your plot at <strong>{html.escape(estate_name)}</strong> is now fully paid for. "
             f"Thank you for your trust in {html.escape(org_name)}.</p>",
         )
+    if event == "payment_reminder":
+        due_label = payment_due_at.strftime("%d %b %Y") if payment_due_at else "the scheduled date"
+        return (
+            f"Payment reminder - Plot {plot_number}, {estate_name}",
+            f"Your next payment is due on {due_label}",
+            f"<p>This is a reminder that your next payment for <strong>Plot {html.escape(plot_number)}</strong> "
+            f"at <strong>{html.escape(estate_name)}</strong> is due on <strong>{html.escape(due_label)}</strong>.</p>"
+            f"<p>Please use your buyer portal below to review your balance and payment history, or contact {html.escape(org_name)} if you need help.</p>",
+        )
     if event == "survey_ready":
         return (
             f"Your Official Survey Plan is Ready - Plot {plot_number}",
@@ -201,7 +219,13 @@ def _event_copy(event: str, *, org_name: str, estate_name: str, plot_number: str
     return (f"Update on Plot {plot_number}", "An update on your plot", "<p>There is an update on your plot.</p>")
 
 
-def _plain_text(heading: str, message_html_stripped: str, financial: tuple[Decimal, Decimal, Decimal] | None, plot_link: str | None = None) -> str:
+def _plain_text(
+    heading: str,
+    message_html_stripped: str,
+    financial: tuple[Decimal, Decimal, Decimal] | None,
+    plot_link: str | None = None,
+    portal_link: str | None = None,
+) -> str:
     import re
 
     text = re.sub(r"<[^>]+>", " ", message_html_stripped)
@@ -209,6 +233,8 @@ def _plain_text(heading: str, message_html_stripped: str, financial: tuple[Decim
     lines = [heading, "", text]
     if plot_link:
         lines += ["", f"View your plot on satellite map: {plot_link}"]
+    if portal_link:
+        lines += ["", f"Open your buyer portal: {portal_link}"]
     if financial:
         agreed, confirmed, outstanding = financial
         lines += ["", f"Agreed price: {format_naira(agreed)}", f"Total paid so far: {format_naira(confirmed)}", f"Outstanding balance: {format_naira(outstanding)}"]
@@ -566,6 +592,8 @@ def notify_customer(
     outstanding: Decimal | None = None,
     amount_just_paid: Decimal | None = None,
     share_token: str | None = None,
+    portal_url: str | None = None,
+    payment_due_at=None,
 ) -> bool:
     """Returns True once the email has actually been sent (not merely queued/attempted) - False if
     there was no address to send to, or delivery failed. Callers use this to tell the person acting
@@ -575,13 +603,29 @@ def notify_customer(
         return False
     try:
         subject, heading, message_html = _event_copy(
-            event, org_name=org_name, estate_name=estate_name, plot_number=plot_number, customer_name=customer_name, amount_just_paid=amount_just_paid
+            event,
+            org_name=org_name,
+            estate_name=estate_name,
+            plot_number=plot_number,
+            customer_name=customer_name,
+            amount_just_paid=amount_just_paid,
+            payment_due_at=payment_due_at,
         )
         has_financials = agreed_price is not None and confirmed_paid is not None and outstanding is not None
         financial_html = _financial_block_html(agreed_price, confirmed_paid, outstanding) if has_financials else ""
         plot_link = public_plot_url(share_token)
-        body_html = _wrap_html(org_name=org_name, heading=heading, message_html=message_html, financial_html=financial_html, plot_link_html=_plot_link_html(plot_link))
-        body_text = _plain_text(heading, message_html, (agreed_price, confirmed_paid, outstanding) if has_financials else None, plot_link)
+        links_html = (
+            _plot_link_html(portal_url, label="Open your buyer portal")
+            + _plot_link_html(plot_link)
+        )
+        body_html = _wrap_html(org_name=org_name, heading=heading, message_html=message_html, financial_html=financial_html, plot_link_html=links_html)
+        body_text = _plain_text(
+            heading,
+            message_html,
+            (agreed_price, confirmed_paid, outstanding) if has_financials else None,
+            plot_link,
+            portal_url,
+        )
         _send_email(
             to_email=to_email,
             from_display_name=f"{org_name} (via LandCheck Estates)",
@@ -592,4 +636,43 @@ def notify_customer(
         return True
     except Exception:
         logger.exception("Estate customer notification email failed (event=%s, to=%s)", event, to_email)
+        return False
+
+
+def send_customer_portal_link(
+    *,
+    to_email: str | None,
+    customer_name: str,
+    org_name: str,
+    portal_url: str,
+) -> bool:
+    """Send a standalone portal link when staff explicitly creates one."""
+    to_email = str(to_email or "").strip()
+    if not to_email:
+        return False
+    first_name = html.escape((customer_name or "there").split(" ")[0])
+    message_html = (
+        f"<p>Hello {first_name},</p>"
+        f"<p>{html.escape(org_name)} has shared your secure buyer portal with you. "
+        "Use it to review your plots, payment progress, receipts, documents and next steps.</p>"
+    )
+    subject = f"Your buyer portal - {org_name}"
+    body_html = _wrap_html(
+        org_name=org_name,
+        heading="Your buyer portal is ready",
+        message_html=message_html,
+        financial_html="",
+        plot_link_html=_plot_link_html(portal_url, label="Open your buyer portal"),
+    )
+    try:
+        _send_email(
+            to_email=to_email,
+            from_display_name=f"{org_name} (via LandCheck Estates)",
+            subject=subject,
+            body_text=_plain_text("Your buyer portal is ready", message_html, None, portal_link=portal_url),
+            body_html=body_html,
+        )
+        return True
+    except Exception:
+        logger.exception("Estate buyer portal email failed (to=%s)", to_email)
         return False
