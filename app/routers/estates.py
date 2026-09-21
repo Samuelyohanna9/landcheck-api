@@ -11,7 +11,7 @@ import uuid
 from datetime import datetime, timezone
 from decimal import Decimal
 from types import SimpleNamespace
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
+from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, Request, UploadFile
 from fastapi.responses import Response
 from reportlab.graphics import renderPDF
 from reportlab.graphics.barcode import qr
@@ -24,6 +24,7 @@ import ezdxf
 from shapely.geometry import mapping, shape
 from shapely.ops import transform as shapely_transform, unary_union
 from sqlalchemy import and_, or_, text
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, aliased
 
 from app.routers.plots import _metric_epsg_for_wgs84_polygon, _subdivide_polygon_equal_count, get_db
@@ -62,6 +63,15 @@ from app.utils.hazard_jobs import get_hazard_job, insert_hazard_job, serialize_h
 
 
 router = APIRouter(prefix="/estates", tags=["estates"])
+
+
+def _normalize_idempotency_key(value: str | None) -> str | None:
+    key = str(value or "").strip()
+    if not key:
+        return None
+    if len(key) > 128:
+        raise HTTPException(status_code=422, detail="Idempotency key must be 128 characters or fewer")
+    return key
 
 
 def _agent_portal_url(raw_token: str) -> str:
@@ -385,9 +395,14 @@ def public_estate_logo(slug: str, db: Session = Depends(get_db)):
 
 
 @router.post("/public/{slug}/plots/{plot_id}/reservation", status_code=201)
-def create_public_reservation(slug: str, plot_id: int, payload: PublicReservationCreate, source: str | None = None, db: Session = Depends(get_db)):
+def create_public_reservation(slug: str, plot_id: int, payload: PublicReservationCreate, source: str | None = None, idempotency_header: str | None = Header(default=None, alias="X-Idempotency-Key"), db: Session = Depends(get_db)):
     """Create a sales lead without creating a customer or changing plot ownership."""
     estate = _public_estate(db, slug)
+    idempotency_key = _normalize_idempotency_key(idempotency_header)
+    if idempotency_key:
+        existing = db.query(EstatePublicReservationRequest).filter(EstatePublicReservationRequest.organization_id == estate.organization_id, EstatePublicReservationRequest.idempotency_key == idempotency_key).one_or_none()
+        if existing:
+            return {"status": "received", "request_id": existing.request_uid, "notification_sent": False, "welcome_email_sent": False, "already_processed": True}
     plot = (
         db.query(EstatePlot)
         .filter(EstatePlot.id == plot_id, EstatePlot.estate_id == estate.id, EstatePlot.geometry_status == "approved")
@@ -404,6 +419,7 @@ def create_public_reservation(slug: str, plot_id: int, payload: PublicReservatio
     campaign = db.query(EstateQrCampaign).filter(EstateQrCampaign.estate_id == estate.id, EstateQrCampaign.code == source_code, EstateQrCampaign.is_active.is_(True)).one_or_none() if source_code else None
     row = EstatePublicReservationRequest(
         organization_id=estate.organization_id,
+        idempotency_key=idempotency_key,
         estate_id=estate.id,
         plot_id=plot.id,
         full_name=payload.full_name.strip(),
@@ -417,7 +433,15 @@ def create_public_reservation(slug: str, plot_id: int, payload: PublicReservatio
         status="new",
     )
     db.add(row)
-    db.flush()
+    try:
+        db.flush()
+    except IntegrityError:
+        db.rollback()
+        if idempotency_key:
+            existing = db.query(EstatePublicReservationRequest).filter(EstatePublicReservationRequest.organization_id == estate.organization_id, EstatePublicReservationRequest.idempotency_key == idempotency_key).one_or_none()
+            if existing:
+                return {"status": "received", "request_id": existing.request_uid, "notification_sent": False, "welcome_email_sent": False, "already_processed": True}
+        raise HTTPException(status_code=409, detail="This reservation request was already submitted")
     append_estate_audit_event(
         db,
         organization_id=estate.organization_id,
@@ -467,7 +491,7 @@ def create_public_reservation(slug: str, plot_id: int, payload: PublicReservatio
         status="sent" if welcome_email_sent else ("failed" if row.email else "skipped"),
     )
     db.commit()
-    return {"status": "received", "request_id": row.request_uid, "notification_sent": notification_sent, "welcome_email_sent": welcome_email_sent}
+    return {"status": "received", "request_id": row.request_uid, "notification_sent": notification_sent, "welcome_email_sent": welcome_email_sent, "already_processed": False}
 
 
 def _import_candidate(*, row_number: int, plot_number: str, geometry: dict) -> dict:
@@ -875,6 +899,7 @@ def convert_public_reservation_request(
     request_id: int,
     payload: PublicReservationConvert,
     request: Request,
+    idempotency_header: str | None = Header(default=None, alias="X-Idempotency-Key"),
     db: Session = Depends(get_db),
 ):
     """Turn a public sales lead into the normal Estate customer and reservation workflow."""
@@ -882,8 +907,17 @@ def convert_public_reservation_request(
     if not row:
         raise HTTPException(404, "Reservation request not found")
     access = require_estate_access(db, request, row.organization_id, permission="allocation.manage")
+    idempotency_key = _normalize_idempotency_key(idempotency_header)
     if row.allocation_id:
         return {**_public_reservation_payload(db, row), "customer_notified": False, "already_converted": True}
+    if idempotency_key:
+        existing = db.query(EstateAllocation).filter(EstateAllocation.organization_id == access.organization_id, EstateAllocation.idempotency_key == idempotency_key).one_or_none()
+        if existing:
+            row.allocation_id = existing.id
+            row.customer_id = existing.customer_id
+            row.status = "converted"
+            db.commit()
+            return {**_public_reservation_payload(db, row), "customer_notified": False, "already_converted": True}
     if row.status == "declined":
         raise HTTPException(409, detail="A declined reservation request cannot be migrated")
     plot = db.query(EstatePlot).filter(EstatePlot.id == row.plot_id, EstatePlot.estate_id == row.estate_id).one_or_none()
@@ -914,18 +948,26 @@ def convert_public_reservation_request(
     configured_payment_plan = "; ".join(
         f"{item.get('label')}: {item.get('percentage')}%" for item in (estate.public_payment_plan or [])
     ) or None
-    allocation = reserve_or_allocate(
-        db,
-        plot=plot,
-        customer=customer,
-        actor=access.principal,
-        allocate=False,
-        agreed_price=agreed_price,
-        payment_plan=scheduled_payment_plan or payload.payment_plan or configured_payment_plan,
-        next_payment_due_at=scheduled_next_due_at,
-        notes=payload.notes or "Created from public reservation request",
-    )
-    initial_payment = _apply_initial_payment(db, record=allocation, payload=payload, actor=access.principal)
+    try:
+        allocation = reserve_or_allocate(
+            db,
+            plot=plot,
+            customer=customer,
+            actor=access.principal,
+            allocate=False,
+            agreed_price=agreed_price,
+            payment_plan=scheduled_payment_plan or payload.payment_plan or configured_payment_plan,
+            next_payment_due_at=scheduled_next_due_at,
+            notes=payload.notes or "Created from public reservation request",
+        )
+        allocation.idempotency_key = idempotency_key
+        initial_payment = _apply_initial_payment(db, record=allocation, payload=payload, actor=access.principal, idempotency_key=idempotency_key)
+    except IntegrityError:
+        db.rollback()
+        existing_row = db.get(EstatePublicReservationRequest, request_id)
+        if existing_row and existing_row.allocation_id:
+            return {**_public_reservation_payload(db, existing_row), "customer_notified": False, "already_converted": True}
+        raise HTTPException(status_code=409, detail="This public reservation was already converted or the plot was reserved by another request")
     if row.assigned_agent_subject_type and row.assigned_agent_subject_id:
         allocation.sales_agent_subject_type = row.assigned_agent_subject_type
         allocation.sales_agent_subject_id = row.assigned_agent_subject_id
@@ -945,7 +987,14 @@ def convert_public_reservation_request(
         entity_id=row.id,
         after_data={"customer_id": customer.id, "allocation_id": allocation.id, "plot_id": plot.id},
     )
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        existing_row = db.get(EstatePublicReservationRequest, request_id)
+        if existing_row and existing_row.allocation_id:
+            return {**_public_reservation_payload(db, existing_row), "customer_notified": False, "already_converted": True}
+        raise HTTPException(status_code=409, detail="This public reservation was already converted or the plot was reserved by another request")
     customer_notified = _notify_allocation_customer(
         db,
         allocation=allocation,
@@ -2507,7 +2556,16 @@ def create_survey_request(plot_id:int, request:Request, db:Session=Depends(get_d
     if db.query(EstateSurveyRequest).filter(EstateSurveyRequest.plot_id==plot_id,EstateSurveyRequest.status.in_(("requested","assigned","in_progress","ready_for_review","approved","failed"))).first(): raise HTTPException(409,"An active Survey request already exists")
     allocation=db.query(EstateAllocation).filter(EstateAllocation.plot_id==plot_id,EstateAllocation.status=="allocated").one_or_none()
     row=EstateSurveyRequest(organization_id=estate.organization_id,estate_id=estate.id,plot_id=plot_id,allocation_id=allocation.id if allocation else None,requested_by_subject_type=access.principal.subject_type,requested_by_subject_id=access.principal.subject_id,status="requested")
-    db.add(row); db.flush(); append_estate_audit_event(db,organization_id=estate.organization_id,actor=access.principal,action="survey_request.created",entity_type="estate_survey_request",entity_id=row.id); db.commit(); return _survey_payload(db,row)
+    db.add(row)
+    try:
+        db.flush()
+    except IntegrityError:
+        db.rollback()
+        existing = db.query(EstateSurveyRequest).filter(EstateSurveyRequest.plot_id == plot_id, EstateSurveyRequest.status.in_(("requested", "assigned", "in_progress", "ready_for_review", "approved", "failed"))).first()
+        if existing:
+            return _survey_payload(db, existing)
+        raise HTTPException(status_code=409, detail="An active Survey request already exists")
+    append_estate_audit_event(db,organization_id=estate.organization_id,actor=access.principal,action="survey_request.created",entity_type="estate_survey_request",entity_id=row.id); db.commit(); return _survey_payload(db,row)
 
 @router.get("/survey-requests")
 def list_survey_requests(request: Request, estate_id: int | None = None, db: Session = Depends(get_db)):
@@ -2627,7 +2685,16 @@ def create_staking_task(request_id:int,request:Request,db:Session=Depends(get_db
     existing=db.query(EstateStakingTask).filter(EstateStakingTask.survey_request_id==survey.id,EstateStakingTask.status.in_(("pending","assigned","in_progress"))).one_or_none()
     if existing: return {"id":existing.id,"status":existing.status}
     task=EstateStakingTask(organization_id=survey.organization_id,estate_id=survey.estate_id,plot_id=survey.plot_id,survey_request_id=survey.id,status="pending")
-    db.add(task); db.flush(); append_estate_audit_event(db,organization_id=survey.organization_id,actor=access.principal,action="staking_task.created",entity_type="estate_staking_task",entity_id=task.id); db.commit(); return {"id":task.id,"status":task.status}
+    db.add(task)
+    try:
+        db.flush()
+    except IntegrityError:
+        db.rollback()
+        existing = db.query(EstateStakingTask).filter(EstateStakingTask.survey_request_id == survey.id, EstateStakingTask.status.in_(("pending", "assigned", "in_progress"))).one_or_none()
+        if existing:
+            return {"id": existing.id, "status": existing.status}
+        raise HTTPException(status_code=409, detail="An active staking task already exists")
+    append_estate_audit_event(db,organization_id=survey.organization_id,actor=access.principal,action="staking_task.created",entity_type="estate_staking_task",entity_id=task.id); db.commit(); return {"id":task.id,"status":task.status}
 
 @router.get("/staking-tasks")
 def list_staking_tasks(request: Request, estate_id: int | None = None, db: Session = Depends(get_db)):
@@ -2868,11 +2935,26 @@ def complete_staking_task(task_id:int,request:Request,db:Session=Depends(get_db)
 
 
 @router.post("/organizations/{organization_id}/customers")
-def create_customer(organization_id: int, payload: CustomerCreate, request: Request, db: Session = Depends(get_db)):
+def create_customer(organization_id: int, payload: CustomerCreate, request: Request, idempotency_header: str | None = Header(default=None, alias="X-Idempotency-Key"), db: Session = Depends(get_db)):
     access = require_estate_access(db, request, organization_id, permission="customer.manage"); _enabled(db, organization_id)
-    customer = EstateCustomer(organization_id=organization_id, full_name=payload.full_name.strip(), full_name_normalized=_normalized(payload.full_name), reference_no=payload.reference_no, phone=payload.phone, email=payload.email, address=payload.address, company_name=payload.company_name, notes=payload.notes)
-    db.add(customer); db.flush(); append_estate_audit_event(db, organization_id=organization_id, actor=access.principal, action="customer.created", entity_type="estate_customer", entity_id=customer.id, after_data={"name": customer.full_name})
-    db.commit(); return {"id": customer.id, "uid": customer.customer_uid, "name": customer.full_name}
+    idempotency_key = _normalize_idempotency_key(idempotency_header)
+    if idempotency_key:
+        existing = db.query(EstateCustomer).filter(EstateCustomer.organization_id == organization_id, EstateCustomer.idempotency_key == idempotency_key).one_or_none()
+        if existing:
+            return {"id": existing.id, "uid": existing.customer_uid, "name": existing.full_name, "already_processed": True}
+    customer = EstateCustomer(organization_id=organization_id, idempotency_key=idempotency_key, full_name=payload.full_name.strip(), full_name_normalized=_normalized(payload.full_name), reference_no=payload.reference_no, phone=payload.phone, email=payload.email, address=payload.address, company_name=payload.company_name, notes=payload.notes)
+    db.add(customer)
+    try:
+        db.flush()
+    except IntegrityError:
+        db.rollback()
+        if idempotency_key:
+            existing = db.query(EstateCustomer).filter(EstateCustomer.organization_id == organization_id, EstateCustomer.idempotency_key == idempotency_key).one_or_none()
+            if existing:
+                return {"id": existing.id, "uid": existing.customer_uid, "name": existing.full_name, "already_processed": True}
+        raise HTTPException(status_code=409, detail="This customer was already added")
+    append_estate_audit_event(db, organization_id=organization_id, actor=access.principal, action="customer.created", entity_type="estate_customer", entity_id=customer.id, after_data={"name": customer.full_name})
+    db.commit(); return {"id": customer.id, "uid": customer.customer_uid, "name": customer.full_name, "already_processed": False}
 
 
 @router.get("/organizations/{organization_id}/survey-eligibility")
@@ -3089,7 +3171,7 @@ def sales_agent_detail(organization_id: int, subject_type: str, subject_id: str,
 
 
 @router.post("/allocations/{allocation_id}/commission-payout")
-def pay_commission(allocation_id: int, payload: CommissionPayoutCreate, request: Request, db: Session = Depends(get_db)):
+def pay_commission(allocation_id: int, payload: CommissionPayoutCreate, request: Request, idempotency_header: str | None = Header(default=None, alias="X-Idempotency-Key"), db: Session = Depends(get_db)):
     """Records the org actually paying an agent the commission they earned on this sale - separate
     from the commission being *earned* (which happens automatically once the sale is Allocated).
     Defaults to paying the full remaining balance when no amount is given; over-payment beyond
@@ -3098,6 +3180,11 @@ def pay_commission(allocation_id: int, payload: CommissionPayoutCreate, request:
     if not allocation:
         raise HTTPException(404, "Allocation not found")
     access = require_estate_access(db, request, allocation.organization_id, permission="payment.manage")
+    idempotency_key = _normalize_idempotency_key(idempotency_header)
+    if idempotency_key:
+        existing = db.query(EstateCommissionPayout).filter(EstateCommissionPayout.organization_id == access.organization_id, EstateCommissionPayout.idempotency_key == idempotency_key).one_or_none()
+        if existing:
+            return {"id": existing.id, "allocation_id": existing.allocation_id, "amount": str(existing.amount), "payment_date": existing.payment_date, "payment_method": existing.payment_method, "already_processed": True}
     if allocation.status != "allocated" or not allocation.commission_amount:
         raise HTTPException(409, "This sale has no earned commission to pay out yet - it becomes payable once the plot is fully Allocated.")
     if not allocation.sales_agent_subject_type or not allocation.sales_agent_subject_id:
@@ -3115,15 +3202,24 @@ def pay_commission(allocation_id: int, payload: CommissionPayoutCreate, request:
         amount=amount, payment_date=payload.payment_date, payment_method=payload.payment_method,
         reference_no=payload.reference_no, notes=payload.notes,
         paid_by_subject_type=access.principal.subject_type, paid_by_subject_id=access.principal.subject_id,
+        idempotency_key=idempotency_key,
     )
     db.add(payout)
-    db.flush()
+    try:
+        db.flush()
+    except IntegrityError:
+        db.rollback()
+        if idempotency_key:
+            existing = db.query(EstateCommissionPayout).filter(EstateCommissionPayout.organization_id == access.organization_id, EstateCommissionPayout.idempotency_key == idempotency_key).one_or_none()
+            if existing:
+                return {"id": existing.id, "allocation_id": existing.allocation_id, "amount": str(existing.amount), "payment_date": existing.payment_date, "payment_method": existing.payment_method, "already_processed": True}
+        raise HTTPException(status_code=409, detail="This commission payment was already submitted or conflicts with another payout")
     append_estate_audit_event(db, organization_id=allocation.organization_id, actor=access.principal, action="commission.paid", entity_type="estate_commission_payout", entity_id=payout.id, after_data={"allocation_id": allocation.id, "amount": str(amount), "sales_agent_subject_id": allocation.sales_agent_subject_id})
     db.commit()
-    return {"id": payout.id, "allocation_id": allocation.id, "amount": str(amount), "payment_date": payout.payment_date, "payment_method": payout.payment_method}
+    return {"id": payout.id, "allocation_id": allocation.id, "amount": str(amount), "payment_date": payout.payment_date, "payment_method": payout.payment_method, "already_processed": False}
 
 
-def _apply_initial_payment(db: Session, *, record: EstateAllocation, payload: AllocationAction, actor) -> EstatePayment | None:
+def _apply_initial_payment(db: Session, *, record: EstateAllocation, payload: AllocationAction, actor, idempotency_key: str | None = None) -> EstatePayment | None:
     """An initial payment entered in the same reserve/allocate call is recorded AND immediately
     confirmed - unlike a normal payment, this represents money the org is directly attesting it
     already received, not a pending customer claim awaiting confirmation. Returns the created
@@ -3140,6 +3236,7 @@ def _apply_initial_payment(db: Session, *, record: EstateAllocation, payload: Al
         notes="Initial payment recorded at reservation/allocation",
         actor=actor,
         confirmation_required=False,
+        idempotency_key=idempotency_key,
     )
     confirm_payment(db, payment=payment, actor=actor)
     # This payment is the first payment received now. The schedule already stores the next
@@ -3256,37 +3353,59 @@ def public_plot_view(share_token: str, db: Session = Depends(get_db)):
 
 
 @router.post("/{estate_id}/plots/{plot_id}/reserve")
-def reserve_plot(estate_id: int, plot_id: int, payload: AllocationAction, request: Request, db: Session = Depends(get_db)):
+def reserve_plot(estate_id: int, plot_id: int, payload: AllocationAction, request: Request, idempotency_header: str | None = Header(default=None, alias="X-Idempotency-Key"), db: Session = Depends(get_db)):
+    idempotency_key = _normalize_idempotency_key(idempotency_header)
     plot = db.query(EstatePlot).filter(EstatePlot.id == plot_id, EstatePlot.estate_id == estate_id).one_or_none()
     if not plot: raise HTTPException(404, "Plot not found")
     estate = db.get(Estate, estate_id)
     access = require_estate_access(db, request, estate.organization_id, permission="allocation.manage")
+    if idempotency_key:
+        existing = db.query(EstateAllocation).filter(EstateAllocation.organization_id == access.organization_id, EstateAllocation.idempotency_key == idempotency_key).one_or_none()
+        if existing:
+            initial_payment = db.query(EstatePayment).filter(EstatePayment.organization_id == access.organization_id, EstatePayment.idempotency_key == idempotency_key).order_by(EstatePayment.id.desc()).first()
+            return {"id": existing.id, "status": existing.status, "agreed_price": str(existing.agreed_price) if existing.agreed_price is not None else None, "initial_payment_id": initial_payment.id if initial_payment else None, "customer_notified": False, "already_processed": True}
     customer = db.get(EstateCustomer, payload.customer_id)
     if not customer or customer.organization_id != access.organization_id: raise HTTPException(404, "Customer not found")
     if not payload.initial_payment_amount:
         raise HTTPException(422, "Record the customer's first payment before reserving this plot.")
     payment_plan, next_payment_due_at = _allocation_payment_fields(payload)
-    record = reserve_or_allocate(db, plot=plot, customer=customer, actor=access.principal, allocate=False, expires_at=payload.expires_at, agreed_price=payload.agreed_price, payment_plan=payment_plan, next_payment_due_at=next_payment_due_at, notes=payload.notes)
-    if payload.sales_agent_subject_type and payload.sales_agent_subject_id:
-        record.sales_agent_subject_type = payload.sales_agent_subject_type
-        record.sales_agent_subject_id = payload.sales_agent_subject_id
-    initial_payment = _apply_initial_payment(db, record=record, payload=payload, actor=access.principal)
-    db.commit()
+    try:
+        record = reserve_or_allocate(db, plot=plot, customer=customer, actor=access.principal, allocate=False, expires_at=payload.expires_at, agreed_price=payload.agreed_price, payment_plan=payment_plan, next_payment_due_at=next_payment_due_at, notes=payload.notes)
+        record.idempotency_key = idempotency_key
+        if payload.sales_agent_subject_type and payload.sales_agent_subject_id:
+            record.sales_agent_subject_type = payload.sales_agent_subject_type
+            record.sales_agent_subject_id = payload.sales_agent_subject_id
+        initial_payment = _apply_initial_payment(db, record=record, payload=payload, actor=access.principal, idempotency_key=idempotency_key)
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        if idempotency_key:
+            existing = db.query(EstateAllocation).filter(EstateAllocation.organization_id == access.organization_id, EstateAllocation.idempotency_key == idempotency_key).one_or_none()
+            if existing:
+                initial_payment = db.query(EstatePayment).filter(EstatePayment.organization_id == access.organization_id, EstatePayment.idempotency_key == idempotency_key).order_by(EstatePayment.id.desc()).first()
+                return {"id": existing.id, "status": existing.status, "agreed_price": str(existing.agreed_price) if existing.agreed_price is not None else None, "initial_payment_id": initial_payment.id if initial_payment else None, "customer_notified": False, "already_processed": True}
+        raise HTTPException(status_code=409, detail="This reservation was already submitted or the plot was reserved by another request")
     customer_notified = _notify_allocation_customer(db, allocation=record, org_name=access.organization_name, event="reserved")
-    return {"id": record.id, "status": record.status, "agreed_price": str(record.agreed_price) if record.agreed_price is not None else None, "initial_payment_id": initial_payment.id if initial_payment else None, "customer_notified": customer_notified}
+    return {"id": record.id, "status": record.status, "agreed_price": str(record.agreed_price) if record.agreed_price is not None else None, "initial_payment_id": initial_payment.id if initial_payment else None, "customer_notified": customer_notified, "already_processed": False}
 
 
 @router.post("/{estate_id}/plots/{plot_id}/allocate")
-def allocate_plot(estate_id: int, plot_id: int, payload: AllocationAction, request: Request, db: Session = Depends(get_db)):
+def allocate_plot(estate_id: int, plot_id: int, payload: AllocationAction, request: Request, idempotency_header: str | None = Header(default=None, alias="X-Idempotency-Key"), db: Session = Depends(get_db)):
     """Marks a plot Allocated - the official, title-bearing status a Nigerian estate normally only
     grants once a plot is fully paid for (a signed reservation typically comes first, on a deposit
     or nothing at all; full allocation and its paperwork follow full payment). Enforced here rather
     than left to operator discretion: this call is refused unless the confirmed payments already on
     record, plus any initial payment submitted in this same call, cover the full agreed price."""
+    idempotency_key = _normalize_idempotency_key(idempotency_header)
     plot = db.query(EstatePlot).filter(EstatePlot.id == plot_id, EstatePlot.estate_id == estate_id).one_or_none()
     if not plot: raise HTTPException(404, "Plot not found")
     estate = db.get(Estate, estate_id)
     access = require_estate_access(db, request, estate.organization_id, permission="allocation.manage")
+    if idempotency_key:
+        existing = db.query(EstateAllocation).filter(EstateAllocation.organization_id == access.organization_id, EstateAllocation.idempotency_key == idempotency_key).one_or_none()
+        if existing:
+            initial_payment = db.query(EstatePayment).filter(EstatePayment.organization_id == access.organization_id, EstatePayment.idempotency_key == idempotency_key).order_by(EstatePayment.id.desc()).first()
+            return {"id": existing.id, "status": existing.status, "agreed_price": str(existing.agreed_price) if existing.agreed_price is not None else None, "initial_payment_id": initial_payment.id if initial_payment else None, "customer_notified": False, "already_processed": True}
     customer = db.get(EstateCustomer, payload.customer_id)
     if not customer or customer.organization_id != access.organization_id: raise HTTPException(404, "Customer not found")
     existing = db.query(EstateAllocation).filter(EstateAllocation.plot_id == plot.id, EstateAllocation.status.in_(("reserved", "allocated"))).one_or_none()
@@ -3303,15 +3422,25 @@ def allocate_plot(estate_id: int, plot_id: int, payload: AllocationAction, reque
             f"Reserve it instead, or record the remaining payment first.",
         )
     payment_plan, next_payment_due_at = _allocation_payment_fields(payload)
-    record = reserve_or_allocate(db, plot=plot, customer=customer, actor=access.principal, allocate=True, agreed_price=payload.agreed_price, payment_plan=payment_plan, next_payment_due_at=next_payment_due_at, notes=payload.notes)
-    if payload.sales_agent_subject_type and payload.sales_agent_subject_id:
-        record.sales_agent_subject_type = payload.sales_agent_subject_type
-        record.sales_agent_subject_id = payload.sales_agent_subject_id
-    initial_payment = _apply_initial_payment(db, record=record, payload=payload, actor=access.principal)
-    commissions.apply_commission(db, allocation=record)
-    db.commit()
+    try:
+        record = reserve_or_allocate(db, plot=plot, customer=customer, actor=access.principal, allocate=True, agreed_price=payload.agreed_price, payment_plan=payment_plan, next_payment_due_at=next_payment_due_at, notes=payload.notes)
+        record.idempotency_key = idempotency_key
+        if payload.sales_agent_subject_type and payload.sales_agent_subject_id:
+            record.sales_agent_subject_type = payload.sales_agent_subject_type
+            record.sales_agent_subject_id = payload.sales_agent_subject_id
+        initial_payment = _apply_initial_payment(db, record=record, payload=payload, actor=access.principal, idempotency_key=idempotency_key)
+        commissions.apply_commission(db, allocation=record)
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        if idempotency_key:
+            existing = db.query(EstateAllocation).filter(EstateAllocation.organization_id == access.organization_id, EstateAllocation.idempotency_key == idempotency_key).one_or_none()
+            if existing:
+                initial_payment = db.query(EstatePayment).filter(EstatePayment.organization_id == access.organization_id, EstatePayment.idempotency_key == idempotency_key).order_by(EstatePayment.id.desc()).first()
+                return {"id": existing.id, "status": existing.status, "agreed_price": str(existing.agreed_price) if existing.agreed_price is not None else None, "initial_payment_id": initial_payment.id if initial_payment else None, "customer_notified": False, "already_processed": True}
+        raise HTTPException(status_code=409, detail="This allocation was already submitted or the plot was allocated by another request")
     customer_notified = _notify_allocation_customer(db, allocation=record, org_name=access.organization_name, event="allocated")
-    return {"id": record.id, "status": record.status, "agreed_price": str(record.agreed_price) if record.agreed_price is not None else None, "initial_payment_id": initial_payment.id if initial_payment else None, "customer_notified": customer_notified}
+    return {"id": record.id, "status": record.status, "agreed_price": str(record.agreed_price) if record.agreed_price is not None else None, "initial_payment_id": initial_payment.id if initial_payment else None, "customer_notified": customer_notified, "already_processed": False}
 
 
 @router.post("/allocations/{allocation_id}/release")
@@ -3322,14 +3451,27 @@ def release_plot(allocation_id: int, request: Request, db: Session = Depends(get
     release_allocation(db, allocation=record, actor=access.principal, reason="Released by authorized user"); db.commit(); return {"id": record.id, "status": record.status}
 
 @router.post("/allocations/{allocation_id}/payments")
-def add_payment(allocation_id: int, payload: PaymentCreate, request: Request, db: Session = Depends(get_db)):
+def add_payment(allocation_id: int, payload: PaymentCreate, request: Request, idempotency_header: str | None = Header(default=None, alias="X-Idempotency-Key"), db: Session = Depends(get_db)):
+    idempotency_key = _normalize_idempotency_key(idempotency_header)
     allocation=db.get(EstateAllocation, allocation_id)
     if not allocation: raise HTTPException(404,"Allocation not found")
     access=require_estate_access(db,request,allocation.organization_id,permission="payment.manage")
-    payment=record_payment(db,allocation=allocation,amount=payload.amount,payment_date=payload.payment_date,method=payload.payment_method,reference=payload.reference_no,notes=payload.notes,actor=access.principal)
-    db.commit()
+    if idempotency_key:
+        existing = db.query(EstatePayment).filter(EstatePayment.organization_id == access.organization_id, EstatePayment.idempotency_key == idempotency_key).one_or_none()
+        if existing:
+            return {"id": existing.id, "status": existing.status, "customer_notified": False, "already_processed": True}
+    try:
+        payment=record_payment(db,allocation=allocation,amount=payload.amount,payment_date=payload.payment_date,method=payload.payment_method,reference=payload.reference_no,notes=payload.notes,actor=access.principal,idempotency_key=idempotency_key)
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        if idempotency_key:
+            existing = db.query(EstatePayment).filter(EstatePayment.organization_id == access.organization_id, EstatePayment.idempotency_key == idempotency_key).one_or_none()
+            if existing:
+                return {"id": existing.id, "status": existing.status, "customer_notified": False, "already_processed": True}
+        raise HTTPException(status_code=409, detail="This payment was already submitted or conflicts with an existing payment reference")
     customer_notified = _notify_allocation_customer(db, allocation=allocation, org_name=access.organization_name, event="payment_recorded", amount_just_paid=payload.amount)
-    return {"id":payment.id,"status":payment.status,"customer_notified":customer_notified}
+    return {"id":payment.id,"status":payment.status,"customer_notified":customer_notified,"already_processed":False}
 
 @router.post("/payments/{payment_id}/confirm")
 def confirm(payment_id:int, request:Request, db:Session=Depends(get_db)):

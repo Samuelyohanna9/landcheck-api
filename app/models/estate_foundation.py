@@ -166,6 +166,7 @@ class EstatePublicReservationRequest(Base):
 
     id = Column(Integer, primary_key=True)
     request_uid = Column(String(36), nullable=False, unique=True, default=lambda: str(uuid.uuid4()))
+    idempotency_key = Column(String(128), nullable=True)
     organization_id = Column(Integer, ForeignKey("estate_organizations.id", ondelete="CASCADE"), nullable=False)
     estate_id = Column(Integer, ForeignKey("estate_estates.id", ondelete="CASCADE"), nullable=False)
     plot_id = Column(Integer, ForeignKey("estate_plots.id", ondelete="CASCADE"), nullable=False)
@@ -195,6 +196,7 @@ class EstateCustomer(Base):
     __tablename__ = "estate_customers"
     id = Column(Integer, primary_key=True)
     customer_uid = Column(String(36), nullable=False, unique=True, default=lambda: str(uuid.uuid4()))
+    idempotency_key = Column(String(128), nullable=True)
     organization_id = Column(Integer, ForeignKey("estate_organizations.id", ondelete="CASCADE"), nullable=False)
     reference_no = Column(String(80), nullable=True)
     full_name = Column(String(255), nullable=False)
@@ -212,6 +214,7 @@ class EstateAllocation(Base):
     __tablename__ = "estate_allocations"
     id = Column(Integer, primary_key=True)
     allocation_uid = Column(String(36), nullable=False, unique=True, default=lambda: str(uuid.uuid4()))
+    idempotency_key = Column(String(128), nullable=True)
     organization_id = Column(Integer, ForeignKey("estate_organizations.id", ondelete="CASCADE"), nullable=False)
     estate_id = Column(Integer, ForeignKey("estate_estates.id", ondelete="CASCADE"), nullable=False)
     plot_id = Column(Integer, ForeignKey("estate_plots.id", ondelete="RESTRICT"), nullable=False)
@@ -275,6 +278,7 @@ class EstateCommissionPayout(Base):
 
     __tablename__ = "estate_commission_payouts"
     id = Column(Integer, primary_key=True)
+    idempotency_key = Column(String(128), nullable=True)
     organization_id = Column(Integer, ForeignKey("estate_organizations.id", ondelete="CASCADE"), nullable=False)
     allocation_id = Column(Integer, ForeignKey("estate_allocations.id", ondelete="CASCADE"), nullable=False)
     sales_agent_subject_type = Column(String(64), nullable=False)
@@ -293,6 +297,7 @@ class EstatePayment(Base):
     __tablename__ = "estate_payments"
     id = Column(Integer, primary_key=True)
     payment_uid = Column(String(36), nullable=False, unique=True, default=lambda: str(uuid.uuid4()))
+    idempotency_key = Column(String(128), nullable=True)
     organization_id = Column(Integer, ForeignKey("estate_organizations.id", ondelete="CASCADE"), nullable=False)
     allocation_id = Column(Integer, ForeignKey("estate_allocations.id", ondelete="RESTRICT"), nullable=False)
     customer_id = Column(Integer, ForeignKey("estate_customers.id", ondelete="RESTRICT"), nullable=False)

@@ -25,12 +25,12 @@ def financial_summary(db: Session, allocation: EstateAllocation) -> FinancialSum
     outstanding = max(Decimal(0), price - confirmed)
     return FinancialSummary(price, confirmed, pending, outstanding, (confirmed / price * 100 if price else Decimal(0)))
 
-def record_payment(db: Session, *, allocation: EstateAllocation, amount: Decimal, payment_date: datetime, method: str, reference: str | None, notes: str | None, actor: EstatePrincipal, confirmation_required: bool = True) -> EstatePayment:
+def record_payment(db: Session, *, allocation: EstateAllocation, amount: Decimal, payment_date: datetime, method: str, reference: str | None, notes: str | None, actor: EstatePrincipal, confirmation_required: bool = True, idempotency_key: str | None = None) -> EstatePayment:
     if allocation.status not in {"reserved", "allocated"}: raise HTTPException(409, "Payments require an active allocation")
     if amount <= 0: raise HTTPException(422, "Payment amount must be positive")
     summary = financial_summary(db, allocation)
     if allocation.agreed_price and summary.confirmed_paid + amount > summary.agreed_price: raise HTTPException(409, "Payment exceeds the outstanding balance")
-    payment = EstatePayment(organization_id=allocation.organization_id, allocation_id=allocation.id, customer_id=allocation.customer_id, plot_id=allocation.plot_id, amount=amount, payment_date=payment_date, payment_method=method, reference_no=reference or None, notes=notes, status="pending_confirmation" if confirmation_required else "recorded", recorded_by_subject_type=actor.subject_type, recorded_by_subject_id=actor.subject_id)
+    payment = EstatePayment(organization_id=allocation.organization_id, allocation_id=allocation.id, customer_id=allocation.customer_id, plot_id=allocation.plot_id, amount=amount, payment_date=payment_date, payment_method=method, reference_no=reference or None, notes=notes, status="pending_confirmation" if confirmation_required else "recorded", recorded_by_subject_type=actor.subject_type, recorded_by_subject_id=actor.subject_id, idempotency_key=idempotency_key)
     db.add(payment); db.flush()
     payment.receipt_number = f"LC-{payment.payment_uid[:8].upper()}"
     append_estate_audit_event(db, organization_id=allocation.organization_id, actor=actor, action="payment.recorded", entity_type="estate_payment", entity_id=payment.id, after_data={"amount": str(amount), "status": payment.status, "reference": reference, "receipt_number": payment.receipt_number})
