@@ -195,11 +195,15 @@ class BlockUpdate(BaseModel):
 class MemberCreate(BaseModel):
     subject_type: str = Field(min_length=1, max_length=64)
     subject_id: str = Field(min_length=1, max_length=128)
-    role_key: str = Field(pattern="^(owner|manager|accounts|surveyor|field_officer|sales|viewer)$")
+    role_key: str = Field(pattern="^(owner|manager|accounts|surveyor|field_officer|sales|marketer|viewer)$")
+    email: str | None = Field(default=None, max_length=255)
+    phone: str | None = Field(default=None, max_length=64)
 
 class MemberUpdate(BaseModel):
-    role_key: str | None = Field(default=None, pattern="^(owner|manager|accounts|surveyor|field_officer|sales|viewer)$")
+    role_key: str | None = Field(default=None, pattern="^(owner|manager|accounts|surveyor|field_officer|sales|marketer|viewer)$")
     is_active: bool | None = None
+    email: str | None = Field(default=None, max_length=255)
+    phone: str | None = Field(default=None, max_length=64)
 
 class ImportReviewCreate(BaseModel):
     source_type: str = Field(pattern="^(coordinates|csv|gis|cad|raster|pdf)$")

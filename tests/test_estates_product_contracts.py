@@ -8,8 +8,9 @@ def test_current_estate_role_matrix_is_explicit_and_server_side():
         "owner": {"payment.manage", "document.read", "document.manage", "estate.manage"},
         "manager": {"payment.manage", "document.read", "document.manage", "estate.manage"},
         "accounts": {"payment.manage", "document.read", "document.manage"},
-        "sales": {"payment.manage", "document.read", "document.manage"},
-        "surveyor": {"document.read", "document.manage"},
+            "sales": {"payment.manage", "document.read", "document.manage"},
+            "marketer": {"payment.read", "document.read"},
+            "surveyor": {"document.read", "document.manage"},
         "field_officer": {"document.read", "document.manage"},
         "viewer": {"document.read"},
     }

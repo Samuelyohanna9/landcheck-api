@@ -12,6 +12,7 @@ from sqlalchemy.orm import Session
 
 from app.models.estate_foundation import (
     Estate,
+    EstateAgentPortalToken,
     EstateAllocation,
     EstateAuditEvent,
     EstateCustomer,
@@ -103,6 +104,42 @@ def issue_customer_portal_token(
         entity_type="estate_customer_portal_token",
         entity_id=row.id,
         after_data={"customer_id": customer.id, "expires_at": row.expires_at.isoformat()},
+    )
+    return row, raw_token
+
+
+def issue_agent_portal_token(
+    db: Session,
+    *,
+    member,
+    actor: EstatePrincipal,
+    expires_in_days: int = 365,
+) -> tuple[EstateAgentPortalToken, str]:
+    """Rotate an agent link while storing only its hash in the database."""
+    now = _now()
+    db.query(EstateAgentPortalToken).filter(
+        EstateAgentPortalToken.member_id == member.id,
+        EstateAgentPortalToken.revoked_at.is_(None),
+    ).update({"revoked_at": now}, synchronize_session=False)
+    raw_token = secrets.token_urlsafe(36)
+    row = EstateAgentPortalToken(
+        organization_id=member.organization_id,
+        member_id=member.id,
+        token_hash=hash_portal_token(raw_token),
+        expires_at=now + timedelta(days=max(1, min(int(expires_in_days), 730))),
+        created_by_subject_type=actor.subject_type,
+        created_by_subject_id=actor.subject_id,
+    )
+    db.add(row)
+    db.flush()
+    append_estate_audit_event(
+        db,
+        organization_id=member.organization_id,
+        actor=actor,
+        action="agent.portal_token.created",
+        entity_type="estate_agent_portal_token",
+        entity_id=row.id,
+        after_data={"member_id": member.id, "expires_at": row.expires_at.isoformat()},
     )
     return row, raw_token
 

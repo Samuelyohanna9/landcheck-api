@@ -30,7 +30,7 @@ from app.routers.plots import _metric_epsg_for_wgs84_polygon, _subdivide_polygon
 from app.services.estates.authorization import list_estate_access, resolve_estate_principal
 from app.services.estates.identity import slugify
 from app.services.estates.entitlements import ESTATE_FEATURES, get_estate_entitlement
-from app.models.estate_foundation import Estate, EstateAllocation, EstateAuditEvent, EstateBlock, EstateCommissionPayout, EstateCommissionTier, EstateCustomer, EstateCustomerPortalToken, EstateDocument, EstateDocumentLink, EstateFieldInspection, EstateHazardAssessment, EstateImportReview, EstateLayoutProposal, EstateOrganization, EstateOrganizationMember, EstatePayment, EstatePaymentInbox, EstatePaymentRule, EstatePlot, EstatePublicReservationRequest, EstateQrCampaign, EstateSpatialFeature, EstateSurveyRequest, EstateStakingTask
+from app.models.estate_foundation import Estate, EstateAgentPortalToken, EstateAllocation, EstateAuditEvent, EstateBlock, EstateCommissionPayout, EstateCommissionTier, EstateCustomer, EstateCustomerPortalToken, EstateDocument, EstateDocumentLink, EstateFieldInspection, EstateHazardAssessment, EstateImportReview, EstateLayoutProposal, EstateOrganization, EstateOrganizationMember, EstatePayment, EstatePaymentInbox, EstatePaymentRule, EstatePlot, EstatePublicReservationRequest, EstateQrCampaign, EstateSpatialFeature, EstateSurveyRequest, EstateStakingTask
 from app.schemas.estates import AllocationAction, BlockCreate, BlockUpdate, CommissionPayoutCreate, CommissionTiersUpdate, CustomerCreate, DevelopmentStatusUpdate, EstateCreate, EstateLayoutCriteria, EstateLayoutDecision, EstateLayoutFeatureAdd, EstateLayoutFeatureRemove, EstateLayoutProposalEdit, EstateSubdivisionCreate, EstateUpdate, FieldInspectionCreate, GeoreferenceSessionLink, ImportFromGeoreference, ImportReviewCreate, ImportReviewDecision, ImportReviewFromGeoreferenceSession, MemberCreate, MemberUpdate, PaymentInboxCreate, PaymentInboxMatch, PlotCreate, PlotAddressUpdate, PlotGeometryUpdate, PlotListingDefaultsUpdate, PlotPriceUpdate, PortalTokenCreate, PublicEstateSettingsUpdate, PublicReservationConvert, PublicReservationCreate, PublicReservationUpdate, PaymentCreate, QrCampaignCreate, SpatialFeatureCreate, SpatialFeatureUpdate, SurveyEligibilityUpdate, VoidAction
 from app.services.estates.payments import confirm_payment, financial_summary, record_payment, void_payment
 from app.services.estates.documents import read_private_estate_file, store_private_estate_file
@@ -56,12 +56,17 @@ from app.services.estates import estate_email
 from app.services.estates.layout_export import render_estate_layout_pdf
 from app.services.estates.report_export import render_customer_statement_pdf, render_estate_report_pdf
 from app.services.estates import commissions
-from app.services.estates.operations import DOCUMENT_REQUIREMENTS, ESTATE_DOCUMENT_TYPES, ESTATE_DOCUMENT_TYPE_CODES, PUBLIC_DOCUMENT_TYPES, build_operations_summary, buyer_portal_payload, document_readiness, hash_portal_token, issue_customer_portal_token, linked_documents
+from app.services.estates.operations import DOCUMENT_REQUIREMENTS, ESTATE_DOCUMENT_TYPES, ESTATE_DOCUMENT_TYPE_CODES, PUBLIC_DOCUMENT_TYPES, build_operations_summary, buyer_portal_payload, document_readiness, hash_portal_token, issue_agent_portal_token, issue_customer_portal_token, linked_documents
 from app.db import SessionLocal
 from app.utils.hazard_jobs import get_hazard_job, insert_hazard_job, serialize_hazard_job, set_hazard_job_status
 
 
 router = APIRouter(prefix="/estates", tags=["estates"])
+
+
+def _agent_portal_url(raw_token: str) -> str:
+    base = str(os.getenv("LANDCHECK_WEB_URL") or "https://landcheck.online").rstrip("/")
+    return f"{base}/estates/agent-portal/{raw_token}"
 
 def _survey_payload(db, row):
     plot=db.get(EstatePlot,row.plot_id); estate=db.get(Estate,row.estate_id)
@@ -2813,7 +2818,7 @@ def list_sales_agents(organization_id: int, request: Request, db: Session = Depe
         cumulative_volume = commissions.cumulative_sales_before(db, organization_id=organization_id, subject_type=row.subject_type, subject_id=row.subject_id)
         current_tier = commissions.resolve_tier(tiers, cumulative_volume)
         results.append({
-            "subject_type": row.subject_type, "subject_id": row.subject_id, "role": row.role_key, "display_name": display_name,
+            "subject_type": row.subject_type, "subject_id": row.subject_id, "role": row.role_key, "display_name": display_name, "email": row.contact_email, "phone": row.contact_phone,
             "cumulative_volume": str(cumulative_volume),
             "current_tier_label": current_tier["label"],
             "current_tier_rate_percent": str(current_tier["rate_percent"]),
@@ -3672,13 +3677,172 @@ def buyer_document_download(token: str, document_id: int, db: Session = Depends(
     return Response(data, media_type=mime, headers={"Content-Disposition": f'inline; filename="{document.original_filename}"'})
 
 
+def _agent_portal_context(db: Session, token: str):
+    row = db.query(EstateAgentPortalToken).filter(EstateAgentPortalToken.token_hash == hash_portal_token(token)).one_or_none()
+    now = datetime.now(timezone.utc)
+    expires_at = row.expires_at.replace(tzinfo=timezone.utc) if row and row.expires_at.tzinfo is None else (row.expires_at if row else None)
+    if not row or row.revoked_at is not None or not expires_at or expires_at <= now:
+        raise HTTPException(404, "This agent workspace link is invalid or expired")
+    member = db.get(EstateOrganizationMember, row.member_id)
+    organization = db.get(EstateOrganization, row.organization_id)
+    if not member or not member.is_active or not organization or organization.status != "active":
+        raise HTTPException(404, "This agent workspace is no longer available")
+    if member.role_key not in {"sales", "marketer"}:
+        raise HTTPException(403, "This link is not assigned to an agent workspace")
+    row.last_used_at = now
+    db.flush()
+    return row, member, organization
+
+
+def _agent_workspace_payload(db: Session, *, member: EstateOrganizationMember, organization: EstateOrganization) -> dict:
+    subject_type = member.subject_type
+    subject_id = member.subject_id
+    estates = db.query(Estate).filter(Estate.organization_id == organization.id, Estate.status != "archived").order_by(Estate.name.asc()).all()
+    all_leads = []
+    all_sales = []
+    estate_payloads = []
+    total_outstanding = Decimal("0")
+    total_commission = Decimal("0")
+    total_paid_commission = Decimal("0")
+
+    for estate in estates:
+        leads = db.query(EstatePublicReservationRequest).filter(
+            EstatePublicReservationRequest.estate_id == estate.id,
+            EstatePublicReservationRequest.assigned_agent_subject_type == subject_type,
+            EstatePublicReservationRequest.assigned_agent_subject_id == subject_id,
+        ).order_by(EstatePublicReservationRequest.created_at.desc()).limit(200).all()
+        allocations = db.query(EstateAllocation).filter(
+            EstateAllocation.estate_id == estate.id,
+            EstateAllocation.sales_agent_subject_type == subject_type,
+            EstateAllocation.sales_agent_subject_id == subject_id,
+            EstateAllocation.status.in_(("reserved", "allocated")),
+        ).order_by(EstateAllocation.created_at.desc()).all()
+        campaigns = db.query(EstateQrCampaign).filter(
+            EstateQrCampaign.estate_id == estate.id,
+            EstateQrCampaign.assigned_agent_subject_type == subject_type,
+            EstateQrCampaign.assigned_agent_subject_id == subject_id,
+            EstateQrCampaign.is_active.is_(True),
+        ).order_by(EstateQrCampaign.created_at.desc()).all()
+        allocation_plot_ids = {allocation.plot_id for allocation in allocations}
+        lead_plot_ids = {lead.plot_id for lead in leads}
+        plots = []
+        for plot in db.query(EstatePlot).filter(EstatePlot.estate_id == estate.id).order_by(EstatePlot.plot_number_normalized.asc()).all():
+            plots.append({
+                "id": plot.id,
+                "plot_number": plot.plot_number,
+                "status": plot.commercial_status,
+                "agent_record": plot.id in allocation_plot_ids or plot.id in lead_plot_ids,
+                "geometry": mapping(to_shape(plot.geometry)) if plot.geometry else None,
+            })
+
+        estate_leads = []
+        for lead in leads:
+            plot = db.get(EstatePlot, lead.plot_id)
+            estate_leads.append({"id": lead.id, "name": lead.full_name, "phone": lead.phone, "email": lead.email, "status": lead.status, "plot": plot.plot_number if plot else None, "source_code": lead.source_code, "source_channel": lead.source_channel, "created_at": lead.created_at})
+        estate_sales = []
+        for allocation in allocations:
+            customer = db.get(EstateCustomer, allocation.customer_id)
+            plot = db.get(EstatePlot, allocation.plot_id)
+            summary = financial_summary(db, allocation)
+            payout_total = Decimal(str(db.query(func.coalesce(func.sum(EstateCommissionPayout.amount), 0)).filter(EstateCommissionPayout.allocation_id == allocation.id).scalar() or 0))
+            commission = Decimal(str(allocation.commission_amount or 0))
+            payments = db.query(EstatePayment).filter(
+                EstatePayment.allocation_id == allocation.id,
+                EstatePayment.status.in_(("confirmed", "recorded", "pending_confirmation")),
+            ).order_by(EstatePayment.payment_date.desc()).limit(50).all()
+            total_outstanding += summary.outstanding
+            total_commission += commission
+            total_paid_commission += payout_total
+            estate_sales.append({
+                "allocation_id": allocation.id,
+                "customer": customer.full_name if customer else None,
+                "plot": plot.plot_number if plot else None,
+                "status": allocation.status,
+                "agreed_price": str(summary.agreed_price),
+                "confirmed_paid": str(summary.confirmed_paid),
+                "outstanding": str(summary.outstanding),
+                "paid": summary.outstanding <= 0,
+                "commission_due": str(max(Decimal("0"), commission - payout_total)),
+                "payments": [{"amount": str(payment.amount), "date": payment.payment_date, "receipt_number": payment.receipt_number, "status": payment.status} for payment in payments],
+            })
+        estate_payloads.append({
+            "id": estate.id,
+            "name": estate.name,
+            "public_slug": estate.public_slug,
+            "public_url": f"{str(os.getenv('LANDCHECK_WEB_URL') or 'https://landcheck.online').rstrip('/')}/estates/public/{estate.public_slug}" if estate.public_slug else None,
+            "plots": plots,
+            "leads": estate_leads,
+            "sales": estate_sales,
+            "campaigns": [_qr_campaign_payload(campaign, estate) for campaign in campaigns],
+        })
+        all_leads.extend([{**lead, "estate_name": estate.name} for lead in estate_leads])
+        all_sales.extend([{**sale, "estate_name": estate.name} for sale in estate_sales])
+
+    return {
+        "agent": {"subject_type": subject_type, "subject_id": subject_id, "name": member.subject_id, "role": member.role_key, "email": member.contact_email, "phone": member.contact_phone},
+        "summary": {"lead_count": len(all_leads), "sale_count": len(all_sales), "paid_sale_count": sum(1 for sale in all_sales if sale["paid"]), "outstanding": str(total_outstanding), "commission_earned": str(total_commission), "commission_paid": str(total_paid_commission), "commission_due": str(max(Decimal("0"), total_commission - total_paid_commission))},
+        "leads": all_leads,
+        "sales": all_sales,
+        "estates": estate_payloads,
+    }
+
+
+@router.get("/agent-portal/{token}")
+def public_agent_workspace(token: str, db: Session = Depends(get_db)):
+    row, member, organization = _agent_portal_context(db, token)
+    payload = _agent_workspace_payload(db, member=member, organization=organization)
+    db.commit()
+    return {"organization": {"id": organization.id, "name": organization.name, "slug": organization.slug}, **payload}
+
+
+@router.post("/agent-portal/{token}/qr-campaigns", status_code=201)
+def public_agent_create_qr_campaign(token: str, estate_id: int, payload: QrCampaignCreate, db: Session = Depends(get_db)):
+    _row, member, organization = _agent_portal_context(db, token)
+    estate = db.get(Estate, estate_id)
+    if not estate or estate.organization_id != organization.id:
+        raise HTTPException(404, "Estate not found")
+    base = re.sub(r"[^a-z0-9]+", "-", payload.name.strip().lower()).strip("-")[:80] or "campaign"
+    code = base
+    if db.query(EstateQrCampaign.id).filter(EstateQrCampaign.estate_id == estate_id, EstateQrCampaign.code == code).first():
+        code = f"{base}-{uuid.uuid4().hex[:6]}"
+    row = EstateQrCampaign(
+        organization_id=organization.id,
+        estate_id=estate.id,
+        code=code,
+        name=payload.name.strip(),
+        channel=payload.channel.strip().lower() or "agent",
+        assigned_agent_subject_type=member.subject_type,
+        assigned_agent_subject_id=member.subject_id,
+        created_by_subject_type=member.subject_type,
+        created_by_subject_id=member.subject_id,
+    )
+    db.add(row)
+    db.flush()
+    db.commit()
+    return _qr_campaign_payload(row, estate)
+
+
+@router.get("/agent-portal/{token}/qr-campaigns/{campaign_id}/print.pdf")
+def public_agent_print_qr_campaign(token: str, campaign_id: int, db: Session = Depends(get_db)):
+    _row, member, organization = _agent_portal_context(db, token)
+    row = db.get(EstateQrCampaign, campaign_id)
+    if not row or row.organization_id != organization.id or row.assigned_agent_subject_type != member.subject_type or row.assigned_agent_subject_id != member.subject_id:
+        raise HTTPException(404, "QR campaign not found")
+    estate = db.get(Estate, row.estate_id)
+    if not estate:
+        raise HTTPException(404, "Estate not found")
+    result = _render_qr_campaign_pdf(row, estate)
+    db.commit()
+    return result
+
+
 @router.get("/agent/workspace")
 def agent_workspace(estate_id: int, request: Request, db: Session = Depends(get_db)):
     estate = db.get(Estate, estate_id)
     if not estate:
         raise HTTPException(404, "Estate not found")
     access = require_estate_access(db, request, estate.organization_id, permission="payment.read")
-    is_sales_agent = access.role_key == "sales"
+    is_sales_agent = access.role_key in {"sales", "marketer"}
     principal = access.principal
     lead_query = db.query(EstatePublicReservationRequest).filter(EstatePublicReservationRequest.estate_id == estate_id)
     allocation_query = db.query(EstateAllocation).filter(EstateAllocation.estate_id == estate_id, EstateAllocation.status.in_(("reserved", "allocated")))
@@ -3700,7 +3864,7 @@ def agent_workspace(estate_id: int, request: Request, db: Session = Depends(get_
         payout_total = Decimal(str(db.query(func.coalesce(func.sum(EstateCommissionPayout.amount), 0)).filter(EstateCommissionPayout.allocation_id == allocation.id).scalar() or 0))
         commission = Decimal(str(allocation.commission_amount or 0))
         total_outstanding += summary.outstanding; total_commission += commission; total_paid_commission += payout_total
-        sales.append({"allocation_id": allocation.id, "customer": customer.full_name if customer else None, "plot": plot.plot_number if plot else None, "status": allocation.status, "agreed_price": str(summary.agreed_price), "confirmed_paid": str(summary.confirmed_paid), "outstanding": str(summary.outstanding), "commission": str(commission), "commission_paid": str(payout_total), "commission_due": str(max(Decimal("0"), commission - payout_total))})
+        sales.append({"allocation_id": allocation.id, "customer": customer.full_name if customer else None, "plot": plot.plot_number if plot else None, "status": allocation.status, "agreed_price": str(summary.agreed_price), "confirmed_paid": str(summary.confirmed_paid), "outstanding": str(summary.outstanding), "paid": summary.outstanding <= 0, "commission": str(commission), "commission_paid": str(payout_total), "commission_due": str(max(Decimal("0"), commission - payout_total))})
     campaigns = [{"id": row.id, "code": row.code, "name": row.name, "channel": row.channel, "scan_count": row.scan_count, "last_scanned_at": row.last_scanned_at, "assigned_agent_subject_id": row.assigned_agent_subject_id, "public_url": f"{str(os.getenv('LANDCHECK_WEB_URL') or 'https://landcheck.online').rstrip('/')}/estates/public/{estate.public_slug}?source={row.code}"} for row in campaign_query.order_by(EstateQrCampaign.created_at.desc()).all()]
     return {"estate": {"id": estate.id, "name": estate.name, "public_slug": estate.public_slug}, "agent": {"subject_type": principal.subject_type, "subject_id": principal.subject_id, "name": principal.display_name, "role": access.role_key}, "summary": {"lead_count": len(leads), "sale_count": len(sales), "outstanding": str(total_outstanding), "commission_earned": str(total_commission), "commission_paid": str(total_paid_commission), "commission_due": str(max(Decimal("0"), total_commission - total_paid_commission))}, "leads": leads, "sales": sales, "campaigns": campaigns}
 
@@ -3737,6 +3901,45 @@ def create_qr_campaign(estate_id: int, payload: QrCampaignCreate, request: Reque
     return _qr_campaign_payload(row, estate)
 
 
+def _render_qr_campaign_pdf(row: EstateQrCampaign, estate: Estate) -> Response:
+    web_url = str(os.getenv("LANDCHECK_WEB_URL") or "https://landcheck.online").rstrip("/")
+    public_url = f"{web_url}/estates/public/{estate.public_slug}?source={row.code}"
+    buffer = io.BytesIO()
+    pdf = canvas.Canvas(buffer, pagesize=A4)
+    width, height = A4
+    pdf.setTitle(f"LandCheck QR - {row.name}")
+    pdf.setFillColorRGB(0.06, 0.25, 0.15)
+    pdf.setFont("Helvetica-Bold", 20)
+    pdf.drawCentredString(width / 2, height - 64, "Want verified land with documents?")
+    pdf.setFillColorRGB(0.12, 0.16, 0.14)
+    pdf.setFont("Helvetica", 11)
+    pdf.drawCentredString(width / 2, height - 87, "Scan this code to view the live estate map and make an enquiry.")
+
+    # ReportLab's QR widget uses barWidth/barHeight as the complete drawing size. The previous
+    # value of 4 rendered a technically valid but invisible-looking mark in the exported PDF.
+    qr_widget = qr.QrCodeWidget(public_url)
+    qr_widget.barWidth = 220
+    qr_widget.barHeight = 220
+    qr_widget.x = 10
+    qr_widget.y = 10
+    drawing = Drawing(240, 240)
+    drawing.add(qr_widget)
+    renderPDF.draw(drawing, pdf, (width - 240) / 2, height - 365)
+
+    pdf.setFillColorRGB(0.06, 0.25, 0.15)
+    pdf.setFont("Helvetica-Bold", 16)
+    pdf.drawCentredString(width / 2, height - 400, estate.name)
+    pdf.setFillColorRGB(0.25, 0.30, 0.27)
+    pdf.setFont("Helvetica", 9)
+    pdf.drawCentredString(width / 2, height - 420, f"Campaign: {row.name} | {row.channel}")
+    pdf.drawCentredString(width / 2, height - 438, public_url)
+    pdf.setFont("Helvetica-Oblique", 9)
+    pdf.drawCentredString(width / 2, 52, "Powered by LandCheck Estates")
+    pdf.save()
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "-", row.name).strip("-.") or "estate-qr"
+    return Response(buffer.getvalue(), media_type="application/pdf", headers={"Content-Disposition": f'attachment; filename="{safe}_QR_Tag.pdf"'})
+
+
 @router.get("/qr-campaigns/{campaign_id}/print.pdf")
 def print_qr_campaign(campaign_id: int, request: Request, db: Session = Depends(get_db)):
     row = db.get(EstateQrCampaign, campaign_id)
@@ -3744,17 +3947,10 @@ def print_qr_campaign(campaign_id: int, request: Request, db: Session = Depends(
         raise HTTPException(404, "QR campaign not found")
     estate = db.get(Estate, row.estate_id)
     access = require_estate_access(db, request, row.organization_id, permission="estate.read")
-    web_url = str(os.getenv("LANDCHECK_WEB_URL") or "https://landcheck.online").rstrip("/")
-    public_url = f"{web_url}/estates/public/{estate.public_slug}?source={row.code}"
-    buffer = io.BytesIO(); pdf = canvas.Canvas(buffer, pagesize=A4); width, height = A4
-    pdf.setTitle(f"LandCheck QR - {row.name}"); pdf.setFont("Helvetica-Bold", 20); pdf.drawCentredString(width / 2, height - 70, "Verified land with documents?")
-    pdf.setFont("Helvetica", 12); pdf.drawCentredString(width / 2, height - 94, "Scan to view the live estate map and make an enquiry.")
-    qr_widget = qr.QrCodeWidget(public_url); qr_widget.barWidth = 4; qr_widget.barHeight = 4
-    drawing = Drawing(260, 260); drawing.add(qr_widget); renderPDF.draw(drawing, pdf, (width - 260) / 2, height - 390)
-    pdf.setFont("Helvetica-Bold", 14); pdf.drawCentredString(width / 2, height - 430, estate.name); pdf.setFont("Helvetica", 9); pdf.drawCentredString(width / 2, height - 450, f"Campaign: {row.name} | {row.channel}"); pdf.drawCentredString(width / 2, height - 470, public_url)
-    pdf.save(); append_estate_audit_event(db, organization_id=row.organization_id, actor=access.principal, action="public_qr_campaign.printed", entity_type="estate_qr_campaign", entity_id=row.id); db.commit()
-    safe = re.sub(r"[^A-Za-z0-9._-]+", "-", row.name).strip("-.") or "estate-qr"
-    return Response(buffer.getvalue(), media_type="application/pdf", headers={"Content-Disposition": f'attachment; filename="{safe}_QR_Tag.pdf"'})
+    result = _render_qr_campaign_pdf(row, estate)
+    append_estate_audit_event(db, organization_id=row.organization_id, actor=access.principal, action="public_qr_campaign.printed", entity_type="estate_qr_campaign", entity_id=row.id)
+    db.commit()
+    return result
 
 
 @router.get("/{estate_id}")
@@ -3788,7 +3984,7 @@ def estate_detail(estate_id: int, request: Request, db: Session = Depends(get_db
 def list_organization_members(organization_id: int, request: Request, db: Session = Depends(get_db)):
     require_estate_access(db, request, organization_id, permission="estate.manage")
     rows = db.query(EstateOrganizationMember).filter(EstateOrganizationMember.organization_id == organization_id).order_by(EstateOrganizationMember.created_at.asc()).all()
-    return [{"id": row.id, "subject_type": row.subject_type, "subject_id": row.subject_id, "role": row.role_key, "is_active": row.is_active} for row in rows]
+    return [{"id": row.id, "subject_type": row.subject_type, "subject_id": row.subject_id, "role": row.role_key, "email": row.contact_email, "phone": row.contact_phone, "is_active": row.is_active} for row in rows]
 
 
 @router.post("/organizations/{organization_id}/members")
@@ -3797,12 +3993,27 @@ def add_organization_member(organization_id: int, payload: MemberCreate, request
     existing = db.query(EstateOrganizationMember).filter(EstateOrganizationMember.organization_id == organization_id, EstateOrganizationMember.subject_type == payload.subject_type.strip(), EstateOrganizationMember.subject_id == payload.subject_id.strip()).one_or_none()
     if existing:
         raise HTTPException(409, "This identity is already an organization member")
-    row = EstateOrganizationMember(organization_id=organization_id, subject_type=payload.subject_type.strip().lower(), subject_id=payload.subject_id.strip(), role_key=payload.role_key)
+    row = EstateOrganizationMember(
+        organization_id=organization_id,
+        subject_type=payload.subject_type.strip().lower(),
+        subject_id=payload.subject_id.strip(),
+        role_key=payload.role_key,
+        contact_email=payload.email.strip().lower() if payload.email and payload.email.strip() else None,
+        contact_phone=payload.phone.strip() if payload.phone and payload.phone.strip() else None,
+    )
     db.add(row)
     db.flush()
+    portal_url = None
+    email_sent = False
+    if row.role_key in {"sales", "marketer"}:
+        _token_row, raw_token = issue_agent_portal_token(db, member=row, actor=access.principal)
+        portal_url = _agent_portal_url(raw_token)
     append_estate_audit_event(db, organization_id=organization_id, actor=access.principal, action="organization_member.added", entity_type="estate_organization_member", entity_id=row.id, after_data={"subject_type": row.subject_type, "subject_id": row.subject_id, "role": row.role_key})
     db.commit()
-    return {"id": row.id, "subject_type": row.subject_type, "subject_id": row.subject_id, "role": row.role_key, "is_active": row.is_active}
+    if portal_url and row.contact_email:
+        organization = db.get(EstateOrganization, organization_id)
+        email_sent = estate_email.send_agent_workspace_invite(organization=organization, member=row, portal_url=portal_url) if organization else False
+    return {"id": row.id, "subject_type": row.subject_type, "subject_id": row.subject_id, "role": row.role_key, "email": row.contact_email, "phone": row.contact_phone, "is_active": row.is_active, "portal_url": portal_url, "email_sent": email_sent}
 
 
 @router.patch("/organizations/{organization_id}/members/{member_id}")
@@ -3818,12 +4029,32 @@ def update_organization_member(organization_id: int, member_id: int, payload: Me
         owner_count = db.query(EstateOrganizationMember).filter(EstateOrganizationMember.organization_id == organization_id, EstateOrganizationMember.role_key == "owner", EstateOrganizationMember.is_active.is_(True)).count()
         if owner_count <= 1:
             raise HTTPException(409, "An organization must retain at least one active owner")
-    before = {"role": row.role_key, "is_active": row.is_active}
+    before = {"role": row.role_key, "is_active": row.is_active, "email": row.contact_email, "phone": row.contact_phone}
     row.role_key = next_role
     row.is_active = next_active
-    append_estate_audit_event(db, organization_id=organization_id, actor=access.principal, action="organization_member.updated", entity_type="estate_organization_member", entity_id=row.id, before_data=before, after_data={"role": row.role_key, "is_active": row.is_active})
+    if "email" in values:
+        row.contact_email = values["email"].strip().lower() if values["email"] and values["email"].strip() else None
+    if "phone" in values:
+        row.contact_phone = values["phone"].strip() if values["phone"] and values["phone"].strip() else None
+    append_estate_audit_event(db, organization_id=organization_id, actor=access.principal, action="organization_member.updated", entity_type="estate_organization_member", entity_id=row.id, before_data=before, after_data={"role": row.role_key, "is_active": row.is_active, "email": row.contact_email, "phone": row.contact_phone})
     db.commit()
-    return {"id": row.id, "subject_type": row.subject_type, "subject_id": row.subject_id, "role": row.role_key, "is_active": row.is_active}
+    return {"id": row.id, "subject_type": row.subject_type, "subject_id": row.subject_id, "role": row.role_key, "email": row.contact_email, "phone": row.contact_phone, "is_active": row.is_active}
+
+
+@router.post("/organizations/{organization_id}/members/{member_id}/portal-invite")
+def send_agent_portal_invite(organization_id: int, member_id: int, request: Request, db: Session = Depends(get_db)):
+    access = require_estate_access(db, request, organization_id, permission="estate.manage")
+    member = db.query(EstateOrganizationMember).filter(EstateOrganizationMember.id == member_id, EstateOrganizationMember.organization_id == organization_id).one_or_none()
+    if not member or member.role_key not in {"sales", "marketer"}:
+        raise HTTPException(404, "Agent member not found")
+    if not member.contact_email:
+        raise HTTPException(422, "Add an email address before sending an invite")
+    token_row, raw_token = issue_agent_portal_token(db, member=member, actor=access.principal)
+    portal_url = _agent_portal_url(raw_token)
+    db.commit()
+    organization = db.get(EstateOrganization, organization_id)
+    email_sent = estate_email.send_agent_workspace_invite(organization=organization, member=member, portal_url=portal_url) if organization else False
+    return {"member_id": member.id, "portal_url": portal_url, "expires_at": token_row.expires_at, "email_sent": email_sent}
 
 
 @router.get("/foundation/access")

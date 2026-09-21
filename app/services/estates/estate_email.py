@@ -381,6 +381,40 @@ def send_welcome_email(*, organization, account) -> bool:
     to_email = str(getattr(account, "email", "") or "").strip()
     if not to_email:
         return False
+
+
+def send_agent_workspace_invite(*, organization, member, portal_url: str) -> bool:
+    """Send a lightweight, revocable workspace link to an agent or marketer."""
+    to_email = str(getattr(member, "contact_email", "") or "").strip()
+    if not to_email:
+        return False
+    name = str(getattr(member, "subject_id", "there") or "there")
+    role = str(getattr(member, "role_key", "agent") or "agent").replace("_", " ").title()
+    organization_name = str(getattr(organization, "name", "your company") or "your company")
+    message_html = (
+        f"<p>Hello {html.escape(name)},</p>"
+        f"<p><strong>{html.escape(organization_name)}</strong> has invited you to its LandCheck Estates "
+        f"{html.escape(role)} workspace.</p>"
+        "<p>Use the secure link below to view estate layouts, your QR leads, buyer payment progress, "
+        "and commission records. The link can be revoked by the company at any time.</p>"
+    )
+    body_html = _account_wrap_html(
+        heading=f"Your {role} workspace is ready",
+        message_html=message_html,
+        button_html=_account_button_html(label="Open agent workspace", url=portal_url),
+    )
+    try:
+        _send_email(
+            to_email=to_email,
+            from_display_name="LandCheck Estates",
+            subject=f"Your LandCheck Estates workspace - {organization_name}",
+            body_text=_account_plain_text(f"Your {role} workspace is ready", message_html, portal_url),
+            body_html=body_html,
+        )
+        return True
+    except Exception:
+        logger.exception("Estate agent invite email failed (to=%s)", to_email)
+        return False
     first_name = str(getattr(account, "full_name", "") or "there").split(" ")[0]
     web_url = os.getenv("LANDCHECK_WEB_URL") or "https://landcheck.online"
     message_html = f"""

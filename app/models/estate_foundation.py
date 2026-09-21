@@ -35,6 +35,8 @@ class EstateOrganizationMember(Base):
     subject_type = Column(String(64), nullable=False)
     subject_id = Column(String(128), nullable=False)
     role_key = Column(String(32), nullable=False)
+    contact_email = Column(String(255), nullable=True)
+    contact_phone = Column(String(64), nullable=True)
     is_active = Column(Boolean, nullable=False, default=True)
     created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
     updated_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
@@ -42,7 +44,7 @@ class EstateOrganizationMember(Base):
     __table_args__ = (
         UniqueConstraint("organization_id", "subject_type", "subject_id", name="uq_estate_member_subject"),
         CheckConstraint(
-            "role_key IN ('owner', 'manager', 'accounts', 'surveyor', 'field_officer', 'sales', 'viewer')",
+            "role_key IN ('owner', 'manager', 'accounts', 'surveyor', 'field_officer', 'sales', 'marketer', 'viewer')",
             name="ck_estate_members_role",
         ),
     )
@@ -352,6 +354,23 @@ class EstateCustomerPortalToken(Base):
     id = Column(Integer, primary_key=True)
     organization_id = Column(Integer, ForeignKey("estate_organizations.id", ondelete="CASCADE"), nullable=False)
     customer_id = Column(Integer, ForeignKey("estate_customers.id", ondelete="CASCADE"), nullable=False)
+    token_hash = Column(String(64), nullable=False, unique=True)
+    expires_at = Column(DateTime(timezone=True), nullable=False)
+    revoked_at = Column(DateTime(timezone=True), nullable=True)
+    last_used_at = Column(DateTime(timezone=True), nullable=True)
+    created_by_subject_type = Column(String(64), nullable=False)
+    created_by_subject_id = Column(String(128), nullable=False)
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+
+class EstateAgentPortalToken(Base):
+    """Revocable, hashed invite links for an organization member's agent workspace."""
+
+    __tablename__ = "estate_agent_portal_tokens"
+
+    id = Column(Integer, primary_key=True)
+    organization_id = Column(Integer, ForeignKey("estate_organizations.id", ondelete="CASCADE"), nullable=False)
+    member_id = Column(Integer, ForeignKey("estate_organization_members.id", ondelete="CASCADE"), nullable=False)
     token_hash = Column(String(64), nullable=False, unique=True)
     expires_at = Column(DateTime(timezone=True), nullable=False)
     revoked_at = Column(DateTime(timezone=True), nullable=True)
