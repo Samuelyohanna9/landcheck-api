@@ -271,6 +271,34 @@ class PaymentCreate(BaseModel):
     reference_no: str | None = None
     notes: str | None = None
 
+
+class PaymentInboxCreate(BaseModel):
+    amount: Decimal = Field(gt=0)
+    payment_date: datetime
+    payer_name: str | None = Field(default=None, max_length=255)
+    payer_reference: str | None = Field(default=None, max_length=160)
+    source: str = Field(default="manual", max_length=80)
+    estate_id: int | None = None
+    raw_payload: dict | None = None
+
+
+class PaymentInboxMatch(BaseModel):
+    allocation_id: int
+    payment_method: str = Field(default="bank_transfer", max_length=80)
+    reference_no: str | None = Field(default=None, max_length=160)
+    notes: str | None = Field(default=None, max_length=4000)
+
+
+class QrCampaignCreate(BaseModel):
+    name: str = Field(min_length=2, max_length=160)
+    channel: str = Field(default="other", max_length=64)
+    assigned_agent_subject_type: str | None = Field(default=None, max_length=64)
+    assigned_agent_subject_id: str | None = Field(default=None, max_length=128)
+
+
+class PortalTokenCreate(BaseModel):
+    expires_in_days: int = Field(default=90, ge=1, le=365)
+
 class VoidAction(BaseModel):
     reason: str = Field(min_length=1)
 
@@ -280,6 +308,7 @@ class PublicReservationCreate(BaseModel):
     phone: str = Field(min_length=5, max_length=64)
     email: str | None = Field(default=None, max_length=255)
     message: str | None = Field(default=None, max_length=2000)
+    source: str | None = Field(default=None, max_length=120)
 
 
 class PublicReservationUpdate(BaseModel):
@@ -290,4 +319,5 @@ class PublicReservationUpdate(BaseModel):
 class PublicReservationConvert(BaseModel):
     agreed_price: Decimal | None = Field(default=None, gt=0)
     payment_plan: str | None = Field(default=None, max_length=4000)
+    next_payment_due_at: datetime | None = None
     notes: str | None = Field(default=None, max_length=4000)

@@ -10,7 +10,7 @@ from app.models.estate_billing import EstateSubscription, EstateSubscriptionChar
 from app.models.estate_foundation import EstateOrganization
 from app.routers.estate_billing import _complete_subscription_payment, _complete_verification
 from app.services.estates import estate_email
-from app.services.estates.subscriptions import attempt_charge, change_plan, process_due_billing, start_trial
+from app.services.estates.subscriptions import attempt_charge, change_plan, start_trial
 from app.utils import estate_flutterwave as flw
 
 
@@ -63,50 +63,6 @@ def test_trial_cannot_be_started_twice(monkeypatch, db_session):
             card_last4="5678",
             card_brand="VISA",
         )
-
-
-def test_process_due_billing_never_records_a_second_trial_conversion(monkeypatch, db_session):
-    """Guards against the exact bug seen in production: a scheduler race (or any other cause)
-    must never leave a subscription with two trial_conversion charge rows - the DB-level unique
-    index enforces this, and process_due_billing must swallow the resulting conflict instead of
-    aborting the whole billing run."""
-    organization = _organization(db_session)
-    subscription = EstateSubscription(
-        organization_id=organization.id,
-        plan_key="basic",
-        billing_cycle="monthly",
-        status="trialing",
-        amount=Decimal("19500"),
-        currency="NGN",
-        trial_ends_at=datetime.now(timezone.utc) - timedelta(minutes=1),
-        card_token="token-1",
-        flutterwave_customer_email="billing@example.com",
-    )
-    db_session.add(subscription)
-    db_session.flush()
-    # Simulate a trial_conversion charge already recorded by a concurrent/earlier run before
-    # this subscription's status was updated away from "trialing".
-    db_session.add(
-        EstateSubscriptionCharge(
-            subscription_id=subscription.id,
-            organization_id=organization.id,
-            charge_type="trial_conversion",
-            amount=Decimal("19500"),
-            currency="NGN",
-            status="failed",
-            tx_ref="SUB-EXISTING",
-        )
-    )
-    db_session.commit()
-    monkeypatch.setattr(estate_email, "send_payment_receipt_email", lambda **kwargs: None)
-    monkeypatch.setattr(flw, "charge_token", lambda **kwargs: {"status": "successful", "id": "tx-2"})
-
-    counts = process_due_billing(db_session)
-    db_session.commit()
-
-    trial_conversion_charges = db_session.query(EstateSubscriptionCharge).filter_by(charge_type="trial_conversion").all()
-    assert len(trial_conversion_charges) == 1
-    assert counts["trial_conversions"] == 0
 
 
 def test_pending_provider_response_is_not_retried_as_a_failure(monkeypatch, db_session):

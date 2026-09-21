@@ -171,6 +171,10 @@ class EstatePublicReservationRequest(Base):
     phone = Column(String(64), nullable=False)
     email = Column(String(255), nullable=True)
     message = Column(Text, nullable=True)
+    source_code = Column(String(120), nullable=True)
+    source_channel = Column(String(64), nullable=True)
+    assigned_agent_subject_type = Column(String(64), nullable=True)
+    assigned_agent_subject_id = Column(String(128), nullable=True)
     status = Column(String(32), nullable=False, default="new")
     staff_notes = Column(Text, nullable=True)
     contacted_at = Column(DateTime(timezone=True), nullable=True)
@@ -213,9 +217,11 @@ class EstateAllocation(Base):
     status = Column(String(32), nullable=False)
     reservation_date = Column(DateTime(timezone=True), nullable=True)
     reservation_expires_at = Column(DateTime(timezone=True), nullable=True)
+    reservation_reminder_sent_at = Column(DateTime(timezone=True), nullable=True)
     allocation_date = Column(DateTime(timezone=True), nullable=True)
     agreed_price = Column(Numeric(16, 2), nullable=True)
     payment_plan = Column(Text, nullable=True)
+    next_payment_due_at = Column(DateTime(timezone=True), nullable=True)
     notes = Column(Text, nullable=True)
     cancelled_at = Column(DateTime(timezone=True), nullable=True)
     cancellation_reason = Column(Text, nullable=True)
@@ -302,7 +308,81 @@ class EstatePayment(Base):
     voided_by_subject_id = Column(String(128), nullable=True)
     voided_at = Column(DateTime(timezone=True), nullable=True)
     void_reason = Column(Text, nullable=True)
+    receipt_number = Column(String(120), nullable=True, unique=True)
+    reconciled_at = Column(DateTime(timezone=True), nullable=True)
+    reconciled_by_subject_type = Column(String(64), nullable=True)
+    reconciled_by_subject_id = Column(String(128), nullable=True)
     created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+
+class EstatePaymentInbox(Base):
+    """A safe holding area for bank/online payment notifications before staff match them."""
+
+    __tablename__ = "estate_payment_inbox"
+
+    id = Column(Integer, primary_key=True)
+    organization_id = Column(Integer, ForeignKey("estate_organizations.id", ondelete="CASCADE"), nullable=False)
+    estate_id = Column(Integer, ForeignKey("estate_estates.id", ondelete="SET NULL"), nullable=True)
+    amount = Column(Numeric(16, 2), nullable=False)
+    currency = Column(String(3), nullable=False, default="NGN")
+    payment_date = Column(DateTime(timezone=True), nullable=False)
+    payer_name = Column(String(255), nullable=True)
+    payer_reference = Column(String(160), nullable=True)
+    source = Column(String(80), nullable=False, default="manual")
+    raw_payload = Column(JSON, nullable=True)
+    status = Column(String(32), nullable=False, default="unmatched")
+    matched_payment_id = Column(Integer, ForeignKey("estate_payments.id", ondelete="SET NULL"), nullable=True)
+    match_notes = Column(Text, nullable=True)
+    matched_at = Column(DateTime(timezone=True), nullable=True)
+    matched_by_subject_type = Column(String(64), nullable=True)
+    matched_by_subject_id = Column(String(128), nullable=True)
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
+
+    __table_args__ = (
+        CheckConstraint("status IN ('unmatched', 'matched', 'ignored')", name="ck_estate_payment_inbox_status"),
+    )
+
+
+class EstateCustomerPortalToken(Base):
+    """Revocable, hashed links for a buyer's safe self-service portal."""
+
+    __tablename__ = "estate_customer_portal_tokens"
+
+    id = Column(Integer, primary_key=True)
+    organization_id = Column(Integer, ForeignKey("estate_organizations.id", ondelete="CASCADE"), nullable=False)
+    customer_id = Column(Integer, ForeignKey("estate_customers.id", ondelete="CASCADE"), nullable=False)
+    token_hash = Column(String(64), nullable=False, unique=True)
+    expires_at = Column(DateTime(timezone=True), nullable=False)
+    revoked_at = Column(DateTime(timezone=True), nullable=True)
+    last_used_at = Column(DateTime(timezone=True), nullable=True)
+    created_by_subject_type = Column(String(64), nullable=False)
+    created_by_subject_id = Column(String(128), nullable=False)
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+
+class EstateQrCampaign(Base):
+    """A tracked public-page source such as an entrance sign, brochure, agent, or WhatsApp link."""
+
+    __tablename__ = "estate_qr_campaigns"
+
+    id = Column(Integer, primary_key=True)
+    organization_id = Column(Integer, ForeignKey("estate_organizations.id", ondelete="CASCADE"), nullable=False)
+    estate_id = Column(Integer, ForeignKey("estate_estates.id", ondelete="CASCADE"), nullable=False)
+    code = Column(String(120), nullable=False)
+    name = Column(String(160), nullable=False)
+    channel = Column(String(64), nullable=False, default="other")
+    assigned_agent_subject_type = Column(String(64), nullable=True)
+    assigned_agent_subject_id = Column(String(128), nullable=True)
+    scan_count = Column(Integer, nullable=False, default=0)
+    last_scanned_at = Column(DateTime(timezone=True), nullable=True)
+    is_active = Column(Boolean, nullable=False, default=True)
+    created_by_subject_type = Column(String(64), nullable=False)
+    created_by_subject_id = Column(String(128), nullable=False)
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
+
+    __table_args__ = (UniqueConstraint("estate_id", "code", name="uq_estate_qr_campaign_code"),)
 
 
 class EstateDocument(Base):

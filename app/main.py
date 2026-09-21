@@ -190,6 +190,31 @@ def _run_estate_subscription_billing_job():
         session_db.close()
 
 
+_ESTATE_RESERVATION_EXPIRY_LOCK_KEY = 872341002
+
+
+def _run_estate_reservation_expiry_job():
+    from sqlalchemy import text
+
+    from app.services.estates.operations import expire_due_reservations
+
+    session_db = SessionLocal()
+    try:
+        got_lock = session_db.execute(text("SELECT pg_try_advisory_lock(:key)"), {"key": _ESTATE_RESERVATION_EXPIRY_LOCK_KEY}).scalar()
+        if not got_lock:
+            return
+        try:
+            expire_due_reservations(session_db)
+            session_db.commit()
+        except Exception:
+            session_db.rollback()
+            raise
+        finally:
+            session_db.execute(text("SELECT pg_advisory_unlock(:key)"), {"key": _ESTATE_RESERVATION_EXPIRY_LOCK_KEY})
+    finally:
+        session_db.close()
+
+
 # Preserve the legacy Survey/Green bootstrap; Estate schema is managed by Alembic.
 @app.on_event("startup")
 def startup_event():
@@ -243,6 +268,12 @@ def startup_event():
         _run_estate_subscription_billing_job,
         trigger=CronTrigger(hour=6, minute=0),
         id="estate_subscription_billing",
+        replace_existing=True,
+    )
+    scheduler.add_job(
+        _run_estate_reservation_expiry_job,
+        trigger=CronTrigger(minute="*/5"),
+        id="estate_reservation_expiry",
         replace_existing=True,
     )
     scheduler.start()

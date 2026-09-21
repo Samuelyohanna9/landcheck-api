@@ -31,7 +31,9 @@ def record_payment(db: Session, *, allocation: EstateAllocation, amount: Decimal
     summary = financial_summary(db, allocation)
     if allocation.agreed_price and summary.confirmed_paid + amount > summary.agreed_price: raise HTTPException(409, "Payment exceeds the outstanding balance")
     payment = EstatePayment(organization_id=allocation.organization_id, allocation_id=allocation.id, customer_id=allocation.customer_id, plot_id=allocation.plot_id, amount=amount, payment_date=payment_date, payment_method=method, reference_no=reference or None, notes=notes, status="pending_confirmation" if confirmation_required else "recorded", recorded_by_subject_type=actor.subject_type, recorded_by_subject_id=actor.subject_id)
-    db.add(payment); db.flush(); append_estate_audit_event(db, organization_id=allocation.organization_id, actor=actor, action="payment.recorded", entity_type="estate_payment", entity_id=payment.id, after_data={"amount": str(amount), "status": payment.status, "reference": reference})
+    db.add(payment); db.flush()
+    payment.receipt_number = f"LC-{payment.payment_uid[:8].upper()}"
+    append_estate_audit_event(db, organization_id=allocation.organization_id, actor=actor, action="payment.recorded", entity_type="estate_payment", entity_id=payment.id, after_data={"amount": str(amount), "status": payment.status, "reference": reference, "receipt_number": payment.receipt_number})
     return payment
 
 def confirm_payment(db: Session, *, payment: EstatePayment, actor: EstatePrincipal) -> EstatePayment:
@@ -39,6 +41,8 @@ def confirm_payment(db: Session, *, payment: EstatePayment, actor: EstatePrincip
         raise HTTPException(409, "Payment is already confirmed")
     if payment.status not in {"recorded", "pending_confirmation"}: raise HTTPException(409, "Payment cannot be confirmed")
     payment.status="confirmed"; payment.confirmed_at=datetime.now(timezone.utc); payment.confirmed_by_subject_type=actor.subject_type; payment.confirmed_by_subject_id=actor.subject_id
+    if not payment.receipt_number:
+        payment.receipt_number = f"LC-{payment.payment_uid[:8].upper()}"
     append_estate_audit_event(db, organization_id=payment.organization_id, actor=actor, action="payment.confirmed", entity_type="estate_payment", entity_id=payment.id, before_data={"status":"pending_confirmation"}, after_data={"status":"confirmed"})
     return payment
 

@@ -148,6 +148,13 @@ def _event_copy(event: str, *, org_name: str, estate_name: str, plot_number: str
             f"<p>We're delighted to confirm that <strong>Plot {html.escape(plot_number)}</strong> at "
             f"<strong>{html.escape(estate_name)}</strong> has been reserved in your name.</p>",
         )
+    if event == "reservation_expiring":
+        return (
+            f"Reservation deadline approaching - Plot {plot_number}",
+            f"Your reservation deadline is approaching, {html.escape(first_name)}",
+            f"<p>Your reservation for <strong>Plot {html.escape(plot_number)}</strong> at <strong>{html.escape(estate_name)}</strong> will expire soon.</p>"
+            f"<p>Please contact {html.escape(org_name)} to confirm payment or the next step before the deadline.</p>",
+        )
     if event == "allocated":
         return (
             f"Plot {plot_number} at {estate_name} is Now Allocated to You",

@@ -13,6 +13,11 @@ from decimal import Decimal
 from types import SimpleNamespace
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import Response
+from reportlab.graphics import renderPDF
+from reportlab.graphics.barcode import qr
+from reportlab.graphics.shapes import Drawing
+from reportlab.lib.pagesizes import A4
+from reportlab.pdfgen import canvas
 from geoalchemy2.shape import from_shape, to_shape
 from pyproj import Transformer
 import ezdxf
@@ -25,8 +30,8 @@ from app.routers.plots import _metric_epsg_for_wgs84_polygon, _subdivide_polygon
 from app.services.estates.authorization import list_estate_access, resolve_estate_principal
 from app.services.estates.identity import slugify
 from app.services.estates.entitlements import ESTATE_FEATURES, get_estate_entitlement
-from app.models.estate_foundation import Estate, EstateAllocation, EstateAuditEvent, EstateBlock, EstateCommissionPayout, EstateCommissionTier, EstateCustomer, EstateDocument, EstateDocumentLink, EstateFieldInspection, EstateHazardAssessment, EstateImportReview, EstateLayoutProposal, EstateOrganization, EstateOrganizationMember, EstatePayment, EstatePaymentRule, EstatePlot, EstatePublicReservationRequest, EstateSpatialFeature, EstateSurveyRequest, EstateStakingTask
-from app.schemas.estates import AllocationAction, BlockCreate, BlockUpdate, CommissionPayoutCreate, CommissionTiersUpdate, CustomerCreate, DevelopmentStatusUpdate, EstateCreate, EstateLayoutCriteria, EstateLayoutDecision, EstateLayoutFeatureAdd, EstateLayoutFeatureRemove, EstateLayoutProposalEdit, EstateSubdivisionCreate, EstateUpdate, FieldInspectionCreate, GeoreferenceSessionLink, ImportFromGeoreference, ImportReviewCreate, ImportReviewDecision, ImportReviewFromGeoreferenceSession, MemberCreate, MemberUpdate, PlotCreate, PlotAddressUpdate, PlotGeometryUpdate, PlotListingDefaultsUpdate, PlotPriceUpdate, PublicEstateSettingsUpdate, PublicReservationConvert, PublicReservationCreate, PublicReservationUpdate, PaymentCreate, SpatialFeatureCreate, SpatialFeatureUpdate, SurveyEligibilityUpdate, VoidAction
+from app.models.estate_foundation import Estate, EstateAllocation, EstateAuditEvent, EstateBlock, EstateCommissionPayout, EstateCommissionTier, EstateCustomer, EstateCustomerPortalToken, EstateDocument, EstateDocumentLink, EstateFieldInspection, EstateHazardAssessment, EstateImportReview, EstateLayoutProposal, EstateOrganization, EstateOrganizationMember, EstatePayment, EstatePaymentInbox, EstatePaymentRule, EstatePlot, EstatePublicReservationRequest, EstateQrCampaign, EstateSpatialFeature, EstateSurveyRequest, EstateStakingTask
+from app.schemas.estates import AllocationAction, BlockCreate, BlockUpdate, CommissionPayoutCreate, CommissionTiersUpdate, CustomerCreate, DevelopmentStatusUpdate, EstateCreate, EstateLayoutCriteria, EstateLayoutDecision, EstateLayoutFeatureAdd, EstateLayoutFeatureRemove, EstateLayoutProposalEdit, EstateSubdivisionCreate, EstateUpdate, FieldInspectionCreate, GeoreferenceSessionLink, ImportFromGeoreference, ImportReviewCreate, ImportReviewDecision, ImportReviewFromGeoreferenceSession, MemberCreate, MemberUpdate, PaymentInboxCreate, PaymentInboxMatch, PlotCreate, PlotAddressUpdate, PlotGeometryUpdate, PlotListingDefaultsUpdate, PlotPriceUpdate, PortalTokenCreate, PublicEstateSettingsUpdate, PublicReservationConvert, PublicReservationCreate, PublicReservationUpdate, PaymentCreate, QrCampaignCreate, SpatialFeatureCreate, SpatialFeatureUpdate, SurveyEligibilityUpdate, VoidAction
 from app.services.estates.payments import confirm_payment, financial_summary, record_payment, void_payment
 from app.services.estates.documents import read_private_estate_file, store_private_estate_file
 from app.utils.r2_objects import delete_object_best_effort, build_r2_settings
@@ -51,6 +56,7 @@ from app.services.estates import estate_email
 from app.services.estates.layout_export import render_estate_layout_pdf
 from app.services.estates.report_export import render_customer_statement_pdf, render_estate_report_pdf
 from app.services.estates import commissions
+from app.services.estates.operations import DOCUMENT_REQUIREMENTS, PUBLIC_DOCUMENT_TYPES, build_operations_summary, buyer_portal_payload, document_readiness, hash_portal_token, issue_customer_portal_token, linked_documents
 from app.db import SessionLocal
 from app.utils.hazard_jobs import get_hazard_job, insert_hazard_job, serialize_hazard_job, set_hazard_job_status
 
@@ -189,6 +195,10 @@ def _public_reservation_payload(db: Session, row: EstatePublicReservationRequest
         "phone": row.phone,
         "email": row.email,
         "message": row.message,
+        "source_code": row.source_code,
+        "source_channel": row.source_channel,
+        "assigned_agent_subject_type": row.assigned_agent_subject_type,
+        "assigned_agent_subject_id": row.assigned_agent_subject_id,
         "status": row.status,
         "staff_notes": row.staff_notes,
         "created_at": row.created_at,
@@ -270,9 +280,16 @@ def _geojson_geometry(value: dict, *, allow_polygon: bool = True):
 
 
 @router.get("/public/{slug}")
-def public_estate_showcase(slug: str, db: Session = Depends(get_db)):
+def public_estate_showcase(slug: str, source: str | None = None, db: Session = Depends(get_db)):
     """Return only the approved, public-safe inventory for a published Estate."""
-    return _public_estate_payload(db, _public_estate(db, slug))
+    estate = _public_estate(db, slug)
+    if source:
+        campaign = db.query(EstateQrCampaign).filter(EstateQrCampaign.estate_id == estate.id, EstateQrCampaign.code == source.strip(), EstateQrCampaign.is_active.is_(True)).one_or_none()
+        if campaign:
+            campaign.scan_count = int(campaign.scan_count or 0) + 1
+            campaign.last_scanned_at = datetime.now(timezone.utc)
+            db.commit()
+    return _public_estate_payload(db, estate)
 
 
 @router.get("/public/{slug}/logo")
@@ -286,7 +303,7 @@ def public_estate_logo(slug: str, db: Session = Depends(get_db)):
 
 
 @router.post("/public/{slug}/plots/{plot_id}/reservation", status_code=201)
-def create_public_reservation(slug: str, plot_id: int, payload: PublicReservationCreate, db: Session = Depends(get_db)):
+def create_public_reservation(slug: str, plot_id: int, payload: PublicReservationCreate, source: str | None = None, db: Session = Depends(get_db)):
     """Create a sales lead without creating a customer or changing plot ownership."""
     estate = _public_estate(db, slug)
     plot = (
@@ -301,6 +318,8 @@ def create_public_reservation(slug: str, plot_id: int, payload: PublicReservatio
     email = str(payload.email or "").strip().lower() or None
     if email and not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email):
         raise HTTPException(status_code=422, detail="Enter a valid email address or leave it blank")
+    source_code = (source or payload.source or "").strip() or None
+    campaign = db.query(EstateQrCampaign).filter(EstateQrCampaign.estate_id == estate.id, EstateQrCampaign.code == source_code, EstateQrCampaign.is_active.is_(True)).one_or_none() if source_code else None
     row = EstatePublicReservationRequest(
         organization_id=estate.organization_id,
         estate_id=estate.id,
@@ -309,6 +328,10 @@ def create_public_reservation(slug: str, plot_id: int, payload: PublicReservatio
         phone=payload.phone.strip(),
         email=email,
         message=payload.message.strip() if payload.message else None,
+        source_code=campaign.code if campaign else source_code,
+        source_channel=campaign.channel if campaign else None,
+        assigned_agent_subject_type=campaign.assigned_agent_subject_type if campaign else None,
+        assigned_agent_subject_id=campaign.assigned_agent_subject_id if campaign else None,
         status="new",
     )
     db.add(row)
@@ -320,8 +343,8 @@ def create_public_reservation(slug: str, plot_id: int, payload: PublicReservatio
         action="public_reservation.created",
         entity_type="estate_public_reservation_request",
         entity_id=row.id,
-        after_data={"estate_id": estate.id, "plot_id": plot.id, "plot_number": plot.plot_number, "full_name": row.full_name, "phone": row.phone, "email": row.email},
-        metadata={"source": "public_estate_showcase"},
+        after_data={"estate_id": estate.id, "plot_id": plot.id, "plot_number": plot.plot_number, "full_name": row.full_name, "phone": row.phone, "email": row.email, "source_code": row.source_code},
+        metadata={"source": "public_estate_showcase", "campaign": row.source_code},
     )
     db.commit()
     organization = db.get(EstateOrganization, estate.organization_id)
@@ -800,6 +823,9 @@ def convert_public_reservation_request(
         payment_plan=payload.payment_plan or configured_payment_plan,
         notes=payload.notes or "Created from public reservation request",
     )
+    if row.assigned_agent_subject_type and row.assigned_agent_subject_id:
+        allocation.sales_agent_subject_type = row.assigned_agent_subject_type
+        allocation.sales_agent_subject_id = row.assigned_agent_subject_id
     row.customer_id = customer.id
     row.allocation_id = allocation.id
     row.status = "converted"
@@ -3079,7 +3105,7 @@ def reserve_plot(estate_id: int, plot_id: int, payload: AllocationAction, reques
     access = require_estate_access(db, request, estate.organization_id, permission="allocation.manage")
     customer = db.get(EstateCustomer, payload.customer_id)
     if not customer or customer.organization_id != access.organization_id: raise HTTPException(404, "Customer not found")
-    record = reserve_or_allocate(db, plot=plot, customer=customer, actor=access.principal, allocate=False, expires_at=payload.expires_at, agreed_price=payload.agreed_price, payment_plan=payload.payment_plan, notes=payload.notes)
+    record = reserve_or_allocate(db, plot=plot, customer=customer, actor=access.principal, allocate=False, expires_at=payload.expires_at, agreed_price=payload.agreed_price, payment_plan=payload.payment_plan, next_payment_due_at=payload.next_payment_due_at, notes=payload.notes)
     if payload.sales_agent_subject_type and payload.sales_agent_subject_id:
         record.sales_agent_subject_type = payload.sales_agent_subject_type
         record.sales_agent_subject_id = payload.sales_agent_subject_id
@@ -3113,7 +3139,7 @@ def allocate_plot(estate_id: int, plot_id: int, payload: AllocationAction, reque
             f"{estate_email.format_naira(already_confirmed + incoming)} of {estate_email.format_naira(effective_agreed_price)} agreed. "
             f"Reserve it instead, or record the remaining payment first.",
         )
-    record = reserve_or_allocate(db, plot=plot, customer=customer, actor=access.principal, allocate=True, agreed_price=payload.agreed_price, payment_plan=payload.payment_plan, notes=payload.notes)
+    record = reserve_or_allocate(db, plot=plot, customer=customer, actor=access.principal, allocate=True, agreed_price=payload.agreed_price, payment_plan=payload.payment_plan, next_payment_due_at=payload.next_payment_due_at, notes=payload.notes)
     if payload.sales_agent_subject_type and payload.sales_agent_subject_id:
         record.sales_agent_subject_type = payload.sales_agent_subject_type
         record.sales_agent_subject_id = payload.sales_agent_subject_id
@@ -3318,7 +3344,88 @@ def list_payments(request: Request, page: int = 1, page_size: int = 25, search: 
     if search:
         term=f"%{search.strip()}%"; query=query.filter((EstateCustomer.full_name.ilike(term)) | (EstatePlot.plot_number.ilike(term)) | (EstatePayment.reference_no.ilike(term)))
     total=query.count(); rows=query.order_by(EstatePayment.payment_date.desc()).offset(max(page-1,0)*min(max(page_size,1),100)).limit(min(max(page_size,1),100)).all()
-    return {"page":page,"page_size":min(max(page_size,1),100),"total":total,"items":[{"id":p.id,"date":p.payment_date,"amount":str(p.amount),"currency":p.currency,"status":p.status,"method":p.payment_method,"reference":p.reference_no,"customer":{"id":c.id,"name":c.full_name},"estate":{"id":e.id,"name":e.name},"plot":{"id":plot.id,"number":plot.plot_number},"allocation_id":p.allocation_id,"recorded_by":p.recorded_by_subject_id,"confirmed_by":p.confirmed_by_subject_id,"can_confirm":has_permission(memberships[p.organization_id].role_key,"payment.manage") and p.status in {"recorded","pending_confirmation"},"can_void":has_permission(memberships[p.organization_id].role_key,"payment.manage") and p.status not in {"voided","reversed"},"can_view_receipt":has_permission(memberships[p.organization_id].role_key,"document.read")} for p,c,e,plot in rows]}
+    return {"page":page,"page_size":min(max(page_size,1),100),"total":total,"items":[{"id":p.id,"date":p.payment_date,"amount":str(p.amount),"currency":p.currency,"status":p.status,"method":p.payment_method,"reference":p.reference_no,"receipt_number":p.receipt_number,"customer":{"id":c.id,"name":c.full_name},"estate":{"id":e.id,"name":e.name},"plot":{"id":plot.id,"number":plot.plot_number},"allocation_id":p.allocation_id,"recorded_by":p.recorded_by_subject_id,"confirmed_by":p.confirmed_by_subject_id,"can_confirm":has_permission(memberships[p.organization_id].role_key,"payment.manage") and p.status in {"recorded","pending_confirmation"},"can_void":has_permission(memberships[p.organization_id].role_key,"payment.manage") and p.status not in {"voided","reversed"},"can_view_receipt":has_permission(memberships[p.organization_id].role_key,"document.read")} for p,c,e,plot in rows]}
+
+@router.post("/payment-inbox", status_code=201)
+def create_payment_inbox(payload: PaymentInboxCreate, request: Request, db: Session = Depends(get_db)):
+    if payload.estate_id is not None:
+        estate = db.get(Estate, payload.estate_id)
+        if not estate:
+            raise HTTPException(404, "Estate not found")
+        access = require_estate_access(db, request, estate.organization_id, permission="payment.manage")
+        organization_id = estate.organization_id
+    else:
+        principal = resolve_estate_principal(db, request)
+        access = next((item for item in list_estate_access(db, principal) if has_permission(item.role_key, "payment.manage")), None)
+        if not access:
+            raise HTTPException(403, "Payment management access is required")
+        organization_id = access.organization_id
+    row = EstatePaymentInbox(organization_id=organization_id, estate_id=payload.estate_id, amount=payload.amount, payment_date=payload.payment_date, payer_name=payload.payer_name, payer_reference=payload.payer_reference, source=payload.source.strip().lower() or "manual", raw_payload=payload.raw_payload)
+    db.add(row); db.flush(); append_estate_audit_event(db, organization_id=organization_id, actor=access.principal, action="payment.inbox.created", entity_type="estate_payment_inbox", entity_id=row.id, after_data={"amount": str(row.amount), "source": row.source}); db.commit()
+    return {"id": row.id, "status": row.status, "amount": str(row.amount), "payment_date": row.payment_date, "payer_name": row.payer_name, "payer_reference": row.payer_reference}
+
+
+@router.get("/payment-inbox")
+def list_payment_inbox(request: Request, status: str = "unmatched", estate_id: int | None = None, db: Session = Depends(get_db)):
+    principal = resolve_estate_principal(db, request)
+    allowed = {item.organization_id for item in list_estate_access(db, principal) if has_permission(item.role_key, "payment.read")}
+    query = db.query(EstatePaymentInbox).filter(EstatePaymentInbox.organization_id.in_(allowed))
+    if status != "all":
+        query = query.filter(EstatePaymentInbox.status == status)
+    if estate_id is not None:
+        query = query.filter(EstatePaymentInbox.estate_id == estate_id)
+    rows = query.order_by(EstatePaymentInbox.payment_date.desc()).limit(200).all()
+    return [{"id": row.id, "estate_id": row.estate_id, "amount": str(row.amount), "currency": row.currency, "payment_date": row.payment_date, "payer_name": row.payer_name, "payer_reference": row.payer_reference, "source": row.source, "status": row.status, "matched_payment_id": row.matched_payment_id} for row in rows]
+
+
+@router.post("/payment-inbox/{inbox_id}/match")
+def match_payment_inbox(inbox_id: int, payload: PaymentInboxMatch, request: Request, db: Session = Depends(get_db)):
+    inbox = db.get(EstatePaymentInbox, inbox_id)
+    if not inbox:
+        raise HTTPException(404, "Payment inbox item not found")
+    access = require_estate_access(db, request, inbox.organization_id, permission="payment.manage")
+    if inbox.status != "unmatched":
+        raise HTTPException(409, "This payment inbox item has already been resolved")
+    allocation = db.get(EstateAllocation, payload.allocation_id)
+    if not allocation or allocation.organization_id != inbox.organization_id:
+        raise HTTPException(404, "Allocation not found")
+    payment = record_payment(db, allocation=allocation, amount=Decimal(str(inbox.amount)), payment_date=inbox.payment_date, method=payload.payment_method, reference=payload.reference_no or inbox.payer_reference, notes=payload.notes or f"Matched from {inbox.source} payment inbox", actor=access.principal)
+    inbox.status = "matched"; inbox.matched_payment_id = payment.id; inbox.matched_at = datetime.now(timezone.utc); inbox.matched_by_subject_type = access.principal.subject_type; inbox.matched_by_subject_id = access.principal.subject_id; inbox.match_notes = payload.notes
+    append_estate_audit_event(db, organization_id=inbox.organization_id, actor=access.principal, action="payment.inbox.matched", entity_type="estate_payment_inbox", entity_id=inbox.id, after_data={"payment_id": payment.id, "allocation_id": allocation.id})
+    db.commit()
+    return {"id": inbox.id, "status": inbox.status, "payment_id": payment.id, "payment_status": payment.status, "receipt_number": payment.receipt_number}
+
+
+@router.post("/payment-inbox/{inbox_id}/ignore")
+def ignore_payment_inbox(inbox_id: int, request: Request, db: Session = Depends(get_db)):
+    inbox = db.get(EstatePaymentInbox, inbox_id)
+    if not inbox:
+        raise HTTPException(404, "Payment inbox item not found")
+    access = require_estate_access(db, request, inbox.organization_id, permission="payment.manage")
+    if inbox.status != "unmatched":
+        raise HTTPException(409, "This payment inbox item has already been resolved")
+    inbox.status = "ignored"; inbox.matched_at = datetime.now(timezone.utc); inbox.matched_by_subject_type = access.principal.subject_type; inbox.matched_by_subject_id = access.principal.subject_id
+    append_estate_audit_event(db, organization_id=inbox.organization_id, actor=access.principal, action="payment.inbox.ignored", entity_type="estate_payment_inbox", entity_id=inbox.id); db.commit()
+    return {"id": inbox.id, "status": inbox.status}
+
+
+@router.get("/payments/{payment_id}/receipt.pdf")
+def payment_receipt_pdf(payment_id: int, request: Request, db: Session = Depends(get_db)):
+    payment = db.get(EstatePayment, payment_id)
+    if not payment:
+        raise HTTPException(404, "Payment not found")
+    access = require_estate_access(db, request, payment.organization_id, permission="document.read")
+    allocation = db.get(EstateAllocation, payment.allocation_id); customer = db.get(EstateCustomer, payment.customer_id); plot = db.get(EstatePlot, payment.plot_id); estate = db.get(Estate, allocation.estate_id) if allocation else None
+    buffer = io.BytesIO(); pdf = canvas.Canvas(buffer, pagesize=A4); width, height = A4
+    pdf.setTitle(payment.receipt_number or f"Payment receipt {payment.id}"); pdf.setFont("Helvetica-Bold", 19); pdf.drawString(42, height - 65, "LandCheck Estate payment receipt")
+    pdf.setFont("Helvetica", 11); y = height - 105
+    for line in [f"Receipt: {payment.receipt_number or 'Pending'}", f"Customer: {customer.full_name if customer else '-'}", f"Estate: {estate.name if estate else '-'}", f"Plot: {plot.plot_number if plot else '-'}", f"Amount: {payment.currency} {Decimal(str(payment.amount)):,.2f}", f"Payment date: {payment.payment_date:%d %b %Y}", f"Method: {payment.payment_method.replace('_', ' ').title()}", f"Reference: {payment.reference_no or '-'}", f"Status: {payment.status.replace('_', ' ').title()}"]:
+        pdf.drawString(48, y, line); y -= 20
+    pdf.setFont("Helvetica-Oblique", 9); pdf.drawString(48, y - 16, "Keep this receipt for your Estate records."); pdf.save()
+    append_estate_audit_event(db, organization_id=payment.organization_id, actor=access.principal, action="payment.receipt_downloaded", entity_type="estate_payment", entity_id=payment.id); db.commit()
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "-", payment.receipt_number or f"payment-{payment.id}").strip("-.")
+    return Response(buffer.getvalue(), media_type="application/pdf", headers={"Content-Disposition": f'attachment; filename="{safe}.pdf"'})
+
 
 @router.get("/payments/{payment_id}")
 def payment_detail(payment_id:int,request:Request,db:Session=Depends(get_db)):
@@ -3327,7 +3434,7 @@ def payment_detail(payment_id:int,request:Request,db:Session=Depends(get_db)):
     access=require_estate_access(db,request,payment.organization_id,permission="payment.read")
     allocation=db.get(EstateAllocation,payment.allocation_id); customer=db.get(EstateCustomer,payment.customer_id); plot=db.get(EstatePlot,payment.plot_id); estate=db.get(Estate,allocation.estate_id); summary=financial_summary(db,allocation)
     evidence=db.query(EstateDocument).join(EstateDocumentLink,EstateDocumentLink.document_id==EstateDocument.id).filter(EstateDocumentLink.entity_type=="payment",EstateDocumentLink.entity_id==str(payment_id)).all()
-    return {"payment":{"id":payment.id,"amount":str(payment.amount),"currency":payment.currency,"date":payment.payment_date,"method":payment.payment_method,"reference":payment.reference_no,"notes":payment.notes,"status":payment.status,"recorded_by":payment.recorded_by_subject_id,"confirmed_by":payment.confirmed_by_subject_id,"confirmed_at":payment.confirmed_at,"void_reason":payment.void_reason},"customer":{"id":customer.id,"name":customer.full_name},"estate":{"id":estate.id,"name":estate.name},"plot":{"id":plot.id,"number":plot.plot_number},"allocation_id":allocation.id,"financial":{"agreed_price":str(summary.agreed_price),"confirmed":str(summary.confirmed_paid),"pending":str(summary.pending_paid),"outstanding":str(summary.outstanding)},"capabilities":{"can_confirm":has_permission(access.role_key,"payment.manage") and payment.status in {"recorded","pending_confirmation"},"can_void":has_permission(access.role_key,"payment.manage") and payment.status not in {"voided","reversed"},"can_view_receipt":has_permission(access.role_key,"document.read")},"evidence":[{"id":d.id,"filename":d.original_filename,"mime_type":d.mime_type} for d in evidence]}
+    return {"payment":{"id":payment.id,"amount":str(payment.amount),"currency":payment.currency,"date":payment.payment_date,"method":payment.payment_method,"reference":payment.reference_no,"receipt_number":payment.receipt_number,"notes":payment.notes,"status":payment.status,"recorded_by":payment.recorded_by_subject_id,"confirmed_by":payment.confirmed_by_subject_id,"confirmed_at":payment.confirmed_at,"void_reason":payment.void_reason},"customer":{"id":customer.id,"name":customer.full_name},"estate":{"id":estate.id,"name":estate.name},"plot":{"id":plot.id,"number":plot.plot_number},"allocation_id":allocation.id,"financial":{"agreed_price":str(summary.agreed_price),"confirmed":str(summary.confirmed_paid),"pending":str(summary.pending_paid),"outstanding":str(summary.outstanding)},"capabilities":{"can_confirm":has_permission(access.role_key,"payment.manage") and payment.status in {"recorded","pending_confirmation"},"can_void":has_permission(access.role_key,"payment.manage") and payment.status not in {"voided","reversed"},"can_view_receipt":has_permission(access.role_key,"document.read")},"evidence":[{"id":d.id,"filename":d.original_filename,"mime_type":d.mime_type} for d in evidence]}
 
 @router.get("/documents")
 def list_documents(request:Request,page:int=1,page_size:int=25,document_type:str|None=None,entity_type:str|None=None,entity_id:int|None=None,db:Session=Depends(get_db)):
@@ -3358,6 +3465,234 @@ def estate_selectors(request:Request, estate_id:int|None=None, customer_id:int|N
     for allocation,estate,plot,customer in allocation_rows:
         summary=financials[allocation.id]; allocation_items.append({"id":allocation.id,"estate_id":estate.id,"estate_name":estate.name,"plot_id":plot.id,"plot_number":plot.plot_number,"customer_id":customer.id,"customer_name":customer.full_name,"status":allocation.status,"allocation_date":allocation.allocation_date,"payment_plan":allocation.payment_plan,"agreed_price":str(summary["agreed_price"]),"currency":"NGN","confirmed":str(summary["confirmed_paid"]),"pending":str(summary["pending_paid"]),"outstanding":str(summary["outstanding"])})
     return {"estates":[{"id":e.id,"name":e.name} for e in estates],"customers":[{"id":c.id,"name":c.full_name,"reference":c.reference_no} for c in customers],"plots":[{"id":p.id,"plot_number":p.plot_number,"estate_id":e.id,"estate_name":e.name,"commercial_status":p.commercial_status,"development_status":p.development_status,"geometry_status":p.geometry_status,"block_id":p.block_id,"area_sqm":float(p.area_sqm) if p.area_sqm is not None else 0.0} for p,e in plots],"allocations":allocation_items}
+
+
+@router.get("/{estate_id}/operations-summary")
+def estate_operations_summary(estate_id: int, request: Request, db: Session = Depends(get_db)):
+    estate = db.get(Estate, estate_id)
+    if not estate:
+        raise HTTPException(404, "Estate not found")
+    require_estate_access(db, request, estate.organization_id, permission="estate.read")
+    return build_operations_summary(db, estate)
+
+
+@router.get("/{estate_id}/document-readiness")
+def estate_document_readiness(estate_id: int, request: Request, db: Session = Depends(get_db)):
+    estate = db.get(Estate, estate_id)
+    if not estate:
+        raise HTTPException(404, "Estate not found")
+    require_estate_access(db, request, estate.organization_id, permission="document.read")
+    allocations = db.query(EstateAllocation).filter(EstateAllocation.estate_id == estate_id, EstateAllocation.status.in_(("reserved", "allocated"))).order_by(EstateAllocation.created_at.desc()).all()
+    result = []
+    for allocation in allocations:
+        customer = db.get(EstateCustomer, allocation.customer_id)
+        plot = db.get(EstatePlot, allocation.plot_id)
+        result.append({"allocation_id": allocation.id, "customer": customer.full_name if customer else None, "plot": plot.plot_number if plot else None, **document_readiness(db, allocation)})
+    return {"requirements": list(DOCUMENT_REQUIREMENTS), "items": result}
+
+
+@router.post("/customers/{customer_id}/portal-token")
+def create_customer_portal_token(customer_id: int, payload: PortalTokenCreate, request: Request, db: Session = Depends(get_db)):
+    customer = db.get(EstateCustomer, customer_id)
+    if not customer:
+        raise HTTPException(404, "Customer not found")
+    access = require_estate_access(db, request, customer.organization_id, permission="customer.manage")
+    row, raw_token = issue_customer_portal_token(db, customer=customer, actor=access.principal, expires_in_days=payload.expires_in_days)
+    db.commit()
+    web_url = str(os.getenv("LANDCHECK_WEB_URL") or "https://landcheck.online").rstrip("/")
+    return {"token": raw_token, "expires_at": row.expires_at, "url": f"{web_url}/estates/buyer/{raw_token}"}
+
+
+@router.get("/buyer/{token}")
+def buyer_portal(token: str, db: Session = Depends(get_db)):
+    row = db.query(EstateCustomerPortalToken).filter(EstateCustomerPortalToken.token_hash == hash_portal_token(token)).one_or_none()
+    now = datetime.now(timezone.utc)
+    expires_at = row.expires_at if row and row.expires_at.tzinfo else (row.expires_at.replace(tzinfo=timezone.utc) if row else None)
+    if not row or row.revoked_at is not None or not expires_at or expires_at <= now:
+        raise HTTPException(404, "This buyer portal link is invalid or expired")
+    payload = buyer_portal_payload(db, row)
+    db.commit()
+    return {**payload, "expires_at": expires_at}
+
+
+@router.get("/buyer/{token}/packet/{allocation_id}.pdf")
+def buyer_packet_pdf(token: str, allocation_id: int, db: Session = Depends(get_db)):
+    row = db.query(EstateCustomerPortalToken).filter(EstateCustomerPortalToken.token_hash == hash_portal_token(token)).one_or_none()
+    now = datetime.now(timezone.utc)
+    expires_at = row.expires_at if row and row.expires_at.tzinfo else (row.expires_at.replace(tzinfo=timezone.utc) if row else None)
+    if not row or row.revoked_at is not None or not expires_at or expires_at <= now:
+        raise HTTPException(404, "This buyer portal link is invalid or expired")
+    allocation = db.get(EstateAllocation, allocation_id)
+    if not allocation or allocation.customer_id != row.customer_id or allocation.organization_id != row.organization_id:
+        raise HTTPException(404, "Allocation not found")
+    customer = db.get(EstateCustomer, allocation.customer_id)
+    estate = db.get(Estate, allocation.estate_id)
+    plot = db.get(EstatePlot, allocation.plot_id)
+    summary = financial_summary(db, allocation)
+    payments = db.query(EstatePayment).filter(EstatePayment.allocation_id == allocation.id).order_by(EstatePayment.payment_date.asc()).all()
+    readiness = document_readiness(db, allocation)
+    documents = [document for document in linked_documents(db, allocation) if document.document_type in PUBLIC_DOCUMENT_TYPES]
+    buffer = io.BytesIO()
+    pdf = canvas.Canvas(buffer, pagesize=A4)
+    width, height = A4
+    y = height - 50
+    pdf.setTitle(f"Buyer packet - Plot {plot.plot_number if plot else allocation.plot_id}")
+    pdf.setFont("Helvetica-Bold", 18); pdf.drawString(42, y, estate.name if estate else "LandCheck Estate"); y -= 28
+    pdf.setFont("Helvetica", 11); pdf.drawString(42, y, f"Buyer packet for {customer.full_name if customer else 'Customer'}"); y -= 28
+    pdf.setFont("Helvetica-Bold", 12); pdf.drawString(42, y, f"Plot {plot.plot_number if plot else '-'}"); y -= 20
+    if plot and plot.geometry:
+        outline = list(to_shape(plot.geometry).exterior.coords)
+        if len(outline) > 2:
+            min_x = min(point[0] for point in outline); max_x = max(point[0] for point in outline); min_y = min(point[1] for point in outline); max_y = max(point[1] for point in outline)
+            scale = min(145 / max(max_x - min_x, 0.000001), 110 / max(max_y - min_y, 0.000001))
+            points = [(350 + (point[0] - min_x) * scale, height - 205 + (point[1] - min_y) * scale) for point in outline]
+            pdf.setStrokeColorRGB(0.05, 0.45, 0.25); pdf.setFillColorRGB(0.86, 0.96, 0.89); pdf.setLineWidth(1.5)
+            path = pdf.beginPath(); path.moveTo(*points[0])
+            for point in points[1:]: path.lineTo(*point)
+            path.close(); pdf.drawPath(path, fill=1, stroke=1); pdf.setFillColorRGB(0, 0, 0)
+            pdf.setFont("Helvetica", 8); pdf.drawString(350, height - 220, "Plot boundary (not to scale)")
+    pdf.setFont("Helvetica", 10)
+    for line in [
+        f"Status: {allocation.status.title()}",
+        f"Area: {float(plot.area_sqm or 0):,.2f} m2" if plot else "Area: Not recorded",
+        f"Agreed price: NGN {summary.agreed_price:,.2f}",
+        f"Confirmed paid: NGN {summary.confirmed_paid:,.2f}",
+        f"Outstanding: NGN {summary.outstanding:,.2f}",
+        f"Payment progress: {summary.percentage:.1f}%",
+    ]:
+        pdf.drawString(42, y, line); y -= 17
+    y -= 12; pdf.setFont("Helvetica-Bold", 12); pdf.drawString(42, y, "Document readiness"); y -= 20; pdf.setFont("Helvetica", 10)
+    for item in readiness["stages"]:
+        pdf.drawString(52, y, f"{'Ready' if item['status'] == 'ready' else 'Missing'} - {item['label']}"); y -= 16
+    y -= 10; pdf.setFont("Helvetica-Bold", 12); pdf.drawString(42, y, "Published documents"); y -= 20; pdf.setFont("Helvetica", 10)
+    if documents:
+        for document in documents:
+            pdf.drawString(52, y, f"{document.document_type.replace('_', ' ').title()} - {document.original_filename}"); y -= 16
+            if y < 60:
+                pdf.showPage(); y = height - 50; pdf.setFont("Helvetica", 10)
+    else:
+        pdf.drawString(52, y, "No published documents linked yet."); y -= 16
+    y -= 10; pdf.setFont("Helvetica-Bold", 12); pdf.drawString(42, y, "Payment receipts"); y -= 20; pdf.setFont("Helvetica", 10)
+    if payments:
+        for payment in payments:
+            pdf.drawString(52, y, f"{payment.payment_date:%d %b %Y} | NGN {Decimal(str(payment.amount)):,.2f} | {payment.status.title()} | {payment.receipt_number or 'Receipt pending'}"); y -= 16
+            if y < 60:
+                pdf.showPage(); y = height - 50; pdf.setFont("Helvetica", 10)
+    else:
+        pdf.drawString(52, y, "No payments recorded yet."); y -= 16
+    y -= 18; pdf.setFont("Helvetica-Oblique", 9); pdf.drawString(42, y, "This packet shows the buyer-safe record available through the LandCheck portal.")
+    pdf.save()
+    db.commit()
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "-", f"plot-{plot.plot_number if plot else allocation_id}").strip("-.") or f"plot-{allocation_id}"
+    return Response(buffer.getvalue(), media_type="application/pdf", headers={"Content-Disposition": f'attachment; filename="{safe}_Buyer_Packet.pdf"'})
+
+
+@router.get("/buyer/{token}/documents/{document_id}/download")
+def buyer_document_download(token: str, document_id: int, db: Session = Depends(get_db)):
+    row = db.query(EstateCustomerPortalToken).filter(EstateCustomerPortalToken.token_hash == hash_portal_token(token)).one_or_none()
+    now = datetime.now(timezone.utc)
+    expires_at = row.expires_at if row and row.expires_at.tzinfo else (row.expires_at.replace(tzinfo=timezone.utc) if row else None)
+    if not row or row.revoked_at is not None or not expires_at or expires_at <= now:
+        raise HTTPException(404, "This buyer portal link is invalid or expired")
+    document = db.get(EstateDocument, document_id)
+    if not document or document.organization_id != row.organization_id or document.document_type not in PUBLIC_DOCUMENT_TYPES:
+        raise HTTPException(404, "Document not found")
+    customer_allocation_ids = {str(allocation.id) for allocation in db.query(EstateAllocation).filter(EstateAllocation.customer_id == row.customer_id, EstateAllocation.organization_id == row.organization_id).all()}
+    customer_plot_ids = {str(allocation.plot_id) for allocation in db.query(EstateAllocation).filter(EstateAllocation.customer_id == row.customer_id, EstateAllocation.organization_id == row.organization_id).all()}
+    allowed = db.query(EstateDocumentLink).filter(EstateDocumentLink.document_id == document.id, or_(
+        (EstateDocumentLink.entity_type == "customer") & (EstateDocumentLink.entity_id == str(row.customer_id)),
+        (EstateDocumentLink.entity_type == "allocation") & EstateDocumentLink.entity_id.in_(customer_allocation_ids or {"-1"}),
+        (EstateDocumentLink.entity_type == "plot") & EstateDocumentLink.entity_id.in_(customer_plot_ids or {"-1"}),
+    )).first()
+    if not allowed:
+        raise HTTPException(404, "Document not found")
+    data, mime = read_private_estate_file(document.object_key)
+    return Response(data, media_type=mime, headers={"Content-Disposition": f'inline; filename="{document.original_filename}"'})
+
+
+@router.get("/agent/workspace")
+def agent_workspace(estate_id: int, request: Request, db: Session = Depends(get_db)):
+    estate = db.get(Estate, estate_id)
+    if not estate:
+        raise HTTPException(404, "Estate not found")
+    access = require_estate_access(db, request, estate.organization_id, permission="payment.read")
+    is_sales_agent = access.role_key == "sales"
+    principal = access.principal
+    lead_query = db.query(EstatePublicReservationRequest).filter(EstatePublicReservationRequest.estate_id == estate_id)
+    allocation_query = db.query(EstateAllocation).filter(EstateAllocation.estate_id == estate_id, EstateAllocation.status.in_(("reserved", "allocated")))
+    campaign_query = db.query(EstateQrCampaign).filter(EstateQrCampaign.estate_id == estate_id, EstateQrCampaign.is_active.is_(True))
+    if is_sales_agent:
+        lead_query = lead_query.filter(EstatePublicReservationRequest.assigned_agent_subject_type == principal.subject_type, EstatePublicReservationRequest.assigned_agent_subject_id == principal.subject_id)
+        allocation_query = allocation_query.filter(EstateAllocation.sales_agent_subject_type == principal.subject_type, EstateAllocation.sales_agent_subject_id == principal.subject_id)
+        campaign_query = campaign_query.filter(EstateQrCampaign.assigned_agent_subject_type == principal.subject_type, EstateQrCampaign.assigned_agent_subject_id == principal.subject_id)
+    leads = []
+    for lead in lead_query.order_by(EstatePublicReservationRequest.created_at.desc()).limit(100).all():
+        plot = db.get(EstatePlot, lead.plot_id)
+        leads.append({"id": lead.id, "name": lead.full_name, "phone": lead.phone, "email": lead.email, "status": lead.status, "source_code": lead.source_code, "source_channel": lead.source_channel, "plot": plot.plot_number if plot else None, "created_at": lead.created_at})
+    sales = []
+    total_outstanding = Decimal("0")
+    total_commission = Decimal("0")
+    total_paid_commission = Decimal("0")
+    for allocation in allocation_query.order_by(EstateAllocation.created_at.desc()).all():
+        customer = db.get(EstateCustomer, allocation.customer_id); plot = db.get(EstatePlot, allocation.plot_id); summary = financial_summary(db, allocation)
+        payout_total = Decimal(str(db.query(func.coalesce(func.sum(EstateCommissionPayout.amount), 0)).filter(EstateCommissionPayout.allocation_id == allocation.id).scalar() or 0))
+        commission = Decimal(str(allocation.commission_amount or 0))
+        total_outstanding += summary.outstanding; total_commission += commission; total_paid_commission += payout_total
+        sales.append({"allocation_id": allocation.id, "customer": customer.full_name if customer else None, "plot": plot.plot_number if plot else None, "status": allocation.status, "agreed_price": str(summary.agreed_price), "confirmed_paid": str(summary.confirmed_paid), "outstanding": str(summary.outstanding), "commission": str(commission), "commission_paid": str(payout_total), "commission_due": str(max(Decimal("0"), commission - payout_total))})
+    campaigns = [{"id": row.id, "code": row.code, "name": row.name, "channel": row.channel, "scan_count": row.scan_count, "last_scanned_at": row.last_scanned_at, "assigned_agent_subject_id": row.assigned_agent_subject_id, "public_url": f"{str(os.getenv('LANDCHECK_WEB_URL') or 'https://landcheck.online').rstrip('/')}/estates/public/{estate.public_slug}?source={row.code}"} for row in campaign_query.order_by(EstateQrCampaign.created_at.desc()).all()]
+    return {"estate": {"id": estate.id, "name": estate.name, "public_slug": estate.public_slug}, "agent": {"subject_type": principal.subject_type, "subject_id": principal.subject_id, "name": principal.display_name, "role": access.role_key}, "summary": {"lead_count": len(leads), "sale_count": len(sales), "outstanding": str(total_outstanding), "commission_earned": str(total_commission), "commission_paid": str(total_paid_commission), "commission_due": str(max(Decimal("0"), total_commission - total_paid_commission))}, "leads": leads, "sales": sales, "campaigns": campaigns}
+
+
+def _qr_campaign_payload(row: EstateQrCampaign, estate: Estate) -> dict:
+    web_url = str(os.getenv("LANDCHECK_WEB_URL") or "https://landcheck.online").rstrip("/")
+    return {"id": row.id, "estate_id": row.estate_id, "code": row.code, "name": row.name, "channel": row.channel, "scan_count": row.scan_count, "last_scanned_at": row.last_scanned_at, "assigned_agent_subject_type": row.assigned_agent_subject_type, "assigned_agent_subject_id": row.assigned_agent_subject_id, "public_url": f"{web_url}/estates/public/{estate.public_slug}?source={row.code}"}
+
+
+@router.get("/{estate_id}/qr-campaigns")
+def list_qr_campaigns(estate_id: int, request: Request, db: Session = Depends(get_db)):
+    estate = db.get(Estate, estate_id)
+    if not estate:
+        raise HTTPException(404, "Estate not found")
+    require_estate_access(db, request, estate.organization_id, permission="estate.read")
+    return [_qr_campaign_payload(row, estate) for row in db.query(EstateQrCampaign).filter(EstateQrCampaign.estate_id == estate_id).order_by(EstateQrCampaign.created_at.desc()).all()]
+
+
+@router.post("/{estate_id}/qr-campaigns", status_code=201)
+def create_qr_campaign(estate_id: int, payload: QrCampaignCreate, request: Request, db: Session = Depends(get_db)):
+    estate = db.get(Estate, estate_id)
+    if not estate:
+        raise HTTPException(404, "Estate not found")
+    access = require_estate_access(db, request, estate.organization_id, permission="estate.read")
+    can_assign = has_permission(access.role_key, "estate.manage")
+    assigned_type = payload.assigned_agent_subject_type if can_assign else access.principal.subject_type
+    assigned_id = payload.assigned_agent_subject_id if can_assign else access.principal.subject_id
+    base = re.sub(r"[^a-z0-9]+", "-", payload.name.strip().lower()).strip("-")[:80] or "campaign"
+    code = base
+    if db.query(EstateQrCampaign.id).filter(EstateQrCampaign.estate_id == estate_id, EstateQrCampaign.code == code).first():
+        code = f"{base}-{uuid.uuid4().hex[:6]}"
+    row = EstateQrCampaign(organization_id=estate.organization_id, estate_id=estate.id, code=code, name=payload.name.strip(), channel=payload.channel.strip().lower() or "other", assigned_agent_subject_type=assigned_type, assigned_agent_subject_id=assigned_id, created_by_subject_type=access.principal.subject_type, created_by_subject_id=access.principal.subject_id)
+    db.add(row); db.flush(); append_estate_audit_event(db, organization_id=estate.organization_id, actor=access.principal, action="public_qr_campaign.created", entity_type="estate_qr_campaign", entity_id=row.id, after_data={"code": row.code, "name": row.name}); db.commit()
+    return _qr_campaign_payload(row, estate)
+
+
+@router.get("/qr-campaigns/{campaign_id}/print.pdf")
+def print_qr_campaign(campaign_id: int, request: Request, db: Session = Depends(get_db)):
+    row = db.get(EstateQrCampaign, campaign_id)
+    if not row:
+        raise HTTPException(404, "QR campaign not found")
+    estate = db.get(Estate, row.estate_id)
+    access = require_estate_access(db, request, row.organization_id, permission="estate.read")
+    web_url = str(os.getenv("LANDCHECK_WEB_URL") or "https://landcheck.online").rstrip("/")
+    public_url = f"{web_url}/estates/public/{estate.public_slug}?source={row.code}"
+    buffer = io.BytesIO(); pdf = canvas.Canvas(buffer, pagesize=A4); width, height = A4
+    pdf.setTitle(f"LandCheck QR - {row.name}"); pdf.setFont("Helvetica-Bold", 20); pdf.drawCentredString(width / 2, height - 70, "Verified land with documents?")
+    pdf.setFont("Helvetica", 12); pdf.drawCentredString(width / 2, height - 94, "Scan to view the live estate map and make an enquiry.")
+    qr_widget = qr.QrCodeWidget(public_url); qr_widget.barWidth = 4; qr_widget.barHeight = 4
+    drawing = Drawing(260, 260); drawing.add(qr_widget); renderPDF.draw(drawing, pdf, (width - 260) / 2, height - 390)
+    pdf.setFont("Helvetica-Bold", 14); pdf.drawCentredString(width / 2, height - 430, estate.name); pdf.setFont("Helvetica", 9); pdf.drawCentredString(width / 2, height - 450, f"Campaign: {row.name} | {row.channel}"); pdf.drawCentredString(width / 2, height - 470, public_url)
+    pdf.save(); append_estate_audit_event(db, organization_id=row.organization_id, actor=access.principal, action="public_qr_campaign.printed", entity_type="estate_qr_campaign", entity_id=row.id); db.commit()
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "-", row.name).strip("-.") or "estate-qr"
+    return Response(buffer.getvalue(), media_type="application/pdf", headers={"Content-Disposition": f'attachment; filename="{safe}_QR_Tag.pdf"'})
 
 
 @router.get("/{estate_id}")
