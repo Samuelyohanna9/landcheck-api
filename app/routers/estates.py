@@ -847,7 +847,7 @@ async def upload_public_estate_logo(estate_id: int, request: Request, file: Uplo
 
 
 @router.get("/{estate_id}/reservation-requests")
-def list_public_reservation_requests(estate_id: int, request: Request, status: str | None = None, db: Session = Depends(get_db)):
+def list_public_reservation_requests(estate_id: int, request: Request, status: str | None = None, page: int | None = None, page_size: int = 8, search: str | None = None, db: Session = Depends(get_db)):
     estate = db.get(Estate, estate_id)
     if not estate:
         raise HTTPException(404, "Estate not found")
@@ -857,8 +857,25 @@ def list_public_reservation_requests(estate_id: int, request: Request, status: s
         if status not in {"new", "contacted", "converted", "declined"}:
             raise HTTPException(status_code=422, detail="Unknown reservation request status")
         query = query.filter(EstatePublicReservationRequest.status == status)
-    rows = query.order_by(EstatePublicReservationRequest.created_at.desc()).limit(200).all()
-    return [_public_reservation_payload(db, row) for row in rows]
+    if search and search.strip():
+        term = f"%{search.strip().lower()}%"
+        query = query.filter(
+            or_(
+                func.lower(EstatePublicReservationRequest.full_name).like(term),
+                func.lower(EstatePublicReservationRequest.phone).like(term),
+                func.lower(EstatePublicReservationRequest.email).like(term),
+            )
+        )
+    ordered = query.order_by(EstatePublicReservationRequest.created_at.desc())
+    if page is None:
+        rows = ordered.limit(200).all()
+        return [_public_reservation_payload(db, row) for row in rows]
+    safe_page = max(1, page)
+    safe_page_size = min(max(page_size, 1), 50)
+    total = ordered.count()
+    rows = ordered.offset((safe_page - 1) * safe_page_size).limit(safe_page_size).all()
+    new_count = query.filter(EstatePublicReservationRequest.status == "new").count()
+    return {"items": [_public_reservation_payload(db, row) for row in rows], "page": safe_page, "page_size": safe_page_size, "total": total, "new_count": new_count}
 
 
 @router.patch("/reservation-requests/{request_id}")
@@ -2568,12 +2585,19 @@ def create_survey_request(plot_id:int, request:Request, db:Session=Depends(get_d
     append_estate_audit_event(db,organization_id=estate.organization_id,actor=access.principal,action="survey_request.created",entity_type="estate_survey_request",entity_id=row.id); db.commit(); return _survey_payload(db,row)
 
 @router.get("/survey-requests")
-def list_survey_requests(request: Request, estate_id: int | None = None, db: Session = Depends(get_db)):
+def list_survey_requests(request: Request, estate_id: int | None = None, page: int | None = None, page_size: int = 20, db: Session = Depends(get_db)):
     principal=resolve_estate_principal(db,request); allowed={a.organization_id for a in list_estate_access(db,principal) if has_permission(a.role_key,"survey.read")}
     query = db.query(EstateSurveyRequest).filter(EstateSurveyRequest.organization_id.in_(allowed))
     if estate_id is not None:
         query = query.filter(EstateSurveyRequest.estate_id == estate_id)
-    return _bulk_survey_payloads(db, query.all())
+    ordered = query.order_by(EstateSurveyRequest.created_at.desc())
+    if page is None:
+        return _bulk_survey_payloads(db, ordered.all())
+    safe_page = max(1, page)
+    safe_page_size = min(max(page_size, 1), 50)
+    total = ordered.count()
+    rows = ordered.offset((safe_page - 1) * safe_page_size).limit(safe_page_size).all()
+    return {"items": _bulk_survey_payloads(db, rows), "page": safe_page, "page_size": safe_page_size, "total": total}
 
 @router.get("/survey-requests/{request_id}")
 def survey_request_detail(request_id:int,request:Request,db:Session=Depends(get_db)):
@@ -2697,13 +2721,20 @@ def create_staking_task(request_id:int,request:Request,db:Session=Depends(get_db
     append_estate_audit_event(db,organization_id=survey.organization_id,actor=access.principal,action="staking_task.created",entity_type="estate_staking_task",entity_id=task.id); db.commit(); return {"id":task.id,"status":task.status}
 
 @router.get("/staking-tasks")
-def list_staking_tasks(request: Request, estate_id: int | None = None, db: Session = Depends(get_db)):
+def list_staking_tasks(request: Request, estate_id: int | None = None, page: int | None = None, page_size: int = 20, db: Session = Depends(get_db)):
     principal=resolve_estate_principal(db,request); allowed={item.organization_id for item in list_estate_access(db,principal) if has_permission(item.role_key,"staking.read")}
     query = db.query(EstateStakingTask).filter(EstateStakingTask.organization_id.in_(allowed))
     if estate_id is not None:
         query = query.filter(EstateStakingTask.estate_id == estate_id)
-    rows=query.all()
-    return [{"id":row.id,"status":row.status,"plot_id":row.plot_id,"survey_request_id":row.survey_request_id,"assigned_subject_id":row.assigned_subject_id,"completed_at":row.completed_at} for row in rows]
+    ordered = query.order_by(EstateStakingTask.created_at.desc())
+    if page is None:
+        rows = ordered.all()
+        return [{"id":row.id,"status":row.status,"plot_id":row.plot_id,"survey_request_id":row.survey_request_id,"assigned_subject_id":row.assigned_subject_id,"completed_at":row.completed_at} for row in rows]
+    safe_page = max(1, page)
+    safe_page_size = min(max(page_size, 1), 50)
+    total = ordered.count()
+    rows = ordered.offset((safe_page - 1) * safe_page_size).limit(safe_page_size).all()
+    return {"items": [{"id":row.id,"status":row.status,"plot_id":row.plot_id,"survey_request_id":row.survey_request_id,"assigned_subject_id":row.assigned_subject_id,"completed_at":row.completed_at} for row in rows], "page": safe_page, "page_size": safe_page_size, "total": total}
 
 @router.get("/staking-tasks/{task_id}/exports/dgps.csv")
 def export_staking_task_dgps_csv(task_id:int, request:Request, raw:bool=False, db:Session=Depends(get_db)):
@@ -2934,6 +2965,27 @@ def complete_staking_task(task_id:int,request:Request,db:Session=Depends(get_db)
     return {"id":task.id,"status":task.status,"completed_at":task.completed_at,"customer_notified":customer_notified}
 
 
+@router.get("/organizations/{organization_id}/customers")
+def list_customers(organization_id: int, request: Request, page: int = 1, page_size: int = 25, search: str | None = None, db: Session = Depends(get_db)):
+    require_estate_access(db, request, organization_id, permission="customer.read")
+    query = db.query(EstateCustomer).filter(EstateCustomer.organization_id == organization_id)
+    if search and search.strip():
+        term = f"%{search.strip().lower()}%"
+        query = query.filter(
+            or_(
+                func.lower(EstateCustomer.full_name).like(term),
+                func.lower(EstateCustomer.phone).like(term),
+                func.lower(EstateCustomer.email).like(term),
+            )
+        )
+    ordered = query.order_by(EstateCustomer.created_at.desc(), EstateCustomer.id.desc())
+    safe_page = max(1, page)
+    safe_page_size = min(max(page_size, 1), 100)
+    total = ordered.count()
+    rows = ordered.offset((safe_page - 1) * safe_page_size).limit(safe_page_size).all()
+    return {"items": [{"id": row.id, "name": row.full_name, "reference": row.reference_no} for row in rows], "page": safe_page, "page_size": safe_page_size, "total": total}
+
+
 @router.post("/organizations/{organization_id}/customers")
 def create_customer(organization_id: int, payload: CustomerCreate, request: Request, idempotency_header: str | None = Header(default=None, alias="X-Idempotency-Key"), db: Session = Depends(get_db)):
     access = require_estate_access(db, request, organization_id, permission="customer.manage"); _enabled(db, organization_id)
@@ -3033,7 +3085,7 @@ def set_commission_tiers_endpoint(organization_id: int, payload: CommissionTiers
 
 
 @router.get("/organizations/{organization_id}/commissions")
-def commission_report(organization_id: int, request: Request, db: Session = Depends(get_db)):
+def commission_report(organization_id: int, request: Request, page: int | None = None, page_size: int = 25, db: Session = Depends(get_db)):
     require_estate_access(db, request, organization_id, permission="payment.read")
     rows = db.query(EstateAllocation).filter(
         EstateAllocation.organization_id == organization_id,
@@ -3073,7 +3125,12 @@ def commission_report(organization_id: int, request: Request, db: Session = Depe
             "current_tier": bucket["current_tier"],
         })
     results.sort(key=lambda item: float(item["total_outstanding"]), reverse=True)
-    return {"organization_id": organization_id, "agents": results}
+    if page is None:
+        return {"organization_id": organization_id, "agents": results}
+    safe_page = max(1, page)
+    safe_page_size = min(max(page_size, 1), 100)
+    start = (safe_page - 1) * safe_page_size
+    return {"organization_id": organization_id, "agents": results[start:start + safe_page_size], "page": safe_page, "page_size": safe_page_size, "total": len(results)}
 
 
 @router.get("/organizations/{organization_id}/sales-agents/detail")
@@ -4383,10 +4440,21 @@ def estate_detail(estate_id: int, request: Request, db: Session = Depends(get_db
 
 
 @router.get("/organizations/{organization_id}/members")
-def list_organization_members(organization_id: int, request: Request, db: Session = Depends(get_db)):
+def list_organization_members(organization_id: int, request: Request, page: int | None = None, page_size: int = 25, search: str | None = None, db: Session = Depends(get_db)):
     require_estate_access(db, request, organization_id, permission="estate.manage")
-    rows = db.query(EstateOrganizationMember).filter(EstateOrganizationMember.organization_id == organization_id).order_by(EstateOrganizationMember.created_at.asc()).all()
-    return [{"id": row.id, "subject_type": row.subject_type, "subject_id": row.subject_id, "role": row.role_key, "email": row.contact_email, "phone": row.contact_phone, "is_active": row.is_active} for row in rows]
+    query = db.query(EstateOrganizationMember).filter(EstateOrganizationMember.organization_id == organization_id)
+    if search and search.strip():
+        term = f"%{search.strip().lower()}%"
+        query = query.filter(or_(func.lower(EstateOrganizationMember.subject_id).like(term), func.lower(EstateOrganizationMember.contact_email).like(term), func.lower(EstateOrganizationMember.contact_phone).like(term)))
+    ordered = query.order_by(EstateOrganizationMember.created_at.asc(), EstateOrganizationMember.id.asc())
+    if page is None:
+        rows = ordered.all()
+        return [{"id": row.id, "subject_type": row.subject_type, "subject_id": row.subject_id, "role": row.role_key, "email": row.contact_email, "phone": row.contact_phone, "is_active": row.is_active} for row in rows]
+    safe_page = max(1, page)
+    safe_page_size = min(max(page_size, 1), 100)
+    total = ordered.count()
+    rows = ordered.offset((safe_page - 1) * safe_page_size).limit(safe_page_size).all()
+    return {"items": [{"id": row.id, "subject_type": row.subject_type, "subject_id": row.subject_id, "role": row.role_key, "email": row.contact_email, "phone": row.contact_phone, "is_active": row.is_active} for row in rows], "page": safe_page, "page_size": safe_page_size, "total": total}
 
 
 @router.post("/organizations/{organization_id}/members")
