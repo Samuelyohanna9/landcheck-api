@@ -271,7 +271,7 @@ def _reservation_attribution(db: Session, row: EstatePublicReservationRequest) -
         )
         return {
             "type": "agent",
-            "label": "Agent QR" if allocation.lead_source_code else "Assigned agent",
+            "label": "Agent QR",
             "agent_name": display_name,
             "source_code": row.source_code,
             "source_channel": row.source_channel,
@@ -292,6 +292,10 @@ def _reservation_attribution(db: Session, row: EstatePublicReservationRequest) -
 
 
 def _agent_display_name(db: Session, *, organization_id: int, subject_type: str, subject_id: str) -> str:
+    if subject_type == "estate_account" and str(subject_id).isdigit():
+        account = db.get(EstateAccount, int(subject_id))
+        if account:
+            return account.full_name
     member = db.query(EstateOrganizationMember).filter(
         EstateOrganizationMember.organization_id == organization_id,
         EstateOrganizationMember.subject_type == subject_type,
@@ -299,10 +303,6 @@ def _agent_display_name(db: Session, *, organization_id: int, subject_type: str,
     ).one_or_none()
     if member:
         return member.subject_id
-    if subject_type == "estate_account" and str(subject_id).isdigit():
-        account = db.get(EstateAccount, int(subject_id))
-        if account:
-            return account.full_name
     return subject_id
 
 
@@ -3956,7 +3956,7 @@ def _agent_workspace_payload(db: Session, *, member: EstateOrganizationMember, o
             EstateQrCampaign.is_active.is_(True),
         ).order_by(EstateQrCampaign.created_at.desc()).all()
         allocation_plot_ids = {allocation.plot_id for allocation in allocations}
-        lead_plot_ids = {lead.plot_id for lead in leads}
+        lead_plot_ids = {lead.plot_id for lead in leads if lead.status in {"new", "contacted", "converted"}}
         plots = []
         for plot in db.query(EstatePlot).filter(EstatePlot.estate_id == estate.id).order_by(EstatePlot.plot_number_normalized.asc()).all():
             plots.append({
@@ -3964,6 +3964,8 @@ def _agent_workspace_payload(db: Session, *, member: EstateOrganizationMember, o
                 "plot_number": plot.plot_number,
                 "status": plot.commercial_status,
                 "agent_record": plot.id in allocation_plot_ids or plot.id in lead_plot_ids,
+                "agent_lead": plot.id in lead_plot_ids,
+                "agent_sale": plot.id in allocation_plot_ids,
                 "geometry": mapping(to_shape(plot.geometry)) if plot.geometry else None,
             })
 
@@ -4011,7 +4013,7 @@ def _agent_workspace_payload(db: Session, *, member: EstateOrganizationMember, o
         all_sales.extend([{**sale, "estate_name": estate.name} for sale in estate_sales])
 
     return {
-        "agent": {"subject_type": subject_type, "subject_id": subject_id, "name": member.subject_id, "role": member.role_key, "email": member.contact_email, "phone": member.contact_phone},
+        "agent": {"subject_type": subject_type, "subject_id": subject_id, "name": _agent_display_name(db, organization_id=organization.id, subject_type=subject_type, subject_id=subject_id), "role": member.role_key, "email": member.contact_email, "phone": member.contact_phone},
         "summary": {"lead_count": len(all_leads), "sale_count": len(all_sales), "paid_sale_count": sum(1 for sale in all_sales if sale["paid"]), "outstanding": str(total_outstanding), "commission_earned": str(total_commission), "commission_paid": str(total_paid_commission), "commission_due": str(max(Decimal("0"), total_commission - total_paid_commission))},
         "leads": all_leads,
         "sales": all_sales,
