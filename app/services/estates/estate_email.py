@@ -150,12 +150,20 @@ def _event_copy(
     first_name = (customer_name or "there").split(" ")[0]
     credibility = _CREDIBILITY_BLURB.format(org_name=html.escape(org_name))
     if event == "reserved":
+        next_payment_line = (
+            f"<p>Your first payment has been recorded. Your next scheduled payment is due on "
+            f"<strong>{html.escape(payment_due_at.strftime('%d %b %Y'))}</strong>. We will email you "
+            "up to 7 days before each scheduled due date.</p>"
+            if payment_due_at
+            else "<p>Your first payment has been recorded. Your Estate team will confirm any next payment date with you.</p>"
+        )
         return (
             f"Welcome to {estate_name} - Plot {plot_number} Reserved",
             f"Welcome to {estate_name}, {html.escape(first_name)}!",
             f"<p>Thank you for choosing {html.escape(org_name)}. {credibility}</p>"
             f"<p>We're delighted to confirm that <strong>Plot {html.escape(plot_number)}</strong> at "
-            f"<strong>{html.escape(estate_name)}</strong> has been reserved in your name.</p>",
+            f"<strong>{html.escape(estate_name)}</strong> has been reserved in your name.</p>"
+            f"{next_payment_line}",
         )
     if event == "reservation_expiring":
         return (

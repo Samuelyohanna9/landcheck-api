@@ -239,11 +239,22 @@ class CustomerCreate(BaseModel):
 
 
 class PaymentScheduleInput(BaseModel):
-    """Machine-readable buyer instalment schedule used by reminders."""
+    """Machine-readable schedule for payments after the first payment is received."""
 
     installment_amount: Decimal = Field(gt=0)
     interval_months: int = Field(ge=1, le=60)
-    first_due_at: datetime
+    # The first payment is entered as part of the reservation/allocation action. This is the
+    # next instalment date, not the date of that first payment. Keep first_due_at for old clients.
+    next_due_at: datetime | None = None
+    first_due_at: datetime | None = None
+
+    @model_validator(mode="after")
+    def resolve_next_due_at(self):
+        if self.next_due_at is None:
+            self.next_due_at = self.first_due_at
+        if self.next_due_at is None:
+            raise ValueError("next_due_at is required")
+        return self
 
 
 class AllocationAction(BaseModel):
@@ -338,4 +349,8 @@ class PublicReservationConvert(BaseModel):
     payment_plan: str | None = Field(default=None, max_length=4000)
     payment_schedule: PaymentScheduleInput | None = None
     next_payment_due_at: datetime | None = None
+    # A public request is only converted into an active reservation after the first payment is
+    # recorded by the Estate team.
+    initial_payment_amount: Decimal | None = Field(default=None, gt=0)
+    initial_payment_method: str | None = Field(default=None, max_length=64)
     notes: str | None = Field(default=None, max_length=4000)

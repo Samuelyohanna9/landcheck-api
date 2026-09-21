@@ -894,6 +894,8 @@ def convert_public_reservation_request(
     estate = db.get(Estate, row.estate_id)
     if not estate:
         raise HTTPException(404, "Estate not found")
+    if not payload.initial_payment_amount:
+        raise HTTPException(422, "Record the customer's first payment before creating a proper reservation.")
     customer = EstateCustomer(
         organization_id=row.organization_id,
         full_name=row.full_name,
@@ -923,6 +925,7 @@ def convert_public_reservation_request(
         next_payment_due_at=scheduled_next_due_at,
         notes=payload.notes or "Created from public reservation request",
     )
+    initial_payment = _apply_initial_payment(db, record=allocation, payload=payload, actor=access.principal)
     if row.assigned_agent_subject_type and row.assigned_agent_subject_id:
         allocation.sales_agent_subject_type = row.assigned_agent_subject_type
         allocation.sales_agent_subject_id = row.assigned_agent_subject_id
@@ -949,7 +952,7 @@ def convert_public_reservation_request(
         org_name=access.organization_name,
         event="reserved",
     )
-    return {**_public_reservation_payload(db, row), "customer_notified": customer_notified, "already_converted": False}
+    return {**_public_reservation_payload(db, row), "customer_notified": customer_notified, "initial_payment_id": initial_payment.id if initial_payment else None, "already_converted": False}
 
 @router.get("/{estate_id}/plots.geojson")
 def estate_plots_geojson(estate_id: int, request: Request, db: Session = Depends(get_db)):
@@ -3139,23 +3142,34 @@ def _apply_initial_payment(db: Session, *, record: EstateAllocation, payload: Al
         confirmation_required=False,
     )
     confirm_payment(db, payment=payment, actor=actor)
-    advance_payment_schedule_after_payment(db, allocation=record, amount=payment.amount)
+    # This payment is the first payment received now. The schedule already stores the next
+    # instalment date, so do not advance it as if this payment were made on that future date.
+    summary = financial_summary(db, record)
+    if summary.agreed_price > 0 and summary.outstanding <= 0:
+        record.next_payment_due_at = None
+        record.payment_reminder_sent_for_due_at = None
     return payment
 
 
 def _allocation_payment_fields(payload) -> tuple[str | None, datetime | None]:
     schedule = getattr(payload, "payment_schedule", None)
     if schedule:
+        next_due_at = getattr(schedule, "next_due_at", None) or getattr(schedule, "first_due_at", None)
+        if next_due_at is None:
+            raise HTTPException(422, "Enter the next instalment due date.")
+        normalized_due_at = next_due_at if next_due_at.tzinfo else next_due_at.replace(tzinfo=timezone.utc)
+        if normalized_due_at <= datetime.now(timezone.utc):
+            raise HTTPException(422, "The next instalment due date must be after the first payment received today.")
         return (
             json.dumps(
                 {
                     "type": "installment",
                     "installment_amount": str(schedule.installment_amount),
                     "interval_months": schedule.interval_months,
-                    "next_due_at": schedule.first_due_at.isoformat(),
+                    "next_due_at": normalized_due_at.isoformat(),
                 }
             ),
-            schedule.first_due_at,
+            normalized_due_at,
         )
     return getattr(payload, "payment_plan", None), getattr(payload, "next_payment_due_at", None)
 
@@ -3194,6 +3208,7 @@ def _notify_allocation_customer(db: Session, *, allocation: EstateAllocation, or
         amount_just_paid=amount_just_paid,
         share_token=allocation.share_token,
         portal_url=portal_url,
+        payment_due_at=allocation.next_payment_due_at,
     )
     record_notification_log(
         db,
@@ -3248,6 +3263,8 @@ def reserve_plot(estate_id: int, plot_id: int, payload: AllocationAction, reques
     access = require_estate_access(db, request, estate.organization_id, permission="allocation.manage")
     customer = db.get(EstateCustomer, payload.customer_id)
     if not customer or customer.organization_id != access.organization_id: raise HTTPException(404, "Customer not found")
+    if not payload.initial_payment_amount:
+        raise HTTPException(422, "Record the customer's first payment before reserving this plot.")
     payment_plan, next_payment_due_at = _allocation_payment_fields(payload)
     record = reserve_or_allocate(db, plot=plot, customer=customer, actor=access.principal, allocate=False, expires_at=payload.expires_at, agreed_price=payload.agreed_price, payment_plan=payment_plan, next_payment_due_at=next_payment_due_at, notes=payload.notes)
     if payload.sales_agent_subject_type and payload.sales_agent_subject_id:
@@ -3276,6 +3293,8 @@ def allocate_plot(estate_id: int, plot_id: int, payload: AllocationAction, reque
     effective_agreed_price = payload.agreed_price if payload.agreed_price is not None else (existing.agreed_price if existing else None)
     already_confirmed = financial_summary(db, existing).confirmed_paid if existing else Decimal("0")
     incoming = payload.initial_payment_amount or Decimal("0")
+    if not existing and not incoming:
+        raise HTTPException(422, "Record the customer's first payment before allocating this plot.")
     if effective_agreed_price and (already_confirmed + incoming) < effective_agreed_price:
         raise HTTPException(
             409,
