@@ -56,7 +56,7 @@ from app.services.estates import estate_email
 from app.services.estates.layout_export import render_estate_layout_pdf
 from app.services.estates.report_export import render_customer_statement_pdf, render_estate_report_pdf
 from app.services.estates import commissions
-from app.services.estates.operations import DOCUMENT_REQUIREMENTS, PUBLIC_DOCUMENT_TYPES, build_operations_summary, buyer_portal_payload, document_readiness, hash_portal_token, issue_customer_portal_token, linked_documents
+from app.services.estates.operations import DOCUMENT_REQUIREMENTS, ESTATE_DOCUMENT_TYPES, ESTATE_DOCUMENT_TYPE_CODES, PUBLIC_DOCUMENT_TYPES, build_operations_summary, buyer_portal_payload, document_readiness, hash_portal_token, issue_customer_portal_token, linked_documents
 from app.db import SessionLocal
 from app.utils.hazard_jobs import get_hazard_job, insert_hazard_job, serialize_hazard_job, set_hazard_job_status
 
@@ -3228,14 +3228,24 @@ def _linked_entity_organization(db: Session, entity_type: str, entity_id: int) -
     row = db.get(model, entity_id) if model else None
     return getattr(row, "organization_id", None)
 
+@router.get("/document-types")
+def estate_document_types(request: Request, db: Session = Depends(get_db)):
+    principal = resolve_estate_principal(db, request)
+    if not any(has_permission(item.role_key, "document.read") for item in list_estate_access(db, principal)):
+        raise HTTPException(403, "Document access is required")
+    return list(ESTATE_DOCUMENT_TYPES)
+
 @router.post("/documents")
 async def upload_document(entity_type: str, entity_id: int, document_type: str, request: Request, file: UploadFile = File(...), description: str | None = None, db: Session = Depends(get_db)):
     organization_id = _linked_entity_organization(db, entity_type, entity_id)
     if not organization_id: raise HTTPException(404, "Linked Estate entity was not found")
     access = require_estate_access(db, request, organization_id, permission="document.manage")
+    normalized_document_type = document_type.strip().lower()
+    if normalized_document_type not in ESTATE_DOCUMENT_TYPE_CODES:
+        raise HTTPException(422, "Choose a supported Estate document type")
     organization = db.get(EstateOrganization, organization_id)
     stored = store_private_estate_file(organization_uid=organization.organization_uid, category="documents", entity_uid=f"{entity_type}_{entity_id}", filename=file.filename or "document", content_type=file.content_type or "", data=await file.read())
-    document = EstateDocument(organization_id=organization_id, object_key=stored.object_key, original_filename=stored.filename, mime_type=stored.mime_type, size_bytes=stored.size_bytes, checksum=stored.checksum, document_type=document_type.lower(), description=description, uploaded_by_subject_type=access.principal.subject_type, uploaded_by_subject_id=access.principal.subject_id)
+    document = EstateDocument(organization_id=organization_id, object_key=stored.object_key, original_filename=stored.filename, mime_type=stored.mime_type, size_bytes=stored.size_bytes, checksum=stored.checksum, document_type=normalized_document_type, description=description, uploaded_by_subject_type=access.principal.subject_type, uploaded_by_subject_id=access.principal.subject_id)
     db.add(document); db.flush(); db.add(EstateDocumentLink(document_id=document.id, entity_type=entity_type, entity_id=str(entity_id))); append_estate_audit_event(db, organization_id=organization_id, actor=access.principal, action="document.uploaded", entity_type="estate_document", entity_id=document.id, after_data={"linked_entity":entity_type,"linked_id":entity_id}); db.commit()
     return {"id":document.id,"filename":document.original_filename}
 
@@ -3259,13 +3269,16 @@ def customer_statement(customer_id:int, request:Request, estate_id:int|None=None
     for allocation in allocations:
         summary=financial_summary(db,allocation); plot=db.get(EstatePlot,allocation.plot_id); estate=db.get(Estate,allocation.estate_id)
         payments=db.query(EstatePayment).filter(EstatePayment.allocation_id==allocation.id).order_by(EstatePayment.payment_date).all()
+        allocation_documents = {document.id: document for document in linked_documents(db, allocation)}
+        survey = db.query(EstateSurveyRequest).filter(EstateSurveyRequest.allocation_id == allocation.id).order_by(EstateSurveyRequest.created_at.desc()).first()
+        staking = db.query(EstateStakingTask).filter(EstateStakingTask.plot_id == allocation.plot_id).order_by(EstateStakingTask.created_at.desc()).first()
         evidence_by_payment: dict[str, list[dict]] = {}
         payment_ids=[str(p.id) for p in payments]
         if payment_ids:
             evidence_rows=db.query(EstateDocument,EstateDocumentLink.entity_id).join(EstateDocumentLink,EstateDocumentLink.document_id==EstateDocument.id).filter(EstateDocumentLink.entity_type=="payment",EstateDocumentLink.entity_id.in_(payment_ids)).all()
             for document,entity_id in evidence_rows:
                 evidence_by_payment.setdefault(entity_id,[]).append({"id":document.id,"filename":document.original_filename})
-        rows.append({"allocation_id":allocation.id,"allocation_date":allocation.allocation_date,"estate":estate.name if estate else None,"plot":plot.plot_number if plot else None,"payment_plan":allocation.payment_plan,"agreed_price":str(summary.agreed_price),"confirmed_paid":str(summary.confirmed_paid),"pending_paid":str(summary.pending_paid),"outstanding":str(summary.outstanding),"transactions":[{"id":p.id,"date":p.payment_date,"reference":p.reference_no,"method":p.payment_method,"amount":str(p.amount),"status":p.status,"receipts":evidence_by_payment.get(str(p.id),[])} for p in payments]})
+        rows.append({"allocation_id":allocation.id,"allocation_date":allocation.allocation_date,"status":allocation.status,"estate":estate.name if estate else None,"plot":plot.plot_number if plot else None,"plot_area_sqm":float(plot.area_sqm or 0) if plot else None,"plot_address":plot.public_address if plot else None,"payment_plan":allocation.payment_plan,"agreed_price":str(summary.agreed_price),"confirmed_paid":str(summary.confirmed_paid),"pending_paid":str(summary.pending_paid),"outstanding":str(summary.outstanding),"survey_status":survey.status if survey else "not_started","staking_status":staking.status if staking else "not_started","documents":[{"id":document.id,"filename":document.original_filename,"type":document.document_type,"description":document.description} for document in allocation_documents.values()],"transactions":[{"id":p.id,"date":p.payment_date,"reference":p.reference_no,"method":p.payment_method,"amount":str(p.amount),"status":p.status,"receipt_number":p.receipt_number,"receipts":evidence_by_payment.get(str(p.id),[])} for p in payments]})
     organization=db.get(EstateOrganization,customer.organization_id)
     return {"statement_date":__import__("datetime").datetime.utcnow().isoformat()+"Z","organization":{"id":customer.organization_id,"name":organization.name if organization else access.organization_name},"customer":{"id":customer.id,"name":customer.full_name,"reference":customer.reference_no},"allocations":rows}
 
@@ -3302,6 +3315,55 @@ def allocation_financial_detail(allocation_id:int,request:Request,db:Session=Dep
     summary=financial_summary(db,allocation); customer=db.get(EstateCustomer,allocation.customer_id); plot=db.get(EstatePlot,allocation.plot_id); estate=db.get(Estate,allocation.estate_id)
     payments=db.query(EstatePayment).filter(EstatePayment.allocation_id==allocation.id).order_by(EstatePayment.payment_date.desc()).all()
     return {"allocation":{"id":allocation.id,"status":allocation.status,"allocation_date":allocation.allocation_date,"payment_plan":allocation.payment_plan},"customer":{"id":customer.id,"name":customer.full_name,"reference":customer.reference_no,"phone":customer.phone,"email":customer.email},"estate":{"id":estate.id,"name":estate.name},"plot":{"id":plot.id,"number":plot.plot_number},"financial":{"agreed_price":str(summary.agreed_price),"confirmed_paid":str(summary.confirmed_paid),"pending_paid":str(summary.pending_paid),"outstanding":str(summary.outstanding),"percentage":str(summary.percentage),"fully_paid":summary.agreed_price>0 and summary.outstanding==0},"payments":[{"id":p.id,"date":p.payment_date,"amount":str(p.amount),"status":p.status,"method":p.payment_method,"reference":p.reference_no} for p in payments]}
+
+@router.get("/allocations/{allocation_id}/record")
+def allocation_record(allocation_id: int, request: Request, db: Session = Depends(get_db)):
+    allocation = db.get(EstateAllocation, allocation_id)
+    if not allocation:
+        raise HTTPException(404, "Allocation not found")
+    require_estate_access(db, request, allocation.organization_id, permission="payment.read")
+    customer = db.get(EstateCustomer, allocation.customer_id)
+    estate = db.get(Estate, allocation.estate_id)
+    plot = db.get(EstatePlot, allocation.plot_id)
+    summary = financial_summary(db, allocation)
+    payments = db.query(EstatePayment).filter(EstatePayment.allocation_id == allocation.id).order_by(EstatePayment.payment_date.desc()).all()
+    payment_ids = [str(payment.id) for payment in payments]
+    evidence_by_payment: dict[str, list[dict]] = {}
+    if payment_ids:
+        evidence_rows = db.query(EstateDocument, EstateDocumentLink.entity_id).join(
+            EstateDocumentLink, EstateDocumentLink.document_id == EstateDocument.id,
+        ).filter(
+            EstateDocument.organization_id == allocation.organization_id,
+            EstateDocumentLink.entity_type == "payment",
+            EstateDocumentLink.entity_id.in_(payment_ids),
+        ).all()
+        for document, payment_id in evidence_rows:
+            evidence_by_payment.setdefault(payment_id, []).append({"id": document.id, "filename": document.original_filename, "type": document.document_type})
+    documents = {document.id: document for document in linked_documents(db, allocation)}
+    survey = db.query(EstateSurveyRequest).filter(EstateSurveyRequest.allocation_id == allocation.id).order_by(EstateSurveyRequest.created_at.desc()).first()
+    staking = db.query(EstateStakingTask).filter(EstateStakingTask.plot_id == allocation.plot_id).order_by(EstateStakingTask.created_at.desc()).first()
+    return {
+        "allocation": {
+            "id": allocation.id,
+            "status": allocation.status,
+            "reservation_date": allocation.reservation_date,
+            "reservation_expires_at": allocation.reservation_expires_at,
+            "allocation_date": allocation.allocation_date,
+            "next_payment_due_at": allocation.next_payment_due_at,
+            "agreed_price": str(allocation.agreed_price or 0),
+            "payment_plan": allocation.payment_plan,
+            "notes": allocation.notes,
+        },
+        "customer": {"id": customer.id, "name": customer.full_name, "reference": customer.reference_no, "phone": customer.phone, "email": customer.email} if customer else None,
+        "estate": {"id": estate.id, "name": estate.name, "state": estate.state, "locality": estate.locality} if estate else None,
+        "plot": {"id": plot.id, "number": plot.plot_number, "area_sqm": float(plot.area_sqm or 0), "public_address": plot.public_address, "land_use": plot.land_use, "commercial_status": plot.commercial_status, "development_status": plot.development_status} if plot else None,
+        "financial": {"agreed_price": str(summary.agreed_price), "confirmed_paid": str(summary.confirmed_paid), "pending_paid": str(summary.pending_paid), "outstanding": str(summary.outstanding), "percentage": str(summary.percentage), "fully_paid": summary.agreed_price > 0 and summary.outstanding == 0},
+        "documents": [{"id": document.id, "filename": document.original_filename, "type": document.document_type, "description": document.description, "mime_type": document.mime_type, "size": document.size_bytes, "uploaded_at": document.created_at} for document in documents.values()],
+        "document_readiness": document_readiness(db, allocation),
+        "survey": {"status": survey.status, "reference": survey.survey_reference, "completed_at": survey.materialized_at} if survey else {"status": "not_started"},
+        "staking": {"status": staking.status, "completed_at": staking.completed_at} if staking else {"status": "not_started"},
+        "payments": [{"id": payment.id, "date": payment.payment_date, "amount": str(payment.amount), "status": payment.status, "method": payment.payment_method, "reference": payment.reference_no, "receipt_number": payment.receipt_number, "confirmed_at": payment.confirmed_at, "evidence": evidence_by_payment.get(str(payment.id), [])} for payment in payments],
+    }
 
 @router.get("/customers/{customer_id}/financial-detail")
 def customer_financial_detail(customer_id:int,request:Request,db:Session=Depends(get_db)):

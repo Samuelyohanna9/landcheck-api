@@ -380,14 +380,25 @@ def render_customer_statement_pdf(
         heading = f"{allocation.get('estate') or 'Estate'} / {allocation.get('plot') or ''}".strip(" /")
         allocation_date = allocation.get("allocation_date")
         allocation_date_text = allocation_date.strftime("%d %b %Y") if hasattr(allocation_date, "strftime") else (str(allocation_date) if allocation_date else "Not yet allocated")
-        detail_line = f"Allocation date: {allocation_date_text} · Agreed price: {_naira(allocation.get('agreed_price'))}"
+        detail_line = f"Status: {str(allocation.get('status') or '').replace('_', ' ').title()} · Allocation date: {allocation_date_text} · Agreed price: {_naira(allocation.get('agreed_price'))}"
+        if allocation.get("plot_area_sqm"):
+            detail_line += f" · Plot area: {float(allocation['plot_area_sqm']):,.2f} m2"
+        if allocation.get("plot_address"):
+            detail_line += f" · Address: {allocation['plot_address']}"
         if allocation.get("payment_plan"):
             detail_line += f" · Payment plan: {allocation['payment_plan']}"
+        detail_line += f" · Survey: {str(allocation.get('survey_status') or 'not_started').replace('_', ' ').title()} · Staking: {str(allocation.get('staking_status') or 'not_started').replace('_', ' ').title()}"
 
         block: list = [Paragraph(heading, styles["section"])]
         block.append(HRFlowable(width="100%", thickness=0.6, color=RULE, spaceAfter=6))
         block.append(Paragraph(detail_line, styles["body_muted"]))
         block.append(Spacer(1, 6))
+
+        documents = allocation.get("documents") or []
+        if documents:
+            document_text = "; ".join(f"{str(item.get('type') or 'document').replace('_', ' ').title()}: {item.get('filename') or '-'}" for item in documents)
+            block.append(Paragraph(f"Documents: {document_text}", styles["body_muted"]))
+            block.append(Spacer(1, 6))
 
         transactions = allocation.get("transactions") or []
         if transactions:
@@ -396,7 +407,7 @@ def render_customer_statement_pdf(
                 when = transaction.get("date")
                 when_text = when.strftime("%d %b %Y") if hasattr(when, "strftime") else str(when or "")
                 receipts = transaction.get("receipts") or []
-                receipt_text = "Attached" if receipts else "–"
+                receipt_text = str(transaction.get("receipt_number") or ("Attached" if receipts else "-"))
                 rows.append([when_text, transaction.get("reference") or "-", str(transaction.get("method") or "").replace("_", " ").title(), _naira(transaction.get("amount")), str(transaction.get("status") or "").replace("_", " ").title(), receipt_text])
             table = _data_table(["Date", "Reference", "Method", "Amount", "Status", "Receipt"], rows, styles, [usable_width * 0.16, usable_width * 0.16, usable_width * 0.2, usable_width * 0.18, usable_width * 0.18, usable_width * 0.12], keep_together=False)
             story.append(KeepTogether(block + [table]))

@@ -41,6 +41,31 @@ DOCUMENT_REQUIREMENTS = (
     {"stage": "handover", "type": "handover_pack", "label": "Handover pack", "required": True},
 )
 
+ESTATE_DOCUMENT_TYPES = (
+    {"code": "deed_of_assignment", "label": "Deed of assignment", "public": False},
+    {"code": "sale_agreement", "label": "Sale agreement", "public": False},
+    {"code": "reservation_agreement", "label": "Reservation agreement", "public": False},
+    {"code": "allocation_letter", "label": "Allocation letter", "public": True},
+    {"code": "survey_plan", "label": "Survey plan", "public": True},
+    {"code": "title_document", "label": "Title document", "public": True},
+    {"code": "certificate_of_occupancy", "label": "Certificate of occupancy", "public": False},
+    {"code": "governors_consent", "label": "Governor's consent", "public": False},
+    {"code": "power_of_attorney", "label": "Power of attorney", "public": False},
+    {"code": "development_agreement", "label": "Development agreement", "public": False},
+    {"code": "offer_letter", "label": "Offer letter", "public": False},
+    {"code": "payment_plan", "label": "Payment plan", "public": False},
+    {"code": "consent", "label": "Consent", "public": False},
+    {"code": "tax_clearance", "label": "Tax clearance", "public": False},
+    {"code": "building_plan", "label": "Building plan", "public": False},
+    {"code": "site_plan", "label": "Site plan", "public": False},
+    {"code": "handover_pack", "label": "Handover pack", "public": True},
+    {"code": "proof_of_identity", "label": "Proof of identity", "public": False},
+    {"code": "staking_evidence", "label": "Staking evidence", "public": False},
+    {"code": "receipt", "label": "Payment receipt", "public": True},
+    {"code": "layout_import", "label": "Layout/import evidence", "public": False},
+    {"code": "other", "label": "Other document", "public": False},
+)
+ESTATE_DOCUMENT_TYPE_CODES = {item["code"] for item in ESTATE_DOCUMENT_TYPES}
 PUBLIC_DOCUMENT_TYPES = {"allocation_letter", "survey_plan", "title_document", "receipt", "handover_pack"}
 
 
