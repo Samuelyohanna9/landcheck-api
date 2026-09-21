@@ -189,6 +189,7 @@ def _public_estate(db: Session, slug: str) -> Estate:
 def _public_reservation_payload(db: Session, row: EstatePublicReservationRequest) -> dict:
     estate = db.get(Estate, row.estate_id)
     plot = db.get(EstatePlot, row.plot_id)
+    attribution = _reservation_attribution(db, row)
     return {
         "id": row.id,
         "uid": row.request_uid,
@@ -204,6 +205,8 @@ def _public_reservation_payload(db: Session, row: EstatePublicReservationRequest
         "source_channel": row.source_channel,
         "assigned_agent_subject_type": row.assigned_agent_subject_type,
         "assigned_agent_subject_id": row.assigned_agent_subject_id,
+        "attribution": attribution,
+        "assigned_agent_name": attribution.get("agent_name"),
         "status": row.status,
         "staff_notes": row.staff_notes,
         "created_at": row.created_at,
@@ -256,6 +259,80 @@ def _public_estate_payload(db: Session, estate: Estate) -> dict:
         "plots": public_plots,
         "counts": counts,
     }
+
+
+def _reservation_attribution(db: Session, row: EstatePublicReservationRequest) -> dict:
+    if row.assigned_agent_subject_type and row.assigned_agent_subject_id:
+        display_name = _agent_display_name(
+            db,
+            organization_id=row.organization_id,
+            subject_type=row.assigned_agent_subject_type,
+            subject_id=row.assigned_agent_subject_id,
+        )
+        return {
+            "type": "agent",
+            "label": "Agent QR" if allocation.lead_source_code else "Assigned agent",
+            "agent_name": display_name,
+            "source_code": row.source_code,
+            "source_channel": row.source_channel,
+        }
+    if row.source_code:
+        campaign = db.query(EstateQrCampaign).filter(
+            EstateQrCampaign.estate_id == row.estate_id,
+            EstateQrCampaign.code == row.source_code,
+        ).one_or_none()
+        return {
+            "type": "company_qr",
+            "label": "Company QR",
+            "campaign_name": campaign.name if campaign else row.source_code,
+            "source_code": row.source_code,
+            "source_channel": row.source_channel or (campaign.channel if campaign else None),
+        }
+    return {"type": "public_page", "label": "Public Estate page", "source_code": None, "source_channel": None}
+
+
+def _agent_display_name(db: Session, *, organization_id: int, subject_type: str, subject_id: str) -> str:
+    member = db.query(EstateOrganizationMember).filter(
+        EstateOrganizationMember.organization_id == organization_id,
+        EstateOrganizationMember.subject_type == subject_type,
+        EstateOrganizationMember.subject_id == subject_id,
+    ).one_or_none()
+    if member:
+        return member.subject_id
+    if subject_type == "estate_account" and str(subject_id).isdigit():
+        account = db.get(EstateAccount, int(subject_id))
+        if account:
+            return account.full_name
+    return subject_id
+
+
+def _allocation_attribution(db: Session, allocation: EstateAllocation) -> dict:
+    if allocation.sales_agent_subject_type and allocation.sales_agent_subject_id:
+        return {
+            "type": "agent",
+            "label": "Agent QR",
+            "agent_name": _agent_display_name(
+                db,
+                organization_id=allocation.organization_id,
+                subject_type=allocation.sales_agent_subject_type,
+                subject_id=allocation.sales_agent_subject_id,
+            ),
+            "source_code": allocation.lead_source_code,
+            "source_channel": allocation.lead_source_channel,
+        }
+    if allocation.lead_source_code:
+        campaign = db.query(EstateQrCampaign).filter(
+            EstateQrCampaign.estate_id == allocation.estate_id,
+            EstateQrCampaign.code == allocation.lead_source_code,
+        ).one_or_none()
+        return {
+            "type": "company_qr",
+            "label": "Company QR",
+            "campaign_name": campaign.name if campaign else allocation.lead_source_code,
+            "source_code": allocation.lead_source_code,
+            "source_channel": allocation.lead_source_channel or (campaign.channel if campaign else None),
+        }
+    return {"type": "direct", "label": "Direct company reservation", "source_code": None, "source_channel": None}
 
 
 def _unique_public_slug(db: Session, estate: Estate) -> str:
@@ -849,6 +926,8 @@ def convert_public_reservation_request(
     if row.assigned_agent_subject_type and row.assigned_agent_subject_id:
         allocation.sales_agent_subject_type = row.assigned_agent_subject_type
         allocation.sales_agent_subject_id = row.assigned_agent_subject_id
+    allocation.lead_source_code = row.source_code
+    allocation.lead_source_channel = row.source_channel
     row.customer_id = customer.id
     row.allocation_id = allocation.id
     row.status = "converted"
@@ -2972,6 +3051,7 @@ def sales_agent_detail(organization_id: int, subject_type: str, subject_id: str,
             "estate_id": row.estate_id,
             "estate_name": estate.name if estate else None,
             "customer_name": customer.full_name if customer else None,
+            "attribution": _allocation_attribution(db, row),
             "status": row.status,
             "agreed_price": str(summary.agreed_price),
             "confirmed_paid": str(summary.confirmed_paid),
@@ -3592,7 +3672,7 @@ def estate_selectors(request:Request, estate_id:int|None=None, customer_id:int|N
     financials = _bulk_financial_summaries(db, [allocation for allocation, _, _, _ in allocation_rows])
     allocation_items=[]
     for allocation,estate,plot,customer in allocation_rows:
-        summary=financials[allocation.id]; allocation_items.append({"id":allocation.id,"estate_id":estate.id,"estate_name":estate.name,"plot_id":plot.id,"plot_number":plot.plot_number,"customer_id":customer.id,"customer_name":customer.full_name,"status":allocation.status,"allocation_date":allocation.allocation_date,"payment_plan":allocation.payment_plan,"agreed_price":str(summary["agreed_price"]),"currency":"NGN","confirmed":str(summary["confirmed_paid"]),"pending":str(summary["pending_paid"]),"outstanding":str(summary["outstanding"])})
+        summary=financials[allocation.id]; allocation_items.append({"id":allocation.id,"estate_id":estate.id,"estate_name":estate.name,"plot_id":plot.id,"plot_number":plot.plot_number,"customer_id":customer.id,"customer_name":customer.full_name,"status":allocation.status,"allocation_date":allocation.allocation_date,"payment_plan":allocation.payment_plan,"lead_source_code":allocation.lead_source_code,"lead_source_channel":allocation.lead_source_channel,"attribution":_allocation_attribution(db, allocation),"agreed_price":str(summary["agreed_price"]),"currency":"NGN","confirmed":str(summary["confirmed_paid"]),"pending":str(summary["pending_paid"]),"outstanding":str(summary["outstanding"])})
     return {"estates":[{"id":e.id,"name":e.name} for e in estates],"customers":[{"id":c.id,"name":c.full_name,"reference":c.reference_no} for c in customers],"plots":[{"id":p.id,"plot_number":p.plot_number,"estate_id":e.id,"estate_name":e.name,"commercial_status":p.commercial_status,"development_status":p.development_status,"geometry_status":p.geometry_status,"block_id":p.block_id,"area_sqm":float(p.area_sqm) if p.area_sqm is not None else 0.0} for p,e in plots],"allocations":allocation_items}
 
 
@@ -4188,6 +4268,26 @@ def send_agent_portal_invite(organization_id: int, member_id: int, request: Requ
     organization = db.get(EstateOrganization, organization_id)
     email_sent = estate_email.send_agent_workspace_invite(organization=organization, member=member, portal_url=portal_url) if organization else False
     return {"member_id": member.id, "portal_url": portal_url, "expires_at": token_row.expires_at, "email_sent": email_sent}
+
+
+@router.post("/organizations/{organization_id}/members/{member_id}/portal-preview")
+def preview_agent_portal(organization_id: int, member_id: int, request: Request, db: Session = Depends(get_db)):
+    """Create a test link without emailing the agent or revoking their current link."""
+    access = require_estate_access(db, request, organization_id, permission="estate.manage")
+    member = db.query(EstateOrganizationMember).filter(
+        EstateOrganizationMember.id == member_id,
+        EstateOrganizationMember.organization_id == organization_id,
+    ).one_or_none()
+    if not member or member.role_key not in {"sales", "marketer"}:
+        raise HTTPException(404, "Agent member not found")
+    token_row, raw_token = issue_agent_portal_token(
+        db,
+        member=member,
+        actor=access.principal,
+        revoke_existing=False,
+    )
+    db.commit()
+    return {"member_id": member.id, "portal_url": _agent_portal_url(raw_token), "expires_at": token_row.expires_at}
 
 
 @router.get("/foundation/access")

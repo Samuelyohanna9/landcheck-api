@@ -236,6 +236,8 @@ class EstateAllocation(Base):
     # never silently rewrites a commission already earned.
     sales_agent_subject_type = Column(String(64), nullable=True)
     sales_agent_subject_id = Column(String(128), nullable=True)
+    lead_source_code = Column(String(120), nullable=True)
+    lead_source_channel = Column(String(64), nullable=True)
     commission_tier_label = Column(String(120), nullable=True)
     commission_rate_percent = Column(Numeric(5, 2), nullable=True)
     commission_amount = Column(Numeric(16, 2), nullable=True)

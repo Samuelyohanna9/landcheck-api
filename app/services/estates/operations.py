@@ -173,13 +173,15 @@ def issue_agent_portal_token(
     member,
     actor: EstatePrincipal,
     expires_in_days: int = 365,
+    revoke_existing: bool = True,
 ) -> tuple[EstateAgentPortalToken, str]:
-    """Rotate an agent link while storing only its hash in the database."""
+    """Issue an agent link while storing only its hash in the database."""
     now = _now()
-    db.query(EstateAgentPortalToken).filter(
-        EstateAgentPortalToken.member_id == member.id,
-        EstateAgentPortalToken.revoked_at.is_(None),
-    ).update({"revoked_at": now}, synchronize_session=False)
+    if revoke_existing:
+        db.query(EstateAgentPortalToken).filter(
+            EstateAgentPortalToken.member_id == member.id,
+            EstateAgentPortalToken.revoked_at.is_(None),
+        ).update({"revoked_at": now}, synchronize_session=False)
     raw_token = secrets.token_urlsafe(36)
     row = EstateAgentPortalToken(
         organization_id=member.organization_id,
