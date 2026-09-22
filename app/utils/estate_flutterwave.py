@@ -72,6 +72,7 @@ def initiate_checkout(
     description: str,
     meta: dict[str, Any] | None = None,
     payment_options: str | None = None,
+    bank_transfer_expiry: int | None = None,
 ) -> str:
     """Creates a hosted-checkout charge and returns the link the customer is redirected to."""
     payload: dict[str, Any] = {
@@ -86,6 +87,8 @@ def initiate_checkout(
     }
     if payment_options:
         payload["payment_options"] = payment_options
+    if bank_transfer_expiry is not None:
+        payload["bank_transfer_options"] = {"expires": int(bank_transfer_expiry)}
     response = call_flutterwave_api(
         "POST",
         "/payments",

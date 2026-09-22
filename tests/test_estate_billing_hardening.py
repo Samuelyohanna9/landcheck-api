@@ -10,7 +10,7 @@ from app.models.estate_billing import EstateSubscription, EstateSubscriptionChar
 from app.models.estate_foundation import EstateOrganization
 from app.routers.estate_billing import _complete_subscription_payment, _complete_verification
 from app.services.estates import estate_email
-from app.services.estates.subscriptions import attempt_charge, change_plan, start_trial
+from app.services.estates.subscriptions import attempt_charge, change_plan, send_due_subscription_reminders, start_trial
 from app.utils import estate_flutterwave as flw
 
 
@@ -129,6 +129,101 @@ def test_verification_without_token_is_refunded_and_does_not_start_trial(monkeyp
     assert "another card" in result["message"]
     assert refunded and refunded[0][0] == "verify-1"
     assert db_session.query(EstateSubscription).count() == 0
+
+
+def test_successful_bank_transfer_verification_starts_bank_transfer_trial(monkeypatch, db_session):
+    organization = _organization(db_session)
+    account = EstateAccount(
+        organization_id=organization.id,
+        email="billing@example.com",
+        email_normalized="billing@example.com",
+        full_name="Billing Owner",
+        password_hash="hashed-password",
+    )
+    db_session.add(account)
+    db_session.commit()
+    monkeypatch.setattr(estate_email, "send_trial_started_email", lambda **kwargs: True)
+    monkeypatch.setattr(flw, "refund_transaction", lambda *args, **kwargs: None)
+
+    result = _complete_verification(
+        db_session,
+        {
+            "id": "bank-transfer-1",
+            "status": "successful",
+            "amount": "50",
+            "currency": "NGN",
+            "payment_type": "banktransfer",
+            "meta": {
+                "purpose": "estate_subscription_verification",
+                "organization_id": str(organization.id),
+                "account_id": str(account.id),
+                "plan_key": "basic",
+                "billing_cycle": "monthly",
+            },
+            "card": {},
+        },
+    )
+
+    subscription = db_session.query(EstateSubscription).one()
+    db_session.refresh(account)
+    assert result["ok"] is True
+    assert subscription.payment_method == "bank_transfer"
+    assert subscription.status == "trialing"
+    assert account.trial_claimed_at is not None
+
+
+def test_bank_transfer_renewal_creates_payment_checkout(monkeypatch, db_session):
+    organization = _organization(db_session)
+    subscription = EstateSubscription(
+        organization_id=organization.id,
+        plan_key="basic",
+        billing_cycle="monthly",
+        status="active",
+        amount=Decimal("19500"),
+        currency="NGN",
+        payment_method="bank_transfer",
+        flutterwave_customer_email="billing@example.com",
+    )
+    db_session.add(subscription)
+    db_session.commit()
+    monkeypatch.setattr(flw, "initiate_checkout", lambda **kwargs: "https://checkout.example/bank-transfer")
+    monkeypatch.setattr(estate_email, "send_subscription_payment_due_email", lambda **kwargs: True)
+
+    assert attempt_charge(db_session, subscription, charge_type="renewal") is False
+    db_session.refresh(subscription)
+    charge = db_session.query(EstateSubscriptionCharge).one()
+    assert subscription.status == "past_due"
+    assert charge.status == "pending"
+    assert charge.flutterwave_payload["checkout_url"] == "https://checkout.example/bank-transfer"
+
+
+def test_subscription_renewal_reminder_is_sent_once(monkeypatch, db_session):
+    organization = _organization(db_session)
+    subscription = EstateSubscription(
+        organization_id=organization.id,
+        plan_key="basic",
+        billing_cycle="monthly",
+        status="active",
+        amount=Decimal("19500"),
+        currency="NGN",
+        payment_method="bank_transfer",
+        next_charge_at=datetime.now(timezone.utc) + timedelta(days=2),
+        flutterwave_customer_email="billing@example.com",
+    )
+    db_session.add(subscription)
+    db_session.commit()
+    sent = []
+    monkeypatch.setattr(estate_email, "send_subscription_renewal_reminder_email", lambda **kwargs: sent.append(kwargs) or True)
+
+    result = send_due_subscription_reminders(db_session)
+    db_session.refresh(subscription)
+    assert result["renewal_reminders"] == 1
+    assert len(sent) == 1
+    assert subscription.renewal_reminder_sent_for is not None
+
+    result = send_due_subscription_reminders(db_session)
+    assert result["renewal_reminders"] == 0
+    assert len(sent) == 1
 
 
 def test_manual_recovery_payment_reactivates_subscription(monkeypatch, db_session):

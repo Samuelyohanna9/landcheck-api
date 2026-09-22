@@ -59,6 +59,7 @@ def _subscription_status_payload(subscription: EstateSubscription | None) -> dic
         "billing_cycle": subscription.billing_cycle,
         "amount": str(subscription.amount),
         "currency": subscription.currency,
+        "payment_method": subscription.payment_method,
         "hazard_analysis": bool(plan.get("hazard_analysis")),
         "trial_ends_at": subscription.trial_ends_at,
         "current_period_end": subscription.current_period_end,
@@ -169,8 +170,9 @@ def start_checkout(payload: ChoosePlanRequest, organization_id: int, request: Re
         name=organization.name,
         redirect_url=f"{_api_public_url()}/estates/billing/checkout/return",
         title="LandCheck Estates",
-        description="Card verification for your free trial - refunded immediately, not a real charge.",
-        payment_options="card",
+        description="Payment verification for your free trial - refunded immediately, not a real charge.",
+        payment_options="card,banktransfer",
+        bank_transfer_expiry=3600,
         meta={
             "purpose": "estate_subscription_verification",
             "organization_id": str(organization_id),
@@ -221,7 +223,14 @@ def _complete_verification(db: Session, verify_data: dict) -> dict:
         return {"ok": True, "already_used": True}
 
     card_token, card_last4, card_brand = flw.extract_card_token(verify_data)
-    if not card_token:
+    provider_payment_type = str(
+        verify_data.get("payment_type")
+        or verify_data.get("payment_method")
+        or verify_data.get("payment_options")
+        or ""
+    ).strip().lower()
+    payment_method = "bank_transfer" if "bank" in provider_payment_type or "transfer" in provider_payment_type else "card"
+    if not card_token and payment_method == "card":
         _refund_verification(verify_data, organization_id)
         return {"ok": False, "message": "This card cannot be saved for recurring billing. Please use another card."}
 
@@ -237,6 +246,7 @@ def _complete_verification(db: Session, verify_data: dict) -> dict:
             card_token=card_token,
             card_last4=card_last4,
             card_brand=card_brand,
+            payment_method=payment_method,
         )
     except ValueError as exc:
         _refund_verification(verify_data, organization_id)
@@ -260,7 +270,7 @@ def start_payment_checkout(organization_id: int, request: Request, db: Session =
         db.query(EstateSubscriptionCharge)
         .filter(
             EstateSubscriptionCharge.subscription_id == subscription.id,
-            EstateSubscriptionCharge.charge_type == "retry",
+            EstateSubscriptionCharge.charge_type.in_(("retry", "trial_conversion", "renewal")),
             EstateSubscriptionCharge.status == "pending",
         )
         .order_by(EstateSubscriptionCharge.id.desc())
@@ -297,7 +307,8 @@ def start_payment_checkout(organization_id: int, request: Request, db: Session =
             redirect_url=f"{_api_public_url()}/estates/billing/checkout/return",
             title="LandCheck Estates",
             description=f"Payment for your {subscription.plan_key.title()} plan.",
-            payment_options="card",
+            payment_options="banktransfer" if subscription.payment_method == "bank_transfer" else "card,banktransfer",
+            bank_transfer_expiry=86400 if subscription.payment_method == "bank_transfer" else None,
             meta={
                 "purpose": "estate_subscription_payment",
                 "organization_id": str(organization_id),
@@ -329,7 +340,7 @@ def _find_charge(db: Session, verify_data: dict, tx_ref: str | None = None) -> E
 
 def _complete_subscription_payment(db: Session, verify_data: dict, tx_ref: str | None = None) -> dict:
     charge = _find_charge(db, verify_data, tx_ref)
-    if not charge or charge.charge_type not in {"retry", "plan_change"}:
+    if not charge or charge.charge_type not in {"retry", "trial_conversion", "renewal", "plan_change"}:
         return {"ok": False, "message": "Could not match this payment to a subscription."}
     if charge.status == "success":
         return {"ok": True, "already_completed": True}
@@ -358,6 +369,14 @@ def _complete_subscription_payment(db: Session, verify_data: dict, tx_ref: str |
         return {"ok": False, "message": "Payment was not successful."}
 
     card_token, card_last4, card_brand = flw.extract_card_token(verify_data)
+    provider_payment_type = str(
+        verify_data.get("payment_type")
+        or verify_data.get("payment_method")
+        or verify_data.get("payment_options")
+        or ""
+    ).strip().lower()
+    if "bank" in provider_payment_type or "transfer" in provider_payment_type:
+        subscription.payment_method = "bank_transfer"
     if card_token:
         subscription.card_token = card_token
         subscription.card_last4 = card_last4

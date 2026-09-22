@@ -180,6 +180,9 @@ def _run_estate_subscription_billing_job():
             return
         try:
             estate_subscriptions.process_due_billing(session_db)
+            # Send trial/renewal reminders in the same locked billing sweep so multiple
+            # application workers cannot send the same subscription email twice.
+            estate_subscriptions.send_due_subscription_reminders(session_db)
             session_db.commit()
         except Exception:
             session_db.rollback()

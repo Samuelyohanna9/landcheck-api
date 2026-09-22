@@ -33,6 +33,7 @@ class EstateSubscription(Base):
     status = Column(String(16), nullable=False, default="trialing")
     amount = Column(Numeric(12, 2), nullable=False)
     currency = Column(String(8), nullable=False, default="NGN")
+    payment_method = Column(String(24), nullable=False, default="card", server_default="card")
 
     trial_ends_at = Column(DateTime(timezone=True), nullable=True)
     current_period_end = Column(DateTime(timezone=True), nullable=True)
@@ -41,6 +42,8 @@ class EstateSubscription(Base):
     failed_charge_attempts = Column(Integer, nullable=False, default=0)
     cancel_at_period_end = Column(Boolean, nullable=False, default=False)
     canceled_at = Column(DateTime(timezone=True), nullable=True)
+    trial_reminder_sent_for = Column(DateTime(timezone=True), nullable=True)
+    renewal_reminder_sent_for = Column(DateTime(timezone=True), nullable=True)
 
     card_token = Column(String(255), nullable=True)
     card_last4 = Column(String(8), nullable=True)
@@ -56,6 +59,10 @@ class EstateSubscription(Base):
         CheckConstraint(
             "status IN ('trialing', 'active', 'past_due', 'canceled', 'expired')",
             name="ck_estate_subscriptions_status",
+        ),
+        CheckConstraint(
+            "payment_method IN ('card', 'bank_transfer')",
+            name="ck_estate_subscriptions_payment_method",
         ),
     )
 

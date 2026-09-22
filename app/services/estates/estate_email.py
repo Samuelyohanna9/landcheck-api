@@ -486,13 +486,102 @@ def send_trial_started_email(*, organization, subscription) -> bool:
         return False
     plan_label = "Plus" if subscription.plan_key == "plus" else "Basic"
     trial_ends = subscription.trial_ends_at.strftime("%d %b %Y") if subscription.trial_ends_at else "in 3 days"
-    message_html = f"<p>Your {html.escape(plan_label)} plan trial has started - you have full access until <strong>{html.escape(trial_ends)}</strong>.</p><p>We'll automatically charge {html.escape(format_naira(subscription.amount))} to your card on file when the trial ends, unless you cancel first. You can cancel anytime from Settings &rarr; Billing.</p>"
+    payment_message = (
+        f"Your next subscription payment will be {html.escape(format_naira(subscription.amount))}. "
+        "Because you selected bank transfer, we will send you a payment reminder and secure payment link before access is renewed."
+        if getattr(subscription, "payment_method", "card") == "bank_transfer"
+        else f"We'll automatically charge {html.escape(format_naira(subscription.amount))} to your card on file when the trial ends, unless you cancel first."
+    )
+    message_html = f"<p>Your {html.escape(plan_label)} plan trial has started - you have full access until <strong>{html.escape(trial_ends)}</strong>.</p><p>{payment_message} You can cancel anytime from Settings &rarr; Billing.</p>"
     body_html = _account_wrap_html(heading="Your free trial has started", message_html=message_html)
     try:
         _send_email(to_email=to_email, from_display_name="LandCheck Estates", subject=f"Your {plan_label} plan trial has started", body_text=_account_plain_text("Your free trial has started", message_html), body_html=body_html)
         return True
     except Exception:
         logger.exception("Estate trial-started email failed (org=%s)", organization.id)
+        return False
+
+
+def send_trial_expiry_reminder_email(*, organization, subscription) -> bool:
+    to_email = _subscription_org_email(organization)
+    if not to_email:
+        return False
+    web_url = str(os.getenv("LANDCHECK_WEB_URL") or "https://landcheck.online").rstrip("/")
+    trial_ends = subscription.trial_ends_at.strftime("%d %b %Y") if subscription.trial_ends_at else "soon"
+    payment_line = (
+        f"Your next payment is {html.escape(format_naira(subscription.amount))}. We will email you a bank-transfer payment link when it is due."
+        if getattr(subscription, "payment_method", "card") == "bank_transfer"
+        else f"Your saved card will be charged {html.escape(format_naira(subscription.amount))} when the trial ends."
+    )
+    message_html = f"<p>Your {html.escape(subscription.plan_key.title())} trial ends on <strong>{html.escape(trial_ends)}</strong>.</p><p>{payment_line} Review your billing details before the trial ends.</p>"
+    body_html = _account_wrap_html(
+        heading="Your Estate trial ends soon",
+        message_html=message_html,
+        button_html=_account_button_html(label="Review billing", url=f"{web_url}/estates/billing"),
+    )
+    try:
+        _send_email(
+            to_email=to_email,
+            from_display_name="LandCheck Estates",
+            subject="Your LandCheck Estates trial ends soon",
+            body_text=_account_plain_text("Your Estate trial ends soon", message_html, f"{web_url}/estates/billing"),
+            body_html=body_html,
+        )
+        return True
+    except Exception:
+        logger.exception("Estate trial reminder email failed (org=%s)", organization.id)
+        return False
+
+
+def send_subscription_renewal_reminder_email(*, organization, subscription) -> bool:
+    to_email = _subscription_org_email(organization)
+    if not to_email:
+        return False
+    web_url = str(os.getenv("LANDCHECK_WEB_URL") or "https://landcheck.online").rstrip("/")
+    due_at = subscription.next_charge_at.strftime("%d %b %Y") if subscription.next_charge_at else "soon"
+    payment_line = (
+        f"Because your subscription uses bank transfer, open Billing to complete the payment when the transfer account is issued."
+        if getattr(subscription, "payment_method", "card") == "bank_transfer"
+        else "Your saved card will be charged automatically."
+    )
+    message_html = f"<p>Your {html.escape(subscription.plan_key.title())} subscription renews on <strong>{html.escape(due_at)}</strong> for <strong>{html.escape(format_naira(subscription.amount))}</strong>.</p><p>{payment_line} You can review your plan and billing details at any time.</p>"
+    body_html = _account_wrap_html(
+        heading="Subscription payment reminder",
+        message_html=message_html,
+        button_html=_account_button_html(label="Open billing", url=f"{web_url}/estates/billing"),
+    )
+    try:
+        _send_email(
+            to_email=to_email,
+            from_display_name="LandCheck Estates",
+            subject="LandCheck Estates subscription payment reminder",
+            body_text=_account_plain_text("Subscription payment reminder", message_html, f"{web_url}/estates/billing"),
+            body_html=body_html,
+        )
+        return True
+    except Exception:
+        logger.exception("Estate renewal reminder email failed (org=%s)", organization.id)
+        return False
+
+
+def send_subscription_payment_due_email(*, organization, subscription, checkout_url: str | None = None) -> bool:
+    to_email = _subscription_org_email(organization)
+    if not to_email:
+        return False
+    message_html = f"<p>Your {html.escape(subscription.plan_key.title())} subscription payment of <strong>{html.escape(format_naira(subscription.amount))}</strong> is due.</p><p>Complete the bank transfer using the secure payment page below. Your Estate workspace will be restored automatically after Flutterwave confirms the transfer.</p>"
+    button_html = _account_button_html(label="Pay subscription by bank transfer", url=checkout_url) if checkout_url else ""
+    body_html = _account_wrap_html(heading="Subscription payment due", message_html=message_html, button_html=button_html)
+    try:
+        _send_email(
+            to_email=to_email,
+            from_display_name="LandCheck Estates",
+            subject="Action needed - Estate subscription payment due",
+            body_text=_account_plain_text("Subscription payment due", message_html, checkout_url),
+            body_html=body_html,
+        )
+        return True
+    except Exception:
+        logger.exception("Estate subscription payment-due email failed (org=%s)", organization.id)
         return False
 
 

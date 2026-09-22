@@ -5,6 +5,7 @@ cancellation, and plan changes. See app/utils/estate_flutterwave.py for the paym
 app/main.py's `_run_estate_subscription_billing_job` for the daily driver of this module."""
 
 import logging
+import os
 import uuid
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -56,9 +57,13 @@ def start_trial(
     card_token: str | None,
     card_last4: str | None,
     card_brand: str | None,
+    payment_method: str = "card",
 ) -> EstateSubscription:
     """Called after the verification checkout has been refunded; this is a single-use trial."""
-    if not card_token:
+    payment_method = str(payment_method or "card").strip().lower()
+    if payment_method not in {"card", "bank_transfer"}:
+        raise ValueError("Unsupported subscription payment method")
+    if payment_method == "card" and not card_token:
         raise ValueError("A reusable card token is required to start the free trial")
     now = datetime.now(timezone.utc)
     trial_ends_at = now + timedelta(days=TRIAL_DAYS)
@@ -73,6 +78,7 @@ def start_trial(
     subscription.status = "trialing"
     subscription.amount = plan_amount(plan_key, billing_cycle)
     subscription.currency = "NGN"
+    subscription.payment_method = payment_method
     subscription.trial_ends_at = trial_ends_at
     subscription.current_period_end = None
     subscription.next_charge_at = trial_ends_at
@@ -80,6 +86,8 @@ def start_trial(
     subscription.failed_charge_attempts = 0
     subscription.cancel_at_period_end = False
     subscription.canceled_at = None
+    subscription.trial_reminder_sent_for = None
+    subscription.renewal_reminder_sent_for = None
     subscription.flutterwave_customer_email = email
     if card_token:
         subscription.card_token = card_token
@@ -138,8 +146,12 @@ def attempt_charge(db: Session, subscription: EstateSubscription, *, charge_type
         .first()
     )
     if existing_pending:
-        _handle_pending_charge(db, subscription, organization=organization)
+        if subscription.payment_method == "card":
+            _handle_pending_charge(db, subscription, organization=organization)
         return False
+
+    if subscription.payment_method == "bank_transfer":
+        return _start_bank_transfer_charge(db, subscription, organization=organization, charge_type=charge_type)
 
     tx_ref = new_tx_ref("SUB")
     charge = _record_charge(
@@ -186,13 +198,87 @@ def attempt_charge(db: Session, subscription: EstateSubscription, *, charge_type
     return False
 
 
+def _start_bank_transfer_charge(
+    db: Session,
+    subscription: EstateSubscription,
+    *,
+    organization: EstateOrganization | None,
+    charge_type: str,
+) -> bool:
+    """Create a one-time bank-transfer checkout for a subscription renewal.
+
+    Bank transfers cannot be silently debited like a saved card. The subscription is held in
+    past-due state until Flutterwave confirms the transfer through its webhook or a later
+    server-side verification.
+    """
+    email = str(subscription.flutterwave_customer_email or (organization.contact_email if organization else "") or "").strip()
+    if not email:
+        subscription.status = "past_due"
+        subscription.next_retry_at = None
+        return False
+    tx_ref = new_tx_ref("SUB")
+    charge = _record_charge(
+        db,
+        subscription=subscription,
+        charge_type=charge_type,
+        amount=subscription.amount,
+        status="pending",
+        tx_ref=tx_ref,
+        flutterwave_transaction_id=None,
+        flutterwave_payload=None,
+        failure_reason="Waiting for bank transfer payment.",
+    )
+    try:
+        link = flw.initiate_checkout(
+            tx_ref=tx_ref,
+            amount=subscription.amount,
+            currency=subscription.currency,
+            email=email,
+            name=organization.name if organization else "LandCheck Estates",
+            redirect_url=f"{str(os.getenv('LANDCHECK_API_PUBLIC_URL') or 'https://api.landcheck.online').rstrip('/')}/estates/billing/checkout/return",
+            title="LandCheck Estates",
+            description=f"Payment for your {subscription.plan_key.title()} plan.",
+            payment_options="banktransfer",
+            bank_transfer_expiry=86400,
+            meta={
+                "purpose": "estate_subscription_payment",
+                "organization_id": str(subscription.organization_id),
+                "subscription_id": str(subscription.id),
+                "charge_id": str(charge.id),
+                "customer_email": email,
+                "payment_method": "bank_transfer",
+            },
+        )
+    except Exception as exc:
+        charge.status = "failed"
+        charge.failure_reason = "Could not create a bank-transfer checkout."
+        charge.flutterwave_payload = {"error": type(exc).__name__}
+        _handle_failed_charge(db, subscription, organization=organization)
+        return False
+
+    charge.flutterwave_payload = {"checkout_url": link, "payment_method": "bank_transfer"}
+    subscription.status = "past_due"
+    subscription.next_retry_at = None
+    db.flush()
+    if organization:
+        estate_email.send_subscription_payment_due_email(
+            organization=organization,
+            subscription=subscription,
+            checkout_url=link,
+        )
+    return False
+
+
 def _handle_pending_charge(db: Session, subscription: EstateSubscription, *, organization: EstateOrganization | None) -> None:
     """Hold access in past-due state without scheduling a blind duplicate retry."""
     subscription.status = "past_due"
     subscription.next_retry_at = None
     db.flush()
     if organization:
-        estate_email.send_payment_failed_email(organization=organization, subscription=subscription)
+        if subscription.payment_method == "bank_transfer":
+            estate_email.send_subscription_payment_due_email(organization=organization, subscription=subscription)
+        else:
+            estate_email.send_payment_failed_email(organization=organization, subscription=subscription)
 
 
 def _handle_successful_charge(db: Session, subscription: EstateSubscription, *, organization: EstateOrganization | None) -> None:
@@ -205,6 +291,7 @@ def _handle_successful_charge(db: Session, subscription: EstateSubscription, *, 
     subscription.failed_charge_attempts = 0
     subscription.cancel_at_period_end = False
     subscription.canceled_at = None
+    subscription.renewal_reminder_sent_for = None
     db.flush()
     if organization:
         estate_email.send_payment_receipt_email(organization=organization, subscription=subscription)
@@ -434,4 +521,41 @@ def process_due_billing(db: Session) -> dict[str, int]:
         counts["cancellations_finalized"] += 1
     db.flush()
 
+    return counts
+
+
+def _as_utc(value: datetime | None) -> datetime | None:
+    if value is None:
+        return None
+    return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value
+
+
+def send_due_subscription_reminders(db: Session) -> dict[str, int]:
+    """Send at-most-once reminders for trials and upcoming subscription renewals."""
+    now = datetime.now(timezone.utc)
+    reminder_window = now + timedelta(days=3)
+    counts = {"trial_reminders": 0, "renewal_reminders": 0}
+    subscriptions = (
+        db.query(EstateSubscription)
+        .filter(EstateSubscription.status.in_(("trialing", "active")))
+        .with_for_update()
+        .all()
+    )
+    for subscription in subscriptions:
+        organization = db.get(EstateOrganization, subscription.organization_id)
+        if not organization:
+            continue
+        if subscription.status == "trialing":
+            trial_ends_at = _as_utc(subscription.trial_ends_at)
+            if trial_ends_at and now < trial_ends_at <= reminder_window and _as_utc(subscription.trial_reminder_sent_for) != trial_ends_at:
+                if estate_email.send_trial_expiry_reminder_email(organization=organization, subscription=subscription):
+                    subscription.trial_reminder_sent_for = trial_ends_at
+                    counts["trial_reminders"] += 1
+        else:
+            next_charge_at = _as_utc(subscription.next_charge_at)
+            if next_charge_at and now < next_charge_at <= reminder_window and _as_utc(subscription.renewal_reminder_sent_for) != next_charge_at:
+                if estate_email.send_subscription_renewal_reminder_email(organization=organization, subscription=subscription):
+                    subscription.renewal_reminder_sent_for = next_charge_at
+                    counts["renewal_reminders"] += 1
+    db.flush()
     return counts
