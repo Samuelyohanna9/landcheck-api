@@ -409,11 +409,44 @@ def send_public_reservation_welcome(
         return False
 
 
-def send_welcome_email(*, organization, account) -> bool:
+def send_welcome_email(*, organization, account, subscription=None) -> bool:
     """Sent right after a new company registers - the first email a customer ever gets from us,
     so it doubles as a mini product tour and pricing reference rather than a bare "you're in"."""
     to_email = str(getattr(account, "email", "") or "").strip()
     if not to_email:
+        return False
+    first_name = str(getattr(account, "full_name", "") or "there").split(" ")[0]
+    web_url = os.getenv("LANDCHECK_WEB_URL") or "https://landcheck.online"
+    trial_context = (
+        f"<p>Your {html.escape(str(subscription.plan_key).title())} plan trial is active until "
+        f"<strong>{html.escape(subscription.trial_ends_at.strftime('%d %b %Y') if subscription.trial_ends_at else 'the trial end date')}</strong>. "
+        "Your workspace access is ready now.</p>"
+        if subscription
+        else "<p>Choose a plan to activate your workspace trial.</p>"
+    )
+    message_html = f"""
+    <p>Welcome to LandCheck Estates, {html.escape(first_name)} - your workspace for
+    <strong>{html.escape(str(getattr(organization, "name", "") or "your company"))}</strong> is ready.</p>
+    {trial_context}
+    <ul style="padding-left:18px;line-height:1.9;">
+      <li>Bring in a layout (survey coordinates, CAD, CSV, or a scanned plan) and manage every plot from one map</li>
+      <li>Track customers, reservations, allocations, payments and receipts</li>
+      <li>Run a tiered sales-agent commission ladder with payout tracking</li>
+      <li>Produce survey plans, staking coordinates and DGPS exports</li>
+      <li>Screen flood and erosion risk for a whole layout (Plus plan)</li>
+    </ul>
+    <p><strong>Basic</strong> is &#8358;19,500/month (or &#8358;220,000/year) - everything except flood and erosion hazard analysis.<br/>
+    <strong>Plus</strong> is &#8358;24,500/month (or &#8358;285,000/year) - everything, including hazard analysis.</p>
+    <p>{"Your subscription will use scheduled bank-transfer reminders." if subscription and getattr(subscription, "payment_method", "card") == "bank_transfer" else "Both plans start with a 3-day free trial, and you can cancel anytime."}</p>
+    """
+    action_label = "Open your workspace" if subscription else "Choose your plan"
+    action_path = "estates/workspace" if subscription else "estates/choose-plan"
+    body_html = _account_wrap_html(heading=f"Welcome to LandCheck Estates, {first_name}!", message_html=message_html, button_html=_account_button_html(label=action_label, url=f"{web_url.rstrip('/')}/{action_path}"))
+    try:
+        _send_email(to_email=to_email, from_display_name="LandCheck Estates", subject="Welcome to LandCheck Estates", body_text=_account_plain_text("Welcome to LandCheck Estates", message_html, f"{web_url.rstrip('/')}/{action_path}"), body_html=body_html)
+        return True
+    except Exception:
+        logger.exception("Estate welcome email failed (to=%s)", to_email)
         return False
 
 
@@ -448,30 +481,6 @@ def send_agent_workspace_invite(*, organization, member, portal_url: str) -> boo
         return True
     except Exception:
         logger.exception("Estate agent invite email failed (to=%s)", to_email)
-        return False
-    first_name = str(getattr(account, "full_name", "") or "there").split(" ")[0]
-    web_url = os.getenv("LANDCHECK_WEB_URL") or "https://landcheck.online"
-    message_html = f"""
-    <p>Welcome to LandCheck Estates, {html.escape(first_name)} - your workspace for
-    <strong>{html.escape(str(getattr(organization, "name", "") or "your company"))}</strong> is ready.</p>
-    <p>Here's what you can do once you pick a plan:</p>
-    <ul style="padding-left:18px;line-height:1.9;">
-      <li>Bring in a layout (survey coordinates, CAD, CSV, or a scanned plan) and manage every plot from one map</li>
-      <li>Track customers, reservations, allocations, payments and receipts</li>
-      <li>Run a tiered sales-agent commission ladder with payout tracking</li>
-      <li>Produce survey plans, staking coordinates and DGPS exports</li>
-      <li>Screen flood and erosion risk for a whole layout (Plus plan)</li>
-    </ul>
-    <p><strong>Basic</strong> is &#8358;19,500/month (or &#8358;220,000/year) - everything except flood and erosion hazard analysis.<br/>
-    <strong>Plus</strong> is &#8358;24,500/month (or &#8358;285,000/year) - everything, including hazard analysis.</p>
-    <p>Both plans start with a 3-day free trial, and you can cancel anytime.</p>
-    """
-    body_html = _account_wrap_html(heading=f"Welcome to LandCheck Estates, {first_name}!", message_html=message_html, button_html=_account_button_html(label="Choose your plan", url=f"{web_url.rstrip('/')}/estates/choose-plan"))
-    try:
-        _send_email(to_email=to_email, from_display_name="LandCheck Estates", subject="Welcome to LandCheck Estates", body_text=_account_plain_text("Welcome to LandCheck Estates", message_html), body_html=body_html)
-        return True
-    except Exception:
-        logger.exception("Estate welcome email failed (to=%s)", to_email)
         return False
 
 

@@ -3,6 +3,7 @@ from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse, Resp
 from sqlalchemy.orm import Session
 from sqlalchemy import bindparam, text
 from datetime import datetime, date, timedelta, timezone
+from decimal import Decimal, InvalidOperation
 from zoneinfo import ZoneInfo
 import logging
 import json
@@ -33,9 +34,15 @@ import requests
 import boto3
 from botocore.exceptions import ClientError
 from PIL import Image, ImageOps, ImageDraw, UnidentifiedImageError
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from app.db import SessionLocal
+from app.models.estate_auth import EstateAccount
+from app.models.estate_billing import EstateSubscription, EstateSubscriptionCharge
+from app.models.estate_foundation import EstateOrganization
+from app.services.estates import estate_email
+from app.services.estates.billing_plans import ESTATE_PLANS
+from app.services.estates.subscriptions import get_subscription, start_trial
 from app.utils.green_pdf import (
     render_green_report_pdf,
     render_green_agric_farmer_sheet_pdf,
@@ -115,6 +122,13 @@ from app.utils.carbon import (
 
 router = APIRouter(prefix="/green", tags=["green"])
 logger = logging.getLogger(__name__)
+
+
+class EstateSubscriptionReconcilePayload(BaseModel):
+    plan_key: str = Field(min_length=4, max_length=16)
+    billing_cycle: str = Field(min_length=6, max_length=16)
+    transfer_reference: str = Field(min_length=3, max_length=64)
+    amount: str = Field(default="50", min_length=1, max_length=32)
 
 _GREEN_SCHEMA_BOOTSTRAP_LOCK = Lock()
 _GREEN_SCHEMA_READY = False
@@ -23605,6 +23619,115 @@ def estate_admin_overview(request: Request, db: Session = Depends(get_db)):
         "generated_at": datetime.now(timezone.utc),
         "totals": {key: int(value or 0) for key, value in dict(totals).items()},
         "organizations": [dict(row) for row in organizations],
+    }
+
+
+@router.post("/admin/estate-overview/{organization_id}/reconcile")
+def reconcile_estate_subscription(
+    organization_id: int,
+    payload: EstateSubscriptionReconcilePayload,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    """Manually activate a verified direct bank transfer for an Estate company.
+
+    This is deliberately restricted to the platform super-admin. A direct bank transfer has no
+    provider callback to match it to the company, so the admin must confirm the reference and the
+    fixed NGN 50 trial-verification amount before access is granted.
+    """
+    require_super_admin_request(db, request)
+    plan_key = str(payload.plan_key or "").strip().lower()
+    billing_cycle = str(payload.billing_cycle or "").strip().lower()
+    transfer_reference = str(payload.transfer_reference or "").strip()
+    if plan_key not in ESTATE_PLANS:
+        raise HTTPException(status_code=422, detail="Choose Basic or Plus")
+    if billing_cycle not in {"monthly", "yearly"}:
+        raise HTTPException(status_code=422, detail="Choose monthly or yearly billing")
+    try:
+        amount = Decimal(str(payload.amount or "50")).quantize(Decimal("0.01"))
+    except (InvalidOperation, TypeError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail="Enter a valid transfer amount") from exc
+    if amount != Decimal("50.00"):
+        raise HTTPException(status_code=422, detail="Trial reconciliation requires the NGN 50 verification transfer")
+    manual_tx_ref = f"MANUAL-{hashlib.sha256(transfer_reference.encode('utf-8')).hexdigest()[:24].upper()}"
+
+    organization = db.get(EstateOrganization, organization_id)
+    if not organization:
+        raise HTTPException(status_code=404, detail="Estate organization was not found")
+    existing_manual_ref = (
+        db.query(EstateSubscriptionCharge)
+        .filter(EstateSubscriptionCharge.tx_ref == manual_tx_ref)
+        .one_or_none()
+    )
+    if existing_manual_ref:
+        if existing_manual_ref.organization_id != organization_id:
+            raise HTTPException(status_code=409, detail="This transfer reference has already been reconciled")
+        subscription = get_subscription(db, organization_id)
+        return {
+            "ok": True,
+            "already_reconciled": True,
+            "status": subscription.status if subscription else "none",
+            "plan_key": subscription.plan_key if subscription else None,
+        }
+
+    subscription = get_subscription(db, organization_id)
+    if subscription and subscription.status in {"trialing", "active"}:
+        raise HTTPException(status_code=409, detail="This organization already has an active subscription")
+    account = (
+        db.query(EstateAccount)
+        .filter(EstateAccount.organization_id == organization_id, EstateAccount.status == "active")
+        .order_by(EstateAccount.created_at.asc(), EstateAccount.id.asc())
+        .with_for_update()
+        .first()
+    )
+    if not account:
+        raise HTTPException(status_code=404, detail="No active Estate account was found for this organization")
+    if account.trial_claimed_at is not None:
+        raise HTTPException(status_code=409, detail="This account has already used its free trial")
+
+    try:
+        subscription = start_trial(
+            db,
+            organization=organization,
+            plan_key=plan_key,
+            billing_cycle=billing_cycle,
+            email=account.email or organization.contact_email or "",
+            card_token=None,
+            card_last4=None,
+            card_brand=None,
+            payment_method="bank_transfer",
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    account.trial_claimed_at = datetime.now(timezone.utc)
+    db.add(
+        EstateSubscriptionCharge(
+            subscription_id=subscription.id,
+            organization_id=organization_id,
+            charge_type="verification",
+            amount=amount,
+            currency="NGN",
+            status="success",
+            tx_ref=manual_tx_ref,
+            flutterwave_payload={
+                "source": "manual_bank_transfer_reconciliation",
+                "transfer_reference": transfer_reference,
+            },
+        )
+    )
+    db.commit()
+
+    # Registration normally sends this message. Reconciliation also sends it so a company that
+    # paid later by direct transfer receives the same onboarding link and plan guidance.
+    estate_email.send_welcome_email(organization=organization, account=account, subscription=subscription)
+    return {
+        "ok": True,
+        "already_reconciled": False,
+        "status": subscription.status,
+        "plan_key": subscription.plan_key,
+        "billing_cycle": subscription.billing_cycle,
+        "trial_ends_at": subscription.trial_ends_at,
     }
 
 
