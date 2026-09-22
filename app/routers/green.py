@@ -23484,6 +23484,12 @@ def estate_admin_overview(request: Request, db: Session = Depends(get_db)):
         if has_public_reservation_table
         else "0 AS reservation_count, 0 AS open_reservation_count,"
     )
+    estate_public_enabled_sql = "COALESCE(e.public_enabled, FALSE)" if has_public_enabled_column else "FALSE"
+    estate_reservation_count_sql = (
+        "(SELECT COUNT(*) FROM estate_public_reservation_requests r WHERE r.estate_id = e.id)"
+        if has_public_reservation_table
+        else "0"
+    )
 
     totals = db.execute(
         text(
@@ -23502,7 +23508,25 @@ def estate_admin_overview(request: Request, db: Session = Depends(get_db)):
                 {reservation_total_sql} AS open_reservations,
                 (SELECT COUNT(*) FROM estate_customers) AS customers,
                 (SELECT COUNT(*) FROM estate_subscriptions WHERE status IN ('trialing', 'active')) AS subscribed_organizations,
-                (SELECT COUNT(*) FROM estate_subscriptions WHERE status = 'past_due') AS past_due_subscriptions
+                (SELECT COUNT(*) FROM estate_subscriptions WHERE status = 'past_due') AS past_due_subscriptions,
+                (
+                    SELECT COUNT(*)
+                    FROM estate_auth_sessions s
+                    JOIN estate_accounts a ON a.id = s.account_id
+                    WHERE s.session_state = 'active'
+                      AND s.revoked_at IS NULL
+                      AND s.expires_at > NOW()
+                      AND s.last_seen_at >= NOW() - INTERVAL '5 minutes'
+                ) AS online_users,
+                (
+                    SELECT COUNT(DISTINCT a.organization_id)
+                    FROM estate_auth_sessions s
+                    JOIN estate_accounts a ON a.id = s.account_id
+                    WHERE s.session_state = 'active'
+                      AND s.revoked_at IS NULL
+                      AND s.expires_at > NOW()
+                      AND s.last_seen_at >= NOW() - INTERVAL '5 minutes'
+                ) AS online_organizations
             """
         )
     ).mappings().one()
@@ -23537,6 +23561,22 @@ def estate_admin_overview(request: Request, db: Session = Depends(get_db)):
                     WHERE a.organization_id = o.id
                       AND a.status = 'active'
                 ), 0) AS active_user_count,
+                COALESCE((
+                    SELECT COUNT(*)
+                    FROM estate_auth_sessions s
+                    JOIN estate_accounts a ON a.id = s.account_id
+                    WHERE a.organization_id = o.id
+                      AND s.session_state = 'active'
+                      AND s.revoked_at IS NULL
+                      AND s.expires_at > NOW()
+                      AND s.last_seen_at >= NOW() - INTERVAL '5 minutes'
+                ), 0) AS online_user_count,
+                (
+                    SELECT MAX(s.last_seen_at)
+                    FROM estate_auth_sessions s
+                    JOIN estate_accounts a ON a.id = s.account_id
+                    WHERE a.organization_id = o.id
+                ) AS last_user_activity_at,
                 COALESCE((
                     SELECT COUNT(*)
                     FROM estate_estates e
@@ -23607,7 +23647,29 @@ def estate_admin_overview(request: Request, db: Session = Depends(get_db)):
                     SELECT MAX(GREATEST(COALESCE(e.updated_at, e.created_at), COALESCE(e.created_at, e.updated_at)))
                     FROM estate_estates e
                     WHERE e.organization_id = o.id
-                ) AS last_estate_activity_at
+                ) AS last_estate_activity_at,
+                COALESCE((
+                    SELECT json_agg(
+                        json_build_object(
+                            'id', e.id,
+                            'name', e.name,
+                            'location', COALESCE(e.location_text, NULLIF(CONCAT_WS(', ', e.locality, e.state), '')),
+                            'status', e.status,
+                            'public_enabled', {estate_public_enabled_sql},
+                            'plot_count', (SELECT COUNT(*) FROM estate_plots p WHERE p.estate_id = e.id),
+                            'approved_plot_count', (SELECT COUNT(*) FROM estate_plots p WHERE p.estate_id = e.id AND p.geometry_status = 'approved'),
+                            'available_plot_count', (SELECT COUNT(*) FROM estate_plots p WHERE p.estate_id = e.id AND p.commercial_status = 'available'),
+                            'reserved_plot_count', (SELECT COUNT(*) FROM estate_plots p WHERE p.estate_id = e.id AND p.commercial_status = 'reserved'),
+                            'allocated_plot_count', (SELECT COUNT(*) FROM estate_plots p WHERE p.estate_id = e.id AND p.commercial_status = 'allocated'),
+                            'area_sqm', COALESCE((SELECT SUM(p.area_sqm) FROM estate_plots p WHERE p.estate_id = e.id), 0),
+                            'reservation_count', {estate_reservation_count_sql},
+                            'updated_at', COALESCE(e.updated_at, e.created_at)
+                        )
+                        ORDER BY e.updated_at DESC NULLS LAST, e.id DESC
+                    )
+                    FROM estate_estates e
+                    WHERE e.organization_id = o.id
+                ), '[]'::json) AS estates
             FROM estate_organizations o
             LEFT JOIN estate_subscriptions s ON s.organization_id = o.id
             ORDER BY COALESCE(o.updated_at, o.created_at) DESC, o.id DESC
