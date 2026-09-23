@@ -33,7 +33,23 @@ def record_payment(db: Session, *, allocation: EstateAllocation, amount: Decimal
     payment = EstatePayment(organization_id=allocation.organization_id, allocation_id=allocation.id, customer_id=allocation.customer_id, plot_id=allocation.plot_id, amount=amount, payment_date=payment_date, payment_method=method, reference_no=reference or None, notes=notes, status="pending_confirmation" if confirmation_required else "recorded", recorded_by_subject_type=actor.subject_type, recorded_by_subject_id=actor.subject_id, idempotency_key=idempotency_key)
     db.add(payment); db.flush()
     payment.receipt_number = f"LC-{payment.payment_uid[:8].upper()}"
-    append_estate_audit_event(db, organization_id=allocation.organization_id, actor=actor, action="payment.recorded", entity_type="estate_payment", entity_id=payment.id, after_data={"amount": str(amount), "status": payment.status, "reference": reference, "receipt_number": payment.receipt_number})
+    reservation_expiry = allocation.reservation_expires_at
+    if allocation.status == "reserved" and reservation_expiry is not None:
+        # A recorded payment protects the reservation. The expiry job only releases reservations
+        # with a non-null deadline, so clearing it is the durable guard against auto-release.
+        allocation.reservation_expires_at = None
+        allocation.reservation_reminder_sent_at = None
+        append_estate_audit_event(
+            db,
+            organization_id=allocation.organization_id,
+            actor=actor,
+            action="allocation.reservation_protected_by_payment",
+            entity_type="estate_allocation",
+            entity_id=allocation.id,
+            before_data={"reservation_expires_at": reservation_expiry.isoformat()},
+            after_data={"reservation_expires_at": None, "payment_id": payment.id},
+        )
+    append_estate_audit_event(db, organization_id=allocation.organization_id, actor=actor, action="payment.recorded", entity_type="estate_payment", entity_id=payment.id, after_data={"amount": str(amount), "status": payment.status, "reference": reference, "receipt_number": payment.receipt_number, "reservation_expiry_cleared": reservation_expiry is not None and allocation.status == "reserved"})
     return payment
 
 def confirm_payment(db: Session, *, payment: EstatePayment, actor: EstatePrincipal) -> EstatePayment:
