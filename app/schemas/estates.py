@@ -144,12 +144,11 @@ class EstateLayoutFeatureAdd(BaseModel):
 
 
 class EstateLayoutFeatureRemove(BaseModel):
-    """Removes a road or open-space shape from a draft layout and gives the vacated space back to
-    the plots that fronted it - either by restoring the exact pre-carve shape of every plot this
-    feature carved when it was added (if it has that history), or, for a plain generated road with
-    no such history, by splitting the vacated corridor along its centreline and merging each half
-    into whichever plots actually front it. plot_candidates/feature_candidates let the caller pass
-    along any edits made in the same session that haven't been saved yet."""
+    """Removes a road or open-space shape from a draft layout. Hand-carved features restore their
+    exact pre-carve plot shapes; a generated road is compacted so one complete layout side closes
+    the internal corridor and the released area moves to the outer edge. plot_candidates/
+    feature_candidates let the caller pass along any edits made in the same session that have not
+    been saved yet."""
     feature_index: int = Field(ge=0)
     plot_candidates: list[dict[str, Any]] | None = None
     feature_candidates: list[dict[str, Any]] | None = None

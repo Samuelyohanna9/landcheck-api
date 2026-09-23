@@ -630,6 +630,136 @@ def _refresh_layout_diagnostics(estate: Estate, diagnostics: dict | None, plot_c
     return refreshed
 
 
+def _compact_generated_road_gap(
+    estate: Estate,
+    plot_candidates: list[dict],
+    deleted_feature: dict,
+    remaining_features: list[dict],
+) -> tuple[list[dict], list[dict]] | None:
+    """Close a deleted generated-road corridor by moving one layout side to the other side.
+
+    Generated roads are centre lines between complete rows of plots. Keeping the released corridor
+    in place creates a visual and geometric split through the middle of the estate. Translating one
+    side by the road width preserves every plot's area and number while moving the same amount of
+    unused land to that side's outer edge. Hand-drawn roads are excluded because their carved-plot
+    history has a more precise restore operation.
+    """
+    if deleted_feature.get("feature_type") != "road" or deleted_feature.get("carved_plots"):
+        return None
+    try:
+        boundary = to_shape(estate.boundary)
+        road_shape = shape(deleted_feature.get("geometry") or {})
+        if road_shape.geom_type not in {"LineString", "MultiLineString"}:
+            return None
+        metric_epsg = _metric_epsg_for_wgs84_polygon(boundary)
+        forward = Transformer.from_crs("EPSG:4326", f"EPSG:{metric_epsg}", always_xy=True).transform
+        backward = Transformer.from_crs(f"EPSG:{metric_epsg}", "EPSG:4326", always_xy=True).transform
+        metric_boundary = shapely_transform(forward, boundary)
+        boundary_check = metric_boundary.buffer(0.1)
+        metric_road = shapely_transform(forward, road_shape)
+        road_parts = [metric_road] if metric_road.geom_type == "LineString" else list(metric_road.geoms)
+        road_line = max(road_parts, key=lambda item: item.length, default=None)
+        if road_line is None or road_line.length < 2:
+            return None
+        start_x, start_y = road_line.coords[0]
+        end_x, end_y = road_line.coords[-1]
+        length = math.hypot(end_x - start_x, end_y - start_y)
+        if length < 2:
+            return None
+        normal_x = -(end_y - start_y) / length
+        normal_y = (end_x - start_x) / length
+        road_center = road_line.centroid
+        width_m = max(float(deleted_feature.get("width_m") or 9.0), 1.0)
+
+        metric_plots = []
+        for candidate in plot_candidates:
+            geometry = shapely_transform(forward, shape(candidate.get("geometry") or {}))
+            if geometry.is_empty or geometry.geom_type not in {"Polygon", "MultiPolygon"}:
+                return None
+            metric_plots.append((candidate, geometry))
+
+        metric_features = []
+        for feature in remaining_features:
+            try:
+                geometry = shapely_transform(forward, shape(feature.get("geometry") or {}))
+            except Exception:
+                return None
+            if geometry.is_empty:
+                return None
+            metric_features.append((feature, geometry))
+
+        def shift_geometry(geometry, side: int):
+            parts = list(geometry.geoms) if geometry.geom_type in {"MultiPolygon", "MultiLineString", "GeometryCollection"} else [geometry]
+            shifted_parts = []
+            moved = False
+            for part in parts:
+                if part.is_empty:
+                    continue
+                signed_distance = ((part.centroid.x - road_center.x) * normal_x) + ((part.centroid.y - road_center.y) * normal_y)
+                should_move = signed_distance * side > max(width_m * 0.1, 0.5)
+                if should_move:
+                    part = shapely_transform(lambda x, y, z=None: (x - normal_x * width_m * side, y - normal_y * width_m * side), part)
+                    moved = True
+                shifted_parts.append(part)
+            if not moved:
+                return geometry, False
+            return (unary_union(shifted_parts) if len(shifted_parts) > 1 else shifted_parts[0]), True
+
+        def try_side(side: int):
+            shifted_plots = []
+            moved_plot_count = 0
+            for candidate, geometry in metric_plots:
+                shifted, moved = shift_geometry(geometry, side)
+                shifted_plots.append((candidate, shifted))
+                moved_plot_count += int(moved)
+            if not moved_plot_count:
+                return None
+
+            shifted_features = []
+            for feature, geometry in metric_features:
+                # Drainage reserves are boundary infrastructure and must not be moved as part of
+                # a road compaction. Roads/open-space components move with the selected layout side.
+                shifted, moved = (geometry, False) if feature.get("feature_type") == "drainage" else shift_geometry(geometry, side)
+                shifted_features.append((feature, shifted, moved))
+
+            all_footprints = []
+            for _, geometry in shifted_plots:
+                all_footprints.append(geometry)
+            for feature, geometry, _ in shifted_features:
+                if feature.get("feature_type") == "road":
+                    all_footprints.append(geometry.buffer(float(feature.get("width_m") or 9.0) / 2, cap_style=2).intersection(metric_boundary))
+                elif geometry.geom_type in {"Polygon", "MultiPolygon"}:
+                    all_footprints.append(geometry)
+            if any(not boundary_check.covers(geometry) for _, geometry in shifted_plots if not geometry.is_empty):
+                return None
+            if any(not boundary_check.covers(geometry) for _, geometry, _ in shifted_features if geometry.geom_type in {"Polygon", "MultiPolygon"} and not geometry.is_empty):
+                return None
+            total_area = sum(float(geometry.area) for geometry in all_footprints)
+            occupied_area = float(unary_union(all_footprints).area) if all_footprints else 0.0
+            # A valid compaction may make boundaries touch, but it must not make plots overlap
+            # remaining roads, reserves, or one another.
+            if total_area - occupied_area > max(2.0, total_area * 1e-6):
+                return None
+
+            updated_plots = []
+            for candidate, geometry in shifted_plots:
+                geometry_wgs84 = shapely_transform(backward, geometry)
+                area_sqm, issues = validate_polygon(mapping(geometry_wgs84))
+                if any(issue.severity == "error" for issue in issues):
+                    return None
+                updated_plots.append({**candidate, "geometry": mapping(geometry_wgs84), "area_sqm": round(float(area_sqm), 2), "valid": True, "issues": []})
+            updated_features = []
+            for feature, geometry, moved in shifted_features:
+                updated_features.append({**feature, "geometry": mapping(shapely_transform(backward, geometry))} if moved else feature)
+            return updated_plots, updated_features
+
+        # Try both directions. The first valid direction moves the side that can be compacted
+        # without leaving the estate boundary or colliding with a fixed reserve.
+        return try_side(1) or try_side(-1)
+    except Exception:
+        return None
+
+
 def _require_layout_approval_access(db: Session, request: Request, organization_id: int):
     """Allow the existing plot managers or survey managers to approve a concept layout."""
     principal = resolve_estate_principal(db, request)
@@ -1847,19 +1977,28 @@ def remove_layout_proposal_feature(proposal_id: int, payload: EstateLayoutFeatur
 
     source_candidates = payload.plot_candidates if payload.plot_candidates is not None else (row.plot_candidates or [])
     candidates_by_number = {str(candidate.get("plot_number")): dict(candidate) for candidate in source_candidates}
+    remaining_features = [item for index, item in enumerate(features) if index != payload.feature_index]
 
     carved_plots = feature.get("carved_plots") or []
-    if feature.get("feature_type") != "road" and carved_plots:
+    road_gap_compacted = False
+    if carved_plots:
         # This feature carved these plots when it was added - hand each one back exactly as it
         # was, regardless of what shape it holds right now.
         for entry in carved_plots:
             candidates_by_number[str(entry.get("plot_number"))] = dict(entry)
+    elif feature.get("feature_type") == "road":
+        compacted = _compact_generated_road_gap(estate=db.get(Estate, row.estate_id), plot_candidates=list(candidates_by_number.values()), deleted_feature=feature, remaining_features=remaining_features)
+        if compacted:
+            compacted_candidates, remaining_features = compacted
+            candidates_by_number = {str(candidate.get("plot_number")): candidate for candidate in compacted_candidates}
+            road_gap_compacted = True
 
     row.plot_candidates = list(candidates_by_number.values())
-    row.feature_candidates = [item for index, item in enumerate(features) if index != payload.feature_index]
+    row.feature_candidates = remaining_features
     diagnostics = dict(row.diagnostics or {})
     diagnostics["estimated_plot_count"] = len(row.plot_candidates)
     diagnostics["total_plot_area_sqm"] = round(sum(float(candidate.get("area_sqm") or 0) for candidate in row.plot_candidates), 2)
+    diagnostics["road_gap_compacted"] = road_gap_compacted
     estate = db.get(Estate, row.estate_id)
     row.diagnostics = _refresh_layout_diagnostics(estate, diagnostics, row.plot_candidates, row.feature_candidates) if estate else diagnostics
 
