@@ -557,6 +557,79 @@ def _layout_proposal_payload(row: EstateLayoutProposal) -> dict:
     }
 
 
+def _layout_unallocated_areas(estate: Estate, plot_candidates: list[dict], feature_candidates: list[dict]) -> list[dict]:
+    """Return measurable pieces of the Estate boundary not occupied by plots or features.
+
+    Layout drafts need to show unused land explicitly. This is intentionally derived from the
+    current draft every time it changes, rather than stored as another editable geometry that can
+    drift away from the plots and roads it describes.
+    """
+    if not estate or not estate.boundary:
+        return []
+    try:
+        boundary = to_shape(estate.boundary)
+        metric_epsg = _metric_epsg_for_wgs84_polygon(boundary)
+        forward = Transformer.from_crs("EPSG:4326", f"EPSG:{metric_epsg}", always_xy=True).transform
+        backward = Transformer.from_crs(f"EPSG:{metric_epsg}", "EPSG:4326", always_xy=True).transform
+        metric_boundary = shapely_transform(forward, boundary)
+        if metric_boundary.is_empty:
+            return []
+    except Exception:
+        return []
+
+    occupied: list = []
+    for candidate in plot_candidates or []:
+        try:
+            geometry = shapely_transform(forward, shape(candidate.get("geometry") or {}))
+            if not geometry.is_empty:
+                occupied.append(geometry.buffer(0) if not geometry.is_valid else geometry)
+        except Exception:
+            continue
+    for feature in feature_candidates or []:
+        try:
+            geometry = shapely_transform(forward, shape(feature.get("geometry") or {}))
+            if geometry.is_empty:
+                continue
+            if feature.get("feature_type") == "road":
+                geometry = geometry.buffer(float(feature.get("width_m") or 9.0) / 2, cap_style=2)
+            occupied.append(geometry.buffer(0) if not geometry.is_valid else geometry)
+        except Exception:
+            continue
+
+    occupied_union = unary_union(occupied) if occupied else None
+    remaining = metric_boundary if occupied_union is None else metric_boundary.difference(occupied_union)
+    if remaining.is_empty:
+        return []
+
+    pieces = []
+    if remaining.geom_type == "Polygon":
+        pieces = [remaining]
+    elif remaining.geom_type == "MultiPolygon":
+        pieces = list(remaining.geoms)
+    elif remaining.geom_type == "GeometryCollection":
+        pieces = [item for item in remaining.geoms if item.geom_type == "Polygon"]
+
+    result = []
+    for index, piece in enumerate(sorted(pieces, key=lambda item: item.area, reverse=True), 1):
+        if piece.is_empty or piece.area < 25:
+            continue
+        geometry = shapely_transform(backward, piece)
+        result.append({
+            "label": f"Unallocated area {index}",
+            "area_sqm": round(float(piece.area), 2),
+            "geometry": mapping(geometry),
+        })
+    return result
+
+
+def _refresh_layout_diagnostics(estate: Estate, diagnostics: dict | None, plot_candidates: list[dict], feature_candidates: list[dict]) -> dict:
+    refreshed = dict(diagnostics or {})
+    unallocated = _layout_unallocated_areas(estate, plot_candidates, feature_candidates)
+    refreshed["unallocated_areas"] = unallocated
+    refreshed["unallocated_area_sqm"] = round(sum(float(item.get("area_sqm") or 0) for item in unallocated), 2)
+    return refreshed
+
+
 def _require_layout_approval_access(db: Session, request: Request, organization_id: int):
     """Allow the existing plot managers or survey managers to approve a concept layout."""
     principal = resolve_estate_principal(db, request)
@@ -1558,6 +1631,12 @@ def generate_layout_proposal(
         generated = generate_estate_layout(to_shape(estate.boundary), payload)
     except ValueError as exc:
         raise HTTPException(422, str(exc)) from exc
+    generated["diagnostics"] = _refresh_layout_diagnostics(
+        estate,
+        generated.get("diagnostics"),
+        generated.get("plot_candidates") or [],
+        generated.get("feature_candidates") or [],
+    )
     row = EstateLayoutProposal(
         organization_id=estate.organization_id,
         estate_id=estate.id,
@@ -1638,6 +1717,9 @@ def edit_layout_proposal(proposal_id: int, payload: EstateLayoutProposalEdit, re
                 cleaned_feature["carved_plots"] = candidate["carved_plots"]
             cleaned_features.append(cleaned_feature)
         row.feature_candidates = cleaned_features
+    estate = db.get(Estate, row.estate_id)
+    if estate:
+        row.diagnostics = _refresh_layout_diagnostics(estate, row.diagnostics, row.plot_candidates or [], row.feature_candidates or [])
     append_estate_audit_event(db, organization_id=row.organization_id, actor=access.principal, action="layout_proposal.edited", entity_type="estate_layout_proposal", entity_id=row.id, after_data={"plot_count": len(row.plot_candidates or []), "feature_count": len(row.feature_candidates or [])})
     db.commit()
     return _layout_proposal_payload(row)
@@ -1734,7 +1816,8 @@ def add_layout_proposal_feature(proposal_id: int, payload: EstateLayoutFeatureAd
     diagnostics = dict(row.diagnostics or {})
     diagnostics["estimated_plot_count"] = len(updated_candidates)
     diagnostics["total_plot_area_sqm"] = round(sum(float(c["area_sqm"]) for c in updated_candidates), 2)
-    row.diagnostics = diagnostics
+    estate = db.get(Estate, row.estate_id)
+    row.diagnostics = _refresh_layout_diagnostics(estate, diagnostics, updated_candidates, row.feature_candidates or []) if estate else diagnostics
 
     append_estate_audit_event(db, organization_id=row.organization_id, actor=access.principal, action="layout_proposal.feature_added", entity_type="estate_layout_proposal", entity_id=row.id, after_data={"feature_type": payload.feature_type, "name": new_feature["name"], "plots_removed": removed, "plots_remaining": len(updated_candidates)})
     db.commit()
@@ -1743,8 +1826,13 @@ def add_layout_proposal_feature(proposal_id: int, payload: EstateLayoutFeatureAd
 
 @router.post("/layout-proposals/{proposal_id}/remove-feature")
 def remove_layout_proposal_feature(proposal_id: int, payload: EstateLayoutFeatureRemove, request: Request, db: Session = Depends(get_db)):
-    """Removes a road or open-space shape and gives the vacated space back to the plots that
-    fronted it - see EstateLayoutFeatureRemove for the two ways that happens."""
+    """Remove a layout feature while keeping released road land visible for later subdivision.
+
+    Open-space features retain their original restore behavior. Roads are different: deleting a
+    road releases its corridor, so the current plot geometry is kept and the diagnostics layer
+    exposes that corridor as unallocated land instead of silently absorbing it into neighboring
+    plots.
+    """
     row = db.get(EstateLayoutProposal, proposal_id)
     if not row:
         raise HTTPException(404, "Layout proposal not found")
@@ -1761,52 +1849,19 @@ def remove_layout_proposal_feature(proposal_id: int, payload: EstateLayoutFeatur
     candidates_by_number = {str(candidate.get("plot_number")): dict(candidate) for candidate in source_candidates}
 
     carved_plots = feature.get("carved_plots") or []
-    if carved_plots:
+    if feature.get("feature_type") != "road" and carved_plots:
         # This feature carved these plots when it was added - hand each one back exactly as it
         # was, regardless of what shape it holds right now.
         for entry in carved_plots:
             candidates_by_number[str(entry.get("plot_number"))] = dict(entry)
-    elif feature.get("feature_type") == "road":
-        try:
-            road_shape = shape(feature.get("geometry") or {})
-        except Exception:
-            road_shape = None
-        if road_shape is not None and not road_shape.is_empty and road_shape.geom_type in {"LineString", "MultiLineString"}:
-            metric_epsg = _metric_epsg_for_wgs84_polygon(road_shape)
-            forward = Transformer.from_crs("EPSG:4326", f"EPSG:{metric_epsg}", always_xy=True).transform
-            backward = Transformer.from_crs(f"EPSG:{metric_epsg}", "EPSG:4326", always_xy=True).transform
-            road_metric = shapely_transform(forward, road_shape)
-            width_m = float(feature.get("width_m") or (row.criteria or {}).get("road_width_m") or 9.0)
-            # A plain generated road has no "before" shape to restore to - it was part of the grid
-            # from the start. Instead, split the vacated corridor along its centreline (Shapely's
-            # single_sided buffer gives exactly one side at a time) and merge each half into
-            # whichever plots actually front it, so the road's old footprint doesn't become
-            # nobody's land.
-            for half in (road_metric.buffer(width_m / 2, single_sided=True), road_metric.buffer(-(width_m / 2), single_sided=True)):
-                if half.is_empty:
-                    continue
-                margin = width_m / 2 + 0.05
-                for plot_number, candidate in list(candidates_by_number.items()):
-                    try:
-                        plot_metric = shapely_transform(forward, shape(candidate.get("geometry") or {}))
-                    except Exception:
-                        continue
-                    shadow = half.intersection(plot_metric.buffer(margin))
-                    if shadow.is_empty:
-                        continue
-                    grown = _largest_polygon_piece(unary_union([plot_metric, shadow])) or plot_metric
-                    grown_wgs84 = shapely_transform(backward, grown)
-                    area_sqm, issues = validate_polygon(mapping(grown_wgs84))
-                    if any(issue.severity == "error" for issue in issues):
-                        continue
-                    candidates_by_number[plot_number] = {**candidate, "geometry": mapping(grown_wgs84), "area_sqm": round(float(area_sqm), 2), "valid": True, "issues": []}
 
     row.plot_candidates = list(candidates_by_number.values())
     row.feature_candidates = [item for index, item in enumerate(features) if index != payload.feature_index]
     diagnostics = dict(row.diagnostics or {})
     diagnostics["estimated_plot_count"] = len(row.plot_candidates)
     diagnostics["total_plot_area_sqm"] = round(sum(float(candidate.get("area_sqm") or 0) for candidate in row.plot_candidates), 2)
-    row.diagnostics = diagnostics
+    estate = db.get(Estate, row.estate_id)
+    row.diagnostics = _refresh_layout_diagnostics(estate, diagnostics, row.plot_candidates, row.feature_candidates) if estate else diagnostics
 
     append_estate_audit_event(db, organization_id=row.organization_id, actor=access.principal, action="layout_proposal.feature_removed", entity_type="estate_layout_proposal", entity_id=row.id, after_data={"feature_type": feature.get("feature_type"), "name": feature.get("name"), "plots_remaining": len(row.plot_candidates)})
     db.commit()
