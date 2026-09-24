@@ -1036,7 +1036,11 @@ def get_estate_development_forecast(estate_id: int, request: Request, db: Sessio
         raise HTTPException(404, "Estate not found")
     require_estate_access(db, request, estate.organization_id, permission="estate.read")
     _enabled(db, estate.organization_id)
-    _require_hazard_plan(db, estate.organization_id)
+    _require_plus_plan(
+        db,
+        estate.organization_id,
+        "Development outlook (flood, erosion and land-cover growth analysis)",
+    )
     return {"estate_id": estate.id, "forecast": estate.public_development_forecast}
 
 
@@ -1053,6 +1057,16 @@ def _run_estate_development_forecast_job(job_id: str) -> None:
         estate = db.get(Estate, int(payload["estate_id"]))
         if not estate:
             set_hazard_job_status(db, job_id, status="failed", stage="Failed", error_text="Estate not found", completed=True)
+            return
+        if not has_hazard_access(get_subscription(db, estate.organization_id)):
+            set_hazard_job_status(
+                db,
+                job_id,
+                status="failed",
+                stage="Plus plan required",
+                error_text="Development outlook is available on the Plus plan. Upgrade to unlock it.",
+                completed=True,
+            )
             return
 
         set_hazard_job_status(db, job_id, status="running", stage="Starting forecast...", progress_pct=1, started=True)
@@ -1116,7 +1130,11 @@ def run_estate_development_forecast(estate_id: int, request: Request, db: Sessio
         raise HTTPException(404, "Estate not found")
     access = require_estate_access(db, request, estate.organization_id, permission="estate.manage")
     _enabled(db, estate.organization_id)
-    _require_hazard_plan(db, estate.organization_id)
+    _require_plus_plan(
+        db,
+        estate.organization_id,
+        "Development outlook (flood, erosion and land-cover growth analysis)",
+    )
     boundary = _estate_forecast_boundary(db, estate)
     job = insert_hazard_job(
         db,
@@ -1140,7 +1158,11 @@ def publish_estate_development_forecast(estate_id: int, payload: DevelopmentFore
         raise HTTPException(404, "Estate not found")
     access = require_estate_access(db, request, estate.organization_id, permission="estate.manage")
     _enabled(db, estate.organization_id)
-    _require_hazard_plan(db, estate.organization_id)
+    _require_plus_plan(
+        db,
+        estate.organization_id,
+        "Development outlook (flood, erosion and land-cover growth analysis)",
+    )
     forecast = dict(estate.public_development_forecast or {})
     if payload.public_enabled and not forecast.get("data_available"):
         raise HTTPException(status_code=409, detail="Run a complete development forecast before publishing it")
@@ -2433,12 +2455,21 @@ def _persist_hazard_results(db: Session, *, estate: Estate, plot_id: int | None,
     return rows
 
 
-def _require_hazard_plan(db: Session, organization_id: int) -> None:
-    """Flood/erosion hazard analysis is a Plus-plan feature - Basic-plan organizations (already
-    confirmed to have an active subscription by require_estate_access) get a clear upgrade message
-    instead of the underlying data."""
+def _require_plus_plan(db: Session, organization_id: int, feature_name: str) -> None:
+    """Keep Plus-only geospatial features behind one server-side entitlement check."""
     if not has_hazard_access(get_subscription(db, organization_id)):
-        raise HTTPException(status_code=402, detail={"code": "upgrade_required", "message": "Hazard analysis (flood and erosion) is available on the Plus plan. Upgrade to unlock it."})
+        raise HTTPException(
+            status_code=402,
+            detail={
+                "code": "upgrade_required",
+                "message": f"{feature_name} is available on the Plus plan. Upgrade to unlock it.",
+            },
+        )
+
+
+def _require_hazard_plan(db: Session, organization_id: int) -> None:
+    """Flood/erosion hazard analysis is a Plus-plan feature."""
+    _require_plus_plan(db, organization_id, "Hazard analysis (flood and erosion)")
 
 
 @router.get("/plots/{plot_id}/hazards")
