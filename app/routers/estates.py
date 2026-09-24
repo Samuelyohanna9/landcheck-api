@@ -32,7 +32,7 @@ from app.services.estates.authorization import list_estate_access, resolve_estat
 from app.services.estates.identity import slugify
 from app.services.estates.entitlements import ESTATE_FEATURES, get_estate_entitlement
 from app.models.estate_foundation import Estate, EstateAgentPortalToken, EstateAllocation, EstateAuditEvent, EstateBlock, EstateCommissionPayout, EstateCommissionTier, EstateCustomer, EstateCustomerPortalToken, EstateDocument, EstateDocumentLink, EstateFieldInspection, EstateHazardAssessment, EstateImportReview, EstateLayoutProposal, EstateNotificationLog, EstateOrganization, EstateOrganizationMember, EstatePayment, EstatePaymentInbox, EstatePaymentRule, EstatePlot, EstatePublicReservationRequest, EstateQrCampaign, EstateSpatialFeature, EstateSurveyRequest, EstateStakingTask
-from app.schemas.estates import AllocationAction, BlockCreate, BlockUpdate, CommissionPayoutCreate, CommissionTiersUpdate, CustomerCreate, DevelopmentStatusUpdate, EstateCreate, EstateLayoutCriteria, EstateLayoutDecision, EstateLayoutFeatureAdd, EstateLayoutFeatureRemove, EstateLayoutProposalEdit, EstateSubdivisionCreate, EstateUpdate, FieldInspectionCreate, GeoreferenceSessionLink, ImportFromGeoreference, ImportReviewCreate, ImportReviewDecision, ImportReviewFromGeoreferenceSession, MemberCreate, MemberUpdate, PaymentInboxCreate, PaymentInboxMatch, PlotCreate, PlotAddressUpdate, PlotGeometryUpdate, PlotListingDefaultsUpdate, PlotPriceUpdate, PortalTokenCreate, PublicEstateSettingsUpdate, PublicReservationConvert, PublicReservationCreate, PublicReservationUpdate, PaymentCreate, QrCampaignCreate, SpatialFeatureCreate, SpatialFeatureUpdate, SurveyEligibilityUpdate, VoidAction
+from app.schemas.estates import AllocationAction, BlockCreate, BlockUpdate, CommissionPayoutCreate, CommissionTiersUpdate, CustomerCreate, DevelopmentForecastPublishUpdate, DevelopmentStatusUpdate, EstateCreate, EstateLayoutCriteria, EstateLayoutDecision, EstateLayoutFeatureAdd, EstateLayoutFeatureRemove, EstateLayoutProposalEdit, EstateSubdivisionCreate, EstateUpdate, FieldInspectionCreate, GeoreferenceSessionLink, ImportFromGeoreference, ImportReviewCreate, ImportReviewDecision, ImportReviewFromGeoreferenceSession, MemberCreate, MemberUpdate, PaymentInboxCreate, PaymentInboxMatch, PlotCreate, PlotAddressUpdate, PlotGeometryUpdate, PlotListingDefaultsUpdate, PlotPriceUpdate, PortalTokenCreate, PublicEstateSettingsUpdate, PublicReservationConvert, PublicReservationCreate, PublicReservationUpdate, PaymentCreate, QrCampaignCreate, SpatialFeatureCreate, SpatialFeatureUpdate, SurveyEligibilityUpdate, VoidAction
 from app.services.estates.payments import confirm_payment, financial_summary, record_payment, void_payment
 from app.services.estates.documents import read_private_estate_file, store_private_estate_file
 from app.utils.r2_objects import delete_object_best_effort, build_r2_settings
@@ -59,7 +59,7 @@ from app.services.estates.report_export import render_customer_statement_pdf, re
 from app.services.estates import commissions
 from app.services.estates.operations import DOCUMENT_REQUIREMENTS, ESTATE_DOCUMENT_TYPES, ESTATE_DOCUMENT_TYPE_CODES, PUBLIC_DOCUMENT_TYPES, advance_payment_schedule_after_payment, build_operations_summary, buyer_portal_payload, customer_portal_url, document_readiness, hash_portal_token, issue_agent_portal_token, issue_customer_portal_link, issue_customer_portal_token, linked_documents, record_notification_log
 from app.db import SessionLocal
-from app.utils.hazard_jobs import get_hazard_job, insert_hazard_job, serialize_hazard_job, set_hazard_job_status
+from app.utils.hazard_jobs import get_hazard_job, insert_hazard_job, make_progress_reporter, serialize_hazard_job, set_hazard_job_status
 
 
 router = APIRouter(prefix="/estates", tags=["estates"])
@@ -252,6 +252,7 @@ def _public_estate_payload(db: Session, estate: Estate) -> dict:
     ]
     counts = {status: sum(1 for plot in public_plots if plot["status"] == status) for status in sorted(visible_statuses)}
     organization = db.get(EstateOrganization, estate.organization_id)
+    forecast = estate.public_development_forecast if isinstance(estate.public_development_forecast, dict) and estate.public_development_forecast.get("published") else None
     return {
         "id": estate.id,
         "name": estate.name,
@@ -268,6 +269,7 @@ def _public_estate_payload(db: Session, estate: Estate) -> dict:
         "boundary": mapping(to_shape(estate.boundary)) if estate.boundary else None,
         "plots": public_plots,
         "counts": counts,
+        "development_forecast": forecast,
     }
 
 
@@ -1005,6 +1007,151 @@ def update_public_estate_settings(estate_id: int, payload: PublicEstateSettingsU
     )
     db.commit()
     return get_public_estate_settings(estate_id, request, db)
+
+
+def _estate_forecast_boundary(db: Session, estate: Estate) -> dict:
+    if estate.boundary:
+        return mapping(to_shape(estate.boundary))
+    geometries = [to_shape(plot.geometry) for plot in db.query(EstatePlot).filter(
+        EstatePlot.estate_id == estate.id,
+        EstatePlot.geometry_status == "approved",
+        EstatePlot.geometry.isnot(None),
+    ).all()]
+    if not geometries:
+        raise HTTPException(status_code=422, detail="Add an Estate boundary or approve plot geometry before running a development forecast")
+    return mapping(unary_union(geometries).convex_hull)
+
+
+@router.get("/{estate_id}/development-forecast")
+def get_estate_development_forecast(estate_id: int, request: Request, db: Session = Depends(get_db)):
+    estate = db.get(Estate, estate_id)
+    if not estate:
+        raise HTTPException(404, "Estate not found")
+    require_estate_access(db, request, estate.organization_id, permission="estate.read")
+    _enabled(db, estate.organization_id)
+    _require_hazard_plan(db, estate.organization_id)
+    return {"estate_id": estate.id, "forecast": estate.public_development_forecast}
+
+
+def _run_estate_development_forecast_job(job_id: str) -> None:
+    """Run the three geospatial inputs away from the request thread, then persist one reviewed result."""
+    db = SessionLocal()
+    try:
+        job = get_hazard_job(db, job_id)
+        if not job:
+            return
+        payload = job.get("request_payload") or {}
+        if isinstance(payload, str):
+            payload = json.loads(payload)
+        estate = db.get(Estate, int(payload["estate_id"]))
+        if not estate:
+            set_hazard_job_status(db, job_id, status="failed", stage="Failed", error_text="Estate not found", completed=True)
+            return
+
+        set_hazard_job_status(db, job_id, status="running", stage="Starting forecast...", progress_pct=1, started=True)
+        report = make_progress_reporter(db, job_id)
+        boundary = payload["boundary"]
+        flood_result = None
+        erosion_result = None
+        from app.routers.hazards import erosion_preview, flood_preview
+
+        report("Running flood screening...", 5)
+        try:
+            flood_result = flood_preview({"boundary": boundary, "show_raster": False}, db)
+        except Exception:
+            db.rollback()
+        report("Running erosion screening...", 25)
+        try:
+            erosion_result = erosion_preview({"boundary": boundary, "show_raster": False}, db)
+        except Exception:
+            db.rollback()
+
+        planned_roads_count = int(db.query(EstateSpatialFeature.id).filter(
+            EstateSpatialFeature.estate_id == estate.id,
+            EstateSpatialFeature.feature_type == "road",
+            EstateSpatialFeature.status == "active",
+        ).count())
+        from app.services.estates.development_forecast import compute_development_forecast
+
+        forecast = compute_development_forecast(
+            boundary,
+            flood_result=flood_result,
+            erosion_result=erosion_result,
+            planned_roads_count=planned_roads_count,
+            progress_cb=report,
+        )
+        # A rerun always needs a fresh human review before it can replace the public story.
+        forecast["published"] = False
+        estate.public_development_forecast = forecast
+        actor = SimpleNamespace(subject_type=payload.get("subject_type"), subject_id=payload.get("subject_id"))
+        append_estate_audit_event(
+            db,
+            organization_id=estate.organization_id,
+            actor=actor,
+            action="estate.development_forecast.generated",
+            entity_type="estate",
+            entity_id=estate.id,
+            after_data={"data_available": forecast.get("data_available"), "published": False},
+        )
+        db.commit()
+        set_hazard_job_status(db, job_id, status="completed", stage="Complete", progress_pct=100, result_payload=forecast, completed=True)
+    except Exception as exc:
+        db.rollback()
+        set_hazard_job_status(db, job_id, status="failed", stage="Failed", error_text=str(exc), completed=True)
+    finally:
+        db.close()
+
+
+@router.post("/{estate_id}/development-forecast/run")
+def run_estate_development_forecast(estate_id: int, request: Request, db: Session = Depends(get_db)):
+    estate = db.get(Estate, estate_id)
+    if not estate:
+        raise HTTPException(404, "Estate not found")
+    access = require_estate_access(db, request, estate.organization_id, permission="estate.manage")
+    _enabled(db, estate.organization_id)
+    _require_hazard_plan(db, estate.organization_id)
+    boundary = _estate_forecast_boundary(db, estate)
+    job = insert_hazard_job(
+        db,
+        hazard_type="estate_development_forecast",
+        output_type="preview",
+        request_payload={
+            "estate_id": estate.id,
+            "boundary": boundary,
+            "subject_type": access.principal.subject_type,
+            "subject_id": access.principal.subject_id,
+        },
+        worker=_run_estate_development_forecast_job,
+    )
+    return serialize_hazard_job(job)
+
+
+@router.patch("/{estate_id}/development-forecast/public")
+def publish_estate_development_forecast(estate_id: int, payload: DevelopmentForecastPublishUpdate, request: Request, db: Session = Depends(get_db)):
+    estate = db.get(Estate, estate_id)
+    if not estate:
+        raise HTTPException(404, "Estate not found")
+    access = require_estate_access(db, request, estate.organization_id, permission="estate.manage")
+    _enabled(db, estate.organization_id)
+    _require_hazard_plan(db, estate.organization_id)
+    forecast = dict(estate.public_development_forecast or {})
+    if payload.public_enabled and not forecast.get("data_available"):
+        raise HTTPException(status_code=409, detail="Run a complete development forecast before publishing it")
+    before = bool(forecast.get("published"))
+    forecast["published"] = bool(payload.public_enabled)
+    estate.public_development_forecast = forecast
+    append_estate_audit_event(
+        db,
+        organization_id=estate.organization_id,
+        actor=access.principal,
+        action="estate.development_forecast.visibility_updated",
+        entity_type="estate",
+        entity_id=estate.id,
+        before_data={"published": before},
+        after_data={"published": forecast["published"]},
+    )
+    db.commit()
+    return {"estate_id": estate.id, "forecast": forecast}
 
 
 @router.post("/{estate_id}/public-logo")

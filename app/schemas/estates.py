@@ -57,6 +57,10 @@ class PublicEstateSettingsUpdate(BaseModel):
                 raise ValueError("Payment plan percentages must add up to 100")
         return self
 
+
+class DevelopmentForecastPublishUpdate(BaseModel):
+    public_enabled: bool = False
+
 class PlotCreate(BaseModel):
     plot_number: str
     geometry: dict[str, Any]

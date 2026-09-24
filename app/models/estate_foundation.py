@@ -114,6 +114,7 @@ class Estate(Base):
     public_logo_object_key = Column(String(512), nullable=True)
     public_show_prices = Column(Boolean, nullable=False, default=True)
     public_payment_plan = Column(JSON, nullable=True)
+    public_development_forecast = Column(JSON, nullable=True)
     created_by_subject_type = Column(String(64), nullable=False)
     created_by_subject_id = Column(String(128), nullable=False)
     created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
