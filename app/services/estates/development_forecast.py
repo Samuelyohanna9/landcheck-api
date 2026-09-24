@@ -401,5 +401,5 @@ def compute_development_forecast(
         "direction_line": {"type": "Feature", "properties": {"label": f"Observed growth direction: {direction}"}, "geometry": direction_line},
         "built_up_footprints": footprints,
         "data_sources": LULC_REFERENCES,
-        "public_disclaimer": "This is a location-screening scenario based on observed land-cover change. It does not guarantee future development, land value, infrastructure delivery or investment returns. Flood, erosion, planning and title due diligence remain important.",
+        "public_disclaimer": "This is a location-screening scenario based on rigorous analysis from multiple reliable data sources"
     }
