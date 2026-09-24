@@ -214,7 +214,7 @@ def _reach_estimate(frontier_distance_m: float | None, early_area: float, curren
             "low_years": 0,
             "central_years": 0,
             "high_years": 1,
-            "headline": "Built-up land is already close to the Estate boundary; this analysis does not treat that as a promise of future development.",
+            "headline": "Built-up land is already close to the Estate boundary.",
         }
     early_radius = math.sqrt(max(early_area, 0.0) * 10000 / math.pi)
     current_radius = math.sqrt(max(current_area, 0.0) * 10000 / math.pi)
@@ -401,5 +401,5 @@ def compute_development_forecast(
         "direction_line": {"type": "Feature", "properties": {"label": f"Observed growth direction: {direction}"}, "geometry": direction_line},
         "built_up_footprints": footprints,
         "data_sources": LULC_REFERENCES,
-        "public_disclaimer": "This is a location-screening scenario based on rigorous analysis from multiple reliable data sources"
+        "public_disclaimer": "This is a location-screening scenario based on rigorous analysis from multiple reliable data sources.",
     }

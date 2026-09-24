@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import csv
 import io
 import json
@@ -252,7 +253,13 @@ def _public_estate_payload(db: Session, estate: Estate) -> dict:
     ]
     counts = {status: sum(1 for plot in public_plots if plot["status"] == status) for status in sorted(visible_statuses)}
     organization = db.get(EstateOrganization, estate.organization_id)
-    forecast = estate.public_development_forecast if isinstance(estate.public_development_forecast, dict) and estate.public_development_forecast.get("published") else None
+    forecast = copy.deepcopy(estate.public_development_forecast) if isinstance(estate.public_development_forecast, dict) and estate.public_development_forecast.get("published") else None
+    if forecast:
+        headline = str((forecast.get("reach_estimate") or {}).get("headline") or "")
+        forecast.setdefault("reach_estimate", {})["headline"] = headline.replace(
+            "; this analysis does not treat that as a promise of future development", ""
+        )
+        forecast["public_disclaimer"] = "This is a location-screening scenario based on rigorous analysis from multiple reliable data sources."
     return {
         "id": estate.id,
         "name": estate.name,
