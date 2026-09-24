@@ -234,6 +234,34 @@ def _reach_estimate(frontier_distance_m: float | None, early_area: float, curren
     }
 
 
+def _value_outlook(annual_percent_rate: float | None, frontier_distance_m: float | None, direction: str, confidence: str) -> dict[str, str]:
+    """Use urbanisation evidence as a value-potential proxy, never as a price prediction."""
+    score = 0
+    if annual_percent_rate is not None:
+        if annual_percent_rate >= 3:
+            score += 2
+        elif annual_percent_rate > 0:
+            score += 1
+    if frontier_distance_m is not None:
+        if frontier_distance_m <= 1000:
+            score += 2
+        elif frontier_distance_m <= 3000:
+            score += 1
+    if direction != "No clear direction":
+        score += 1
+    if confidence == "high":
+        score += 1
+    level = "strong" if score >= 5 else "moderate" if score >= 3 else "emerging" if score >= 1 else "unclear"
+    labels = {"strong": "Strong", "moderate": "Moderate", "emerging": "Emerging", "unclear": "Unclear"}
+    summaries = {
+        "strong": "Urban growth around this Estate shows strong potential to support future land demand.",
+        "moderate": "Urban growth around this Estate shows moderate potential to support future land demand.",
+        "emerging": "The surrounding area shows early signs of urban growth that may support future land demand.",
+        "unclear": "The available evidence is not strong enough to classify future land-demand potential yet.",
+    }
+    return {"level": level, "label": labels[level], "summary": summaries[level]}
+
+
 def compute_development_forecast(
     boundary_geojson: dict[str, Any],
     *,
@@ -389,6 +417,7 @@ def compute_development_forecast(
         },
         "projections": _scenario_rows(latest["built_up_area_ha"], annual_rate, latest["year"]),
         "reach_estimate": _reach_estimate(frontier_distance_m, first["built_up_area_ha"], latest["built_up_area_ha"], observed_years),
+        "value_outlook": _value_outlook(annual_percent_rate, frontier_distance_m, direction, confidence),
         "confidence": {"level": confidence, "reasons": confidence_reasons},
         "factors": {"supporting": supporting, "constraining": constraining},
         "hazards": {"flood": flood, "erosion": erosion},
