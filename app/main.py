@@ -31,6 +31,7 @@ from app.routers import (
     estates,
     estate_auth,
     estate_billing,
+    estate_marketing,
 )
 from app.db_init import init_db
 from app.utils.activity_logger import ensure_activity_log_table, log_request_activity, should_skip_request_logging
@@ -243,6 +244,43 @@ def _run_estate_payment_reminder_job():
         session_db.close()
 
 
+_ESTATE_LEAD_FOLLOWUP_LOCK_KEY = 872341004
+_ESTATE_INSPECTION_REMINDER_LOCK_KEY = 872341005
+
+
+def _run_locked_estate_marketing_job(lock_key: int, work) -> None:
+    """Runs one marketing sweep under a Postgres advisory lock so only one worker process sends it."""
+    from sqlalchemy import text
+
+    session_db = SessionLocal()
+    try:
+        got_lock = session_db.execute(text("SELECT pg_try_advisory_lock(:key)"), {"key": lock_key}).scalar()
+        if not got_lock:
+            return
+        try:
+            work(session_db)
+            session_db.commit()
+        except Exception:
+            session_db.rollback()
+            raise
+        finally:
+            session_db.execute(text("SELECT pg_advisory_unlock(:key)"), {"key": lock_key})
+    finally:
+        session_db.close()
+
+
+def _run_estate_lead_followup_job():
+    from app.services.estates.marketing_alerts import send_lead_followup_reminders
+
+    _run_locked_estate_marketing_job(_ESTATE_LEAD_FOLLOWUP_LOCK_KEY, send_lead_followup_reminders)
+
+
+def _run_estate_inspection_reminder_job():
+    from app.services.estates.marketing_alerts import send_inspection_reminders
+
+    _run_locked_estate_marketing_job(_ESTATE_INSPECTION_REMINDER_LOCK_KEY, send_inspection_reminders)
+
+
 # Preserve the legacy Survey/Green bootstrap; Estate schema is managed by Alembic.
 @app.on_event("startup")
 def startup_event():
@@ -308,6 +346,18 @@ def startup_event():
         _run_estate_payment_reminder_job,
         trigger=CronTrigger(hour="*/2"),
         id="estate_payment_reminders",
+        replace_existing=True,
+    )
+    scheduler.add_job(
+        _run_estate_lead_followup_job,
+        trigger=CronTrigger(minute="*/20"),
+        id="estate_lead_followup",
+        replace_existing=True,
+    )
+    scheduler.add_job(
+        _run_estate_inspection_reminder_job,
+        trigger=CronTrigger(minute="*/30"),
+        id="estate_inspection_reminders",
         replace_existing=True,
     )
     scheduler.start()
@@ -413,6 +463,7 @@ app.include_router(field_to_finish.router)
 app.include_router(estates.router)
 app.include_router(estate_auth.router)
 app.include_router(estate_billing.router)
+app.include_router(estate_marketing.router)
 
 @app.get("/")
 def root():

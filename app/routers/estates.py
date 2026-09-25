@@ -4,6 +4,7 @@ import copy
 import csv
 import io
 import json
+import logging
 import re
 import tempfile
 import os
@@ -54,7 +55,7 @@ from app.utils.coordinate_converter import COORDINATE_SYSTEMS, resolve_coordinat
 from app.models.estate_auth import EstateAccount
 from app.utils.survey_auth_security import find_or_create_survey_user, issue_survey_session
 from app.models.plot import Plot
-from app.services.estates import estate_email
+from app.services.estates import estate_email, marketing_alerts, marketing_common
 from app.services.estates.layout_export import render_estate_layout_pdf
 from app.services.estates.report_export import render_customer_statement_pdf, render_estate_report_pdf
 from app.services.estates import commissions
@@ -63,6 +64,7 @@ from app.db import SessionLocal
 from app.utils.hazard_jobs import get_hazard_job, insert_hazard_job, make_progress_reporter, serialize_hazard_job, set_hazard_job_status
 
 
+logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/estates", tags=["estates"])
 
 
@@ -271,6 +273,8 @@ def _public_estate_payload(db: Session, estate: Estate) -> dict:
         "description": estate.public_description or estate.description,
         "location": estate.location_text or ", ".join(filter(None, [estate.locality, estate.state])) or None,
         "contact_phone": estate.public_contact_phone,
+        "whatsapp_number": marketing_common.normalize_phone_digits(estate.public_whatsapp_number or estate.public_contact_phone),
+        "meeting_point": estate.public_meeting_point if isinstance(estate.public_meeting_point, dict) else None,
         "show_prices": bool(estate.public_show_prices),
         "payment_plan": estate.public_payment_plan or [],
         "boundary": mapping(to_shape(estate.boundary)) if estate.boundary else None,
@@ -384,13 +388,26 @@ def _geojson_geometry(value: dict, *, allow_polygon: bool = True):
 def public_estate_showcase(slug: str, source: str | None = None, db: Session = Depends(get_db)):
     """Return only the approved, public-safe inventory for a published Estate."""
     estate = _public_estate(db, slug)
+    agent = None
+    campaign_code = None
     if source:
         campaign = db.query(EstateQrCampaign).filter(EstateQrCampaign.estate_id == estate.id, EstateQrCampaign.code == source.strip(), EstateQrCampaign.is_active.is_(True)).one_or_none()
         if campaign:
+            campaign_code = campaign.code
             campaign.scan_count = int(campaign.scan_count or 0) + 1
             campaign.last_scanned_at = datetime.now(timezone.utc)
+            member = marketing_common.agent_member_for(db, campaign)
+            if member:
+                agent = {"name": member.subject_id, "whatsapp_number": marketing_common.normalize_phone_digits(member.contact_phone), "phone": member.contact_phone}
             db.commit()
-    return _public_estate_payload(db, estate)
+    payload = _public_estate_payload(db, estate)
+    payload["agent"] = agent
+    payload["source_code"] = campaign_code
+    payload["share"] = {
+        "estate": marketing_common.share_page_url(estate, source=campaign_code),
+        "plot_template": marketing_common.share_page_url(estate, source=campaign_code, plot_id=987654321).replace("987654321", "{plot_id}"),
+    }
+    return payload
 
 
 @router.get("/public/{slug}/logo")
@@ -487,6 +504,10 @@ def create_public_reservation(slug: str, plot_id: int, payload: PublicReservatio
         contact_email=organization.contact_email if organization else None,
         public_page_url=f"{str(os.getenv('LANDCHECK_WEB_URL') or 'https://landcheck.online').rstrip('/')}/estates/public/{estate.public_slug}",
     )
+    try:
+        marketing_alerts.notify_new_lead(db, estate=estate, plot=plot, lead=row)
+    except Exception:
+        logger.exception("Estate new-lead alert failed (estate=%s, plot=%s)", estate.id, plot.id)
     record_notification_log(
         db,
         organization_id=estate.organization_id,
@@ -976,6 +997,8 @@ def get_public_estate_settings(estate_id: int, request: Request, db: Session = D
         "public_description": estate.public_description,
         "public_tagline": estate.public_tagline,
         "public_contact_phone": estate.public_contact_phone,
+        "public_whatsapp_number": estate.public_whatsapp_number,
+        "public_meeting_point": estate.public_meeting_point if isinstance(estate.public_meeting_point, dict) else None,
         "public_logo_path": f"/estates/public/{estate.public_slug}/logo" if estate.public_logo_object_key else None,
         "public_show_prices": bool(estate.public_show_prices),
         "payment_plan": estate.public_payment_plan or [],
@@ -1000,6 +1023,10 @@ def update_public_estate_settings(estate_id: int, payload: PublicEstateSettingsU
     estate.public_description = payload.public_description.strip() if payload.public_description else None
     estate.public_tagline = payload.public_tagline.strip() if payload.public_tagline else None
     estate.public_contact_phone = payload.public_contact_phone.strip() if payload.public_contact_phone else None
+    if "public_whatsapp_number" in payload.model_fields_set:
+        estate.public_whatsapp_number = payload.public_whatsapp_number.strip() if payload.public_whatsapp_number and payload.public_whatsapp_number.strip() else None
+    if "public_meeting_point" in payload.model_fields_set:
+        estate.public_meeting_point = payload.public_meeting_point.model_dump() if payload.public_meeting_point else None
     estate.public_show_prices = payload.public_show_prices
     estate.public_payment_plan = [{"label": item.label.strip(), "percentage": str(item.percentage)} for item in payload.payment_plan] if payload.payment_plan else None
     append_estate_audit_event(
@@ -1267,6 +1294,9 @@ def update_public_reservation_request(request_id: int, payload: PublicReservatio
         raise HTTPException(status_code=409, detail="Use Migrate to customer to create the customer and reserve this plot")
     previous = row.status
     row.status = payload.status
+    if previous != payload.status:
+        row.follow_up_reminder_count = 0
+        row.last_follow_up_reminder_at = None
     if "staff_notes" in payload.model_fields_set:
         row.staff_notes = payload.staff_notes.strip() if payload.staff_notes else None
     now = datetime.now(timezone.utc)

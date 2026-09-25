@@ -40,11 +40,20 @@ class PublicPaymentPlanItem(BaseModel):
     percentage: Decimal = Field(gt=0, le=100)
 
 
+class PublicMeetingPoint(BaseModel):
+    lat: float = Field(ge=-90, le=90)
+    lng: float = Field(ge=-180, le=180)
+    label: str | None = Field(default=None, max_length=160)
+    note: str | None = Field(default=None, max_length=500)
+
+
 class PublicEstateSettingsUpdate(BaseModel):
     public_enabled: bool = False
     public_description: str | None = Field(default=None, max_length=4000)
     public_tagline: str | None = Field(default=None, max_length=255)
     public_contact_phone: str | None = Field(default=None, max_length=64)
+    public_whatsapp_number: str | None = Field(default=None, max_length=32)
+    public_meeting_point: PublicMeetingPoint | None = None
     public_show_prices: bool = True
     payment_plan: list[PublicPaymentPlanItem] | None = Field(default=None, max_length=8)
 

@@ -3,7 +3,7 @@ from __future__ import annotations
 import uuid
 
 from geoalchemy2 import Geometry
-from sqlalchemy import Boolean, CheckConstraint, Column, DateTime, ForeignKey, Integer, JSON, Numeric, String, Text, UniqueConstraint
+from sqlalchemy import Boolean, CheckConstraint, Column, DateTime, Float, ForeignKey, Index, Integer, JSON, Numeric, String, Text, UniqueConstraint
 from sqlalchemy.sql import func
 
 from app.db_base import Base
@@ -115,6 +115,8 @@ class Estate(Base):
     public_show_prices = Column(Boolean, nullable=False, default=True)
     public_payment_plan = Column(JSON, nullable=True)
     public_development_forecast = Column(JSON, nullable=True)
+    public_whatsapp_number = Column(String(32), nullable=True)
+    public_meeting_point = Column(JSON, nullable=True)  # {lat, lng, label, note} - where inspection visitors meet
     created_by_subject_type = Column(String(64), nullable=False)
     created_by_subject_id = Column(String(128), nullable=False)
     created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
@@ -185,6 +187,8 @@ class EstatePublicReservationRequest(Base):
     resolved_at = Column(DateTime(timezone=True), nullable=True)
     customer_id = Column(Integer, ForeignKey("estate_customers.id", ondelete="SET NULL"), nullable=True)
     allocation_id = Column(Integer, ForeignKey("estate_allocations.id", ondelete="SET NULL"), nullable=True)
+    follow_up_reminder_count = Column(Integer, nullable=False, default=0, server_default="0")
+    last_follow_up_reminder_at = Column(DateTime(timezone=True), nullable=True)
     created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
     updated_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
 
