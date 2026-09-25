@@ -264,7 +264,8 @@ def fetch_satellite(view: View) -> Image.Image | None:
     with _SAT_LOCK:
         hit = _SAT_CACHE.get(key)
         if hit and now - hit[0] < 6 * 3600:
-            return Image.open(io.BytesIO(hit[1])).convert("RGB")
+            cached = Image.open(io.BytesIO(hit[1])).convert("RGB")
+            return cached if cached.size == (view.width, view.height) else cached.resize((view.width, view.height), Image.LANCZOS)
     url = (
         f"https://api.mapbox.com/styles/v1/mapbox/satellite-v9/static/{lon:.6f},{lat:.6f},{view.zoom:.3f},0,0/{lw}x{lh}@2x"
         f"?attribution=false&logo=false&access_token={token}"
@@ -704,8 +705,11 @@ def _contact(ctx: "mr.MarketingContext") -> list[str]:
     lines = []
     if ctx.agent_name:
         lines.append(ctx.agent_name)
-    if ctx.contact_phone:
-        lines.append(ctx.contact_phone)
+    reach = ctx.contact_phone or (f"+{ctx.whatsapp_digits}" if ctx.whatsapp_digits else None)
+    if reach:
+        lines.append(reach)
+    if ctx.contact_email and len(lines) < 2:
+        lines.append(ctx.contact_email)
     lines.append(re.sub(r"^https?://", "", ctx.page_url).split("?")[0])
     return lines
 

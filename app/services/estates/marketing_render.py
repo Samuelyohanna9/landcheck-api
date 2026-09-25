@@ -157,6 +157,7 @@ class MarketingContext:
     page_url: str
     logo_bytes: bytes | None
     forecast: dict | None
+    contact_email: str | None = None
     generated_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
     @property
@@ -229,6 +230,7 @@ def build_context(db: Session, estate: Estate, *, source: str | None = None) -> 
         page_url=public_page_url(estate, source=campaign.code if campaign else None),
         logo_bytes=_logo_bytes(estate.public_logo_object_key) if estate.public_logo_object_key else None,
         forecast=forecast,
+        contact_email=(str(organization.contact_email).strip() or None) if (organization and organization.contact_email) else None,
     )
 
 

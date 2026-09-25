@@ -349,11 +349,22 @@ def compose_poster(spec: PromoSpec, kind: str) -> bytes:
 
     c = bar(contact_top)
     d = ImageDraw.Draw(canvas, "RGBA")
-    dz.T(d, c[0] + 30 * su, c[1] + 14 * su, "Contact", dz.sans(int(26 * su), "extrabold"), accent)
-    bits = [b for b in [ctx.agent_name, ctx.contact_phone] if b]
+    dz.T(d, c[0] + 30 * su, c[1] + 12 * su, "Contact", dz.sans(int(26 * su), "extrabold"), accent)
+    reach = ctx.contact_phone or (f"+{ctx.whatsapp_digits}" if ctx.whatsapp_digits else None)
+    bits = [b for b in [ctx.agent_name, reach] if b]
+    room = c[2] - c[0] - 260 * su
+    line_y = c[1] + bar_h - 50 * su
     if bits:
-        text = "  \u00b7  ".join(bits)
-        dz.T(d, c[0] + 30 * su, c[1] + bar_h - 46 * su, text, dz.fit(d, text, c[2] - c[0] - 260 * su, int(30 * su), 16, lambda z: dz.sans(z, "extrabold")), INK)
+        with_email = "  \u00b7  ".join(bits + ([ctx.contact_email] if ctx.contact_email else []))
+        f = dz.fit(d, with_email, room, int(30 * su), 14, lambda z: dz.sans(z, "extrabold"))
+        if ctx.contact_email and f.size < int(21 * su):
+            with_email = "  \u00b7  ".join(bits)
+            f = dz.fit(d, with_email, room, int(30 * su), 16, lambda z: dz.sans(z, "extrabold"))
+        dz.T(d, c[0] + 30 * su, line_y, with_email, f, INK)
+    elif ctx.contact_email:
+        dz.T(d, c[0] + 30 * su, line_y, ctx.contact_email, dz.fit(d, ctx.contact_email, room, int(30 * su), 14, lambda z: dz.sans(z, "extrabold")), INK)
+    else:
+        dz.T(d, c[0] + 30 * su, line_y, "Scan the code to reserve online", dz.fit(d, "Scan the code to reserve online", room, int(28 * su), 14, lambda z: dz.sans(z, "extrabold")), INK)
     if spec.qr_url:
         q = int(bar_h - 22 * su)
         canvas.paste(mr.qr_image(spec.qr_url, q, dark=INK).convert("RGB"), (int(c[2] - q - 16 * su), int(c[1] + 11 * su)))
