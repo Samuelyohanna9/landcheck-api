@@ -10,7 +10,7 @@ import tempfile
 import os
 import math
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from types import SimpleNamespace
 from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, Request, UploadFile
@@ -811,6 +811,55 @@ def list_estates(request: Request, db: Session = Depends(get_db)):
             continue
         rows.extend(db.query(Estate).filter(Estate.organization_id == item.organization_id, Estate.archived_at.is_(None)).all())
     return [{"id": row.id, "uid": row.estate_uid, "name": row.name, "status": row.status, "organization_id": row.organization_id, "location": row.location_text, "crs": row.crs, "unit_system": row.unit_system, "project_reference": row.project_reference, "project_owner": row.project_owner, "public_enabled": bool(row.public_enabled), "public_slug": row.public_slug} for row in rows]
+
+
+@router.get("/attention")
+def estates_attention(request: Request, db: Session = Depends(get_db)):
+    """Per-estate items that need a look, so a company with many estates can see which to open first.
+
+    Reservation requests and upcoming inspections are live server state. Delivery messages come back
+    as timestamps because "seen" is remembered per browser (the same marker the estate dashboard uses)."""
+    from app.models.estate_marketing import EstateInspectionBooking, EstateInspectionSlot
+
+    principal = resolve_estate_principal(db, request)
+    access_by_org = {item.organization_id: item for item in list_estate_access(db, principal)}
+    estates = []
+    for org_id, item in access_by_org.items():
+        if not get_estate_entitlement(db, org_id, "ESTATES_ENABLED").is_enabled:
+            continue
+        estates.extend(db.query(Estate.id, Estate.organization_id).filter(Estate.organization_id == org_id, Estate.archived_at.is_(None)).all())
+    ids = [row.id for row in estates]
+    result = {row.id: {"new_reservations": 0, "upcoming_inspections": 0, "delivery_timestamps": []} for row in estates}
+    if not ids:
+        return {"estates": {}}
+    org_of = {row.id: row.organization_id for row in estates}
+    can = lambda estate_id, permission: has_permission(access_by_org[org_of[estate_id]].role_key, permission)
+
+    reservations = db.query(EstatePublicReservationRequest.estate_id, func.count(EstatePublicReservationRequest.id)).filter(
+        EstatePublicReservationRequest.estate_id.in_(ids), EstatePublicReservationRequest.status == "new"
+    ).group_by(EstatePublicReservationRequest.estate_id).all()
+    for estate_id, count in reservations:
+        if can(estate_id, "allocation.read"):
+            result[estate_id]["new_reservations"] = int(count)
+
+    now = datetime.now(timezone.utc)
+    inspections = db.query(EstateInspectionBooking.estate_id, func.count(EstateInspectionBooking.id)).join(
+        EstateInspectionSlot, EstateInspectionSlot.id == EstateInspectionBooking.slot_id
+    ).filter(
+        EstateInspectionBooking.estate_id.in_(ids), EstateInspectionBooking.status == "booked",
+        EstateInspectionSlot.status != "cancelled", EstateInspectionSlot.starts_at >= now, EstateInspectionSlot.starts_at <= now + timedelta(hours=48),
+    ).group_by(EstateInspectionBooking.estate_id).all()
+    for estate_id, count in inspections:
+        if can(estate_id, "estate.read"):
+            result[estate_id]["upcoming_inspections"] = int(count)
+
+    log_rows = db.query(EstateNotificationLog.estate_id, EstateNotificationLog.created_at).filter(
+        EstateNotificationLog.estate_id.in_(ids), EstateNotificationLog.created_at >= now - timedelta(days=60)
+    ).order_by(EstateNotificationLog.created_at.desc()).limit(3000).all()
+    for estate_id, created_at in log_rows:
+        if can(estate_id, "estate.read") and len(result[estate_id]["delivery_timestamps"]) < 250:
+            result[estate_id]["delivery_timestamps"].append(created_at.isoformat() if created_at else None)
+    return {"estates": {str(key): value for key, value in result.items()}}
 
 
 @router.post("/organizations/{organization_id}")
