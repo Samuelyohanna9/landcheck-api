@@ -23,7 +23,7 @@ RIBBON_DARK = (150, 16, 30)
 INK = (17, 24, 21)
 SOFT_INK = (66, 78, 72)
 GOLDEN = (255, 214, 64)
-SIZES = {"status": (1080, 1920), "post": (1080, 1350), "poster": (1240, 1754), "landscape": (1200, 630)}
+SIZES = {"status": (1080, 1920), "post": (1080, 1350), "poster": (1240, 1754), "poster_hd": (2480, 3508), "landscape": (1200, 630)}
 
 
 def accent_from_logo(logo_bytes: bytes | None) -> tuple[int, int, int]:

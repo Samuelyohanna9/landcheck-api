@@ -408,7 +408,7 @@ def draw_layout_png(
 
 
 # ── Premium composition (see marketing_design) ───────────────────────────────────────────────
-AD_KINDS = {"status", "post", "landscape", "poster"}
+AD_KINDS = {"status", "post", "landscape", "poster", "poster_hd"}
 AD_STYLES = {"luxury", "promo"}
 PORTRAIT_SIZES = {"status": (1080, 1920), "post": (1080, 1350)}
 LANDSCAPE_SIZE = (1200, 630)
@@ -419,7 +419,7 @@ def _check(kind: str, style: str) -> None:
         raise ValueError("Unknown ad format")
     if style not in AD_STYLES:
         raise ValueError("Unknown design style")
-    if kind == "poster" and style != "promo":
+    if kind in {"poster", "poster_hd"} and style != "promo":
         raise ValueError("The print poster is only available in the promo style")
 
 

@@ -131,12 +131,12 @@ def _campaign_for_staff(db: Session, estate: Estate, campaign_id: int | None) ->
 
 
 # ── Rendering shared by staff, agent and public endpoints ───────────────────────────────────
-def _render_flyer(ctx) -> bytes:
-    return marketing_render.cached_render(("flyer", marketing_render.context_signature(ctx)), 60, lambda: marketing_pdf.render_flyer_pdf(ctx))
+def _render_flyer(ctx, style: str = "luxury") -> bytes:
+    return marketing_render.cached_render(("flyer", style, marketing_render.context_signature(ctx)), 60, lambda: marketing_pdf.render_flyer_pdf(ctx, style))
 
 
-def _render_brochure(ctx) -> bytes:
-    return marketing_render.cached_render(("brochure", marketing_render.context_signature(ctx)), 60, lambda: marketing_pdf.render_brochure_pdf(ctx))
+def _render_brochure(ctx, style: str = "luxury") -> bytes:
+    return marketing_render.cached_render(("brochure", style, marketing_render.context_signature(ctx)), 60, lambda: marketing_pdf.render_brochure_pdf(ctx, style))
 
 
 def _render_estate_ad(ctx, fmt: str, *, qr: bool = True, style: str = "luxury") -> bytes:
@@ -445,19 +445,21 @@ def public_progress_media(slug: str, update_uid: str, db: Session = Depends(get_
 # STAFF - materials, share links, overview
 # ═════════════════════════════════════════════════════════════════════════════════════════════
 @router.get("/{estate_id}/marketing/materials/flyer.pdf")
-def staff_flyer(estate_id: int, request: Request, campaign_id: int | None = None, db: Session = Depends(get_db)):
+def staff_flyer(estate_id: int, request: Request, style: str = "luxury", campaign_id: int | None = None, db: Session = Depends(get_db)):
+    style = _ad_style(style)
     estate, _access = _staff(db, request, estate_id)
     campaign = _campaign_for_staff(db, estate, campaign_id)
     ctx = _build_ctx(db, estate, campaign.code if campaign else None)
-    return _pdf(_render_flyer(ctx), f"{_safe_name(estate.name)}-flyer.pdf")
+    return _pdf(_render_flyer(ctx, style), f"{_safe_name(estate.name)}-{style}-flyer.pdf")
 
 
 @router.get("/{estate_id}/marketing/materials/brochure.pdf")
-def staff_brochure(estate_id: int, request: Request, campaign_id: int | None = None, db: Session = Depends(get_db)):
+def staff_brochure(estate_id: int, request: Request, style: str = "luxury", campaign_id: int | None = None, db: Session = Depends(get_db)):
+    style = _ad_style(style)
     estate, _access = _staff(db, request, estate_id)
     campaign = _campaign_for_staff(db, estate, campaign_id)
     ctx = _build_ctx(db, estate, campaign.code if campaign else None)
-    return _pdf(_render_brochure(ctx), f"{_safe_name(estate.name)}-brochure.pdf")
+    return _pdf(_render_brochure(ctx, style), f"{_safe_name(estate.name)}-{style}-brochure.pdf")
 
 
 @router.get("/{estate_id}/marketing/materials/ad.png")
@@ -1097,21 +1099,23 @@ def agent_kit(token: str, days: int = 30, db: Session = Depends(get_db)):
 
 
 @router.get("/agent-portal/{token}/marketing/{estate_id}/flyer.pdf")
-def agent_flyer(token: str, estate_id: int, db: Session = Depends(get_db)):
+def agent_flyer(token: str, estate_id: int, style: str = "luxury", db: Session = Depends(get_db)):
+    style = _ad_style(style)
     _row, member, organization = _agent_portal_context(db, token)
     estate = _agent_estate(db, organization.id, estate_id)
     ctx, _campaign = _agent_ctx(db, member, estate)
     db.commit()
-    return _pdf(_render_flyer(ctx), f"{_safe_name(estate.name)}-flyer.pdf")
+    return _pdf(_render_flyer(ctx, style), f"{_safe_name(estate.name)}-{style}-flyer.pdf")
 
 
 @router.get("/agent-portal/{token}/marketing/{estate_id}/brochure.pdf")
-def agent_brochure(token: str, estate_id: int, db: Session = Depends(get_db)):
+def agent_brochure(token: str, estate_id: int, style: str = "luxury", db: Session = Depends(get_db)):
+    style = _ad_style(style)
     _row, member, organization = _agent_portal_context(db, token)
     estate = _agent_estate(db, organization.id, estate_id)
     ctx, _campaign = _agent_ctx(db, member, estate)
     db.commit()
-    return _pdf(_render_brochure(ctx), f"{_safe_name(estate.name)}-brochure.pdf")
+    return _pdf(_render_brochure(ctx, style), f"{_safe_name(estate.name)}-{style}-brochure.pdf")
 
 
 @router.get("/agent-portal/{token}/marketing/{estate_id}/ad.png")

@@ -759,9 +759,11 @@ def hero_banner(ctx: "mr.MarketingContext", width: int, height: int) -> bytes:
     over(canvas, alpha_gradient(width, int(height * 0.62), NIGHT, 0, 250), (0, height - int(height * 0.62)))
     d = ImageDraw.Draw(canvas, "RGBA")
     sc = width / 1190
-    name = ctx.organization_name.upper()
-    nf = fit(d, name, width * 0.5, int(30 * sc), 14, lambda z: sans(z, "extrabold"))
-    T(d, int(56 * sc), int(48 * sc), name, nf, IVORY, spacing=3 * sc)
+    if not _logo_plate(canvas, ctx, int(56 * sc), int(30 * sc), int(62 * sc), int(300 * sc)):
+        name = ctx.organization_name.upper()
+        nf = fit(d, name, width * 0.5, int(30 * sc), 14, lambda z: sans(z, "extrabold"))
+        T(d, int(56 * sc), int(48 * sc), name, nf, IVORY, spacing=3 * sc)
+        d = ImageDraw.Draw(canvas, "RGBA")
     pf = sans(int(18 * sc), "bold")
     label = "AVAILABLE NOW"
     pw = int(measure(d, label, pf, 2 * sc)) + int(60 * sc)
@@ -796,9 +798,11 @@ def cover_page(ctx: "mr.MarketingContext", width: int, height: int) -> bytes:
     over(canvas, alpha_gradient(width, int(height * 0.5), NIGHT_DEEP, 0, 252), (0, height - int(height * 0.5)))
     d = ImageDraw.Draw(canvas, "RGBA")
     sc = width / 1190
-    name = ctx.organization_name.upper()
-    nf = fit(d, name, width * 0.6, int(34 * sc), 16, lambda z: sans(z, "extrabold"))
-    T(d, int(70 * sc), int(70 * sc), name, nf, IVORY, spacing=4 * sc)
+    if not _logo_plate(canvas, ctx, int(70 * sc), int(54 * sc), int(84 * sc), int(340 * sc)):
+        name = ctx.organization_name.upper()
+        nf = fit(d, name, width * 0.6, int(34 * sc), 16, lambda z: sans(z, "extrabold"))
+        T(d, int(70 * sc), int(70 * sc), name, nf, IVORY, spacing=4 * sc)
+        d = ImageDraw.Draw(canvas, "RGBA")
     y = int(height * 0.66)
     d.rounded_rectangle([int(70 * sc), y - int(30 * sc), int(70 * sc) + int(90 * sc), y - int(25 * sc)], radius=3, fill=GOLD + (255,))
     tf = fit(d, ctx.estate.name, width - int(140 * sc), int(128 * sc), 60, lambda z: serif(z, "bold"))
