@@ -57,7 +57,8 @@ from app.utils.r2_objects import build_r2_settings, delete_object_best_effort
 
 router = APIRouter(prefix="/estates", tags=["estate-marketing"])
 
-AD_FORMATS = {"status", "post", "landscape"}
+AD_FORMATS = {"status", "post", "landscape", "poster"}
+AD_STYLES = {"luxury", "promo"}
 NO_CACHE_PRIVATE = {"Cache-Control": "private, no-store"}
 
 
@@ -71,11 +72,20 @@ def _aware(value: datetime | None) -> datetime | None:
     return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
 
 
-def _ad_format(value: str) -> str:
+def _ad_format(value: str, style: str = "luxury") -> str:
     fmt = str(value or "post").strip().lower()
     if fmt not in AD_FORMATS:
-        raise HTTPException(422, "Choose status, post or landscape")
+        raise HTTPException(422, "Choose status, post, landscape or poster")
+    if fmt == "poster" and style != "promo":
+        raise HTTPException(422, "The print poster is only available in the promo style")
     return fmt
+
+
+def _ad_style(value: str) -> str:
+    style = str(value or "luxury").strip().lower()
+    if style not in AD_STYLES:
+        raise HTTPException(422, "Choose the classic (luxury) or promo design")
+    return style
 
 
 def _estate_or_404(db: Session, estate_id: int) -> Estate:
@@ -129,16 +139,16 @@ def _render_brochure(ctx) -> bytes:
     return marketing_render.cached_render(("brochure", marketing_render.context_signature(ctx)), 60, lambda: marketing_pdf.render_brochure_pdf(ctx))
 
 
-def _render_estate_ad(ctx, fmt: str, *, qr: bool = True) -> bytes:
+def _render_estate_ad(ctx, fmt: str, *, qr: bool = True, style: str = "luxury") -> bytes:
     try:
-        return marketing_render.cached_render(("estate-ad", fmt, qr, marketing_render.context_signature(ctx)), 60, lambda: marketing_render.compose_estate_ad(ctx, fmt, qr=qr))
+        return marketing_render.cached_render(("estate-ad", fmt, qr, style, marketing_render.context_signature(ctx)), 60, lambda: marketing_render.compose_estate_ad(ctx, fmt, qr=qr, style=style))
     except ValueError as exc:
         raise HTTPException(409, str(exc)) from exc
 
 
-def _render_plot_ad(ctx, plot: EstatePlot, fmt: str, *, qr: bool = True) -> bytes:
-    key = ("plot-ad", fmt, qr, plot.id, plot.commercial_status, str(plot.asking_price), marketing_render.context_signature(ctx))
-    return marketing_render.cached_render(key, 120, lambda: marketing_render.compose_plot_ad(ctx, plot, fmt, qr=qr))
+def _render_plot_ad(ctx, plot: EstatePlot, fmt: str, *, qr: bool = True, style: str = "luxury") -> bytes:
+    key = ("plot-ad", fmt, qr, style, plot.id, plot.commercial_status, str(plot.asking_price), marketing_render.context_signature(ctx))
+    return marketing_render.cached_render(key, 120, lambda: marketing_render.compose_plot_ad(ctx, plot, fmt, qr=qr, style=style))
 
 
 def _ctx_plot(ctx, plot_id: int) -> EstatePlot:
@@ -451,22 +461,24 @@ def staff_brochure(estate_id: int, request: Request, campaign_id: int | None = N
 
 
 @router.get("/{estate_id}/marketing/materials/ad.png")
-def staff_estate_ad(estate_id: int, request: Request, format: str = "post", campaign_id: int | None = None, db: Session = Depends(get_db)):
-    fmt = _ad_format(format)
+def staff_estate_ad(estate_id: int, request: Request, format: str = "post", style: str = "luxury", campaign_id: int | None = None, db: Session = Depends(get_db)):
+    style = _ad_style(style)
+    fmt = _ad_format(format, style)
     estate, _access = _staff(db, request, estate_id)
     campaign = _campaign_for_staff(db, estate, campaign_id)
     ctx = _build_ctx(db, estate, campaign.code if campaign else None)
-    return _png(_render_estate_ad(ctx, fmt), filename=f"{_safe_name(estate.name)}-{fmt}.png")
+    return _png(_render_estate_ad(ctx, fmt, style=style), filename=f"{_safe_name(estate.name)}-{style}-{fmt}.png")
 
 
 @router.get("/{estate_id}/marketing/materials/plots/{plot_id}/ad.png")
-def staff_plot_ad(estate_id: int, plot_id: int, request: Request, format: str = "post", campaign_id: int | None = None, db: Session = Depends(get_db)):
-    fmt = _ad_format(format)
+def staff_plot_ad(estate_id: int, plot_id: int, request: Request, format: str = "post", style: str = "luxury", campaign_id: int | None = None, db: Session = Depends(get_db)):
+    style = _ad_style(style)
+    fmt = _ad_format(format, style)
     estate, _access = _staff(db, request, estate_id)
     campaign = _campaign_for_staff(db, estate, campaign_id)
     ctx = _build_ctx(db, estate, campaign.code if campaign else None)
     plot = _ctx_plot(ctx, plot_id)
-    return _png(_render_plot_ad(ctx, plot, fmt), filename=f"{_safe_name(estate.name)}-plot-{_safe_name(plot.plot_number)}-{fmt}.png")
+    return _png(_render_plot_ad(ctx, plot, fmt, style=style), filename=f"{_safe_name(estate.name)}-plot-{_safe_name(plot.plot_number)}-{style}-{fmt}.png")
 
 
 def _share_links_payload(db: Session, estate: Estate, campaign: EstateQrCampaign | None, agent_name: str | None, organization_name: str) -> dict:
@@ -1103,24 +1115,26 @@ def agent_brochure(token: str, estate_id: int, db: Session = Depends(get_db)):
 
 
 @router.get("/agent-portal/{token}/marketing/{estate_id}/ad.png")
-def agent_estate_ad(token: str, estate_id: int, format: str = "post", db: Session = Depends(get_db)):
-    fmt = _ad_format(format)
+def agent_estate_ad(token: str, estate_id: int, format: str = "post", style: str = "luxury", db: Session = Depends(get_db)):
+    style = _ad_style(style)
+    fmt = _ad_format(format, style)
     _row, member, organization = _agent_portal_context(db, token)
     estate = _agent_estate(db, organization.id, estate_id)
     ctx, _campaign = _agent_ctx(db, member, estate)
     db.commit()
-    return _png(_render_estate_ad(ctx, fmt), filename=f"{_safe_name(estate.name)}-{fmt}.png")
+    return _png(_render_estate_ad(ctx, fmt, style=style), filename=f"{_safe_name(estate.name)}-{style}-{fmt}.png")
 
 
 @router.get("/agent-portal/{token}/marketing/{estate_id}/plots/{plot_id}/ad.png")
-def agent_plot_ad(token: str, estate_id: int, plot_id: int, format: str = "post", db: Session = Depends(get_db)):
-    fmt = _ad_format(format)
+def agent_plot_ad(token: str, estate_id: int, plot_id: int, format: str = "post", style: str = "luxury", db: Session = Depends(get_db)):
+    style = _ad_style(style)
+    fmt = _ad_format(format, style)
     _row, member, organization = _agent_portal_context(db, token)
     estate = _agent_estate(db, organization.id, estate_id)
     ctx, _campaign = _agent_ctx(db, member, estate)
     plot = _ctx_plot(ctx, plot_id)
     db.commit()
-    return _png(_render_plot_ad(ctx, plot, fmt), filename=f"{_safe_name(estate.name)}-plot-{_safe_name(plot.plot_number)}-{fmt}.png")
+    return _png(_render_plot_ad(ctx, plot, fmt, style=style), filename=f"{_safe_name(estate.name)}-plot-{_safe_name(plot.plot_number)}-{style}-{fmt}.png")
 
 
 @router.patch("/agent-portal/{token}/leads/{lead_id}")

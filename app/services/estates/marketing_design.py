@@ -66,6 +66,11 @@ def serif(size: int, weight: str = "bold") -> ImageFont.FreeTypeFont:
     return ImageFont.truetype(_font_path(SERIF_FILES.get(weight, SERIF_FILES["bold"]), _DEJAVU_BOLD), int(size))
 
 
+@lru_cache(maxsize=32)
+def serif_italic(size: int) -> ImageFont.FreeTypeFont:
+    return ImageFont.truetype(_font_path("PlayfairDisplay-Italic-Medium.ttf", _DEJAVU_BOLD), int(size))
+
+
 @lru_cache(maxsize=64)
 def _naira_font(size: int) -> ImageFont.FreeTypeFont:
     # Neither bundled family carries the naira sign, so it is drawn from a fallback face.
