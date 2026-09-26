@@ -58,7 +58,7 @@ from app.utils.r2_objects import build_r2_settings, delete_object_best_effort
 router = APIRouter(prefix="/estates", tags=["estate-marketing"])
 
 AD_FORMATS = {"status", "post", "landscape", "poster"}
-AD_STYLES = {"luxury", "promo"}
+AD_STYLES = {"luxury", "promo", "heritage", "bold", "blueprint"}
 NO_CACHE_PRIVATE = {"Cache-Control": "private, no-store"}
 
 
@@ -76,15 +76,15 @@ def _ad_format(value: str, style: str = "luxury") -> str:
     fmt = str(value or "post").strip().lower()
     if fmt not in AD_FORMATS:
         raise HTTPException(422, "Choose status, post, landscape or poster")
-    if fmt == "poster" and style != "promo":
-        raise HTTPException(422, "The print poster is only available in the promo style")
+    if fmt == "poster" and style == "luxury":
+        raise HTTPException(422, "The print poster is not available in the classic dark style")
     return fmt
 
 
 def _ad_style(value: str) -> str:
     style = str(value or "luxury").strip().lower()
     if style not in AD_STYLES:
-        raise HTTPException(422, "Choose the classic (luxury) or promo design")
+        raise HTTPException(422, "Choose a valid design style")
     return style
 
 

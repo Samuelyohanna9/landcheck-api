@@ -423,7 +423,8 @@ def draw_layout_png(
 
 # ── Premium composition (see marketing_design) ───────────────────────────────────────────────
 AD_KINDS = {"status", "post", "landscape", "poster", "poster_hd"}
-AD_STYLES = {"luxury", "promo"}
+AD_STYLES = {"luxury", "promo", "heritage", "bold", "blueprint"}
+DESIGN_STYLES = {"heritage", "bold", "blueprint"}
 PORTRAIT_SIZES = {"status": (1080, 1920), "post": (1080, 1350)}
 LANDSCAPE_SIZE = (1200, 630)
 
@@ -433,12 +434,16 @@ def _check(kind: str, style: str) -> None:
         raise ValueError("Unknown ad format")
     if style not in AD_STYLES:
         raise ValueError("Unknown design style")
-    if kind in {"poster", "poster_hd"} and style != "promo":
-        raise ValueError("The print poster is only available in the promo style")
+    if kind in {"poster", "poster_hd"} and style == "luxury":
+        raise ValueError("The print poster is not available in the classic dark style")
 
 
 def compose_estate_ad(ctx: MarketingContext, kind: str, *, qr: bool = True, style: str = "luxury") -> bytes:
     _check(kind, style)
+    if style in DESIGN_STYLES:
+        from app.services.estates import marketing_designs
+
+        return marketing_designs.estate_design(ctx, style, kind, qr=qr)
     if style == "promo":
         from app.services.estates import marketing_promo
 
@@ -450,6 +455,10 @@ def compose_estate_ad(ctx: MarketingContext, kind: str, *, qr: bool = True, styl
 
 def compose_plot_ad(ctx: MarketingContext, plot: EstatePlot, kind: str, *, qr: bool = True, style: str = "luxury") -> bytes:
     _check(kind, style)
+    if style in DESIGN_STYLES:
+        from app.services.estates import marketing_designs
+
+        return marketing_designs.plot_design(ctx, plot, style, kind, qr=qr)
     if style == "promo":
         from app.services.estates import marketing_promo
 

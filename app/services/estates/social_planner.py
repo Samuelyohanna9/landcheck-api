@@ -79,8 +79,12 @@ def make_slots(start: date, days: int, per_day: int | None, per_week: int | None
     return slots
 
 
+ALL_STYLES = ("promo", "luxury", "heritage", "bold", "blueprint")
+ROTATION = ("promo", "heritage", "bold", "luxury", "blueprint")
+
+
 def _style_for(style: str, index: int) -> str:
-    return style if style in ("promo", "luxury") else ("promo" if index % 2 == 0 else "luxury")
+    return style if style in ALL_STYLES else ROTATION[index % len(ROTATION)]
 
 
 def generate_items(db: Session, ctx: marketing_render.MarketingContext, *, tone: str, style: str, slots: list[datetime], cursor: int) -> tuple[list[dict[str, Any]], int]:
@@ -115,8 +119,8 @@ def build_preview(db: Session, ctx: marketing_render.MarketingContext, *, days: 
     validate_frequency(per_day, per_week)
     if tone not in TONES:
         raise PlanError("Choose friendly, professional or urgent.")
-    if style not in ("promo", "luxury", "mixed"):
-        raise PlanError("Choose the promo, classic or mixed design.")
+    if style not in ALL_STYLES + ("mixed",):
+        raise PlanError("Choose one of the designs, or mixed.")
     slots = make_slots(start or default_start(), days, per_day, per_week, clean_times(times))
     if not slots:
         raise PlanError("No posting times fall in the future for those dates. Pick a later start date.")

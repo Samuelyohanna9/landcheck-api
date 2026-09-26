@@ -27,6 +27,7 @@ from reportlab.pdfgen import canvas
 
 from app.services.estates import marketing_design as design
 from app.services.estates import marketing_promo as promo
+from app.services.estates import marketing_render as mr
 from app.services.estates.marketing_render import MarketingContext, area_text, naira, naira_short
 
 _FONTS_READY = False
@@ -271,9 +272,12 @@ def _title_bar(pdf: canvas.Canvas, ctx: MarketingContext, title: str, theme: The
     return PAGE_H - 108
 
 
-def _poster_page(pdf: canvas.Canvas, ctx: MarketingContext) -> None:
-    """A full-bleed page from the promo poster, rendered at print resolution."""
-    data = _jpeg(promo.estate_promo(ctx, "poster_hd"))
+POSTER_STYLES = {"promo", "heritage", "bold", "blueprint"}
+
+
+def _poster_page(pdf: canvas.Canvas, ctx: MarketingContext, style: str = "promo") -> None:
+    """A full-bleed page from a poster design, rendered at print resolution."""
+    data = _jpeg(mr.compose_estate_ad(ctx, "poster_hd", style=style))
     pdf.drawImage(ImageReader(io.BytesIO(data)), 0, 0, width=PAGE_W, height=PAGE_H)
 
 
@@ -282,8 +286,8 @@ def render_flyer_pdf(ctx: MarketingContext, style: str = "luxury") -> bytes:
     buffer = io.BytesIO()
     pdf = canvas.Canvas(buffer, pagesize=A4)
     pdf.setTitle(f"{ctx.estate.name} - flyer")
-    if style == "promo":
-        _poster_page(pdf, ctx)
+    if style in POSTER_STYLES:
+        _poster_page(pdf, ctx, style)
         pdf.showPage()
         pdf.save()
         return buffer.getvalue()
@@ -354,7 +358,7 @@ def _potential_label(forecast: dict) -> str:
 
 def render_brochure_pdf(ctx: MarketingContext, style: str = "luxury") -> bytes:
     _fonts()
-    theme = make_theme(ctx, "promo" if style == "promo" else "luxury")
+    theme = make_theme(ctx, "promo" if style in POSTER_STYLES else "luxury")
     buffer = io.BytesIO()
     pdf = canvas.Canvas(buffer, pagesize=A4)
     pdf.setTitle(f"{ctx.estate.name} - brochure")
@@ -362,7 +366,7 @@ def render_brochure_pdf(ctx: MarketingContext, style: str = "luxury") -> bytes:
 
     # Cover
     if theme.name == "promo":
-        _poster_page(pdf, ctx)
+        _poster_page(pdf, ctx, style if style in POSTER_STYLES else "promo")
     else:
         try:
             _image(pdf, design.cover_page(ctx, 1190, int(1190 * PAGE_H / PAGE_W)), 0, 0, PAGE_W, PAGE_H)

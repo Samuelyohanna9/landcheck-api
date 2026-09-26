@@ -30,7 +30,7 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/estates", tags=["estate-social"])
 
 WRITE = "marketing.manage"
-STYLES = {"promo", "luxury"}
+STYLES = {"promo", "luxury", "heritage", "bold", "blueprint"}
 EDITABLE = ("draft", "scheduled", "failed", "partial")
 
 
