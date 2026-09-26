@@ -23,6 +23,7 @@ from app.services.estates import marketing_render, social_broadcast, social_meta
 from app.services.estates.audit import append_estate_audit_event
 from app.services.estates.authorization import require_estate_access
 from app.services.estates.marketing_common import client_ip, throttled, web_url
+from app.services.estates.subscriptions import get_subscription, has_auto_posting_access
 from app.services.estates.social_templates import ALL_CHANNELS, AUTOMATIC_CHANNELS, CHANNEL_FORMAT, CHANNEL_LABEL, MANUAL_CHANNELS
 from app.utils.secret_box import SecretNotConfigured, decrypt_text, encrypt_text, make_signed_token, read_signed_token, secret_configured
 
@@ -139,6 +140,7 @@ def _post_for_staff(db: Session, request: Request, post_id: int, permission: str
 def _require_automatic_accounts(db: Session, organization_id: int, channels: list[str]) -> None:
     for channel in channels:
         if channel in AUTOMATIC_CHANNELS:
+            _require_auto_posting(db, organization_id)
             if not social_meta.configured():
                 raise HTTPException(503, "Facebook and Instagram posting is not switched on for this server yet.")
             if social_posts._account_for(db, organization_id, channel) is None:
@@ -161,6 +163,7 @@ def social_overview(estate_id: int, request: Request, db: Session = Depends(get_
         "accounts": [social_posts.account_public(item) for item in accounts],
         "channels": [{"key": key, "label": CHANNEL_LABEL[key], "automatic": key in AUTOMATIC_CHANNELS, "format": CHANNEL_FORMAT[key]} for key in ALL_CHANNELS],
         "published": bool(estate.public_enabled and estate.public_slug),
+        "auto_posting": has_auto_posting_access(get_subscription(db, estate.organization_id)),
     }
 
 
@@ -370,9 +373,18 @@ def _preview_item(item: dict) -> dict:
     return {"scheduled_at": item["scheduled_at"], "template_key": item["template_key"], "label": item["label"], "strategy": item["strategy"], "caption": item["caption"], "image_style": item["image_style"], "plot_id": item["plot_id"]}
 
 
+def _require_auto_posting(db: Session, organization_id: int) -> None:
+    if not has_auto_posting_access(get_subscription(db, organization_id)):
+        raise HTTPException(
+            status_code=402,
+            detail={"code": "upgrade_required", "feature": "auto_posting", "message": "Automatic posting plans are available on the Pro and Enterprise plans. Upgrade to unlock them.", "suggested_plan": "pro"},
+        )
+
+
 @router.post("/{estate_id}/marketing/social/plans/preview")
 def preview_plan(estate_id: int, payload: PlanCreate, request: Request, db: Session = Depends(get_db)):
     estate, _access = _staff(db, request, estate_id, permission=WRITE)
+    _require_auto_posting(db, estate.organization_id)
     ctx, _source = _plan_context(db, estate, payload.campaign_id)
     _check_channels(payload.channels)
     try:
@@ -386,6 +398,7 @@ def preview_plan(estate_id: int, payload: PlanCreate, request: Request, db: Sess
 @router.post("/{estate_id}/marketing/social/plans", status_code=201)
 def create_plan(estate_id: int, payload: PlanCreate, request: Request, db: Session = Depends(get_db)):
     estate, access = _staff(db, request, estate_id, permission=WRITE)
+    _require_auto_posting(db, estate.organization_id)
     ctx, source = _plan_context(db, estate, payload.campaign_id)
     channels = _check_channels(payload.channels)
     _require_automatic_accounts(db, estate.organization_id, channels)
@@ -442,6 +455,7 @@ def update_plan(plan_id: int, payload: PlanUpdate, request: Request, db: Session
 @router.post("/{estate_id}/marketing/social/meta/connect")
 def meta_connect(estate_id: int, request: Request, db: Session = Depends(get_db)):
     estate, access = _staff(db, request, estate_id, permission=WRITE)
+    _require_auto_posting(db, estate.organization_id)
     if not social_meta.configured():
         raise HTTPException(503, "Facebook and Instagram posting is not switched on for this server yet.")
     state = make_signed_token("metastate", estate.organization_id, estate.id, access.principal.subject_type, access.principal.subject_id, ttl_seconds=900)

@@ -50,7 +50,7 @@ def _decimal(value: object, default: Decimal = Decimal("0")) -> Decimal:
 
 def _subscription_status_payload(subscription: EstateSubscription | None) -> dict:
     if subscription is None:
-        return {"status": "none", "plan_key": None, "hazard_analysis": False}
+        return {"status": "none", "plan_key": None, "hazard_analysis": False, "auto_posting": False, "max_estates": 1}
     plan = ESTATE_PLANS.get(subscription.plan_key, {})
     return {
         "status": subscription.status,
@@ -61,6 +61,8 @@ def _subscription_status_payload(subscription: EstateSubscription | None) -> dic
         "currency": subscription.currency,
         "payment_method": subscription.payment_method,
         "hazard_analysis": bool(plan.get("hazard_analysis")),
+        "auto_posting": bool(plan.get("auto_posting")),
+        "max_estates": plan.get("max_estates"),
         "trial_ends_at": subscription.trial_ends_at,
         "current_period_end": subscription.current_period_end,
         "cancel_at_period_end": subscription.cancel_at_period_end,
@@ -107,7 +109,7 @@ def billing_plans():
     return {
         "trial_days": TRIAL_DAYS,
         "plans": {
-            key: {"label": plan["label"], "monthly": str(plan["monthly"]), "yearly": str(plan["yearly"]), "hazard_analysis": plan["hazard_analysis"]}
+            key: {"label": plan["label"], "monthly": str(plan["monthly"]), "yearly": str(plan["yearly"]), "hazard_analysis": plan["hazard_analysis"], "auto_posting": plan["auto_posting"], "max_estates": plan["max_estates"]}
             for key, plan in ESTATE_PLANS.items()
         },
     }

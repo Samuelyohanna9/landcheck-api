@@ -19,6 +19,8 @@ from email.utils import formatdate, make_msgid
 
 from app.utils.email_branding import render_branded_email_shell
 
+from app.services.estates.billing_plans import ESTATE_PLANS
+
 logger = logging.getLogger(__name__)
 
 
@@ -493,7 +495,7 @@ def send_trial_started_email(*, organization, subscription) -> bool:
     to_email = _subscription_org_email(organization)
     if not to_email:
         return False
-    plan_label = "Plus" if subscription.plan_key == "plus" else "Basic"
+    plan_label = str(ESTATE_PLANS.get(subscription.plan_key, {}).get("label") or "Basic")
     trial_ends = subscription.trial_ends_at.strftime("%d %b %Y") if subscription.trial_ends_at else "in 3 days"
     payment_message = (
         f"Your next subscription payment will be {html.escape(format_naira(subscription.amount))}. "
@@ -598,7 +600,7 @@ def send_payment_receipt_email(*, organization, subscription) -> bool:
     to_email = _subscription_org_email(organization)
     if not to_email:
         return False
-    plan_label = "Plus" if subscription.plan_key == "plus" else "Basic"
+    plan_label = str(ESTATE_PLANS.get(subscription.plan_key, {}).get("label") or "Basic")
     period_end = subscription.current_period_end.strftime("%d %b %Y") if subscription.current_period_end else ""
     message_html = f"<p>We've charged {html.escape(format_naira(subscription.amount))} for your {html.escape(plan_label)} plan ({html.escape(subscription.billing_cycle)}).</p><p>Your subscription is active through <strong>{html.escape(period_end)}</strong>.</p>"
     body_html = _account_wrap_html(heading="Payment received", message_html=message_html)
@@ -614,7 +616,7 @@ def send_plan_change_receipt_email(*, organization, subscription, charged_amount
     to_email = _subscription_org_email(organization)
     if not to_email:
         return False
-    plan_label = "Plus" if subscription.plan_key == "plus" else "Basic"
+    plan_label = str(ESTATE_PLANS.get(subscription.plan_key, {}).get("label") or "Basic")
     period_end = subscription.current_period_end.strftime("%d %b %Y") if subscription.current_period_end else ""
     message_html = (
         f"<p>We've charged {html.escape(format_naira(charged_amount))} for your upgrade to the "

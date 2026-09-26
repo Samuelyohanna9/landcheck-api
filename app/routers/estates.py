@@ -44,7 +44,8 @@ from sqlalchemy import func
 from app.services.estates.allocations import release_allocation, reserve_or_allocate
 from app.services.estates.audit import append_estate_audit_event
 from app.services.estates.authorization import EstatePrincipal, require_estate_access
-from app.services.estates.subscriptions import get_subscription, has_hazard_access
+from app.services.estates.billing_plans import next_plan_with_estates, plan_label
+from app.services.estates.subscriptions import estate_limit_for, get_subscription, has_hazard_access
 from app.services.estates.survey_requests import transition
 from app.services.estates.survey_adapter import materialize_estate_plot_for_survey
 from app.schemas.estate_survey import SurveyorAssignment
@@ -867,6 +868,22 @@ def estates_attention(request: Request, db: Session = Depends(get_db)):
 def create_estate(organization_id: int, payload: EstateCreate, request: Request, db: Session = Depends(get_db)):
     access = require_estate_access(db, request, organization_id, permission="estate.manage")
     _enabled(db, organization_id)
+    subscription = get_subscription(db, organization_id)
+    limit = estate_limit_for(subscription)
+    if limit is not None:
+        in_use = db.query(Estate).filter(Estate.organization_id == organization_id, Estate.archived_at.is_(None)).count()
+        if in_use >= limit:
+            nxt = next_plan_with_estates(subscription.plan_key if subscription else None)
+            current = plan_label(subscription.plan_key if subscription else None)
+            raise HTTPException(
+                status_code=402,
+                detail={
+                    "code": "estate_limit_reached",
+                    "message": f"Your {current} plan manages {limit} estate{'s' if limit != 1 else ''}. Upgrade{' to ' + plan_label(nxt) if nxt else ''} to add another.",
+                    "limit": limit,
+                    "suggested_plan": nxt,
+                },
+            )
     boundary = None
     if payload.boundary:
         _, issues = validate_polygon(payload.boundary)

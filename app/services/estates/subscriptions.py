@@ -16,7 +16,7 @@ from sqlalchemy.orm import Session
 
 from app.models.estate_billing import EstateSubscription, EstateSubscriptionCharge
 from app.models.estate_foundation import EstateOrganization
-from app.services.estates.billing_plans import ACTIVE_SUBSCRIPTION_STATUSES, TRIAL_DAYS, plan_amount, plan_includes_hazard_analysis
+from app.services.estates.billing_plans import ACTIVE_SUBSCRIPTION_STATUSES, TRIAL_DAYS, plan_amount, plan_includes_auto_posting, plan_includes_hazard_analysis, plan_label, plan_max_estates
 from app.services.estates import estate_email
 from app.utils import estate_flutterwave as flw
 
@@ -41,6 +41,15 @@ def is_access_active(subscription: EstateSubscription | None) -> bool:
 
 def has_hazard_access(subscription: EstateSubscription | None) -> bool:
     return is_access_active(subscription) and plan_includes_hazard_analysis(subscription.plan_key)
+
+
+def has_auto_posting_access(subscription: EstateSubscription | None) -> bool:
+    return is_access_active(subscription) and plan_includes_auto_posting(subscription.plan_key)
+
+
+def estate_limit_for(subscription: EstateSubscription | None) -> int | None:
+    """None means unlimited. An organisation with no subscription record keeps the Basic limit."""
+    return plan_max_estates(subscription.plan_key if subscription else None)
 
 
 def _advance_period(start: datetime, billing_cycle: str) -> datetime:
@@ -371,6 +380,18 @@ def change_plan(
     """
     if new_plan_key == subscription.plan_key:
         return {"changed": False, "payment_status": "not_required", "charged_amount": Decimal("0")}
+
+    new_limit = plan_max_estates(new_plan_key)
+    current_limit = plan_max_estates(subscription.plan_key)
+    if new_limit is not None and (current_limit is None or new_limit < current_limit):
+        from app.models.estate_foundation import Estate
+
+        in_use = db.query(Estate).filter(Estate.organization_id == subscription.organization_id, Estate.archived_at.is_(None)).count()
+        if in_use > new_limit:
+            raise ValueError(
+                f"The {plan_label(new_plan_key)} plan manages {new_limit} estate{'s' if new_limit != 1 else ''} and you have {in_use}. "
+                "Archive estates you no longer need before switching down."
+            )
 
     current_amount = Decimal(str(subscription.amount))
     new_amount = plan_amount(new_plan_key, subscription.billing_cycle)

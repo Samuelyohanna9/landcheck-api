@@ -54,7 +54,7 @@ class EstateSubscription(Base):
     updated_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
 
     __table_args__ = (
-        CheckConstraint("plan_key IN ('basic', 'plus')", name="ck_estate_subscriptions_plan"),
+        CheckConstraint("plan_key IN ('basic', 'plus', 'pro', 'enterprise')", name="ck_estate_subscriptions_plan"),
         CheckConstraint("billing_cycle IN ('monthly', 'yearly')", name="ck_estate_subscriptions_cycle"),
         CheckConstraint(
             "status IN ('trialing', 'active', 'past_due', 'canceled', 'expired')",
