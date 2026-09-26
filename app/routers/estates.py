@@ -2696,14 +2696,20 @@ def _slim_hazard_result(value):
 def _estate_hazard_dashboard_payload(db: Session, estate: Estate) -> dict:
     # Only the newest record per plot and hazard, with overlays stripped inside the database, instead
     # of loading every historical assessment (each carrying full map images) into Python.
-    rows = db.execute(text("""
-        SELECT DISTINCT ON (plot_id, hazard_type)
-               id, plot_id, estate_id, hazard_type, risk_class, risk_score, assessed_at,
-               (result_payload::jsonb #- '{overlay}' #- '{river,overlay}' #- '{floodplain,overlay}' #- '{rainfall,overlay}') AS result
+    # Step 1 picks the newest row ids from the small columns only, so the big JSON of older rows is
+    # never read. Step 2 fetches (and strips overlays from) just those rows.
+    latest_ids = [row[0] for row in db.execute(text("""
+        SELECT DISTINCT ON (plot_id, hazard_type) id
         FROM estate_hazard_assessments
         WHERE estate_id = :estate_id
         ORDER BY plot_id, hazard_type, assessed_at DESC
-    """), {"estate_id": estate.id}).mappings().all()
+    """), {"estate_id": estate.id}).all()]
+    rows = db.execute(text("""
+        SELECT id, plot_id, estate_id, hazard_type, risk_class, risk_score, assessed_at,
+               (result_payload::jsonb #- '{overlay}' #- '{river,overlay}' #- '{floodplain,overlay}' #- '{rainfall,overlay}') AS result
+        FROM estate_hazard_assessments
+        WHERE id = ANY(:ids)
+    """), {"ids": latest_ids}).mappings().all() if latest_ids else []
     total = int(db.execute(text("SELECT count(*) FROM estate_hazard_assessments WHERE estate_id = :estate_id"), {"estate_id": estate.id}).scalar() or 0)
     plot_results = {}
     for row in rows:
