@@ -61,9 +61,23 @@ def redirect_uri() -> str:
     return f"{api_url()}/estates/marketing/social/meta/callback"
 
 
+def scopes() -> list[str]:
+    """META_SCOPES (comma separated) overrides the default list without a code change."""
+    raw = str(os.getenv("META_SCOPES") or "").strip()
+    return [item.strip() for item in raw.split(",") if item.strip()] if raw else list(SCOPES)
+
+
 def oauth_url(state: str) -> str:
-    query = urlencode({"client_id": app_id(), "redirect_uri": redirect_uri(), "state": state, "response_type": "code", "scope": ",".join(SCOPES)})
-    return f"https://www.facebook.com/{graph_version()}/dialog/oauth?{query}"
+    """Classic Facebook Login sends a list of permissions. Apps that use Facebook Login for Business send
+    a configuration id instead (META_LOGIN_CONFIG_ID), which carries the permissions."""
+    params = {"client_id": app_id(), "redirect_uri": redirect_uri(), "state": state, "response_type": "code"}
+    config_id = str(os.getenv("META_LOGIN_CONFIG_ID") or "").strip()
+    if config_id:
+        params["config_id"] = config_id
+        params["override_default_response_type"] = "true"
+    else:
+        params["scope"] = ",".join(scopes())
+    return f"https://www.facebook.com/{graph_version()}/dialog/oauth?{urlencode(params)}"
 
 
 def _raise_for(response: requests.Response) -> dict[str, Any]:

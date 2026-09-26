@@ -3,14 +3,14 @@ from __future__ import annotations
 """Creating, rendering, publishing and reminding for estate marketing posts."""
 
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
-from app.models.estate_foundation import Estate, EstatePlot
-from app.models.estate_social import EstateSocialAccount, EstateSocialPost
+from app.models.estate_foundation import Estate, EstateNotificationLog, EstatePlot
+from app.models.estate_social import EstateSocialAccount, EstateSocialPlan, EstateSocialPost
 from app.services.estates import marketing_render, social_meta
 from app.services.estates.marketing_alerts import _dedupe, _member_emails, _send
 from app.services.estates.marketing_common import api_url, web_url
@@ -20,6 +20,7 @@ from app.utils.secret_box import SecretNotConfigured, decrypt_text, make_signed_
 logger = logging.getLogger(__name__)
 
 IMAGE_TOKEN_TTL_SECONDS = 24 * 3600
+STALE_PLAN_POST = timedelta(hours=12)
 
 
 # ── Images ───────────────────────────────────────────────────────────────────────────────────
@@ -62,6 +63,24 @@ def _account_for(db: Session, organization_id: int, channel: str) -> EstateSocia
     )
 
 
+# ── Delivery records (shown in Message delivery) ─────────────────────────────────────────────
+def log_delivery(db: Session, post: EstateSocialPost, channel: str, outcome: dict[str, Any], *, account_name: str | None = None) -> None:
+    """One Message delivery row per channel a post was sent to, so the company has a record of everything
+    that went out (or failed, or was skipped) in the same place as its customer emails."""
+    state = outcome.get("status")
+    status = "sent" if state == "ok" else "skipped" if state == "skipped" else "failed"
+    first_line = next((line.strip() for line in (post.caption or "").splitlines() if line.strip()), "Marketing post")
+    db.add(EstateNotificationLog(
+        organization_id=post.organization_id, estate_id=post.estate_id, channel=channel, event_key="social_post",
+        recipient_name=(account_name or outcome.get("account") or CHANNEL_LABEL.get(channel, channel))[:255], subject=first_line[:255], status=status,
+        error_message=(outcome.get("error") or None) if status != "sent" else None,
+        details={"post_id": post.id, "plan_id": post.plan_id, "template": post.template_key, "url": outcome.get("url") or "", "manual": bool(outcome.get("manual")), "scheduled_at": post.scheduled_at.isoformat() if post.scheduled_at else ""},
+        sent_at=datetime.now(timezone.utc) if status == "sent" else None,
+    ))
+    db.flush()
+
+
+
 def channels_of(post: EstateSocialPost) -> list[str]:
     return [channel for channel in (post.channels or []) if channel in CHANNEL_LABEL]
 
@@ -98,6 +117,17 @@ def _publish_channel(db: Session, post: EstateSocialPost, channel: str) -> dict[
 def publish_post(db: Session, post: EstateSocialPost) -> EstateSocialPost:
     """Send the post to its automatic channels. Channels that already succeeded are never sent twice, so
     retrying after a partial failure is safe. Manual channels stay 'pending' until someone marks them posted."""
+    if post.auto_caption:
+        from app.services.estates.social_planner import refresh_auto_post
+
+        if not refresh_auto_post(db, post):
+            post.status = "skipped"
+            post.results = {"skipped": {"status": "skipped", "error": "No plots are available right now, so nothing was posted."}}
+            for channel in channels_of(post):
+                log_delivery(db, post, channel, {"status": "skipped", "error": "No plots are available right now, so nothing was posted."})
+            db.commit()
+            return post
+        db.commit()
     results = dict(post.results or {})
     auto = [channel for channel in channels_of(post) if channel in AUTOMATIC_CHANNELS]
     for channel in channels_of(post):
@@ -114,6 +144,7 @@ def publish_post(db: Session, post: EstateSocialPost) -> EstateSocialPost:
         results = dict(post.results or {})
         results[channel] = outcome
         post.results = results
+        log_delivery(db, post, channel, outcome)
         db.commit()
 
     statuses = [(post.results or {}).get(channel, {}).get("status") for channel in auto]
@@ -137,6 +168,7 @@ def mark_manual_posted(db: Session, post: EstateSocialPost, channel: str) -> Est
     results = dict(post.results or {})
     results[channel] = {"status": "ok", "done_at": datetime.now(timezone.utc).isoformat(), "manual": True}
     post.results = results
+    log_delivery(db, post, channel, results[channel])
     manual_left = [c for c in channels_of(post) if c in MANUAL_CHANNELS and (post.results.get(c) or {}).get("status") != "ok"]
     auto = [c for c in channels_of(post) if c in AUTOMATIC_CHANNELS]
     auto_ok = all((post.results.get(c) or {}).get("status") == "ok" for c in auto)
@@ -151,13 +183,32 @@ def mark_manual_posted(db: Session, post: EstateSocialPost, channel: str) -> Est
 def publish_due_posts(db: Session, *, now: datetime | None = None) -> dict[str, int]:
     """Called every minute: publish scheduled posts whose time has come."""
     now = now or datetime.now(timezone.utc)
+    # A plan post that is many hours late (server down, plan resumed) would go out at a strange time with
+    # stale timing - skip it instead; the plan keeps going with its later posts.
+    stale_ids = db.execute(text("""
+        UPDATE estate_social_posts SET status = 'skipped', updated_at = NOW(),
+               results = '{"skipped": {"status": "skipped", "error": "The scheduled time passed before it could be posted."}}'::json
+        WHERE status = 'scheduled' AND plan_id IS NOT NULL AND scheduled_at < :stale
+        RETURNING id
+    """), {"stale": now - STALE_PLAN_POST}).scalars().all()
+    for stale_id in stale_ids:
+        stale = db.get(EstateSocialPost, stale_id)
+        if stale is not None:
+            for channel in channels_of(stale):
+                log_delivery(db, stale, channel, {"status": "skipped", "error": "The scheduled time passed before it could be posted."})
+    # A worker that died mid-publish leaves the post 'publishing' forever; give it a clear failed state.
+    db.execute(text("""
+        UPDATE estate_social_posts SET status = 'failed', updated_at = NOW()
+        WHERE status = 'publishing' AND updated_at < :stuck
+    """), {"stuck": now - timedelta(minutes=20)})
     claimed = db.execute(text("""
         UPDATE estate_social_posts SET status = 'publishing', updated_at = NOW()
         WHERE id IN (
-            SELECT id FROM estate_social_posts
-            WHERE status = 'scheduled' AND scheduled_at IS NOT NULL AND scheduled_at <= :now
-              AND channels::jsonb ?| array['facebook', 'instagram', 'instagram_story']
-            ORDER BY scheduled_at ASC LIMIT 10 FOR UPDATE SKIP LOCKED)
+            SELECT p.id FROM estate_social_posts p LEFT JOIN estate_social_plans pl ON pl.id = p.plan_id
+            WHERE p.status = 'scheduled' AND p.scheduled_at IS NOT NULL AND p.scheduled_at <= :now
+              AND (p.plan_id IS NULL OR pl.status = 'active')
+              AND p.channels::jsonb ?| array['facebook', 'instagram', 'instagram_story']
+            ORDER BY p.scheduled_at ASC LIMIT 10 FOR UPDATE OF p SKIP LOCKED)
         RETURNING id
     """), {"now": now}).scalars().all()
     db.commit()
@@ -199,6 +250,18 @@ def send_manual_post_reminders(db: Session, *, now: datetime | None = None) -> d
         estate = db.get(Estate, post.estate_id)
         if estate is None:
             continue
+        if post.plan_id:
+            plan = db.get(EstateSocialPlan, post.plan_id)
+            if plan is not None and plan.status != "active":
+                continue
+        if post.auto_caption:
+            from app.services.estates.social_planner import refresh_auto_post
+
+            if not refresh_auto_post(db, post):
+                post.status = "skipped"
+                post.results = {"skipped": {"status": "skipped", "error": "No plots are available right now, so nothing was posted."}}
+                post.reminder_sent_at = now
+                continue
         recipients = _dedupe(_member_emails(db, post.organization_id, ("owner", "manager", "marketer")))
         labels = ", ".join(CHANNEL_LABEL[c] for c in manual)
         link = f"{web_url()}/estates/{estate.id}/marketing?tab=social&post={post.id}"
@@ -212,8 +275,11 @@ def send_manual_post_reminders(db: Session, *, now: datetime | None = None) -> d
 
 
 def run_social_sweeps(db: Session) -> None:
+    from app.services.estates.social_planner import extend_active_plans
+
     publish_due_posts(db)
     send_manual_post_reminders(db)
+    extend_active_plans(db)
     from app.services.estates.social_broadcast import process_queued_whatsapp_sends
 
     process_queued_whatsapp_sends(db)

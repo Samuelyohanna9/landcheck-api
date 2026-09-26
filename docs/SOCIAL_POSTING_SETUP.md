@@ -17,6 +17,8 @@ SOCIAL_SECRET_KEY=<random string, 32+ characters>   # encrypts stored tokens, si
 META_APP_ID=<from developers.facebook.com>
 META_APP_SECRET=<from developers.facebook.com>
 META_GRAPH_VERSION=v23.0                            # optional, default v23.0
+META_LOGIN_CONFIG_ID=                               # optional: Facebook Login for Business configuration id (used instead of permission names)
+META_SCOPES=                                        # optional: comma-separated permission override
 LANDCHECK_API_PUBLIC_URL=https://api.landcheck.online   # must be public HTTPS - Meta fetches post images from it
 LANDCHECK_WEB_URL=https://landcheck.online
 
@@ -49,6 +51,8 @@ Until `META_APP_ID`, `META_APP_SECRET` and `SOCIAL_SECRET_KEY` are all set, the 
    - **Deauthorize callback URL:** `https://api.landcheck.online/estates/marketing/social/meta/deauthorize`
 4. Complete **Business verification** in Meta Business Settings (needed for Advanced Access to page permissions). Have your CAC documents ready.
 5. While in Development mode only people with a role on the app can connect - add yourself and a test Page/Instagram account as Tester/Developer and test the whole flow first.
+
+**Use cases:** the app needs the *Manage everything on your Page* and *Manage messaging & content on Instagram* use cases (Facebook Login alone reports every Page/Instagram permission as "Invalid Scope"). If Meta will not combine them with Facebook Login, create the app with just those two.
 
 ## 3. App review - permissions to request
 
@@ -88,3 +92,20 @@ Provide a test login (a reviewer account with the Estate created and published) 
 - **Manual channels** (WhatsApp Status, Other): the scheduled time emails the team (owners, managers, marketers) with a link that opens the post; after posting, click **Mark as posted**.
 - **Permissions:** owners and managers (and the new `marketing.manage` permission, given to the marketer role) can create, schedule, connect and broadcast; everyone with estate access can view.
 - **Data deletion:** Meta's deauthorize/data-deletion callbacks delete the connected accounts for that Facebook user.
+
+## 6. Automatic posting plans
+
+Marketing -> Social posts -> **Automatic posting plan** writes and schedules a run of different posts (for example one a day for a week, twice a day, or 2-3 a week). Migration `20260927_0036`.
+
+- Angles rotate so neighbouring posts differ: plots available, sizes and prices, payment plan, featured plot, how to buy, progress update, area outlook, only-a-few-left (only when stock is genuinely low), plots already sold, site inspection, common question, buying-land checklist, talk to us. A template with no real data behind it is not used.
+- Tones: friendly, professional (no emoji), urgent. Designs: bright promo, classic dark, or mixed.
+- Captions are rewritten from live plot data just before each post goes out; if no plots are available nothing is posted (the post shows "Skipped").
+- Posts more than 12 hours late (server down) are skipped rather than posted at a strange time. Pausing a plan holds its posts; resuming moves missed ones to the next free times.
+- "Keep going automatically" adds the next batch when fewer than two days of posts remain.
+- Editing a caption in Your posts keeps that post's own words (it is no longer rewritten).
+
+### Scheduled & posted page and delivery records
+
+- **Marketing -> Social posts -> "See and edit all posts"** (or straight after scheduling a plan) opens `/estates/<id>/marketing/posts`: every post grouped by day, with tabs Upcoming / Posted / Needs attention / Drafts / Cancelled / All and a plan filter. Open a post to edit the caption, time (Lagos), channels and design, try another wording, post now, retry, cancel, or give a skipped/cancelled post a new time.
+- **Message delivery** (`/estates/<id>/notifications`) now also lists every Facebook / Instagram / WhatsApp Status post (sent, failed, skipped, with the reason and a link to the post) and every WhatsApp update, next to customer emails. Filter: Everything / Customer emails / Social posts / WhatsApp updates.
+- **Default posting times (Lagos, WAT):** 1 a day 18:30; 2 a day 09:00 and 19:00; 3 a day 08:30, 13:00 and 19:30; weekly plans post at 18:30 on Wed (1/wk), Tue+Fri (2/wk), Mon+Wed+Fri (3/wk), Mon-Fri (5/wk). Custom times can be chosen per plan. The scheduler runs every minute, so posts go out within about a minute of their time.

@@ -4492,8 +4492,16 @@ def estate_document_readiness(estate_id: int, request: Request, db: Session = De
     return {"requirements": list(DOCUMENT_REQUIREMENTS), "items": result}
 
 
+DELIVERY_GROUPS = {
+    "email": ("email",),
+    "social": ("facebook", "instagram", "instagram_story", "whatsapp_status", "other"),
+    "whatsapp": ("whatsapp",),
+}
+
+
 @router.get("/{estate_id}/notifications")
-def estate_notification_log(estate_id: int, request: Request, limit: int = 100, status: str | None = None, db: Session = Depends(get_db)):
+def estate_notification_log(estate_id: int, request: Request, limit: int = 100, status: str | None = None, group: str | None = None, db: Session = Depends(get_db)):
+    """Everything the estate sent out: customer emails, marketing posts and WhatsApp updates."""
     estate = db.get(Estate, estate_id)
     if not estate:
         raise HTTPException(404, "Estate not found")
@@ -4503,17 +4511,21 @@ def estate_notification_log(estate_id: int, request: Request, limit: int = 100, 
         EstateNotificationLog.estate_id == estate_id,
         EstateNotificationLog.organization_id == estate.organization_id,
     )
+    if group in DELIVERY_GROUPS:
+        base_query = base_query.filter(EstateNotificationLog.channel.in_(DELIVERY_GROUPS[group]))
+    group_counts = {name: int(db.query(func.count(EstateNotificationLog.id)).filter(EstateNotificationLog.estate_id == estate_id, EstateNotificationLog.organization_id == estate.organization_id, EstateNotificationLog.channel.in_(channels)).scalar() or 0) for name, channels in DELIVERY_GROUPS.items()}
     if status in {"sent", "failed", "skipped"}:
         base_query = base_query.filter(EstateNotificationLog.status == status)
     rows = base_query.order_by(EstateNotificationLog.created_at.desc()).limit(safe_limit).all()
     def status_count(value: str) -> int:
-        return int(
-            db.query(func.count(EstateNotificationLog.id)).filter(
-                EstateNotificationLog.estate_id == estate_id,
-                EstateNotificationLog.organization_id == estate.organization_id,
-                EstateNotificationLog.status == value,
-            ).scalar() or 0
+        counted = db.query(func.count(EstateNotificationLog.id)).filter(
+            EstateNotificationLog.estate_id == estate_id,
+            EstateNotificationLog.organization_id == estate.organization_id,
+            EstateNotificationLog.status == value,
         )
+        if group in DELIVERY_GROUPS:
+            counted = counted.filter(EstateNotificationLog.channel.in_(DELIVERY_GROUPS[group]))
+        return int(counted.scalar() or 0)
     return {
         "items": [
             {
@@ -4536,6 +4548,7 @@ def estate_notification_log(estate_id: int, request: Request, limit: int = 100, 
             "failed": status_count("failed"),
             "skipped": status_count("skipped"),
         },
+        "groups": group_counts,
     }
 
 

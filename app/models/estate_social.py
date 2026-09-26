@@ -2,12 +2,12 @@ from __future__ import annotations
 
 import uuid
 
-from sqlalchemy import CheckConstraint, Column, DateTime, ForeignKey, Index, Integer, JSON, String, Text, UniqueConstraint
+from sqlalchemy import Boolean, CheckConstraint, Column, Date, DateTime, ForeignKey, Index, Integer, JSON, String, Text, UniqueConstraint
 from sqlalchemy.sql import func
 
 from app.db_base import Base
 
-POST_STATUSES = ("draft", "scheduled", "publishing", "published", "partial", "failed", "cancelled")
+POST_STATUSES = ("draft", "scheduled", "publishing", "published", "partial", "failed", "cancelled", "skipped")
 
 
 class EstateSocialAccount(Base):
@@ -38,6 +38,39 @@ class EstateSocialAccount(Base):
     )
 
 
+class EstateSocialPlan(Base):
+    """A content plan: several posts written and scheduled automatically (for example one a day for a week),
+    optionally repeating so the schedule never runs dry."""
+
+    __tablename__ = "estate_social_plans"
+
+    id = Column(Integer, primary_key=True)
+    organization_id = Column(Integer, ForeignKey("estate_organizations.id", ondelete="CASCADE"), nullable=False)
+    estate_id = Column(Integer, ForeignKey("estate_estates.id", ondelete="CASCADE"), nullable=False)
+    name = Column(String(120), nullable=False)
+    status = Column(String(16), nullable=False, default="active")  # active | paused | ended
+    per_day = Column(Integer, nullable=True)
+    per_week = Column(Integer, nullable=True)
+    times = Column(JSON, nullable=False, default=list)  # ["09:00", "19:00"] in Lagos time
+    channels = Column(JSON, nullable=False, default=list)
+    style = Column(String(16), nullable=False, default="mixed")  # promo | luxury | mixed
+    tone = Column(String(16), nullable=False, default="friendly")  # friendly | professional | urgent
+    duration_days = Column(Integer, nullable=False, default=7)
+    auto_renew = Column(Boolean, nullable=False, default=False)
+    source_code = Column(String(120), nullable=True)
+    cursor = Column(Integer, nullable=False, default=0)  # where the content rotation stands, so renewals continue it
+    start_date = Column(Date, nullable=True)
+    created_by_subject_type = Column(String(64), nullable=False)
+    created_by_subject_id = Column(String(128), nullable=False)
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
+
+    __table_args__ = (
+        CheckConstraint("status IN ('active', 'paused', 'ended')", name="ck_estate_social_plan_status"),
+        Index("ix_estate_social_plans_estate", "estate_id", "status"),
+    )
+
+
 class EstateSocialPost(Base):
     """One marketing post: a caption plus a generated image, sent to one or more channels now or later."""
 
@@ -48,6 +81,9 @@ class EstateSocialPost(Base):
     organization_id = Column(Integer, ForeignKey("estate_organizations.id", ondelete="CASCADE"), nullable=False)
     estate_id = Column(Integer, ForeignKey("estate_estates.id", ondelete="CASCADE"), nullable=False)
     plot_id = Column(Integer, ForeignKey("estate_plots.id", ondelete="SET NULL"), nullable=True)
+    plan_id = Column(Integer, ForeignKey("estate_social_plans.id", ondelete="SET NULL"), nullable=True)
+    auto_caption = Column(Boolean, nullable=False, default=False)  # rewritten from live data just before posting
+    variant = Column(Integer, nullable=False, default=0)
     template_key = Column(String(40), nullable=False, default="custom")
     caption = Column(Text, nullable=False)
     image_format = Column(String(16), nullable=False, default="post")
@@ -66,7 +102,8 @@ class EstateSocialPost(Base):
     updated_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
 
     __table_args__ = (
-        CheckConstraint("status IN ('draft', 'scheduled', 'publishing', 'published', 'partial', 'failed', 'cancelled')", name="ck_estate_social_post_status"),
+        CheckConstraint("status IN ('draft', 'scheduled', 'publishing', 'published', 'partial', 'failed', 'cancelled', 'skipped')", name="ck_estate_social_post_status"),
+        Index("ix_estate_social_posts_plan", "plan_id", "scheduled_at"),
         Index("ix_estate_social_posts_estate", "estate_id", "created_at"),
         Index("ix_estate_social_posts_due", "status", "scheduled_at"),
     )

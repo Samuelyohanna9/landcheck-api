@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 
 from sqlalchemy.orm import Session
 
-from app.models.estate_foundation import Estate
+from app.models.estate_foundation import Estate, EstateNotificationLog
 from app.models.estate_social import EstateMarketingOptin, EstateWhatsappSend
 from app.services.estates import social_whatsapp
 from app.services.estates.marketing_common import normalize_phone_digits, share_page_url
@@ -88,6 +88,18 @@ def queue_broadcast(db: Session, *, estate: Estate, preset: str, detail: str | N
     return batch, len(optins)
 
 
+def _record(db: Session, row: EstateWhatsappSend, optin: EstateMarketingOptin | None) -> None:
+    """Every WhatsApp update also appears in Message delivery, next to the company's customer emails."""
+    who = (optin.full_name if optin and optin.full_name else None) or (f"+{optin.phone_digits}" if optin else "Subscriber")
+    db.add(EstateNotificationLog(
+        organization_id=row.organization_id, estate_id=row.estate_id, channel="whatsapp", event_key="whatsapp_update", recipient_name=who[:255],
+        subject=f"WhatsApp update ({row.template_name})", status=row.status if row.status in ("sent", "failed", "skipped") else "failed",
+        error_message=row.error, details={"phone": f"+{optin.phone_digits}" if optin else "", "batch": row.batch_uid, "message_id": row.provider_message_id or ""},
+        sent_at=datetime.now(timezone.utc) if row.status == "sent" else None,
+    ))
+    db.flush()
+
+
 def process_queued_whatsapp_sends(db: Session) -> dict[str, int]:
     """Deliver queued sends (called every minute). Skips anyone who opted out after the broadcast was queued."""
     if not social_whatsapp.configured():
@@ -99,6 +111,7 @@ def process_queued_whatsapp_sends(db: Session) -> dict[str, int]:
         if optin is None or optin.status != "active":
             row.status = "skipped"
             row.error = "Contact opted out"
+            _record(db, row, optin)
             continue
         try:
             row.provider_message_id = social_whatsapp.send_template(optin.phone_digits, row.template_name, list(row.params or []))
@@ -113,6 +126,7 @@ def process_queued_whatsapp_sends(db: Session) -> dict[str, int]:
             row.status = "failed"
             row.error = f"Could not reach WhatsApp: {exc}"[:500]
             failed += 1
+        _record(db, row, optin)
         db.commit()
         time.sleep(SEND_PAUSE_SECONDS)
     db.commit()

@@ -6,7 +6,7 @@ import html
 import logging
 import os
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from urllib.parse import quote
 
 from fastapi import APIRouter, Body, Depends, Form, HTTPException, Query, Request, Response
@@ -16,10 +16,10 @@ from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app.models.estate_foundation import Estate, EstateOrganization, EstatePlot
-from app.models.estate_social import EstateMarketingOptin, EstateSocialAccount, EstateSocialPost, EstateWhatsappSend
+from app.models.estate_social import EstateMarketingOptin, EstateSocialAccount, EstateSocialPlan, EstateSocialPost, EstateWhatsappSend
 from app.routers.estate_marketing import _campaign_for_staff, _png, _staff
 from app.routers.plots import get_db
-from app.services.estates import marketing_render, social_broadcast, social_meta, social_posts, social_templates, social_whatsapp
+from app.services.estates import marketing_render, social_broadcast, social_meta, social_planner, social_posts, social_templates, social_whatsapp
 from app.services.estates.audit import append_estate_audit_event
 from app.services.estates.authorization import require_estate_access
 from app.services.estates.marketing_common import client_ip, throttled, web_url
@@ -53,6 +53,26 @@ class PostUpdate(BaseModel):
     scheduled_at: datetime | None = None
     clear_schedule: bool = False
     cancel: bool = False
+
+
+class PlanCreate(BaseModel):
+    name: str | None = Field(default=None, max_length=120)
+    days: int = Field(default=7, ge=1, le=30)
+    per_day: int | None = Field(default=None, ge=1, le=3)
+    per_week: int | None = Field(default=None, ge=1, le=7)
+    times: list[str] = Field(default_factory=list, max_length=3)
+    channels: list[str] = Field(min_length=1, max_length=5)
+    tone: str = "friendly"
+    style: str = "mixed"
+    start_date: date | None = None
+    campaign_id: int | None = None
+    auto_renew: bool = False
+    approve: bool = True
+
+
+class PlanUpdate(BaseModel):
+    action: str | None = None  # pause | resume | stop | approve
+    auto_renew: bool | None = None
 
 
 class MarkPosted(BaseModel):
@@ -100,6 +120,8 @@ def _post_payload(post: EstateSocialPost) -> dict:
         "id": post.id, "estate_id": post.estate_id, "plot_id": post.plot_id, "template_key": post.template_key, "caption": post.caption,
         "channels": list(post.channels or []), "image_style": post.image_style, "status": post.status, "scheduled_at": post.scheduled_at,
         "published_at": post.published_at, "reminder_sent_at": post.reminder_sent_at, "results": post.results or {}, "created_at": post.created_at,
+        "plan_id": post.plan_id, "auto_caption": bool(post.auto_caption),
+        "template_label": social_templates.TEMPLATE_INFO.get(post.template_key, (None,))[0], "strategy": (social_templates.TEMPLATE_INFO.get(post.template_key) or (None, None))[1],
     }
 
 
@@ -156,14 +178,14 @@ def social_templates_endpoint(estate_id: int, request: Request, plot_id: int | N
 
 
 @router.get("/{estate_id}/marketing/social/image.png")
-def social_image(estate_id: int, request: Request, channel: str = "facebook", style: str = "promo", plot_id: int | None = None, campaign_id: int | None = None, download: bool = False, db: Session = Depends(get_db)):
+def social_image(estate_id: int, request: Request, channel: str = "facebook", style: str = "promo", plot_id: int | None = None, campaign_id: int | None = None, source: str | None = None, download: bool = False, db: Session = Depends(get_db)):
     estate, _access = _staff(db, request, estate_id)
     if channel not in ALL_CHANNELS or style not in STYLES:
         raise HTTPException(422, "Unknown channel or design")
     if not (estate.public_enabled and estate.public_slug):
         raise HTTPException(409, "Publish this estate's public page first.")
     campaign = _campaign_for_staff(db, estate, campaign_id)
-    source = campaign.code if campaign else None
+    source = campaign.code if campaign else (source[:120] if source else None)
     name = estate.name
     db.commit()
     try:
@@ -190,11 +212,37 @@ def public_social_image(token: str, db: Session = Depends(get_db)):
 
 
 # ── Posts ────────────────────────────────────────────────────────────────────────────────────
+SCOPE_STATUSES = {
+    "upcoming": ("scheduled", "publishing"),
+    "posted": ("published", "partial"),
+    "attention": ("failed", "partial", "skipped"),
+    "drafts": ("draft",),
+    "cancelled": ("cancelled",),
+}
+
+
 @router.get("/{estate_id}/marketing/social/posts")
-def list_posts(estate_id: int, request: Request, db: Session = Depends(get_db)):
+def list_posts(estate_id: int, request: Request, scope: str = "all", plan_id: int | None = None, limit: int = 100, offset: int = 0, db: Session = Depends(get_db)):
+    """Every post for the estate. `scope` narrows it (upcoming, posted, attention, drafts, cancelled); the
+    counts always describe the whole estate so tabs can show their totals."""
     estate, _access = _staff(db, request, estate_id)
-    rows = db.query(EstateSocialPost).filter(EstateSocialPost.estate_id == estate.id).order_by(EstateSocialPost.created_at.desc()).limit(50).all()
-    return {"items": [_post_payload(row) for row in rows]}
+    base = db.query(EstateSocialPost).filter(EstateSocialPost.estate_id == estate.id)
+    if plan_id:
+        base = base.filter(EstateSocialPost.plan_id == plan_id)
+    by_status = dict(base.with_entities(EstateSocialPost.status, func.count(EstateSocialPost.id)).group_by(EstateSocialPost.status).all())
+    counts = {name: sum(int(by_status.get(status, 0)) for status in statuses) for name, statuses in SCOPE_STATUSES.items()}
+    counts["all"] = sum(int(value) for value in by_status.values())
+    query = base
+    if scope in SCOPE_STATUSES:
+        query = query.filter(EstateSocialPost.status.in_(SCOPE_STATUSES[scope]))
+    moment = func.coalesce(EstateSocialPost.scheduled_at, EstateSocialPost.created_at)
+    query = query.order_by(moment.asc() if scope == "upcoming" else moment.desc(), EstateSocialPost.id.asc())
+    rows = query.offset(max(offset, 0)).limit(min(max(limit, 1), 200)).all()
+    plan_ids = {row.plan_id for row in rows if row.plan_id}
+    plan_names = {plan.id: plan.name for plan in db.query(EstateSocialPlan).filter(EstateSocialPlan.id.in_(plan_ids or {-1})).all()}
+    items = [{**_post_payload(row), "source_code": row.source_code, "plan_name": plan_names.get(row.plan_id)} for row in rows]
+    plans = db.query(EstateSocialPlan).filter(EstateSocialPlan.estate_id == estate.id).order_by(EstateSocialPlan.created_at.desc()).limit(30).all()
+    return {"items": items, "counts": counts, "plans": [{"id": plan.id, "name": plan.name, "status": plan.status} for plan in plans]}
 
 
 @router.post("/{estate_id}/marketing/social/posts", status_code=201)
@@ -234,14 +282,19 @@ def create_post(estate_id: int, payload: PostCreate, request: Request, db: Sessi
 @router.patch("/marketing/social/posts/{post_id}")
 def update_post(post_id: int, payload: PostUpdate, request: Request, db: Session = Depends(get_db)):
     post, estate, access = _post_for_staff(db, request, post_id)
-    if post.status not in EDITABLE:
+    revive = post.status in ("skipped", "cancelled") and payload.scheduled_at is not None and not payload.cancel
+    if post.status not in EDITABLE and not revive:
         raise HTTPException(409, "This post has already been sent or is being sent")
+    if revive:  # a skipped or cancelled post given a new time is a fresh scheduled post
+        post.results = {}
+        post.reminder_sent_at = None
     if payload.cancel:
         post.status = "cancelled"
         post.scheduled_at = None
     else:
         if payload.caption is not None:
             post.caption = payload.caption.strip()
+            post.auto_caption = False  # the company's own words are kept exactly as written
         if payload.image_style is not None:
             if payload.image_style not in STYLES:
                 raise HTTPException(422, "Choose the promo or classic design")
@@ -281,6 +334,108 @@ def mark_posted(post_id: int, payload: MarkPosted, request: Request, db: Session
     except ValueError as exc:
         raise HTTPException(422, str(exc)) from exc
     return _post_payload(post)
+
+
+@router.post("/marketing/social/posts/{post_id}/rewrite")
+def rewrite_post(post_id: int, request: Request, db: Session = Depends(get_db)):
+    """Swap in another wording of the same post, written from today's plot data."""
+    post, _estate, _access = _post_for_staff(db, request, post_id)
+    if post.status not in EDITABLE:
+        raise HTTPException(409, "This post has already been sent or is being sent")
+    if not social_planner.rewrite_post(db, post):
+        raise HTTPException(409, "There is no other wording for this post. Edit the caption yourself instead.")
+    db.commit()
+    return _post_payload(post)
+
+
+# ── Content plans (auto-written, auto-scheduled posts) ───────────────────────────────────────
+def _plan_payload(db: Session, plan: EstateSocialPlan) -> dict:
+    counts = dict(db.query(EstateSocialPost.status, func.count(EstateSocialPost.id)).filter(EstateSocialPost.plan_id == plan.id).group_by(EstateSocialPost.status).all())
+    nxt = db.query(func.min(EstateSocialPost.scheduled_at)).filter(EstateSocialPost.plan_id == plan.id, EstateSocialPost.status == "scheduled", EstateSocialPost.scheduled_at > datetime.now(timezone.utc)).scalar()
+    return {
+        "id": plan.id, "name": plan.name, "status": plan.status, "per_day": plan.per_day, "per_week": plan.per_week, "times": list(plan.times or []),
+        "channels": list(plan.channels or []), "style": plan.style, "tone": plan.tone, "duration_days": plan.duration_days, "auto_renew": plan.auto_renew,
+        "counts": {key: int(value) for key, value in counts.items()}, "next_post_at": nxt, "created_at": plan.created_at,
+    }
+
+
+def _plan_context(db: Session, estate: Estate, campaign_id: int | None):
+    if not (estate.public_enabled and estate.public_slug):
+        raise HTTPException(409, "Publish this estate's public page first - posts link to it.")
+    campaign = _campaign_for_staff(db, estate, campaign_id)
+    return marketing_render.build_context(db, estate, source=campaign.code if campaign else None), (campaign.code if campaign else None)
+
+
+def _preview_item(item: dict) -> dict:
+    return {"scheduled_at": item["scheduled_at"], "template_key": item["template_key"], "label": item["label"], "strategy": item["strategy"], "caption": item["caption"], "image_style": item["image_style"], "plot_id": item["plot_id"]}
+
+
+@router.post("/{estate_id}/marketing/social/plans/preview")
+def preview_plan(estate_id: int, payload: PlanCreate, request: Request, db: Session = Depends(get_db)):
+    estate, _access = _staff(db, request, estate_id, permission=WRITE)
+    ctx, _source = _plan_context(db, estate, payload.campaign_id)
+    _check_channels(payload.channels)
+    try:
+        items = social_planner.build_preview(db, ctx, days=payload.days, per_day=payload.per_day, per_week=payload.per_week, times=payload.times, tone=payload.tone, style=payload.style, start=payload.start_date)
+    except social_planner.PlanError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    db.commit()
+    return {"items": [_preview_item(item) for item in items], "count": len(items)}
+
+
+@router.post("/{estate_id}/marketing/social/plans", status_code=201)
+def create_plan(estate_id: int, payload: PlanCreate, request: Request, db: Session = Depends(get_db)):
+    estate, access = _staff(db, request, estate_id, permission=WRITE)
+    ctx, source = _plan_context(db, estate, payload.campaign_id)
+    channels = _check_channels(payload.channels)
+    _require_automatic_accounts(db, estate.organization_id, channels)
+    try:
+        plan, posts = social_planner.create_plan(
+            db, estate, ctx, name=payload.name, days=payload.days, per_day=payload.per_day, per_week=payload.per_week, times=payload.times, channels=channels, tone=payload.tone,
+            style=payload.style, start=payload.start_date, auto_renew=payload.auto_renew, approve=payload.approve, source_code=source,
+            subject_type=access.principal.subject_type, subject_id=str(access.principal.subject_id),
+        )
+    except social_planner.PlanError as exc:
+        db.rollback()
+        raise HTTPException(422, str(exc)) from exc
+    append_estate_audit_event(db, organization_id=estate.organization_id, actor=access.principal, action="social_plan.created", entity_type="estate_social_plan", entity_id=plan.id, after_data={"posts": len(posts), "channels": channels, "auto_renew": plan.auto_renew, "approved": payload.approve})
+    db.commit()
+    return {**_plan_payload(db, plan), "created_posts": len(posts)}
+
+
+@router.get("/{estate_id}/marketing/social/plans")
+def list_plans(estate_id: int, request: Request, db: Session = Depends(get_db)):
+    estate, _access = _staff(db, request, estate_id)
+    plans = db.query(EstateSocialPlan).filter(EstateSocialPlan.estate_id == estate.id, EstateSocialPlan.status.in_(("active", "paused"))).order_by(EstateSocialPlan.created_at.desc()).limit(20).all()
+    return {"items": [_plan_payload(db, plan) for plan in plans]}
+
+
+@router.patch("/marketing/social/plans/{plan_id}")
+def update_plan(plan_id: int, payload: PlanUpdate, request: Request, db: Session = Depends(get_db)):
+    plan = db.get(EstateSocialPlan, plan_id)
+    if plan is None:
+        raise HTTPException(404, "Plan not found")
+    access = require_estate_access(db, request, plan.organization_id, permission=WRITE)
+    if payload.auto_renew is not None:
+        plan.auto_renew = payload.auto_renew
+    action = payload.action
+    if action == "pause":
+        plan.status = "paused"
+    elif action == "resume":
+        _require_automatic_accounts(db, plan.organization_id, list(plan.channels or []))
+        plan.status = "active"
+        social_planner.reslot_overdue(db, plan)
+    elif action == "stop":
+        plan.status = "ended"
+        db.query(EstateSocialPost).filter(EstateSocialPost.plan_id == plan.id, EstateSocialPost.status.in_(("scheduled", "draft"))).update({"status": "cancelled", "scheduled_at": None}, synchronize_session=False)
+    elif action == "approve":
+        _require_automatic_accounts(db, plan.organization_id, list(plan.channels or []))
+        social_planner.approve_plan(db, plan)
+    elif action is not None:
+        raise HTTPException(422, "Unknown action")
+    append_estate_audit_event(db, organization_id=plan.organization_id, actor=access.principal, action=f"social_plan.{action or 'updated'}", entity_type="estate_social_plan", entity_id=plan.id, after_data={"status": plan.status, "auto_renew": plan.auto_renew})
+    db.commit()
+    return _plan_payload(db, plan)
 
 
 # ── Facebook / Instagram connection ──────────────────────────────────────────────────────────
@@ -355,6 +510,14 @@ def _forget_facebook_user(db: Session, facebook_user_id: str) -> int:
         db.delete(row)
     db.commit()
     return len(rows)
+
+
+@router.get("/marketing/social/meta/deauthorize", include_in_schema=False)
+@router.get("/marketing/social/meta/data-deletion", include_in_schema=False)
+def meta_callbacks_for_people():
+    """These addresses receive POST requests from Meta. A person opening one in a browser gets the
+    plain-language deletion instructions instead of an error."""
+    return RedirectResponse(f"{web_url()}/data-deletion", status_code=302)
 
 
 @router.post("/marketing/social/meta/deauthorize")
