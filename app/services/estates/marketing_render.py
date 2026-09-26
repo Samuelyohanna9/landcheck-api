@@ -237,6 +237,7 @@ def build_context(db: Session, estate: Estate, *, source: str | None = None) -> 
 # ── Small render cache ───────────────────────────────────────────────────────────────────────
 _CACHE: dict[Any, tuple[float, bytes]] = {}
 _CACHE_LOCK = threading.Lock()
+_RENDER_SLOTS = threading.BoundedSemaphore(4)
 
 
 def cached_render(key: Any, ttl_seconds: int, builder: Callable[[], bytes]) -> bytes:
@@ -245,7 +246,14 @@ def cached_render(key: Any, ttl_seconds: int, builder: Callable[[], bytes]) -> b
         hit = _CACHE.get(key)
         if hit and now - hit[0] < ttl_seconds:
             return hit[1]
-    data = builder()
+    # Bound concurrent renders: each is CPU heavy and may wait on a satellite fetch, and unbounded
+    # parallel previews would starve every other request of worker threads.
+    with _RENDER_SLOTS:
+        with _CACHE_LOCK:
+            hit = _CACHE.get(key)
+            if hit and time.monotonic() - hit[0] < ttl_seconds:
+                return hit[1]
+        data = builder()
     with _CACHE_LOCK:
         if len(_CACHE) > 200:
             for stale in [item for item, value in _CACHE.items() if now - value[0] > ttl_seconds]:

@@ -130,7 +130,13 @@ def resolve_session(db: Session, request: Request, *, touch: bool = True) -> Est
         or int(account.organization_id) != int(session.organization_id)
     ):
         return None
-    if touch:
+    # Only refresh last_seen_at when it is stale. Writing it on every request made all concurrent
+    # requests from one user queue on the same row lock (each holding a pooled connection while it
+    # waited, and the holder kept the lock until its request finished), which exhausted the pool.
+    last_seen = session.last_seen_at
+    if last_seen is not None and getattr(last_seen, "tzinfo", None) is not None:
+        last_seen = last_seen.replace(tzinfo=None)
+    if touch and (last_seen is None or (now - last_seen).total_seconds() > 60):
         session.last_seen_at = now
         db.flush()
     result = EstateSessionContext(

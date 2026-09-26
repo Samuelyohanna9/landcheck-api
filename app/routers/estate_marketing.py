@@ -158,12 +158,23 @@ def _ctx_plot(ctx, plot_id: int) -> EstatePlot:
     return plot
 
 
+def _release_db(db: Session) -> None:
+    """Hand the database connection back before slow rendering (satellite fetches, PDF/image
+    composition take seconds). Loaded objects are detached first, so they stay readable but nothing
+    reloads lazily; holding a connection through a render is what exhausted the pool when several
+    previews were requested at once."""
+    db.expunge_all()
+    db.commit()
+
+
 def _build_ctx(db: Session, estate: Estate, source: str | None):
     _require_published(estate)
     try:
-        return marketing_render.build_context(db, estate, source=source)
+        ctx = marketing_render.build_context(db, estate, source=source)
     except Exception as exc:
         raise HTTPException(409, "Marketing material could not be prepared for this estate") from exc
+    _release_db(db)
+    return ctx
 
 
 # ═════════════════════════════════════════════════════════════════════════════════════════════
@@ -1009,7 +1020,9 @@ def _agent_ctx(db: Session, member: EstateOrganizationMember, estate: Estate):
     _require_published(estate)
     campaign = ensure_agent_campaign(db, estate=estate, member=member)
     db.flush()
-    return marketing_render.build_context(db, estate, source=campaign.code), campaign
+    ctx = marketing_render.build_context(db, estate, source=campaign.code)
+    _release_db(db)
+    return ctx, campaign
 
 
 @router.get("/agent-portal/{token}/kit")

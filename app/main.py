@@ -2,6 +2,7 @@
 import os
 from time import perf_counter
 
+from starlette.concurrency import run_in_threadpool
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware  # Added for speed
@@ -408,15 +409,28 @@ app.add_middleware(
 )
 
 
-@app.middleware("http")
-async def capture_system_activity(request: Request, call_next):
-    started_at = perf_counter()
+def _resolve_request_session_sync(request: Request) -> None:
+    """Look the bearer token up on a short-lived session and give the connection straight back."""
     session_db = SessionLocal()
     try:
         try:
             resolve_request_session(session_db, request)
         except Exception:
             session_db.rollback()
+    finally:
+        try:
+            session_db.close()
+        except Exception:
+            pass
+
+
+@app.middleware("http")
+async def capture_system_activity(request: Request, call_next):
+    started_at = perf_counter()
+    try:
+        # Sync database work must never run on the event loop: when the pool is busy it blocks
+        # until a connection frees up, and with the loop blocked nothing can finish and release one.
+        await run_in_threadpool(_resolve_request_session_sync, request)
         if _requires_super_admin_session(request):
             session = getattr(request.state, "landcheck_session", None)
             if session is None:
@@ -427,21 +441,16 @@ async def capture_system_activity(request: Request, call_next):
     except HTTPException as exc:
         duration_ms = (perf_counter() - started_at) * 1000
         if _should_log_request_activity(request, status_code=exc.status_code, duration_ms=duration_ms):
-            log_request_activity(request, status_code=exc.status_code, duration_ms=duration_ms, error_message=str(exc.detail))
+            await run_in_threadpool(log_request_activity, request, status_code=exc.status_code, duration_ms=duration_ms, error_message=str(exc.detail))
         return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
     except Exception as exc:
         duration_ms = (perf_counter() - started_at) * 1000
         if _should_log_request_activity(request, status_code=500, duration_ms=duration_ms):
-            log_request_activity(request, status_code=500, duration_ms=duration_ms, error_message=str(exc))
+            await run_in_threadpool(log_request_activity, request, status_code=500, duration_ms=duration_ms, error_message=str(exc))
         raise
-    finally:
-        try:
-            session_db.close()
-        except Exception:
-            pass
     duration_ms = (perf_counter() - started_at) * 1000
     if _should_log_request_activity(request, status_code=response.status_code, duration_ms=duration_ms):
-        log_request_activity(request, status_code=response.status_code, duration_ms=duration_ms)
+        await run_in_threadpool(log_request_activity, request, status_code=response.status_code, duration_ms=duration_ms)
     return response
 
 
