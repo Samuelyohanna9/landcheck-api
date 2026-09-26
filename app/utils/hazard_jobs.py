@@ -122,7 +122,29 @@ def get_hazard_job(db: Session, job_id: str) -> Optional[Dict[str, Any]]:
                started_at, completed_at, created_at, updated_at
         FROM hazard_analysis_jobs WHERE id = :job_id LIMIT 1
     """), {"job_id": str(job_id)}).mappings().first()
+    if row and row["hazard_type"] == "estate_all" and row["status"] in ("queued", "running"):
+        # These jobs send a heartbeat while they run. If it goes quiet the worker running the job
+        # died (restart, out of memory) and nothing will ever finish it - fail it now so the user
+        # gets an answer instead of an endless "running".
+        stale_after = _env_workers("HAZARD_JOB_STALE_SECONDS", 120)
+        expired = db.execute(text("""
+            UPDATE hazard_analysis_jobs
+            SET status = 'failed', stage = 'Failed', completed_at = NOW(), updated_at = NOW(),
+                error_text = 'The analysis was interrupted because the server restarted or ran out of memory. Please run it again.'
+            WHERE id = :job_id
+              AND ((status = 'running' AND updated_at < NOW() - make_interval(secs => :secs))
+                   OR (status = 'queued' AND updated_at < NOW() - make_interval(secs => :queued_secs)))
+        """), {"job_id": str(job_id), "secs": stale_after, "queued_secs": max(stale_after * 8, 900)}).rowcount
+        db.commit()
+        if expired:
+            return get_hazard_job(db, job_id)
     return dict(row) if row else None
+
+
+def touch_hazard_job(db: Session, job_id: str) -> None:
+    """Heartbeat: shows the worker is still alive during a long stretch with no progress change."""
+    db.execute(text("UPDATE hazard_analysis_jobs SET updated_at = NOW() WHERE id = :job_id AND status = 'running'"), {"job_id": str(job_id)})
+    db.commit()
 
 
 def get_hazard_job_file(db: Session, job_id: str) -> Optional[Dict[str, Any]]:

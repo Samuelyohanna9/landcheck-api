@@ -61,7 +61,7 @@ def max_rss_default_mb() -> int:
         return 1400
 
 
-def run_isolated(func: Callable[..., Any], *args: Any, max_rss_mb: int | None = None, timeout_s: float = 600, **kwargs: Any) -> Any:
+def run_isolated(func: Callable[..., Any], *args: Any, max_rss_mb: int | None = None, timeout_s: float = 600, heartbeat: Callable[[], None] | None = None, **kwargs: Any) -> Any:
     """`func` must be importable at module level (it is pickled into the child)."""
     limit = max_rss_mb or max_rss_default_mb()
     ctx = multiprocessing.get_context("spawn")
@@ -81,12 +81,19 @@ def run_isolated(func: Callable[..., Any], *args: Any, max_rss_mb: int | None = 
     reader = threading.Thread(target=receive, daemon=True)
     reader.start()
     started = time.monotonic()
+    last_beat = started
     peak = 0.0
     try:
         while reader.is_alive():
             reader.join(0.4)
             if not reader.is_alive():
                 break
+            if heartbeat is not None and time.monotonic() - last_beat >= 20:
+                last_beat = time.monotonic()
+                try:
+                    heartbeat()
+                except Exception:
+                    pass
             rss = _rss_mb(process.pid)
             if rss is not None:
                 peak = max(peak, rss)

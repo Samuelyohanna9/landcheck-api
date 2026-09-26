@@ -61,7 +61,7 @@ from app.services.estates.report_export import render_customer_statement_pdf, re
 from app.services.estates import commissions
 from app.services.estates.operations import DOCUMENT_REQUIREMENTS, ESTATE_DOCUMENT_TYPES, ESTATE_DOCUMENT_TYPE_CODES, PUBLIC_DOCUMENT_TYPES, advance_payment_schedule_after_payment, build_operations_summary, buyer_portal_payload, customer_portal_url, document_readiness, hash_portal_token, issue_agent_portal_token, issue_customer_portal_link, issue_customer_portal_token, linked_documents, record_notification_log
 from app.db import SessionLocal
-from app.utils.hazard_jobs import get_hazard_job, insert_hazard_job, make_progress_reporter, serialize_hazard_job, set_hazard_job_status, find_active_hazard_job
+from app.utils.hazard_jobs import get_hazard_job, insert_hazard_job, make_progress_reporter, serialize_hazard_job, set_hazard_job_status, find_active_hazard_job, touch_hazard_job
 
 
 logger = logging.getLogger(__name__)
@@ -2496,7 +2496,7 @@ def estate_quality_check(estate_id:int, request:Request, db:Session=Depends(get_
             issues.append({"severity":"error","plot_id":plot_id,"related_plot_id":other_id,"code":"overlap","message":f"Overlaps plot {other.plot_number}"})
     return {"estate_id":estate_id,"plot_count":len(plots),"issues":issues,"review_required":any(item["severity"]=="error" for item in issues)}
 
-def _calculate_plot_hazards(geometry, db: Session | None) -> dict:
+def _calculate_plot_hazards(geometry, db: Session | None, heartbeat=None) -> dict:
     """`geometry` is a stored plot geometry or an already-converted GeoJSON boundary. With no `db`
     a short-lived session is used, so a connection is only taken if the analysis actually queries."""
     from app.routers.hazards import erosion_preview, flood_preview
@@ -2510,7 +2510,7 @@ def _calculate_plot_hazards(geometry, db: Session | None) -> dict:
     from app.utils.isolated_run import IsolatedMemoryLimit, IsolatedRunError, run_isolated
 
     try:
-        return run_isolated(screen_boundary, boundary)
+        return run_isolated(screen_boundary, boundary, heartbeat=heartbeat)
     except IsolatedMemoryLimit as exc:
         raise HTTPException(status_code=422, detail="This area is too large to screen in one pass. Try a smaller boundary or screen individual plots.") from exc
     except IsolatedRunError as exc:
@@ -2639,7 +2639,7 @@ def _run_estate_hazard_assessment_job(job_id: str) -> None:
         db.commit()  # nothing below needs the transaction open while Earth Engine answers
 
         set_hazard_job_status(db, job_id, status="running", stage="Screening flood and erosion risk for the Estate...", progress_pct=15)
-        results = _calculate_plot_hazards(boundary, None)
+        results = _calculate_plot_hazards(boundary, None, heartbeat=lambda: touch_hazard_job(db, job_id))
 
         set_hazard_job_status(db, job_id, status="running", stage="Saving results...", progress_pct=90)
         estate = db.get(Estate, estate_id)
@@ -4262,14 +4262,14 @@ def organization_financial_summary(request:Request, db:Session=Depends(get_db)):
     principal=resolve_estate_principal(db,request); access=list_estate_access(db,principal); result=[]
     for item in access:
         allocations=db.query(EstateAllocation).filter(EstateAllocation.organization_id==item.organization_id).all()
-        summaries=[financial_summary(db,a) for a in allocations]
+        summaries=[SimpleNamespace(**values) for values in _bulk_financial_summaries(db, allocations).values()]
         result.append({"organization_id":item.organization_id,"contracted_sales_value":str(sum((s.agreed_price for s in summaries),0)),"confirmed_collections":str(sum((s.confirmed_paid for s in summaries),0)),"pending_collections":str(sum((s.pending_paid for s in summaries),0)),"outstanding_balance":str(sum((s.outstanding for s in summaries),0)),"fully_paid_allocations":sum(1 for s in summaries if s.agreed_price>0 and s.outstanding==0)})
     return result
 
 @router.get("/payments")
 def list_payments(request: Request, page: int = 1, page_size: int = 25, search: str | None = None, status: str | None = None, estate_id: int | None = None, customer_id: int | None = None, method: str | None = None, date_from: str | None = None, date_to: str | None = None, db: Session = Depends(get_db)):
     principal=resolve_estate_principal(db,request); memberships={a.organization_id:a for a in list_estate_access(db,principal)}; allowed=set(memberships)
-    query=db.query(EstatePayment,EstateCustomer,Estate,EstatePlot).join(EstateCustomer,EstateCustomer.id==EstatePayment.customer_id).join(EstatePlot,EstatePlot.id==EstatePayment.plot_id).join(Estate,Estate.id==EstatePlot.estate_id).filter(EstatePayment.organization_id.in_(allowed))
+    query=db.query(EstatePayment,EstateCustomer.id,EstateCustomer.full_name,Estate.id,Estate.name,EstatePlot.id,EstatePlot.plot_number).join(EstateCustomer,EstateCustomer.id==EstatePayment.customer_id).join(EstatePlot,EstatePlot.id==EstatePayment.plot_id).join(Estate,Estate.id==EstatePlot.estate_id).filter(EstatePayment.organization_id.in_(allowed))
     if estate_id: query=query.filter(Estate.id==estate_id)
     if customer_id: query=query.filter(EstateCustomer.id==customer_id)
     if status: query=query.filter(EstatePayment.status==status)
@@ -4279,6 +4279,7 @@ def list_payments(request: Request, page: int = 1, page_size: int = 25, search: 
     if search:
         term=f"%{search.strip()}%"; query=query.filter((EstateCustomer.full_name.ilike(term)) | (EstatePlot.plot_number.ilike(term)) | (EstatePayment.reference_no.ilike(term)))
     total=query.count(); rows=query.order_by(EstatePayment.payment_date.desc()).offset(max(page-1,0)*min(max(page_size,1),100)).limit(min(max(page_size,1),100)).all()
+    rows=[(p,SimpleNamespace(id=customer_pk,full_name=customer_name),SimpleNamespace(id=estate_pk,name=estate_name),SimpleNamespace(id=plot_pk,plot_number=plot_number)) for p,customer_pk,customer_name,estate_pk,estate_name,plot_pk,plot_number in rows]
     return {"page":page,"page_size":min(max(page_size,1),100),"total":total,"items":[{"id":p.id,"date":p.payment_date,"amount":str(p.amount),"currency":p.currency,"status":p.status,"method":p.payment_method,"reference":p.reference_no,"receipt_number":p.receipt_number,"customer":{"id":c.id,"name":c.full_name},"estate":{"id":e.id,"name":e.name},"plot":{"id":plot.id,"number":plot.plot_number},"allocation_id":p.allocation_id,"recorded_by":p.recorded_by_subject_id,"confirmed_by":p.confirmed_by_subject_id,"can_confirm":has_permission(memberships[p.organization_id].role_key,"payment.manage") and p.status in {"recorded","pending_confirmation"},"can_void":has_permission(memberships[p.organization_id].role_key,"payment.manage") and p.status not in {"voided","reversed"},"can_view_receipt":has_permission(memberships[p.organization_id].role_key,"document.read")} for p,c,e,plot in rows]}
 
 @router.post("/payment-inbox", status_code=201)
@@ -4384,22 +4385,29 @@ def list_documents(request:Request,page:int=1,page_size:int=25,document_type:str
 @router.get("/selectors")
 def estate_selectors(request:Request, estate_id:int|None=None, customer_id:int|None=None, plot_id:int|None=None, status:str|None=None, db:Session=Depends(get_db)):
     principal=resolve_estate_principal(db,request); access=list_estate_access(db,principal); allowed={a.organization_id for a in access}
-    estates=db.query(Estate).filter(Estate.organization_id.in_(allowed),Estate.archived_at.is_(None)).all()
-    customers=db.query(EstateCustomer).filter(EstateCustomer.organization_id.in_(allowed)).all()
-    plots=db.query(EstatePlot,Estate).join(Estate,Estate.id==EstatePlot.estate_id).filter(Estate.organization_id.in_(allowed))
+    # Column selects on purpose: joining whole Estate/EstatePlot entities sends the estate boundary
+    # and every plot geometry once per row - for a company with thousands of plots/allocations that
+    # was gigabytes per request and got the API worker killed for running out of memory.
+    estates=db.query(Estate.id,Estate.name).filter(Estate.organization_id.in_(allowed),Estate.archived_at.is_(None)).all()
+    customers=db.query(EstateCustomer.id,EstateCustomer.full_name,EstateCustomer.reference_no).filter(EstateCustomer.organization_id.in_(allowed)).all()
+    plots=db.query(EstatePlot.id,EstatePlot.plot_number,EstatePlot.estate_id,Estate.name,EstatePlot.commercial_status,EstatePlot.development_status,EstatePlot.geometry_status,EstatePlot.block_id,EstatePlot.area_sqm).join(Estate,Estate.id==EstatePlot.estate_id).filter(Estate.organization_id.in_(allowed))
     if estate_id: plots=plots.filter(EstatePlot.estate_id==estate_id)
     plots=plots.all()
-    allocations=db.query(EstateAllocation,Estate,EstatePlot,EstateCustomer).join(Estate,Estate.id==EstateAllocation.estate_id).join(EstatePlot,EstatePlot.id==EstateAllocation.plot_id).join(EstateCustomer,EstateCustomer.id==EstateAllocation.customer_id).filter(EstateAllocation.organization_id.in_(allowed))
+    allocations=db.query(EstateAllocation,Estate.id,Estate.name,EstatePlot.id,EstatePlot.plot_number,EstateCustomer.id,EstateCustomer.full_name).join(Estate,Estate.id==EstateAllocation.estate_id).join(EstatePlot,EstatePlot.id==EstateAllocation.plot_id).join(EstateCustomer,EstateCustomer.id==EstateAllocation.customer_id).filter(EstateAllocation.organization_id.in_(allowed))
     if estate_id: allocations=allocations.filter(EstateAllocation.estate_id==estate_id)
     if customer_id: allocations=allocations.filter(EstateAllocation.customer_id==customer_id)
     if plot_id: allocations=allocations.filter(EstateAllocation.plot_id==plot_id)
     if status: allocations=allocations.filter(EstateAllocation.status==status)
     allocation_rows = allocations.all()
-    financials = _bulk_financial_summaries(db, [allocation for allocation, _, _, _ in allocation_rows])
+    financials = _bulk_financial_summaries(db, [row[0] for row in allocation_rows])
+    attribution_cache={}
     allocation_items=[]
-    for allocation,estate,plot,customer in allocation_rows:
-        summary=financials[allocation.id]; allocation_items.append({"id":allocation.id,"estate_id":estate.id,"estate_name":estate.name,"plot_id":plot.id,"plot_number":plot.plot_number,"customer_id":customer.id,"customer_name":customer.full_name,"status":allocation.status,"allocation_date":allocation.allocation_date,"payment_plan":allocation.payment_plan,"lead_source_code":allocation.lead_source_code,"lead_source_channel":allocation.lead_source_channel,"attribution":_allocation_attribution(db, allocation),"agreed_price":str(summary["agreed_price"]),"currency":"NGN","confirmed":str(summary["confirmed_paid"]),"pending":str(summary["pending_paid"]),"outstanding":str(summary["outstanding"])})
-    return {"estates":[{"id":e.id,"name":e.name} for e in estates],"customers":[{"id":c.id,"name":c.full_name,"reference":c.reference_no} for c in customers],"plots":[{"id":p.id,"plot_number":p.plot_number,"estate_id":e.id,"estate_name":e.name,"commercial_status":p.commercial_status,"development_status":p.development_status,"geometry_status":p.geometry_status,"block_id":p.block_id,"area_sqm":float(p.area_sqm) if p.area_sqm is not None else 0.0} for p,e in plots],"allocations":allocation_items}
+    for allocation,estate_pk,estate_name,plot_pk,plot_number,customer_pk,customer_name in allocation_rows:
+        summary=financials[allocation.id]
+        attribution_key=(allocation.organization_id,allocation.estate_id,allocation.sales_agent_subject_type,allocation.sales_agent_subject_id,allocation.lead_source_code)
+        if attribution_key not in attribution_cache: attribution_cache[attribution_key]=_allocation_attribution(db, allocation)
+        allocation_items.append({"id":allocation.id,"estate_id":estate_pk,"estate_name":estate_name,"plot_id":plot_pk,"plot_number":plot_number,"customer_id":customer_pk,"customer_name":customer_name,"status":allocation.status,"allocation_date":allocation.allocation_date,"payment_plan":allocation.payment_plan,"lead_source_code":allocation.lead_source_code,"lead_source_channel":allocation.lead_source_channel,"attribution":attribution_cache[attribution_key],"agreed_price":str(summary["agreed_price"]),"currency":"NGN","confirmed":str(summary["confirmed_paid"]),"pending":str(summary["pending_paid"]),"outstanding":str(summary["outstanding"])})
+    return {"estates":[{"id":e.id,"name":e.name} for e in estates],"customers":[{"id":c.id,"name":c.full_name,"reference":c.reference_no} for c in customers],"plots":[{"id":p.id,"plot_number":p.plot_number,"estate_id":p.estate_id,"estate_name":p.name,"commercial_status":p.commercial_status,"development_status":p.development_status,"geometry_status":p.geometry_status,"block_id":p.block_id,"area_sqm":float(p.area_sqm) if p.area_sqm is not None else 0.0} for p in plots],"allocations":allocation_items}
 
 
 @router.get("/{estate_id}/operations-summary")
