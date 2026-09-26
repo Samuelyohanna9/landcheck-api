@@ -24,8 +24,20 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+# Server-side safety nets so one stuck request can never hold the whole pool hostage:
+# - lock_timeout: a statement waiting on another transaction's lock gives up (and the request
+#   fails fast) instead of queueing while holding a pooled connection;
+# - idle_in_transaction_session_timeout: a connection whose owner went quiet inside an open
+#   transaction is closed by Postgres, releasing its locks.
+_connect_args = {}
+if str(DATABASE_URL or "").startswith(("postgresql", "postgres")):
+    _lock_ms = max(_env_int("DB_LOCK_TIMEOUT_MS", 20000), 0)
+    _idle_tx_ms = max(_env_int("DB_IDLE_TX_TIMEOUT_MS", 300000), 0)
+    _connect_args["options"] = f"-c lock_timeout={_lock_ms} -c idle_in_transaction_session_timeout={_idle_tx_ms}"
+
 engine = create_engine(
     DATABASE_URL,
+    connect_args=_connect_args,
     echo=_env_bool("SQLALCHEMY_ECHO", False),
     pool_pre_ping=_env_bool("SQLALCHEMY_POOL_PRE_PING", True),
     pool_recycle=max(_env_int("SQLALCHEMY_POOL_RECYCLE", 1800), 60),

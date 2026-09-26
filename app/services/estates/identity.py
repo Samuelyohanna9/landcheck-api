@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
 from fastapi import Request
+from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from app.models.estate_auth import EstateAccount, EstateAuthSession
@@ -130,15 +131,18 @@ def resolve_session(db: Session, request: Request, *, touch: bool = True) -> Est
         or int(account.organization_id) != int(session.organization_id)
     ):
         return None
-    # Only refresh last_seen_at when it is stale. Writing it on every request made all concurrent
-    # requests from one user queue on the same row lock (each holding a pooled connection while it
-    # waited, and the holder kept the lock until its request finished), which exhausted the pool.
-    last_seen = session.last_seen_at
-    if last_seen is not None and getattr(last_seen, "tzinfo", None) is not None:
-        last_seen = last_seen.replace(tzinfo=None)
-    if touch and (last_seen is None or (now - last_seen).total_seconds() > 60):
-        session.last_seen_at = now
-        db.flush()
+    # Only refresh last_seen_at when it is stale, and never wait for it: the row lock this takes is
+    # held until the request ends, so concurrent requests from one user used to queue behind each
+    # other (each holding a pooled connection). SKIP LOCKED makes everyone but the first skip it.
+    if touch:
+        db.execute(
+            text(
+                "UPDATE estate_auth_sessions SET last_seen_at = :now WHERE id IN ("
+                "SELECT id FROM estate_auth_sessions WHERE id = :id "
+                "AND (last_seen_at IS NULL OR last_seen_at < :cutoff) FOR UPDATE SKIP LOCKED)"
+            ),
+            {"now": now, "id": session.id, "cutoff": now - timedelta(seconds=60)},
+        )
     result = EstateSessionContext(
         session_uid=session.session_uid,
         account_id=int(account.id),
