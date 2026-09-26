@@ -26,7 +26,7 @@ def _env_workers(name: str, default: int) -> int:
 # API. Two bounded lanes instead: quick single-site analyses never wait behind Estate-wide runs,
 # and Estate-wide runs take turns.
 _BULK_JOB_TYPES = {"estate_all", "estate_development_forecast"}
-_INTERACTIVE_LANE = ThreadPoolExecutor(max_workers=_env_workers("HAZARD_JOB_WORKERS", 4), thread_name_prefix="hazard-job")
+_INTERACTIVE_LANE = ThreadPoolExecutor(max_workers=_env_workers("HAZARD_JOB_WORKERS", 2), thread_name_prefix="hazard-job")
 _BULK_LANE = ThreadPoolExecutor(max_workers=_env_workers("HAZARD_BULK_WORKERS", 1), thread_name_prefix="hazard-bulk")
 
 _HAZARD_JOBS_TABLE_LOCK = threading.Lock()

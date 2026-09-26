@@ -13,6 +13,7 @@ import json
 import math
 import os
 import re
+import gc
 import threading
 import time
 from dataclasses import dataclass, field
@@ -237,10 +238,13 @@ def build_context(db: Session, estate: Estate, *, source: str | None = None) -> 
 # ── Small render cache ───────────────────────────────────────────────────────────────────────
 _CACHE: dict[Any, tuple[float, bytes]] = {}
 _CACHE_LOCK = threading.Lock()
-_RENDER_SLOTS = threading.BoundedSemaphore(4)
+# Memory is the constraint, not CPU: a print-resolution page needs a few hundred MB while it renders,
+# so those run one at a time and everything else two at a time.
+_RENDER_SLOTS = threading.BoundedSemaphore(2)
+_HEAVY_SLOTS = threading.BoundedSemaphore(1)
 
 
-def cached_render(key: Any, ttl_seconds: int, builder: Callable[[], bytes]) -> bytes:
+def cached_render(key: Any, ttl_seconds: int, builder: Callable[[], bytes], *, heavy: bool = False) -> bytes:
     now = time.monotonic()
     with _CACHE_LOCK:
         hit = _CACHE.get(key)
@@ -248,12 +252,14 @@ def cached_render(key: Any, ttl_seconds: int, builder: Callable[[], bytes]) -> b
             return hit[1]
     # Bound concurrent renders: each is CPU heavy and may wait on a satellite fetch, and unbounded
     # parallel previews would starve every other request of worker threads.
-    with _RENDER_SLOTS:
+    with (_HEAVY_SLOTS if heavy else _RENDER_SLOTS):
         with _CACHE_LOCK:
             hit = _CACHE.get(key)
             if hit and time.monotonic() - hit[0] < ttl_seconds:
                 return hit[1]
         data = builder()
+        if heavy:
+            gc.collect()  # hand the big page buffers back before the next request starts
     with _CACHE_LOCK:
         if len(_CACHE) > 200:
             for stale in [item for item, value in _CACHE.items() if now - value[0] > ttl_seconds]:

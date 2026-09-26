@@ -132,11 +132,11 @@ def _campaign_for_staff(db: Session, estate: Estate, campaign_id: int | None) ->
 
 # ── Rendering shared by staff, agent and public endpoints ───────────────────────────────────
 def _render_flyer(ctx, style: str = "luxury") -> bytes:
-    return marketing_render.cached_render(("flyer", style, marketing_render.context_signature(ctx)), 60, lambda: marketing_pdf.render_flyer_pdf(ctx, style))
+    return marketing_render.cached_render(("flyer", style, marketing_render.context_signature(ctx)), 60, lambda: marketing_pdf.render_flyer_pdf(ctx, style), heavy=True)
 
 
 def _render_brochure(ctx, style: str = "luxury") -> bytes:
-    return marketing_render.cached_render(("brochure", style, marketing_render.context_signature(ctx)), 60, lambda: marketing_pdf.render_brochure_pdf(ctx, style))
+    return marketing_render.cached_render(("brochure", style, marketing_render.context_signature(ctx)), 60, lambda: marketing_pdf.render_brochure_pdf(ctx, style), heavy=True)
 
 
 def _render_estate_ad(ctx, fmt: str, *, qr: bool = True, style: str = "luxury") -> bytes:
