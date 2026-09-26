@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import hashlib
 import json
+import threading
+import time
 from typing import Any, Dict, List, Optional, Tuple
 
 import ee
@@ -19,6 +22,9 @@ RISK_TIERS = [
     (1.01, "Severe", "#ef4444"),
 ]
 NO_DATA_COLOR = "#94a3b8"
+
+_BUILDINGS_CACHE: Dict[Any, Tuple[float, List[Any]]] = {}
+_BUILDINGS_CACHE_LOCK = threading.Lock()
 
 # Real, peer-reviewed sources grounding each screening methodology - surfaced to users in both
 # the PDF report and the web UI so the analysis is auditable, not a black box. Each entry is a
@@ -151,29 +157,42 @@ def fetch_buildings_near(db: Session, boundary_geojson: Dict[str, Any], buffer_m
     real spatial density everywhere, at the cost of a full sort of the matched rows (still fast -
     the GiST index on geom already does the heavy filtering before this sort ever runs).
     """
-    rows = db.execute(
-        text(
-            """
-            SELECT m.geom
-            FROM multipolygons m
-            WHERE m.building IS NOT NULL
-              AND ST_Intersects(
-                  m.geom,
-                  ST_Buffer(
-                      ST_SetSRID(ST_GeomFromGeoJSON(:boundary_geojson), 4326)::geography,
-                      :buffer_m
-                  )::geometry
-              )
-            ORDER BY random()
-            LIMIT :limit
-            """
-        ),
-        {"boundary_geojson": json.dumps(boundary_geojson), "buffer_m": buffer_m, "limit": limit},
-    ).fetchall()
+    cache_key = (hashlib.sha1(json.dumps(boundary_geojson, sort_keys=True).encode()).hexdigest(), float(buffer_m), int(limit))
+    now = time.monotonic()
+    with _BUILDINGS_CACHE_LOCK:
+        hit = _BUILDINGS_CACHE.get(cache_key)
+        if hit and now - hit[0] < 300:
+            return list(hit[1])
+    # Flood, floodplain, rainfall and erosion each ask for the same footprints of the same area, and
+    # the old "ORDER BY random()" sorted every building in a big area each time - for an Estate-sized
+    # boundary that meant gigabytes of database memory and minutes of CPU. Now: count (bounded, no
+    # sort), then either take them all or keep each with probability limit/count. Buildings only
+    # decorate the result, so if the area is still too heavy we give up after a timeout and go on
+    # without them instead of hanging the database.
+    params = {"boundary_geojson": json.dumps(boundary_geojson), "buffer_m": buffer_m, "limit": limit}
+    area_cte = "WITH b AS MATERIALIZED (SELECT ST_Buffer(ST_SetSRID(ST_GeomFromGeoJSON(:boundary_geojson), 4326)::geography, :buffer_m)::geometry AS g)"
+    try:
+        db.execute(text("SET LOCAL statement_timeout = '30s'"))
+        matched = int(db.execute(text(area_cte + " SELECT count(*) FROM (SELECT 1 FROM multipolygons m, b WHERE m.building IS NOT NULL AND ST_Intersects(m.geom, b.g) LIMIT 400000) t"), params).scalar() or 0)
+        if matched == 0:
+            rows = []
+        else:
+            sample = min(1.0, (limit * 1.3) / matched)
+            rows = db.execute(
+                text(area_cte + " SELECT m.geom FROM multipolygons m, b WHERE m.building IS NOT NULL AND ST_Intersects(m.geom, b.g) AND random() < :sample LIMIT :limit"),
+                {**params, "sample": sample},
+            ).fetchall()
+    except Exception:
+        db.rollback()
+        return []
     geometries = []
     for row in rows:
         try:
             geometries.append(wkb.loads(row[0]))
         except Exception:
             continue
+    with _BUILDINGS_CACHE_LOCK:
+        if len(_BUILDINGS_CACHE) >= 16:
+            _BUILDINGS_CACHE.clear()
+        _BUILDINGS_CACHE[cache_key] = (time.monotonic(), list(geometries))
     return geometries
