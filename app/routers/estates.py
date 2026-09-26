@@ -10,6 +10,7 @@ import tempfile
 import os
 import math
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from types import SimpleNamespace
@@ -61,7 +62,7 @@ from app.services.estates.report_export import render_customer_statement_pdf, re
 from app.services.estates import commissions
 from app.services.estates.operations import DOCUMENT_REQUIREMENTS, ESTATE_DOCUMENT_TYPES, ESTATE_DOCUMENT_TYPE_CODES, PUBLIC_DOCUMENT_TYPES, advance_payment_schedule_after_payment, build_operations_summary, buyer_portal_payload, customer_portal_url, document_readiness, hash_portal_token, issue_agent_portal_token, issue_customer_portal_link, issue_customer_portal_token, linked_documents, record_notification_log
 from app.db import SessionLocal
-from app.utils.hazard_jobs import get_hazard_job, insert_hazard_job, make_progress_reporter, serialize_hazard_job, set_hazard_job_status
+from app.utils.hazard_jobs import get_hazard_job, insert_hazard_job, make_progress_reporter, serialize_hazard_job, set_hazard_job_status, find_active_hazard_job
 
 
 logger = logging.getLogger(__name__)
@@ -1211,6 +1212,9 @@ def run_estate_development_forecast(estate_id: int, request: Request, db: Sessio
         estate.organization_id,
         "Development outlook (flood, erosion and land-cover growth analysis)",
     )
+    existing = find_active_hazard_job(db, hazard_type="estate_development_forecast", estate_id=estate.id)
+    if existing:
+        return serialize_hazard_job(existing)
     boundary = _estate_forecast_boundary(db, estate)
     job = insert_hazard_job(
         db,
@@ -2493,10 +2497,19 @@ def estate_quality_check(estate_id:int, request:Request, db:Session=Depends(get_
             issues.append({"severity":"error","plot_id":plot_id,"related_plot_id":other_id,"code":"overlap","message":f"Overlaps plot {other.plot_number}"})
     return {"estate_id":estate_id,"plot_count":len(plots),"issues":issues,"review_required":any(item["severity"]=="error" for item in issues)}
 
-def _calculate_plot_hazards(geometry, db: Session) -> dict:
+def _calculate_plot_hazards(geometry, db: Session | None) -> dict:
+    """`geometry` is a stored plot geometry or an already-converted GeoJSON boundary. With no `db`
+    a short-lived session is used, so a connection is only taken if the analysis actually queries."""
     from app.routers.hazards import erosion_preview, flood_preview
-    payload = {"boundary": mapping(to_shape(geometry)), "show_raster": False}
-    return {"flood": flood_preview(payload, db), "erosion": erosion_preview(payload, db)}
+    boundary = geometry if isinstance(geometry, dict) else mapping(to_shape(geometry))
+    payload = {"boundary": boundary, "show_raster": False}
+    if db is not None:
+        return {"flood": flood_preview(payload, db), "erosion": erosion_preview(payload, db)}
+    own = SessionLocal()
+    try:
+        return {"flood": flood_preview(payload, own), "erosion": erosion_preview(payload, own)}
+    finally:
+        own.close()
 
 
 def _hazard_row_payload(row: EstateHazardAssessment) -> dict:
@@ -2580,10 +2593,15 @@ def assess_plot_hazards(plot_id: int, request: Request, db: Session = Depends(ge
     _require_hazard_plan(db, estate.organization_id)
     if plot.geometry_status != "approved":
         raise HTTPException(409, "Only approved plot geometry can be screened")
-    results = _calculate_plot_hazards(plot.geometry, db)
-    rows = _persist_hazard_results(db, estate=estate, plot_id=plot.id, results=results, access=access)
+    plot_id, estate_id, geometry = plot.id, estate.id, plot.geometry
+    boundary = mapping(to_shape(geometry))
+    db.expunge_all()
+    db.commit()  # the analysis below is slow (Earth Engine round-trips); don't hold a pooled connection through it
+    results = _calculate_plot_hazards(boundary, None)
+    estate = db.get(Estate, estate_id)
+    rows = _persist_hazard_results(db, estate=estate, plot_id=plot_id, results=results, access=access)
     db.commit()
-    return {"plot_id": plot.id, "persisted": True, "assessments": [_hazard_row_payload(row) for row in rows], **results}
+    return {"plot_id": plot_id, "persisted": True, "assessments": [_hazard_row_payload(row) for row in rows], **results}
 
 
 def _run_estate_hazard_assessment_job(job_id: str) -> None:
@@ -2618,13 +2636,29 @@ def _run_estate_hazard_assessment_job(job_id: str) -> None:
             set_hazard_job_status(db, job_id, status="failed", stage="Failed", error_text="This Estate has no approved plot geometry to screen yet", completed=True)
             return
 
-        for index, plot in enumerate(plots):
-            set_hazard_job_status(db, job_id, status="running", stage=f"Screening plot {index + 1} of {len(plots)}...", progress_pct=int(5 + 90 * index / len(plots)))
-            results = _calculate_plot_hazards(plot.geometry, db)
-            _persist_hazard_results(db, estate=estate, plot_id=plot.id, results=results, access=access)
-            db.commit()
-
-        append_estate_audit_event(db, organization_id=estate.organization_id, actor=access.principal, action="hazard.estate_assessment_completed", entity_type="estate", entity_id=estate.id, after_data={"plots_screened": len(plots)})
+        boundaries = [(plot.id, mapping(to_shape(plot.geometry))) for plot in plots]
+        db.commit()  # nothing below needs the transaction open while Earth Engine answers
+        workers = max(1, min(int(os.getenv("HAZARD_ESTATE_PLOT_WORKERS", "3") or 3), len(boundaries)))
+        screened = 0
+        failed = 0
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="hazard-plot") as pool:
+            futures = {pool.submit(_calculate_plot_hazards, boundary, None): plot_id for plot_id, boundary in boundaries}
+            for done_count, future in enumerate(as_completed(futures), start=1):
+                plot_id = futures[future]
+                try:
+                    results = future.result()
+                except Exception:
+                    failed += 1
+                    results = None
+                if results is not None:
+                    _persist_hazard_results(db, estate=estate, plot_id=plot_id, results=results, access=access)
+                    db.commit()
+                    screened += 1
+                set_hazard_job_status(db, job_id, status="running", stage=f"Screened {done_count} of {len(boundaries)} plots...", progress_pct=int(5 + 90 * done_count / len(boundaries)))
+        if screened == 0:
+            set_hazard_job_status(db, job_id, status="failed", stage="Failed", error_text="No plot could be screened right now. Please try again shortly.", completed=True)
+            return
+        append_estate_audit_event(db, organization_id=estate.organization_id, actor=access.principal, action="hazard.estate_assessment_completed", entity_type="estate", entity_id=estate.id, after_data={"plots_screened": screened, "plots_failed": failed})
         db.commit()
         result_payload = _estate_hazard_dashboard_payload(db, estate)
         set_hazard_job_status(db, job_id, status="completed", stage="Complete", progress_pct=100, result_payload=result_payload, completed=True)
@@ -2650,6 +2684,9 @@ def assess_estate_hazards(estate_id: int, request: Request, db: Session = Depend
     has_screenable_plot = db.query(EstatePlot.id).filter(EstatePlot.estate_id == estate_id, EstatePlot.geometry_status == "approved").first()
     if not has_screenable_plot:
         raise HTTPException(422, "This Estate has no approved plot geometry to screen yet")
+    existing = find_active_hazard_job(db, hazard_type="estate_all", estate_id=estate_id)
+    if existing:
+        return serialize_hazard_job(existing)
     job = insert_hazard_job(
         db,
         hazard_type="estate_all",

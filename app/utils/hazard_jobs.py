@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+import os
 import threading
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable, Dict, Optional
 
 from sqlalchemy import text
@@ -11,6 +13,21 @@ from sqlalchemy.orm import Session
 from app.utils.survey_auth_security import ensure_survey_auth_schema
 
 HAZARD_JOB_STATUS_VALUES = {"queued", "running", "completed", "failed"}
+
+def _env_workers(name: str, default: int) -> int:
+    try:
+        return max(1, int(str(os.getenv(name, default)).strip()))
+    except ValueError:
+        return default
+
+
+# Jobs used to start one unbounded thread each, so a few Estate-wide runs (hundreds of Earth Engine
+# round-trips apiece) ran side by side with everyone's single-site analyses and slowed the whole
+# API. Two bounded lanes instead: quick single-site analyses never wait behind Estate-wide runs,
+# and Estate-wide runs take turns.
+_BULK_JOB_TYPES = {"estate_all", "estate_development_forecast"}
+_INTERACTIVE_LANE = ThreadPoolExecutor(max_workers=_env_workers("HAZARD_JOB_WORKERS", 4), thread_name_prefix="hazard-job")
+_BULK_LANE = ThreadPoolExecutor(max_workers=_env_workers("HAZARD_BULK_WORKERS", 1), thread_name_prefix="hazard-bulk")
 
 _HAZARD_JOBS_TABLE_LOCK = threading.Lock()
 _HAZARD_JOBS_TABLE_READY = False
@@ -93,7 +110,7 @@ def insert_hazard_job(
         "owner_user_id": owner_user_id,
     })
     db.commit()
-    threading.Thread(target=worker, args=(job_id,), daemon=True).start()
+    (_BULK_LANE if hazard_type in _BULK_JOB_TYPES else _INTERACTIVE_LANE).submit(worker, job_id)
     return get_hazard_job(db, job_id) or {"id": job_id, "status": "queued"}
 
 
@@ -143,7 +160,7 @@ def set_hazard_job_status(
         params["progress_pct"] = int(progress_pct)
     if result_payload is not None:
         updates.append("result_payload = CAST(:result_payload AS JSONB)")
-        params["result_payload"] = json.dumps(result_payload)
+        params["result_payload"] = json.dumps(result_payload, default=_json_default)
     if file_bytes is not None:
         updates.append("file_bytes = :file_bytes")
         params["file_bytes"] = file_bytes
@@ -194,3 +211,24 @@ def serialize_hazard_job(job: Dict[str, Any]) -> Dict[str, Any]:
             else None
         ),
     }
+
+
+def _json_default(value: Any) -> Any:
+    if hasattr(value, "isoformat"):
+        return value.isoformat()
+    return str(value)
+
+
+def find_active_hazard_job(db: Session, *, hazard_type: str, estate_id: int) -> Optional[Dict[str, Any]]:
+    """The queued/running job of this type for an Estate (started in the last 3 hours), if any, so a
+    repeated click or retry joins the existing run instead of stacking another one."""
+    ensure_hazard_analysis_jobs_table(db)
+    row = db.execute(text("""
+        SELECT id FROM hazard_analysis_jobs
+        WHERE hazard_type = :hazard_type
+          AND status IN ('queued', 'running')
+          AND request_payload->>'estate_id' = :estate_id
+          AND created_at > NOW() - INTERVAL '3 hours'
+        ORDER BY created_at DESC LIMIT 1
+    """), {"hazard_type": hazard_type, "estate_id": str(estate_id)}).first()
+    return get_hazard_job(db, row[0]) if row else None
