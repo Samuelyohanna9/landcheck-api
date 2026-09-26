@@ -28,3 +28,4 @@ apscheduler
 tzdata
 alembic
 psutil
+cryptography

@@ -17,6 +17,7 @@ load_dotenv()
 from app.db_base import Base
 from app.models import estate_foundation  # noqa: F401 - register Estate tables for autogeneration.
 from app.models import estate_marketing  # noqa: F401 - register Estate marketing tables.
+from app.models import estate_social  # noqa: F401 - register Estate social posting models.
 from app.models import estate_auth  # noqa: F401 - register Estate identity tables for autogeneration.
 
 config = context.config

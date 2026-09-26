@@ -35,13 +35,14 @@ ROLE_PERMISSIONS: Final[dict[str, frozenset[str]]] = {
             "infrastructure.manage",
             "report.read",
             "audit.read",
+            "marketing.manage",
         }
     ),
     "accounts": frozenset({"estate.read", "plot.read", "customer.read", "allocation.read", "payment.read", "payment.manage", "document.read", "document.manage", "report.read", "audit.read"}),
     "surveyor": frozenset({"estate.read", "plot.read", "survey.read", "survey.manage", "staking.read", "staking.manage", "document.read", "document.manage", "audit.read"}),
     "field_officer": frozenset({"estate.read", "plot.read", "staking.read", "field.read", "field.manage", "document.read", "document.manage"}),
     "sales": frozenset({"estate.read", "plot.read", "customer.read", "customer.manage", "allocation.read", "allocation.manage", "payment.read", "payment.manage", "document.read", "document.manage"}),
-    "marketer": frozenset({"estate.read", "plot.read", "customer.read", "customer.manage", "allocation.read", "allocation.manage", "payment.read", "document.read"}),
+    "marketer": frozenset({"estate.read", "plot.read", "customer.read", "customer.manage", "allocation.read", "allocation.manage", "payment.read", "document.read", "marketing.manage"}),
     "viewer": frozenset({"estate.read", "plot.read", "customer.read", "allocation.read", "document.read", "survey.read", "staking.read", "field.read", "infrastructure.read", "report.read"}),
 }
 

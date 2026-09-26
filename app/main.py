@@ -33,6 +33,7 @@ from app.routers import (
     estate_auth,
     estate_billing,
     estate_marketing,
+    estate_social,
 )
 from app.db_init import init_db
 from app.utils.activity_logger import ensure_activity_log_table, log_request_activity, should_skip_request_logging
@@ -282,6 +283,15 @@ def _run_estate_inspection_reminder_job():
     _run_locked_estate_marketing_job(_ESTATE_INSPECTION_REMINDER_LOCK_KEY, send_inspection_reminders)
 
 
+_ESTATE_SOCIAL_LOCK_KEY = 872341006
+
+
+def _run_estate_social_job():
+    from app.services.estates.social_posts import run_social_sweeps
+
+    _run_locked_estate_marketing_job(_ESTATE_SOCIAL_LOCK_KEY, run_social_sweeps)
+
+
 # Preserve the legacy Survey/Green bootstrap; Estate schema is managed by Alembic.
 @app.on_event("startup")
 def startup_event():
@@ -360,6 +370,15 @@ def startup_event():
         trigger=CronTrigger(minute="*/30"),
         id="estate_inspection_reminders",
         replace_existing=True,
+    )
+    # Scheduled social posts, "time to post" reminders and queued WhatsApp updates.
+    scheduler.add_job(
+        _run_estate_social_job,
+        trigger=CronTrigger(minute="*"),
+        id="estate_social_sweeps",
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
     )
     scheduler.start()
 
@@ -473,6 +492,7 @@ app.include_router(estates.router)
 app.include_router(estate_auth.router)
 app.include_router(estate_billing.router)
 app.include_router(estate_marketing.router)
+app.include_router(estate_social.router)
 
 @app.get("/")
 def root():
