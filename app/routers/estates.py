@@ -8,6 +8,7 @@ import logging
 import re
 import tempfile
 import os
+import time
 import math
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -2580,9 +2581,12 @@ def plot_hazards(plot_id: int, request: Request, db: Session = Depends(get_db)):
     _require_hazard_plan(db, estate.organization_id)
     if plot.geometry_status != "approved":
         raise HTTPException(409, "Only approved plot geometry can be screened")
+    # Newest record per hazard only - a plot can carry many earlier runs, each with full map images.
     latest = {}
-    for row in db.query(EstateHazardAssessment).filter(EstateHazardAssessment.plot_id == plot.id).order_by(EstateHazardAssessment.assessed_at.desc()).all():
-        latest.setdefault(row.hazard_type, row)
+    for hazard_type in ("flood", "erosion"):
+        row = db.query(EstateHazardAssessment).filter(EstateHazardAssessment.plot_id == plot.id, EstateHazardAssessment.hazard_type == hazard_type).order_by(EstateHazardAssessment.assessed_at.desc()).first()
+        if row is not None:
+            latest[hazard_type] = row
     if {"flood", "erosion"}.issubset(latest):
         return {"plot_id": plot.id, "persisted": True, "flood": latest["flood"].result_payload, "erosion": latest["erosion"].result_payload}
     return {"plot_id": plot.id, "persisted": False, **_calculate_plot_hazards(plot.geometry, db)}
@@ -2642,12 +2646,21 @@ def _run_estate_hazard_assessment_job(job_id: str) -> None:
         results = _calculate_plot_hazards(boundary, None, heartbeat=lambda: touch_hazard_job(db, job_id))
 
         set_hazard_job_status(db, job_id, status="running", stage="Saving results...", progress_pct=90)
+        step_started = time.monotonic()
+        def step(label):
+            nonlocal step_started
+            print(f"[hazard-save] {label}: {time.monotonic() - step_started:.1f}s, api memory {_own_rss_mb():.0f} MB", flush=True)
+            step_started = time.monotonic()
+        step("analysis received")
         estate = db.get(Estate, estate_id)
         _persist_hazard_results(db, estate=estate, plot_id=None, results=results, access=access)
         append_estate_audit_event(db, organization_id=estate.organization_id, actor=access.principal, action="hazard.estate_assessment_completed", entity_type="estate", entity_id=estate.id, after_data={"scope": "estate_boundary"})
         db.commit()
+        step("results stored")
         result_payload = _estate_hazard_dashboard_payload(db, estate)
+        step("summary built")
         set_hazard_job_status(db, job_id, status="completed", stage="Complete", progress_pct=100, result_payload=result_payload, completed=True)
+        step("job completed")
     except Exception as exc:
         db.rollback()
         set_hazard_job_status(db, job_id, status="failed", stage="Failed", error_text=str(getattr(exc, "detail", None) or exc), completed=True)
@@ -2682,22 +2695,34 @@ def assess_estate_hazards(estate_id: int, request: Request, db: Session = Depend
     return serialize_hazard_job(job)
 
 
+def _own_rss_mb() -> float:
+    try:
+        import psutil
+
+        return psutil.Process().memory_info().rss / 1e6
+    except Exception:
+        return 0.0
+
+
 def _slim_hazard_result(value):
-    """Drop the map overlays (base64 images, often megabytes each) - the Estate views only need the
-    scores and classes, and keeping every historical overlay in memory/JSON is what exhausted the
-    server when results were saved."""
+    """Keep only what the Estate views read (scores, classes, short text). Map overlays (base64
+    images), long point lists and other bulky fields are dropped: they can be megabytes each, and
+    carrying them through the results page and job result is what exhausted the server's memory."""
     if isinstance(value, dict):
         return {key: _slim_hazard_result(item) for key, item in value.items() if key != "overlay"}
     if isinstance(value, list):
-        return [_slim_hazard_result(item) for item in value]
+        return [] if len(value) > 60 else [_slim_hazard_result(item) for item in value]
+    if isinstance(value, str) and len(value) > 4000:
+        return None
     return value
 
 
 def _estate_hazard_dashboard_payload(db: Session, estate: Estate) -> dict:
-    # Only the newest record per plot and hazard, with overlays stripped inside the database, instead
-    # of loading every historical assessment (each carrying full map images) into Python.
-    # Step 1 picks the newest row ids from the small columns only, so the big JSON of older rows is
-    # never read. Step 2 fetches (and strips overlays from) just those rows.
+    """Summary for the Estate Hazard page and Risk Overview.
+
+    Estate-level results (one per hazard) are returned in full (slimmed). Per-plot records are returned
+    as metadata only - class, score, date - read from small columns, so the database never has to
+    open the (very large) stored JSON of every plot just to draw a list."""
     latest_ids = [row[0] for row in db.execute(text("""
         SELECT DISTINCT ON (plot_id, hazard_type) id
         FROM estate_hazard_assessments
@@ -2705,11 +2730,15 @@ def _estate_hazard_dashboard_payload(db: Session, estate: Estate) -> dict:
         ORDER BY plot_id, hazard_type, assessed_at DESC
     """), {"estate_id": estate.id}).all()]
     rows = db.execute(text("""
-        SELECT id, plot_id, estate_id, hazard_type, risk_class, risk_score, assessed_at,
-               (result_payload::jsonb #- '{overlay}' #- '{river,overlay}' #- '{floodplain,overlay}' #- '{rainfall,overlay}') AS result
+        SELECT id, plot_id, estate_id, hazard_type, risk_class, risk_score, assessed_at
         FROM estate_hazard_assessments
         WHERE id = ANY(:ids)
     """), {"ids": latest_ids}).mappings().all() if latest_ids else []
+    estate_result_ids = [row["id"] for row in rows if row["plot_id"] is None]
+    estate_results = {}
+    if estate_result_ids:
+        for result_id, payload in db.execute(text("SELECT id, result_payload FROM estate_hazard_assessments WHERE id = ANY(:ids)"), {"ids": estate_result_ids}).all():
+            estate_results[result_id] = _slim_hazard_result(payload)
     total = int(db.execute(text("SELECT count(*) FROM estate_hazard_assessments WHERE estate_id = :estate_id"), {"estate_id": estate.id}).scalar() or 0)
     plot_results = {}
     for row in rows:
@@ -2717,7 +2746,7 @@ def _estate_hazard_dashboard_payload(db: Session, estate: Estate) -> dict:
             "id": row["id"], "plot_id": row["plot_id"], "estate_id": row["estate_id"], "hazard_type": row["hazard_type"],
             "status": "completed", "risk_class": row["risk_class"],
             "risk_score": float(row["risk_score"]) if row["risk_score"] is not None else None,
-            "assessed_at": row["assessed_at"], "result": row["result"],
+            "assessed_at": row["assessed_at"], "result": estate_results.get(row["id"]),
         }
     estate_level = [row for row in rows if row["plot_id"] is None]
     summaries = {}
