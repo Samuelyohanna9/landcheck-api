@@ -253,4 +253,7 @@ def find_active_hazard_job(db: Session, *, hazard_type: str, estate_id: int) -> 
           AND created_at > NOW() - INTERVAL '3 hours'
         ORDER BY created_at DESC LIMIT 1
     """), {"hazard_type": hazard_type, "estate_id": str(estate_id)}).first()
-    return get_hazard_job(db, row[0]) if row else None
+    if not row:
+        return None
+    job = get_hazard_job(db, row[0])  # also retires it if its worker has gone quiet
+    return job if job and job.get("status") in ("queued", "running") else None

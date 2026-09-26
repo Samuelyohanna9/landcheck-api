@@ -90,6 +90,7 @@ def run_isolated(func: Callable[..., Any], *args: Any, max_rss_mb: int | None = 
                 break
             if heartbeat is not None and time.monotonic() - last_beat >= 20:
                 last_beat = time.monotonic()
+                print(f"[isolated-run] {getattr(func, '__name__', 'job')}: running {time.monotonic() - started:.0f}s, child at {(_rss_mb(process.pid) or 0):.0f} MB", flush=True)
                 try:
                     heartbeat()
                 except Exception:
@@ -98,6 +99,7 @@ def run_isolated(func: Callable[..., Any], *args: Any, max_rss_mb: int | None = 
             if rss is not None:
                 peak = max(peak, rss)
                 if rss > limit:
+                    print(f"[isolated-run] {getattr(func, '__name__', 'job')}: stopped at {rss:.0f} MB (limit {limit} MB) after {time.monotonic() - started:.0f}s", flush=True)
                     process.kill()
                     raise IsolatedMemoryLimit(f"analysis needed more than {limit} MB of memory (stopped at {rss:.0f} MB)")
             if time.monotonic() - started > timeout_s:
@@ -115,6 +117,7 @@ def run_isolated(func: Callable[..., Any], *args: Any, max_rss_mb: int | None = 
         except Exception:
             pass
     message = outcome.get("message")
+    print(f"[isolated-run] {getattr(func, '__name__', 'job')}: finished in {time.monotonic() - started:.0f}s, peak {peak:.0f} MB, result={'ok' if message and message[0] == 'ok' else 'failed'}", flush=True)
     if not message:
         raise IsolatedRunError("analysis stopped unexpectedly (it may have run out of memory)")
     kind, payload = message
