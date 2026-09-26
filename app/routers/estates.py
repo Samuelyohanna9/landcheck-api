@@ -2504,11 +2504,17 @@ def _calculate_plot_hazards(geometry, db: Session | None) -> dict:
     payload = {"boundary": boundary, "show_raster": False}
     if db is not None:
         return {"flood": flood_preview(payload, db), "erosion": erosion_preview(payload, db)}
-    own = SessionLocal()
+    # Estate-sized areas can need far more memory than a plot. Run in a child process that is
+    # stopped at a memory ceiling, so one heavy analysis can never OOM-kill the API worker.
+    from app.utils.hazard_isolated import screen_boundary
+    from app.utils.isolated_run import IsolatedMemoryLimit, IsolatedRunError, run_isolated
+
     try:
-        return {"flood": flood_preview(payload, own), "erosion": erosion_preview(payload, own)}
-    finally:
-        own.close()
+        return run_isolated(screen_boundary, boundary)
+    except IsolatedMemoryLimit as exc:
+        raise HTTPException(status_code=422, detail="This area is too large to screen in one pass. Try a smaller boundary or screen individual plots.") from exc
+    except IsolatedRunError as exc:
+        raise HTTPException(status_code=502, detail=f"Hazard screening could not be completed: {exc}") from exc
 
 
 def _hazard_row_payload(row: EstateHazardAssessment) -> dict:
@@ -2644,7 +2650,7 @@ def _run_estate_hazard_assessment_job(job_id: str) -> None:
         set_hazard_job_status(db, job_id, status="completed", stage="Complete", progress_pct=100, result_payload=result_payload, completed=True)
     except Exception as exc:
         db.rollback()
-        set_hazard_job_status(db, job_id, status="failed", stage="Failed", error_text=str(exc), completed=True)
+        set_hazard_job_status(db, job_id, status="failed", stage="Failed", error_text=str(getattr(exc, "detail", None) or exc), completed=True)
     finally:
         db.close()
 

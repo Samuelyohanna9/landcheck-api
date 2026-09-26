@@ -27,3 +27,4 @@ python-docx
 apscheduler
 tzdata
 alembic
+psutil
