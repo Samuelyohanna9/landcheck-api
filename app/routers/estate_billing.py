@@ -16,7 +16,7 @@ from app.models.estate_foundation import EstateOrganization
 from app.routers.plots import get_db
 from app.schemas.estate_billing import ChangePlanRequest, ChoosePlanRequest
 from app.services.estates.authorization import EstateAccess, require_estate_access
-from app.services.estates.billing_plans import ESTATE_PLANS, TRIAL_DAYS, VERIFICATION_CHARGE_AMOUNT
+from app.services.estates.billing_plans import ESTATE_PLANS, TRIAL_DAYS, VERIFICATION_CHARGE_AMOUNT, plan_amount
 from app.services.estates.subscriptions import (
     _handle_successful_charge,
     cancel_subscription,
@@ -145,7 +145,7 @@ def start_checkout(payload: ChoosePlanRequest, organization_id: int, request: Re
     plan_key = str(payload.plan_key or "").strip().lower()
     billing_cycle = str(payload.billing_cycle or "").strip().lower()
     if plan_key not in ESTATE_PLANS:
-        raise HTTPException(422, "Choose Basic or Plus")
+        raise HTTPException(422, "Choose a valid plan")
     if billing_cycle not in {"monthly", "yearly"}:
         raise HTTPException(422, "Choose monthly or yearly billing")
     organization = db.get(EstateOrganization, organization_id)
@@ -477,16 +477,62 @@ def cancel(organization_id: int, request: Request, db: Session = Depends(get_db)
     return _subscription_status_payload(subscription)
 
 
+def _upgrade_checkout(db: Session, subscription: EstateSubscription, organization: EstateOrganization | None, plan_key: str, difference: Decimal) -> dict:
+    if organization is None:
+        raise HTTPException(404, "Estate organization was not found")
+    pending = (
+        db.query(EstateSubscriptionCharge)
+        .filter(EstateSubscriptionCharge.subscription_id == subscription.id, EstateSubscriptionCharge.charge_type == "plan_change", EstateSubscriptionCharge.status == "pending")
+        .all()
+    )
+    for row in pending:
+        payload = row.flutterwave_payload if isinstance(row.flutterwave_payload, dict) else {}
+        if payload.get("plan_key") == plan_key and payload.get("checkout_url") and Decimal(str(row.amount)) == difference and payload.get("previous_plan_key") == subscription.plan_key:
+            return {**_subscription_status_payload(subscription), "plan_change_status": "checkout", "plan_change_amount": str(difference), "checkout_url": payload["checkout_url"]}
+        row.status = "failed"
+        row.failure_reason = "Replaced by a new upgrade request."
+    email = str(subscription.flutterwave_customer_email or organization.contact_email or "").strip()
+    if not email:
+        raise HTTPException(422, "This organization has no billing email on file")
+    tx_ref = new_tx_ref("PAY")
+    charge = EstateSubscriptionCharge(
+        subscription_id=subscription.id, organization_id=organization.id, charge_type="plan_change", amount=difference,
+        currency=subscription.currency, status="pending", tx_ref=tx_ref,
+        flutterwave_payload={"plan_key": plan_key, "previous_plan_key": subscription.plan_key},
+    )
+    db.add(charge)
+    db.flush()
+    try:
+        link = flw.initiate_checkout(
+            tx_ref=tx_ref, amount=charge.amount, currency=charge.currency, email=email, name=organization.name,
+            redirect_url=f"{_api_public_url()}/estates/billing/checkout/return", title="LandCheck Estates",
+            description=f"Upgrade to the {ESTATE_PLANS[plan_key]['label']} plan (price difference for this billing period).",
+            payment_options="card,banktransfer",
+            meta={"purpose": "estate_subscription_payment", "organization_id": str(organization.id), "subscription_id": str(subscription.id), "charge_id": str(charge.id), "customer_email": email},
+        )
+    except Exception:
+        db.rollback()
+        raise
+    charge.flutterwave_payload = {"plan_key": plan_key, "previous_plan_key": subscription.plan_key, "checkout_url": link}
+    db.commit()
+    return {**_subscription_status_payload(subscription), "plan_change_status": "checkout", "plan_change_amount": str(difference), "checkout_url": link}
+
+
 @router.post("/change-plan")
 def change(payload: ChangePlanRequest, organization_id: int, request: Request, db: Session = Depends(get_db)):
     require_estate_access(db, request, organization_id, permission="billing.manage", require_subscription=False)
     plan_key = str(payload.plan_key or "").strip().lower()
     if plan_key not in ESTATE_PLANS:
-        raise HTTPException(422, "Choose Basic or Plus")
+        raise HTTPException(422, "Choose a valid plan")
     subscription = get_subscription(db, organization_id)
     if not subscription or subscription.status not in {"trialing", "active"}:
         raise HTTPException(409, "There is no active subscription to change")
     organization = db.get(EstateOrganization, organization_id)
+    difference = plan_amount(plan_key, subscription.billing_cycle) - Decimal(str(subscription.amount))
+    if plan_key != subscription.plan_key and subscription.status == "active" and difference > 0:
+        # A paid upgrade always goes through Flutterwave's hosted page, so the customer sees the amount
+        # and approves it (card authorisation / bank transfer) instead of a silent background charge.
+        return _upgrade_checkout(db, subscription, organization, plan_key, difference)
     try:
         result = change_plan(db, subscription, new_plan_key=plan_key, organization=organization)
     except ValueError as exc:
