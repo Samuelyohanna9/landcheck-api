@@ -2541,7 +2541,7 @@ def _persist_hazard_results(db: Session, *, estate: Estate, plot_id: int | None,
             hazard_type=hazard_type,
             risk_class=risk_class,
             risk_score=score,
-            result_payload=result,
+            result_payload=_slim_hazard_result(result) if plot_id is None else result,
             assessed_by_subject_type=access.principal.subject_type,
             assessed_by_subject_id=access.principal.subject_id,
         )
@@ -2682,23 +2682,46 @@ def assess_estate_hazards(estate_id: int, request: Request, db: Session = Depend
     return serialize_hazard_job(job)
 
 
+def _slim_hazard_result(value):
+    """Drop the map overlays (base64 images, often megabytes each) - the Estate views only need the
+    scores and classes, and keeping every historical overlay in memory/JSON is what exhausted the
+    server when results were saved."""
+    if isinstance(value, dict):
+        return {key: _slim_hazard_result(item) for key, item in value.items() if key != "overlay"}
+    if isinstance(value, list):
+        return [_slim_hazard_result(item) for item in value]
+    return value
+
+
 def _estate_hazard_dashboard_payload(db: Session, estate: Estate) -> dict:
-    latest = {}
-    rows = db.query(EstateHazardAssessment).filter(EstateHazardAssessment.estate_id == estate.id).order_by(EstateHazardAssessment.assessed_at.desc()).all()
-    for row in rows:
-        latest.setdefault((row.plot_id, row.hazard_type), row)
+    # Only the newest record per plot and hazard, with overlays stripped inside the database, instead
+    # of loading every historical assessment (each carrying full map images) into Python.
+    rows = db.execute(text("""
+        SELECT DISTINCT ON (plot_id, hazard_type)
+               id, plot_id, estate_id, hazard_type, risk_class, risk_score, assessed_at,
+               (result_payload::jsonb #- '{overlay}' #- '{river,overlay}' #- '{floodplain,overlay}' #- '{rainfall,overlay}') AS result
+        FROM estate_hazard_assessments
+        WHERE estate_id = :estate_id
+        ORDER BY plot_id, hazard_type, assessed_at DESC
+    """), {"estate_id": estate.id}).mappings().all()
+    total = int(db.execute(text("SELECT count(*) FROM estate_hazard_assessments WHERE estate_id = :estate_id"), {"estate_id": estate.id}).scalar() or 0)
     plot_results = {}
-    for (plot_id, hazard_type), row in latest.items():
-        plot_results.setdefault(str(plot_id or "estate"), {"plot_id": plot_id, "hazards": {}})["hazards"][hazard_type] = _hazard_row_payload(row)
-    estate_level = [row for row in latest.values() if row.plot_id is None]
+    for row in rows:
+        plot_results.setdefault(str(row["plot_id"] or "estate"), {"plot_id": row["plot_id"], "hazards": {}})["hazards"][row["hazard_type"]] = {
+            "id": row["id"], "plot_id": row["plot_id"], "estate_id": row["estate_id"], "hazard_type": row["hazard_type"],
+            "status": "completed", "risk_class": row["risk_class"],
+            "risk_score": float(row["risk_score"]) if row["risk_score"] is not None else None,
+            "assessed_at": row["assessed_at"], "result": row["result"],
+        }
+    estate_level = [row for row in rows if row["plot_id"] is None]
     summaries = {}
-    for row in (estate_level or latest.values()):
-        bucket = summaries.setdefault(row.hazard_type, {"assessed": 0, "classes": {}})
+    for row in (estate_level or rows):
+        bucket = summaries.setdefault(row["hazard_type"], {"assessed": 0, "classes": {}})
         bucket["assessed"] += 1
-        if row.risk_class:
-            bucket["classes"][row.risk_class] = bucket["classes"].get(row.risk_class, 0) + 1
+        if row["risk_class"]:
+            bucket["classes"][row["risk_class"]] = bucket["classes"].get(row["risk_class"], 0) + 1
     ordered = sorted(plot_results.values(), key=lambda item: 0 if item["plot_id"] is None else 1)
-    return {"estate": {"id": estate.id, "name": estate.name}, "assessments": ordered, "summary": summaries, "assessment_count": len(rows)}
+    return {"estate": {"id": estate.id, "name": estate.name}, "assessments": ordered, "summary": summaries, "assessment_count": total}
 
 
 @router.get("/{estate_id}/hazards")
