@@ -15,6 +15,7 @@ from app.models.estate_foundation import (
 )
 from app.models.estate_auth import EstateAccount
 from app.models.estate_billing import EstateSubscription, EstateSubscriptionCharge
+from app.models.estate_legal import EstateDpaAcceptance
 
 
 def _test_database_url() -> str:
@@ -39,6 +40,7 @@ def db_session() -> Session:
         EstateSubscriptionCharge.__table__,
         EstateAccount.__table__,
         EstateAuditEvent.__table__,
+        EstateDpaAcceptance.__table__,
     ]
     for table in tables:
         table.create(bind=engine, checkfirst=True)

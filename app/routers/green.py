@@ -42,6 +42,7 @@ from app.models.estate_billing import EstateSubscription, EstateSubscriptionChar
 from app.models.estate_foundation import EstateOrganization
 from app.services.estates import estate_email
 from app.services.estates.billing_plans import ESTATE_PLANS
+from app.services.estates import dpa
 from app.services.estates.subscriptions import get_subscription, start_trial
 from app.utils.green_pdf import (
     render_green_report_pdf,
@@ -23526,9 +23527,11 @@ def estate_admin_overview(request: Request, db: Session = Depends(get_db)):
                       AND s.revoked_at IS NULL
                       AND s.expires_at > NOW()
                       AND s.last_seen_at >= NOW() - INTERVAL '5 minutes'
-                ) AS online_organizations
+                ) AS online_organizations,
+                (SELECT COUNT(DISTINCT organization_id) FROM estate_dpa_acceptances WHERE version = :dpa_version) AS dpa_accepted_organizations
             """
-        )
+        ),
+        {"dpa_version": dpa.DPA_VERSION},
     ).mappings().one()
 
     organizations = db.execute(
@@ -23669,12 +23672,27 @@ def estate_admin_overview(request: Request, db: Session = Depends(get_db)):
                     )
                     FROM estate_estates e
                     WHERE e.organization_id = o.id
-                ), '[]'::json) AS estates
+                ), '[]'::json) AS estates,
+                (
+                    SELECT d.accepted_at
+                    FROM estate_dpa_acceptances d
+                    WHERE d.organization_id = o.id AND d.version = :dpa_version
+                    ORDER BY d.accepted_at DESC, d.id DESC
+                    LIMIT 1
+                ) AS dpa_accepted_at,
+                (
+                    SELECT COALESCE(d.accepted_by_name, d.accepted_by_email)
+                    FROM estate_dpa_acceptances d
+                    WHERE d.organization_id = o.id AND d.version = :dpa_version
+                    ORDER BY d.accepted_at DESC, d.id DESC
+                    LIMIT 1
+                ) AS dpa_accepted_by
             FROM estate_organizations o
             LEFT JOIN estate_subscriptions s ON s.organization_id = o.id
             ORDER BY COALESCE(o.updated_at, o.created_at) DESC, o.id DESC
             """
-        )
+        ),
+        {"dpa_version": dpa.DPA_VERSION},
     ).mappings().all()
 
     return {
