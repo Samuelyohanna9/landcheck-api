@@ -16,7 +16,8 @@ from app.models.estate_billing import EstatePasswordResetToken
 from app.models.estate_foundation import EstateOrganization, EstateOrganizationEntitlement, EstateOrganizationMember
 from app.routers.plots import get_db
 from app.schemas.estate_auth import EstateLogin, EstateRegister
-from app.services.estates import estate_email
+from app.services.estates import dpa, estate_email
+from app.services.estates.marketing_common import client_ip
 from app.services.estates.identity import (
     hash_password,
     issue_session,
@@ -77,6 +78,8 @@ def register(payload: EstateRegister, request: Request, db: Session = Depends(ge
     email = normalize_email(payload.email)
     if not EMAIL_PATTERN.fullmatch(email):
         raise HTTPException(status_code=422, detail="Enter a valid company email address")
+    if not payload.accept_dpa:
+        raise HTTPException(status_code=422, detail="Accept the Data Processing Agreement to create an account")
     if db.query(EstateAccount).filter(EstateAccount.email_normalized == email).first():
         raise HTTPException(status_code=409, detail="An Estate account already exists for this email")
     base_slug = slugify(payload.organization_slug or payload.organization_name)
@@ -105,6 +108,10 @@ def register(payload: EstateRegister, request: Request, db: Session = Depends(ge
     )
     db.add(account)
     db.flush()
+    dpa.record_acceptance(
+        db, organization_id=organization.id, subject_type="estate_account", subject_id=str(account.id),
+        name=account.full_name, email=account.email, ip_address=client_ip(request),
+    )
     db.add(
         EstateOrganizationMember(
             organization_id=organization.id,

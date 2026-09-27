@@ -9,6 +9,7 @@ class EstateRegister(BaseModel):
     full_name: str = Field(min_length=2, max_length=255)
     email: str = Field(min_length=5, max_length=255)
     password: str = Field(min_length=8, max_length=200)
+    accept_dpa: bool = Field(default=False)
 
 
 class EstateLogin(BaseModel):

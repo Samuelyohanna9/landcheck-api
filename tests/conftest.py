@@ -13,7 +13,7 @@ from app.models.estate_foundation import (
     EstateOrganizationEntitlement,
     EstateOrganizationMember,
 )
-from app.models.estate_auth import EstateAccount
+from app.models.estate_auth import EstateAccount, EstateAuthSession
 from app.models.estate_billing import EstateSubscription, EstateSubscriptionCharge
 from app.models.estate_legal import EstateDpaAcceptance
 
@@ -39,6 +39,7 @@ def db_session() -> Session:
         EstateSubscription.__table__,
         EstateSubscriptionCharge.__table__,
         EstateAccount.__table__,
+        EstateAuthSession.__table__,
         EstateAuditEvent.__table__,
         EstateDpaAcceptance.__table__,
     ]
