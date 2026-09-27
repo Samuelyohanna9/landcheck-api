@@ -63,6 +63,13 @@ def configured() -> bool:
     return bool(token() and phone_number_id())
 
 
+def template_images_enabled() -> bool:
+    """Only turn this on once every template above has an approved IMAGE header in WhatsApp Manager -
+    see docs/SOCIAL_POSTING_SETUP.md. A template whose approved structure has no header will be
+    rejected by Meta if we send one, so this stays off until the templates are actually updated."""
+    return str(os.getenv("WHATSAPP_TEMPLATE_IMAGES") or "").strip().lower() in {"1", "true", "yes"}
+
+
 def template_name(preset: str) -> str:
     spec = PRESETS[preset]
     return str(os.getenv(spec["env"]) or spec["default_name"]).strip()
@@ -81,10 +88,17 @@ class WhatsAppError(RuntimeError):
     pass
 
 
-def send_template(to_digits: str, name: str, params: list[str], *, language: str = "en") -> str:
-    """Sends one approved template message. Returns the WhatsApp message id."""
+def send_template(to_digits: str, name: str, params: list[str], *, language: str = "en", header_image_url: str | None = None) -> str:
+    """Sends one approved template message. Returns the WhatsApp message id.
+
+    header_image_url only has an effect once the named template was itself approved with an IMAGE
+    header component - see template_images_enabled()."""
     if not configured():
         raise WhatsAppError("WhatsApp messaging is not configured on this server")
+    components = []
+    if header_image_url:
+        components.append({"type": "header", "parameters": [{"type": "image", "image": {"link": header_image_url}}]})
+    components.append({"type": "body", "parameters": [{"type": "text", "text": _clean_param(value)} for value in params]})
     body = {
         "messaging_product": "whatsapp",
         "to": to_digits,
@@ -92,7 +106,7 @@ def send_template(to_digits: str, name: str, params: list[str], *, language: str
         "template": {
             "name": name,
             "language": {"code": language},
-            "components": [{"type": "body", "parameters": [{"type": "text", "text": _clean_param(value)} for value in params]}],
+            "components": components,
         },
     }
     response = requests.post(

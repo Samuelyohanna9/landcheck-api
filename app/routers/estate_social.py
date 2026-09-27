@@ -90,6 +90,7 @@ class OptinCreate(BaseModel):
 class BroadcastCreate(BaseModel):
     preset: str
     detail: str | None = Field(default=None, max_length=200)
+    image_style: str | None = None
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────────────────────
@@ -196,6 +197,21 @@ def social_image(estate_id: int, request: Request, channel: str = "facebook", st
     except ValueError as exc:
         raise HTTPException(409, str(exc)) from exc
     return _png(data, filename=f"{name.replace(' ', '-')}-{channel}.png" if download else None)
+
+
+@router.get("/marketing/social/whatsapp-image/{token}.png")
+def public_whatsapp_image(token: str, db: Session = Depends(get_db)):
+    """Fetched by WhatsApp's servers as a template header image. The link is signed and expires after 24 hours."""
+    parsed = social_posts.read_broadcast_image_token(token)
+    if parsed is None:
+        raise HTTPException(404, "Image not found")
+    estate_id, style = parsed
+    estate = db.get(Estate, estate_id)
+    if estate is None or style not in marketing_render.AD_STYLES:
+        raise HTTPException(404, "Image not found")
+    data = social_posts.render_image(db, estate, fmt="landscape", style=style, plot_id=None, source="whatsapp")
+    db.commit()
+    return _png(data, public=True)
 
 
 @router.get("/marketing/social/image/{token}.png")
@@ -596,7 +612,7 @@ def list_optins(estate_id: int, request: Request, db: Session = Depends(get_db))
         entry["created_at"] = min(entry["created_at"], created) if created else entry["created_at"]
     recent = sorted(summary.values(), key=lambda item: item["created_at"] or datetime.min.replace(tzinfo=timezone.utc), reverse=True)[:5]
     return {
-        "whatsapp_available": social_whatsapp.configured(), "active": int(active), "revoked": int(revoked),
+        "whatsapp_available": social_whatsapp.configured(), "template_images": social_whatsapp.template_images_enabled(), "active": int(active), "revoked": int(revoked),
         "presets": social_whatsapp.presets_payload(), "batches": recent,
         "items": [{"id": row.id, "name": row.full_name, "phone": f"+{row.phone_digits}", "status": row.status, "consented_at": row.consented_at, "source": row.source_code} for row in rows],
     }
@@ -610,8 +626,11 @@ def whatsapp_broadcast(estate_id: int, payload: BroadcastCreate, request: Reques
     if not (estate.public_enabled and estate.public_slug):
         raise HTTPException(409, "Publish this estate's public page first - messages link to it.")
     ctx = marketing_render.build_context(db, estate, source=None)
+    image_style = str(payload.image_style or "").strip().lower()
+    if image_style and image_style not in marketing_render.AD_STYLES:
+        raise HTTPException(422, "Choose a valid design style")
     try:
-        batch, count = social_broadcast.queue_broadcast(db, estate=estate, preset=payload.preset, detail=payload.detail, min_price=ctx.min_price if ctx.show_prices else None, sent_by=str(access.principal.subject_id))
+        batch, count = social_broadcast.queue_broadcast(db, estate=estate, preset=payload.preset, detail=payload.detail, min_price=ctx.min_price if ctx.show_prices else None, sent_by=str(access.principal.subject_id), image_style=image_style or None)
     except ValueError as exc:
         raise HTTPException(422, str(exc)) from exc
     if not count:

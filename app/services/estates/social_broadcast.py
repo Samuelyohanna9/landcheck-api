@@ -13,7 +13,7 @@ from sqlalchemy.orm import Session
 
 from app.models.estate_foundation import Estate, EstateNotificationLog
 from app.models.estate_social import EstateMarketingOptin, EstateWhatsappSend
-from app.services.estates import social_whatsapp
+from app.services.estates import social_posts, social_whatsapp
 from app.services.estates.marketing_common import normalize_phone_digits, share_page_url
 from app.services.estates.marketing_render import naira_short
 
@@ -68,21 +68,26 @@ def _params_for(preset: str, *, first_name: str, estate: Estate, detail: str, li
     return [first_name or "there", estate.name, detail, link]
 
 
-def queue_broadcast(db: Session, *, estate: Estate, preset: str, detail: str | None, min_price, sent_by: str | None) -> tuple[str, int]:
+def queue_broadcast(db: Session, *, estate: Estate, preset: str, detail: str | None, min_price, sent_by: str | None, image_style: str | None = None) -> tuple[str, int]:
     """Creates one queued send per active opt-in. The scheduler delivers them in small batches, so a large
-    audience never ties up a request and stays within WhatsApp's rate limits."""
+    audience never ties up a request and stays within WhatsApp's rate limits.
+
+    Each send carries a link to the estate's flyer design as its header image, once the approved
+    template has an IMAGE header for it to fill (see social_whatsapp.template_images_enabled)."""
     if preset not in social_whatsapp.PRESETS:
         raise ValueError("Unknown message type")
     name = social_whatsapp.template_name(preset)
     optins = db.query(EstateMarketingOptin).filter(EstateMarketingOptin.estate_id == estate.id, EstateMarketingOptin.status == "active", EstateMarketingOptin.channel == "whatsapp").limit(social_whatsapp.MAX_BROADCAST).all()
     default_detail = f"from {naira_short(min_price)}" if min_price else "see the latest details"
     link = share_page_url(estate, source="whatsapp-updates")
+    image_url = social_posts.broadcast_image_url(estate.id, image_style or "promo") if social_whatsapp.template_images_enabled() else None
     batch = str(uuid.uuid4())
     for optin in optins:
         first = (optin.full_name or "").strip().split(" ")[0] if optin.full_name else ""
         db.add(EstateWhatsappSend(
             organization_id=estate.organization_id, estate_id=estate.id, optin_id=optin.id, batch_uid=batch, template_name=name,
             params=_params_for(preset, first_name=first, estate=estate, detail=(detail or default_detail), link=link), status="queued", sent_by_subject_id=sent_by,
+            image_url=image_url,
         ))
     db.flush()
     return batch, len(optins)
@@ -114,7 +119,7 @@ def process_queued_whatsapp_sends(db: Session) -> dict[str, int]:
             _record(db, row, optin)
             continue
         try:
-            row.provider_message_id = social_whatsapp.send_template(optin.phone_digits, row.template_name, list(row.params or []))
+            row.provider_message_id = social_whatsapp.send_template(optin.phone_digits, row.template_name, list(row.params or []), header_image_url=row.image_url)
             row.status = "sent"
             sent += 1
         except social_whatsapp.WhatsAppError as exc:

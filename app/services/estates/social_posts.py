@@ -42,6 +42,22 @@ def post_image_url(post: EstateSocialPost, channel: str) -> str:
     return f"{api_url()}/estates/marketing/social/image/{token}.png"
 
 
+def broadcast_image_url(estate_id: int, style: str) -> str:
+    """A signed, expiring address for the flyer design attached to a WhatsApp broadcast's header."""
+    token = make_signed_token("wai", estate_id, style, ttl_seconds=IMAGE_TOKEN_TTL_SECONDS)
+    return f"{api_url()}/estates/marketing/social/whatsapp-image/{token}.png"
+
+
+def read_broadcast_image_token(token: str) -> tuple[int, str] | None:
+    parts = read_signed_token(token, "wai")
+    if not parts or len(parts) != 2:
+        return None
+    try:
+        return int(parts[0]), parts[1]
+    except ValueError:
+        return None
+
+
 def read_image_token(token: str) -> tuple[int, str] | None:
     parts = read_signed_token(token, "img")
     if not parts or len(parts) != 2:

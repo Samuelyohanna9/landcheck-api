@@ -31,7 +31,18 @@ WHATSAPP_APP_SECRET=<app secret; falls back to META_APP_SECRET>
 WA_TEMPLATE_NEW_PLOTS=estate_new_plots
 WA_TEMPLATE_PRICE_UPDATE=estate_price_update
 WA_TEMPLATE_INSPECTION=estate_inspection_invite
+WHATSAPP_TEMPLATE_IMAGES=false                      # true once every template below has an approved IMAGE header
 ```
+
+### WhatsApp templates carrying a flyer design
+
+Facebook and Instagram posts already carry one of the five flyer designs. To have WhatsApp updates carry
+one too, each of the three templates above must be edited in WhatsApp Manager to add an **IMAGE** header
+component above the body text, and re-submitted for approval (Meta re-reviews template edits, usually
+within a day). Once all three are approved with an image header, set `WHATSAPP_TEMPLATE_IMAGES=true` and
+restart the API - staff then get a design picker (the same five styles as Facebook/Instagram) when sending
+a broadcast, and the estate's flyer is sent as the header image. Leave this flag `false` (the default)
+until the templates are updated - sending a header Meta does not expect will make the message fail.
 
 Then `docker compose build api && docker compose up -d api` (runs `alembic upgrade head`, migration `20260926_0035`).
 `cryptography` is now in `requirements.txt`, so a rebuild is required.

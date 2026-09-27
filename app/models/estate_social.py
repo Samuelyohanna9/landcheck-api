@@ -147,6 +147,7 @@ class EstateWhatsappSend(Base):
     batch_uid = Column(String(36), nullable=False)
     template_name = Column(String(120), nullable=False)
     params = Column(JSON, nullable=False, default=list)
+    image_url = Column(String(500), nullable=True)  # the flyer design attached as the template's header image
     status = Column(String(16), nullable=False, default="queued")  # queued | sent | failed | skipped
     provider_message_id = Column(String(120), nullable=True)
     error = Column(Text, nullable=True)
