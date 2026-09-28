@@ -271,6 +271,7 @@ def _public_estate_payload(db: Session, estate: Estate) -> dict:
         "organization_name": organization.name if organization else None,
         "organization_email": organization.contact_email if organization else None,
         "logo_url": f"/estates/public/{estate.public_slug}/logo" if estate.public_logo_object_key else None,
+        "cover_url": f"/estates/public/{estate.public_slug}/cover" if estate.public_cover_object_key else None,
         "tagline": estate.public_tagline,
         "description": estate.public_description or estate.description,
         "location": estate.location_text or ", ".join(filter(None, [estate.locality, estate.state])) or None,
@@ -419,6 +420,16 @@ def public_estate_logo(slug: str, db: Session = Depends(get_db)):
     if not estate.public_logo_object_key:
         raise HTTPException(status_code=404, detail="Logo not available")
     data, mime = read_private_estate_file(estate.public_logo_object_key)
+    return Response(data, media_type=mime, headers={"Cache-Control": "public, max-age=3600"})
+
+
+@router.get("/public/{slug}/cover")
+def public_estate_cover(slug: str, db: Session = Depends(get_db)):
+    """Serve the company's chosen public-page hero photo. A 404 here just means the page uses the built-in default image instead."""
+    estate = _public_estate(db, slug)
+    if not estate.public_cover_object_key:
+        raise HTTPException(status_code=404, detail="Cover photo not available")
+    data, mime = read_private_estate_file(estate.public_cover_object_key)
     return Response(data, media_type=mime, headers={"Cache-Control": "public, max-age=3600"})
 
 
@@ -1067,6 +1078,7 @@ def get_public_estate_settings(estate_id: int, request: Request, db: Session = D
         "public_whatsapp_number": estate.public_whatsapp_number,
         "public_meeting_point": estate.public_meeting_point if isinstance(estate.public_meeting_point, dict) else None,
         "public_logo_path": f"/estates/public/{estate.public_slug}/logo" if estate.public_logo_object_key else None,
+        "public_cover_path": f"/estates/public/{estate.public_slug}/cover" if estate.public_cover_object_key else None,
         "public_show_prices": bool(estate.public_show_prices),
         "payment_plan": estate.public_payment_plan or [],
         "can_publish": estate.status == "active" and db.query(EstatePlot).filter(EstatePlot.estate_id == estate.id, EstatePlot.geometry_status == "approved").count() > 0,
@@ -1320,6 +1332,77 @@ async def upload_public_estate_logo(estate_id: int, request: Request, file: Uplo
         if settings:
             delete_object_best_effort(settings, previous_key)
     return {"logo_path": f"/estates/public/{estate.public_slug}/logo" if estate.public_slug else None}
+
+
+@router.post("/{estate_id}/public-cover")
+async def upload_public_estate_cover(estate_id: int, request: Request, file: UploadFile = File(...), db: Session = Depends(get_db)):
+    """The public page's hero background photo. Companies can upload their own or leave it unset
+    to keep the built-in default - see _public_estate_payload's cover_url and PublicEstatePage.tsx."""
+    estate = db.get(Estate, estate_id)
+    if not estate:
+        raise HTTPException(404, "Estate not found")
+    access = require_estate_access(db, request, estate.organization_id, permission="estate.manage")
+    _enabled(db, estate.organization_id)
+    if str(file.content_type or "").lower() not in {"image/png", "image/jpeg"}:
+        raise HTTPException(422, "Upload a PNG or JPEG photo")
+    data = await file.read()
+    if len(data) > 8 * 1024 * 1024:
+        raise HTTPException(413, "Cover photo must be 8 MB or smaller")
+    organization = db.get(EstateOrganization, estate.organization_id)
+    if not organization:
+        raise HTTPException(404, "Estate company not found")
+    stored = store_private_estate_file(
+        organization_uid=organization.organization_uid,
+        category="public-assets",
+        entity_uid=f"estate_{estate.estate_uid}",
+        filename=file.filename or "estate-cover.jpg",
+        content_type=file.content_type or "",
+        data=data,
+    )
+    previous_key = estate.public_cover_object_key
+    estate.public_cover_object_key = stored.object_key
+    append_estate_audit_event(
+        db,
+        organization_id=estate.organization_id,
+        actor=access.principal,
+        action="estate.public_cover_updated",
+        entity_type="estate",
+        entity_id=estate.id,
+        after_data={"filename": stored.filename},
+    )
+    db.commit()
+    if previous_key:
+        settings = build_r2_settings(prefix="R2")
+        if settings:
+            delete_object_best_effort(settings, previous_key)
+    return {"cover_path": f"/estates/public/{estate.public_slug}/cover" if estate.public_slug else None}
+
+
+@router.delete("/{estate_id}/public-cover", status_code=204)
+def remove_public_estate_cover(estate_id: int, request: Request, db: Session = Depends(get_db)):
+    """Switch the public page's hero photo back to the built-in default."""
+    estate = db.get(Estate, estate_id)
+    if not estate:
+        raise HTTPException(404, "Estate not found")
+    access = require_estate_access(db, request, estate.organization_id, permission="estate.manage")
+    _enabled(db, estate.organization_id)
+    previous_key = estate.public_cover_object_key
+    if not previous_key:
+        return Response(status_code=204)
+    estate.public_cover_object_key = None
+    append_estate_audit_event(
+        db,
+        organization_id=estate.organization_id,
+        actor=access.principal,
+        action="estate.public_cover_removed",
+        entity_type="estate",
+        entity_id=estate.id,
+    )
+    db.commit()
+    settings = build_r2_settings(prefix="R2")
+    if settings:
+        delete_object_best_effort(settings, previous_key)
+    return Response(status_code=204)
 
 
 @router.get("/{estate_id}/reservation-requests")

@@ -112,6 +112,7 @@ class Estate(Base):
     public_tagline = Column(String(255), nullable=True)
     public_contact_phone = Column(String(64), nullable=True)
     public_logo_object_key = Column(String(512), nullable=True)
+    public_cover_object_key = Column(String(512), nullable=True)  # hero background photo; falls back to the built-in default when unset
     public_show_prices = Column(Boolean, nullable=False, default=True)
     public_payment_plan = Column(JSON, nullable=True)
     public_development_forecast = Column(JSON, nullable=True)
