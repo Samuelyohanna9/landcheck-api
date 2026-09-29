@@ -2816,6 +2816,7 @@ def _soil_preview_payload(risk_value: float, risk_class: str, breakdown: dict) -
         "drainage_proximity_score": breakdown.get("drainage_proximity_score"),
         "presumptive_bearing_capacity": breakdown.get("presumptive_bearing_capacity"),
         "water_table": breakdown.get("water_table"),
+        "soil_profile": breakdown.get("soil_profile", []),
         "note": "Soil and terrain screening for this site, from satellite soil texture and terrain data.",
         "scope_note": breakdown.get("scope_note"),
         "data_available": bool(breakdown.get("data_available", True)),

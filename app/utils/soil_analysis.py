@@ -47,10 +47,25 @@ What this module can and can't do, and why:
   precision. This module reports a relative tendency class (shallow/moderate/deep) plus the raw
   TWI value, never a depth in metres.
 
-- Subsurface soil layers / stratigraphy: NOT provided, full stop. Radar penetrates at most a few
-  centimetres into soil (L-band ~5cm, longer wavelengths only slightly more, and even that is
-  uncertain - see hazard_pluvial.py-adjacent research). There is no satellite-based way to see
-  meters-deep subsurface layers, and this module makes no attempt to.
+- Subsurface soil profile (0-2m): SoilGrids/OpenLandMap actually models sand/clay fraction at six
+  standard depths (0, 10, 30, 60, 100, 200cm - see _SOIL_DEPTH_BANDS), not just the surface, so this
+  module reports an indicative TEXTURE-BY-DEPTH profile to 2m (soil_profile in the breakdown). This
+  is genuinely useful and was missing from an earlier version of this module - but it is NOT
+  geological subsurface imaging: it's a ~250m-resolution machine-learning model trained on a global
+  soil-profile database (Hengl et al., 2017), reporting the SAME kind of texture reading as the
+  surface value, just modeled separately at each depth. It cannot identify bedrock depth, a water
+  table, distinct geological strata, or any engineering-classified layer boundary - those need an
+  actual borehole log.
+
+  Radar-based subsurface sensing (P-/L-band SAR) is real - the classic case is NASA's Shuttle
+  Imaging Radar finding buried paleo-river channels under the Eastern Sahara - but it strictly
+  requires extremely dry, fine-grained sand with minimal vegetation (moisture reflects radar and
+  blocks penetration; grain size must be under ~1/5 of the radar wavelength). Nigeria's actual
+  climate and soils (moist, clay-bearing, vegetated) are the opposite of that condition, and even
+  where the technique works, it resolves kilometre-scale ancient river channels/geology, not a
+  single plot's engineering strata. It genuinely does not apply here, and this module does not use
+  it. Satellite gravimetry (GRACE/GRACE-FO) is real for continental aquifer-depletion trends but
+  resolves at ~300km - equally inapplicable to a single plot.
 """
 
 # Same OpenLandMap/SoilGrids250m asset IDs hazard_pluvial.py already reads for its Hydrologic
@@ -59,6 +74,12 @@ _SOIL_SAND_ASSET = "OpenLandMap/SOL/SOL_SAND-WFRACTION_USDA-3A1A1A_M/v02"
 _SOIL_CLAY_ASSET = "OpenLandMap/SOL/SOL_CLAY-WFRACTION_USDA-3A1A1A_M/v02"
 _SOIL_BAND = "b0"
 _SOIL_SCALE_M = 250
+
+# SoilGrids/OpenLandMap models sand/clay fraction at six standard depths, one band per depth on
+# the same image (confirmed against the Earth Engine Data Catalog entry for this exact asset) -
+# not a single surface-only reading. This is what supports the indicative soil_profile reading
+# (see the module docstring's "Subsurface soil profile" section for what it can't tell us).
+_SOIL_DEPTH_BANDS = [0, 10, 30, 60, 100, 200]
 
 # A = high infiltration/sandy (best natural drainage) ... D = low infiltration/clayey (poorest
 # natural drainage, most prone to waterlogging and expansive-soil behaviour).
@@ -75,12 +96,13 @@ BS8004_BEARING_TABLE = {
 }
 
 SOIL_SCOPE_NOTE = (
-    "This is a satellite- and terrain-based screening, not a soil test. The bearing-capacity range "
-    "and water-table tendency below are indicative, from published texture and terrain methods "
-    "(see references) - not measurements. They do not, and cannot, determine soil density or "
-    "consistency (which materially changes bearing capacity), or subsurface soil layers / "
-    "stratigraphy at any depth. For any foundation design decision, commission a licensed "
-    "geotechnical investigation (boreholes, SPT/CPT testing, and lab soil analysis)."
+    "This is a satellite- and terrain-based screening, not a soil test. The bearing-capacity "
+    "range, water-table tendency, and 0-2m soil profile below are indicative, from published "
+    "texture and terrain methods (see references) - not measurements. They do not, and cannot, "
+    "determine soil density or consistency (which materially changes bearing capacity), or "
+    "identify bedrock depth, distinct geological strata, or any engineering-classified subsurface "
+    "layer. For any foundation design decision, commission a licensed geotechnical investigation "
+    "(boreholes, SPT/CPT testing, and lab soil analysis)."
 )
 
 SOIL_ANALYSIS_REFERENCES = [
@@ -157,6 +179,50 @@ def _water_table_tendency(twi_value: Optional[float]) -> Dict[str, Any]:
             "water table depth - see references. Confirm actual depth with a borehole/piezometer."
         ),
     }
+
+
+def _texture_label(sand_pct: Optional[float], clay_pct: Optional[float]) -> str:
+    if sand_pct is None or clay_pct is None:
+        return "unavailable"
+    if sand_pct >= 70 and clay_pct < 15:
+        return "sandy"
+    if clay_pct >= 35:
+        return "clayey"
+    return "loamy/mixed"
+
+
+def _fetch_soil_profile(analysis_region: "ee.Geometry") -> List[Dict[str, Any]]:
+    """Sand/clay fraction at each of SoilGrids' six standard depths, in one combined EE round-trip
+    (same batching idiom hazard_erosion.py already uses) - an indicative texture-by-depth reading
+    to 2m, not a borehole log. See the module docstring for exactly what this can't tell us."""
+    try:
+        sand_img = ee.Image(_SOIL_SAND_ASSET)
+        clay_img = ee.Image(_SOIL_CLAY_ASSET)
+        fields: Dict[str, Any] = {}
+        for depth_cm in _SOIL_DEPTH_BANDS:
+            band = f"b{depth_cm}"
+            fields[f"sand_{depth_cm}"] = sand_img.select(band).reduceRegion(
+                reducer=ee.Reducer.mean(), geometry=analysis_region, scale=_SOIL_SCALE_M, maxPixels=1e9,
+            ).get(band)
+            fields[f"clay_{depth_cm}"] = clay_img.select(band).reduceRegion(
+                reducer=ee.Reducer.mean(), geometry=analysis_region, scale=_SOIL_SCALE_M, maxPixels=1e9,
+            ).get(band)
+        combined = ee.Dictionary(fields).getInfo()
+    except Exception:
+        return []
+    profile = []
+    for depth_cm in _SOIL_DEPTH_BANDS:
+        sand_val = combined.get(f"sand_{depth_cm}")
+        clay_val = combined.get(f"clay_{depth_cm}")
+        if sand_val is None or clay_val is None:
+            continue
+        profile.append({
+            "depth_cm": depth_cm,
+            "sand_pct": round(float(sand_val), 1),
+            "clay_pct": round(float(clay_val), 1),
+            "texture": _texture_label(float(sand_val), float(clay_val)),
+        })
+    return profile
 
 
 def compute_soil_analysis(
@@ -256,9 +322,12 @@ def compute_soil_analysis(
         factor_sources, factor_weights, local_point_count=local_soil_point_count, plot_area_ha=plot_area_ha,
     )
 
-    report("Estimating bearing capacity and water table tendency...", 88)
+    report("Estimating bearing capacity and water table tendency...", 85)
     bearing_capacity = _presumptive_bearing_capacity(hydrologic_soil_group, sand_pct, clay_pct)
     water_table = _water_table_tendency(twi_value)
+
+    report("Reading soil profile to 2m depth...", 90)
+    soil_profile = _fetch_soil_profile(analysis_region)
 
     breakdown: Dict[str, Any] = {
         "hydrologic_soil_group": hydrologic_soil_group,
@@ -274,6 +343,7 @@ def compute_soil_analysis(
         "confidence": confidence,
         "presumptive_bearing_capacity": bearing_capacity,
         "water_table": water_table,
+        "soil_profile": soil_profile,
         "scope_note": SOIL_SCOPE_NOTE,
         "_references": SOIL_ANALYSIS_REFERENCES,
     }
