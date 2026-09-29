@@ -59,6 +59,18 @@ FLOOD_REFERENCES_TERRAIN_PROXY = [
     HYDROSHEDS_REFERENCE,
 ]
 
+GROUND_REFERENCES = [
+    {
+        "short": "Hengl et al. (2017)",
+        "citation": (
+            "Hengl, T., Mendes de Jesus, J., Heuvelink, G.B.M., et al. (2017). SoilGrids250m: "
+            "Global gridded soil information based on machine learning. PLoS ONE, 12(2), e0169748."
+        ),
+        "url": "https://doi.org/10.1371/journal.pone.0169748",
+    },
+    HYDROSHEDS_REFERENCE,
+]
+
 EROSION_REFERENCES = [
     {
         "short": "Renard et al. (1997)",

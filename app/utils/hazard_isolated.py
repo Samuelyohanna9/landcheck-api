@@ -5,11 +5,11 @@ from __future__ import annotations
 
 def screen_boundary(boundary: dict) -> dict:
     from app.db import SessionLocal
-    from app.routers.hazards import erosion_preview, flood_preview
+    from app.routers.hazards import erosion_preview, flood_preview, ground_preview
 
     payload = {"boundary": boundary, "show_raster": False}
     db = SessionLocal()
     try:
-        return {"flood": flood_preview(payload, db), "erosion": erosion_preview(payload, db)}
+        return {"flood": flood_preview(payload, db), "erosion": erosion_preview(payload, db), "ground": ground_preview(payload, db)}
     finally:
         db.close()

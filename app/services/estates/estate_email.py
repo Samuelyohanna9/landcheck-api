@@ -341,6 +341,62 @@ def notify_reservation_request(
         return False
 
 
+def notify_geotech_survey_request(
+    *,
+    organization_name: str,
+    estate_name: str,
+    plot_number: str | None = None,
+    requested_by_name: str | None = None,
+    contact_name: str | None = None,
+    contact_phone: str | None = None,
+    contact_email: str | None = None,
+    note: str | None = None,
+) -> bool:
+    """Notify LandCheck's own team that an Estate staff member requested a geotechnical survey -
+    the honest handoff from the Ground & Drainage screening, which is explicitly not a soil test
+    and can't answer load-bearing capacity, water table depth, or subsurface layer questions.
+    Unlike notify_reservation_request (a public buyer lead sent to the Estate's own team), this
+    goes to LandCheck's own admin address, since LandCheck - not the Estate - is the one who would
+    need to source/vet a geotechnical partner for the customer.
+    """
+    scope_line = f"Plot {html.escape(plot_number)}" if plot_number else "the whole Estate boundary"
+    contact_bits = []
+    if contact_name:
+        contact_bits.append(f"<p><strong>Contact name:</strong> {html.escape(contact_name)}</p>")
+    if contact_phone:
+        contact_bits.append(f"<p><strong>Phone:</strong> {html.escape(contact_phone)}</p>")
+    if contact_email:
+        contact_bits.append(f"<p><strong>Email:</strong> {html.escape(contact_email)}</p>")
+    if note:
+        contact_bits.append(f"<p><strong>Note:</strong><br/>{html.escape(str(note).strip())}</p>")
+    contact_html = "".join(contact_bits)
+    message_html = (
+        f"<p><strong>{html.escape(organization_name)}</strong> requested a geotechnical survey for "
+        f"{scope_line} at <strong>{html.escape(estate_name)}</strong>, from the Estate dashboard's "
+        "Ground &amp; Drainage screening."
+        + (f" Requested by {html.escape(requested_by_name)}." if requested_by_name else "")
+        + "</p>"
+        f"{contact_html}"
+        "<p>This screening is satellite-based and explicitly does not measure load-bearing "
+        "capacity, water table depth, or subsurface soil layers - follow up to connect this "
+        "customer with a licensed geotechnical investigation.</p>"
+    )
+    body_html = _account_wrap_html(heading="Geotechnical survey requested", message_html=message_html)
+    body_text = _account_plain_text("Geotechnical survey requested", message_html)
+    try:
+        _send_email(
+            to_email="admin@landcheck.online",
+            from_display_name="LandCheck Estates",
+            subject=f"Geotechnical survey requested - {estate_name}",
+            body_text=body_text,
+            body_html=body_html,
+        )
+        return True
+    except Exception:
+        logger.exception("Geotech survey request notification failed (estate=%s, plot=%s)", estate_name, plot_number)
+        return False
+
+
 def send_public_reservation_welcome(
     *,
     to_email: str | None,

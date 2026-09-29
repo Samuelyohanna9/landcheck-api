@@ -14,7 +14,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from types import SimpleNamespace
-from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, Request, UploadFile
+from fastapi import APIRouter, Body, Depends, File, Form, Header, HTTPException, Request, UploadFile
 from fastapi.responses import Response
 from reportlab.graphics import renderPDF
 from reportlab.graphics.barcode import qr
@@ -34,7 +34,7 @@ from app.routers.plots import _metric_epsg_for_wgs84_polygon, _subdivide_polygon
 from app.services.estates.authorization import list_estate_access, resolve_estate_principal
 from app.services.estates.identity import slugify
 from app.services.estates.entitlements import ESTATE_FEATURES, get_estate_entitlement
-from app.models.estate_foundation import Estate, EstateAgentPortalToken, EstateAllocation, EstateAuditEvent, EstateBlock, EstateCommissionPayout, EstateCommissionTier, EstateCustomer, EstateCustomerPortalToken, EstateDocument, EstateDocumentLink, EstateFieldInspection, EstateHazardAssessment, EstateImportReview, EstateLayoutProposal, EstateNotificationLog, EstateOrganization, EstateOrganizationMember, EstatePayment, EstatePaymentInbox, EstatePaymentRule, EstatePlot, EstatePublicReservationRequest, EstateQrCampaign, EstateSpatialFeature, EstateSurveyRequest, EstateStakingTask
+from app.models.estate_foundation import Estate, EstateAgentPortalToken, EstateAllocation, EstateAuditEvent, EstateBlock, EstateCommissionPayout, EstateCommissionTier, EstateCustomer, EstateCustomerPortalToken, EstateDocument, EstateDocumentLink, EstateFieldInspection, EstateHazardAssessment, EstateImportReview, EstateLayoutProposal, EstateNotificationLog, EstateOrganization, EstateOrganizationMember, EstatePayment, EstatePaymentInbox, EstatePaymentRule, EstatePlot, EstatePublicReservationRequest, EstateQrCampaign, EstateSpatialFeature, EstateSurveyRequest, EstateStakingTask, GeotechSurveyRequest
 from app.schemas.estates import AllocationAction, BlockCreate, BlockUpdate, CommissionPayoutCreate, CommissionTiersUpdate, CustomerCreate, DevelopmentForecastPublishUpdate, DevelopmentStatusUpdate, EstateCreate, EstateLayoutCriteria, EstateLayoutDecision, EstateLayoutFeatureAdd, EstateLayoutFeatureRemove, EstateLayoutProposalEdit, EstateSubdivisionCreate, EstateUpdate, FieldInspectionCreate, GeoreferenceSessionLink, ImportFromGeoreference, ImportReviewCreate, ImportReviewDecision, ImportReviewFromGeoreferenceSession, MemberCreate, MemberUpdate, PaymentInboxCreate, PaymentInboxMatch, PlotCreate, PlotAddressUpdate, PlotGeometryUpdate, PlotListingDefaultsUpdate, PlotPriceUpdate, PortalTokenCreate, PublicEstateSettingsUpdate, PublicReservationConvert, PublicReservationCreate, PublicReservationUpdate, PaymentCreate, QrCampaignCreate, SpatialFeatureCreate, SpatialFeatureUpdate, SurveyEligibilityUpdate, VoidAction
 from app.services.estates.payments import confirm_payment, financial_summary, record_payment, void_payment
 from app.services.estates.documents import read_private_estate_file, store_private_estate_file
@@ -2600,11 +2600,11 @@ def estate_quality_check(estate_id:int, request:Request, db:Session=Depends(get_
 def _calculate_plot_hazards(geometry, db: Session | None, heartbeat=None) -> dict:
     """`geometry` is a stored plot geometry or an already-converted GeoJSON boundary. With no `db`
     a short-lived session is used, so a connection is only taken if the analysis actually queries."""
-    from app.routers.hazards import erosion_preview, flood_preview
+    from app.routers.hazards import erosion_preview, flood_preview, ground_preview
     boundary = geometry if isinstance(geometry, dict) else mapping(to_shape(geometry))
     payload = {"boundary": boundary, "show_raster": False}
     if db is not None:
-        return {"flood": flood_preview(payload, db), "erosion": erosion_preview(payload, db)}
+        return {"flood": flood_preview(payload, db), "erosion": erosion_preview(payload, db), "ground": ground_preview(payload, db)}
     # Estate-sized areas can need far more memory than a plot. Run in a child process that is
     # stopped at a memory ceiling, so one heavy analysis can never OOM-kill the API worker.
     from app.utils.hazard_isolated import screen_boundary
@@ -2666,8 +2666,8 @@ def _require_plus_plan(db: Session, organization_id: int, feature_name: str) -> 
 
 
 def _require_hazard_plan(db: Session, organization_id: int) -> None:
-    """Flood/erosion hazard analysis is a Plus-plan feature."""
-    _require_plus_plan(db, organization_id, "Hazard analysis (flood and erosion)")
+    """Flood/erosion/ground hazard analysis is a Plus-plan feature."""
+    _require_plus_plan(db, organization_id, "Hazard analysis (flood, erosion and ground)")
 
 
 @router.get("/plots/{plot_id}/hazards")
@@ -2683,12 +2683,12 @@ def plot_hazards(plot_id: int, request: Request, db: Session = Depends(get_db)):
         raise HTTPException(409, "Only approved plot geometry can be screened")
     # Newest record per hazard only - a plot can carry many earlier runs, each with full map images.
     latest = {}
-    for hazard_type in ("flood", "erosion"):
+    for hazard_type in ("flood", "erosion", "ground"):
         row = db.query(EstateHazardAssessment).filter(EstateHazardAssessment.plot_id == plot.id, EstateHazardAssessment.hazard_type == hazard_type).order_by(EstateHazardAssessment.assessed_at.desc()).first()
         if row is not None:
             latest[hazard_type] = row
-    if {"flood", "erosion"}.issubset(latest):
-        return {"plot_id": plot.id, "persisted": True, "flood": latest["flood"].result_payload, "erosion": latest["erosion"].result_payload}
+    if {"flood", "erosion", "ground"}.issubset(latest):
+        return {"plot_id": plot.id, "persisted": True, "flood": latest["flood"].result_payload, "erosion": latest["erosion"].result_payload, "ground": latest["ground"].result_payload}
     return {"plot_id": plot.id, "persisted": False, **_calculate_plot_hazards(plot.geometry, db)}
 
 
@@ -2793,6 +2793,65 @@ def assess_estate_hazards(estate_id: int, request: Request, db: Session = Depend
         worker=_run_estate_hazard_assessment_job,
     )
     return serialize_hazard_job(job)
+
+
+def _create_geotech_survey_request(db: Session, *, estate: Estate, plot_id: int | None, plot_number: str | None, access, payload: dict) -> GeotechSurveyRequest:
+    row = GeotechSurveyRequest(
+        organization_id=estate.organization_id,
+        estate_id=estate.id,
+        plot_id=plot_id,
+        requested_by_subject_type=access.principal.subject_type,
+        requested_by_subject_id=access.principal.subject_id,
+        contact_name=str(payload.get("contact_name") or access.principal.display_name or "").strip() or None,
+        contact_phone=str(payload.get("contact_phone") or "").strip() or None,
+        contact_email=str(payload.get("contact_email") or "").strip() or None,
+        note=str(payload.get("note") or "").strip() or None,
+    )
+    db.add(row)
+    db.flush()
+    append_estate_audit_event(
+        db, organization_id=estate.organization_id, actor=access.principal, action="hazard.geotech_survey_requested",
+        entity_type="estate_plot" if plot_id else "estate", entity_id=plot_id or estate.id,
+        after_data={"request_id": row.id},
+    )
+    db.commit()
+    estate_email.notify_geotech_survey_request(
+        organization_name=access.organization_name,
+        estate_name=estate.name,
+        plot_number=plot_number,
+        requested_by_name=access.principal.display_name,
+        contact_name=row.contact_name,
+        contact_phone=row.contact_phone,
+        contact_email=row.contact_email,
+        note=row.note,
+    )
+    return row
+
+
+@router.post("/plots/{plot_id}/hazards/geotech-request")
+def request_plot_geotech_survey(plot_id: int, request: Request, payload: dict = Body(default={}), db: Session = Depends(get_db)):
+    """The honest follow-through on the Ground & Drainage screening's scope note: it can't answer
+    load-bearing capacity, water table depth, or subsurface-layer questions, so this raises a real
+    lead for LandCheck's team to connect the customer with a licensed geotechnical investigation."""
+    plot = db.get(EstatePlot, plot_id)
+    if not plot:
+        raise HTTPException(404, "Plot not found")
+    estate = db.get(Estate, plot.estate_id)
+    access = require_estate_access(db, request, estate.organization_id, permission="plot.manage")
+    _require_hazard_plan(db, estate.organization_id)
+    row = _create_geotech_survey_request(db, estate=estate, plot_id=plot.id, plot_number=plot.plot_number, access=access, payload=payload)
+    return {"id": row.id, "request_uid": row.request_uid, "status": row.status}
+
+
+@router.post("/{estate_id}/hazards/geotech-request")
+def request_estate_geotech_survey(estate_id: int, request: Request, payload: dict = Body(default={}), db: Session = Depends(get_db)):
+    estate = db.get(Estate, estate_id)
+    if not estate:
+        raise HTTPException(404, "Estate not found")
+    access = require_estate_access(db, request, estate.organization_id, permission="plot.manage")
+    _require_hazard_plan(db, estate.organization_id)
+    row = _create_geotech_survey_request(db, estate=estate, plot_id=None, plot_number=None, access=access, payload=payload)
+    return {"id": row.id, "request_uid": row.request_uid, "status": row.status}
 
 
 def _own_rss_mb() -> float:

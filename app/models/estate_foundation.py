@@ -198,6 +198,35 @@ class EstatePublicReservationRequest(Base):
     )
 
 
+class GeotechSurveyRequest(Base):
+    """A staff-initiated request (from the Estate dashboard's Hazard tab) to have a licensed
+    geotechnical survey done for a plot or a whole Estate - the honest follow-through on the
+    Ground & Drainage screening's scope note, which explicitly does not measure load-bearing
+    capacity, water table depth, or subsurface layers. Unlike EstatePublicReservationRequest, this
+    is raised by an already-authenticated Estate staff member, not an anonymous public visitor."""
+
+    __tablename__ = "estate_geotech_survey_requests"
+
+    id = Column(Integer, primary_key=True)
+    request_uid = Column(String(36), nullable=False, unique=True, default=lambda: str(uuid.uuid4()))
+    organization_id = Column(Integer, ForeignKey("estate_organizations.id", ondelete="CASCADE"), nullable=False)
+    estate_id = Column(Integer, ForeignKey("estate_estates.id", ondelete="CASCADE"), nullable=False)
+    plot_id = Column(Integer, ForeignKey("estate_plots.id", ondelete="CASCADE"), nullable=True)
+    requested_by_subject_type = Column(String(64), nullable=False)
+    requested_by_subject_id = Column(String(128), nullable=False)
+    contact_name = Column(String(255), nullable=True)
+    contact_phone = Column(String(64), nullable=True)
+    contact_email = Column(String(255), nullable=True)
+    note = Column(Text, nullable=True)
+    status = Column(String(32), nullable=False, default="new")
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
+
+    __table_args__ = (
+        CheckConstraint("status IN ('new', 'contacted', 'completed', 'declined')", name="ck_geotech_survey_request_status"),
+    )
+
+
 class EstateCustomer(Base):
     __tablename__ = "estate_customers"
     id = Column(Integer, primary_key=True)

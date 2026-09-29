@@ -16,6 +16,7 @@ from app.utils.hazard_flood import compute_flood_risk, overlay_to_data_url as fl
 from app.utils.hazard_floodplain import compute_floodplain_risk, floodplain_overlay_to_data_url
 from app.utils.hazard_pluvial import compute_pluvial_risk, pluvial_overlay_to_data_url
 from app.utils.hazard_erosion import compute_erosion_risk, overlay_to_data_url as erosion_overlay_to_data_url
+from app.utils.hazard_ground import compute_ground_risk
 from app.utils.hazard_lulc import compute_lulc_summary, overlay_to_data_url as lulc_overlay_to_data_url
 from app.utils.hazard_pdf import render_flood_report_pdf, render_erosion_report_pdf, render_lulc_report_pdf
 from app.utils.hazard_gis_export import build_hazard_gis_export_zip
@@ -666,6 +667,57 @@ def erosion_pdf(payload: dict = Body(...), db: Session = Depends(get_db)):
     return _pdf_response_with_r2(pdf_path, "erosion_risk_report.pdf", "hazard-erosion")
 
 
+# ---------------- GROUND & DRAINAGE ----------------
+# A drainage/waterlogging screening, deliberately NOT framed as a soil test - see
+# hazard_ground.py's module docstring and GROUND_SCOPE_NOTE for why. No raster overlay or PDF/GIS
+# export yet (compute_ground_risk always returns overlay_png=None) - the Estate dashboard only
+# needs the preview payload today (see estates.py's _calculate_plot_hazards); a map overlay and
+# report export can follow later the same way erosion's did.
+
+def _ground_preview_payload(risk_value, risk_class, class_color, breakdown, legend) -> dict:
+    return {
+        "risk_score": f"{round(risk_value * 100, 1)}",
+        "risk_class": risk_class,
+        "class_color": class_color,
+        "hydrologic_soil_group": breakdown.get("hydrologic_soil_group"),
+        "sand_pct": breakdown.get("sand_pct"),
+        "clay_pct": breakdown.get("clay_pct"),
+        "distance_to_drainage_m": breakdown.get("distance_to_drainage_m"),
+        "soil_drainage_score": breakdown.get("soil_drainage_score"),
+        "drainage_proximity_score": breakdown.get("drainage_proximity_score"),
+        "note": "Drainage and waterlogging screening for this site, from satellite soil texture and drainage-network data.",
+        "scope_note": breakdown.get("scope_note"),
+        "legend": legend,
+        "data_available": bool(breakdown.get("data_available", True)),
+        "soil_source": breakdown.get("soil_source", "unavailable"),
+        "analysis_mode": breakdown.get("analysis_mode", "hybrid"),
+        "data_sources": breakdown.get("data_sources"),
+        "confidence": breakdown.get("confidence"),
+        "references": breakdown.get("_references", []),
+    }
+
+
+@router.post("/ground/preview")
+def ground_preview(payload: dict = Body(...), db: Session = Depends(get_db)):
+    boundary = _extract_boundary(payload)
+    local_elevation_points = _extract_local_elevation_points(payload)
+    site_params = _extract_site_params(payload)
+    try:
+        # show_raster isn't read from payload here - compute_ground_risk has no raster overlay yet
+        # (always returns overlay_png=None), so there's nothing for a "show_raster" flag to turn on.
+        risk_value, risk_class, breakdown, _overlay_png = compute_ground_risk(
+            db, boundary, False, local_elevation_points,
+            analysis_mode=site_params["analysis_mode"],
+        )
+    except Exception as exc:
+        logger.exception("Ground & Drainage preview failed")
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    _, class_color = classify_risk(risk_value, breakdown.get("data_available", True))
+    legend = _build_legend(risk_class, class_color, "This Site", False, [])
+    return _ground_preview_payload(risk_value, risk_class, class_color, breakdown, legend)
+
+
 # ---------------- LAND USE / LAND COVER ----------------
 # Architecturally the odd one out among the three hazard types: purely informational (no risk
 # score/tier/badge - land cover isn't itself a hazard), no OSM buildings, no local-survey inputs.
@@ -943,6 +995,13 @@ def _run_hazard_analysis_job(job_id: str) -> None:
             )
             _, class_color = classify_risk(risk_value, breakdown.get("data_available", True))
             legend = _build_legend(risk_class, class_color, "This Site", show_raster, RASTER_LEGEND_EROSION)
+        elif hazard_type == "ground":
+            risk_value, risk_class, breakdown, overlay_png = compute_ground_risk(
+                db, boundary, show_raster, local_elevation_points,
+                analysis_mode=site_params["analysis_mode"], progress_cb=report,
+            )
+            _, class_color = classify_risk(risk_value, breakdown.get("data_available", True))
+            legend = _build_legend(risk_class, class_color, "This Site", False, [])
         else:  # lulc
             breakdown, overlay_png = compute_lulc_summary(db, boundary, progress_cb=report)
             legend = breakdown.get("legend", [])
@@ -952,6 +1011,8 @@ def _run_hazard_analysis_job(job_id: str) -> None:
                 result = _flood_summary_payload(river_result, floodplain_result, pluvial_result, show_raster, return_period)
             elif hazard_type == "erosion":
                 result = _erosion_preview_payload(risk_value, risk_class, class_color, breakdown, overlay_png, show_raster, legend)
+            elif hazard_type == "ground":
+                result = _ground_preview_payload(risk_value, risk_class, class_color, breakdown, legend)
             else:
                 result = _lulc_preview_payload(breakdown, overlay_png)
             set_hazard_job_status(db, job_id, status="completed", stage="Complete", progress_pct=100, result_payload=result, completed=True)
@@ -1077,7 +1138,7 @@ def _run_hazard_analysis_job(job_id: str) -> None:
 
 @router.post("/{hazard_type}/analyze")
 def create_hazard_analysis_job(hazard_type: str, request: Request, payload: dict = Body(...), db: Session = Depends(get_db)):
-    if hazard_type not in ("flood", "erosion", "lulc"):
+    if hazard_type not in ("flood", "erosion", "lulc", "ground"):
         raise HTTPException(status_code=404, detail="Unknown hazard type")
     output_type = str(payload.get("output_type") or "preview")
     if output_type not in ("preview", "pdf", "gis-export"):
@@ -1088,6 +1149,11 @@ def create_hazard_analysis_job(hazard_type: str, request: Request, payload: dict
         # queuing and polling a job that would always fail) - see _run_hazard_analysis_job's
         # gis-export branch for the defense-in-depth backstop.
         raise HTTPException(status_code=400, detail="GIS export is not available for land cover analysis")
+    if hazard_type == "ground" and output_type != "preview":
+        # Ground & Drainage has no map overlay yet (compute_ground_risk always returns
+        # overlay_png=None), so there's nothing to put in a PDF or GIS export - preview only, for
+        # now (see hazard_ground.py's module docstring).
+        raise HTTPException(status_code=400, detail="PDF and GIS export are not yet available for Ground & Drainage screening")
     request_payload = {
         "geometry": _extract_boundary(payload),
         "show_raster": bool(payload.get("show_raster", False)),
