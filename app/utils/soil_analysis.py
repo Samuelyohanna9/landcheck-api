@@ -133,6 +133,26 @@ SOIL_ANALYSIS_REFERENCES = [
 ]
 
 
+# Plain-language "what this means for you" text, in a builder/buyer's own terms, laid out
+# side-by-side with the technical reading rather than replacing it - a non-technical Estate owner
+# should never have to guess what "75-300 kPa" or "TWI 9.4" implies for their own decision. These
+# are honest, general rules of thumb (not a substitute for the disclaimers above them) - phrased as
+# "usually"/"can" rather than guarantees, since satellite data never lets us say more than that.
+_BEARING_CAPACITY_PLAIN_MEANING = {
+    "sand": "This soil is sandy. Sandy soil usually supports normal homes (bungalows, duplexes) well once properly compacted, but can be loose in places - a soil test confirms how firm it really is before you build.",
+    "sand_or_gravel": "This soil is sandy/gravelly, which is often strong and can usually support larger buildings too - but a soil test should still confirm this before construction.",
+    "clay": "This soil is clayey. Clay can support normal homes, but it tends to swell when wet and shrink when dry - if the foundation isn't designed for that, it can crack walls or floors over time.",
+    "mixed": "This soil is a mix of sand and clay. It usually supports normal residential buildings (bungalows, duplexes) reasonably well, but a soil test is recommended before anything larger or heavier.",
+}
+
+_DRAINAGE_PLAIN_MEANING = {
+    "low": "Good news: this land is likely to drain well after rain, with a low risk of water pooling or waterlogging.",
+    "moderate": "This land may hold some water after heavy rain. Normal site drainage (sloped landscaping, gutters) should be enough, but keep an eye on it in the rainy season.",
+    "high": "This land is likely to hold water after rain. Plan for extra drainage work (e.g. a raised foundation or drainage channels) before building.",
+    "severe": "This land is very likely to waterlog after rain. Site drainage work is strongly recommended before any construction - consider having a professional assess it first.",
+}
+
+
 def _presumptive_bearing_capacity(hydrologic_soil_group: str, sand_pct: Optional[float], clay_pct: Optional[float]) -> Dict[str, Any]:
     if sand_pct is not None and clay_pct is not None:
         if sand_pct >= 70 and clay_pct < 15:
@@ -155,22 +175,37 @@ def _presumptive_bearing_capacity(hydrologic_soil_group: str, sand_pct: Optional
             "capacity within this range depends on soil density/consistency, which satellite data "
             "cannot determine. Confirm with a site-specific geotechnical investigation."
         ),
+        "plain_meaning": _BEARING_CAPACITY_PLAIN_MEANING[key],
     }
+
+
+def _drainage_plain_meaning(risk_class: str) -> str:
+    return _DRAINAGE_PLAIN_MEANING.get(
+        (risk_class or "").lower(),
+        "There isn't enough satellite data to judge drainage for this exact site.",
+    )
 
 
 def _water_table_tendency(twi_value: Optional[float]) -> Dict[str, Any]:
     if twi_value is None:
-        return {"twi": None, "tendency": "unavailable", "note": "Terrain wetness data unavailable for this site."}
+        return {
+            "twi": None, "tendency": "unavailable",
+            "note": "Terrain wetness data unavailable for this site.",
+            "plain_meaning": "There isn't enough terrain data to judge this for this site.",
+        }
     # TWI typically spans roughly -3 (steep ridges, fast drainage) to 30 (flat, high-accumulation
     # valley bottoms). These cut points are a documented-range judgement call (see references),
     # not a calibrated depth-to-water regression - reported as a relative tendency, never a metre
     # figure, for exactly that reason.
     if twi_value < 7:
         tendency = "deeper (well-drained terrain position)"
+        plain_meaning = "Water is likely to sit well below the surface here, so there's a lower chance of it affecting a normal foundation or basement."
     elif twi_value < 11:
         tendency = "moderate"
+        plain_meaning = "Water may sit at a moderate depth beneath this site - not an immediate concern for a normal foundation, but worth checking if you're planning a basement or septic system."
     else:
         tendency = "shallow (low-lying, high-accumulation terrain position)"
+        plain_meaning = "This site sits in a low-lying spot where underground water tends to collect. Water could be close to the surface, especially in the rainy season - this matters for basements, septic tanks and deep foundations."
     return {
         "twi": round(twi_value, 2),
         "tendency": tendency,
@@ -178,7 +213,17 @@ def _water_table_tendency(twi_value: Optional[float]) -> Dict[str, Any]:
             "A relative terrain-position tendency (Topographic Wetness Index), not a measured "
             "water table depth - see references. Confirm actual depth with a borehole/piezometer."
         ),
+        "plain_meaning": plain_meaning,
     }
+
+
+def _profile_plain_meaning(profile: List[Dict[str, Any]]) -> str:
+    if not profile:
+        return ""
+    textures = {layer["texture"] for layer in profile}
+    if len(textures) <= 1:
+        return "In simple terms: the soil composition looks fairly consistent from the surface down to 2 metres."
+    return "In simple terms: the soil composition changes somewhat with depth - normal, but a foundation engineer should account for it."
 
 
 def _texture_label(sand_pct: Optional[float], clay_pct: Optional[float]) -> str:
@@ -344,11 +389,13 @@ def compute_soil_analysis(
         "presumptive_bearing_capacity": bearing_capacity,
         "water_table": water_table,
         "soil_profile": soil_profile,
+        "profile_plain_meaning": _profile_plain_meaning(soil_profile),
         "scope_note": SOIL_SCOPE_NOTE,
         "_references": SOIL_ANALYSIS_REFERENCES,
     }
 
     risk_class, _class_color = classify_risk(risk_value, has_data)
+    breakdown["risk_class_plain_meaning"] = _drainage_plain_meaning(risk_class)
     breakdown["_gis_export"] = {"boundary_geojson": boundary_geojson, "buildings_gdf": None, "value_points": None, "value_key": "soil_risk_pct"}
     breakdown["_interactive"] = None
     breakdown["buildings_total"] = 0
