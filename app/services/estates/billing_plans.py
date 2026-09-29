@@ -18,6 +18,7 @@ class EstatePlanDefinition(TypedDict):
     yearly: Decimal
     hazard_analysis: bool
     auto_posting: bool
+    soil_analysis: bool
     max_estates: int | None  # None = unlimited
 
 
@@ -28,6 +29,7 @@ ESTATE_PLANS: Final[dict[str, EstatePlanDefinition]] = {
         "yearly": Decimal("220000"),
         "hazard_analysis": False,
         "auto_posting": False,
+        "soil_analysis": False,
         "max_estates": 1,
     },
     "plus": {
@@ -36,6 +38,7 @@ ESTATE_PLANS: Final[dict[str, EstatePlanDefinition]] = {
         "yearly": Decimal("285000"),
         "hazard_analysis": True,
         "auto_posting": False,
+        "soil_analysis": False,
         "max_estates": 3,
     },
     "pro": {
@@ -44,6 +47,7 @@ ESTATE_PLANS: Final[dict[str, EstatePlanDefinition]] = {
         "yearly": Decimal("533500"),  # 11 months for the price of 12
         "hazard_analysis": True,
         "auto_posting": True,
+        "soil_analysis": True,
         "max_estates": 6,
     },
     "enterprise": {
@@ -52,6 +56,7 @@ ESTATE_PLANS: Final[dict[str, EstatePlanDefinition]] = {
         "yearly": Decimal("1595000"),  # 11 months for the price of 12
         "hazard_analysis": True,
         "auto_posting": True,
+        "soil_analysis": True,
         "max_estates": None,
     },
 }
@@ -93,3 +98,7 @@ def plan_amount(plan_key: str, billing_cycle: str) -> Decimal:
 
 def plan_includes_hazard_analysis(plan_key: str) -> bool:
     return bool(ESTATE_PLANS.get(plan_key, {}).get("hazard_analysis", False))
+
+
+def plan_includes_soil_analysis(plan_key: str) -> bool:
+    return bool(ESTATE_PLANS.get(plan_key, {}).get("soil_analysis", False))

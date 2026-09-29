@@ -45,7 +45,7 @@ from app.services.estates.allocations import release_allocation, reserve_or_allo
 from app.services.estates.audit import append_estate_audit_event
 from app.services.estates.authorization import EstatePrincipal, require_estate_access
 from app.services.estates.billing_plans import next_plan_with_estates, plan_label
-from app.services.estates.subscriptions import estate_limit_for, get_subscription, has_hazard_access
+from app.services.estates.subscriptions import estate_limit_for, get_subscription, has_hazard_access, has_soil_analysis_access
 from app.services.estates.survey_requests import transition
 from app.services.estates.survey_adapter import materialize_estate_plot_for_survey
 from app.schemas.estate_survey import SurveyorAssignment
@@ -2670,6 +2670,19 @@ def _require_hazard_plan(db: Session, organization_id: int) -> None:
     _require_plus_plan(db, organization_id, "Hazard analysis (flood and erosion)")
 
 
+def _require_pro_plan(db: Session, organization_id: int, feature_name: str) -> None:
+    """Keep Pro-and-above-only features behind one server-side entitlement check - a stricter
+    gate than _require_plus_plan's (Plus-and-above)."""
+    if not has_soil_analysis_access(get_subscription(db, organization_id)):
+        raise HTTPException(
+            status_code=402,
+            detail={
+                "code": "upgrade_required",
+                "message": f"{feature_name} is available on the Pro plan. Upgrade to unlock it.",
+            },
+        )
+
+
 @router.get("/plots/{plot_id}/hazards")
 def plot_hazards(plot_id: int, request: Request, db: Session = Depends(get_db)):
     """Return the latest stored result, with a read-only calculation for legacy records."""
@@ -2801,7 +2814,7 @@ def assess_estate_hazards(estate_id: int, request: Request, db: Session = Depend
 # (EstateSoilAssessment), its own entitlement message, its own endpoints.
 
 def _require_soil_plan(db: Session, organization_id: int) -> None:
-    _require_plus_plan(db, organization_id, "Soil analysis")
+    _require_pro_plan(db, organization_id, "Soil analysis")
 
 
 def _soil_preview_payload(risk_value: float, risk_class: str, breakdown: dict) -> dict:
