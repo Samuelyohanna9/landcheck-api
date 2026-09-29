@@ -25,7 +25,7 @@ def _env_workers(name: str, default: int) -> int:
 # round-trips apiece) ran side by side with everyone's single-site analyses and slowed the whole
 # API. Two bounded lanes instead: quick single-site analyses never wait behind Estate-wide runs,
 # and Estate-wide runs take turns.
-_BULK_JOB_TYPES = {"estate_all", "estate_development_forecast"}
+_BULK_JOB_TYPES = {"estate_all", "estate_development_forecast", "estate_soil"}
 _INTERACTIVE_LANE = ThreadPoolExecutor(max_workers=_env_workers("HAZARD_JOB_WORKERS", 2), thread_name_prefix="hazard-job")
 _BULK_LANE = ThreadPoolExecutor(max_workers=_env_workers("HAZARD_BULK_WORKERS", 1), thread_name_prefix="hazard-bulk")
 
@@ -122,7 +122,7 @@ def get_hazard_job(db: Session, job_id: str) -> Optional[Dict[str, Any]]:
                started_at, completed_at, created_at, updated_at
         FROM hazard_analysis_jobs WHERE id = :job_id LIMIT 1
     """), {"job_id": str(job_id)}).mappings().first()
-    if row and row["hazard_type"] == "estate_all" and row["status"] in ("queued", "running"):
+    if row and row["hazard_type"] in ("estate_all", "estate_soil") and row["status"] in ("queued", "running"):
         # These jobs send a heartbeat while they run. If it goes quiet the worker running the job
         # died (restart, out of memory) and nothing will ever finish it - fail it now so the user
         # gets an answer instead of an endless "running".

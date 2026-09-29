@@ -592,6 +592,27 @@ class EstateHazardAssessment(Base):
     created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
 
 
+class EstateSoilAssessment(Base):
+    """Soil Analysis results - deliberately a separate table from EstateHazardAssessment: Soil
+    Analysis is its own sidebar tool, not a Hazard Analysis category (see soil_analysis.py's
+    module docstring), so its stored results don't live in the same table/dashboard the Hazard
+    pages read from."""
+
+    __tablename__ = "estate_soil_assessments"
+    id = Column(Integer, primary_key=True)
+    organization_id = Column(Integer, ForeignKey("estate_organizations.id", ondelete="CASCADE"), nullable=False)
+    estate_id = Column(Integer, ForeignKey("estate_estates.id", ondelete="CASCADE"), nullable=False)
+    plot_id = Column(Integer, ForeignKey("estate_plots.id", ondelete="CASCADE"), nullable=True)
+    status = Column(String(32), nullable=False, default="completed")
+    risk_class = Column(String(64), nullable=True)
+    risk_score = Column(Numeric(8, 3), nullable=True)
+    result_payload = Column(JSON, nullable=False, default=dict)
+    assessed_by_subject_type = Column(String(64), nullable=False)
+    assessed_by_subject_id = Column(String(128), nullable=False)
+    assessed_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+
 class EstateImportReview(Base):
     __tablename__ = "estate_import_reviews"
     id = Column(Integer, primary_key=True)

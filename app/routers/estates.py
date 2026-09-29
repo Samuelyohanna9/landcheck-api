@@ -34,7 +34,7 @@ from app.routers.plots import _metric_epsg_for_wgs84_polygon, _subdivide_polygon
 from app.services.estates.authorization import list_estate_access, resolve_estate_principal
 from app.services.estates.identity import slugify
 from app.services.estates.entitlements import ESTATE_FEATURES, get_estate_entitlement
-from app.models.estate_foundation import Estate, EstateAgentPortalToken, EstateAllocation, EstateAuditEvent, EstateBlock, EstateCommissionPayout, EstateCommissionTier, EstateCustomer, EstateCustomerPortalToken, EstateDocument, EstateDocumentLink, EstateFieldInspection, EstateHazardAssessment, EstateImportReview, EstateLayoutProposal, EstateNotificationLog, EstateOrganization, EstateOrganizationMember, EstatePayment, EstatePaymentInbox, EstatePaymentRule, EstatePlot, EstatePublicReservationRequest, EstateQrCampaign, EstateSpatialFeature, EstateSurveyRequest, EstateStakingTask, GeotechSurveyRequest
+from app.models.estate_foundation import Estate, EstateAgentPortalToken, EstateAllocation, EstateAuditEvent, EstateBlock, EstateCommissionPayout, EstateCommissionTier, EstateCustomer, EstateCustomerPortalToken, EstateDocument, EstateDocumentLink, EstateFieldInspection, EstateHazardAssessment, EstateImportReview, EstateLayoutProposal, EstateNotificationLog, EstateOrganization, EstateOrganizationMember, EstatePayment, EstatePaymentInbox, EstatePaymentRule, EstatePlot, EstatePublicReservationRequest, EstateQrCampaign, EstateSoilAssessment, EstateSpatialFeature, EstateSurveyRequest, EstateStakingTask, GeotechSurveyRequest
 from app.schemas.estates import AllocationAction, BlockCreate, BlockUpdate, CommissionPayoutCreate, CommissionTiersUpdate, CustomerCreate, DevelopmentForecastPublishUpdate, DevelopmentStatusUpdate, EstateCreate, EstateLayoutCriteria, EstateLayoutDecision, EstateLayoutFeatureAdd, EstateLayoutFeatureRemove, EstateLayoutProposalEdit, EstateSubdivisionCreate, EstateUpdate, FieldInspectionCreate, GeoreferenceSessionLink, ImportFromGeoreference, ImportReviewCreate, ImportReviewDecision, ImportReviewFromGeoreferenceSession, MemberCreate, MemberUpdate, PaymentInboxCreate, PaymentInboxMatch, PlotCreate, PlotAddressUpdate, PlotGeometryUpdate, PlotListingDefaultsUpdate, PlotPriceUpdate, PortalTokenCreate, PublicEstateSettingsUpdate, PublicReservationConvert, PublicReservationCreate, PublicReservationUpdate, PaymentCreate, QrCampaignCreate, SpatialFeatureCreate, SpatialFeatureUpdate, SurveyEligibilityUpdate, VoidAction
 from app.services.estates.payments import confirm_payment, financial_summary, record_payment, void_payment
 from app.services.estates.documents import read_private_estate_file, store_private_estate_file
@@ -2600,11 +2600,11 @@ def estate_quality_check(estate_id:int, request:Request, db:Session=Depends(get_
 def _calculate_plot_hazards(geometry, db: Session | None, heartbeat=None) -> dict:
     """`geometry` is a stored plot geometry or an already-converted GeoJSON boundary. With no `db`
     a short-lived session is used, so a connection is only taken if the analysis actually queries."""
-    from app.routers.hazards import erosion_preview, flood_preview, ground_preview
+    from app.routers.hazards import erosion_preview, flood_preview
     boundary = geometry if isinstance(geometry, dict) else mapping(to_shape(geometry))
     payload = {"boundary": boundary, "show_raster": False}
     if db is not None:
-        return {"flood": flood_preview(payload, db), "erosion": erosion_preview(payload, db), "ground": ground_preview(payload, db)}
+        return {"flood": flood_preview(payload, db), "erosion": erosion_preview(payload, db)}
     # Estate-sized areas can need far more memory than a plot. Run in a child process that is
     # stopped at a memory ceiling, so one heavy analysis can never OOM-kill the API worker.
     from app.utils.hazard_isolated import screen_boundary
@@ -2666,8 +2666,8 @@ def _require_plus_plan(db: Session, organization_id: int, feature_name: str) -> 
 
 
 def _require_hazard_plan(db: Session, organization_id: int) -> None:
-    """Flood/erosion/ground hazard analysis is a Plus-plan feature."""
-    _require_plus_plan(db, organization_id, "Hazard analysis (flood, erosion and ground)")
+    """Flood/erosion hazard analysis is a Plus-plan feature."""
+    _require_plus_plan(db, organization_id, "Hazard analysis (flood and erosion)")
 
 
 @router.get("/plots/{plot_id}/hazards")
@@ -2683,12 +2683,12 @@ def plot_hazards(plot_id: int, request: Request, db: Session = Depends(get_db)):
         raise HTTPException(409, "Only approved plot geometry can be screened")
     # Newest record per hazard only - a plot can carry many earlier runs, each with full map images.
     latest = {}
-    for hazard_type in ("flood", "erosion", "ground"):
+    for hazard_type in ("flood", "erosion"):
         row = db.query(EstateHazardAssessment).filter(EstateHazardAssessment.plot_id == plot.id, EstateHazardAssessment.hazard_type == hazard_type).order_by(EstateHazardAssessment.assessed_at.desc()).first()
         if row is not None:
             latest[hazard_type] = row
-    if {"flood", "erosion", "ground"}.issubset(latest):
-        return {"plot_id": plot.id, "persisted": True, "flood": latest["flood"].result_payload, "erosion": latest["erosion"].result_payload, "ground": latest["ground"].result_payload}
+    if {"flood", "erosion"}.issubset(latest):
+        return {"plot_id": plot.id, "persisted": True, "flood": latest["flood"].result_payload, "erosion": latest["erosion"].result_payload}
     return {"plot_id": plot.id, "persisted": False, **_calculate_plot_hazards(plot.geometry, db)}
 
 
@@ -2795,6 +2795,221 @@ def assess_estate_hazards(estate_id: int, request: Request, db: Session = Depend
     return serialize_hazard_job(job)
 
 
+# ---------------- SOIL ANALYSIS ----------------
+# A standalone Estate-dashboard tool, deliberately NOT a Hazard Analysis category - see
+# soil_analysis.py's module docstring for the full reasoning. Its own table
+# (EstateSoilAssessment), its own entitlement message, its own endpoints.
+
+def _require_soil_plan(db: Session, organization_id: int) -> None:
+    _require_plus_plan(db, organization_id, "Soil analysis")
+
+
+def _soil_preview_payload(risk_value: float, risk_class: str, breakdown: dict) -> dict:
+    return {
+        "risk_score": f"{round(risk_value * 100, 1)}",
+        "risk_class": risk_class,
+        "hydrologic_soil_group": breakdown.get("hydrologic_soil_group"),
+        "sand_pct": breakdown.get("sand_pct"),
+        "clay_pct": breakdown.get("clay_pct"),
+        "distance_to_drainage_m": breakdown.get("distance_to_drainage_m"),
+        "soil_drainage_score": breakdown.get("soil_drainage_score"),
+        "drainage_proximity_score": breakdown.get("drainage_proximity_score"),
+        "presumptive_bearing_capacity": breakdown.get("presumptive_bearing_capacity"),
+        "water_table": breakdown.get("water_table"),
+        "note": "Soil and terrain screening for this site, from satellite soil texture and terrain data.",
+        "scope_note": breakdown.get("scope_note"),
+        "data_available": bool(breakdown.get("data_available", True)),
+        "soil_source": breakdown.get("soil_source", "unavailable"),
+        "analysis_mode": breakdown.get("analysis_mode", "hybrid"),
+        "data_sources": breakdown.get("data_sources"),
+        "confidence": breakdown.get("confidence"),
+        "references": breakdown.get("_references", []),
+    }
+
+
+def _calculate_plot_soil(geometry, db: Session | None, heartbeat=None) -> dict:
+    """Mirrors _calculate_plot_hazards's shape (direct DB session for a plot-sized area; an
+    isolated child process for an Estate-sized boundary), but for Soil Analysis's own compute
+    function and its own (much lighter, no-overlay) memory footprint."""
+    from app.utils.soil_analysis import compute_soil_analysis
+    boundary = geometry if isinstance(geometry, dict) else mapping(to_shape(geometry))
+    if db is not None:
+        risk_value, risk_class, breakdown, _overlay_png = compute_soil_analysis(db, boundary)
+        return {"soil": _soil_preview_payload(risk_value, risk_class, breakdown)}
+    from app.utils.hazard_isolated import screen_boundary_soil
+    from app.utils.isolated_run import IsolatedMemoryLimit, IsolatedRunError, run_isolated
+    try:
+        return run_isolated(screen_boundary_soil, boundary, heartbeat=heartbeat)
+    except IsolatedMemoryLimit as exc:
+        raise HTTPException(status_code=422, detail="This area is too large to screen in one pass. Try a smaller boundary or screen individual plots.") from exc
+    except IsolatedRunError as exc:
+        raise HTTPException(status_code=502, detail=f"Soil analysis could not be completed: {exc}") from exc
+
+
+def _persist_soil_result(db: Session, *, estate: Estate, plot_id: int | None, result: dict, access) -> EstateSoilAssessment:
+    try:
+        score = float(result.get("risk_score")) if result.get("risk_score") is not None else None
+    except (TypeError, ValueError):
+        score = None
+    row = EstateSoilAssessment(
+        organization_id=estate.organization_id,
+        estate_id=estate.id,
+        plot_id=plot_id,
+        risk_class=str(result.get("risk_class") or "unavailable"),
+        risk_score=score,
+        result_payload=result,
+        assessed_by_subject_type=access.principal.subject_type,
+        assessed_by_subject_id=access.principal.subject_id,
+    )
+    db.add(row)
+    db.flush()
+    append_estate_audit_event(
+        db, organization_id=estate.organization_id, actor=access.principal, action="soil_analysis.completed",
+        entity_type="estate_plot" if plot_id else "estate", entity_id=plot_id or estate.id,
+        after_data={"assessment_id": row.id},
+    )
+    return row
+
+
+@router.get("/plots/{plot_id}/soil-analysis")
+def plot_soil_analysis(plot_id: int, request: Request, db: Session = Depends(get_db)):
+    """Return the latest stored result, with a read-only calculation for legacy/first-time plots."""
+    plot = db.get(EstatePlot, plot_id)
+    if not plot:
+        raise HTTPException(404, "Plot not found")
+    estate = db.get(Estate, plot.estate_id)
+    require_estate_access(db, request, estate.organization_id, permission="plot.read")
+    _require_soil_plan(db, estate.organization_id)
+    if plot.geometry_status != "approved":
+        raise HTTPException(409, "Only approved plot geometry can be screened")
+    row = db.query(EstateSoilAssessment).filter(EstateSoilAssessment.plot_id == plot.id).order_by(EstateSoilAssessment.assessed_at.desc()).first()
+    if row is not None:
+        return {"plot_id": plot.id, "persisted": True, "soil": row.result_payload}
+    return {"plot_id": plot.id, "persisted": False, **_calculate_plot_soil(plot.geometry, db)}
+
+
+@router.post("/plots/{plot_id}/soil-analysis/assess")
+def assess_plot_soil(plot_id: int, request: Request, db: Session = Depends(get_db)):
+    plot = db.get(EstatePlot, plot_id)
+    if not plot:
+        raise HTTPException(404, "Plot not found")
+    estate = db.get(Estate, plot.estate_id)
+    access = require_estate_access(db, request, estate.organization_id, permission="plot.manage")
+    _require_soil_plan(db, estate.organization_id)
+    if plot.geometry_status != "approved":
+        raise HTTPException(409, "Only approved plot geometry can be screened")
+    plot_id, estate_id, geometry = plot.id, estate.id, plot.geometry
+    boundary = mapping(to_shape(geometry))
+    db.expunge_all()
+    db.commit()  # the analysis below is slow (Earth Engine round-trips); don't hold a pooled connection through it
+    results = _calculate_plot_soil(boundary, None)
+    estate = db.get(Estate, estate_id)
+    row = _persist_soil_result(db, estate=estate, plot_id=plot_id, result=results["soil"], access=access)
+    db.commit()
+    return {"plot_id": plot_id, "persisted": True, "assessment_id": row.id, **results}
+
+
+def _estate_soil_dashboard_payload(db: Session, estate: Estate) -> dict:
+    latest_ids = [row[0] for row in db.execute(text("""
+        SELECT DISTINCT ON (plot_id) id
+        FROM estate_soil_assessments
+        WHERE estate_id = :estate_id
+        ORDER BY plot_id, assessed_at DESC
+    """), {"estate_id": estate.id}).all()]
+    rows = db.execute(text("""
+        SELECT id, plot_id, estate_id, risk_class, risk_score, assessed_at, result_payload
+        FROM estate_soil_assessments
+        WHERE id = ANY(:ids)
+    """), {"ids": latest_ids}).mappings().all() if latest_ids else []
+    total = int(db.execute(text("SELECT count(*) FROM estate_soil_assessments WHERE estate_id = :estate_id"), {"estate_id": estate.id}).scalar() or 0)
+    assessments = [
+        {
+            "plot_id": row["plot_id"], "risk_class": row["risk_class"],
+            "risk_score": float(row["risk_score"]) if row["risk_score"] is not None else None,
+            "assessed_at": row["assessed_at"], "result": row["result_payload"],
+        }
+        for row in rows
+    ]
+    assessments.sort(key=lambda item: 0 if item["plot_id"] is None else 1)
+    return {"estate": {"id": estate.id, "name": estate.name}, "assessments": assessments, "assessment_count": total}
+
+
+@router.get("/{estate_id}/soil-analysis")
+def estate_soil_dashboard(estate_id: int, request: Request, db: Session = Depends(get_db)):
+    estate = db.get(Estate, estate_id)
+    if not estate:
+        raise HTTPException(404, "Estate not found")
+    require_estate_access(db, request, estate.organization_id, permission="plot.read")
+    _require_soil_plan(db, estate.organization_id)
+    return _estate_soil_dashboard_payload(db, estate)
+
+
+def _run_estate_soil_assessment_job(job_id: str) -> None:
+    """Background worker for the Estate-level soil analysis run - same shape as
+    _run_estate_hazard_assessment_job, screening the Estate boundary once rather than every plot
+    separately."""
+    db = SessionLocal()
+    try:
+        job = get_hazard_job(db, job_id)
+        if not job:
+            return
+        payload = job.get("request_payload") or {}
+        if isinstance(payload, str):
+            payload = json.loads(payload)
+        estate_id = int(payload["estate_id"])
+        access = SimpleNamespace(principal=SimpleNamespace(subject_type=payload.get("subject_type"), subject_id=payload.get("subject_id")))
+
+        set_hazard_job_status(db, job_id, status="running", stage="Preparing the Estate boundary...", progress_pct=5, started=True)
+        estate = db.get(Estate, estate_id)
+        if not estate:
+            set_hazard_job_status(db, job_id, status="failed", stage="Failed", error_text="Estate not found", completed=True)
+            return
+        try:
+            boundary = _estate_forecast_boundary(db, estate)
+        except HTTPException:
+            set_hazard_job_status(db, job_id, status="failed", stage="Failed", error_text="Add an Estate boundary or approve plot geometry before running soil analysis", completed=True)
+            return
+        db.commit()
+
+        set_hazard_job_status(db, job_id, status="running", stage="Screening soil and terrain for the Estate...", progress_pct=20)
+        results = _calculate_plot_soil(boundary, None, heartbeat=lambda: touch_hazard_job(db, job_id))
+
+        set_hazard_job_status(db, job_id, status="running", stage="Saving results...", progress_pct=90)
+        estate = db.get(Estate, estate_id)
+        _persist_soil_result(db, estate=estate, plot_id=None, result=results["soil"], access=access)
+        append_estate_audit_event(db, organization_id=estate.organization_id, actor=access.principal, action="soil_analysis.estate_completed", entity_type="estate", entity_id=estate.id, after_data={"scope": "estate_boundary"})
+        db.commit()
+        result_payload = _estate_soil_dashboard_payload(db, estate)
+        set_hazard_job_status(db, job_id, status="completed", stage="Complete", progress_pct=100, result_payload=result_payload, completed=True)
+    except Exception as exc:
+        db.rollback()
+        set_hazard_job_status(db, job_id, status="failed", stage="Failed", error_text=str(getattr(exc, "detail", None) or exc), completed=True)
+    finally:
+        db.close()
+
+
+@router.post("/{estate_id}/soil-analysis/assess-all")
+def assess_estate_soil(estate_id: int, request: Request, db: Session = Depends(get_db)):
+    estate = db.get(Estate, estate_id)
+    if not estate:
+        raise HTTPException(404, "Estate not found")
+    access = require_estate_access(db, request, estate.organization_id, permission="plot.manage")
+    _require_soil_plan(db, estate.organization_id)
+    if not estate.boundary and not db.query(EstatePlot.id).filter(EstatePlot.estate_id == estate_id, EstatePlot.geometry_status == "approved", EstatePlot.geometry.isnot(None)).first():
+        raise HTTPException(422, "Add an Estate boundary or approve plot geometry before running soil analysis")
+    existing = find_active_hazard_job(db, hazard_type="estate_soil", estate_id=estate_id)
+    if existing:
+        return serialize_hazard_job(existing)
+    job = insert_hazard_job(
+        db,
+        hazard_type="estate_soil",
+        output_type="preview",
+        request_payload={"estate_id": estate_id, "subject_type": access.principal.subject_type, "subject_id": access.principal.subject_id},
+        worker=_run_estate_soil_assessment_job,
+    )
+    return serialize_hazard_job(job)
+
+
 def _create_geotech_survey_request(db: Session, *, estate: Estate, plot_id: int | None, plot_number: str | None, access, payload: dict) -> GeotechSurveyRequest:
     row = GeotechSurveyRequest(
         organization_id=estate.organization_id,
@@ -2810,7 +3025,7 @@ def _create_geotech_survey_request(db: Session, *, estate: Estate, plot_id: int 
     db.add(row)
     db.flush()
     append_estate_audit_event(
-        db, organization_id=estate.organization_id, actor=access.principal, action="hazard.geotech_survey_requested",
+        db, organization_id=estate.organization_id, actor=access.principal, action="soil_analysis.geotech_survey_requested",
         entity_type="estate_plot" if plot_id else "estate", entity_id=plot_id or estate.id,
         after_data={"request_id": row.id},
     )
@@ -2828,28 +3043,28 @@ def _create_geotech_survey_request(db: Session, *, estate: Estate, plot_id: int 
     return row
 
 
-@router.post("/plots/{plot_id}/hazards/geotech-request")
+@router.post("/plots/{plot_id}/soil-analysis/geotech-request")
 def request_plot_geotech_survey(plot_id: int, request: Request, payload: dict = Body(default={}), db: Session = Depends(get_db)):
-    """The honest follow-through on the Ground & Drainage screening's scope note: it can't answer
-    load-bearing capacity, water table depth, or subsurface-layer questions, so this raises a real
-    lead for LandCheck's team to connect the customer with a licensed geotechnical investigation."""
+    """The honest follow-through on Soil Analysis's scope note: it can't answer soil density,
+    exact water table depth, or subsurface-layer questions, so this raises a real lead for
+    LandCheck's team to connect the customer with a licensed geotechnical investigation."""
     plot = db.get(EstatePlot, plot_id)
     if not plot:
         raise HTTPException(404, "Plot not found")
     estate = db.get(Estate, plot.estate_id)
     access = require_estate_access(db, request, estate.organization_id, permission="plot.manage")
-    _require_hazard_plan(db, estate.organization_id)
+    _require_soil_plan(db, estate.organization_id)
     row = _create_geotech_survey_request(db, estate=estate, plot_id=plot.id, plot_number=plot.plot_number, access=access, payload=payload)
     return {"id": row.id, "request_uid": row.request_uid, "status": row.status}
 
 
-@router.post("/{estate_id}/hazards/geotech-request")
+@router.post("/{estate_id}/soil-analysis/geotech-request")
 def request_estate_geotech_survey(estate_id: int, request: Request, payload: dict = Body(default={}), db: Session = Depends(get_db)):
     estate = db.get(Estate, estate_id)
     if not estate:
         raise HTTPException(404, "Estate not found")
     access = require_estate_access(db, request, estate.organization_id, permission="plot.manage")
-    _require_hazard_plan(db, estate.organization_id)
+    _require_soil_plan(db, estate.organization_id)
     row = _create_geotech_survey_request(db, estate=estate, plot_id=None, plot_number=None, access=access, payload=payload)
     return {"id": row.id, "request_uid": row.request_uid, "status": row.status}
 

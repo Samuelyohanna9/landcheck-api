@@ -353,11 +353,12 @@ def notify_geotech_survey_request(
     note: str | None = None,
 ) -> bool:
     """Notify LandCheck's own team that an Estate staff member requested a geotechnical survey -
-    the honest handoff from the Ground & Drainage screening, which is explicitly not a soil test
-    and can't answer load-bearing capacity, water table depth, or subsurface layer questions.
-    Unlike notify_reservation_request (a public buyer lead sent to the Estate's own team), this
-    goes to LandCheck's own admin address, since LandCheck - not the Estate - is the one who would
-    need to source/vet a geotechnical partner for the customer.
+    the honest handoff from Soil Analysis, which gives indicative bearing-capacity and water-table
+    readings from satellite data but is explicitly not a soil test and can't determine soil
+    density/consistency or subsurface layers. Unlike notify_reservation_request (a public buyer
+    lead sent to the Estate's own team), this goes to LandCheck's own admin address, since
+    LandCheck - not the Estate - is the one who would need to source/vet a geotechnical partner
+    for the customer.
     """
     scope_line = f"Plot {html.escape(plot_number)}" if plot_number else "the whole Estate boundary"
     contact_bits = []
@@ -373,12 +374,12 @@ def notify_geotech_survey_request(
     message_html = (
         f"<p><strong>{html.escape(organization_name)}</strong> requested a geotechnical survey for "
         f"{scope_line} at <strong>{html.escape(estate_name)}</strong>, from the Estate dashboard's "
-        "Ground &amp; Drainage screening."
+        "Soil Analysis tool."
         + (f" Requested by {html.escape(requested_by_name)}." if requested_by_name else "")
         + "</p>"
         f"{contact_html}"
-        "<p>This screening is satellite-based and explicitly does not measure load-bearing "
-        "capacity, water table depth, or subsurface soil layers - follow up to connect this "
+        "<p>Soil Analysis is satellite-based and gives indicative readings only - it does not "
+        "determine soil density/consistency or subsurface soil layers - follow up to connect this "
         "customer with a licensed geotechnical investigation.</p>"
     )
     body_html = _account_wrap_html(heading="Geotechnical survey requested", message_html=message_html)
