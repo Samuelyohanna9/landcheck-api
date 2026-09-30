@@ -2757,6 +2757,39 @@ def _collect_connected_road_edge_lines(road_geoms_with_width, snap_tol_m: float 
         merged_edges = linemerge(unary_union(snapped_edges))
         final_edges = [seg for seg in _iter_line_geometries(merged_edges) if seg is not None and not getattr(seg, "is_empty", True)]
         if final_edges:
+            # The offset casings above are open lines, so a T-junction can still leave
+            # the near edge of the through road drawn straight across the branch mouth.
+            # Use the boundary of the unioned road corridors as a support mask: it keeps
+            # the outside casing, but removes internal casing lines at T and cross joins.
+            corridor_parts = []
+            for centerline, half_width in snapped_parts:
+                for center_part in _iter_line_geometries(centerline):
+                    if center_part is None or getattr(center_part, "is_empty", True):
+                        continue
+                    try:
+                        corridor_parts.append(center_part.buffer(max(0.5, float(half_width)), cap_style=2, join_style=1))
+                    except Exception:
+                        continue
+            if corridor_parts:
+                corridor_boundary = unary_union(corridor_parts).boundary
+                edge_network = unary_union(final_edges)
+                trimmed = edge_network.intersection(corridor_boundary)
+                trimmed_edges = [
+                    seg for seg in _iter_line_geometries(trimmed)
+                    if seg is not None and not getattr(seg, "is_empty", True) and getattr(seg, "length", 0.0) > 0
+                ]
+                if not trimmed_edges:
+                    # A curved offset can differ from a buffer boundary by a few
+                    # centimetres after projection. Keep a narrow fallback tolerance
+                    # for those cases without restoring the junction blockage.
+                    boundary_support = corridor_boundary.buffer(max(0.05, min(0.75, snap_tol_m * 0.15)))
+                    trimmed = edge_network.intersection(boundary_support)
+                    trimmed_edges = [
+                        seg for seg in _iter_line_geometries(trimmed)
+                        if seg is not None and not getattr(seg, "is_empty", True) and getattr(seg, "length", 0.0) > 0
+                    ]
+                if trimmed_edges:
+                    final_edges = trimmed_edges
             return final_edges
     except Exception:
         pass

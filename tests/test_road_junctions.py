@@ -14,9 +14,17 @@ def test_t_junction_connects_each_side_road_casing_to_the_near_edge():
 
     vertical_edges = [edge for edge in edges if abs(edge.bounds[0] - edge.bounds[2]) < 1e-9]
     branch_edges = [edge for edge in vertical_edges if edge.bounds[1] < -5.0 and edge.bounds[3] <= -5.0 + 1e-9]
+    blocked_mouth_edges = [
+        edge
+        for edge in edges
+        if abs(edge.bounds[1] + 5.0) < 1e-9
+        and abs(edge.bounds[3] + 5.0) < 1e-9
+        and edge.bounds[0] < 0 < edge.bounds[2]
+    ]
 
     assert {round(edge.bounds[0]) for edge in branch_edges} == {-5, 5}
     assert all(abs(edge.bounds[3] + 5.0) < 1e-9 for edge in branch_edges)
+    assert blocked_mouth_edges == []
 
 
 def test_t_junction_does_not_cross_join_parallel_dead_end_casings():
