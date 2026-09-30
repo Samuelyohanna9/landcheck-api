@@ -2171,6 +2171,17 @@ def _iter_line_geometries(geom):
             yield from _iter_line_geometries(part)
 
 
+def _iter_point_geometries(geom):
+    if geom is None or getattr(geom, "is_empty", True):
+        return
+    if getattr(geom, "geom_type", "") == "Point":
+        yield geom
+        return
+    if hasattr(geom, "geoms"):
+        for part in geom.geoms:
+            yield from _iter_point_geometries(part)
+
+
 def _iter_polygons(geom):
     if geom is None or getattr(geom, "is_empty", False):
         return
@@ -2585,6 +2596,8 @@ def _close_dangling_road_endpoints(
     tolerance_m: float,
     support_lines=None,
     support_forward_only: bool = False,
+    support_target_geom=None,
+    reject_parallel: bool = False,
 ):
     """Pull each line's free endpoints onto the nearest point of another line, if one is
     close enough to be the same junction. Optional support lines (such as the map frame) are
@@ -2662,6 +2675,24 @@ def _close_dangling_road_endpoints(
                 if d < best_dist:
                     try:
                         candidate_point = nearest_points(pt, cand)[1]
+                        if cand_idx >= edge_count and support_forward_only and support_target_geom is not None:
+                            ray_length = max(tolerance_m, 0.5)
+                            ray_end = Point(
+                                pt.x - tangent_x * ray_length,
+                                pt.y - tangent_y * ray_length,
+                            )
+                            ray = LineString([pt, ray_end])
+                            hit_geom = ray.intersection(support_target_geom.boundary)
+                            hit_points = [
+                                hit for hit in _iter_point_geometries(hit_geom)
+                                if hit.distance(pt) > 1e-9 and hit.distance(pt) <= tolerance_m + 1e-9
+                            ]
+                            if not hit_points:
+                                continue
+                            candidate_point = min(hit_points, key=lambda hit: hit.distance(pt))
+                        candidate_distance_to_target = float(pt.distance(candidate_point))
+                        if candidate_distance_to_target >= best_dist:
+                            continue
                         # Do not join the two parallel casings of the same road at a
                         # dead-end. A real junction changes direction; a near-parallel
                         # candidate is normally the other side of this same road.
@@ -2679,11 +2710,11 @@ def _close_dangling_road_endpoints(
                                 (candidate_x / candidate_length) * tangent_x
                                 + (candidate_y / candidate_length) * tangent_y
                             )
-                            if candidate_alignment > 0.85 and candidate_forward <= 1e-6:
+                            if candidate_alignment > 0.85 and (reject_parallel or candidate_forward <= 1e-6):
                                 continue
                         elif support_forward_only and support_forward <= 1e-6:
                             continue
-                        candidate_points.append((d, candidate_point))
+                        candidate_points.append((candidate_distance_to_target, candidate_point))
                     except Exception:
                         continue
             if already_touching or not candidate_points:
@@ -2768,7 +2799,9 @@ def _collect_connected_road_edge_lines(
     try:
         max_hw = max((hw for _, hw in snapped_parts), default=1.0)
         junction_tol = min(max(2.2 * max_hw, 1.5), 12.0)
-        edge_lines = _close_dangling_road_endpoints(edge_lines, junction_tol)
+        edge_lines = _close_dangling_road_endpoints(
+            edge_lines, junction_tol, reject_parallel=True,
+        )
     except Exception:
         pass
 
@@ -2862,6 +2895,8 @@ def _collect_connected_road_edge_lines(
                         support_tol,
                         support_lines=[extent_boundary],
                         support_forward_only=True,
+                        support_target_geom=extent_geom,
+                        reject_parallel=True,
                     )
                     clipped_edges = []
                     for edge in final_edges:
@@ -2974,7 +3009,9 @@ def _draw_road_edges(
         # moves a vertex onto an existing vertex of the target, and simplify rarely leaves one
         # sitting exactly at the junction).
         try:
-            edge_lines = _close_dangling_road_endpoints(edge_lines, max(tolerance_m, 0.5))
+            edge_lines = _close_dangling_road_endpoints(
+                edge_lines, max(tolerance_m, 0.5), reject_parallel=True,
+            )
         except Exception:
             pass
     lw = scaled_line_weight(0.3, font_scale, scale_ratio)
