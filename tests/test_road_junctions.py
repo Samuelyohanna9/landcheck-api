@@ -66,3 +66,17 @@ def test_road_edges_are_trimmed_to_the_grid_boundary():
 
     assert all(0 <= edge.bounds[0] <= 10 for edge in edges)
     assert all(0 <= edge.bounds[2] <= 10 for edge in edges)
+
+
+def test_nearby_separate_roads_keep_their_long_casing_lines():
+    edges = _collect_connected_road_edge_lines(
+        [
+            (LineString([(-100, 0), (100, 0)]), 5),
+            (LineString([(-100, 8), (100, 8)]), 5),
+        ],
+        snap_tol_m=1,
+    )
+
+    assert len(edges) == 4
+    assert all(round(edge.length, 6) == 200 for edge in edges)
+    assert {round(edge.bounds[1], 6) for edge in edges} == {-5, 3, 5, 13}

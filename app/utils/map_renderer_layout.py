@@ -2785,34 +2785,68 @@ def _collect_connected_road_edge_lines(
             # Use the boundary of the unioned road corridors as a support mask: it keeps
             # the outside casing, but removes internal casing lines at T and cross joins.
             corridor_parts = []
+            centerline_items = []
             for centerline, half_width in snapped_parts:
                 for center_part in _iter_line_geometries(centerline):
                     if center_part is None or getattr(center_part, "is_empty", True):
                         continue
+                    centerline_items.append((center_part, float(half_width)))
                     try:
                         corridor_parts.append(center_part.buffer(max(0.5, float(half_width)), cap_style=2, join_style=1))
                     except Exception:
                         continue
             if corridor_parts:
-                corridor_boundary = unary_union(corridor_parts).boundary
+                corridor_union = unary_union(corridor_parts)
+                corridor_boundary = corridor_union.boundary
                 edge_network = unary_union(final_edges)
-                # Keep a narrow tolerance for projected/curved offsets. Requiring exact
-                # line equality here can fragment a smooth road into short visible pieces.
-                boundary_support = corridor_boundary.buffer(max(0.05, min(0.75, snap_tol_m * 0.15)))
-                trimmed = edge_network.intersection(boundary_support)
-                trimmed_edges = [
-                    seg for seg in _iter_line_geometries(trimmed)
-                    if seg is not None and not getattr(seg, "is_empty", True) and getattr(seg, "length", 0.0) > 0
-                ]
-                if trimmed_edges:
-                    # Re-merge after trimming so the clean-copy renderer does not
-                    # restart a dashed pattern at every source-road vertex.
-                    trimmed_network = linemerge(unary_union(trimmed_edges))
-                    merged_trimmed_edges = [
-                        seg for seg in _iter_line_geometries(trimmed_network)
+                # Apply the boundary mask only around actual centreline junctions. A global
+                # mask incorrectly treats two nearby but separate roads as one corridor and
+                # can discard long, valid casing lines between them.
+                junction_regions = []
+                try:
+                    center_tree = STRtree([item[0] for item in centerline_items])
+                    center_join_tol = max(0.5, float(snap_tol_m))
+                    for left_idx, (left_line, left_width) in enumerate(centerline_items):
+                        for right_idx in center_tree.query(left_line.buffer(center_join_tol)):
+                            right_idx = int(right_idx)
+                            if right_idx <= left_idx:
+                                continue
+                            right_line, right_width = centerline_items[right_idx]
+                            if left_line.distance(right_line) > center_join_tol:
+                                continue
+                            intersection = left_line.intersection(right_line)
+                            points = [
+                                point for point in _iter_line_geometries(intersection)
+                                if point is not None and point.geom_type == "Point"
+                            ]
+                            if not points:
+                                first, second = nearest_points(left_line, right_line)
+                                points = [Point((first.x + second.x) / 2.0, (first.y + second.y) / 2.0)]
+                            radius = max(0.5, max(left_width, right_width) * 1.25)
+                            junction_regions.extend(point.buffer(radius) for point in points)
+                except Exception:
+                    junction_regions = []
+
+                if junction_regions:
+                    junction_area = unary_union(junction_regions)
+                    boundary_support = corridor_boundary.buffer(max(0.05, min(0.75, snap_tol_m * 0.15)))
+                    junction_edges = edge_network.intersection(junction_area)
+                    outside_junction = edge_network.difference(junction_area)
+                    trimmed_junction = junction_edges.intersection(boundary_support)
+                    trimmed = unary_union([outside_junction, trimmed_junction])
+                    trimmed_edges = [
+                        seg for seg in _iter_line_geometries(trimmed)
                         if seg is not None and not getattr(seg, "is_empty", True) and getattr(seg, "length", 0.0) > 0
                     ]
-                    final_edges = merged_trimmed_edges or trimmed_edges
+                    if trimmed_edges:
+                        # Re-merge after trimming so the clean-copy renderer does not
+                        # restart a dashed pattern at every source-road vertex.
+                        trimmed_network = linemerge(unary_union(trimmed_edges))
+                        merged_trimmed_edges = [
+                            seg for seg in _iter_line_geometries(trimmed_network)
+                            if seg is not None and not getattr(seg, "is_empty", True) and getattr(seg, "length", 0.0) > 0
+                        ]
+                        final_edges = merged_trimmed_edges or trimmed_edges
 
             # A road endpoint can stop a few metres short of the map frame after clipping,
             # especially when its centreline approaches the frame at an angle. Extend it to
