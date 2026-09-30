@@ -217,6 +217,27 @@ class MemberUpdate(BaseModel):
     email: str | None = Field(default=None, max_length=255)
     phone: str | None = Field(default=None, max_length=64)
 
+class StaffRoleCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
+    permissions: list[str] = Field(default_factory=list)
+
+class StaffRoleUpdate(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=120)
+    permissions: list[str] | None = None
+
+class StaffCreate(BaseModel):
+    full_name: str = Field(min_length=1, max_length=255)
+    email: str = Field(min_length=3, max_length=255)
+    phone: str | None = Field(default=None, max_length=64)
+    role_id: int | None = None
+    permissions: list[str] = Field(default_factory=list)
+
+class StaffUpdate(BaseModel):
+    role_id: int | None = None
+    permissions: list[str] | None = None
+    is_active: bool | None = None
+    phone: str | None = Field(default=None, max_length=64)
+
 class ImportReviewCreate(BaseModel):
     source_type: str = Field(pattern="^(coordinates|csv|gis|cad|raster|pdf)$")
     survey_georeference_session_id: str | None = Field(default=None, max_length=128)

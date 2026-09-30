@@ -35,6 +35,13 @@ class EstateOrganizationMember(Base):
     subject_type = Column(String(64), nullable=False)
     subject_id = Column(String(128), nullable=False)
     role_key = Column(String(32), nullable=False)
+    # Only set (and only consulted) when role_key == 'staff' - a custom-built role with an
+    # organization-owner-chosen checklist of dashboard permissions, rather than one of the fixed
+    # built-in roles above. custom_role_id is the named template it was created from (for display
+    # and re-editing); custom_permissions is the actual granted set, copied from that role at
+    # creation and independently editable per staff member afterwards.
+    custom_role_id = Column(Integer, ForeignKey("estate_staff_roles.id", ondelete="SET NULL"), nullable=True)
+    custom_permissions = Column(JSON, nullable=True)
     contact_email = Column(String(255), nullable=True)
     contact_phone = Column(String(64), nullable=True)
     is_active = Column(Boolean, nullable=False, default=True)
@@ -44,9 +51,30 @@ class EstateOrganizationMember(Base):
     __table_args__ = (
         UniqueConstraint("organization_id", "subject_type", "subject_id", name="uq_estate_member_subject"),
         CheckConstraint(
-            "role_key IN ('owner', 'manager', 'accounts', 'surveyor', 'field_officer', 'sales', 'marketer', 'viewer')",
+            "role_key IN ('owner', 'manager', 'accounts', 'surveyor', 'field_officer', 'sales', 'marketer', 'viewer', 'staff')",
             name="ck_estate_members_role",
         ),
+    )
+
+
+class EstateStaffRole(Base):
+    """An organization-owner-defined named role for the "Add Access" staff feature - a name plus
+    a checklist of dashboard permission keys (see app/services/estates/permissions.py's
+    PERMISSION_CATALOG). Distinct from the fixed built-in roles on EstateOrganizationMember.role_key:
+    those are hardcoded product roles, these are ad hoc, per-organization, and editable at any time.
+    """
+
+    __tablename__ = "estate_staff_roles"
+
+    id = Column(Integer, primary_key=True)
+    organization_id = Column(Integer, ForeignKey("estate_organizations.id", ondelete="CASCADE"), nullable=False)
+    name = Column(String(120), nullable=False)
+    permissions = Column(JSON, nullable=False, default=list)
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
+
+    __table_args__ = (
+        UniqueConstraint("organization_id", "name", name="uq_estate_staff_role_org_name"),
     )
 
 

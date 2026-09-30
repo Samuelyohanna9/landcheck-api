@@ -18,6 +18,7 @@ from app.routers.plots import get_db
 from app.schemas.estate_auth import EstateLogin, EstateRegister
 from app.services.estates import dpa, estate_email
 from app.services.estates.marketing_common import client_ip
+from app.services.estates.permissions import ROLE_PERMISSIONS
 from app.services.estates.identity import (
     hash_password,
     issue_session,
@@ -27,6 +28,11 @@ from app.services.estates.identity import (
     slugify,
     verify_password,
 )
+
+
+class ChangePasswordRequest(BaseModel):
+    current_password: str
+    new_password: str = Field(min_length=8, max_length=200)
 
 
 class ForgotPasswordRequest(BaseModel):
@@ -61,12 +67,19 @@ def _account_payload(db: Session, account: EstateAccount) -> dict:
         .one_or_none()
     )
     organization = db.get(EstateOrganization, account.organization_id)
+    role_key = membership.role_key if membership else None
+    if role_key == "staff":
+        permissions = list(membership.custom_permissions or [])
+    else:
+        permissions = sorted(ROLE_PERMISSIONS.get(str(role_key or "").lower(), frozenset()))
     return {
         "id": int(account.id),
         "account_uid": account.account_uid,
         "full_name": account.full_name,
         "email": account.email,
-        "role_key": membership.role_key if membership else None,
+        "role_key": role_key,
+        "permissions": permissions,
+        "must_change_password": bool(account.must_change_password),
         "organization_id": int(account.organization_id),
         "organization_name": organization.name if organization else None,
         "organization_slug": organization.slug if organization else None,
@@ -171,6 +184,36 @@ def me(request: Request, db: Session = Depends(get_db)):
     if not account:
         return {"authed": False}
     return {"authed": True, "user": _account_payload(db, account), "expires_at": session.expires_at}
+
+
+@router.post("/change-password")
+def change_password(payload: ChangePasswordRequest, request: Request, db: Session = Depends(get_db)):
+    """Authenticated password change - used both for a voluntary change and for the forced
+    first-login flow after a staff invite (see EstateAccount.must_change_password). The current
+    password is always required, even right after a temp-password login: the recipient already
+    knows it (it's what they just signed in with), and requiring it again is standard defense in
+    depth against a hijacked session."""
+    session = resolve_session(db, request)
+    if not session:
+        raise HTTPException(status_code=401, detail="Sign in again to change your password")
+    account = db.get(EstateAccount, session.account_id)
+    if not account or not verify_password(payload.current_password, account.password_hash):
+        raise HTTPException(status_code=401, detail="Current password is incorrect")
+    try:
+        account.password_hash = hash_password(payload.new_password)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    account.must_change_password = False
+    now = datetime.utcnow()
+    # Keep the session that just made this request; drop every other active session for this
+    # account, same as a self-service reset does.
+    db.query(EstateAuthSession).filter(
+        EstateAuthSession.account_id == account.id,
+        EstateAuthSession.session_state == "active",
+        EstateAuthSession.session_uid != session.session_uid,
+    ).update({"session_state": "revoked", "revoked_at": now, "revoke_reason": "password_changed"})
+    db.commit()
+    return {"status": "ok"}
 
 
 @router.post("/forgot-password")

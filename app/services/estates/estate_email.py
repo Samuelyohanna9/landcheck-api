@@ -543,6 +543,67 @@ def send_agent_workspace_invite(*, organization, member, portal_url: str) -> boo
         return False
 
 
+def send_staff_invite_email(
+    *,
+    organization,
+    account,
+    role_label: str,
+    permission_labels: list[str],
+    temp_password: str,
+    login_url: str,
+) -> bool:
+    """Sent when the organization owner adds a full dashboard staff account via "Add Access" -
+    the one email that ever carries a plaintext password, since it's the only copy that will
+    ever exist (only the hash is stored). first login forces the recipient to set their own."""
+    to_email = str(getattr(account, "email", "") or "").strip()
+    if not to_email:
+        return False
+    first_name = str(getattr(account, "full_name", "") or "there").split(" ")[0]
+    organization_name = str(getattr(organization, "name", "your company") or "your company")
+    access_list_html = (
+        "<ul style=\"padding-left:18px;line-height:1.9;\">"
+        + "".join(f"<li>{html.escape(item)}</li>" for item in permission_labels)
+        + "</ul>"
+        if permission_labels
+        else "<p>No dashboard sections are enabled yet - ask an administrator to grant access.</p>"
+    )
+    message_html = (
+        f"<p>Hello {html.escape(first_name)},</p>"
+        f"<p><strong>{html.escape(organization_name)}</strong> has added you to its LandCheck Estates "
+        f"dashboard as <strong>{html.escape(role_label)}</strong>.</p>"
+        f"<p>Your access covers:</p>"
+        f"{access_list_html}"
+        "<p>Sign in with the temporary password below - you'll be asked to set your own password "
+        "the first time you log in.</p>"
+        f"<p style=\"margin:18px 0;padding:14px 16px;background:#f4fbf6;border:1px solid rgba(15,111,57,0.18);"
+        f"border-radius:12px;font-size:15px;\">Email: <strong>{html.escape(to_email)}</strong><br/>"
+        f"Temporary password: <strong style=\"font-family:monospace;font-size:16px;letter-spacing:0.5px;\">"
+        f"{html.escape(temp_password)}</strong></p>"
+    )
+    body_html = _account_wrap_html(
+        heading=f"You've been added to {organization_name}",
+        message_html=message_html,
+        button_html=_account_button_html(label="Log in to LandCheck Estates", url=login_url),
+    )
+    try:
+        _send_email(
+            to_email=to_email,
+            from_display_name="LandCheck Estates",
+            subject=f"You've been added to {organization_name} on LandCheck Estates",
+            body_text=_account_plain_text(
+                f"You've been added to {organization_name}",
+                message_html,
+                login_url,
+            )
+            + f"\n\nEmail: {to_email}\nTemporary password: {temp_password}",
+            body_html=body_html,
+        )
+        return True
+    except Exception:
+        logger.exception("Estate staff invite email failed (to=%s)", to_email)
+        return False
+
+
 def _subscription_org_email(organization) -> str | None:
     value = str(getattr(organization, "contact_email", "") or "").strip()
     return value or None

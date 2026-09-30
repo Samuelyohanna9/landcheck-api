@@ -27,6 +27,10 @@ class EstateAccess:
     organization_slug: str
     role_key: str
     principal: EstatePrincipal
+    # Only set for role_key == "staff" (a custom "Add Access" role/checklist) - when present it
+    # is authoritative and ROLE_PERMISSIONS is not consulted at all, since a custom role has no
+    # entry there.
+    custom_permissions: frozenset[str] | None = None
 
 
 def resolve_estate_principal(db: Session, request: Request) -> EstatePrincipal:
@@ -86,6 +90,9 @@ def list_estate_access(db: Session, principal: EstatePrincipal) -> list[EstateAc
             organization_slug=str(organization.slug),
             role_key=str(member.role_key),
             principal=principal,
+            custom_permissions=(
+                frozenset(member.custom_permissions or []) if member.role_key == "staff" else None
+            ),
         )
         for member, organization in rows
     ]
@@ -113,8 +120,14 @@ def require_estate_access(
     access = next((item for item in list_estate_access(db, principal) if item.organization_id == int(organization_id)), None)
     if access is None:
         raise HTTPException(status_code=404, detail="Estate organization was not found")
-    if permission and not has_permission(access.role_key, permission):
-        raise HTTPException(status_code=403, detail="You do not have permission for this Estate action")
+    if permission:
+        allowed = (
+            str(permission).strip().lower() in access.custom_permissions
+            if access.custom_permissions is not None
+            else has_permission(access.role_key, permission)
+        )
+        if not allowed:
+            raise HTTPException(status_code=403, detail="You do not have permission for this Estate action")
     if require_subscription:
         subscription = get_subscription(db, organization_id)
         if not is_access_active(subscription):

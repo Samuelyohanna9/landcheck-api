@@ -14,7 +14,7 @@ import matplotlib.pyplot as plt
 from sqlalchemy import text
 from shapely import wkb
 from shapely.geometry import LineString, Point, Polygon, shape
-from shapely.ops import snap, linemerge, unary_union, nearest_points
+from shapely.ops import snap, linemerge, unary_union, nearest_points, polygonize
 from shapely.strtree import STRtree
 import matplotlib.patches as patches
 import matplotlib.lines as mlines
@@ -2527,6 +2527,11 @@ def _fetch_live_road_geoms(db, plot_id: int) -> list:
                 END AS geom
             FROM lines r
             WHERE r.highway IS NOT NULL
+              AND lower(r.highway) NOT IN (
+                  'footway', 'path', 'steps', 'cycleway', 'pedestrian', 'bridleway',
+                  'track', 'corridor', 'construction', 'proposed', 'raceway',
+                  'escape', 'elevator', 'platform', 'crossing'
+              )
         )
         SELECT roads.geom AS geom
         FROM roads
@@ -2603,6 +2608,68 @@ def _collect_road_edge_lines(centerline_geom, half_width_m: float):
         except Exception:
             pass
     return edges
+
+
+def _normalize_fragmented_roundabouts(snapped_parts, center_network, snap_tol_m: float):
+    """Replace a circular road loop split across several ways with one clean centreline.
+
+    OSM imports commonly store a roundabout as several touching way segments rather than one
+    closed LineString. Offsetting those fragments independently produces the scattered inner
+    joins visible on a survey plan. Only compact, reasonably circular polygonized loops are
+    normalized; ordinary open roads and the existing junction network remain unchanged.
+    """
+    if center_network is None or not snapped_parts:
+        return snapped_parts
+    if any(getattr(part, "is_ring", False) for part, _ in snapped_parts):
+        return snapped_parts
+    try:
+        polygons = list(polygonize(center_network))
+    except Exception:
+        return snapped_parts
+    if not polygons:
+        return snapped_parts
+
+    join_tol = max(0.5, float(snap_tol_m or 0.0))
+    replacements = []
+    for polygon in polygons:
+        if polygon is None or getattr(polygon, "is_empty", True):
+            continue
+        perimeter = float(getattr(polygon, "length", 0.0) or 0.0)
+        area = float(getattr(polygon, "area", 0.0) or 0.0)
+        coords = list(polygon.exterior.coords)
+        if perimeter <= 0 or area <= 0 or len(coords) < 10:
+            continue
+        circularity = (4.0 * math.pi * area) / (perimeter * perimeter)
+        minx, miny, maxx, maxy = polygon.bounds
+        short_side = min(maxx - minx, maxy - miny)
+        long_side = max(maxx - minx, maxy - miny)
+        if circularity < 0.55 or short_side <= 0 or long_side / short_side > 3.0:
+            continue
+        ring = LineString(coords)
+        nearby_widths = [
+            width for part, width in snapped_parts
+            if part.distance(ring) <= join_tol
+        ]
+        if nearby_widths:
+            replacements.append((ring, max(nearby_widths)))
+
+    if not replacements:
+        return snapped_parts
+
+    normalized = []
+    for part, width in snapped_parts:
+        remainder = part
+        for ring, _ in replacements:
+            try:
+                if remainder.distance(ring) <= join_tol:
+                    remainder = remainder.difference(ring.buffer(join_tol))
+            except Exception:
+                continue
+        for remainder_part in _iter_line_geometries(remainder):
+            if remainder_part is not None and not getattr(remainder_part, "is_empty", True) and remainder_part.length > 0:
+                normalized.append((remainder_part, width))
+    normalized.extend(replacements)
+    return normalized or snapped_parts
 
 
 def _close_dangling_road_endpoints(
@@ -2799,6 +2866,8 @@ def _collect_connected_road_edge_lines(
         except Exception:
             snapped = seg
         snapped_parts.append((snapped, hw))
+
+    snapped_parts = _normalize_fragmented_roundabouts(snapped_parts, center_network, snap_tol_m)
 
     for seg, hw in snapped_parts:
         edge_lines.extend(_collect_road_edge_lines(seg, hw))
@@ -6902,6 +6971,11 @@ def render_plot_map_layout(
                     r.name
                 FROM lines r
                 WHERE r.highway IS NOT NULL
+                  AND lower(r.highway) NOT IN (
+                      'footway', 'path', 'steps', 'cycleway', 'pedestrian', 'bridleway',
+                      'track', 'corridor', 'construction', 'proposed', 'raceway',
+                      'escape', 'elevator', 'platform', 'crossing'
+                  )
             )
             SELECT roads.geom, roads.highway, roads.name
             FROM roads

@@ -32,14 +32,14 @@ from sqlalchemy.orm import Session, aliased
 
 from app.routers.plots import _metric_epsg_for_wgs84_polygon, _subdivide_polygon_equal_count, get_db
 from app.services.estates.authorization import list_estate_access, resolve_estate_principal
-from app.services.estates.identity import slugify
+from app.services.estates.identity import generate_temp_password, hash_password, normalize_email, slugify
 from app.services.estates.entitlements import ESTATE_FEATURES, get_estate_entitlement
-from app.models.estate_foundation import Estate, EstateAgentPortalToken, EstateAllocation, EstateAuditEvent, EstateBlock, EstateCommissionPayout, EstateCommissionTier, EstateCustomer, EstateCustomerPortalToken, EstateDocument, EstateDocumentLink, EstateFieldInspection, EstateHazardAssessment, EstateImportReview, EstateLayoutProposal, EstateNotificationLog, EstateOrganization, EstateOrganizationMember, EstatePayment, EstatePaymentInbox, EstatePaymentRule, EstatePlot, EstatePublicReservationRequest, EstateQrCampaign, EstateSoilAssessment, EstateSpatialFeature, EstateSurveyRequest, EstateStakingTask, GeotechSurveyRequest
-from app.schemas.estates import AllocationAction, BlockCreate, BlockUpdate, CommissionPayoutCreate, CommissionTiersUpdate, CustomerCreate, DevelopmentForecastPublishUpdate, DevelopmentStatusUpdate, EstateCreate, EstateLayoutCriteria, EstateLayoutDecision, EstateLayoutFeatureAdd, EstateLayoutFeatureRemove, EstateLayoutProposalEdit, EstateSubdivisionCreate, EstateUpdate, FieldInspectionCreate, GeoreferenceSessionLink, ImportFromGeoreference, ImportReviewCreate, ImportReviewDecision, ImportReviewFromGeoreferenceSession, MemberCreate, MemberUpdate, PaymentInboxCreate, PaymentInboxMatch, PlotCreate, PlotAddressUpdate, PlotGeometryUpdate, PlotListingDefaultsUpdate, PlotPriceUpdate, PortalTokenCreate, PublicEstateSettingsUpdate, PublicReservationConvert, PublicReservationCreate, PublicReservationUpdate, PaymentCreate, QrCampaignCreate, SpatialFeatureCreate, SpatialFeatureUpdate, SurveyEligibilityUpdate, VoidAction
+from app.models.estate_foundation import Estate, EstateAgentPortalToken, EstateAllocation, EstateAuditEvent, EstateBlock, EstateCommissionPayout, EstateCommissionTier, EstateCustomer, EstateCustomerPortalToken, EstateDocument, EstateDocumentLink, EstateFieldInspection, EstateHazardAssessment, EstateImportReview, EstateLayoutProposal, EstateNotificationLog, EstateOrganization, EstateOrganizationMember, EstatePayment, EstatePaymentInbox, EstatePaymentRule, EstatePlot, EstatePublicReservationRequest, EstateQrCampaign, EstateSoilAssessment, EstateSpatialFeature, EstateStaffRole, EstateSurveyRequest, EstateStakingTask, GeotechSurveyRequest
+from app.schemas.estates import AllocationAction, BlockCreate, BlockUpdate, CommissionPayoutCreate, CommissionTiersUpdate, CustomerCreate, DevelopmentForecastPublishUpdate, DevelopmentStatusUpdate, EstateCreate, EstateLayoutCriteria, EstateLayoutDecision, EstateLayoutFeatureAdd, EstateLayoutFeatureRemove, EstateLayoutProposalEdit, EstateSubdivisionCreate, EstateUpdate, FieldInspectionCreate, GeoreferenceSessionLink, ImportFromGeoreference, ImportReviewCreate, ImportReviewDecision, ImportReviewFromGeoreferenceSession, MemberCreate, MemberUpdate, PaymentInboxCreate, PaymentInboxMatch, PlotCreate, PlotAddressUpdate, PlotGeometryUpdate, PlotListingDefaultsUpdate, PlotPriceUpdate, PortalTokenCreate, PublicEstateSettingsUpdate, PublicReservationConvert, PublicReservationCreate, PublicReservationUpdate, PaymentCreate, QrCampaignCreate, SpatialFeatureCreate, SpatialFeatureUpdate, StaffCreate, StaffRoleCreate, StaffRoleUpdate, StaffUpdate, SurveyEligibilityUpdate, VoidAction
 from app.services.estates.payments import confirm_payment, financial_summary, record_payment, void_payment
 from app.services.estates.documents import read_private_estate_file, store_private_estate_file
 from app.utils.r2_objects import delete_object_best_effort, build_r2_settings
-from app.services.estates.permissions import has_permission
+from app.services.estates.permissions import PERMISSION_CATALOG, has_permission, sanitize_permissions
 from sqlalchemy import func
 from app.services.estates.allocations import release_allocation, reserve_or_allocate
 from app.services.estates.audit import append_estate_audit_event
@@ -54,7 +54,7 @@ from app.services.estates.qc import validate_polygon
 from app.services.estates.layout_generation import generate_estate_layout
 from app.services.survey.dgps import alpha_station, render_dgps_staking_csv
 from app.utils.coordinate_converter import COORDINATE_SYSTEMS, resolve_coordinate_system_key, convert_coordinates
-from app.models.estate_auth import EstateAccount
+from app.models.estate_auth import EstateAccount, EstateAuthSession
 from app.utils.survey_auth_security import find_or_create_survey_user, issue_survey_session
 from app.models.plot import Plot
 from app.services.estates import estate_email, marketing_alerts, marketing_common
@@ -5496,6 +5496,297 @@ def preview_agent_portal(organization_id: int, member_id: int, request: Request,
     )
     db.commit()
     return {"member_id": member.id, "portal_url": _agent_portal_url(raw_token), "expires_at": token_row.expires_at}
+
+
+# ---------------------------------------------------------------------------
+# Add Access: custom staff roles + staff dashboard accounts.
+#
+# Distinct from the "organization members" endpoints above (which link an *existing* identity,
+# such as an agent's portal-only access, to a coarse fixed role). This is the organization
+# owner's "Add Access" screen: define a named role as a checklist of dashboard permissions, then
+# create a brand-new EstateAccount (full dashboard login) for a staff member and grant them either
+# a role's checklist or a hand-picked one. The new account gets a random temp password by email
+# and must set its own on first login (see estate_auth.change_password / must_change_password).
+# ---------------------------------------------------------------------------
+
+_PERMISSION_LABELS: dict[str, str] = {
+    item["key"]: item["label"] for group in PERMISSION_CATALOG for item in group["items"]
+}
+
+
+def _permission_labels(keys: list[str]) -> list[str]:
+    return [_PERMISSION_LABELS[key] for key in keys if key in _PERMISSION_LABELS]
+
+
+def _staff_role_payload(role: EstateStaffRole) -> dict:
+    return {"id": role.id, "name": role.name, "permissions": list(role.permissions or [])}
+
+
+def _staff_login_url() -> str:
+    web_url = str(os.getenv("LANDCHECK_WEB_URL") or "https://landcheck.online").rstrip("/")
+    return f"{web_url}/estates/login"
+
+
+@router.get("/organizations/{organization_id}/permission-catalog")
+def get_permission_catalog(organization_id: int, request: Request, db: Session = Depends(get_db)):
+    require_estate_access(db, request, organization_id, permission="estate.manage")
+    return {"groups": PERMISSION_CATALOG}
+
+
+@router.get("/organizations/{organization_id}/staff-roles")
+def list_staff_roles(organization_id: int, request: Request, db: Session = Depends(get_db)):
+    require_estate_access(db, request, organization_id, permission="estate.manage")
+    rows = (
+        db.query(EstateStaffRole)
+        .filter(EstateStaffRole.organization_id == organization_id)
+        .order_by(EstateStaffRole.name.asc())
+        .all()
+    )
+    return [_staff_role_payload(row) for row in rows]
+
+
+@router.post("/organizations/{organization_id}/staff-roles", status_code=201)
+def create_staff_role(organization_id: int, payload: StaffRoleCreate, request: Request, db: Session = Depends(get_db)):
+    access = require_estate_access(db, request, organization_id, permission="estate.manage")
+    name = payload.name.strip()
+    if not name:
+        raise HTTPException(422, "Role name is required")
+    existing = db.query(EstateStaffRole).filter(EstateStaffRole.organization_id == organization_id, func.lower(EstateStaffRole.name) == name.lower()).one_or_none()
+    if existing:
+        raise HTTPException(409, "A role with this name already exists")
+    row = EstateStaffRole(organization_id=organization_id, name=name, permissions=sanitize_permissions(payload.permissions))
+    db.add(row)
+    db.flush()
+    append_estate_audit_event(db, organization_id=organization_id, actor=access.principal, action="staff_role.created", entity_type="estate_staff_role", entity_id=row.id, after_data=_staff_role_payload(row))
+    db.commit()
+    return _staff_role_payload(row)
+
+
+@router.patch("/organizations/{organization_id}/staff-roles/{role_id}")
+def update_staff_role(organization_id: int, role_id: int, payload: StaffRoleUpdate, request: Request, db: Session = Depends(get_db)):
+    access = require_estate_access(db, request, organization_id, permission="estate.manage")
+    row = db.query(EstateStaffRole).filter(EstateStaffRole.id == role_id, EstateStaffRole.organization_id == organization_id).one_or_none()
+    if not row:
+        raise HTTPException(404, "Role not found")
+    before = _staff_role_payload(row)
+    values = payload.model_dump(exclude_unset=True)
+    if "name" in values and values["name"]:
+        new_name = values["name"].strip()
+        clash = db.query(EstateStaffRole).filter(EstateStaffRole.organization_id == organization_id, EstateStaffRole.id != role_id, func.lower(EstateStaffRole.name) == new_name.lower()).one_or_none()
+        if clash:
+            raise HTTPException(409, "A role with this name already exists")
+        row.name = new_name
+    if "permissions" in values and values["permissions"] is not None:
+        row.permissions = sanitize_permissions(values["permissions"])
+    append_estate_audit_event(db, organization_id=organization_id, actor=access.principal, action="staff_role.updated", entity_type="estate_staff_role", entity_id=row.id, before_data=before, after_data=_staff_role_payload(row))
+    db.commit()
+    return _staff_role_payload(row)
+
+
+@router.delete("/organizations/{organization_id}/staff-roles/{role_id}", status_code=204)
+def delete_staff_role(organization_id: int, role_id: int, request: Request, db: Session = Depends(get_db)):
+    access = require_estate_access(db, request, organization_id, permission="estate.manage")
+    row = db.query(EstateStaffRole).filter(EstateStaffRole.id == role_id, EstateStaffRole.organization_id == organization_id).one_or_none()
+    if not row:
+        raise HTTPException(404, "Role not found")
+    append_estate_audit_event(db, organization_id=organization_id, actor=access.principal, action="staff_role.deleted", entity_type="estate_staff_role", entity_id=row.id, before_data=_staff_role_payload(row))
+    db.delete(row)
+    db.commit()
+    return Response(status_code=204)
+
+
+def _staff_member_payload(db: Session, member: EstateOrganizationMember, account: EstateAccount | None, role_name: str | None) -> dict:
+    permissions = list(member.custom_permissions or [])
+    return {
+        "member_id": member.id,
+        "account_id": account.id if account else None,
+        "full_name": account.full_name if account else member.subject_id,
+        "email": account.email if account else member.contact_email,
+        "phone": member.contact_phone,
+        "role_id": member.custom_role_id,
+        "role_name": role_name,
+        "permissions": permissions,
+        "permission_labels": _permission_labels(permissions),
+        "is_active": member.is_active,
+        "must_change_password": bool(account.must_change_password) if account else False,
+        "last_login_at": account.last_login_at.isoformat() if account and account.last_login_at else None,
+        "created_at": member.created_at.isoformat() if member.created_at else None,
+    }
+
+
+@router.get("/organizations/{organization_id}/staff")
+def list_staff(organization_id: int, request: Request, db: Session = Depends(get_db)):
+    require_estate_access(db, request, organization_id, permission="estate.manage")
+    rows = (
+        db.query(EstateOrganizationMember)
+        .filter(
+            EstateOrganizationMember.organization_id == organization_id,
+            EstateOrganizationMember.subject_type == "estate_account",
+            EstateOrganizationMember.role_key == "staff",
+        )
+        .order_by(EstateOrganizationMember.created_at.asc())
+        .all()
+    )
+    role_ids = {row.custom_role_id for row in rows if row.custom_role_id}
+    roles_by_id = {}
+    if role_ids:
+        for role in db.query(EstateStaffRole).filter(EstateStaffRole.id.in_(role_ids)).all():
+            roles_by_id[role.id] = role.name
+    account_ids = [int(row.subject_id) for row in rows if str(row.subject_id).isdigit()]
+    accounts_by_id = {}
+    if account_ids:
+        for account in db.query(EstateAccount).filter(EstateAccount.id.in_(account_ids)).all():
+            accounts_by_id[account.id] = account
+    return [
+        _staff_member_payload(db, row, accounts_by_id.get(int(row.subject_id)) if str(row.subject_id).isdigit() else None, roles_by_id.get(row.custom_role_id))
+        for row in rows
+    ]
+
+
+@router.post("/organizations/{organization_id}/staff", status_code=201)
+def create_staff(organization_id: int, payload: StaffCreate, request: Request, db: Session = Depends(get_db)):
+    access = require_estate_access(db, request, organization_id, permission="estate.manage")
+    organization = db.get(EstateOrganization, organization_id)
+    if not organization:
+        raise HTTPException(404, "Estate organization was not found")
+    email = normalize_email(payload.email)
+    if "@" not in email or "." not in email.split("@")[-1]:
+        raise HTTPException(422, "Enter a valid email address")
+    full_name = payload.full_name.strip()
+    if not full_name:
+        raise HTTPException(422, "Staff member's name is required")
+    if db.query(EstateAccount).filter(EstateAccount.email_normalized == email).first():
+        raise HTTPException(409, "An Estate account already exists for this email")
+    role = None
+    if payload.role_id is not None:
+        role = db.query(EstateStaffRole).filter(EstateStaffRole.id == payload.role_id, EstateStaffRole.organization_id == organization_id).one_or_none()
+        if not role:
+            raise HTTPException(404, "Role not found")
+    permissions = sanitize_permissions(payload.permissions)
+    temp_password = generate_temp_password()
+    account = EstateAccount(
+        organization_id=organization_id,
+        email=payload.email.strip(),
+        email_normalized=email,
+        full_name=full_name,
+        password_hash=hash_password(temp_password),
+        status="active",
+        must_change_password=True,
+    )
+    db.add(account)
+    try:
+        db.flush()
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(409, "An Estate account already exists for this email") from exc
+    member = EstateOrganizationMember(
+        organization_id=organization_id,
+        subject_type="estate_account",
+        subject_id=str(account.id),
+        role_key="staff",
+        custom_role_id=role.id if role else None,
+        custom_permissions=permissions,
+        contact_email=email,
+        contact_phone=payload.phone.strip() if payload.phone and payload.phone.strip() else None,
+        is_active=True,
+    )
+    db.add(member)
+    db.flush()
+    append_estate_audit_event(
+        db, organization_id=organization_id, actor=access.principal, action="staff.added",
+        entity_type="estate_organization_member", entity_id=member.id,
+        after_data={"email": email, "role_id": role.id if role else None, "permissions": permissions},
+    )
+    db.commit()
+    email_sent = estate_email.send_staff_invite_email(
+        organization=organization,
+        account=account,
+        role_label=role.name if role else "Custom access",
+        permission_labels=_permission_labels(permissions),
+        temp_password=temp_password,
+        login_url=_staff_login_url(),
+    )
+    payload_out = _staff_member_payload(db, member, account, role.name if role else None)
+    payload_out["email_sent"] = email_sent
+    return payload_out
+
+
+@router.patch("/organizations/{organization_id}/staff/{member_id}")
+def update_staff(organization_id: int, member_id: int, payload: StaffUpdate, request: Request, db: Session = Depends(get_db)):
+    access = require_estate_access(db, request, organization_id, permission="estate.manage")
+    member = db.query(EstateOrganizationMember).filter(
+        EstateOrganizationMember.id == member_id,
+        EstateOrganizationMember.organization_id == organization_id,
+        EstateOrganizationMember.role_key == "staff",
+    ).one_or_none()
+    if not member:
+        raise HTTPException(404, "Staff member not found")
+    account = db.get(EstateAccount, int(member.subject_id)) if str(member.subject_id).isdigit() else None
+    before = _staff_member_payload(db, member, account, None)
+    values = payload.model_dump(exclude_unset=True)
+    if "role_id" in values:
+        if values["role_id"] is not None:
+            role = db.query(EstateStaffRole).filter(EstateStaffRole.id == values["role_id"], EstateStaffRole.organization_id == organization_id).one_or_none()
+            if not role:
+                raise HTTPException(404, "Role not found")
+            member.custom_role_id = role.id
+        else:
+            member.custom_role_id = None
+    if "permissions" in values and values["permissions"] is not None:
+        member.custom_permissions = sanitize_permissions(values["permissions"])
+    if "is_active" in values and values["is_active"] is not None:
+        member.is_active = values["is_active"]
+        if account:
+            account.status = "active" if values["is_active"] else "suspended"
+            if not values["is_active"]:
+                db.query(EstateAuthSession).filter(EstateAuthSession.account_id == account.id, EstateAuthSession.session_state == "active").update(
+                    {"session_state": "revoked", "revoked_at": datetime.utcnow(), "revoke_reason": "staff_access_revoked"}
+                )
+    if "phone" in values:
+        member.contact_phone = values["phone"].strip() if values["phone"] and values["phone"].strip() else None
+    role_name = None
+    if member.custom_role_id:
+        role_row = db.get(EstateStaffRole, member.custom_role_id)
+        role_name = role_row.name if role_row else None
+    append_estate_audit_event(db, organization_id=organization_id, actor=access.principal, action="staff.updated", entity_type="estate_organization_member", entity_id=member.id, before_data=before, after_data=_staff_member_payload(db, member, account, role_name))
+    db.commit()
+    return _staff_member_payload(db, member, account, role_name)
+
+
+@router.post("/organizations/{organization_id}/staff/{member_id}/resend-invite")
+def resend_staff_invite(organization_id: int, member_id: int, request: Request, db: Session = Depends(get_db)):
+    """Issue a fresh temp password and re-send the welcome email - for when the first one never
+    arrived, or the staff member never completed their first login."""
+    access = require_estate_access(db, request, organization_id, permission="estate.manage")
+    member = db.query(EstateOrganizationMember).filter(
+        EstateOrganizationMember.id == member_id,
+        EstateOrganizationMember.organization_id == organization_id,
+        EstateOrganizationMember.role_key == "staff",
+    ).one_or_none()
+    if not member or not str(member.subject_id).isdigit():
+        raise HTTPException(404, "Staff member not found")
+    account = db.get(EstateAccount, int(member.subject_id))
+    if not account:
+        raise HTTPException(404, "Staff member not found")
+    organization = db.get(EstateOrganization, organization_id)
+    temp_password = generate_temp_password()
+    account.password_hash = hash_password(temp_password)
+    account.must_change_password = True
+    role_name = None
+    if member.custom_role_id:
+        role_row = db.get(EstateStaffRole, member.custom_role_id)
+        role_name = role_row.name if role_row else None
+    append_estate_audit_event(db, organization_id=organization_id, actor=access.principal, action="staff.invite_resent", entity_type="estate_organization_member", entity_id=member.id)
+    db.commit()
+    email_sent = estate_email.send_staff_invite_email(
+        organization=organization,
+        account=account,
+        role_label=role_name or "Custom access",
+        permission_labels=_permission_labels(list(member.custom_permissions or [])),
+        temp_password=temp_password,
+        login_url=_staff_login_url(),
+    )
+    return {"member_id": member.id, "email_sent": email_sent}
 
 
 @router.get("/foundation/access")

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import uuid
 
-from sqlalchemy import CheckConstraint, Column, DateTime, ForeignKey, Integer, String, UniqueConstraint
+from sqlalchemy import Boolean, CheckConstraint, Column, DateTime, ForeignKey, Integer, String, UniqueConstraint
 from sqlalchemy.sql import func
 
 from app.db_base import Base
@@ -20,6 +20,10 @@ class EstateAccount(Base):
     email_normalized = Column(String(255), nullable=False, unique=True)
     full_name = Column(String(255), nullable=False)
     password_hash = Column(String(255), nullable=False)
+    # True for a staff account created via "Add Access" and still on its emailed temp password -
+    # the frontend forces a password-set screen before the dashboard on first login, then this
+    # clears. Never true for a self-registered owner account (they chose their own password).
+    must_change_password = Column(Boolean, nullable=False, default=False)
     status = Column(String(32), nullable=False, default="active")
     trial_claimed_at = Column(DateTime(timezone=True), nullable=True)
     last_login_at = Column(DateTime(timezone=True), nullable=True)

@@ -92,3 +92,21 @@ def test_closed_roundabout_renders_as_two_complete_rings():
 
     assert len(edges) == 2
     assert all(edge.is_ring for edge in edges)
+
+
+def test_fragmented_roundabout_segments_are_rebuilt_before_offsetting():
+    roundabout = Point(0, 0).buffer(20, quad_segs=8).boundary
+    coordinates = list(roundabout.coords)
+    segment_size = (len(coordinates) - 1) // 4
+    fragments = [
+        LineString(coordinates[index:index + segment_size + 1])
+        for index in range(0, len(coordinates) - 1, segment_size)
+    ]
+
+    edges = _collect_connected_road_edge_lines(
+        [(fragment, 3) for fragment in fragments],
+        snap_tol_m=1,
+    )
+
+    assert len(edges) == 2
+    assert all(edge.is_ring for edge in edges)

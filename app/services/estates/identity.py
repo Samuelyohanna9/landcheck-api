@@ -55,6 +55,16 @@ def verify_password(password: str, encoded: str | None) -> bool:
         return False
 
 
+_TEMP_PASSWORD_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789"
+
+
+def generate_temp_password(length: int = 12) -> str:
+    """A random one-time password for a newly invited staff account, sent by email and forced to
+    be changed on first login. Excludes visually ambiguous characters (0/O, 1/l/I) since it's
+    typically hand-typed once off a phone screen."""
+    return "".join(secrets.choice(_TEMP_PASSWORD_ALPHABET) for _ in range(length))
+
+
 def slugify(value: str) -> str:
     slug = re.sub(r"[^a-z0-9]+", "-", str(value or "").strip().lower()).strip("-")
     return slug[:108] or "estate-company"

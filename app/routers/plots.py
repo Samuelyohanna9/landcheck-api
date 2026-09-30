@@ -1921,6 +1921,11 @@ def _load_plot_road_segments_wgs84(db: Session, plot_id: int) -> list[dict]:
                 END AS geom
             FROM lines r
             WHERE r.highway IS NOT NULL
+              AND lower(r.highway) NOT IN (
+                  'footway', 'path', 'steps', 'cycleway', 'pedestrian', 'bridleway',
+                  'track', 'corridor', 'construction', 'proposed', 'raceway',
+                  'escape', 'elevator', 'platform', 'crossing'
+              )
         ),
         clipped AS (
             SELECT (ST_Dump(ST_Intersection(roads.geom, b.geom))).geom AS geom
@@ -3259,6 +3264,11 @@ def _render_subdivision_clean_copy_pdf(
                     r.name AS name
                 FROM lines r
                 WHERE r.highway IS NOT NULL
+                  AND lower(r.highway) NOT IN (
+                      'footway', 'path', 'steps', 'cycleway', 'pedestrian', 'bridleway',
+                      'track', 'corridor', 'construction', 'proposed', 'raceway',
+                      'escape', 'elevator', 'platform', 'crossing'
+                  )
             )
             SELECT roads.geom, roads.name
             FROM roads
@@ -6172,6 +6182,11 @@ def get_plot_features_geojson(
                 r.name
             FROM lines r
             WHERE r.highway IS NOT NULL
+              AND lower(r.highway) NOT IN (
+                  'footway', 'path', 'steps', 'cycleway', 'pedestrian', 'bridleway',
+                  'track', 'corridor', 'construction', 'proposed', 'raceway',
+                  'escape', 'elevator', 'platform', 'crossing'
+              )
         ),
         clipped AS (
             SELECT
