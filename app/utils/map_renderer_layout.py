@@ -2727,6 +2727,13 @@ def _draw_road_edges(
     try:
         network = unary_union(edge_lines)
         snap_tol = max(0.5, 0.6 * max(1.0, float(font_scale)))
+        if scale_ratio:
+            # The simplify pass above can shift a junction vertex on one edge without shifting
+            # the matching vertex on the edge it was touching, reopening a small gap - this final
+            # join pass must close at least as much as simplify could have just opened, or that
+            # gap survives into the drawn plan. A plain font_scale-only tolerance doesn't grow
+            # with plan scale the way the simplify tolerance does, so widen to match it.
+            snap_tol = max(snap_tol, tolerance_m)
         snapped = [snap(seg, network, snap_tol) for seg in edge_lines]
         merged = linemerge(unary_union(snapped))
         merged_lines = [seg for seg in _iter_line_geometries(merged) if seg is not None and not getattr(seg, "is_empty", True)]
