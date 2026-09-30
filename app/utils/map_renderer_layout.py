@@ -2569,6 +2569,20 @@ def _collect_road_edge_lines(centerline_geom, half_width_m: float):
         try:
             if getattr(line_part, "length", 0.0) <= 0:
                 continue
+            if getattr(line_part, "is_ring", False):
+                # A roundabout is a closed centreline. parallel_offset() treats a closed
+                # ring like an open path and can leave one casing open or fragmented at the
+                # seam. Buffer the ring once and use its inner/outer boundaries instead.
+                ring_corridor = line_part.buffer(half_width_m, join_style=1)
+                ring_edges = [
+                    edge for edge in _iter_line_geometries(ring_corridor.boundary)
+                    if edge is not None
+                    and not getattr(edge, "is_empty", True)
+                    and getattr(edge, "length", 0.0) > 0
+                ]
+                if ring_edges:
+                    edges.extend(ring_edges)
+                    continue
             # Use round joins so overlaps/intersections look continuous.
             left = line_part.parallel_offset(half_width_m, "left", join_style=1)
             right = line_part.parallel_offset(half_width_m, "right", join_style=1)

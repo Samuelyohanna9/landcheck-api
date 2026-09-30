@@ -1,4 +1,4 @@
-from shapely.geometry import LineString, box
+from shapely.geometry import LineString, Point, box
 
 from app.utils.map_renderer_layout import _collect_connected_road_edge_lines
 
@@ -80,3 +80,15 @@ def test_nearby_separate_roads_keep_their_long_casing_lines():
     assert len(edges) == 4
     assert all(round(edge.length, 6) == 200 for edge in edges)
     assert {round(edge.bounds[1], 6) for edge in edges} == {-5, 3, 5, 13}
+
+
+def test_closed_roundabout_renders_as_two_complete_rings():
+    roundabout = Point(0, 0).buffer(20, quad_segs=8).boundary
+
+    edges = _collect_connected_road_edge_lines(
+        [(roundabout, 3)],
+        snap_tol_m=1,
+    )
+
+    assert len(edges) == 2
+    assert all(edge.is_ring for edge in edges)
