@@ -2580,7 +2580,12 @@ def _collect_road_edge_lines(centerline_geom, half_width_m: float):
     return edges
 
 
-def _close_dangling_road_endpoints(edge_lines, tolerance_m: float, support_lines=None):
+def _close_dangling_road_endpoints(
+    edge_lines,
+    tolerance_m: float,
+    support_lines=None,
+    support_forward_only: bool = False,
+):
     """Pull each line's free endpoints onto the nearest point of another line, if one is
     close enough to be the same junction. Optional support lines (such as the map frame) are
     targets only; they are never modified.
@@ -2624,8 +2629,10 @@ def _close_dangling_road_endpoints(edge_lines, tolerance_m: float, support_lines
             # side-road casing endpoint. Prefer the candidate in the direction in which
             # that casing continues. This sends a branch to the near edge of the through
             # road instead of choosing the opposite edge and drawing a diagonal join.
-            tangent_source = coords[1] if idx == 0 else coords[-2]
             anchor = coords[0] if idx == 0 else coords[-1]
+            tangent_source = coords[1] if idx == 0 else coords[-2]
+            # Road-to-road joins target the casing direction toward the line interior;
+            # a grid-frame extension targets the opposite direction, outward to the frame.
             tangent_x = float(tangent_source[0]) - float(anchor[0])
             tangent_y = float(tangent_source[1]) - float(anchor[1])
             tangent_length = math.hypot(tangent_x, tangent_y)
@@ -2665,14 +2672,17 @@ def _close_dangling_road_endpoints(edge_lines, tolerance_m: float, support_lines
                         candidate_x = candidate_after.x - candidate_before.x
                         candidate_y = candidate_after.y - candidate_before.y
                         candidate_length = math.hypot(candidate_x, candidate_y)
+                        candidate_forward = (candidate_point.x - pt.x) * tangent_x + (candidate_point.y - pt.y) * tangent_y
+                        support_forward = -candidate_forward
                         if candidate_length > 0 and cand_idx < edge_count:
-                            candidate_forward = (candidate_point.x - pt.x) * tangent_x + (candidate_point.y - pt.y) * tangent_y
                             candidate_alignment = abs(
                                 (candidate_x / candidate_length) * tangent_x
                                 + (candidate_y / candidate_length) * tangent_y
                             )
                             if candidate_alignment > 0.85 and candidate_forward <= 1e-6:
                                 continue
+                        elif support_forward_only and support_forward <= 1e-6:
+                            continue
                         candidate_points.append((d, candidate_point))
                     except Exception:
                         continue
@@ -2817,6 +2827,7 @@ def _collect_connected_road_edge_lines(
                         final_edges,
                         support_tol,
                         support_lines=[extent_boundary],
+                        support_forward_only=True,
                     )
                     clipped_edges = []
                     for edge in final_edges:
