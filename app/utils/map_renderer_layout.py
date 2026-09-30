@@ -2773,23 +2773,23 @@ def _collect_connected_road_edge_lines(road_geoms_with_width, snap_tol_m: float 
             if corridor_parts:
                 corridor_boundary = unary_union(corridor_parts).boundary
                 edge_network = unary_union(final_edges)
-                trimmed = edge_network.intersection(corridor_boundary)
+                # Keep a narrow tolerance for projected/curved offsets. Requiring exact
+                # line equality here can fragment a smooth road into short visible pieces.
+                boundary_support = corridor_boundary.buffer(max(0.05, min(0.75, snap_tol_m * 0.15)))
+                trimmed = edge_network.intersection(boundary_support)
                 trimmed_edges = [
                     seg for seg in _iter_line_geometries(trimmed)
                     if seg is not None and not getattr(seg, "is_empty", True) and getattr(seg, "length", 0.0) > 0
                 ]
-                if not trimmed_edges:
-                    # A curved offset can differ from a buffer boundary by a few
-                    # centimetres after projection. Keep a narrow fallback tolerance
-                    # for those cases without restoring the junction blockage.
-                    boundary_support = corridor_boundary.buffer(max(0.05, min(0.75, snap_tol_m * 0.15)))
-                    trimmed = edge_network.intersection(boundary_support)
-                    trimmed_edges = [
-                        seg for seg in _iter_line_geometries(trimmed)
+                if trimmed_edges:
+                    # Re-merge after trimming so the clean-copy renderer does not
+                    # restart a dashed pattern at every source-road vertex.
+                    trimmed_network = linemerge(unary_union(trimmed_edges))
+                    merged_trimmed_edges = [
+                        seg for seg in _iter_line_geometries(trimmed_network)
                         if seg is not None and not getattr(seg, "is_empty", True) and getattr(seg, "length", 0.0) > 0
                     ]
-                if trimmed_edges:
-                    final_edges = trimmed_edges
+                    final_edges = merged_trimmed_edges or trimmed_edges
             return final_edges
     except Exception:
         pass
