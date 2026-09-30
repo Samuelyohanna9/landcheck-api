@@ -3539,19 +3539,9 @@ def _render_subdivision_clean_copy_pdf(
         road_label_size = max(7, int(7.2 * font_scale))
         road_snap_tol = max(1.0, (5.0 / 1000.0) * scale_ratio)
         road_label_features: list[tuple[Any, str]] = []
+        road_geom_width: list[tuple[Any, float]] = []
         road_line_zorder = 21
         road_label_zorder = 23
-
-        def _line_length_total(geom_obj: Any) -> float:
-            total = 0.0
-            for part in _iter_line_geometries_for_clean_copy(geom_obj):
-                if part is None or part.is_empty:
-                    continue
-                try:
-                    total += float(getattr(part, "length", 0.0))
-                except Exception:
-                    continue
-            return total
 
         for road_item in roads_wgs:
             road_geom = road_item.get("geom")
@@ -3581,12 +3571,35 @@ def _render_subdivision_clean_copy_pdf(
             if clipped.is_empty:
                 continue
             snapped_clipped = snap(clipped, extent_poly.boundary, road_snap_tol)
-            edge_lines = _collect_connected_road_edge_lines([(snapped_clipped, half_width)], snap_tol_m=road_snap_tol)
-            source_len = _line_length_total(snapped_clipped)
-            drawn_edge_len = 0.0
-            if not edge_lines:
-                # Fallback: draw per-part offset lines so road still appears for edge cases.
-                for part in _iter_line_geometries_for_clean_copy(snapped_clipped):
+            road_geom_width.append((snapped_clipped, half_width))
+            if road_name:
+                road_label_features.append((snapped_clipped, road_name))
+
+        # Build one connected casing network for the whole road set. Processing each
+        # road separately leaves visible gaps at T-junctions because a side road can
+        # only be joined to another road when both are present in the same pass.
+        edge_lines = _collect_connected_road_edge_lines(road_geom_width, snap_tol_m=road_snap_tol)
+        if edge_lines:
+            for seg in edge_lines:
+                try:
+                    x_vals, y_vals = seg.xy
+                    ax.plot(
+                        x_vals,
+                        y_vals,
+                        color=road_edge_color,
+                        lw=road_edge_lw,
+                        linestyle=road_edge_linestyle,
+                        zorder=road_line_zorder,
+                        solid_joinstyle="round",
+                        solid_capstyle="round",
+                    )
+                except Exception:
+                    continue
+        else:
+            # Fallback for malformed or empty road networks: keep the original
+            # per-road offset rendering rather than dropping the road completely.
+            for road_geom, half_width in road_geom_width:
+                for part in _iter_line_geometries_for_clean_copy(road_geom):
                     if part is None or part.is_empty:
                         continue
                     try:
@@ -3604,46 +3617,8 @@ def _render_subdivision_clean_copy_pdf(
                                     linestyle=road_edge_linestyle,
                                     zorder=road_line_zorder,
                                 )
-                                try:
-                                    drawn_edge_len += float(getattr(edge_part, "length", 0.0))
-                                except Exception:
-                                    pass
                     except Exception:
                         continue
-            else:
-                for seg in edge_lines:
-                    try:
-                        x_vals, y_vals = seg.xy
-                        ax.plot(
-                            x_vals,
-                            y_vals,
-                            color=road_edge_color,
-                            lw=road_edge_lw,
-                            linestyle=road_edge_linestyle,
-                            zorder=road_line_zorder,
-                        )
-                        drawn_edge_len += float(getattr(seg, "length", 0.0))
-                    except Exception:
-                        continue
-            # If edge geometry is too weak (or effectively invisible), force a centerline fallback.
-            if source_len > 0 and drawn_edge_len < (0.35 * source_len):
-                for part in _iter_line_geometries_for_clean_copy(snapped_clipped):
-                    if part is None or part.is_empty:
-                        continue
-                    try:
-                        x_vals, y_vals = part.xy
-                        ax.plot(
-                            x_vals,
-                            y_vals,
-                            color=road_edge_color,
-                            lw=max(0.7, 0.85 * road_edge_lw),
-                            linestyle=road_edge_linestyle,
-                            zorder=road_line_zorder,
-                        )
-                    except Exception:
-                        continue
-            if road_name:
-                road_label_features.append((snapped_clipped, road_name))
 
         for geom, road_name in road_label_features:
             try:

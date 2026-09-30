@@ -2611,12 +2611,25 @@ def _close_dangling_road_endpoints(edge_lines, tolerance_m: float):
         changed = False
         for idx in (0, -1):
             pt = Point(coords[idx])
+            # At a T-junction both sides of the through road can be equally close to a
+            # side-road casing endpoint. Prefer the candidate in the direction in which
+            # that casing continues. This sends a branch to the near edge of the through
+            # road instead of choosing the opposite edge and drawing a diagonal join.
+            tangent_source = coords[1] if idx == 0 else coords[-2]
+            anchor = coords[0] if idx == 0 else coords[-1]
+            tangent_x = float(tangent_source[0]) - float(anchor[0])
+            tangent_y = float(tangent_source[1]) - float(anchor[1])
+            tangent_length = math.hypot(tangent_x, tangent_y)
+            if tangent_length > 0:
+                tangent_x /= tangent_length
+                tangent_y /= tangent_length
             try:
                 candidate_idxs = tree.query(pt.buffer(tolerance_m))
             except Exception:
                 continue
             best_point = None
             best_dist = tolerance_m
+            candidate_points = []
             already_touching = False
             for cand_idx in candidate_idxs:
                 cand_idx = int(cand_idx)
@@ -2632,12 +2645,39 @@ def _close_dangling_road_endpoints(edge_lines, tolerance_m: float):
                     break
                 if d < best_dist:
                     try:
-                        best_point = nearest_points(pt, cand)[1]
-                        best_dist = d
+                        candidate_point = nearest_points(pt, cand)[1]
+                        # Do not join the two parallel casings of the same road at a
+                        # dead-end. A real junction changes direction; a near-parallel
+                        # candidate is normally the other side of this same road.
+                        candidate_distance = float(cand.project(candidate_point))
+                        tangent_delta = min(max(0.1, float(cand.length) * 0.01), float(cand.length) / 2.0)
+                        candidate_before = cand.interpolate(max(0.0, candidate_distance - tangent_delta))
+                        candidate_after = cand.interpolate(min(float(cand.length), candidate_distance + tangent_delta))
+                        candidate_x = candidate_after.x - candidate_before.x
+                        candidate_y = candidate_after.y - candidate_before.y
+                        candidate_length = math.hypot(candidate_x, candidate_y)
+                        if candidate_length > 0:
+                            candidate_forward = (candidate_point.x - pt.x) * tangent_x + (candidate_point.y - pt.y) * tangent_y
+                            candidate_alignment = abs(
+                                (candidate_x / candidate_length) * tangent_x
+                                + (candidate_y / candidate_length) * tangent_y
+                            )
+                            if candidate_alignment > 0.85 and candidate_forward <= 1e-6:
+                                continue
+                        candidate_points.append((d, candidate_point))
                     except Exception:
                         continue
-            if already_touching or best_point is None:
+            if already_touching or not candidate_points:
                 continue
+            forward_points = [
+                (distance, point)
+                for distance, point in candidate_points
+                if ((point.x - pt.x) * tangent_x + (point.y - pt.y) * tangent_y) > 1e-6
+            ]
+            best_dist, best_point = min(
+                forward_points or candidate_points,
+                key=lambda item: item[0],
+            )
             coords[idx] = (best_point.x, best_point.y)
             changed = True
         if changed:
