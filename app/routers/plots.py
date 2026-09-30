@@ -3578,7 +3578,9 @@ def _render_subdivision_clean_copy_pdf(
         # Build one connected casing network for the whole road set. Processing each
         # road separately leaves visible gaps at T-junctions because a side road can
         # only be joined to another road when both are present in the same pass.
-        edge_lines = _collect_connected_road_edge_lines(road_geom_width, snap_tol_m=road_snap_tol)
+        edge_lines = _collect_connected_road_edge_lines(
+            road_geom_width, snap_tol_m=road_snap_tol, extent_geom=extent_poly,
+        )
         if edge_lines:
             for seg in edge_lines:
                 try:

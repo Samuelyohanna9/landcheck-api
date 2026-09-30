@@ -2580,9 +2580,10 @@ def _collect_road_edge_lines(centerline_geom, half_width_m: float):
     return edges
 
 
-def _close_dangling_road_endpoints(edge_lines, tolerance_m: float):
+def _close_dangling_road_endpoints(edge_lines, tolerance_m: float, support_lines=None):
     """Pull each line's free endpoints onto the nearest point of another line, if one is
-    close enough to be the same junction.
+    close enough to be the same junction. Optional support lines (such as the map frame) are
+    targets only; they are never modified.
 
     This is not what shapely.ops.snap() does: snap() only ever moves a vertex onto an
     EXISTING vertex of the target geometry, never onto an arbitrary point along one of its
@@ -2596,8 +2597,16 @@ def _close_dangling_road_endpoints(edge_lines, tolerance_m: float):
     """
     if not edge_lines or tolerance_m <= 0:
         return edge_lines
+    candidate_lines = list(edge_lines)
+    edge_count = len(candidate_lines)
+    for support_line in support_lines or ():
+        if support_line is None or getattr(support_line, "is_empty", True):
+            continue
+        candidate_lines.extend(_iter_line_geometries(support_line))
+    if not candidate_lines:
+        return edge_lines
     try:
-        tree = STRtree(edge_lines)
+        tree = STRtree(candidate_lines)
     except Exception:
         return edge_lines
     result = list(edge_lines)
@@ -2635,7 +2644,7 @@ def _close_dangling_road_endpoints(edge_lines, tolerance_m: float):
                 cand_idx = int(cand_idx)
                 if cand_idx == i:
                     continue
-                cand = edge_lines[cand_idx]
+                cand = candidate_lines[cand_idx]
                 try:
                     d = pt.distance(cand)
                 except Exception:
@@ -2656,7 +2665,7 @@ def _close_dangling_road_endpoints(edge_lines, tolerance_m: float):
                         candidate_x = candidate_after.x - candidate_before.x
                         candidate_y = candidate_after.y - candidate_before.y
                         candidate_length = math.hypot(candidate_x, candidate_y)
-                        if candidate_length > 0:
+                        if candidate_length > 0 and cand_idx < edge_count:
                             candidate_forward = (candidate_point.x - pt.x) * tangent_x + (candidate_point.y - pt.y) * tangent_y
                             candidate_alignment = abs(
                                 (candidate_x / candidate_length) * tangent_x
@@ -2688,7 +2697,11 @@ def _close_dangling_road_endpoints(edge_lines, tolerance_m: float):
     return result
 
 
-def _collect_connected_road_edge_lines(road_geoms_with_width, snap_tol_m: float = 1.0):
+def _collect_connected_road_edge_lines(
+    road_geoms_with_width,
+    snap_tol_m: float = 1.0,
+    extent_geom=None,
+):
     """
     Build two open offset edges for each road centerline.
 
@@ -2790,6 +2803,40 @@ def _collect_connected_road_edge_lines(road_geoms_with_width, snap_tol_m: float 
                         if seg is not None and not getattr(seg, "is_empty", True) and getattr(seg, "length", 0.0) > 0
                     ]
                     final_edges = merged_trimmed_edges or trimmed_edges
+
+            # A road endpoint can stop a few metres short of the map frame after clipping,
+            # especially when its centreline approaches the frame at an angle. Extend it to
+            # the frame only when the frame is already within the same bounded junction
+            # tolerance used for road-to-road joins. Then clip once more so overextended
+            # casings are trimmed cleanly at the grid boundary.
+            if extent_geom is not None and final_edges:
+                try:
+                    extent_boundary = extent_geom.boundary
+                    support_tol = max(junction_tol, snap_tol_m)
+                    final_edges = _close_dangling_road_endpoints(
+                        final_edges,
+                        support_tol,
+                        support_lines=[extent_boundary],
+                    )
+                    clipped_edges = []
+                    for edge in final_edges:
+                        clipped = edge.intersection(extent_geom)
+                        clipped_edges.extend(
+                            seg for seg in _iter_line_geometries(clipped)
+                            if seg is not None
+                            and not getattr(seg, "is_empty", True)
+                            and getattr(seg, "length", 0.0) > 0
+                        )
+                    if clipped_edges:
+                        clipped_network = linemerge(unary_union(clipped_edges))
+                        final_edges = [
+                            seg for seg in _iter_line_geometries(clipped_network)
+                            if seg is not None
+                            and not getattr(seg, "is_empty", True)
+                            and getattr(seg, "length", 0.0) > 0
+                        ] or clipped_edges
+                except Exception:
+                    pass
             return final_edges
     except Exception:
         pass
@@ -3785,7 +3832,9 @@ def _render_plot_map_layout_adamawa(
         snapped_clipped = snap(clipped, extent_poly.boundary, road_snap_tol)
         river_label_features.append((snapped_clipped, name))
 
-    road_edge_lines = _collect_connected_road_edge_lines(road_geom_width, snap_tol_m=road_snap_tol)
+    road_edge_lines = _collect_connected_road_edge_lines(
+        road_geom_width, snap_tol_m=road_snap_tol, extent_geom=extent_poly,
+    )
     _draw_road_edges(ax, road_edge_lines, font_scale=font_scale, color=road_color, scale_ratio=scale_ratio, road_style=road_style)
 
     min_road_label_len = max(2.0, (10.0 / 1000.0) * scale_ratio)
@@ -4729,7 +4778,9 @@ def _render_plot_map_layout_cadastral(
             road_geom_width.append((snapped_clipped, half_w))
         except Exception:
             continue
-    road_edge_lines = _collect_connected_road_edge_lines(road_geom_width, snap_tol_m=road_snap_tol)
+    road_edge_lines = _collect_connected_road_edge_lines(
+        road_geom_width, snap_tol_m=road_snap_tol, extent_geom=extent_poly,
+    )
     _draw_road_edges(ax, road_edge_lines, font_scale=font_scale, color=road_color, linestyle=(0, (6, 4)), scale_ratio=scale_ratio, road_style=road_style)
 
     if _safe_text(location_text):
@@ -5339,7 +5390,9 @@ def _render_plot_map_layout_fct(
             road_geom_width.append((snapped_clipped, half_w))
         except Exception:
             continue
-    road_edge_lines = _collect_connected_road_edge_lines(road_geom_width, snap_tol_m=road_snap_tol)
+    road_edge_lines = _collect_connected_road_edge_lines(
+        road_geom_width, snap_tol_m=road_snap_tol, extent_geom=extent_poly,
+    )
     # A road running right along the frontage would otherwise draw its near-side edge inside or
     # immediately alongside the actual property line - a near-duplicate dashed line right next to
     # the solid red boundary that reads as the boundary itself being broken/doubled. Only the
@@ -6085,7 +6138,9 @@ def _render_plot_map_layout_site_plan(
             road_geom_width.append((snapped_clipped, half_w))
         except Exception:
             continue
-    road_edge_lines = _collect_connected_road_edge_lines(road_geom_width, snap_tol_m=road_snap_tol)
+    road_edge_lines = _collect_connected_road_edge_lines(
+        road_geom_width, snap_tol_m=road_snap_tol, extent_geom=extent_poly,
+    )
     _draw_road_edges(ax, road_edge_lines, font_scale=font_scale, color=road_color, linestyle=(0, (6, 4)), scale_ratio=scale_ratio, road_style=road_style)
 
     if _safe_text(location_text):
@@ -6733,7 +6788,9 @@ def render_plot_map_layout(
                 continue
             snapped_clipped = snap(clipped, extent_poly.boundary, road_snap_tol)
             road_label_features.append((snapped_clipped, name, "override"))
-        road_edge_lines = _collect_connected_road_edge_lines(road_geom_width, snap_tol_m=road_snap_tol)
+        road_edge_lines = _collect_connected_road_edge_lines(
+            road_geom_width, snap_tol_m=road_snap_tol, extent_geom=extent_poly,
+        )
         has_roads = len(road_edge_lines) > 0
     else:
         # Draw roads with class-based real-world widths
@@ -6820,7 +6877,9 @@ def render_plot_map_layout(
             except Exception:
                 continue
 
-        road_edge_lines = _collect_connected_road_edge_lines(road_geom_width, snap_tol_m=road_snap_tol)
+        road_edge_lines = _collect_connected_road_edge_lines(
+            road_geom_width, snap_tol_m=road_snap_tol, extent_geom=extent_poly,
+        )
         has_roads = len(effective_road_rows) > 0 or len(road_add_geoms) > 0
 
     # River names come from user-provided overrides (rivers have no name in detected_features/OSM
