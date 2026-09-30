@@ -14,7 +14,8 @@ import matplotlib.pyplot as plt
 from sqlalchemy import text
 from shapely import wkb
 from shapely.geometry import LineString, Point, Polygon, shape
-from shapely.ops import snap, linemerge, unary_union
+from shapely.ops import snap, linemerge, unary_union, nearest_points
+from shapely.strtree import STRtree
 import matplotlib.patches as patches
 import matplotlib.lines as mlines
 import matplotlib.patheffects as patheffects
@@ -2579,6 +2580,74 @@ def _collect_road_edge_lines(centerline_geom, half_width_m: float):
     return edges
 
 
+def _close_dangling_road_endpoints(edge_lines, tolerance_m: float):
+    """Pull each line's free endpoints onto the nearest point of another line, if one is
+    close enough to be the same junction.
+
+    This is not what shapely.ops.snap() does: snap() only ever moves a vertex onto an
+    EXISTING vertex of the target geometry, never onto an arbitrary point along one of its
+    segments. That makes it blind to the ordinary T-junction, where a side road's casing
+    edge ends a little short of (or past) a through road's casing line, not at one of that
+    line's own vertices - the through road was digitized on its own and rarely has a vertex
+    sitting exactly at the junction. This walks every dangling endpoint and, if the nearest
+    point on some other edge line is within tolerance, extends the endpoint to meet it
+    exactly, so the two casings read as one continuous joined line instead of leaving the
+    small visible gap.
+    """
+    if not edge_lines or tolerance_m <= 0:
+        return edge_lines
+    try:
+        tree = STRtree(edge_lines)
+    except Exception:
+        return edge_lines
+    result = list(edge_lines)
+    for i, seg in enumerate(edge_lines):
+        try:
+            coords = list(seg.coords)
+        except Exception:
+            continue
+        if len(coords) < 2:
+            continue
+        changed = False
+        for idx in (0, -1):
+            pt = Point(coords[idx])
+            try:
+                candidate_idxs = tree.query(pt.buffer(tolerance_m))
+            except Exception:
+                continue
+            best_point = None
+            best_dist = tolerance_m
+            already_touching = False
+            for cand_idx in candidate_idxs:
+                cand_idx = int(cand_idx)
+                if cand_idx == i:
+                    continue
+                cand = edge_lines[cand_idx]
+                try:
+                    d = pt.distance(cand)
+                except Exception:
+                    continue
+                if d <= 1e-9:
+                    already_touching = True
+                    break
+                if d < best_dist:
+                    try:
+                        best_point = nearest_points(pt, cand)[1]
+                        best_dist = d
+                    except Exception:
+                        continue
+            if already_touching or best_point is None:
+                continue
+            coords[idx] = (best_point.x, best_point.y)
+            changed = True
+        if changed:
+            try:
+                result[i] = LineString(coords)
+            except Exception:
+                continue
+    return result
+
+
 def _collect_connected_road_edge_lines(road_geoms_with_width, snap_tol_m: float = 1.0):
     """
     Build two open offset edges for each road centerline.
@@ -2627,6 +2696,18 @@ def _collect_connected_road_edge_lines(road_geoms_with_width, snap_tol_m: float 
         edge_lines.extend(_collect_road_edge_lines(seg, hw))
     if not edge_lines:
         return []
+
+    # Close ordinary T-junctions: a side road's casing ends near, not on, the through road's
+    # casing line, so bridge that with the nearest-point closer above before the vertex-only
+    # snap pass below. Scale to the widest road actually involved - wide enough to bridge both
+    # roads' half-widths at a real junction, capped so it can't bridge across to an unrelated
+    # nearby road.
+    try:
+        max_hw = max((hw for _, hw in snapped_parts), default=1.0)
+        junction_tol = min(max(2.2 * max_hw, 1.5), 12.0)
+        edge_lines = _close_dangling_road_endpoints(edge_lines, junction_tol)
+    except Exception:
+        pass
 
     # Final snap/merge pass for cleaner joins.
     try:
@@ -2722,18 +2803,20 @@ def _draw_road_edges(
             except Exception:
                 simplified_edges.append(seg)
         edge_lines = simplified_edges
+        # The simplify pass above can shift a junction vertex on one edge without shifting the
+        # matching vertex on the edge it was touching, reopening a small gap - re-close it with
+        # the same nearest-point closer used upstream (plain snap() can't do this: it only ever
+        # moves a vertex onto an existing vertex of the target, and simplify rarely leaves one
+        # sitting exactly at the junction).
+        try:
+            edge_lines = _close_dangling_road_endpoints(edge_lines, max(tolerance_m, 0.5))
+        except Exception:
+            pass
     lw = scaled_line_weight(0.3, font_scale, scale_ratio)
     draw_lines = edge_lines
     try:
         network = unary_union(edge_lines)
         snap_tol = max(0.5, 0.6 * max(1.0, float(font_scale)))
-        if scale_ratio:
-            # The simplify pass above can shift a junction vertex on one edge without shifting
-            # the matching vertex on the edge it was touching, reopening a small gap - this final
-            # join pass must close at least as much as simplify could have just opened, or that
-            # gap survives into the drawn plan. A plain font_scale-only tolerance doesn't grow
-            # with plan scale the way the simplify tolerance does, so widen to match it.
-            snap_tol = max(snap_tol, tolerance_m)
         snapped = [snap(seg, network, snap_tol) for seg in edge_lines]
         merged = linemerge(unary_union(snapped))
         merged_lines = [seg for seg in _iter_line_geometries(merged) if seg is not None and not getattr(seg, "is_empty", True)]
