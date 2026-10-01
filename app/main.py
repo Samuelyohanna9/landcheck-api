@@ -666,6 +666,8 @@ def _rate_limit_for_path(path: str) -> tuple[int, int] | None:
 
 @app.middleware("http")
 async def rate_limit_sensitive_requests(request: Request, call_next):
+    if _is_cors_preflight_request(request):
+        return await call_next(request)
     policy = _rate_limit_for_path(request.url.path)
     if policy:
         limit, window_seconds = policy
@@ -703,16 +705,17 @@ def _resolve_request_session_sync(request: Request) -> None:
 async def capture_system_activity(request: Request, call_next):
     started_at = perf_counter()
     try:
-        # Sync database work must never run on the event loop: when the pool is busy it blocks
-        # until a connection frees up, and with the loop blocked nothing can finish and release one.
-        await run_in_threadpool(_resolve_request_session_sync, request)
-        await run_in_threadpool(_enforce_private_request_sync, request)
-        if _requires_super_admin_session(request):
-            session = getattr(request.state, "landcheck_session", None)
-            if session is None:
-                raise HTTPException(status_code=401, detail="Authentication required")
-            if not bool(getattr(session, "is_super_admin", False)):
-                raise HTTPException(status_code=403, detail="Super Admin access is required for this action.")
+        if not _is_cors_preflight_request(request):
+            # Sync database work must never run on the event loop: when the pool is busy it blocks
+            # until a connection frees up, and with the loop blocked nothing can finish and release one.
+            await run_in_threadpool(_resolve_request_session_sync, request)
+            await run_in_threadpool(_enforce_private_request_sync, request)
+            if _requires_super_admin_session(request):
+                session = getattr(request.state, "landcheck_session", None)
+                if session is None:
+                    raise HTTPException(status_code=401, detail="Authentication required")
+                if not bool(getattr(session, "is_super_admin", False)):
+                    raise HTTPException(status_code=403, detail="Super Admin access is required for this action.")
         response = await call_next(request)
     except HTTPException as exc:
         duration_ms = (perf_counter() - started_at) * 1000
