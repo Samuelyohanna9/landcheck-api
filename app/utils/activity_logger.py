@@ -24,6 +24,17 @@ _SKIP_LOG_PATHS = {
     "/green/public/logs",
 }
 
+_SENSITIVE_QUERY_KEYS = {
+    "access_token",
+    "api_key",
+    "authorization",
+    "code",
+    "password",
+    "secret",
+    "signature",
+    "token",
+}
+
 
 def _normalize_text(value: Any, max_len: int = 255) -> str | None:
     text_value = str(value or "").strip()
@@ -189,7 +200,10 @@ def _request_query_payload(request: Request) -> dict[str, str]:
         clean_key = _normalize_text(key, 120)
         if not clean_key:
             continue
-        payload[clean_key] = _normalize_text(value, 240) or ""
+        if clean_key.lower().replace("-", "_") in _SENSITIVE_QUERY_KEYS:
+            payload[clean_key] = "[redacted]"
+        else:
+            payload[clean_key] = _normalize_text(value, 240) or ""
         if len(payload) >= 20:
             break
     return payload
@@ -235,7 +249,7 @@ def build_request_log_details(
         "route_path": _normalize_text(request.headers.get("X-LC-App-Route"), 200),
         "ip_address": _request_ip(request),
         "user_agent": _normalize_text(request.headers.get("user-agent"), 500),
-        "error": _normalize_text(error_message, 1000),
+        "error": _normalize_text(error_message, 1000) if not error_message else "request_failed",
     }
 
 

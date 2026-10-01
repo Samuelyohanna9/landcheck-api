@@ -13,6 +13,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from app.db import engine
+from app.utils.http_security import SURVEY_SESSION_COOKIE, cookie_token
 
 # Parallel to app.utils.auth_security's Green auth pattern (hashed opaque tokens, SES-style
 # session ids, expiry-based sessions) but against its own tables - issue_auth_session /
@@ -351,12 +352,13 @@ def issue_survey_session(db: Session, *, user_id: int, request: Request | None =
 
 def _request_bearer_token(request: Request) -> str | None:
     authorization = _clean_text(request.headers.get("authorization"), 2000)
-    if not authorization:
-        return None
-    scheme, _, token = authorization.partition(" ")
-    if scheme.lower() != "bearer":
-        return None
-    return _clean_text(token, 1500)
+    if authorization:
+        scheme, _, token = authorization.partition(" ")
+        if scheme.lower() == "bearer":
+            clean_token = _clean_text(token, 1500)
+            if clean_token:
+                return clean_token
+    return cookie_token(request, SURVEY_SESSION_COOKIE)
 
 
 def resolve_survey_session(db: Session, request: Request, *, touch: bool = True) -> SurveySessionContext | None:

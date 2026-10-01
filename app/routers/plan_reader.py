@@ -17,6 +17,7 @@ from app.utils.plan_reader import (
     extract_survey_plan,
 )
 from app.utils.survey_auth_security import resolve_survey_session
+from app.utils.upload_security import read_limited_upload
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/plan-reader", tags=["plan-reader"])
@@ -51,11 +52,7 @@ async def plan_reader_extract(request: Request, file: UploadFile = File(...), db
     if content_type not in ALLOWED_CONTENT_TYPES:
         raise HTTPException(status_code=400, detail="Upload a JPEG, PNG, WEBP, or PDF of the survey plan.")
 
-    payload = await file.read()
-    if not payload:
-        raise HTTPException(status_code=400, detail="The uploaded file is empty.")
-    if len(payload) > MAX_UPLOAD_BYTES:
-        raise HTTPException(status_code=400, detail=f"File exceeds the {MAX_UPLOAD_BYTES // (1024 * 1024)} MB upload limit.")
+    payload = await read_limited_upload(file, max_bytes=MAX_UPLOAD_BYTES)
 
     # Quota is consumed here, AFTER basic file validation (so an obviously wrong upload doesn't
     # burn one of the day's 3 reads) but BEFORE the actual Gemini call (so a blurry/unreadable photo

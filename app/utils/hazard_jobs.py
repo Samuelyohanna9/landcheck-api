@@ -11,6 +11,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from app.utils.survey_auth_security import ensure_survey_auth_schema
+from app.utils.row_security import ensure_survey_row_security
 
 HAZARD_JOB_STATUS_VALUES = {"queued", "running", "completed", "failed"}
 
@@ -82,6 +83,7 @@ def ensure_hazard_analysis_jobs_table(db: Session) -> None:
             "ON hazard_analysis_jobs(owner_user_id, created_at DESC)"
         ))
         db.commit()
+        ensure_survey_row_security(db)
         _HAZARD_JOBS_TABLE_READY = True
 
 

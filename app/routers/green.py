@@ -85,6 +85,7 @@ from app.utils.green_impact_narrative import (
     generate_impact_narrative,
 )
 from app.utils.r2_exports import upload_export_file_best_effort, _build_export_r2_settings
+from app.utils.upload_security import read_limited_upload
 from app.utils.activity_logger import ensure_activity_log_table, safe_log_activity
 from app.utils.email_branding import render_branded_email_shell
 from app.utils.auth_security import (
@@ -107,6 +108,7 @@ from app.utils.auth_security import (
     revoke_request_session,
     verify_totp_code,
 )
+from app.utils.http_security import GREEN_SESSION_COOKIE, clear_session_cookie, request_uses_browser_auth, set_session_cookie
 from app.utils.carbon import (
     compute_project_carbon,
     generate_co2_projection_table,
@@ -746,6 +748,7 @@ def _issue_partner_auth_response(
     *,
     user_row: dict,
     app_mode: str,
+    response: Response | None = None,
 ) -> dict:
     role_key = str(user_row.get("role_key") or user_row.get("role") or "").strip() or None
     payload = {
@@ -788,10 +791,14 @@ def _issue_partner_auth_response(
         mfa_verified=not bool(user_row.get("mfa_enabled", False)),
         metadata={"organization_slug": user_row.get("organization_slug")},
     )
+    if response is not None:
+        set_session_cookie(response, name=GREEN_SESSION_COOKIE, token=str(session_bundle["access_token"]), max_age=24 * 60 * 60)
+        if request_uses_browser_auth(request):
+            session_bundle["access_token"] = None
     return _build_auth_response(payload, session_bundle)
 
 
-def _issue_env_admin_auth_response(db: Session, request: Request) -> dict:
+def _issue_env_admin_auth_response(db: Session, request: Request, response: Response | None = None) -> dict:
     payload = {
         "ok": True,
         "auth_mode": "env_admin",
@@ -825,6 +832,10 @@ def _issue_env_admin_auth_response(db: Session, request: Request) -> dict:
         mfa_verified=True,
         metadata={"source": "environment_credentials"},
     )
+    if response is not None:
+        set_session_cookie(response, name=GREEN_SESSION_COOKIE, token=str(session_bundle["access_token"]), max_age=24 * 60 * 60)
+        if request_uses_browser_auth(request):
+            session_bundle["access_token"] = None
     return _build_auth_response(payload, session_bundle)
 
 
@@ -972,8 +983,9 @@ def _serialize_mfa_status(session, subject_row: dict | None, *, supported: bool 
 
 
 @router.post("/auth/logout")
-def auth_logout(request: Request, db: Session = Depends(get_db)):
+def auth_logout(request: Request, response: Response, db: Session = Depends(get_db)):
     revoked = revoke_request_session(db, request, reason="user_logout")
+    clear_session_cookie(response, name=GREEN_SESSION_COOKIE)
     return {"ok": True, "revoked": bool(revoked)}
 
 
@@ -1831,24 +1843,48 @@ def _hash_password_value(password: str) -> str:
     raw = str(password or "")
     if len(raw) < 6:
         raise HTTPException(status_code=400, detail="Password must be at least 6 characters")
-    iterations = 260000
     salt = secrets.token_hex(16)
-    digest = hashlib.pbkdf2_hmac("sha256", raw.encode("utf-8"), salt.encode("utf-8"), iterations)
-    return f"pbkdf2_sha256${iterations}${salt}${digest.hex()}"
+    n, r, p, dklen = 2**14, 8, 1, 32
+    digest = hashlib.scrypt(
+        raw.encode("utf-8"),
+        salt=salt.encode("utf-8"),
+        n=n,
+        r=r,
+        p=p,
+        dklen=dklen,
+        maxmem=64 * 1024 * 1024,
+    )
+    return f"scrypt${n}${r}${p}${salt}${digest.hex()}"
 
 
 def _verify_password_value(password: str, encoded: str | None) -> bool:
     if not encoded:
         return False
     try:
-        algo, iter_str, salt, digest_hex = str(encoded).split("$", 3)
-        if algo != "pbkdf2_sha256":
+        parts = str(encoded).split("$")
+        if parts[0] == "scrypt" and len(parts) == 6:
+            _, n, r, p, salt, digest_hex = parts
+            derived = hashlib.scrypt(
+                str(password or "").encode("utf-8"),
+                salt=salt.encode("utf-8"),
+                n=int(n),
+                r=int(r),
+                p=int(p),
+                dklen=32,
+                maxmem=64 * 1024 * 1024,
+            )
+            return hmac.compare_digest(derived.hex(), digest_hex)
+        if parts[0] != "pbkdf2_sha256" or len(parts) != 4:
             return False
-        iterations = int(iter_str)
-        derived = hashlib.pbkdf2_hmac("sha256", str(password or "").encode("utf-8"), salt.encode("utf-8"), iterations)
+        _, iter_str, salt, digest_hex = parts
+        derived = hashlib.pbkdf2_hmac("sha256", str(password or "").encode("utf-8"), salt.encode("utf-8"), int(iter_str))
         return hmac.compare_digest(derived.hex(), digest_hex)
     except Exception:
         return False
+
+
+def _hash_email_verification_token(token: str) -> str:
+    return hashlib.sha256(str(token or "").encode("utf-8")).hexdigest()
 
 
 def _generate_temporary_login_password(length: int = 12) -> str:
@@ -2908,6 +2944,35 @@ def _render_premium_email_shell(
         body_html=body_html,
         footer_note="You are receiving this email because of an action taken on LandCheck Green.",
     )
+
+
+def _send_green_email_verification(*, to_email: str, full_name: str, verification_url: str) -> bool:
+    recipient = str(to_email or "").strip()
+    if not recipient or not verification_url:
+        return False
+    first_name = str(full_name or "there").strip().split(" ")[0] or "there"
+    body_html = _render_premium_email_shell(
+        kicker="LandCheck Green - security",
+        title="Verify your email address",
+        subtitle="Confirm your email before opening your Work dashboard.",
+        body_html=(
+            f"<p>Hello {html.escape(first_name)},</p>"
+            "<p>Use the button below to verify this email address and activate your LandCheck Work account.</p>"
+            "<p>This link expires in 24 hours and can only be used once.</p>"
+            f'<p><a href="{html.escape(verification_url, quote=True)}" style="display:inline-block;padding:12px 18px;border-radius:10px;background:#1f8c58;color:#fff;font-weight:700;text-decoration:none;">Verify email</a></p>'
+        ),
+    )
+    try:
+        _send_html_email(
+            to_email=recipient,
+            subject="Verify your LandCheck Green email",
+            text_body=f"Verify your LandCheck Green email here: {verification_url}",
+            html_body=body_html,
+        )
+        return True
+    except Exception:
+        logger.exception("Green email verification failed")
+        return False
 
 
 def _load_sponsor_order_email_payload(db: Session, order_id: int):
@@ -6485,6 +6550,19 @@ def ensure_green_tables(db: Session):
             created_at TIMESTAMP DEFAULT NOW()
         )
     """))
+    db.execute(text("ALTER TABLE IF EXISTS green_users ADD COLUMN IF NOT EXISTS email_verified_at TIMESTAMP DEFAULT NOW()"))
+    db.execute(text("""
+        CREATE TABLE IF NOT EXISTS green_email_verification_tokens (
+            id BIGSERIAL PRIMARY KEY,
+            subject_type TEXT NOT NULL,
+            subject_id BIGINT NOT NULL,
+            token_hash TEXT NOT NULL UNIQUE,
+            created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+            expires_at TIMESTAMP NOT NULL,
+            used_at TIMESTAMP
+        )
+    """))
+    db.execute(text("CREATE INDEX IF NOT EXISTS idx_green_email_verification_subject ON green_email_verification_tokens(subject_type, subject_id)"))
     db.execute(text("""
         CREATE TABLE IF NOT EXISTS green_sponsor_accounts (
             id SERIAL PRIMARY KEY,
@@ -6603,6 +6681,7 @@ def ensure_green_tables(db: Session):
         db.execute(text("ALTER TABLE IF EXISTS green_users ADD COLUMN IF NOT EXISTS is_active BOOLEAN NOT NULL DEFAULT TRUE"))
         db.execute(text("ALTER TABLE IF EXISTS green_users ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW()"))
         db.execute(text("ALTER TABLE IF EXISTS green_users ADD COLUMN IF NOT EXISTS profile_photo_url TEXT"))
+        db.execute(text("ALTER TABLE IF EXISTS green_users ADD COLUMN IF NOT EXISTS email_verified_at TIMESTAMP DEFAULT NOW()"))
         db.execute(text("ALTER TABLE IF EXISTS green_sponsor_accounts ADD COLUMN IF NOT EXISTS sponsor_uid TEXT"))
         db.execute(text("ALTER TABLE IF EXISTS green_sponsor_accounts ADD COLUMN IF NOT EXISTS account_type TEXT NOT NULL DEFAULT 'individual'"))
         db.execute(text("ALTER TABLE IF EXISTS green_sponsor_accounts ADD COLUMN IF NOT EXISTS organization_name TEXT"))
@@ -8869,13 +8948,8 @@ async def upload_photo_to_r2(
     if not content_type.startswith("image/"):
         raise HTTPException(status_code=400, detail="Only image uploads are allowed.")
 
-    payload = await file.read()
-    if not payload:
-        raise HTTPException(status_code=400, detail="Uploaded file is empty.")
-
     max_bytes = 10 * 1024 * 1024
-    if len(payload) > max_bytes:
-        raise HTTPException(status_code=413, detail="Image too large. Max size is 10MB.")
+    payload = await read_limited_upload(file, max_bytes=max_bytes)
 
     # Cheap, local, no-AI fraud/mistake signals - perceptual-hash near-duplicate detection and an
     # EXIF GPS/capture-time sanity check against the tree's own recorded location. Computed
@@ -14326,7 +14400,7 @@ def get_public_sponsorship_project(project_id: int, db: Session = Depends(get_db
 
 
 @router.post("/sponsor-auth/signup")
-def sponsor_auth_signup(payload: SponsorSignupPayload, request: Request, db: Session = Depends(get_db)):
+def sponsor_auth_signup(payload: SponsorSignupPayload, request: Request, response: Response, db: Session = Depends(get_db)):
     full_name = str(payload.full_name or "").strip()
     if not full_name:
         raise HTTPException(status_code=400, detail="Full name is required")
@@ -14417,6 +14491,9 @@ def sponsor_auth_signup(payload: SponsorSignupPayload, request: Request, db: Ses
         mfa_verified=not bool(row.get("mfa_enabled", False)),
         metadata={"account_type": row.get("account_type")},
     )
+    set_session_cookie(response, name=GREEN_SESSION_COOKIE, token=str(session_bundle["access_token"]), max_age=24 * 60 * 60)
+    if request_uses_browser_auth(request):
+        session_bundle["access_token"] = None
     db.commit()
     try:
         _notify_sponsor_welcome_email(db, int(row["id"]), request=request)
@@ -14426,7 +14503,7 @@ def sponsor_auth_signup(payload: SponsorSignupPayload, request: Request, db: Ses
 
 
 @router.post("/sponsor-auth/login")
-def sponsor_auth_login(payload: SponsorLoginPayload, request: Request, db: Session = Depends(get_db)):
+def sponsor_auth_login(payload: SponsorLoginPayload, request: Request, response: Response, db: Session = Depends(get_db)):
     email = _normalize_email_address(payload.email)
     row = db.execute(
         text(
@@ -14466,6 +14543,9 @@ def sponsor_auth_login(payload: SponsorLoginPayload, request: Request, db: Sessi
         mfa_verified=not bool(row.get("mfa_enabled", False)),
         metadata={"account_type": row.get("account_type")},
     )
+    set_session_cookie(response, name=GREEN_SESSION_COOKIE, token=str(session_bundle["access_token"]), max_age=24 * 60 * 60)
+    if request_uses_browser_auth(request):
+        session_bundle["access_token"] = None
     db.commit()
     return _build_sponsor_auth_payload(dict(row), session_bundle=session_bundle)
 
@@ -16237,7 +16317,7 @@ async def shopify_merchant_webhook(merchant_uid: str, request: Request, db: Sess
 
 
 @router.post("/sponsor/guest/claim")
-def claim_guest_sponsor_account(payload: SponsorGuestClaimPayload, request: Request, db: Session = Depends(get_db)):
+def claim_guest_sponsor_account(payload: SponsorGuestClaimPayload, request: Request, response: Response, db: Session = Depends(get_db)):
     """Turn a guest checkout account into a fully login-capable sponsor account.
 
     Requires the sponsor_id + the email on file to match, so an order confirmation
@@ -16275,6 +16355,9 @@ def claim_guest_sponsor_account(payload: SponsorGuestClaimPayload, request: Requ
         actor=str(row.get("full_name") or "").strip(),
         details={"email": str(row.get("email") or "")},
     )
+    set_session_cookie(response, name=GREEN_SESSION_COOKIE, token=str(session_bundle["access_token"]), max_age=24 * 60 * 60)
+    if request_uses_browser_auth(request):
+        session_bundle["access_token"] = None
     db.commit()
     claimed_row = db.execute(
         text(
@@ -27851,6 +27934,7 @@ def update_green_user_profile_photo(
 @router.post("/work-auth/register")
 def work_auth_register(
     request: Request,
+    response: Response,
     db: Session = Depends(get_db),
     organization_name: str = Body(...),
     full_name: str = Body(...),
@@ -27919,11 +28003,11 @@ def work_auth_register(
             """
             INSERT INTO green_users (
                 full_name, role, user_uid, organization_id, role_id, email, phone,
-                allow_green, allow_work, work_username, work_password_hash, is_active, updated_at
+                allow_green, allow_work, work_username, work_password_hash, is_active, email_verified_at, updated_at
             )
             VALUES (
                 :full_name, 'admin', :user_uid, :organization_id, :role_id, :email, :phone,
-                TRUE, TRUE, :work_username, :work_password_hash, TRUE, NOW()
+                TRUE, TRUE, :work_username, :work_password_hash, TRUE, NULL, NOW()
             )
             RETURNING id, user_uid, full_name, role, role_id, email, phone, organization_id,
                       allow_green, allow_work, work_username
@@ -27951,29 +28035,16 @@ def work_auth_register(
         details={"name": org_name_clean, "slug": final_slug, "registered_by": email_clean},
     )
 
-    session_user_row = {
-        "id": user_row["id"],
-        "user_uid": user_row["user_uid"],
-        "full_name": user_row["full_name"],
-        "role": user_row["role"],
-        "role_id": user_row["role_id"],
-        "role_key": admin_role["role_key"] if admin_role else "admin",
-        "role_uid": None,
-        "role_name": admin_role["role_name"] if admin_role else "Admin",
-        "allow_work": True,
-        "allow_green": True,
-        "work_username": user_row["work_username"],
-        "organization_id": organization_id,
-        "organization_name": org_row["name"],
-        "organization_slug": org_row["slug"],
-        "organization_status": org_row["status"],
-        "organization_is_active": bool(org_row["is_active"]),
-        "organization_logo_url": org_row["logo_url"],
-        "profile_photo_url": None,
-        "email": email_clean,
-        "mfa_enabled": False,
-    }
-    response = _issue_partner_auth_response(db, request, user_row=session_user_row, app_mode="green_work")
+    raw_verification_token = secrets.token_urlsafe(32)
+    db.execute(
+        text(
+            """
+            INSERT INTO green_email_verification_tokens (subject_type, subject_id, token_hash, expires_at)
+            VALUES ('green_user', :subject_id, :token_hash, NOW() + INTERVAL '24 hours')
+            """
+        ),
+        {"subject_id": int(user_row["id"]), "token_hash": _hash_email_verification_token(raw_verification_token)},
+    )
     db.commit()
     try:
         _send_organization_welcome_email(
@@ -27986,12 +28057,53 @@ def work_auth_register(
         )
     except Exception:
         pass
-    return response
+    _send_green_email_verification(
+        to_email=email_clean,
+        full_name=full_name_clean,
+        verification_url=f"{_build_public_api_base_url(request) or 'https://api.landcheck.online'}/green/green-auth/verify-email?token={quote(raw_verification_token)}",
+    )
+    return {
+        "verification_required": True,
+        "email": email_clean,
+        "message": "Check your email to verify your address before signing in.",
+    }
+
+
+@router.get("/green-auth/verify-email")
+def green_verify_email(token: str, db: Session = Depends(get_db)):
+    _ensure_green_schema_ready(db)
+    row = db.execute(
+        text(
+            """
+            SELECT id, subject_type, subject_id, expires_at, used_at
+            FROM green_email_verification_tokens
+            WHERE token_hash = :token_hash
+            LIMIT 1
+            """
+        ),
+        {"token_hash": _hash_email_verification_token(token)},
+    ).mappings().first()
+    if not row or row.get("used_at") is not None or row.get("expires_at") <= datetime.utcnow():
+        raise HTTPException(status_code=400, detail="This verification link is invalid or has expired")
+    if str(row.get("subject_type") or "") != "green_user":
+        raise HTTPException(status_code=400, detail="This verification link is invalid or has expired")
+    db.execute(
+        text("UPDATE green_users SET email_verified_at = NOW(), updated_at = NOW() WHERE id = :user_id"),
+        {"user_id": int(row["subject_id"])},
+    )
+    db.execute(
+        text("UPDATE green_email_verification_tokens SET used_at = NOW() WHERE id = :token_id"),
+        {"token_id": int(row["id"])},
+    )
+    db.commit()
+    web_url = str(os.getenv("LANDCHECK_WEB_URL") or "https://landcheck.online").rstrip("/")
+    return RedirectResponse(f"{web_url}/green-work/login?verified=1", status_code=303)
 
 
 @router.post("/work-auth/login")
 def work_auth_login(
     request: Request,
+    response: Response,
     db: Session = Depends(get_db),
     username: str = Body(...),
     password: str = Body(...),
@@ -28003,9 +28115,9 @@ def work_auth_login(
 
     env_credentials = get_env_admin_credentials()
     if env_credentials and username_clean == env_credentials[0] and str(password or "") == env_credentials[1]:
-        response = _issue_env_admin_auth_response(db, request)
+        response_payload = _issue_env_admin_auth_response(db, request, response=response)
         db.commit()
-        return response
+        return response_payload
 
     org_id_filter = int(organization_id) if organization_id is not None else None
     if org_id_filter is not None and org_id_filter <= 0:
@@ -28018,7 +28130,7 @@ def work_auth_login(
                 COALESCE(u.allow_green, TRUE) AS allow_green,
                 COALESCE(u.allow_work, FALSE) AS allow_work,
                 COALESCE(u.is_active, TRUE) AS is_active,
-                u.work_username, u.work_password_hash, u.profile_photo_url, u.email,
+                u.work_username, u.work_password_hash, u.profile_photo_url, u.email, u.email_verified_at,
                 COALESCE(u.mfa_enabled, FALSE) AS mfa_enabled,
                 u.organization_id,
                 o.name AS organization_name, o.slug AS organization_slug, o.status AS organization_status,
@@ -28053,14 +28165,23 @@ def work_auth_login(
         raise HTTPException(status_code=403, detail="This organization is suspended")
     if not _verify_password_value(password, user_row.get("work_password_hash")):
         raise HTTPException(status_code=401, detail="Invalid username or password")
-    response = _issue_partner_auth_response(db, request, user_row=dict(user_row), app_mode="green_work")
+    if user_row.get("email_verified_at") is None:
+        raise HTTPException(status_code=403, detail="Verify your email address before signing in")
+    response_payload = _issue_partner_auth_response(
+        db,
+        request,
+        user_row=dict(user_row),
+        app_mode="green_work",
+        response=response,
+    )
     db.commit()
-    return response
+    return response_payload
 
 
 @router.post("/green-auth/login")
 def green_auth_login(
     request: Request,
+    response: Response,
     db: Session = Depends(get_db),
     username: str = Body(...),
     password: str = Body(...),
@@ -28072,9 +28193,9 @@ def green_auth_login(
 
     env_credentials = get_env_admin_credentials()
     if env_credentials and username_clean == env_credentials[0] and str(password or "") == env_credentials[1]:
-        response = _issue_env_admin_auth_response(db, request)
+        response_payload = _issue_env_admin_auth_response(db, request, response=response)
         db.commit()
-        return response
+        return response_payload
 
     org_id_filter = int(organization_id) if organization_id is not None else None
     if org_id_filter is not None and org_id_filter <= 0:
@@ -28087,7 +28208,7 @@ def green_auth_login(
                 COALESCE(u.allow_green, TRUE) AS allow_green,
                 COALESCE(u.allow_work, FALSE) AS allow_work,
                 COALESCE(u.is_active, TRUE) AS is_active,
-                u.work_username, u.work_password_hash, u.profile_photo_url, u.email,
+                u.work_username, u.work_password_hash, u.profile_photo_url, u.email, u.email_verified_at,
                 COALESCE(u.mfa_enabled, FALSE) AS mfa_enabled,
                 u.organization_id,
                 o.name AS organization_name, o.slug AS organization_slug, o.status AS organization_status,
@@ -28122,9 +28243,17 @@ def green_auth_login(
         raise HTTPException(status_code=403, detail="This organization is suspended")
     if not _verify_password_value(password, user_row.get("work_password_hash")):
         raise HTTPException(status_code=401, detail="Invalid username or password")
-    response = _issue_partner_auth_response(db, request, user_row=dict(user_row), app_mode="green")
+    if user_row.get("email_verified_at") is None:
+        raise HTTPException(status_code=403, detail="Verify your email address before signing in")
+    response_payload = _issue_partner_auth_response(
+        db,
+        request,
+        user_row=dict(user_row),
+        app_mode="green",
+        response=response,
+    )
     db.commit()
-    return response
+    return response_payload
 
 
 @router.post("/green-auth/forgot-password")

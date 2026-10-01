@@ -7,6 +7,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware  # Added for speed
 from fastapi.responses import JSONResponse
+from sqlalchemy import text
 
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -39,6 +40,12 @@ from app.routers import (
 from app.db_init import init_db
 from app.utils.activity_logger import ensure_activity_log_table, log_request_activity, should_skip_request_logging
 from app.utils.auth_security import resolve_request_session
+from app.utils.auth_security import require_authenticated_session
+from app.utils.rate_limit import allow_request
+from app.utils.row_security import set_survey_user_context
+from app.services.estates.identity import resolve_session as resolve_estate_session
+from app.utils.survey_auth_security import require_survey_session
+from app.utils.survey_auth_security import resolve_survey_session
 
 app = FastAPI(title="LandCheck API")
 
@@ -110,6 +117,200 @@ def _requires_super_admin_session(request: Request) -> bool:
     if clean_path in _GREEN_ADMIN_PUBLIC_CALLBACKS:
         return False
     return clean_path.startswith("/green/admin/")
+
+
+_GREEN_PUBLIC_PREFIXES = (
+    "/green/public/",
+    "/green/public-projects",
+    "/green/sponsor/public/",
+    "/green/sponsor-auth/",
+    "/green/work-auth/",
+    "/green/green-auth/",
+    "/green/merchant/",
+    "/green/merchant-auth/",
+    "/green/track-order",
+    "/green/sponsor-engagement/unsubscribe",
+    "/green/sponsor/public/reset-password",
+)
+
+
+def _requires_green_session(request: Request) -> bool:
+    if _is_cors_preflight_request(request):
+        return False
+    path = str(request.url.path or "").strip().lower()
+    method = str(request.method or "").strip().upper()
+    if not path.startswith("/green/"):
+        return False
+    if path in {"/green/privacy/policy", "/green/privacy/consents", "/green/app/version-check", "/green/public/logs"}:
+        return False
+    if path == "/green/auth/logout":
+        return False
+    if path.startswith("/green/admin/sponsor-agent-payouts/flutterwave/callback"):
+        return False
+    if any(path.startswith(prefix) for prefix in _GREEN_PUBLIC_PREFIXES):
+        return False
+    if path.startswith("/green/sponsor/payments/flutterwave/"):
+        return False
+    if path == "/green/sponsor/orders" and method == "POST":
+        return False
+    if path == "/green/sponsor/public/order-lookup":
+        return False
+    if path == "/green/organizations/logo-proxy":
+        return False
+    # Every remaining Green endpoint is private. Route handlers still enforce the precise actor,
+    # organization, role, and sponsor/project scope; this closes forgotten-route gaps centrally.
+    return True
+
+
+def _requires_estate_session(request: Request) -> bool:
+    if _is_cors_preflight_request(request):
+        return False
+    path = str(request.url.path or "").strip().lower()
+    if not path.startswith("/estates/"):
+        return False
+    public_prefixes = (
+        "/estates/auth/",
+        "/estates/public/",
+        "/estates/buyer/",
+        "/estates/agent-portal/",
+    )
+    if any(path.startswith(prefix) for prefix in public_prefixes):
+        return False
+    if path in {
+        "/estates/billing/plans",
+        "/estates/billing/checkout/return",
+        "/estates/billing/webhook",
+    }:
+        return False
+    return True
+
+
+def _enforce_survey_resource_scope(db, request: Request) -> None:
+    """Protect legacy Survey resources that predate router-level auth dependencies."""
+    path = str(request.url.path or "").strip().lower()
+
+    def table_exists(table_name: str) -> bool:
+        return db.execute(text("SELECT to_regclass(:table_name)"), {"table_name": table_name}).scalar() is not None
+
+    if path.startswith("/plots/"):
+        parts = [part for part in path.split("/") if part]
+        if len(parts) >= 2 and parts[1].isdigit():
+            if not table_exists("plots"):
+                return
+            session = require_survey_session(db, request)
+            owner_id = db.execute(
+                text("SELECT owner_user_id FROM plots WHERE id = :plot_id"),
+                {"plot_id": int(parts[1])},
+            ).scalar()
+            if owner_id is not None and int(owner_id) != int(session.user_id):
+                raise HTTPException(status_code=404, detail="Plot not found")
+    if path.startswith("/hazards/jobs/"):
+        parts = [part for part in path.split("/") if part]
+        if len(parts) >= 3 and parts[2] != "mine":
+            if not table_exists("hazard_analysis_jobs"):
+                return
+            session = require_survey_session(db, request)
+            owner_id = db.execute(
+                text("SELECT owner_user_id FROM hazard_analysis_jobs WHERE id = :job_id"),
+                {"job_id": parts[2]},
+            ).scalar()
+            if owner_id is not None and int(owner_id) != int(session.user_id):
+                raise HTTPException(status_code=404, detail="Hazard job not found")
+    if path.startswith("/survey-georeference/sessions/"):
+        parts = [part for part in path.split("/") if part]
+        if len(parts) >= 3 and parts[2] not in {"mine", "claim"}:
+            if not table_exists("survey_georeference_sessions"):
+                return
+            session = require_survey_session(db, request)
+            owner_id = db.execute(
+                text("SELECT owner_user_id FROM survey_georeference_sessions WHERE id = :session_id"),
+                {"session_id": parts[2]},
+            ).scalar()
+            if owner_id is not None and int(owner_id) != int(session.user_id):
+                raise HTTPException(status_code=404, detail="Georeference session not found")
+
+    if path.startswith("/plots/subdivision/batches/"):
+        parts = [part for part in path.split("/") if part]
+        if len(parts) >= 4 and parts[3].isdigit():
+            if not table_exists("plot_subdivision_batches") or not table_exists("plots"):
+                return
+            session = require_survey_session(db, request)
+            owner_id = db.execute(
+                text(
+                    """
+                    SELECT p.owner_user_id
+                    FROM plot_subdivision_batches b
+                    JOIN plots p ON p.id = b.parent_plot_id
+                    WHERE b.id = :batch_id
+                    """
+                ),
+                {"batch_id": int(parts[3])},
+            ).scalar()
+            if owner_id is not None and int(owner_id) != int(session.user_id):
+                raise HTTPException(status_code=404, detail="Subdivision batch not found")
+
+    if path.startswith("/plots/export-jobs/"):
+        parts = [part for part in path.split("/") if part]
+        if len(parts) >= 3 and parts[2].isdigit():
+            if not table_exists("plot_export_jobs"):
+                return
+            session = require_survey_session(db, request)
+            owner_id = db.execute(
+                text(
+                    """
+                    SELECT COALESCE(p.owner_user_id, parent_plot.owner_user_id)
+                    FROM plot_export_jobs j
+                    LEFT JOIN plots p ON p.id = j.plot_id
+                    LEFT JOIN plot_subdivision_batches b ON b.id = j.subdivision_batch_id
+                    LEFT JOIN plots parent_plot ON parent_plot.id = b.parent_plot_id
+                    WHERE j.id = :job_id
+                    """
+                ),
+                {"job_id": int(parts[2])},
+            ).scalar()
+            if owner_id is not None and int(owner_id) != int(session.user_id):
+                raise HTTPException(status_code=404, detail="Export job not found")
+
+
+def _enforce_private_request_sync(request: Request) -> None:
+    session_db = SessionLocal()
+    try:
+        if _requires_green_session(request):
+            require_authenticated_session(session_db, request, auth_modes={"partner_user", "env_admin", "sponsor_user"})
+        if _requires_estate_session(request):
+            if resolve_estate_session(session_db, request) is None:
+                raise HTTPException(status_code=401, detail="Authentication required")
+        if str(request.url.path or "").lower().startswith(("/plots/", "/hazards/jobs/", "/survey-georeference/sessions/")):
+            survey_session = resolve_survey_session(session_db, request)
+            set_survey_user_context(session_db, survey_session.user_id if survey_session else None)
+        _enforce_survey_resource_scope(session_db, request)
+    finally:
+        session_db.close()
+
+
+def _validate_production_configuration() -> None:
+    if not _env_bool("LANDCHECK_ENV_PRODUCTION_CHECKS", True):
+        return
+    environment = str(os.getenv("LANDCHECK_ENV") or os.getenv("APP_ENV") or "").strip().lower()
+    if environment not in {"prod", "production", "live"}:
+        return
+    required = {"DATABASE_URL": os.getenv("DATABASE_URL"), "CORS_ALLOW_ORIGINS": os.getenv("CORS_ALLOW_ORIGINS"), "LANDCHECK_API_PUBLIC_URL": os.getenv("LANDCHECK_API_PUBLIC_URL")}
+    missing = [name for name, value in required.items() if not str(value or "").strip()]
+    if missing:
+        raise RuntimeError(f"Missing production security configuration: {', '.join(missing)}")
+    if not str(required["LANDCHECK_API_PUBLIC_URL"]).strip().lower().startswith("https://"):
+        raise RuntimeError("LANDCHECK_API_PUBLIC_URL must use HTTPS in production")
+    if "*" in _parse_csv_env("CORS_ALLOW_ORIGINS"):
+        raise RuntimeError("CORS_ALLOW_ORIGINS must not contain '*' in production")
+    if str(os.getenv("CORS_ALLOW_ORIGIN_REGEX") or "").strip():
+        raise RuntimeError("CORS_ALLOW_ORIGIN_REGEX must be empty in production")
+    if str(os.getenv("DEBUG") or "").strip().lower() in {"1", "true", "yes", "on"}:
+        raise RuntimeError("DEBUG must be disabled in production")
+    if str(os.getenv("LANDCHECK_ENV_ADMIN_MFA_ENABLED") or "").strip().lower() not in {"1", "true", "yes", "on"}:
+        raise RuntimeError("LANDCHECK_ENV_ADMIN_MFA_ENABLED must be true in production")
+    for name in ("WORK_USERNAME", "WORK_PASSWORD"):
+        if str(os.getenv(name) or "").strip().lower() in {"", "change_me", "changeme", "password", "admin"}:
+            raise RuntimeError(f"{name} must be replaced with a strong server-side secret")
 
 scheduler = BackgroundScheduler(timezone="Africa/Lagos")
 
@@ -296,6 +497,7 @@ def _run_estate_social_job():
 # Preserve the legacy Survey/Green bootstrap; Estate schema is managed by Alembic.
 @app.on_event("startup")
 def startup_event():
+    _validate_production_configuration()
     init_db()
     ensure_activity_log_table()
     green.bootstrap_green_schema()
@@ -408,6 +610,10 @@ default_origins = [
     "http://127.0.0.1:4173",
 ]
 
+_production_environment = str(os.getenv("LANDCHECK_ENV") or os.getenv("APP_ENV") or "").strip().lower() in {"prod", "production", "live"}
+if _production_environment:
+    default_origins = []
+
 origins: list[str] = []
 for origin in [*default_origins, *_parse_csv_env("CORS_ALLOW_ORIGINS")]:
     clean = origin.strip().rstrip("/")
@@ -416,17 +622,66 @@ for origin in [*default_origins, *_parse_csv_env("CORS_ALLOW_ORIGINS")]:
 
 default_local_origin_regex = r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$"
 configured_origin_regex = str(os.getenv("CORS_ALLOW_ORIGIN_REGEX", "") or "").strip()
-local_origin_regex = configured_origin_regex or default_local_origin_regex
+local_origin_regex = None if _production_environment else (configured_origin_regex or default_local_origin_regex)
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,
     allow_origin_regex=local_origin_regex or None,
     allow_credentials=True,  # Now allowed because we specified origins
-    allow_methods=["*"],
-    allow_headers=["*"],
-    expose_headers=["*"],
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["Accept", "Authorization", "Content-Type", "X-LC-Auth-Mode", "X-LC-App-Route", "X-LC-Client", "X-LC-Organization-Id", "X-LC-Role-Key", "X-LC-Session-App-Mode", "X-LC-User-Id", "X-LC-User-Name", "X-Idempotency-Key", "X-Requested-With"],
+    expose_headers=["Content-Disposition", "X-Request-Id"],
 )
+
+
+def _rate_limit_for_path(path: str) -> tuple[int, int] | None:
+    path = str(path or "").lower()
+    if path in {
+        "/estates/auth/login",
+        "/green/work-auth/login",
+        "/green/green-auth/login",
+        "/green/sponsor-auth/login",
+        "/green/auth/mfa/verify",
+    }:
+        return 10, 300
+    if path in {
+        "/estates/auth/register",
+        "/green/work-auth/register",
+        "/green/sponsor-auth/signup",
+    }:
+        return 5, 900
+    if path in {
+        "/estates/auth/forgot-password",
+        "/estates/auth/reset-password",
+        "/green/green-auth/forgot-password",
+        "/green/green-auth/reset-password",
+        "/survey/auth/magic-link/request",
+        "/survey/auth/otp/verify",
+        "/green/sponsor/guest/claim",
+    }:
+        return 5, 900
+    return None
+
+
+@app.middleware("http")
+async def rate_limit_sensitive_requests(request: Request, call_next):
+    policy = _rate_limit_for_path(request.url.path)
+    if policy:
+        limit, window_seconds = policy
+        client_host = str(request.client.host if request.client else "unknown")
+        allowed, retry_after = allow_request(
+            f"{client_host}:{str(request.url.path).lower()}",
+            limit=limit,
+            window_seconds=window_seconds,
+        )
+        if not allowed:
+            return JSONResponse(
+                {"detail": "Too many attempts. Please try again later."},
+                status_code=429,
+                headers={"Retry-After": str(retry_after), "Cache-Control": "no-store"},
+            )
+    return await call_next(request)
 
 
 def _resolve_request_session_sync(request: Request) -> None:
@@ -451,6 +706,7 @@ async def capture_system_activity(request: Request, call_next):
         # Sync database work must never run on the event loop: when the pool is busy it blocks
         # until a connection frees up, and with the loop blocked nothing can finish and release one.
         await run_in_threadpool(_resolve_request_session_sync, request)
+        await run_in_threadpool(_enforce_private_request_sync, request)
         if _requires_super_admin_session(request):
             session = getattr(request.state, "landcheck_session", None)
             if session is None:
@@ -471,6 +727,26 @@ async def capture_system_activity(request: Request, call_next):
     duration_ms = (perf_counter() - started_at) * 1000
     if _should_log_request_activity(request, status_code=response.status_code, duration_ms=duration_ms):
         await run_in_threadpool(log_request_activity, request, status_code=response.status_code, duration_ms=duration_ms)
+    return response
+
+
+@app.middleware("http")
+async def add_security_headers(request: Request, call_next):
+    response = await call_next(request)
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    response.headers.setdefault("Referrer-Policy", "no-referrer")
+    response.headers.setdefault("Permissions-Policy", "camera=(), microphone=(), geolocation=(self)")
+    response.headers.setdefault("Cross-Origin-Resource-Policy", "same-site")
+    response.headers.setdefault("X-Permitted-Cross-Domain-Policies", "none")
+    response.headers.setdefault("Cross-Origin-Opener-Policy", "same-origin")
+    response.headers.setdefault("Cross-Origin-Embedder-Policy", "unsafe-none")
+    if str(response.headers.get("content-type") or "").lower().startswith("text/html"):
+        response.headers.setdefault("Content-Security-Policy", "default-src 'none'; frame-ancestors 'none'; base-uri 'none'")
+    if _production_environment:
+        response.headers.setdefault("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+    if request.url.path.startswith(("/estates/auth/", "/survey/auth/", "/green/auth/", "/green/work-auth/", "/green/green-auth/", "/green/sponsor-auth/")):
+        response.headers.setdefault("Cache-Control", "no-store")
     return response
 
 

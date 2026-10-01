@@ -15,6 +15,7 @@ from app.utils.field_to_finish import (
 )
 from app.utils.plan_reader import consume_daily_reading
 from app.utils.survey_auth_security import resolve_survey_session
+from app.utils.upload_security import read_limited_upload
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/field-to-finish", tags=["field-to-finish"])
@@ -52,11 +53,7 @@ async def field_to_finish_import(request: Request, file: UploadFile = File(...),
     if not filename.endswith(_ALLOWED_EXTENSIONS):
         raise HTTPException(status_code=400, detail="Upload a .txt, .csv, .dat, or .tsv raw coordinate export file.")
 
-    payload = await file.read()
-    if not payload:
-        raise HTTPException(status_code=400, detail="The uploaded file is empty.")
-    if len(payload) > MAX_UPLOAD_BYTES:
-        raise HTTPException(status_code=400, detail=f"File exceeds the {MAX_UPLOAD_BYTES // (1024 * 1024)} MB upload limit.")
+    payload = await read_limited_upload(file, max_bytes=MAX_UPLOAD_BYTES)
 
     try:
         raw_text = payload.decode("utf-8", errors="replace")

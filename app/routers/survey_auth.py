@@ -5,7 +5,7 @@ from time import time
 from urllib.parse import urlencode
 
 import requests
-from fastapi import APIRouter, Body, Depends, HTTPException, Request
+from fastapi import APIRouter, Body, Depends, HTTPException, Request, Response
 from fastapi.responses import RedirectResponse
 from sqlalchemy.orm import Session
 
@@ -21,6 +21,12 @@ from app.utils.survey_auth_security import (
     revoke_survey_session,
 )
 from app.utils.survey_email import send_magic_link_email
+from app.utils.http_security import (
+    SURVEY_SESSION_COOKIE,
+    clear_session_cookie,
+    request_uses_browser_auth,
+    set_session_cookie,
+)
 
 router = APIRouter(prefix="/survey/auth", tags=["survey-auth"])
 
@@ -53,20 +59,34 @@ def request_magic_link(email: str = Body(..., embed=True), db: Session = Depends
 
 
 @router.post("/magic-link/verify")
-def verify_magic_link(request: Request, token: str = Body(..., embed=True), db: Session = Depends(get_db)):
+def verify_magic_link(
+    request: Request,
+    response: Response,
+    token: str = Body(..., embed=True),
+    db: Session = Depends(get_db),
+):
     user_id = consume_magic_link_token(db, raw_token=token)
-    return issue_survey_session(db, user_id=user_id, request=request)
+    session_payload = issue_survey_session(db, user_id=user_id, request=request)
+    set_session_cookie(response, name=SURVEY_SESSION_COOKIE, token=session_payload["access_token"])
+    if request_uses_browser_auth(request):
+        session_payload["access_token"] = None
+    return session_payload
 
 
 @router.post("/otp/verify")
 def verify_magic_link_otp(
     request: Request,
+    response: Response,
     email: str = Body(..., embed=True),
     code: str = Body(..., embed=True),
     db: Session = Depends(get_db),
 ):
     user_id = consume_magic_link_otp(db, email=email, code=code)
-    return issue_survey_session(db, user_id=user_id, request=request)
+    session_payload = issue_survey_session(db, user_id=user_id, request=request)
+    set_session_cookie(response, name=SURVEY_SESSION_COOKIE, token=session_payload["access_token"])
+    if request_uses_browser_auth(request):
+        session_payload["access_token"] = None
+    return session_payload
 
 
 @router.get("/google/start")
@@ -132,17 +152,26 @@ def google_oauth_callback(request: Request, code: str, db: Session = Depends(get
 
 
 @router.post("/google/exchange")
-def google_oauth_exchange(code: str = Body(..., embed=True)):
+def google_oauth_exchange(
+    request: Request,
+    response: Response,
+    code: str = Body(..., embed=True),
+):
     with _oauth_exchange_lock:
         entry = _oauth_exchange_codes.pop(code, None)
     if not entry or entry["expires_at"] < time():
         raise HTTPException(status_code=400, detail="This sign-in link has expired")
-    return entry["session"]
+    session_payload = dict(entry["session"])
+    set_session_cookie(response, name=SURVEY_SESSION_COOKIE, token=session_payload["access_token"])
+    if request_uses_browser_auth(request):
+        session_payload["access_token"] = None
+    return session_payload
 
 
 @router.post("/logout")
-def logout(request: Request, db: Session = Depends(get_db)):
+def logout(request: Request, response: Response, db: Session = Depends(get_db)):
     revoke_survey_session(db, request)
+    clear_session_cookie(response, name=SURVEY_SESSION_COOKIE)
     return {"status": "ok"}
 
 

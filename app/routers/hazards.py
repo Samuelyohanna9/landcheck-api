@@ -30,6 +30,8 @@ from app.utils.hazard_jobs import (
 )
 from app.utils.r2_exports import upload_export_file_best_effort
 from app.utils.survey_auth_security import require_survey_session, resolve_survey_session
+from app.utils.row_security import ensure_survey_row_security, set_survey_user_context
+from app.utils.upload_security import read_limited_upload
 
 
 router = APIRouter(prefix="/hazards", tags=["hazards"])
@@ -39,11 +41,20 @@ BASE_DIR = os.path.dirname(os.path.dirname(__file__))
 REPORTS_DIR = os.path.join(BASE_DIR, "reports")
 
 
-def get_db():
+def get_db(request: Request):
     db = SessionLocal()
     try:
+        survey_session = resolve_survey_session(db, request)
+        set_survey_user_context(db, survey_session.user_id if survey_session else None)
+        ensure_survey_row_security(db)
         yield db
     finally:
+        try:
+            if db.bind.dialect.name == "postgresql":
+                db.execute(text("RESET app.survey_user_id"))
+                db.commit()
+        except Exception:
+            db.rollback()
         db.close()
 
 RASTER_LEGEND_FLOOD = [
@@ -868,11 +879,7 @@ async def upload_hazard_boundary(file: UploadFile = File(...)):
     if suffix not in (".zip", ".geojson", ".json", ".kml"):
         raise HTTPException(status_code=400, detail="Upload a zipped Shapefile (.zip), GeoJSON (.geojson/.json), or KML (.kml) file.")
 
-    payload = await file.read()
-    if not payload:
-        raise HTTPException(status_code=400, detail="The uploaded file is empty.")
-    if len(payload) > MAX_BOUNDARY_UPLOAD_BYTES:
-        raise HTTPException(status_code=400, detail=f"File exceeds the {MAX_BOUNDARY_UPLOAD_BYTES // (1024 * 1024)} MB upload limit.")
+    payload = await read_limited_upload(file, max_bytes=MAX_BOUNDARY_UPLOAD_BYTES)
 
     tmp_dir = tempfile.mkdtemp(prefix="hazard_boundary_")
     try:

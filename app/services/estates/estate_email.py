@@ -22,6 +22,7 @@ from app.utils.email_branding import render_branded_email_shell
 from app.services.estates.billing_plans import ESTATE_PLANS
 
 logger = logging.getLogger(__name__)
+EMAIL_VERIFICATION_TTL_HOURS = 24
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -510,6 +511,37 @@ def send_welcome_email(*, organization, account, subscription=None) -> bool:
         return True
     except Exception:
         logger.exception("Estate welcome email failed (to=%s)", to_email)
+        return False
+
+
+def send_email_verification_email(*, organization, account, verification_url: str) -> bool:
+    to_email = str(getattr(account, "email", "") or "").strip()
+    if not to_email or not verification_url:
+        return False
+    first_name = str(getattr(account, "full_name", "") or "there").split(" ")[0]
+    organization_name = str(getattr(organization, "name", "your company") or "your company")
+    message_html = (
+        f"<p>Hello {html.escape(first_name)},</p>"
+        f"<p>Confirm this email address to activate the LandCheck Estates workspace for "
+        f"<strong>{html.escape(organization_name)}</strong>.</p>"
+        f"<p>This verification link expires in {EMAIL_VERIFICATION_TTL_HOURS} hours.</p>"
+    )
+    body_html = _account_wrap_html(
+        heading="Verify your company email",
+        message_html=message_html,
+        button_html=_account_button_html(label="Verify email address", url=verification_url),
+    )
+    try:
+        _send_email(
+            to_email=to_email,
+            from_display_name="LandCheck Estates",
+            subject="Verify your LandCheck Estates email",
+            body_text=_account_plain_text("Verify your company email", message_html, verification_url),
+            body_html=body_html,
+        )
+        return True
+    except Exception:
+        logger.exception("Estate email verification failed")
         return False
 
 

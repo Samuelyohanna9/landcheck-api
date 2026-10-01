@@ -38,6 +38,7 @@ import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 
 from app.db import SessionLocal
+from app.utils.row_security import ensure_survey_row_security, set_survey_user_context
 from app.models.plot import Plot
 from app.models.estate_foundation import Estate, EstateSurveyRequest
 from app.services.survey.plots import create_survey_plot
@@ -231,12 +232,22 @@ def ensure_plots_schema_once(db: Session):
         _PLOTS_SCHEMA_READY = True
 
 
-def get_db():
+def get_db(request: Request):
     db = SessionLocal()
     try:
         ensure_plots_schema_once(db)
+        ensure_survey_row_security(db)
+        survey_path = str(request.url.path or "").lower()
+        survey_session = resolve_survey_session(db, request) if survey_path.startswith(("/plots", "/hazards", "/survey-georeference")) else None
+        set_survey_user_context(db, survey_session.user_id if survey_session else None)
         yield db
     finally:
+        try:
+            if db.bind.dialect.name == "postgresql":
+                db.execute(text("RESET app.survey_user_id"))
+                db.commit()
+        except Exception:
+            db.rollback()
         db.close()
 
 

@@ -37,7 +37,7 @@ from app.services.estates.entitlements import ESTATE_FEATURES, get_estate_entitl
 from app.models.estate_foundation import Estate, EstateAgentPortalToken, EstateAllocation, EstateAuditEvent, EstateBlock, EstateCommissionPayout, EstateCommissionTier, EstateCustomer, EstateCustomerPortalToken, EstateDocument, EstateDocumentLink, EstateFieldInspection, EstateHazardAssessment, EstateImportReview, EstateLayoutProposal, EstateNotificationLog, EstateOrganization, EstateOrganizationMember, EstatePayment, EstatePaymentInbox, EstatePaymentRule, EstatePlot, EstatePublicReservationRequest, EstateQrCampaign, EstateSoilAssessment, EstateSpatialFeature, EstateStaffRole, EstateSurveyRequest, EstateStakingTask, GeotechSurveyRequest
 from app.schemas.estates import AllocationAction, BlockCreate, BlockUpdate, CommissionPayoutCreate, CommissionTiersUpdate, CustomerCreate, DevelopmentForecastPublishUpdate, DevelopmentStatusUpdate, EstateCreate, EstateLayoutCriteria, EstateLayoutDecision, EstateLayoutFeatureAdd, EstateLayoutFeatureRemove, EstateLayoutProposalEdit, EstateSubdivisionCreate, EstateUpdate, FieldInspectionCreate, GeoreferenceSessionLink, ImportFromGeoreference, ImportReviewCreate, ImportReviewDecision, ImportReviewFromGeoreferenceSession, MemberCreate, MemberUpdate, PaymentInboxCreate, PaymentInboxMatch, PlotCreate, PlotAddressUpdate, PlotGeometryUpdate, PlotListingDefaultsUpdate, PlotPriceUpdate, PortalTokenCreate, PublicEstateSettingsUpdate, PublicReservationConvert, PublicReservationCreate, PublicReservationUpdate, PaymentCreate, QrCampaignCreate, SpatialFeatureCreate, SpatialFeatureUpdate, StaffCreate, StaffRoleCreate, StaffRoleUpdate, StaffUpdate, SurveyEligibilityUpdate, VoidAction
 from app.services.estates.payments import confirm_payment, financial_summary, record_payment, void_payment
-from app.services.estates.documents import read_private_estate_file, store_private_estate_file
+from app.services.estates.documents import MAX_ESTATE_DOCUMENT_BYTES, read_private_estate_file, store_private_estate_file
 from app.utils.r2_objects import delete_object_best_effort, build_r2_settings
 from app.services.estates.permissions import PERMISSION_CATALOG, has_permission, sanitize_permissions
 from sqlalchemy import func
@@ -64,6 +64,7 @@ from app.services.estates import commissions
 from app.services.estates.operations import DOCUMENT_REQUIREMENTS, ESTATE_DOCUMENT_TYPES, ESTATE_DOCUMENT_TYPE_CODES, PUBLIC_DOCUMENT_TYPES, advance_payment_schedule_after_payment, build_operations_summary, buyer_portal_payload, customer_portal_url, document_readiness, hash_portal_token, issue_agent_portal_token, issue_customer_portal_link, issue_customer_portal_token, linked_documents, record_notification_log
 from app.db import SessionLocal
 from app.utils.hazard_jobs import get_hazard_job, insert_hazard_job, make_progress_reporter, serialize_hazard_job, set_hazard_job_status, find_active_hazard_job, touch_hazard_job
+from app.utils.upload_security import read_limited_upload, upload_extension
 
 
 logger = logging.getLogger(__name__)
@@ -1301,9 +1302,7 @@ async def upload_public_estate_logo(estate_id: int, request: Request, file: Uplo
     _enabled(db, estate.organization_id)
     if str(file.content_type or "").lower() not in {"image/png", "image/jpeg"}:
         raise HTTPException(422, "Upload a PNG or JPEG logo")
-    data = await file.read()
-    if len(data) > 5 * 1024 * 1024:
-        raise HTTPException(413, "Logo must be 5 MB or smaller")
+    data = await read_limited_upload(file, max_bytes=5 * 1024 * 1024)
     organization = db.get(EstateOrganization, estate.organization_id)
     if not organization:
         raise HTTPException(404, "Estate company not found")
@@ -1345,9 +1344,7 @@ async def upload_public_estate_cover(estate_id: int, request: Request, file: Upl
     _enabled(db, estate.organization_id)
     if str(file.content_type or "").lower() not in {"image/png", "image/jpeg"}:
         raise HTTPException(422, "Upload a PNG or JPEG photo")
-    data = await file.read()
-    if len(data) > 8 * 1024 * 1024:
-        raise HTTPException(413, "Cover photo must be 8 MB or smaller")
+    data = await read_limited_upload(file, max_bytes=8 * 1024 * 1024)
     organization = db.get(EstateOrganization, estate.organization_id)
     if not organization:
         raise HTTPException(404, "Estate company not found")
@@ -1704,7 +1701,9 @@ async def import_estate_csv(estate_id: int, request: Request, source_crs: str | 
     estate=db.get(Estate,estate_id)
     if not estate: raise HTTPException(404,"Estate not found")
     access=require_estate_access(db,request,estate.organization_id,permission="plot.manage")
-    try: raw_records=list(csv.DictReader(io.StringIO((await file.read()).decode("utf-8-sig"))))
+    if upload_extension(file) not in {".csv", ".txt"}:
+        raise HTTPException(422, "Upload a CSV file")
+    try: raw_records=list(csv.DictReader(io.StringIO((await read_limited_upload(file)).decode("utf-8-sig"))))
     except Exception as exc: raise HTTPException(422,"CSV could not be read") from exc
     records = _normalize_csv_records(raw_records)
     candidates = []
@@ -1751,7 +1750,9 @@ async def import_estate_geojson(estate_id:int,request:Request,file:UploadFile=Fi
     estate=db.get(Estate,estate_id)
     if not estate: raise HTTPException(404,"Estate not found")
     access=require_estate_access(db,request,estate.organization_id,permission="plot.manage")
-    try: document=json.loads((await file.read()).decode("utf-8-sig")); features=document.get("features",[]) if document.get("type")=="FeatureCollection" else [document]
+    if upload_extension(file) not in {".geojson", ".json"}:
+        raise HTTPException(422, "Upload a GeoJSON file")
+    try: document=json.loads((await read_limited_upload(file)).decode("utf-8-sig")); features=document.get("features",[]) if document.get("type")=="FeatureCollection" else [document]
     except Exception as exc: raise HTTPException(422,"GeoJSON could not be read") from exc
     candidates=[]
     for index,feature in enumerate(features,1):
@@ -1794,7 +1795,9 @@ async def import_estate_dxf(estate_id:int,source_crs:str,request:Request,file:Up
     if not estate: raise HTTPException(404,"Estate not found")
     access=require_estate_access(db,request,estate.organization_id,permission="plot.manage")
     handle=None
-    try: src=source_crs.strip().upper(); transformer=Transformer.from_crs(src,"EPSG:4326",always_xy=True); content=await file.read(); handle=tempfile.NamedTemporaryFile(suffix=".dxf",delete=False); handle.write(content); handle.close(); document=ezdxf.readfile(handle.name)
+    if upload_extension(file) != ".dxf":
+        raise HTTPException(422, "Upload a DXF file")
+    try: src=source_crs.strip().upper(); transformer=Transformer.from_crs(src,"EPSG:4326",always_xy=True); content=await read_limited_upload(file); handle=tempfile.NamedTemporaryFile(suffix=".dxf",delete=False); handle.write(content); handle.close(); document=ezdxf.readfile(handle.name)
     except Exception as exc: raise HTTPException(422,"DXF could not be read; provide a valid source CRS") from exc
     finally:
         try: os.unlink(handle.name if handle else "")
@@ -1875,7 +1878,7 @@ async def import_scanned_layout(
         entity_uid=f"import_review_{review.id}",
         filename=file.filename or "scanned-layout",
         content_type=file.content_type or "",
-        data=await file.read(),
+        data=await read_limited_upload(file, max_bytes=MAX_ESTATE_DOCUMENT_BYTES),
     )
     document = EstateDocument(
         organization_id=estate.organization_id,
@@ -4506,7 +4509,7 @@ async def upload_payment_evidence(payment_id:int, request:Request, file:UploadFi
     if not payment: raise HTTPException(404,"Payment not found")
     access=require_estate_access(db,request,payment.organization_id,permission="document.manage")
     organization=db.get(EstateOrganization,payment.organization_id)
-    stored=store_private_estate_file(organization_uid=organization.organization_uid,category="payments",entity_uid=payment.payment_uid,filename=file.filename or "receipt",content_type=file.content_type or "",data=await file.read())
+    stored=store_private_estate_file(organization_uid=organization.organization_uid,category="payments",entity_uid=payment.payment_uid,filename=file.filename or "receipt",content_type=file.content_type or "",data=await read_limited_upload(file, max_bytes=MAX_ESTATE_DOCUMENT_BYTES))
     document=EstateDocument(organization_id=payment.organization_id,object_key=stored.object_key,original_filename=stored.filename,mime_type=stored.mime_type,size_bytes=stored.size_bytes,checksum=stored.checksum,document_type="receipt",uploaded_by_subject_type=access.principal.subject_type,uploaded_by_subject_id=access.principal.subject_id)
     db.add(document); db.flush(); db.add(EstateDocumentLink(document_id=document.id,entity_type="payment",entity_id=str(payment.id))); append_estate_audit_event(db,organization_id=payment.organization_id,actor=access.principal,action="payment.evidence_uploaded",entity_type="estate_document",entity_id=document.id,after_data={"payment_id":payment.id,"filename":stored.filename}); db.commit()
     return {"id":document.id,"filename":document.original_filename}
@@ -4539,7 +4542,7 @@ async def upload_document(entity_type: str, entity_id: int, document_type: str, 
     if normalized_document_type not in ESTATE_DOCUMENT_TYPE_CODES:
         raise HTTPException(422, "Choose a supported Estate document type")
     organization = db.get(EstateOrganization, organization_id)
-    stored = store_private_estate_file(organization_uid=organization.organization_uid, category="documents", entity_uid=f"{entity_type}_{entity_id}", filename=file.filename or "document", content_type=file.content_type or "", data=await file.read())
+    stored = store_private_estate_file(organization_uid=organization.organization_uid, category="documents", entity_uid=f"{entity_type}_{entity_id}", filename=file.filename or "document", content_type=file.content_type or "", data=await read_limited_upload(file, max_bytes=MAX_ESTATE_DOCUMENT_BYTES))
     document = EstateDocument(organization_id=organization_id, object_key=stored.object_key, original_filename=stored.filename, mime_type=stored.mime_type, size_bytes=stored.size_bytes, checksum=stored.checksum, document_type=normalized_document_type, description=description, uploaded_by_subject_type=access.principal.subject_type, uploaded_by_subject_id=access.principal.subject_id)
     db.add(document); db.flush(); db.add(EstateDocumentLink(document_id=document.id, entity_type=entity_type, entity_id=str(entity_id))); append_estate_audit_event(db, organization_id=organization_id, actor=access.principal, action="document.uploaded", entity_type="estate_document", entity_id=document.id, after_data={"linked_entity":entity_type,"linked_id":entity_id}); db.commit()
     return {"id":document.id,"filename":document.original_filename}
@@ -5671,6 +5674,7 @@ def create_staff(organization_id: int, payload: StaffCreate, request: Request, d
         full_name=full_name,
         password_hash=hash_password(temp_password),
         status="active",
+        email_verified_at=datetime.utcnow(),
         must_change_password=True,
     )
     db.add(account)

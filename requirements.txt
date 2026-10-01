@@ -18,7 +18,6 @@ pyproj
 numpy
 pandas
 requests
-psycopg2-binary
 earthengine-api
 google-auth
 boto3

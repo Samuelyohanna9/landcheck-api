@@ -13,9 +13,14 @@ from sqlalchemy.orm import Session
 
 from app.models.estate_auth import EstateAccount, EstateAuthSession
 from app.models.estate_foundation import EstateOrganization
+from app.utils.http_security import ESTATE_SESSION_COOKIE, cookie_token
 
 
-PASSWORD_ITERATIONS = 260_000
+PASSWORD_SCRYPT_N = 2**14
+PASSWORD_SCRYPT_R = 8
+PASSWORD_SCRYPT_P = 1
+PASSWORD_DKLEN = 32
+PASSWORD_MAXMEM = 64 * 1024 * 1024
 SESSION_TTL_HOURS = 24
 
 
@@ -38,17 +43,38 @@ def hash_password(password: str) -> str:
     if len(raw) < 8:
         raise ValueError("Password must be at least 8 characters")
     salt = secrets.token_hex(16)
-    digest = hashlib.pbkdf2_hmac("sha256", raw.encode("utf-8"), salt.encode("utf-8"), PASSWORD_ITERATIONS)
-    return f"pbkdf2_sha256${PASSWORD_ITERATIONS}${salt}${digest.hex()}"
+    digest = hashlib.scrypt(
+        raw.encode("utf-8"),
+        salt=salt.encode("utf-8"),
+        n=PASSWORD_SCRYPT_N,
+        r=PASSWORD_SCRYPT_R,
+        p=PASSWORD_SCRYPT_P,
+        dklen=PASSWORD_DKLEN,
+        maxmem=PASSWORD_MAXMEM,
+    )
+    return f"scrypt${PASSWORD_SCRYPT_N}${PASSWORD_SCRYPT_R}${PASSWORD_SCRYPT_P}${salt}${digest.hex()}"
 
 
 def verify_password(password: str, encoded: str | None) -> bool:
     if not encoded:
         return False
     try:
-        algorithm, iterations, salt, digest_hex = str(encoded).split("$", 3)
-        if algorithm != "pbkdf2_sha256":
+        parts = str(encoded).split("$")
+        if parts[0] == "scrypt" and len(parts) == 6:
+            _, n, r, p, salt, digest_hex = parts
+            derived = hashlib.scrypt(
+                str(password or "").encode("utf-8"),
+                salt=salt.encode("utf-8"),
+                n=int(n),
+                r=int(r),
+                p=int(p),
+                dklen=PASSWORD_DKLEN,
+                maxmem=PASSWORD_MAXMEM,
+            )
+            return hmac.compare_digest(derived.hex(), digest_hex)
+        if parts[0] != "pbkdf2_sha256" or len(parts) != 4:
             return False
+        _, iterations, salt, digest_hex = parts
         derived = hashlib.pbkdf2_hmac("sha256", str(password or "").encode("utf-8"), salt.encode("utf-8"), int(iterations))
         return hmac.compare_digest(derived.hex(), digest_hex)
     except (TypeError, ValueError):
@@ -73,10 +99,11 @@ def slugify(value: str) -> str:
 def request_token(request: Request) -> str | None:
     headers = getattr(request, "headers", {}) or {}
     scheme, _, token = str(headers.get("authorization") or "").partition(" ")
-    if scheme.lower() != "bearer":
-        return None
-    token = token.strip()
-    return token[:1500] if token else None
+    if scheme.lower() == "bearer":
+        token = token.strip()
+        if token:
+            return token[:1500]
+    return cookie_token(request, ESTATE_SESSION_COOKIE)
 
 
 def _hash_token(token: str) -> str:

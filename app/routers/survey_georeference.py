@@ -23,10 +23,12 @@ from starlette.concurrency import run_in_threadpool
 from app.db import SessionLocal
 from app.routers.plots import COORDINATE_SYSTEMS, get_db, _safe_filename_fragment
 from app.utils.survey_auth_security import require_survey_session, resolve_survey_session
+from app.utils.row_security import ensure_survey_row_security, set_survey_user_context
 from app.utils.survey_activity import ensure_survey_activity_table, log_survey_activity
 from app.utils.coordinate_converter import is_nigeria_auto_utm_coordinate_system, resolve_coordinate_system_key
 from app.utils.r2_objects import build_r2_settings, create_r2_client, delete_object_best_effort, upload_bytes
 from app.utils.plan_reader import consume_daily_reading
+from app.utils.upload_security import read_limited_upload
 from app.utils.georeference_ai_digitize import (
     AI_DIGITIZE_DAILY_LIMIT,
     GeoreferenceAiDigitizeError,
@@ -228,6 +230,7 @@ def _ensure_schema(db: Session):
             )
         )
         db.commit()
+        ensure_survey_row_security(db)
         _SCHEMA_READY = True
 
 
@@ -1230,11 +1233,7 @@ async def create_georeference_session(
     if content_type not in {"image/jpeg", "image/png", "image/webp"}:
         raise HTTPException(status_code=400, detail="Upload a JPEG, PNG, or WEBP raster.")
 
-    payload = await file.read()
-    if not payload:
-        raise HTTPException(status_code=400, detail="The raster file is empty.")
-    if len(payload) > MAX_UPLOAD_BYTES:
-        raise HTTPException(status_code=400, detail=f"Raster exceeds the {MAX_UPLOAD_BYTES // (1024 * 1024)} MB upload limit.")
+    payload = await read_limited_upload(file, max_bytes=MAX_UPLOAD_BYTES)
 
     try:
         image = Image.open(io.BytesIO(payload))

@@ -6,12 +6,13 @@ import secrets
 from datetime import datetime, timedelta, timezone
 import re
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request, Response
+from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, Field
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app.models.estate_auth import EstateAccount, EstateAuthSession
+from app.models.estate_auth import EstateAccount, EstateAuthSession, EstateEmailVerificationToken
 from app.models.estate_billing import EstatePasswordResetToken
 from app.models.estate_foundation import EstateOrganization, EstateOrganizationEntitlement, EstateOrganizationMember
 from app.routers.plots import get_db
@@ -28,6 +29,7 @@ from app.services.estates.identity import (
     slugify,
     verify_password,
 )
+from app.utils.http_security import ESTATE_SESSION_COOKIE, clear_session_cookie, request_uses_browser_auth, set_session_cookie
 
 
 class ChangePasswordRequest(BaseModel):
@@ -45,6 +47,7 @@ class ResetPasswordRequest(BaseModel):
 
 
 RESET_TOKEN_TTL_HOURS = 1
+EMAIL_VERIFICATION_TTL_HOURS = 24
 
 
 def _hash_reset_token(token: str) -> str:
@@ -118,6 +121,7 @@ def register(payload: EstateRegister, request: Request, db: Session = Depends(ge
         full_name=payload.full_name.strip(),
         password_hash=hash_password(payload.password),
         status="active",
+        email_verified_at=None,
     )
     db.add(account)
     db.flush()
@@ -142,36 +146,82 @@ def register(payload: EstateRegister, request: Request, db: Session = Depends(ge
         )
     )
     try:
-        session = issue_session(db, account, request)
         db.commit()
     except IntegrityError as exc:
         db.rollback()
         raise HTTPException(status_code=409, detail="This Estate company or account already exists") from exc
-    estate_email.send_welcome_email(organization=organization, account=account)
-    return {**session, "user": _account_payload(db, account), "organization": {"id": organization.id, "name": organization.name, "slug": organization.slug}}
+    raw_token = secrets.token_urlsafe(32)
+    db.add(
+        EstateEmailVerificationToken(
+            account_id=account.id,
+            token_hash=_hash_reset_token(raw_token),
+            expires_at=datetime.now(timezone.utc) + timedelta(hours=EMAIL_VERIFICATION_TTL_HOURS),
+        )
+    )
+    db.commit()
+    estate_email.send_email_verification_email(
+        organization=organization,
+        account=account,
+        verification_url=f"{str(os.getenv('LANDCHECK_API_PUBLIC_URL') or 'https://api.landcheck.online').rstrip('/')}/estates/auth/verify-email?token={raw_token}",
+    )
+    return {
+        "user": _account_payload(db, account),
+        "organization": {"id": organization.id, "name": organization.name, "slug": organization.slug},
+        "verification_required": True,
+        "email": account.email,
+        "message": "Check your email to verify your address before signing in.",
+    }
 
 
 @router.post("/login")
-def login(payload: EstateLogin, request: Request, db: Session = Depends(get_db)):
+def login(payload: EstateLogin, request: Request, response: Response, db: Session = Depends(get_db)):
     email = normalize_email(payload.email)
     if not EMAIL_PATTERN.fullmatch(email):
         raise HTTPException(status_code=422, detail="Enter a valid company email address")
     account = db.query(EstateAccount).filter(EstateAccount.email_normalized == email).one_or_none()
     if not account or account.status != "active" or not verify_password(payload.password, account.password_hash):
         raise HTTPException(status_code=401, detail="Invalid Estate email or password")
+    if account.email_verified_at is None:
+        raise HTTPException(status_code=403, detail="Verify your email address before signing in")
     organization = db.get(EstateOrganization, account.organization_id)
     if not organization or organization.status != "active":
         raise HTTPException(status_code=403, detail="This Estate company is not active")
     account.last_login_at = datetime.utcnow()
     session = issue_session(db, account, request)
     db.commit()
-    return {**session, "user": _account_payload(db, account), "organization": {"id": organization.id, "name": organization.name, "slug": organization.slug}}
+    set_session_cookie(response, name=ESTATE_SESSION_COOKIE, token=str(session["access_token"]), max_age=24 * 60 * 60)
+    payload_out = {**session, "user": _account_payload(db, account), "organization": {"id": organization.id, "name": organization.name, "slug": organization.slug}}
+    if request_uses_browser_auth(request):
+        payload_out["access_token"] = None
+    return payload_out
+
+
+@router.get("/verify-email")
+def verify_email(token: str, db: Session = Depends(get_db)):
+    token_hash = _hash_reset_token(str(token or ""))
+    row = db.query(EstateEmailVerificationToken).filter(EstateEmailVerificationToken.token_hash == token_hash).one_or_none()
+    now = datetime.now(timezone.utc)
+    expires_at = row.expires_at if row and row.expires_at.tzinfo else (row.expires_at.replace(tzinfo=timezone.utc) if row else None)
+    if not row or row.used_at is not None or (expires_at and expires_at <= now):
+        raise HTTPException(status_code=400, detail="This verification link is invalid or has expired")
+    account = db.get(EstateAccount, row.account_id)
+    if not account or account.status != "active":
+        raise HTTPException(status_code=400, detail="This verification link is invalid or has expired")
+    account.email_verified_at = now
+    row.used_at = now
+    db.commit()
+    organization = db.get(EstateOrganization, account.organization_id)
+    if organization:
+        estate_email.send_welcome_email(organization=organization, account=account)
+    web_url = str(os.getenv("LANDCHECK_WEB_URL") or "https://landcheck.online").rstrip("/")
+    return RedirectResponse(f"{web_url}/estates/login?verified=1", status_code=303)
 
 
 @router.post("/logout")
-def logout(request: Request, db: Session = Depends(get_db)):
+def logout(request: Request, response: Response, db: Session = Depends(get_db)):
     revoke_session(db, request)
     db.commit()
+    clear_session_cookie(response, name=ESTATE_SESSION_COOKIE)
     return {"status": "ok"}
 
 
@@ -241,7 +291,7 @@ def forgot_password(payload: ForgotPasswordRequest, db: Session = Depends(get_db
 
 
 @router.post("/reset-password")
-def reset_password(payload: ResetPasswordRequest, db: Session = Depends(get_db)):
+def reset_password(payload: ResetPasswordRequest, response: Response, db: Session = Depends(get_db)):
     token_hash = _hash_reset_token(str(payload.token or ""))
     row = db.query(EstatePasswordResetToken).filter(EstatePasswordResetToken.token_hash == token_hash).one_or_none()
     now = datetime.now(timezone.utc)
@@ -262,4 +312,5 @@ def reset_password(payload: ResetPasswordRequest, db: Session = Depends(get_db))
         {"session_state": "revoked", "revoked_at": now, "revoke_reason": "password_reset"}
     )
     db.commit()
+    clear_session_cookie(response, name=ESTATE_SESSION_COOKIE)
     return {"status": "ok"}

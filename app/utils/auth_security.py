@@ -19,6 +19,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from app.db import engine
+from app.utils.http_security import GREEN_SESSION_COOKIE, cookie_token
 
 _AUTH_SECURITY_SCHEMA_READY = False
 _AUTH_SECURITY_SCHEMA_LOCK = Lock()
@@ -307,7 +308,7 @@ def _request_bearer_token(request: Request) -> str | None:
         query_token = _clean_text(request.query_params.get("access_token"), 1500)
         if query_token:
             return query_token
-    return None
+    return cookie_token(request, GREEN_SESSION_COOKIE)
 
 
 def _session_context_from_row(row: dict[str, Any], *, mfa_enabled: bool = False, mfa_verified: bool = False) -> AuthSessionContext:

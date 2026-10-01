@@ -25,6 +25,7 @@ class EstateAccount(Base):
     # clears. Never true for a self-registered owner account (they chose their own password).
     must_change_password = Column(Boolean, nullable=False, default=False)
     status = Column(String(32), nullable=False, default="active")
+    email_verified_at = Column(DateTime(timezone=True), nullable=True)
     trial_claimed_at = Column(DateTime(timezone=True), nullable=True)
     last_login_at = Column(DateTime(timezone=True), nullable=True)
     created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
@@ -59,3 +60,14 @@ class EstateAuthSession(Base):
     __table_args__ = (
         CheckConstraint("session_state IN ('active', 'revoked', 'expired')", name="ck_estate_auth_sessions_state"),
     )
+
+
+class EstateEmailVerificationToken(Base):
+    __tablename__ = "estate_email_verification_tokens"
+
+    id = Column(Integer, primary_key=True)
+    account_id = Column(Integer, ForeignKey("estate_accounts.id", ondelete="CASCADE"), nullable=False)
+    token_hash = Column(String(64), nullable=False, unique=True)
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    expires_at = Column(DateTime(timezone=True), nullable=False)
+    used_at = Column(DateTime(timezone=True), nullable=True)
