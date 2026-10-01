@@ -102,6 +102,7 @@ from app.utils.auth_security import (
     issue_auth_session,
     require_authenticated_session,
     require_signed_flutterwave_webhooks,
+    resolve_request_session,
     require_super_admin_request,
     revoke_request_session,
     verify_totp_code,
@@ -857,6 +858,47 @@ def _require_partner_session_for_user(
     return session
 
 
+def _require_project_write_access(db: Session, request: Request, project_id: int):
+    """Require a Work session authorized to modify the given project: a super admin, or the
+    project's own organization's "admin" role. Shared by the project/report-schedule/alert-rule
+    endpoints, which were previously missing any auth check at all."""
+    session = require_authenticated_session(db, request, auth_modes={"partner_user", "env_admin"})
+    if session.is_super_admin:
+        return session
+    if str(session.role_key or "").strip().lower() != "admin":
+        raise HTTPException(status_code=403, detail="Only an organization admin can do this")
+    project_org_id = db.execute(
+        text("SELECT organization_id FROM tree_projects WHERE id = :project_id"),
+        {"project_id": project_id},
+    ).scalar()
+    if project_org_id is None:
+        raise HTTPException(status_code=404, detail="Project not found")
+    if int(project_org_id or 0) != int(session.organization_id or 0):
+        raise HTTPException(status_code=403, detail="This project does not belong to your organization")
+    return session
+
+
+def _require_project_member_access(db: Session, request: Request, project_id: int):
+    """Require a Work session that belongs to the given project's own organization: unlike
+    _require_project_write_access, any role qualifies, not just "admin" - a field officer or
+    volunteer needs to read a project's trees/tasks/reports and do routine day-to-day field work
+    (log a tree, a visit, a task, a custodian) without being an org admin. Reserve
+    _require_project_write_access for structural/admin-level changes (project settings, deletion,
+    report schedules, alert rules, org reassignment)."""
+    session = require_authenticated_session(db, request, auth_modes={"partner_user", "env_admin"})
+    if session.is_super_admin:
+        return session
+    project_org_id = db.execute(
+        text("SELECT organization_id FROM tree_projects WHERE id = :project_id"),
+        {"project_id": project_id},
+    ).scalar()
+    if project_org_id is None:
+        raise HTTPException(status_code=404, detail="Project not found")
+    if int(project_org_id or 0) != int(session.organization_id or 0):
+        raise HTTPException(status_code=403, detail="This project does not belong to your organization")
+    return session
+
+
 def _load_session_subject_mfa_row(db: Session, session) -> dict | None:
     if str(session.auth_mode or "").strip().lower() == "sponsor_user":
         row = db.execute(
@@ -1578,13 +1620,25 @@ def _set_green_export_job_status(
 
 
 @router.get("/exports/object/{object_key:path}")
-def get_exported_object(object_key: str):
+def get_exported_object(object_key: str, request: Request, db: Session = Depends(get_db)):
+    # Previously had no auth at all - streamed any file out of the export bucket (donor
+    # financials, custodian PII, etc) to anyone who knew or guessed the key. Not referenced
+    # anywhere in this repo's frontend (confirmed by search), so require a Work session, and
+    # scope to the owning project when the key matches a known export job.
     settings = _build_export_r2_settings()
     if not settings:
         raise HTTPException(status_code=404, detail="Export storage is not configured.")
     resolved_key = _normalize_export_object_key(object_key)
     if not resolved_key:
         raise HTTPException(status_code=400, detail="Invalid export key.")
+    owning_job = db.execute(
+        text("SELECT project_id FROM green_export_jobs WHERE object_key = :object_key LIMIT 1"),
+        {"object_key": resolved_key},
+    ).mappings().first()
+    if owning_job and owning_job.get("project_id") is not None:
+        _require_project_member_access(db, request, int(owning_job["project_id"]))
+    else:
+        require_authenticated_session(db, request, auth_modes={"partner_user", "env_admin"})
     try:
         client = boto3.client(
             "s3",
@@ -7905,6 +7959,24 @@ def record_privacy_consent(
     request: Request,
     db: Session = Depends(get_db),
 ):
+    # This endpoint is intentionally reachable without a session - actor_type defaults to
+    # "anonymous" because consent is often recorded before an account exists (e.g. during
+    # registration). But when a session DOES exist, the payload's actor/org must actually be
+    # that session's own identity - otherwise a logged-in user could write a consent record
+    # attributed to a different actor_id/organization_id entirely, a log-spoofing gap.
+    session = resolve_request_session(db, request)
+    if session is not None:
+        session_actor_id = session.sponsor_account_id if session.auth_mode == "sponsor_user" else session.user_id
+        if payload.actor_id is not None and session_actor_id is not None and int(payload.actor_id) != int(session_actor_id):
+            raise HTTPException(status_code=403, detail="actor_id does not match the authenticated session")
+        if (
+            payload.organization_id is not None
+            and session.organization_id is not None
+            and int(payload.organization_id) != int(session.organization_id)
+            and not session.is_super_admin
+        ):
+            raise HTTPException(status_code=403, detail="organization_id does not match the authenticated session")
+
     scope_key = _normalize_privacy_scope(payload.scope_key)
     consent_version = str(payload.consent_version or PRIVACY_CONSENT_VERSION).strip() or PRIVACY_CONSENT_VERSION
     source_app = _normalize_privacy_source_app(payload.source_app)
@@ -8556,12 +8628,20 @@ def _append_photo_candidates(bucket: list[str], photo_url: str | None, photo_url
 @router.get("/trees/{tree_id}/photo")
 def get_tree_best_photo(
     tree_id: int,
+    request: Request,
     w: int | None = Query(default=None, ge=64, le=4096),
     h: int | None = Query(default=None, ge=64, le=4096),
     q: int = Query(default=72, ge=35, le=95),
     fm: str | None = Query(default=None, pattern="^(?i:webp|jpeg|jpg|png)$"),
     db: Session = Depends(get_db),
 ):
+    # tree_id is a small sequential integer, unlike the UUID-keyed /uploads/object/ proxy - freely
+    # enumerable across every organization's trees without this check. Not referenced anywhere in
+    # this repo's frontend (confirmed by search), so locking it down fully.
+    photo_project_id = _get_project_id_for_tree(db, tree_id)
+    if photo_project_id is None:
+        raise HTTPException(status_code=404, detail="Tree not found.")
+    _require_project_member_access(db, request, int(photo_project_id))
     tree = db.execute(
         text(
             """
@@ -8615,12 +8695,17 @@ def get_tree_best_photo(
 @router.get("/trees/{tree_id}/photo-inline")
 def get_tree_best_photo_inline(
     tree_id: int,
+    request: Request,
     w: int | None = Query(default=1280, ge=64, le=4096),
     h: int | None = Query(default=None, ge=64, le=4096),
     q: int = Query(default=76, ge=35, le=95),
     fm: str | None = Query(default="jpeg", pattern="^(?i:webp|jpeg|jpg|png)$"),
     db: Session = Depends(get_db),
 ):
+    photo_project_id = _get_project_id_for_tree(db, tree_id)
+    if photo_project_id is None:
+        raise HTTPException(status_code=404, detail="Tree not found.")
+    _require_project_member_access(db, request, int(photo_project_id))
     tree = db.execute(
         text(
             """
@@ -8675,16 +8760,57 @@ def get_tree_best_photo_inline(
     raise last_not_found or HTTPException(status_code=404, detail="Tree photo not found.")
 
 
+def _is_safe_public_proxy_target(hostname: str) -> bool:
+    """Resolve a hostname and reject anything that isn't a plain public address - the defense
+    against SSRF (fetching http://169.254.169.254/... cloud metadata, http://localhost/..., an
+    internal 10.x/192.168.x service, etc via a server-side "fetch this URL for me" endpoint)."""
+    import ipaddress
+    import socket
+
+    try:
+        infos = socket.getaddrinfo(hostname, None)
+    except Exception:
+        return False
+    for info in infos:
+        sockaddr = info[4]
+        ip_str = sockaddr[0] if sockaddr else None
+        if not ip_str:
+            return False
+        try:
+            ip = ipaddress.ip_address(ip_str)
+        except ValueError:
+            return False
+        if (
+            ip.is_private
+            or ip.is_loopback
+            or ip.is_link_local
+            or ip.is_multicast
+            or ip.is_reserved
+            or ip.is_unspecified
+        ):
+            return False
+    return bool(infos)
+
+
 @router.get("/organizations/logo-proxy")
 def proxy_organization_logo(
+    request: Request,
+    db: Session = Depends(get_db),
     url: str = Query(..., min_length=1),
 ):
+    # Previously had no auth AND no destination check at all - a classic SSRF: the server would
+    # fetch any attacker-supplied URL, including internal/cloud-metadata addresses, and no
+    # frontend code in this repo even calls this endpoint, so it's locked down fully rather than
+    # just auth-gated.
+    require_authenticated_session(db, request, auth_modes={"partner_user", "env_admin"})
     raw = str(url or "").strip()
     if not raw:
         raise HTTPException(status_code=400, detail="Logo URL is required.")
     parsed = urlparse(raw)
     if parsed.scheme.lower() not in {"http", "https"}:
         raise HTTPException(status_code=400, detail="Only http/https logo URLs are supported.")
+    if not parsed.hostname or not _is_safe_public_proxy_target(parsed.hostname):
+        raise HTTPException(status_code=400, detail="This logo URL cannot be fetched.")
 
     try:
         import requests
@@ -8694,7 +8820,7 @@ def proxy_organization_logo(
             timeout=20,
             headers={"User-Agent": "LandCheck/1.0"},
             stream=True,
-            allow_redirects=True,
+            allow_redirects=False,
         )
         if response.status_code != 200:
             raise HTTPException(status_code=404, detail="Organization logo not found.")
@@ -8723,8 +8849,21 @@ async def upload_photo_to_r2(
     tree_id: int | None = Form(default=None),
     task_id: int | None = Form(default=None),
 ):
+    # Previously had no auth at all - anyone could upload arbitrary images (storage-cost abuse)
+    # and attach them to any tree/task (evidence-record tampering).
+    require_authenticated_session(db, request, auth_modes={"partner_user", "env_admin"})
     if tree_id is not None and task_id is not None:
         raise HTTPException(status_code=400, detail="Provide either tree_id or task_id, not both.")
+    if tree_id is not None:
+        upload_project_id = _get_project_id_for_tree(db, tree_id)
+        if upload_project_id is None:
+            raise HTTPException(status_code=404, detail="Tree not found")
+        _require_project_member_access(db, request, int(upload_project_id))
+    elif task_id is not None:
+        upload_project_id = _get_project_id_for_task(db, task_id)
+        if upload_project_id is None:
+            raise HTTPException(status_code=404, detail="Task not found")
+        _require_project_member_access(db, request, int(upload_project_id))
 
     content_type = (file.content_type or "").strip().lower()
     if not content_type.startswith("image/"):
@@ -8943,6 +9082,7 @@ async def upload_photo_to_r2(
 
 @router.post("/projects")
 def create_project(
+    request: Request,
     db: Session = Depends(get_db),
     name: str = Body(...),
     location_text: str = Body(default=""),
@@ -8971,6 +9111,15 @@ def create_project(
     allow_existing_tree_link: bool = Body(default=False),
     default_existing_tree_scope: str = Body(default=DEFAULT_EXISTING_TREE_SCOPE),
 ):
+    # Previously had no auth at all - anyone could create a project under any organization_id.
+    session = require_authenticated_session(db, request, auth_modes={"partner_user", "env_admin"})
+    if not session.is_super_admin:
+        if str(session.role_key or "").strip().lower() != "admin":
+            raise HTTPException(status_code=403, detail="Only an organization admin can create a project")
+        organization_id = int(session.organization_id or 0) or None
+        if not organization_id:
+            raise HTTPException(status_code=403, detail="Your account is not linked to an organization")
+
     normalized_workflow_profile = _normalize_workflow_profile(workflow_profile)
     normalized_access_model = _normalize_project_access_model(access_model)
     normalized_public_sponsor_enabled = _is_public_sponsorship_enabled(normalized_access_model, public_sponsor_enabled)
@@ -13012,13 +13161,14 @@ def _build_tree_carbon_summary(tree_row: dict) -> dict:
 @router.delete("/projects/{project_id}")
 def delete_project(
     project_id: int,
+    request: Request,
     db: Session = Depends(get_db),
     confirm_name: str = Body(..., embed=True),
 ):
     project = db.execute(
         text(
             """
-            SELECT id, name
+            SELECT id, name, organization_id
             FROM tree_projects
             WHERE id = :project_id
             """
@@ -13027,6 +13177,14 @@ def delete_project(
     ).mappings().first()
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
+    # Previously had no auth at all - anyone could permanently delete any project (and its trees,
+    # tasks, everything under it).
+    session = require_authenticated_session(db, request, auth_modes={"partner_user", "env_admin"})
+    if not session.is_super_admin:
+        if str(session.role_key or "").strip().lower() != "admin":
+            raise HTTPException(status_code=403, detail="Only an organization admin can delete a project")
+        if int(project.get("organization_id") or 0) != int(session.organization_id or 0):
+            raise HTTPException(status_code=403, detail="This project does not belong to your organization")
 
     expected_name = str(project.get("name") or "").strip()
     provided_name = str(confirm_name or "").strip()
@@ -13115,6 +13273,7 @@ def delete_project(
 @router.patch("/projects/{project_id}/settings")
 def update_project_settings(
     project_id: int,
+    request: Request,
     db: Session = Depends(get_db),
     workflow_profile: str | None = Body(default=None),
     access_model: str | None = Body(default=None),
@@ -13157,6 +13316,14 @@ def update_project_settings(
     ).mappings().first()
     if not existing:
         raise HTTPException(status_code=404, detail="Project not found")
+    # Previously had no auth at all - anyone could rewrite a project's sponsor pricing, payment
+    # instructions, access model or capacity.
+    session = require_authenticated_session(db, request, auth_modes={"partner_user", "env_admin"})
+    if not session.is_super_admin:
+        if str(session.role_key or "").strip().lower() != "admin":
+            raise HTTPException(status_code=403, detail="Only an organization admin can change project settings")
+        if int(existing.get("organization_id") or 0) != int(session.organization_id or 0):
+            raise HTTPException(status_code=403, detail="This project does not belong to your organization")
 
     next_status = (
         status.strip().lower()
@@ -13425,9 +13592,14 @@ def update_project_settings(
 @router.patch("/projects/{project_id}/organization")
 def assign_project_organization(
     project_id: int,
+    request: Request,
     db: Session = Depends(get_db),
     organization_id: int | None = Body(default=None),
 ):
+    # Moving a project between organizations is an inherently cross-tenant action (unlike the
+    # other project endpoints, there's no "my own org" scope that makes sense for an org admin to
+    # self-serve here) - restricted to super admin only. Previously had no auth at all.
+    require_super_admin_request(db, request)
     project_row = db.execute(
         text("SELECT id, name, organization_id FROM tree_projects WHERE id = :project_id"),
         {"project_id": project_id},
@@ -14147,7 +14319,7 @@ def download_org_impact_pdf(org_slug: str, request: Request, db: Session = Depen
 
 @router.get("/public-projects/{project_id}")
 def get_public_sponsorship_project(project_id: int, db: Session = Depends(get_db)):
-    project = get_project(project_id=project_id, db=db, assignee_name=None)
+    project = _fetch_project_detail(project_id=project_id, db=db, assignee_name=None)
     if not _is_public_sponsorship_project(project):
         raise HTTPException(status_code=404, detail="Public sponsorship project not found")
     return _build_public_project_snapshot(project, db)
@@ -14508,7 +14680,7 @@ def create_sponsor_order(
         if not bool(sponsor_row.get("is_active", True)):
             raise HTTPException(status_code=404, detail="This sponsor account is not active. Please contact support.")
         sponsor_id = int(sponsor_row["id"])
-    project = get_project(project_id=int(payload.project_id), db=db, assignee_name=None)
+    project = _fetch_project_detail(project_id=int(payload.project_id), db=db, assignee_name=None)
     if not _is_public_sponsorship_project(project):
         raise HTTPException(status_code=400, detail="Project is not open for public sponsorship")
     quantity = max(1, int(payload.quantity or 1))
@@ -14836,7 +15008,7 @@ def _create_merchant_sponsorship(
     default_project_id = int(merchant_row.get("default_project_id") or 0)
     if default_project_id <= 0:
         raise HTTPException(status_code=409, detail="This merchant has no default project configured yet â€” set one in LandCheck Work before integrating.")
-    project = get_project(project_id=default_project_id, db=db, assignee_name=None)
+    project = _fetch_project_detail(project_id=default_project_id, db=db, assignee_name=None)
     if not _is_public_sponsorship_project(project):
         raise HTTPException(status_code=409, detail="This merchant's default project is not open for sponsorship")
 
@@ -15003,7 +15175,7 @@ def create_admin_merchant(payload: AdminCreateMerchantPayload, request: Request,
     if existing:
         raise HTTPException(status_code=409, detail="A sponsor/merchant account with this email already exists")
     if payload.default_project_id:
-        project = get_project(project_id=int(payload.default_project_id), db=db, assignee_name=None)
+        project = _fetch_project_detail(project_id=int(payload.default_project_id), db=db, assignee_name=None)
         if not _is_public_sponsorship_project(project):
             raise HTTPException(status_code=400, detail="default_project_id must be a public-sponsorship project")
     api_key = _generate_merchant_api_key()
@@ -15205,7 +15377,7 @@ def create_admin_birthday_gift_sponsorship(payload: AdminCreateBirthdayGiftPaylo
     if not full_name_clean or not email_clean:
         raise HTTPException(status_code=400, detail="full_name and email are required")
     quantity_clean = max(1, min(int(payload.quantity or 1), 100))
-    project = get_project(project_id=int(payload.project_id), db=db, assignee_name=None)
+    project = _fetch_project_detail(project_id=int(payload.project_id), db=db, assignee_name=None)
     if not _is_public_sponsorship_project(project):
         raise HTTPException(status_code=400, detail="project_id must be a public-sponsorship project")
 
@@ -15882,7 +16054,12 @@ def _summarize_merchant_report_rows(rows: list[dict]) -> dict:
 
 
 @router.get("/merchant-auth/dashboard")
-def get_merchant_dashboard(merchant_id: int = Query(...), db: Session = Depends(get_db)):
+def get_merchant_dashboard(request: Request, merchant_id: int = Query(...), db: Session = Depends(get_db)):
+    # merchant_id was previously a bare, unauthenticated query param (a small sequential int,
+    # trivially enumerable) returning that merchant's order history, amounts and GPS map points.
+    # Merchants log in through the same sponsor-account session as /green/sponsor-auth/login
+    # (account_type='merchant'), so require that session and that it's actually this merchant.
+    _require_sponsor_session_for_id(db, request, merchant_id)
     merchant_row = _get_active_merchant_account_row(db, merchant_id)
     report_rows = _build_merchant_report_rows(db, merchant_id)
     summary = _summarize_merchant_report_rows(report_rows)
@@ -15917,7 +16094,8 @@ def get_merchant_dashboard(merchant_id: int = Query(...), db: Session = Depends(
 
 
 @router.get("/merchant-auth/report.pdf")
-def get_merchant_report_pdf(merchant_id: int = Query(...), db: Session = Depends(get_db)):
+def get_merchant_report_pdf(request: Request, merchant_id: int = Query(...), db: Session = Depends(get_db)):
+    _require_sponsor_session_for_id(db, request, merchant_id)
     merchant_row = _get_active_merchant_account_row(db, merchant_id)
     report_rows = _build_merchant_report_rows(db, merchant_id)
     summary = _summarize_merchant_report_rows(report_rows)
@@ -20346,6 +20524,10 @@ def export_sponsorship_unit_qr_tag_pdf(
     ).mappings().first()
     if not unit_project:
         raise HTTPException(status_code=404, detail="Sponsor QR tag not found")
+    # user_id was previously a trusted, unauthenticated query param: anyone who knew (or guessed)
+    # a valid agent's user_id could pull their QR sheet. Require the session to actually be that
+    # agent (or a super admin).
+    _require_partner_session_for_user(db, request, user_id=int(user_id), organization_id=int(organization_id) if organization_id is not None else None)
 
     project_row, user_row, _selected_agent_ids = _ensure_public_sponsor_agent_project_access(
         db,
@@ -20472,6 +20654,7 @@ def export_agent_sponsor_qr_sheet_pdf(
     sync: bool = Query(default=True),
     db: Session = Depends(get_db),
 ):
+    _require_partner_session_for_user(db, request, user_id=int(user_id), organization_id=int(organization_id) if organization_id is not None else None)
     _ensure_sponsor_qr_unit_columns(db)
     project_row, user_row, _selected_agent_ids = _ensure_public_sponsor_agent_project_access(
         db,
@@ -20617,8 +20800,12 @@ def export_tree_qr_tag_pdf(
     
     if not tree:
         raise HTTPException(status_code=404, detail="Tree not found")
-        
+
     tree_dict = dict(tree)
+    # Require real org membership for this tree's own project regardless of whether user_id was
+    # given - previously a bare, optional, unauthenticated user_id was trusted at face value, so
+    # anyone could pass any agent's user_id (or omit it) to pull any tree's QR tag.
+    _require_project_member_access(db, request, int(tree_dict.get("project_id") or 0))
     downloader_user = None
     if tree_dict.get("unit_id") and user_id is not None and int(user_id) > 0:
         _project_row, downloader_user, _selected_agent_ids = _ensure_public_sponsor_agent_project_access(
@@ -20830,7 +21017,12 @@ def list_sponsor_agent_banks(country: str = Query(default="NG")):
 
 
 @router.post("/agent-payouts/account/resolve")
-def resolve_sponsor_agent_bank_account(payload: SponsorAgentBankResolvePayload):
+def resolve_sponsor_agent_bank_account(payload: SponsorAgentBankResolvePayload, request: Request, db: Session = Depends(get_db)):
+    # Previously had no auth at all - anyone could use this as a free bank-account-name lookup
+    # oracle for any bank_code/account_number, which is both a PII leak of unrelated third
+    # parties and a paid-API cost-abuse vector. No specific user owns this action, so any
+    # authenticated Work session is enough to stop anonymous internet-wide abuse.
+    require_authenticated_session(db, request, auth_modes={"partner_user", "env_admin"})
     account_number = _normalize_account_number(payload.account_number)
     if len(account_number) < 10:
         raise HTTPException(status_code=400, detail="Enter a valid bank account number")
@@ -23867,10 +24059,18 @@ def export_admin_org_credentials_pdf(
 
 @router.get("/projects")
 def list_projects(
+    request: Request,
     db: Session = Depends(get_db),
     organization_id: int | None = Query(default=None),
     assignee_name: str | None = Query(default=None),
 ):
+    # Previously had no auth at all - listed every project across every organization, including
+    # sponsor pricing and payment instructions, to anyone.
+    session = require_authenticated_session(db, request, auth_modes={"partner_user", "env_admin"})
+    if not session.is_super_admin:
+        organization_id = int(session.organization_id or 0) or None
+        if not organization_id:
+            raise HTTPException(status_code=403, detail="Your account is not linked to an organization")
     organization_id_value = int(organization_id) if organization_id is not None else None
     assignee_clean = (assignee_name or "").strip() or None
     rows = db.execute(text("""
@@ -23968,8 +24168,7 @@ def list_projects(
     return items
 
 
-@router.get("/projects/{project_id}")
-def get_project(
+def _fetch_project_detail(
     project_id: int,
     db: Session = Depends(get_db),
     assignee_name: str | None = None,
@@ -24196,15 +24395,32 @@ def get_project(
     }
 
 
+@router.get("/projects/{project_id}")
+def get_project(
+    project_id: int,
+    request: Request,
+    db: Session = Depends(get_db),
+    assignee_name: str | None = None,
+):
+    # Previously had no auth at all. _fetch_project_detail is also called internally by other
+    # endpoints (some with their own distinct, narrower assignee-scoped access model) - this is
+    # the actual HTTP-facing route, so the Work-session check belongs here, not inside the shared
+    # helper.
+    _require_project_member_access(db, request, project_id)
+    return _fetch_project_detail(project_id, db=db, assignee_name=assignee_name)
+
+
 @router.get("/projects/{project_id}/trees")
 def list_trees(
     project_id: int,
+    request: Request,
     db: Session = Depends(get_db),
     assignee_name: str | None = Query(default=None),
 ):
+    _require_project_member_access(db, request, project_id)
     assignee_clean = (assignee_name or "").strip() or None
     if assignee_clean:
-        get_project(project_id=project_id, db=db, assignee_name=assignee_clean)
+        _fetch_project_detail(project_id=project_id, db=db, assignee_name=assignee_clean)
     rows = db.execute(text("""
         SELECT
                t.id,
@@ -24283,7 +24499,8 @@ def list_trees(
 
 
 @router.get("/projects/{project_id}/custodians")
-def list_custodians(project_id: int, db: Session = Depends(get_db)):
+def list_custodians(project_id: int, request: Request, db: Session = Depends(get_db)):
+    _require_project_member_access(db, request, project_id)
     _get_project_settings(db, project_id)
     rows = db.execute(
         text(
@@ -24319,6 +24536,7 @@ def list_custodians(project_id: int, db: Session = Depends(get_db)):
 @router.post("/projects/{project_id}/custodians")
 def create_custodian(
     project_id: int,
+    request: Request,
     db: Session = Depends(get_db),
     custodian_type: str = Body(default="household"),
     name: str = Body(...),
@@ -24334,6 +24552,7 @@ def create_custodian(
     profile_data: dict | None = Body(default=None),
     created_by: str | None = Body(default=None),
 ):
+    _require_project_member_access(db, request, project_id)
     _get_project_settings(db, project_id)
     clean_name = (name or "").strip()
     if not clean_name:
@@ -24413,6 +24632,7 @@ def create_custodian(
 @router.patch("/custodians/{custodian_id}")
 def update_custodian(
     custodian_id: int,
+    request: Request,
     db: Session = Depends(get_db),
     custodian_type: str | None = Body(default=None),
     name: str | None = Body(default=None),
@@ -24441,6 +24661,7 @@ def update_custodian(
     ).mappings().first()
     if not existing:
         raise HTTPException(status_code=404, detail="Custodian not found")
+    _require_project_member_access(db, request, int(existing["project_id"]))
 
     next_name = (name or "").strip() if name is not None else str(existing.get("name") or "").strip()
     if not next_name:
@@ -24524,7 +24745,8 @@ def update_custodian(
 
 
 @router.get("/projects/{project_id}/distribution-events")
-def list_distribution_events(project_id: int, db: Session = Depends(get_db)):
+def list_distribution_events(project_id: int, request: Request, db: Session = Depends(get_db)):
+    _require_project_member_access(db, request, project_id)
     _get_project_settings(db, project_id)
     rows = db.execute(
         text(
@@ -24553,6 +24775,7 @@ def list_distribution_events(project_id: int, db: Session = Depends(get_db)):
 @router.post("/projects/{project_id}/distribution-events")
 def create_distribution_event(
     project_id: int,
+    request: Request,
     db: Session = Depends(get_db),
     event_date: str = Body(...),
     species: str | None = Body(default=None),
@@ -24561,6 +24784,7 @@ def create_distribution_event(
     distributed_by: str | None = Body(default=None),
     notes: str | None = Body(default=None),
 ):
+    _require_project_member_access(db, request, project_id)
     _get_project_settings(db, project_id)
     event_date_value = _parse_date_value(event_date)
     if event_date_value is None:
@@ -24618,7 +24842,8 @@ def create_distribution_event(
 
 
 @router.get("/projects/{project_id}/distribution-allocations")
-def list_distribution_allocations(project_id: int, db: Session = Depends(get_db)):
+def list_distribution_allocations(project_id: int, request: Request, db: Session = Depends(get_db)):
+    _require_project_member_access(db, request, project_id)
     _get_project_settings(db, project_id)
     rows = db.execute(
         text(
@@ -24689,6 +24914,7 @@ def list_distribution_allocations(project_id: int, db: Session = Depends(get_db)
 @router.post("/distribution-events/{event_id}/allocations")
 def upsert_distribution_allocation(
     event_id: int,
+    request: Request,
     db: Session = Depends(get_db),
     custodian_id: int = Body(...),
     quantity_allocated: int = Body(default=0),
@@ -24704,6 +24930,7 @@ def upsert_distribution_allocation(
     ).mappings().first()
     if not event_row:
         raise HTTPException(status_code=404, detail="Distribution event not found")
+    _require_project_member_access(db, request, int(event_row["project_id"]))
 
     custodian_row = db.execute(
         text("SELECT id, project_id, name FROM green_custodians WHERE id = :custodian_id"),
@@ -24796,6 +25023,7 @@ def upsert_distribution_allocation(
 @router.post("/distribution-allocations/{allocation_id}/assign-supervision")
 def assign_distribution_supervision(
     allocation_id: int,
+    request: Request,
     db: Session = Depends(get_db),
     assignee_name: str = Body(...),
     visits_to_assign: int = Body(default=1),
@@ -24841,6 +25069,7 @@ def assign_distribution_supervision(
     ).mappings().first()
     if not allocation:
         raise HTTPException(status_code=404, detail="Allocation not found")
+    _require_project_member_access(db, request, int(allocation["project_id"]))
 
     supervision_target = int(allocation.get("supervision_target") or 0)
     if supervision_target <= 0:
@@ -25014,12 +25243,14 @@ def assign_distribution_supervision(
 def assign_custodian_field_capture(
     project_id: int,
     custodian_id: int,
+    request: Request,
     db: Session = Depends(get_db),
     assignee_name: str = Body(...),
     due_date: str | None = Body(default=None),
     priority: str = Body(default="normal"),
     actor_name: str | None = Body(default=None),
 ):
+    _require_project_member_access(db, request, project_id)
     assignee_clean = (assignee_name or "").strip()
     if not assignee_clean:
         raise HTTPException(status_code=400, detail="Assignee name is required")
@@ -25223,10 +25454,13 @@ def assign_custodian_field_capture(
 @router.get("/projects/{project_id}/existing-tree-candidates")
 def list_existing_tree_candidates(
     project_id: int,
+    request: Request,
     source_project_id: int = Query(...),
     limit: int = Query(default=500, ge=1, le=2000),
     db: Session = Depends(get_db),
 ):
+    _require_project_member_access(db, request, project_id)
+    _require_project_member_access(db, request, source_project_id)
     _get_project_settings(db, project_id)
     _get_project_settings(db, source_project_id)
     if int(project_id) == int(source_project_id):
@@ -25285,6 +25519,7 @@ def list_existing_tree_candidates(
 @router.post("/projects/{project_id}/existing-trees/import")
 def import_existing_trees(
     project_id: int,
+    request: Request,
     db: Session = Depends(get_db),
     source_project_id: int = Body(...),
     tree_ids: list[int] = Body(...),
@@ -25294,6 +25529,10 @@ def import_existing_trees(
     count_in_planting_kpis: bool | None = Body(default=None),
     count_in_carbon_scope: bool | None = Body(default=None),
 ):
+    # Links trees across two projects - require member access to both, so this can't be used to
+    # pull trees out of (or attribute trees into) a project in another organization.
+    _require_project_member_access(db, request, project_id)
+    _require_project_member_access(db, request, source_project_id)
     target_settings = _get_project_settings(db, project_id)
     _get_project_settings(db, source_project_id)
     if int(project_id) == int(source_project_id):
@@ -25604,11 +25843,13 @@ def get_species_maturity(project_id: int, db: Session = Depends(get_db)):
 @router.put("/projects/{project_id}/species-maturity")
 def upsert_species_maturity(
     project_id: int,
+    request: Request,
     db: Session = Depends(get_db),
     species_key: str = Body(...),
     maturity_years: int = Body(...),
     species_label: str | None = Body(default=None),
 ):
+    _require_project_member_access(db, request, project_id)
     normalized_key = (species_key or "").strip().lower()
     if not normalized_key:
         raise HTTPException(status_code=400, detail="species_key is required")
@@ -25660,7 +25901,7 @@ def carbon_summary(
 ):
     """Get CO2 sequestration summary for a project."""
     assignee_clean = (assignee_name or "").strip() or None
-    get_project(project_id=project_id, db=db, assignee_name=assignee_clean)
+    _fetch_project_detail(project_id=project_id, db=db, assignee_name=assignee_clean)
 
     tree_rows = db.execute(text("""
         SELECT id, species, planting_date, status, created_at, tree_age_months, COALESCE(inventory_tree_count, 1) AS inventory_tree_count
@@ -25684,7 +25925,7 @@ def carbon_projection(
 ):
     """Get year-by-year CO2 projection for a project."""
     assignee_clean = (assignee_name or "").strip() or None
-    get_project(project_id=project_id, db=db, assignee_name=assignee_clean)
+    _fetch_project_detail(project_id=project_id, db=db, assignee_name=assignee_clean)
 
     tree_rows = db.execute(text("""
         SELECT id, species, planting_date, status, created_at, tree_age_months, COALESCE(inventory_tree_count, 1) AS inventory_tree_count
@@ -25741,6 +25982,7 @@ def carbon_species_database():
 
 @router.post("/trees")
 def add_tree(
+    request: Request,
     db: Session = Depends(get_db),
     project_id: int = Body(...),
     lng: float = Body(...),
@@ -25767,6 +26009,7 @@ def add_tree(
     created_by_user_id: int | None = Body(default=None),
     created_by_organization_id: int | None = Body(default=None),
 ):
+    _require_project_member_access(db, request, int(project_id))
     project_settings = _get_project_settings(db, int(project_id))
     origin = _normalize_tree_origin(tree_origin)
     if origin not in TREE_ORIGIN_VALUES:
@@ -26098,6 +26341,7 @@ def add_tree(
 @router.patch("/trees/{tree_id}")
 def update_tree(
     tree_id: int,
+    request: Request,
     db: Session = Depends(get_db),
     lng: float | None = Body(default=None),
     lat: float | None = Body(default=None),
@@ -26122,6 +26366,10 @@ def update_tree(
     clear_existing_area_geojson: bool = Body(default=False),
     record_profile_data: dict | None = Body(default=None),
 ):
+    tree_project_id = db.execute(text("SELECT project_id FROM trees WHERE id = :tree_id"), {"tree_id": tree_id}).scalar()
+    if tree_project_id is None:
+        raise HTTPException(status_code=404, detail="Tree not found")
+    _require_project_member_access(db, request, int(tree_project_id))
     if (lng is None) != (lat is None):
         raise HTTPException(status_code=400, detail="Both lng and lat are required together")
     if lng is not None and not (-180 <= float(lng) <= 180):
@@ -26457,6 +26705,7 @@ def update_tree(
 @router.delete("/trees/{tree_id}")
 def delete_tree(
     tree_id: int,
+    request: Request,
     confirm_tree_id: int | None = Query(default=None),
     project_id: int | None = Query(default=None),
     actor_name: str | None = Query(default=None),
@@ -26476,6 +26725,7 @@ def delete_tree(
         raise HTTPException(status_code=404, detail="Tree not found")
 
     project_id_value = int(row.get("project_id") or 0)
+    _require_project_member_access(db, request, project_id_value)
     if project_id is not None and int(project_id) != project_id_value:
         raise HTTPException(status_code=400, detail="Project mismatch for selected tree")
     if confirm_tree_id is not None and int(confirm_tree_id) != int(tree_id):
@@ -26502,6 +26752,7 @@ def delete_tree(
 @router.post("/trees/{tree_id}/visits")
 def add_visit(
     tree_id: int,
+    request: Request,
     db: Session = Depends(get_db),
     visit_date: str = Body(...),
     status: str = Body(...),
@@ -26509,6 +26760,10 @@ def add_visit(
     photo_url: str = Body(default=""),
     created_by: str = Body(default=""),
 ):
+    visit_project_id = _get_project_id_for_tree(db, tree_id)
+    if visit_project_id is None:
+        raise HTTPException(status_code=404, detail="Tree not found")
+    _require_project_member_access(db, request, int(visit_project_id))
     normalized_status = _normalize_tree_status(status)
     if normalized_status not in TREE_STATUS_VALUES:
         raise HTTPException(status_code=400, detail="Invalid status")
@@ -26541,6 +26796,7 @@ def add_visit(
 @router.post("/trees/{tree_id}/tasks")
 def add_task(
     tree_id: int,
+    request: Request,
     db: Session = Depends(get_db),
     task_type: str = Body(...),
     assignee_name: str = Body(...),
@@ -26567,6 +26823,7 @@ def add_task(
     ).mappings().first()
     if not tree_row:
         raise HTTPException(status_code=404, detail="Tree not found")
+    _require_project_member_access(db, request, int(tree_row["project_id"]))
     tree_status = _normalize_tree_status(tree_row.get("status") or "alive")
     replacement_required = _is_replacement_trigger_status(tree_status)
     if activity == "replacement" and not replacement_required:
@@ -26964,8 +27221,8 @@ def create_user(
         },
     )
     db.commit()
-    payload = list_users(
-        db=db,
+    payload = _fetch_user_rows(
+        db,
         include_inactive=True,
         organization_id=None,
         role_id=None,
@@ -26995,14 +27252,18 @@ def create_user(
     return payload
 
 
-@router.get("/users")
-def list_users(
-    db: Session = Depends(get_db),
-    include_inactive: bool = Query(default=False),
-    organization_id: int | None = Query(default=None),
-    role_id: int | None = Query(default=None),
+def _fetch_user_rows(
+    db: Session,
+    *,
+    include_inactive: bool = False,
+    organization_id: int | None = None,
+    role_id: int | None = None,
     user_id_filter: int | None = None,
 ):
+    """Raw row-fetch shared by the GET /users endpoint and a few internal callers
+    (create_user/update_user/reset_user_password re-fetch the single row they just touched to
+    shape their response) - callers that already did their own auth pass call this directly;
+    nothing outside this module should call it without having authorized the request first."""
     def _safe_int_or_none(value):
         if value is None:
             return None
@@ -27039,9 +27300,36 @@ def list_users(
     return [dict(r) for r in rows]
 
 
+@router.get("/users")
+def list_users(
+    request: Request,
+    db: Session = Depends(get_db),
+    include_inactive: bool = Query(default=False),
+    organization_id: int | None = Query(default=None),
+    role_id: int | None = Query(default=None),
+    user_id_filter: int | None = None,
+):
+    # Previously had no auth at all - dumped every user's name/email/phone/role across every
+    # organization to anyone who found the URL. A partner session may only ever see its own
+    # organization's users; only a super admin can see across organizations or omit the filter.
+    session = require_authenticated_session(db, request, auth_modes={"partner_user", "env_admin"})
+    if not session.is_super_admin:
+        organization_id = int(session.organization_id or 0) or None
+        if not organization_id:
+            raise HTTPException(status_code=403, detail="Your account is not linked to an organization")
+    return _fetch_user_rows(
+        db,
+        include_inactive=include_inactive,
+        organization_id=organization_id,
+        role_id=role_id,
+        user_id_filter=user_id_filter,
+    )
+
+
 @router.patch("/users/{user_id}")
 def update_user(
     user_id: int,
+    request: Request,
     db: Session = Depends(get_db),
     full_name: str | None = Body(default=None),
     role: str | None = Body(default=None),
@@ -27073,6 +27361,16 @@ def update_user(
     ).mappings().first()
     if not existing:
         raise HTTPException(status_code=404, detail="User not found")
+    # Previously had no auth at all - let anyone rewrite any user's role, organization, email,
+    # work_username or password. A partner org's "admin" may only edit its own organization's
+    # users, and may not move a user into a different organization.
+    session = require_authenticated_session(db, request, auth_modes={"partner_user", "env_admin"})
+    if not session.is_super_admin:
+        if str(session.role_key or "").strip().lower() != "admin":
+            raise HTTPException(status_code=403, detail="Only an organization admin can edit users")
+        if int(existing.get("organization_id") or 0) != int(session.organization_id or 0):
+            raise HTTPException(status_code=403, detail="This user does not belong to your organization")
+        organization_id = existing.get("organization_id")
     org_id_value = None
     if organization_id is None:
         org_id_value = existing.get("organization_id")
@@ -27197,8 +27495,8 @@ def update_user(
         },
     )
     db.commit()
-    result = list_users(
-        db=db,
+    result = _fetch_user_rows(
+        db,
         include_inactive=True,
         organization_id=None,
         role_id=None,
@@ -27210,6 +27508,7 @@ def update_user(
 @router.delete("/users/{user_id}")
 def delete_user(
     user_id: int,
+    request: Request,
     db: Session = Depends(get_db),
 ):
     existing = db.execute(
@@ -27229,6 +27528,15 @@ def delete_user(
     ).mappings().first()
     if not existing:
         raise HTTPException(status_code=404, detail="User not found")
+    # Previously had no auth at all - anyone could permanently delete any user account.
+    session = require_authenticated_session(db, request, auth_modes={"partner_user", "env_admin"})
+    if not session.is_super_admin:
+        if str(session.role_key or "").strip().lower() != "admin":
+            raise HTTPException(status_code=403, detail="Only an organization admin can remove users")
+        if int(existing.get("organization_id") or 0) != int(session.organization_id or 0):
+            raise HTTPException(status_code=403, detail="This user does not belong to your organization")
+        if int(session.user_id or 0) == int(user_id):
+            raise HTTPException(status_code=400, detail="You cannot remove your own account")
 
     deleted_id = db.execute(
         text("DELETE FROM green_users WHERE id = :user_id RETURNING id"),
@@ -27262,6 +27570,7 @@ def delete_user(
 @router.post("/users/{user_id}/reset-password")
 def reset_user_password(
     user_id: int,
+    request: Request,
     db: Session = Depends(get_db),
     send_credentials_email: bool = Body(default=True),
     password_length: int = Body(default=12),
@@ -27285,6 +27594,14 @@ def reset_user_password(
     ).mappings().first()
     if not existing:
         raise HTTPException(status_code=404, detail="User not found")
+    # Previously had no auth at all - combined with the update/delete gaps above, this completed
+    # a full account-takeover chain against any user in any organization.
+    session = require_authenticated_session(db, request, auth_modes={"partner_user", "env_admin"})
+    if not session.is_super_admin:
+        if str(session.role_key or "").strip().lower() != "admin":
+            raise HTTPException(status_code=403, detail="Only an organization admin can reset a user's password")
+        if int(existing.get("organization_id") or 0) != int(session.organization_id or 0):
+            raise HTTPException(status_code=403, detail="This user does not belong to your organization")
 
     allow_green_value = bool(existing.get("allow_green", True))
     allow_work_value = bool(existing.get("allow_work", False))
@@ -27355,8 +27672,8 @@ def reset_user_password(
     )
     db.commit()
 
-    payload = list_users(
-        db=db,
+    payload = _fetch_user_rows(
+        db,
         include_inactive=True,
         organization_id=None,
         role_id=None,
@@ -27485,8 +27802,12 @@ def change_own_password(
 @router.post("/auth/update-profile-photo")
 def update_green_user_profile_photo(
     payload: GreenUserUpdateProfilePhotoPayload,
+    request: Request,
     db: Session = Depends(get_db),
 ):
+    # Previously trusted payload.user_id with no session check - anyone could set any user's
+    # profile photo by ID alone.
+    _require_partner_session_for_user(db, request, user_id=int(payload.user_id))
     photo_url = str(payload.profile_photo_url or "").strip()
     if not photo_url:
         raise HTTPException(status_code=400, detail="Profile photo URL is required")
@@ -28064,6 +28385,7 @@ def deactivate_sponsor_mobile_push_token(
 @router.patch("/tasks/{task_id}")
 def update_task(
     task_id: int,
+    request: Request,
     db: Session = Depends(get_db),
     status: str | None = Body(default=None),
     notes: str | None = Body(default=None),
@@ -28075,6 +28397,10 @@ def update_task(
     activity_recorded_at: str | None = Body(default=None),
     actor_name: str | None = Body(default=None),
 ):
+    task_project_id = _get_project_id_for_task(db, task_id)
+    if task_project_id is None:
+        raise HTTPException(status_code=404, detail="Task not found")
+    _require_project_member_access(db, request, int(task_project_id))
     if status and status not in TASK_STATUS_VALUES:
         raise HTTPException(status_code=400, detail="Invalid status")
     normalized_tree_status = _normalize_tree_status(tree_status) if tree_status is not None else None
@@ -28280,6 +28606,7 @@ def task_review_queue(
 @router.post("/tasks/{task_id}/submit")
 def submit_task_for_review(
     task_id: int,
+    request: Request,
     db: Session = Depends(get_db),
     notes: str | None = Body(default=None),
     photo_url: str | None = Body(default=None),
@@ -28290,6 +28617,10 @@ def submit_task_for_review(
     activity_recorded_at: str | None = Body(default=None),
     actor_name: str | None = Body(default=None),
 ):
+    submit_project_id = _get_project_id_for_task(db, task_id)
+    if submit_project_id is None:
+        raise HTTPException(status_code=404, detail="Task not found")
+    _require_project_member_access(db, request, int(submit_project_id))
     normalized_tree_status = _normalize_tree_status(tree_status) if tree_status is not None else None
     if normalized_tree_status is not None and normalized_tree_status not in TREE_STATUS_VALUES:
         raise HTTPException(status_code=400, detail="Invalid tree status")
@@ -28414,6 +28745,7 @@ def submit_task_for_review(
 @router.post("/tasks/{task_id}/review")
 def review_submitted_task(
     task_id: int,
+    request: Request,
     db: Session = Depends(get_db),
     decision: str = Body(...),
     reviewer_name: str = Body(default=""),
@@ -28441,6 +28773,9 @@ def review_submitted_task(
         raise HTTPException(status_code=404, detail="Task not found")
     if _normalize_name(task.get("review_state")) != "submitted":
         raise HTTPException(status_code=409, detail="Task is not in submitted state")
+    # The approval/rejection sign-off step - restricted to an org admin, not any org member, or
+    # the same person who submitted a task could approve their own work.
+    _require_project_write_access(db, request, int(task["project_id"]))
 
     project_id = int(task["project_id"])
     auto_generated_task_id = None
@@ -28647,6 +28982,7 @@ def review_submitted_task(
 
 @router.post("/tasks/review-bulk")
 def review_submitted_tasks_bulk(
+    request: Request,
     db: Session = Depends(get_db),
     task_ids: list[int] = Body(...),
     reviewer_name: str = Body(default=""),
@@ -28685,6 +29021,7 @@ def review_submitted_tasks_bulk(
         try:
             review_submitted_task(
                 task_id=task_id,
+                request=request,
                 db=db,
                 decision="approve",
                 reviewer_name=reviewer_name,
@@ -28728,6 +29065,7 @@ def review_submitted_tasks_bulk(
 @router.post("/tasks/{task_id}/reopen")
 def reopen_approved_task(
     task_id: int,
+    request: Request,
     db: Session = Depends(get_db),
     reviewer_name: str = Body(default=""),
     reason: str = Body(default=""),
@@ -28745,6 +29083,8 @@ def reopen_approved_task(
         raise HTTPException(status_code=404, detail="Task not found")
     if _normalize_name(task.get("review_state")) != "approved":
         raise HTTPException(status_code=409, detail="Only approved tasks can be reopened")
+    # Overriding an already-approved compliance record - admin-level action, same as approval.
+    _require_project_write_access(db, request, int(task["project_id"]))
 
     db.execute(
         text("""
@@ -28785,10 +29125,12 @@ def reopen_approved_task(
 @router.get("/projects/{project_id}/alerts")
 def project_alerts(
     project_id: int,
+    request: Request,
     refresh: bool = Query(default=True),
     status: str = Query(default="open"),
     db: Session = Depends(get_db),
 ):
+    _require_project_member_access(db, request, project_id)
     if refresh:
         _refresh_project_alerts(db, project_id)
         db.commit()
@@ -28831,11 +29173,13 @@ def _compare_metric(metric_value: float, comparator: str, threshold: float) -> b
 
 @router.get("/reports/kpi")
 def reports_kpi(
+    request: Request,
     project_id: int = Query(...),
     days: int = Query(default=30, ge=1, le=365),
     snapshot: bool = Query(default=True),
     db: Session = Depends(get_db),
 ):
+    _require_project_member_access(db, request, project_id)
     metrics = _compute_kpi_snapshot(project_id, db)
     if snapshot:
         _store_kpi_snapshot(project_id, metrics, db)
@@ -28858,9 +29202,11 @@ def reports_kpi(
 
 @router.get("/reports/schedule")
 def list_report_schedules(
+    request: Request,
     project_id: int = Query(...),
     db: Session = Depends(get_db),
 ):
+    _require_project_member_access(db, request, project_id)
     rows = db.execute(
         text("""
             SELECT id, project_id, report_type, report_format, recipients, cron_expr, timezone, webhook_url,
@@ -28876,6 +29222,7 @@ def list_report_schedules(
 
 @router.post("/reports/schedule")
 def create_report_schedule(
+    request: Request,
     project_id: int = Body(...),
     report_type: str = Body(default="donor"),
     report_format: str = Body(default="pdf"),
@@ -28886,6 +29233,9 @@ def create_report_schedule(
     created_by: str | None = Body(default=None),
     db: Session = Depends(get_db),
 ):
+    # Previously had no auth at all - anyone could create a recurring report delivered to any
+    # email or webhook destination for any project.
+    _require_project_write_access(db, request, project_id)
     row = db.execute(
         text("""
             INSERT INTO green_scheduled_reports (
@@ -28915,6 +29265,7 @@ def create_report_schedule(
 @router.patch("/reports/schedule/{schedule_id}")
 def update_report_schedule(
     schedule_id: int,
+    request: Request,
     report_type: str | None = Body(default=None),
     report_format: str | None = Body(default=None),
     recipients: str | None = Body(default=None),
@@ -28924,6 +29275,16 @@ def update_report_schedule(
     is_enabled: bool | None = Body(default=None),
     db: Session = Depends(get_db),
 ):
+    # Previously had no auth at all - anyone could redirect an existing schedule's delivery
+    # destination (email/webhook), a data-exfiltration primitive against a project's own
+    # recurring donor/financial reports.
+    existing_project_id = db.execute(
+        text("SELECT project_id FROM green_scheduled_reports WHERE id = :schedule_id"),
+        {"schedule_id": schedule_id},
+    ).scalar()
+    if existing_project_id is None:
+        raise HTTPException(status_code=404, detail="Schedule not found")
+    _require_project_write_access(db, request, int(existing_project_id))
     row = db.execute(
         text("""
             UPDATE green_scheduled_reports
@@ -28957,7 +29318,15 @@ def update_report_schedule(
 
 
 @router.delete("/reports/schedule/{schedule_id}")
-def delete_report_schedule(schedule_id: int, db: Session = Depends(get_db)):
+def delete_report_schedule(schedule_id: int, request: Request, db: Session = Depends(get_db)):
+    # Previously had no auth at all.
+    existing_project_id = db.execute(
+        text("SELECT project_id FROM green_scheduled_reports WHERE id = :schedule_id"),
+        {"schedule_id": schedule_id},
+    ).scalar()
+    if existing_project_id is None:
+        raise HTTPException(status_code=404, detail="Schedule not found")
+    _require_project_write_access(db, request, int(existing_project_id))
     deleted = db.execute(
         text("DELETE FROM green_scheduled_reports WHERE id = :schedule_id RETURNING id"),
         {"schedule_id": schedule_id},
@@ -28970,9 +29339,11 @@ def delete_report_schedule(schedule_id: int, db: Session = Depends(get_db)):
 
 @router.get("/alerts/rules")
 def list_alert_rules(
+    request: Request,
     project_id: int = Query(...),
     db: Session = Depends(get_db),
 ):
+    _require_project_member_access(db, request, project_id)
     rows = db.execute(
         text("""
             SELECT id, project_id, rule_name, metric_key, comparator, threshold, severity,
@@ -28988,6 +29359,7 @@ def list_alert_rules(
 
 @router.post("/alerts/rules")
 def create_alert_rule(
+    request: Request,
     project_id: int = Body(...),
     rule_name: str = Body(...),
     metric_key: str = Body(...),
@@ -28998,6 +29370,8 @@ def create_alert_rule(
     created_by: str | None = Body(default=None),
     db: Session = Depends(get_db),
 ):
+    # Previously had no auth at all.
+    _require_project_write_access(db, request, project_id)
     cmp_key = _normalize_name(comparator)
     if cmp_key not in {"gt", "gte", "lt", "lte", "eq"}:
         raise HTTPException(status_code=400, detail="Invalid comparator")
@@ -29033,6 +29407,7 @@ def create_alert_rule(
 @router.patch("/alerts/rules/{rule_id}")
 def update_alert_rule(
     rule_id: int,
+    request: Request,
     rule_name: str | None = Body(default=None),
     metric_key: str | None = Body(default=None),
     comparator: str | None = Body(default=None),
@@ -29042,6 +29417,14 @@ def update_alert_rule(
     is_enabled: bool | None = Body(default=None),
     db: Session = Depends(get_db),
 ):
+    # Previously had no auth at all.
+    existing_project_id = db.execute(
+        text("SELECT project_id FROM green_alert_rules WHERE id = :rule_id"),
+        {"rule_id": rule_id},
+    ).scalar()
+    if existing_project_id is None:
+        raise HTTPException(status_code=404, detail="Alert rule not found")
+    _require_project_write_access(db, request, int(existing_project_id))
     cmp_key = _normalize_name(comparator) if comparator is not None else None
     if cmp_key is not None and cmp_key not in {"gt", "gte", "lt", "lte", "eq"}:
         raise HTTPException(status_code=400, detail="Invalid comparator")
@@ -29082,9 +29465,11 @@ def update_alert_rule(
 
 @router.post("/alerts/evaluate")
 def evaluate_alert_rules(
+    request: Request,
     project_id: int = Body(...),
     db: Session = Depends(get_db),
 ):
+    _require_project_member_access(db, request, project_id)
     metrics = _compute_kpi_snapshot(project_id, db)
     rules = db.execute(
         text("""
@@ -29174,10 +29559,12 @@ def evaluate_alert_rules(
 
 @router.get("/alerts/events")
 def list_alert_events(
+    request: Request,
     project_id: int = Query(...),
     status: str = Query(default="all"),
     db: Session = Depends(get_db),
 ):
+    _require_project_member_access(db, request, project_id)
     rows = db.execute(
         text("""
             SELECT id, project_id, rule_id, severity, status, metric_key, metric_value, threshold,
@@ -29195,10 +29582,12 @@ def list_alert_events(
 
 @router.get("/alerts/webhook-deliveries")
 def list_webhook_deliveries(
+    request: Request,
     project_id: int = Query(...),
     status: str = Query(default="all"),
     db: Session = Depends(get_db),
 ):
+    _require_project_member_access(db, request, project_id)
     rows = db.execute(
         text(
             """
@@ -29221,12 +29610,24 @@ def list_webhook_deliveries(
 @router.patch("/alerts/webhook-deliveries/{delivery_id}")
 def update_webhook_delivery(
     delivery_id: int,
+    request: Request,
     status: str | None = Body(default=None),
     response_code: int | None = Body(default=None),
     response_body: str | None = Body(default=None),
     increment_attempt: bool = Body(default=False),
     db: Session = Depends(get_db),
 ):
+    delivery_project_id = db.execute(
+        text("""
+            SELECT e.project_id FROM green_webhook_deliveries d
+            JOIN green_alert_events e ON e.id = d.event_id
+            WHERE d.id = :delivery_id
+        """),
+        {"delivery_id": delivery_id},
+    ).scalar()
+    if delivery_project_id is None:
+        raise HTTPException(status_code=404, detail="Webhook delivery not found")
+    _require_project_member_access(db, request, int(delivery_project_id))
     status_key = _normalize_name(status) if status is not None else None
     if status_key is not None and status_key not in {"pending", "failed", "delivered"}:
         raise HTTPException(status_code=400, detail="Invalid delivery status")
@@ -29264,9 +29665,11 @@ def update_webhook_delivery(
 @router.get("/projects/{project_id}/audit-events")
 def project_audit_events(
     project_id: int,
+    request: Request,
     limit: int = Query(default=200, ge=1, le=1000),
     db: Session = Depends(get_db),
 ):
+    _require_project_member_access(db, request, project_id)
     rows = db.execute(
         text("""
             SELECT id, project_id, entity_type, entity_id, action, actor, details, created_at
@@ -29283,11 +29686,13 @@ def project_audit_events(
 @router.get("/projects/{project_id}/live-maintenance")
 def live_maintenance_rows(
     project_id: int,
+    request: Request,
     season_mode: str = Query(default="rainy"),
     assignee_name: str | None = Query(default=None),
     tree_scope: str = Query(default="new_planting"),
     db: Session = Depends(get_db),
 ):
+    _require_project_member_access(db, request, project_id)
     payload = _compute_live_maintenance_rows(
         db=db,
         project_id=project_id,
@@ -30133,7 +30538,7 @@ def _build_verra_vcs_payload(
     methodology_id: str | None = None,
     verifier_notes: str | None = None,
 ) -> dict:
-    project = get_project(project_id, db)
+    project = _fetch_project_detail(project_id, db)
     season = "dry" if _normalize_name(season_mode) == "dry" else "rainy"
     assignee_clean = (assignee_name or "").strip() or None
 
@@ -31207,6 +31612,7 @@ def _render_verra_vcs_docx(package: dict) -> io.BytesIO:
 @router.get("/projects/{project_id}/export/verra-vcs")
 def export_project_verra_vcs(
     project_id: int,
+    request: Request,
     season_mode: str = Query(default="rainy"),
     assignee_name: str | None = Query(default=None),
     monitoring_start: str | None = Query(default=None),
@@ -31217,6 +31623,7 @@ def export_project_verra_vcs(
     output_format: str = Query(default="zip", alias="format"),
     db: Session = Depends(get_db),
 ):
+    _require_project_member_access(db, request, project_id)
     monitoring_start_date = _parse_date_value(monitoring_start)
     monitoring_end_date = _parse_date_value(monitoring_end)
     if monitoring_start and monitoring_start_date is None:
@@ -31307,6 +31714,7 @@ def export_project_verra_vcs(
 
 @router.get("/donor/export/verra-vcs")
 def export_project_verra_vcs_alias(
+    request: Request,
     project_id: int = Query(...),
     season_mode: str = Query(default="rainy"),
     assignee_name: str | None = Query(default=None),
@@ -31320,6 +31728,7 @@ def export_project_verra_vcs_alias(
 ):
     return export_project_verra_vcs(
         project_id=project_id,
+        request=request,
         season_mode=season_mode,
         assignee_name=assignee_name,
         monitoring_start=monitoring_start,
@@ -31335,9 +31744,11 @@ def export_project_verra_vcs_alias(
 @router.get("/projects/{project_id}/verra/exports")
 def list_verra_export_history(
     project_id: int,
+    request: Request,
     limit: int = Query(default=100, ge=1, le=500),
     db: Session = Depends(get_db),
 ):
+    _require_project_member_access(db, request, project_id)
     rows = db.execute(
         text(
             """
@@ -31355,8 +31766,9 @@ def list_verra_export_history(
     return [dict(row) for row in rows]
 
 @router.get("/projects/{project_id}/donor-report/csv")
-def export_donor_report_csv(project_id: int, db: Session = Depends(get_db)):
-    project = get_project(project_id, db)
+def export_donor_report_csv(project_id: int, request: Request, db: Session = Depends(get_db)):
+    _require_project_member_access(db, request, project_id)
+    project = _fetch_project_detail(project_id, db)
     rows = db.execute(text("""
         SELECT
             t.id,
@@ -31584,6 +31996,7 @@ def export_donor_report_csv(project_id: int, db: Session = Depends(get_db)):
 @router.get("/projects/{project_id}/donor-report/pdf")
 def export_donor_report_pdf(
     project_id: int,
+    request: Request,
     assignee_name: str | None = None,
     include_photos: bool = False,
     lng: float | None = None,
@@ -31596,6 +32009,7 @@ def export_donor_report_pdf(
     # Use the comprehensive map report and include donor/review details in additional pages.
     return export_work_report_pdf(
         project_id=project_id,
+        request=request,
         assignee_name=assignee_name,
         include_photos=include_photos,
         lng=lng,
@@ -31609,14 +32023,16 @@ def export_donor_report_pdf(
 
 @router.get("/donor/export/csv")
 def export_donor_report_csv_alias(
+    request: Request,
     project_id: int = Query(...),
     db: Session = Depends(get_db),
 ):
-    return export_donor_report_csv(project_id=project_id, db=db)
+    return export_donor_report_csv(project_id=project_id, request=request, db=db)
 
 
 @router.get("/donor/export/pdf")
 def export_donor_report_pdf_alias(
+    request: Request,
     project_id: int = Query(...),
     assignee_name: str | None = None,
     include_photos: bool = False,
@@ -31629,6 +32045,7 @@ def export_donor_report_pdf_alias(
 ):
     return export_donor_report_pdf(
         project_id=project_id,
+        request=request,
         assignee_name=assignee_name,
         include_photos=include_photos,
         lng=lng,
@@ -31641,7 +32058,11 @@ def export_donor_report_pdf_alias(
 
 
 @router.get("/trees/{tree_id}/timeline")
-def tree_timeline(tree_id: int, db: Session = Depends(get_db)):
+def tree_timeline(tree_id: int, request: Request, db: Session = Depends(get_db)):
+    timeline_project_id = _get_project_id_for_tree(db, tree_id)
+    if timeline_project_id is None:
+        raise HTTPException(status_code=404, detail="Tree not found")
+    _require_project_member_access(db, request, int(timeline_project_id))
     tree = db.execute(text("""
         SELECT
             t.id,
@@ -31704,7 +32125,8 @@ def tree_timeline(tree_id: int, db: Session = Depends(get_db)):
 
 
 @router.get("/projects/{project_id}/task-stats")
-def task_stats(project_id: int, db: Session = Depends(get_db)):
+def task_stats(project_id: int, request: Request, db: Session = Depends(get_db)):
+    _require_project_member_access(db, request, project_id)
     rows = db.execute(text("""
         SELECT
             COUNT(*) AS total,
@@ -31738,6 +32160,7 @@ def task_stats(project_id: int, db: Session = Depends(get_db)):
 
 @router.post("/work-orders")
 def create_work_order(
+    request: Request,
     background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
     project_id: int = Body(...),
@@ -31753,6 +32176,7 @@ def create_work_order(
     area_geojson: dict | str | None = Body(default=None),
     allow_existing_tree_area_reuse: bool = Body(default=False),
 ):
+    _require_project_member_access(db, request, project_id)
     work_order_assignee_user_available = _ensure_work_order_assignee_columns(db)
     if work_type not in {"planting", "maintenance"}:
         raise HTTPException(status_code=400, detail="Invalid work_type")
@@ -32246,10 +32670,12 @@ def create_work_order(
 
 @router.get("/work-orders")
 def list_work_orders(
+    request: Request,
     project_id: int,
     assignee_name: str | None = None,
     db: Session = Depends(get_db),
 ):
+    _require_project_member_access(db, request, project_id)
     work_order_assignee_user_available = _ensure_work_order_assignee_columns(db)
     assignee_aliases = _list_assignee_aliases_for_lookup(db, assignee_name=assignee_name)
     if assignee_name and not assignee_aliases:
@@ -32562,8 +32988,10 @@ def _get_or_compute_remote_monitoring_report(
 @router.get("/vegetation-areas")
 def list_remote_monitoring_areas(
     project_id: int,
+    request: Request,
     db: Session = Depends(get_db),
 ):
+    _require_project_member_access(db, request, int(project_id))
     _get_project_settings(db, int(project_id))
     rows = _run_remote_monitoring_query(
         db,
@@ -32581,6 +33009,7 @@ def list_remote_monitoring_areas(
 @router.post("/remote-monitoring/analysis")
 @router.post("/vegetation-analysis")
 def analyze_remote_monitoring_area(
+    request: Request,
     payload: VegetationAnalysisPayload,
     series_months: int = Query(default=6, ge=1, le=12),
     summary_window_days: int = Query(default=90, ge=30, le=180),
@@ -32588,6 +33017,7 @@ def analyze_remote_monitoring_area(
     db: Session = Depends(get_db),
 ):
     project_id = int(payload.project_id)
+    _require_project_member_access(db, request, project_id)
     _get_project_settings(db, project_id)
     normalized_area_geojson = _normalize_polygon_area_geojson(payload.area_geojson)
     if normalized_area_geojson is None:
@@ -32685,6 +33115,7 @@ def create_remote_monitoring_analysis_job(
     db: Session = Depends(get_db),
 ):
     project_id = int(payload.project_id)
+    _require_project_member_access(db, request, project_id)
     _get_project_settings(db, project_id)
     normalized_area_geojson = _normalize_polygon_area_geojson(payload.area_geojson)
     if normalized_area_geojson is None:
@@ -32761,9 +33192,11 @@ def create_remote_monitoring_analysis_job(
 @router.post("/vegetation-areas")
 def create_remote_monitoring_area(
     payload: RemoteMonitoringAreaPayload,
+    request: Request,
     db: Session = Depends(get_db),
 ):
     project_id = int(payload.project_id)
+    _require_project_member_access(db, request, project_id)
     _get_project_settings(db, project_id)
     name = str(payload.name or "").strip()
     if not name:
@@ -32809,8 +33242,10 @@ def create_remote_monitoring_area(
 def delete_remote_monitoring_area(
     area_id: int,
     project_id: int,
+    request: Request,
     db: Session = Depends(get_db),
 ):
+    _require_project_member_access(db, request, int(project_id))
     _get_project_settings(db, int(project_id))
     existing = _get_remote_monitoring_area_row(db, area_id=area_id, project_id=project_id)
     if not existing:
@@ -32828,6 +33263,7 @@ def delete_remote_monitoring_area(
 @router.get("/vegetation-areas/{area_id}/analysis")
 def remote_monitoring_area_analysis(
     area_id: int,
+    request: Request,
     series_months: int = Query(default=6, ge=1, le=12),
     summary_window_days: int = Query(default=90, ge=30, le=180),
     refresh: bool = Query(default=False),
@@ -32839,6 +33275,7 @@ def remote_monitoring_area_analysis(
     project_id = int(area_row.get("project_id") or 0)
     if project_id <= 0:
         raise HTTPException(status_code=400, detail="Monitoring area is missing a project link")
+    _require_project_member_access(db, request, project_id)
     _get_project_settings(db, project_id)
 
     area_payload = _serialize_remote_monitoring_area(area_row)
@@ -32879,6 +33316,7 @@ def remote_monitoring_area_analysis(
 @router.patch("/work-orders/{work_id}")
 def update_work_order(
     work_id: int,
+    request: Request,
     db: Session = Depends(get_db),
     status: str | None = Body(default=None),
     planted_count: int | None = Body(default=None),
@@ -32893,6 +33331,9 @@ def update_work_order(
         FROM green_work_orders
         WHERE id = :work_id
     """), {"work_id": work_id}).mappings().first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Work order not found")
+    _require_project_member_access(db, request, int(row["project_id"]))
 
     clear_area = area_enabled is False
     update_area = area_enabled is not None
@@ -32973,7 +33414,8 @@ def update_work_order(
 
 
 @router.get("/work-stats")
-def work_stats(project_id: int, db: Session = Depends(get_db)):
+def work_stats(project_id: int, request: Request, db: Session = Depends(get_db)):
+    _require_project_member_access(db, request, project_id)
     orders = db.execute(text("""
         SELECT assignee_name,
                COUNT(*) AS orders,
@@ -33048,8 +33490,8 @@ def work_stats(project_id: int, db: Session = Depends(get_db)):
 
 
 @router.get("/work-stats/export/csv")
-def export_work_stats_csv(project_id: int, db: Session = Depends(get_db)):
-    stats = work_stats(project_id, db)
+def export_work_stats_csv(project_id: int, request: Request, db: Session = Depends(get_db)):
+    stats = work_stats(project_id, request, db)
     os.makedirs(REPORTS_DIR, exist_ok=True)
     tmp_csv = tempfile.NamedTemporaryFile(suffix="_work_stats.csv", delete=False)
     csv_path = tmp_csv.name
@@ -33071,9 +33513,9 @@ def export_work_stats_csv(project_id: int, db: Session = Depends(get_db)):
 
 
 @router.get("/work-stats/export/pdf")
-def export_work_stats_pdf(project_id: int, db: Session = Depends(get_db)):
-    project = get_project(project_id, db)
-    stats = work_stats(project_id, db)
+def export_work_stats_pdf(project_id: int, request: Request, db: Session = Depends(get_db)):
+    project = _fetch_project_detail(project_id, db)
+    stats = work_stats(project_id, request, db)
     os.makedirs(REPORTS_DIR, exist_ok=True)
     tmp_pdf = tempfile.NamedTemporaryFile(suffix="_work_report.pdf", delete=False)
     pdf_path = tmp_pdf.name
@@ -33092,10 +33534,12 @@ def export_work_stats_pdf(project_id: int, db: Session = Depends(get_db)):
 @router.get("/projects/{project_id}/custodians/export/pdf")
 def export_custodian_report_pdf(
     project_id: int,
+    request: Request,
     include_photos: bool = True,
     db: Session = Depends(get_db),
 ):
-    project = get_project(project_id, db)
+    _require_project_member_access(db, request, project_id)
+    project = _fetch_project_detail(project_id, db)
     summary = db.execute(
         text(
             """
@@ -33343,7 +33787,8 @@ def export_custodian_report_pdf(
 
 
 @router.get("/projects/{project_id}/tasks/export/csv")
-def export_tasks_csv(project_id: int, db: Session = Depends(get_db)):
+def export_tasks_csv(project_id: int, request: Request, db: Session = Depends(get_db)):
+    _require_project_member_access(db, request, project_id)
     rows = db.execute(text("""
         SELECT t.id, t.task_type, t.assignee_name, t.due_date, t.priority, t.status,
                t.review_state, t.submitted_at, t.reviewed_at, t.reviewed_by, t.review_notes,
@@ -33381,9 +33826,10 @@ def export_tasks_csv(project_id: int, db: Session = Depends(get_db)):
 
 
 @router.get("/projects/{project_id}/tasks/export/pdf")
-def export_tasks_pdf(project_id: int, db: Session = Depends(get_db)):
-    project = get_project(project_id, db)
-    stats = task_stats(project_id, db)
+def export_tasks_pdf(project_id: int, request: Request, db: Session = Depends(get_db)):
+    _require_project_member_access(db, request, project_id)
+    project = _fetch_project_detail(project_id, db)
+    stats = task_stats(project_id, request, db)
     os.makedirs(REPORTS_DIR, exist_ok=True)
     tmp_pdf = tempfile.NamedTemporaryFile(suffix="_tasks_report.pdf", delete=False)
     pdf_path = tmp_pdf.name
@@ -34060,7 +34506,7 @@ def _build_csr_programme_export_context(
     *,
     include_map: bool = False,
 ) -> dict:
-    project = get_project(project_id, db)
+    project = _fetch_project_detail(project_id, db)
     project_copy = dict(project)
     project_copy["csr_config"] = _normalize_csr_config(project.get("csr_config")) or {}
 
@@ -34261,7 +34707,7 @@ def _build_agric_programme_export_context(
     *,
     include_map: bool = False,
 ) -> dict:
-    project = get_project(project_id, db)
+    project = _fetch_project_detail(project_id, db)
     project_copy = dict(project)
     project_copy["agric_config"] = _normalize_agric_config(project.get("agric_config")) or {}
 
@@ -34628,7 +35074,7 @@ def _build_relief_programme_export_context(
     *,
     include_map: bool = False,
 ) -> dict:
-    project = get_project(project_id, db)
+    project = _fetch_project_detail(project_id, db)
     project_copy = dict(project)
     project_copy["relief_config"] = _normalize_relief_config(project.get("relief_config")) or {}
 
@@ -35163,7 +35609,7 @@ def _render_csr_programme_pdf_with_fallback(
 
 
 def _require_csr_workflow_project(project_id: int, db: Session) -> dict:
-    project = get_project(project_id, db)
+    project = _fetch_project_detail(project_id, db)
     workflow_profile = _normalize_workflow_profile(project.get("workflow_profile"))
     # A project counts as "CSR" via either signal - same combined check _render_work_report_to_pdf
     # already uses to pick the CSR report branch. Checking workflow_profile alone (as this guard
@@ -35189,7 +35635,7 @@ async def generate_project_impact_narrative(project_id: int, request: Request, d
     as verified fact' discipline as the Plan Reader and Green photo-evidence checks.
     """
     session = require_authenticated_session(db, request, auth_modes={"partner_user", "env_admin"})
-    project = get_project(project_id, db)
+    project = _fetch_project_detail(project_id, db)
     if not session.is_super_admin and int(session.organization_id or 0) != int(project.get("organization_id") or 0):
         raise HTTPException(status_code=403, detail="Session organization does not match this project")
 
@@ -35288,11 +35734,13 @@ async def generate_project_impact_narrative(project_id: int, request: Request, d
 
 
 @router.get("/projects/{project_id}/sustainability-disclosure/pdf")
-def export_sustainability_disclosure_pdf(project_id: int, db: Session = Depends(get_db)):
+def export_sustainability_disclosure_pdf(project_id: int, request: Request, db: Session = Depends(get_db)):
     # CSR-only: mirrors the workflow_profile == "csr" gate used elsewhere for CSR-specific
     # reporting (see _render_work_report_to_pdf). Reuses the same context builder as the CSR
     # Programme Impact Report - same verified data, relabeled against IFRS S2.29 / GRI 304-305
-    # line items instead of donor-report language.
+    # line items instead of donor-report language. _require_csr_workflow_project only validates
+    # the project's workflow profile, not who is asking - that's a business-rule check, not auth.
+    _require_project_member_access(db, request, project_id)
     _require_csr_workflow_project(project_id, db)
     context = _build_csr_programme_export_context(project_id, db, include_map=False)
 
@@ -35318,7 +35766,8 @@ def export_sustainability_disclosure_pdf(project_id: int, db: Session = Depends(
 
 
 @router.get("/projects/{project_id}/existing-trees/metrics")
-def get_existing_tree_metrics(project_id: int, db: Session = Depends(get_db)):
+def get_existing_tree_metrics(project_id: int, request: Request, db: Session = Depends(get_db)):
+    _require_project_member_access(db, request, project_id)
     _get_project_settings(db, project_id)
     rows = _fetch_existing_tree_export_rows(project_id, db)
     items = []
@@ -35351,8 +35800,9 @@ def get_existing_tree_metrics(project_id: int, db: Session = Depends(get_db)):
 
 
 @router.get("/projects/{project_id}/existing-trees/export/csv")
-def export_existing_trees_csv(project_id: int, db: Session = Depends(get_db)):
-    project = get_project(project_id, db)
+def export_existing_trees_csv(project_id: int, request: Request, db: Session = Depends(get_db)):
+    _require_project_member_access(db, request, project_id)
+    project = _fetch_project_detail(project_id, db)
     workflow_profile = _normalize_workflow_profile(project.get("workflow_profile"))
     csr_report_mode = workflow_profile == "csr" or _is_csr_programme_access_model(project.get("access_model"))
     if workflow_profile == "agric":
@@ -35960,8 +36410,9 @@ def export_existing_trees_csv(project_id: int, db: Session = Depends(get_db)):
 
 
 @router.get("/projects/{project_id}/agric/farmers-sheet/export/pdf")
-def export_agric_farmers_sheet_pdf(project_id: int, db: Session = Depends(get_db)):
-    project = get_project(project_id, db)
+def export_agric_farmers_sheet_pdf(project_id: int, request: Request, db: Session = Depends(get_db)):
+    _require_project_member_access(db, request, project_id)
+    project = _fetch_project_detail(project_id, db)
     if _normalize_workflow_profile(project.get("workflow_profile")) != "agric":
         raise HTTPException(status_code=400, detail="Farmer sheet export is available only for agric projects.")
     context = _build_agric_programme_export_context(project_id, db, include_map=False)
@@ -35985,14 +36436,13 @@ def export_agric_farmers_sheet_pdf(project_id: int, db: Session = Depends(get_db
     )
 
 
-@router.get("/projects/{project_id}/existing-trees/export/pdf")
-def export_existing_trees_pdf(
+def _render_existing_trees_pdf(
     project_id: int,
     include_photos: bool = False,
     ai_narrative: str | None = None,
     db: Session = Depends(get_db),
 ):
-    project = get_project(project_id, db)
+    project = _fetch_project_detail(project_id, db)
     workflow_profile = _normalize_workflow_profile(project.get("workflow_profile"))
     csr_report_mode = workflow_profile == "csr" or _is_csr_programme_access_model(project.get("access_model"))
     if csr_report_mode:
@@ -36100,8 +36550,24 @@ def export_existing_trees_pdf(
     )
 
 
+@router.get("/projects/{project_id}/existing-trees/export/pdf")
+def export_existing_trees_pdf(
+    project_id: int,
+    request: Request,
+    include_photos: bool = False,
+    ai_narrative: str | None = None,
+    db: Session = Depends(get_db),
+):
+    # The background export-job worker (_run_green_file_export_job) calls
+    # _render_existing_trees_pdf directly with no request - that job was already authorized when
+    # it was created (create_green_report_export_job checks access up front).
+    _require_project_member_access(db, request, project_id)
+    return _render_existing_trees_pdf(project_id, include_photos=include_photos, ai_narrative=ai_narrative, db=db)
+
+
 @router.get("/projects/{project_id}/export/csv")
-def export_project_csv(project_id: int, db: Session = Depends(get_db)):
+def export_project_csv(project_id: int, request: Request, db: Session = Depends(get_db)):
+    _require_project_member_access(db, request, project_id)
     rows = db.execute(text("""
         SELECT
             t.id,
@@ -36241,14 +36707,13 @@ def _attach_maintenance_to_tree_rows(rows: list[dict], summary_rows: list[dict])
     return merged
 
 
-@router.get("/projects/{project_id}/export/pdf")
-def export_project_pdf(
+def _render_project_pdf(
     project_id: int,
-    lng: float | None = Query(default=None),
-    lat: float | None = Query(default=None),
-    zoom: float | None = Query(default=None),
-    bearing: float | None = Query(default=0.0),
-    pitch: float | None = Query(default=0.0),
+    lng: float | None = None,
+    lat: float | None = None,
+    zoom: float | None = None,
+    bearing: float | None = 0.0,
+    pitch: float | None = 0.0,
     db: Session = Depends(get_db),
 ):
     def _coerce_optional_float(value: object) -> float | None:
@@ -36267,7 +36732,7 @@ def export_project_pdf(
     bearing_value = _coerce_optional_float(bearing)
     pitch_value = _coerce_optional_float(pitch)
 
-    project = get_project(project_id, db)
+    project = _fetch_project_detail(project_id, db)
     workflow_profile = _normalize_workflow_profile(project.get("workflow_profile"))
     csr_report_mode = workflow_profile == "csr" or _is_csr_programme_access_model(project.get("access_model"))
     if csr_report_mode:
@@ -36411,6 +36876,24 @@ def export_project_pdf(
     )
 
 
+@router.get("/projects/{project_id}/export/pdf")
+def export_project_pdf(
+    project_id: int,
+    request: Request,
+    lng: float | None = Query(default=None),
+    lat: float | None = Query(default=None),
+    zoom: float | None = Query(default=None),
+    bearing: float | None = Query(default=0.0),
+    pitch: float | None = Query(default=0.0),
+    db: Session = Depends(get_db),
+):
+    # The background export-job worker (_run_green_file_export_job) calls _render_project_pdf
+    # directly with no request - that job was already authorized when it was created
+    # (create_green_report_export_job checks access up front).
+    _require_project_member_access(db, request, project_id)
+    return _render_project_pdf(project_id, lng=lng, lat=lat, zoom=zoom, bearing=bearing, pitch=pitch, db=db)
+
+
 def _fetch_kpi_trend(project_id: int, db: Session, days: int = 90, assignee_name: str | None = None) -> list[dict]:
     """Fetch KPI trend series for charts using cohort/activity monthly basis."""
     return _build_kpi_trend_series(project_id, db, days=days, assignee_name=assignee_name)
@@ -36465,7 +36948,7 @@ def _render_work_report_to_pdf(
     pitch_value = _coerce_optional_float(pitch)
 
     assignee_clean = assignee_name.strip() if isinstance(assignee_name, str) else None
-    project = get_project(project_id=project_id, db=db, assignee_name=assignee_clean)
+    project = _fetch_project_detail(project_id=project_id, db=db, assignee_name=assignee_clean)
     workflow_profile = _normalize_workflow_profile(project.get("workflow_profile"))
     csr_report_mode = workflow_profile == "csr" or _is_csr_programme_access_model(project.get("access_model"))
     if workflow_profile == "agric":
@@ -36721,6 +37204,7 @@ def _render_work_report_to_pdf(
 @router.get("/work-report/pdf")
 def export_work_report_pdf(
     project_id: int,
+    request: Request,
     assignee_name: str | None = None,
     include_photos: bool = False,
     lng: float | None = None,
@@ -36730,6 +37214,7 @@ def export_work_report_pdf(
     pitch: float | None = 0.0,
     db: Session = Depends(get_db),
 ):
+    _require_project_member_access(db, request, project_id)
     os.makedirs(REPORTS_DIR, exist_ok=True)
     tmp_pdf = tempfile.NamedTemporaryFile(suffix="_work_map_report.pdf", delete=False)
     pdf_path = tmp_pdf.name
@@ -36833,7 +37318,8 @@ def create_work_report_export_job(
     request: Request,
     db: Session = Depends(get_db),
 ):
-    project = get_project(
+    _require_project_member_access(db, request, int(payload.project_id))
+    project = _fetch_project_detail(
         project_id=int(payload.project_id),
         db=db,
         assignee_name=(payload.assignee_name or "").strip() or None,
@@ -36973,7 +37459,7 @@ def _run_green_file_export_job(job_id: str):
         project_id = int(job.get("project_id") or 0)
         organization_id = int(job.get("organization_id") or 0) or None
         if export_type == "green-existing-trees-report":
-            response = export_existing_trees_pdf(
+            response = _render_existing_trees_pdf(
                 project_id=project_id,
                 include_photos=bool(payload.get("include_photos")),
                 ai_narrative=payload.get("ai_narrative"),
@@ -36981,7 +37467,7 @@ def _run_green_file_export_job(job_id: str):
             )
             category = "green-existing-trees-report"
         elif export_type == "green-project-report":
-            response = export_project_pdf(
+            response = _render_project_pdf(
                 project_id=project_id,
                 lng=payload.get("lng"),
                 lat=payload.get("lat"),
@@ -37052,7 +37538,8 @@ def create_green_report_export_job(
     export_type = str(payload.export_type or "").strip().lower()
     if export_type not in {"green-existing-trees-report", "green-project-report"}:
         raise HTTPException(status_code=400, detail="Unsupported report export type")
-    project = get_project(
+    _require_project_member_access(db, request, int(payload.project_id))
+    project = _fetch_project_detail(
         project_id=int(payload.project_id),
         db=db,
         assignee_name=(payload.assignee_name or "").strip() or None,
@@ -37141,4 +37628,8 @@ def get_green_export_job_status(job_id: str, request: Request, db: Session = Dep
     job = _get_green_export_job(db, job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Export job not found")
+    if job.get("project_id") is not None:
+        _require_project_member_access(db, request, int(job["project_id"]))
+    else:
+        require_authenticated_session(db, request, auth_modes={"partner_user", "env_admin"})
     return _serialize_green_export_job(job, request=request)
