@@ -3612,7 +3612,7 @@ def issue_survey_request_session(request_id: int, request: Request, response: Re
     plot=db.get(Plot,row.survey_working_plot_id)
     if not plot or not plot.owner_user_id: raise HTTPException(404,"Survey working plot not found")
     session_payload = issue_survey_session(db, user_id=plot.owner_user_id)
-    set_session_cookie(response, name=SURVEY_SESSION_COOKIE, token=session_payload["access_token"])
+    set_session_cookie(response, name=SURVEY_SESSION_COOKIE, token=session_payload["access_token"], max_age=30 * 24 * 60 * 60)
     if request_uses_browser_auth(request):
         session_payload["access_token"] = None
     return {"survey_session": session_payload}

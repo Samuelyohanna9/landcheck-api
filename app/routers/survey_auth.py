@@ -67,7 +67,7 @@ def verify_magic_link(
 ):
     user_id = consume_magic_link_token(db, raw_token=token)
     session_payload = issue_survey_session(db, user_id=user_id, request=request)
-    set_session_cookie(response, name=SURVEY_SESSION_COOKIE, token=session_payload["access_token"])
+    set_session_cookie(response, name=SURVEY_SESSION_COOKIE, token=session_payload["access_token"], max_age=30 * 24 * 60 * 60)
     if request_uses_browser_auth(request):
         session_payload["access_token"] = None
     return session_payload
@@ -83,7 +83,7 @@ def verify_magic_link_otp(
 ):
     user_id = consume_magic_link_otp(db, email=email, code=code)
     session_payload = issue_survey_session(db, user_id=user_id, request=request)
-    set_session_cookie(response, name=SURVEY_SESSION_COOKIE, token=session_payload["access_token"])
+    set_session_cookie(response, name=SURVEY_SESSION_COOKIE, token=session_payload["access_token"], max_age=30 * 24 * 60 * 60)
     if request_uses_browser_auth(request):
         session_payload["access_token"] = None
     return session_payload
@@ -162,7 +162,7 @@ def google_oauth_exchange(
     if not entry or entry["expires_at"] < time():
         raise HTTPException(status_code=400, detail="This sign-in link has expired")
     session_payload = dict(entry["session"])
-    set_session_cookie(response, name=SURVEY_SESSION_COOKIE, token=session_payload["access_token"])
+    set_session_cookie(response, name=SURVEY_SESSION_COOKIE, token=session_payload["access_token"], max_age=30 * 24 * 60 * 60)
     if request_uses_browser_auth(request):
         session_payload["access_token"] = None
     return session_payload
