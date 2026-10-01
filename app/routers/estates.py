@@ -56,6 +56,7 @@ from app.services.survey.dgps import alpha_station, render_dgps_staking_csv
 from app.utils.coordinate_converter import COORDINATE_SYSTEMS, resolve_coordinate_system_key, convert_coordinates
 from app.models.estate_auth import EstateAccount, EstateAuthSession
 from app.utils.survey_auth_security import find_or_create_survey_user, issue_survey_session
+from app.utils.http_security import SURVEY_SESSION_COOKIE, request_uses_browser_auth, set_session_cookie
 from app.models.plot import Plot
 from app.services.estates import estate_email, marketing_alerts, marketing_common
 from app.services.estates.layout_export import render_estate_layout_pdf
@@ -3594,7 +3595,7 @@ def start_survey_request(request_id:int,request:Request,db:Session=Depends(get_d
     return _survey_payload(db,row)
 
 @router.post("/survey-requests/{request_id}/survey-session")
-def issue_survey_request_session(request_id:int,request:Request,db:Session=Depends(get_db)):
+def issue_survey_request_session(request_id: int, request: Request, response: Response, db: Session = Depends(get_db)):
     """The Survey working plot behind an Estate survey request is owned by a real Survey account
     (see _resolve_survey_owner_user_id), not shared/anonymous - so opening it from the Estates
     dashboard only works if the browser's Survey-side session already belongs to that exact
@@ -3610,7 +3611,11 @@ def issue_survey_request_session(request_id:int,request:Request,db:Session=Depen
     if not row.survey_working_plot_id: raise HTTPException(409,"Survey has not been started for this request yet")
     plot=db.get(Plot,row.survey_working_plot_id)
     if not plot or not plot.owner_user_id: raise HTTPException(404,"Survey working plot not found")
-    return {"survey_session": issue_survey_session(db, user_id=plot.owner_user_id)}
+    session_payload = issue_survey_session(db, user_id=plot.owner_user_id)
+    set_session_cookie(response, name=SURVEY_SESSION_COOKIE, token=session_payload["access_token"])
+    if request_uses_browser_auth(request):
+        session_payload["access_token"] = None
+    return {"survey_session": session_payload}
 
 
 @router.post("/survey-requests/{request_id}/complete")
