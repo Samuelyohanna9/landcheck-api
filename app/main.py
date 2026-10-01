@@ -197,11 +197,15 @@ def _enforce_survey_resource_scope(db, request: Request) -> None:
         if len(parts) >= 2 and parts[1].isdigit():
             if not table_exists("plots"):
                 return
-            session = require_survey_session(db, request)
             owner_id = db.execute(
                 text("SELECT owner_user_id FROM plots WHERE id = :plot_id"),
                 {"plot_id": int(parts[1])},
             ).scalar()
+            # SurveyPlan intentionally supports anonymous drafts. They are not customer-owned
+            # data yet; enforce ownership as soon as the draft is claimed by a Survey account.
+            if owner_id is None:
+                return
+            session = require_survey_session(db, request)
             if owner_id is not None and int(owner_id) != int(session.user_id):
                 raise HTTPException(status_code=404, detail="Plot not found")
     if path.startswith("/hazards/jobs/"):
@@ -209,11 +213,13 @@ def _enforce_survey_resource_scope(db, request: Request) -> None:
         if len(parts) >= 3 and parts[2] != "mine":
             if not table_exists("hazard_analysis_jobs"):
                 return
-            session = require_survey_session(db, request)
             owner_id = db.execute(
                 text("SELECT owner_user_id FROM hazard_analysis_jobs WHERE id = :job_id"),
                 {"job_id": parts[2]},
             ).scalar()
+            if owner_id is None:
+                return
+            session = require_survey_session(db, request)
             if owner_id is not None and int(owner_id) != int(session.user_id):
                 raise HTTPException(status_code=404, detail="Hazard job not found")
     if path.startswith("/survey-georeference/sessions/"):
@@ -221,11 +227,13 @@ def _enforce_survey_resource_scope(db, request: Request) -> None:
         if len(parts) >= 3 and parts[2] not in {"mine", "claim"}:
             if not table_exists("survey_georeference_sessions"):
                 return
-            session = require_survey_session(db, request)
             owner_id = db.execute(
                 text("SELECT owner_user_id FROM survey_georeference_sessions WHERE id = :session_id"),
                 {"session_id": parts[2]},
             ).scalar()
+            if owner_id is None:
+                return
+            session = require_survey_session(db, request)
             if owner_id is not None and int(owner_id) != int(session.user_id):
                 raise HTTPException(status_code=404, detail="Georeference session not found")
 
@@ -234,7 +242,6 @@ def _enforce_survey_resource_scope(db, request: Request) -> None:
         if len(parts) >= 4 and parts[3].isdigit():
             if not table_exists("plot_subdivision_batches") or not table_exists("plots"):
                 return
-            session = require_survey_session(db, request)
             owner_id = db.execute(
                 text(
                     """
@@ -246,6 +253,9 @@ def _enforce_survey_resource_scope(db, request: Request) -> None:
                 ),
                 {"batch_id": int(parts[3])},
             ).scalar()
+            if owner_id is None:
+                return
+            session = require_survey_session(db, request)
             if owner_id is not None and int(owner_id) != int(session.user_id):
                 raise HTTPException(status_code=404, detail="Subdivision batch not found")
 
@@ -254,7 +264,6 @@ def _enforce_survey_resource_scope(db, request: Request) -> None:
         if len(parts) >= 3 and parts[2].isdigit():
             if not table_exists("plot_export_jobs"):
                 return
-            session = require_survey_session(db, request)
             owner_id = db.execute(
                 text(
                     """
@@ -268,6 +277,9 @@ def _enforce_survey_resource_scope(db, request: Request) -> None:
                 ),
                 {"job_id": int(parts[2])},
             ).scalar()
+            if owner_id is None:
+                return
+            session = require_survey_session(db, request)
             if owner_id is not None and int(owner_id) != int(session.user_id):
                 raise HTTPException(status_code=404, detail="Export job not found")
 
@@ -624,17 +636,6 @@ default_local_origin_regex = r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$"
 configured_origin_regex = str(os.getenv("CORS_ALLOW_ORIGIN_REGEX", "") or "").strip()
 local_origin_regex = None if _production_environment else (configured_origin_regex or default_local_origin_regex)
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=origins,
-    allow_origin_regex=local_origin_regex or None,
-    allow_credentials=True,  # Now allowed because we specified origins
-    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-    allow_headers=["Accept", "Authorization", "Content-Type", "X-LC-Auth-Mode", "X-LC-App-Route", "X-LC-Client", "X-LC-Organization-Id", "X-LC-Role-Key", "X-LC-Session-App-Mode", "X-LC-User-Id", "X-LC-User-Name", "X-Idempotency-Key", "X-Requested-With"],
-    expose_headers=["Content-Disposition", "X-Request-Id"],
-)
-
-
 def _rate_limit_for_path(path: str) -> tuple[int, int] | None:
     path = str(path or "").lower()
     if path in {
@@ -751,6 +752,20 @@ async def add_security_headers(request: Request, call_next):
     if request.url.path.startswith(("/estates/auth/", "/survey/auth/", "/green/auth/", "/green/work-auth/", "/green/green-auth/", "/green/sponsor-auth/")):
         response.headers.setdefault("Cache-Control", "no-store")
     return response
+
+
+# Keep CORS outermost so middleware-generated 4xx/5xx responses still include the browser's
+# Access-Control-Allow-Origin header. Otherwise a valid 401 can be reported as an opaque CORS
+# failure, hiding the actual authentication problem from the client.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,
+    allow_origin_regex=local_origin_regex or None,
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["Accept", "Authorization", "Content-Type", "X-LC-Auth-Mode", "X-LC-App-Route", "X-LC-Client", "X-LC-Organization-Id", "X-LC-Role-Key", "X-LC-Session-App-Mode", "X-LC-User-Id", "X-LC-User-Name", "X-Idempotency-Key", "X-Requested-With"],
+    expose_headers=["Content-Disposition", "X-Request-Id"],
+)
 
 
 # Routers
