@@ -26831,6 +26831,7 @@ def list_tasks(
 
 @router.post("/users")
 def create_user(
+    request: Request,
     db: Session = Depends(get_db),
     full_name: str = Body(...),
     role: str = Body(default="field_officer"),
@@ -26847,6 +26848,20 @@ def create_user(
     notes: str | None = Body(default=None),
     is_active: bool = Body(default=True),
 ):
+    # This endpoint had no authorization check at all until now - anyone who knew the path could
+    # create a login-enabled user in any organization. A partner org's own "admin" role may only
+    # add staff to its own organization; the organization_id it sends is ignored in favor of its
+    # session's own org, so a compromised/malicious client can't target a different organization.
+    session = require_authenticated_session(db, request, auth_modes={"partner_user", "env_admin"})
+    actor_label = "super_admin"
+    if not session.is_super_admin:
+        if str(session.role_key or "").strip().lower() != "admin":
+            raise HTTPException(status_code=403, detail="Only an organization admin can add users")
+        organization_id = int(session.organization_id or 0) or None
+        if not organization_id:
+            raise HTTPException(status_code=403, detail="Your account is not linked to an organization")
+        actor_label = f"partner_user:{session.user_id}"
+
     full_name_clean = (full_name or "").strip()
     if not full_name_clean:
         raise HTTPException(status_code=400, detail="Full name required")
@@ -26939,7 +26954,7 @@ def create_user(
         entity_type="user",
         entity_id=int(row["id"]),
         action="user_created",
-        actor="super_admin",
+        actor=actor_label,
         details={
             "user_uid": row.get("user_uid"),
             "role": row.get("role"),
@@ -27510,6 +27525,147 @@ def update_green_user_profile_photo(
     )
     db.commit()
     return {"ok": True, "profile_photo_url": _normalize_logo_asset_path(photo_url)}
+
+
+@router.post("/work-auth/register")
+def work_auth_register(
+    request: Request,
+    db: Session = Depends(get_db),
+    organization_name: str = Body(...),
+    full_name: str = Body(...),
+    email: str = Body(...),
+    password: str = Body(...),
+    phone: str | None = Body(default=None),
+    organization_type: str = Body(default="standard"),
+):
+    """Public self-service registration for a new LandCheck Work organization - previously only a
+    super admin could create an organization (POST /green/admin/organizations) or a user
+    (POST /green/users), both gated behind admin auth. This lets an organization sign itself up
+    and land as that organization's own "admin" (able to add further staff via POST /green/users,
+    which an "admin"-role partner session is now allowed to call for its own org)."""
+    org_name_clean = (organization_name or "").strip()
+    if not org_name_clean:
+        raise HTTPException(status_code=400, detail="Organization name is required")
+    full_name_clean = (full_name or "").strip()
+    if not full_name_clean:
+        raise HTTPException(status_code=400, detail="Full name is required")
+    email_clean = (email or "").strip().lower()
+    if not email_clean or "@" not in email_clean or "." not in email_clean.split("@")[-1]:
+        raise HTTPException(status_code=400, detail="Enter a valid email address")
+    existing_email = db.execute(
+        text("SELECT id FROM green_users WHERE LOWER(COALESCE(email, '')) = :email LIMIT 1"),
+        {"email": email_clean},
+    ).first()
+    if existing_email:
+        raise HTTPException(status_code=409, detail="An account already exists for this email")
+    password_hash = _hash_password_value(password)
+
+    final_slug = _ensure_unique_org_slug(db, org_name_clean)
+    org_row = db.execute(
+        text(
+            """
+            INSERT INTO green_organizations (name, slug, organization_type, status, contact_email, contact_phone, is_active)
+            VALUES (:name, :slug, :organization_type, 'pilot', :contact_email, :contact_phone, TRUE)
+            RETURNING id, name, slug, status, is_active, logo_url
+            """
+        ),
+        {
+            "name": org_name_clean,
+            "slug": final_slug,
+            "organization_type": _normalize_organization_type(organization_type),
+            "contact_email": email_clean,
+            "contact_phone": (phone or "").strip() or None,
+        },
+    ).mappings().first()
+    organization_id = int(org_row["id"])
+
+    admin_role = db.execute(
+        text("SELECT id, role_key, role_name FROM green_roles WHERE LOWER(role_key) = 'admin' LIMIT 1"),
+    ).mappings().first()
+    user_uid_value = _ensure_unique_user_uid(db, None)
+    work_username_clean = str(user_uid_value).strip().lower()
+    # _ensure_unique_user_uid only guarantees uniqueness against the user_uid column, not
+    # work_username - create_user's own fallback (user_uid lowercased) has the same shape, so
+    # check the column it actually has to be unique against before using it as a login username.
+    while db.execute(
+        text("SELECT id FROM green_users WHERE LOWER(COALESCE(work_username, '')) = LOWER(:work_username) LIMIT 1"),
+        {"work_username": work_username_clean},
+    ).first():
+        user_uid_value = _ensure_unique_user_uid(db, None)
+        work_username_clean = str(user_uid_value).strip().lower()
+    user_row = db.execute(
+        text(
+            """
+            INSERT INTO green_users (
+                full_name, role, user_uid, organization_id, role_id, email, phone,
+                allow_green, allow_work, work_username, work_password_hash, is_active, updated_at
+            )
+            VALUES (
+                :full_name, 'admin', :user_uid, :organization_id, :role_id, :email, :phone,
+                TRUE, TRUE, :work_username, :work_password_hash, TRUE, NOW()
+            )
+            RETURNING id, user_uid, full_name, role, role_id, email, phone, organization_id,
+                      allow_green, allow_work, work_username
+            """
+        ),
+        {
+            "full_name": full_name_clean,
+            "user_uid": user_uid_value,
+            "organization_id": organization_id,
+            "role_id": int(admin_role["id"]) if admin_role else None,
+            "email": email_clean,
+            "phone": (phone or "").strip() or None,
+            "work_username": work_username_clean,
+            "work_password_hash": password_hash,
+        },
+    ).mappings().first()
+
+    _log_audit_event(
+        db,
+        project_id=None,
+        entity_type="organization",
+        entity_id=organization_id,
+        action="organization_self_registered",
+        actor=f"partner_user:{user_row['id']}",
+        details={"name": org_name_clean, "slug": final_slug, "registered_by": email_clean},
+    )
+
+    session_user_row = {
+        "id": user_row["id"],
+        "user_uid": user_row["user_uid"],
+        "full_name": user_row["full_name"],
+        "role": user_row["role"],
+        "role_id": user_row["role_id"],
+        "role_key": admin_role["role_key"] if admin_role else "admin",
+        "role_uid": None,
+        "role_name": admin_role["role_name"] if admin_role else "Admin",
+        "allow_work": True,
+        "allow_green": True,
+        "work_username": user_row["work_username"],
+        "organization_id": organization_id,
+        "organization_name": org_row["name"],
+        "organization_slug": org_row["slug"],
+        "organization_status": org_row["status"],
+        "organization_is_active": bool(org_row["is_active"]),
+        "organization_logo_url": org_row["logo_url"],
+        "profile_photo_url": None,
+        "email": email_clean,
+        "mfa_enabled": False,
+    }
+    response = _issue_partner_auth_response(db, request, user_row=session_user_row, app_mode="green_work")
+    db.commit()
+    try:
+        _send_organization_welcome_email(
+            to_email=email_clean,
+            organization_name=org_name_clean,
+            organization_type=_normalize_organization_type(organization_type),
+            organization_slug=final_slug,
+            status="pilot",
+            contact_phone=(phone or "").strip() or None,
+        )
+    except Exception:
+        pass
+    return response
 
 
 @router.post("/work-auth/login")
