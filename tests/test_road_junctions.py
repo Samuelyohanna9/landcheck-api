@@ -110,3 +110,21 @@ def test_fragmented_roundabout_segments_are_rebuilt_before_offsetting():
 
     assert len(edges) == 2
     assert all(edge.is_ring for edge in edges)
+
+
+def test_roundabout_with_connector_roads_keeps_a_clean_outer_loop():
+    roundabout = Point(0, 0).buffer(20, quad_segs=8).boundary
+    connectors = [
+        LineString([(0, -35), (0, -20)]),
+        LineString([(0, 20), (0, 35)]),
+        LineString([(-35, 0), (-20, 0)]),
+        LineString([(20, 0), (35, 0)]),
+    ]
+
+    edges = _collect_connected_road_edge_lines(
+        [(roundabout, 3), *[(connector, 3) for connector in connectors]],
+        snap_tol_m=1,
+    )
+
+    ring_edges = [edge for edge in edges if edge.is_ring]
+    assert len(ring_edges) == 2

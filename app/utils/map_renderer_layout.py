@@ -78,6 +78,14 @@ ADAMAWA_BLUE = "#1f2f8a"
 # Roads need to remain secondary to boundary and station work on printed plans.
 SURVEY_ROAD_COLOR = "#56616B"
 
+# Detail-only OSM ways are intentionally omitted from printed survey maps. They are useful in a
+# navigation map, but at site-plan scale they make roundabouts and junctions unreadable.
+_MINOR_ROAD_CLASSES = frozenset({
+    "footway", "path", "steps", "cycleway", "pedestrian", "bridleway", "track",
+    "corridor", "construction", "proposed", "raceway", "escape", "elevator",
+    "platform", "crossing", "service",
+})
+
 
 def format_station_label(label) -> str:
     raw = str(label or "").strip()
@@ -2517,27 +2525,7 @@ def _fetch_live_road_geoms(db, plot_id: int) -> list:
     (built from this same live query) doesn't line up with a differently-sourced base road
     segment (e.g. the older, separately-snapshotted `detected_features` rows).
     """
-    rows = db.execute(text("""
-        WITH roads AS (
-            SELECT
-                CASE
-                    WHEN ST_SRID(r.geom) = 4326 THEN r.geom
-                    WHEN ST_SRID(r.geom) = 0 THEN ST_SetSRID(r.geom, 4326)
-                    ELSE ST_Transform(r.geom, 4326)
-                END AS geom
-            FROM lines r
-            WHERE r.highway IS NOT NULL
-              AND lower(r.highway) NOT IN (
-                  'footway', 'path', 'steps', 'cycleway', 'pedestrian', 'bridleway',
-                  'track', 'corridor', 'construction', 'proposed', 'raceway',
-                  'escape', 'elevator', 'platform', 'crossing'
-              )
-        )
-        SELECT roads.geom AS geom
-        FROM roads
-        JOIN plot_buffers b ON b.plot_id = :plot_id
-        WHERE ST_Intersects(roads.geom, b.geom)
-    """), {"plot_id": plot_id}).fetchall()
+    rows = _fetch_live_road_rows(db, plot_id)
     geoms = []
     for row in rows:
         try:
@@ -2552,14 +2540,56 @@ def _fetch_live_road_geoms(db, plot_id: int) -> list:
     # rather than silently rendering with no roads at all.
     if not geoms:
         fallback_rows = db.execute(text("""
-            SELECT geom FROM detected_features WHERE plot_id = :plot_id AND feature_type = 'road'
+            SELECT geom, subtype
+            FROM detected_features
+            WHERE plot_id = :plot_id AND feature_type = 'road'
         """), {"plot_id": plot_id}).fetchall()
         for row in fallback_rows:
+            subtype = str(getattr(row, "subtype", "") or "").strip().lower()
+            if subtype in _MINOR_ROAD_CLASSES:
+                continue
             try:
                 geoms.append(wkb.loads(row.geom))
             except Exception:
                 continue
     return geoms
+
+
+def _fetch_live_road_rows(db, plot_id: int) -> list:
+    """Return the filtered OSM road rows used by every map renderer.
+
+    Minor pedestrian and access ways are useful for navigation, but at survey-plan scale they
+    turn a roundabout into a dark knot and make the vector map disagree with its satellite inset.
+    Keep roads that represent vehicle access and discard those detail-only classes consistently.
+    """
+    try:
+        return db.execute(text("""
+        WITH roads AS (
+            SELECT
+                CASE
+                    WHEN ST_SRID(r.geom) = 4326 THEN r.geom
+                    WHEN ST_SRID(r.geom) = 0 THEN ST_SetSRID(r.geom, 4326)
+                    ELSE ST_Transform(r.geom, 4326)
+                END AS geom,
+                lower(trim(r.highway)) AS highway,
+                r.name AS name
+            FROM lines r
+            WHERE r.highway IS NOT NULL
+              AND lower(r.highway) NOT IN (
+                  'footway', 'path', 'steps', 'cycleway', 'pedestrian', 'bridleway',
+                  'track', 'corridor', 'construction', 'proposed', 'raceway',
+                  'escape', 'elevator', 'platform', 'crossing', 'service'
+              )
+        )
+        SELECT roads.geom AS geom, roads.highway, roads.name
+        FROM roads
+        JOIN plot_buffers b ON b.plot_id = :plot_id
+        WHERE ST_Intersects(roads.geom, b.geom)
+    """), {"plot_id": plot_id}).fetchall()
+    except Exception:
+        # Non-Nigeria deployments may not have the local `lines` extract. The caller can use
+        # the Overpass-backed detected_features fallback in that case.
+        return []
 
 
 def _collect_road_edge_lines(centerline_geom, half_width_m: float):
@@ -2630,8 +2660,20 @@ def _normalize_fragmented_roundabouts(snapped_parts, center_network, snap_tol_m:
         return snapped_parts
 
     join_tol = max(0.5, float(snap_tol_m or 0.0))
+    # Connector roads can split a roundabout into several polygonized sectors. Merge touching
+    # faces first so the outer boundary of the whole circle is evaluated, rather than rejecting
+    # every sector as a thin non-circular polygon.
+    candidate_polygons = polygons
+    try:
+        merged_faces = unary_union(polygons)
+        merged_candidates = list(_iter_polygons(merged_faces))
+        if merged_candidates:
+            candidate_polygons = merged_candidates
+    except Exception:
+        pass
+
     replacements = []
-    for polygon in polygons:
+    for polygon in candidate_polygons:
         if polygon is None or getattr(polygon, "is_empty", True):
             continue
         perimeter = float(getattr(polygon, "length", 0.0) or 0.0)
@@ -2873,6 +2915,10 @@ def _collect_connected_road_edge_lines(
         edge_lines.extend(_collect_road_edge_lines(seg, hw))
     if not edge_lines:
         return []
+    protected_ring_edges = [
+        edge for edge in edge_lines
+        if getattr(edge, "is_ring", False)
+    ]
 
     # Close ordinary T-junctions: a side road's casing ends near, not on, the through road's
     # casing line, so bridge that with the nearest-point closer above before the vertex-only
@@ -2949,7 +2995,15 @@ def _collect_connected_road_edge_lines(
                     junction_edges = edge_network.intersection(junction_area)
                     outside_junction = edge_network.difference(junction_area)
                     trimmed_junction = junction_edges.intersection(boundary_support)
+                    # A roundabout is intentionally drawn as two complete closed casings. The
+                    # ordinary junction mask must not cut four small holes into those rings at
+                    # each connector, which is what produces the scattered central shapes in the
+                    # site-plan export. Keep the rings separate from the open-road casing union;
+                    # otherwise a connector touching a ring splits it into many short fragments.
+                    protected_rings = unary_union(protected_ring_edges) if protected_ring_edges else None
                     trimmed = unary_union([outside_junction, trimmed_junction])
+                    if protected_rings is not None and not protected_rings.is_empty:
+                        trimmed = trimmed.difference(protected_rings)
                     trimmed_edges = [
                         seg for seg in _iter_line_geometries(trimmed)
                         if seg is not None and not getattr(seg, "is_empty", True) and getattr(seg, "length", 0.0) > 0
@@ -2963,6 +3017,10 @@ def _collect_connected_road_edge_lines(
                             if seg is not None and not getattr(seg, "is_empty", True) and getattr(seg, "length", 0.0) > 0
                         ]
                         final_edges = merged_trimmed_edges or trimmed_edges
+                        if protected_ring_edges:
+                            final_edges = [*protected_ring_edges, *final_edges]
+                    elif protected_ring_edges:
+                        final_edges = list(protected_ring_edges)
 
             # A road endpoint can stop a few metres short of the map frame after clipping,
             # especially when its centreline approaches the frame at an angle. Extend it to
@@ -6974,7 +7032,7 @@ def render_plot_map_layout(
                   AND lower(r.highway) NOT IN (
                       'footway', 'path', 'steps', 'cycleway', 'pedestrian', 'bridleway',
                       'track', 'corridor', 'construction', 'proposed', 'raceway',
-                      'escape', 'elevator', 'platform', 'crossing'
+                      'escape', 'elevator', 'platform', 'crossing', 'service'
                   )
             )
             SELECT roads.geom, roads.highway, roads.name

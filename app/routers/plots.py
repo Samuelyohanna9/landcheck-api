@@ -1924,7 +1924,7 @@ def _load_plot_road_segments_wgs84(db: Session, plot_id: int) -> list[dict]:
               AND lower(r.highway) NOT IN (
                   'footway', 'path', 'steps', 'cycleway', 'pedestrian', 'bridleway',
                   'track', 'corridor', 'construction', 'proposed', 'raceway',
-                  'escape', 'elevator', 'platform', 'crossing'
+                  'escape', 'elevator', 'platform', 'crossing', 'service'
               )
         ),
         clipped AS (
@@ -2793,7 +2793,13 @@ def _run_plot_feature_detection(db: Session, plot_id: int):
             INSERT INTO detected_features (plot_id, feature_type, location, geom)
             SELECT :plot_id, 'road', 'inside', r.geom
             FROM (
-                SELECT geom FROM lines WHERE highway IS NOT NULL
+                SELECT geom FROM lines
+                WHERE highway IS NOT NULL
+                  AND lower(highway) NOT IN (
+                      'footway', 'path', 'steps', 'cycleway', 'pedestrian', 'bridleway',
+                      'track', 'corridor', 'construction', 'proposed', 'raceway',
+                      'escape', 'elevator', 'platform', 'crossing', 'service'
+                  )
                 UNION ALL
                 SELECT geom FROM multilinestrings
                 WHERE type = 'highway' OR other_tags LIKE '%highway%'
@@ -2810,7 +2816,13 @@ def _run_plot_feature_detection(db: Session, plot_id: int):
             INSERT INTO detected_features (plot_id, feature_type, location, geom)
             SELECT :plot_id, 'road', 'buffer', r.geom
             FROM (
-                SELECT geom FROM lines WHERE highway IS NOT NULL
+                SELECT geom FROM lines
+                WHERE highway IS NOT NULL
+                  AND lower(highway) NOT IN (
+                      'footway', 'path', 'steps', 'cycleway', 'pedestrian', 'bridleway',
+                      'track', 'corridor', 'construction', 'proposed', 'raceway',
+                      'escape', 'elevator', 'platform', 'crossing', 'service'
+                  )
                 UNION ALL
                 SELECT geom FROM multilinestrings
                 WHERE type = 'highway' OR other_tags LIKE '%highway%'
@@ -3265,9 +3277,9 @@ def _render_subdivision_clean_copy_pdf(
                 FROM lines r
                 WHERE r.highway IS NOT NULL
                   AND lower(r.highway) NOT IN (
-                      'footway', 'path', 'steps', 'cycleway', 'pedestrian', 'bridleway',
-                      'track', 'corridor', 'construction', 'proposed', 'raceway',
-                      'escape', 'elevator', 'platform', 'crossing'
+                  'footway', 'path', 'steps', 'cycleway', 'pedestrian', 'bridleway',
+                  'track', 'corridor', 'construction', 'proposed', 'raceway',
+                  'escape', 'elevator', 'platform', 'crossing', 'service'
                   )
             )
             SELECT roads.geom, roads.name
@@ -6185,7 +6197,7 @@ def get_plot_features_geojson(
               AND lower(r.highway) NOT IN (
                   'footway', 'path', 'steps', 'cycleway', 'pedestrian', 'bridleway',
                   'track', 'corridor', 'construction', 'proposed', 'raceway',
-                  'escape', 'elevator', 'platform', 'crossing'
+                  'escape', 'elevator', 'platform', 'crossing', 'service'
               )
         ),
         clipped AS (
