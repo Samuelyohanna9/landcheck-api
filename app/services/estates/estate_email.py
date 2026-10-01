@@ -50,10 +50,14 @@ def _send_email(*, to_email: str, from_display_name: str, subject: str, body_tex
     use_ssl = _env_bool("SMTP_USE_SSL", False)
     use_tls = _env_bool("SMTP_USE_TLS", not use_ssl)
 
+    reply_to = str(os.getenv("SMTP_REPLY_TO") or "support@landcheck.online").strip()
+
     msg = EmailMessage()
     msg["Subject"] = subject
     msg["From"] = f"{from_display_name} <{smtp_from_email}>" if from_display_name else smtp_from_email
     msg["To"] = to_email
+    if reply_to:
+        msg["Reply-To"] = reply_to
     msg["Message-ID"] = make_msgid(domain=smtp_from_email.split("@")[-1] or None)
     msg["Date"] = formatdate(localtime=True)
     msg.set_content(body_text)
