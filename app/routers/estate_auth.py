@@ -20,6 +20,7 @@ from app.schemas.estate_auth import EstateLogin, EstateRegister
 from app.services.estates import dpa, estate_email
 from app.services.estates.marketing_common import client_ip
 from app.services.estates.permissions import ROLE_PERMISSIONS
+from app.services.estates.subscriptions import get_subscription, is_access_active
 from app.services.estates.identity import (
     hash_password,
     issue_session,
@@ -190,7 +191,19 @@ def login(payload: EstateLogin, request: Request, response: Response, db: Sessio
     session = issue_session(db, account, request)
     db.commit()
     set_session_cookie(response, name=ESTATE_SESSION_COOKIE, token=str(session["access_token"]), max_age=24 * 60 * 60)
-    payload_out = {**session, "user": _account_payload(db, account), "organization": {"id": organization.id, "name": organization.name, "slug": organization.slug}}
+    # Resolved here, once, right after login, rather than left to a client-side effect that fires
+    # after the dashboard has already rendered: a brand-new organization has no subscription row
+    # at all (status "none") until it picks a plan, and the dashboard's own billing-gate redirect
+    # only runs after first paint - this makes "does this account still need to choose a plan"
+    # part of the login response itself, so the frontend can send them there immediately instead
+    # of racing a second request against the dashboard mounting.
+    needs_plan = not is_access_active(get_subscription(db, organization.id))
+    payload_out = {
+        **session,
+        "user": _account_payload(db, account),
+        "organization": {"id": organization.id, "name": organization.name, "slug": organization.slug},
+        "needs_plan": needs_plan,
+    }
     if request_uses_browser_auth(request):
         payload_out["access_token"] = None
     return payload_out
@@ -214,7 +227,7 @@ def verify_email(token: str, db: Session = Depends(get_db)):
     if organization:
         estate_email.send_welcome_email(organization=organization, account=account)
     web_url = str(os.getenv("LANDCHECK_WEB_URL") or "https://landcheck.online").rstrip("/")
-    return RedirectResponse(f"{web_url}/estates/login?verified=1", status_code=303)
+    return RedirectResponse(f"{web_url}/estates/email-verified", status_code=303)
 
 
 @router.post("/logout")
