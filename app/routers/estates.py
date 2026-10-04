@@ -58,7 +58,7 @@ from app.models.estate_auth import EstateAccount, EstateAuthSession
 from app.utils.survey_auth_security import find_or_create_survey_user, issue_survey_session
 from app.utils.http_security import SURVEY_SESSION_COOKIE, request_uses_browser_auth, set_session_cookie
 from app.models.plot import Plot
-from app.services.estates import estate_email, marketing_alerts, marketing_common
+from app.services.estates import estate_email, estate_sms, marketing_alerts, marketing_common
 from app.services.estates.layout_export import render_estate_layout_pdf
 from app.services.estates.report_export import render_customer_statement_pdf, render_estate_report_pdf
 from app.services.estates import commissions
@@ -4314,6 +4314,30 @@ def _notify_allocation_customer(db: Session, *, allocation: EstateAllocation, or
         subject=f"LandCheck Estate update: {event.replace('_', ' ')}",
         status="sent" if notified else ("failed" if customer.email else "skipped"),
     )
+    if customer.phone:
+        sms_message_id = estate_sms.notify_customer_sms(
+            to_phone=customer.phone,
+            org_name=org_name,
+            estate_name=estate.name,
+            plot_number=plot.plot_number,
+            event=event,
+            amount_just_paid=amount_just_paid,
+            payment_due_at=allocation.next_payment_due_at,
+        )
+        record_notification_log(
+            db,
+            organization_id=allocation.organization_id,
+            estate_id=allocation.estate_id,
+            customer_id=allocation.customer_id,
+            allocation_id=allocation.id,
+            event_key=event,
+            recipient_email=None,
+            recipient_name=customer.full_name,
+            subject=None,
+            status="sent" if sms_message_id else "failed",
+            details={"phone": customer.phone, **({"message_id": sms_message_id} if sms_message_id else {})},
+            channel="sms",
+        )
     # Notification delivery is best-effort and must not roll back the allocation/payment action.
     db.commit()
     return notified
@@ -4892,6 +4916,7 @@ def estate_document_readiness(estate_id: int, request: Request, db: Session = De
 
 DELIVERY_GROUPS = {
     "email": ("email",),
+    "sms": ("sms",),
     "social": ("facebook", "instagram", "instagram_story", "whatsapp_status", "other"),
     "whatsapp": ("whatsapp",),
 }
@@ -4948,6 +4973,37 @@ def estate_notification_log(estate_id: int, request: Request, limit: int = 100, 
         },
         "groups": group_counts,
     }
+
+
+@router.post("/webhooks/termii")
+async def termii_delivery_webhook(request: Request, token: str | None = None, db: Session = Depends(get_db)):
+    """Delivery-status callback from Termii (sent -> delivered/failed on the handset, after the SMS
+    already left our side). Matches back to the row recorded at send time by Termii's message_id,
+    stored in that row's details - this never creates a row itself, only annotates an existing one.
+
+    Termii doesn't sign its webhook payloads, so this is protected the one way that's practical for an
+    unsigned webhook: a shared secret in the URL itself (TERMII_WEBHOOK_TOKEN), checked when set. Low
+    blast radius either way - at most this lets someone write a bogus delivery status onto a log row
+    whose message_id they'd have to already know."""
+    configured_token = str(os.getenv("TERMII_WEBHOOK_TOKEN") or "").strip()
+    if configured_token and token != configured_token:
+        raise HTTPException(401, "Invalid webhook token")
+    try:
+        payload = await request.json()
+    except Exception:
+        return {"ok": False}
+    message_id = str(payload.get("message_id") or "").strip()
+    delivery_status = str(payload.get("status") or "").strip()
+    if not message_id or not delivery_status:
+        return {"ok": True, "ignored": True}
+    rows = db.query(EstateNotificationLog).filter(
+        EstateNotificationLog.channel == "sms",
+        EstateNotificationLog.details["message_id"].astext == message_id,
+    ).all()
+    for row in rows:
+        row.details = {**(row.details or {}), "delivery_status": delivery_status, "delivery_checked_at": datetime.now(timezone.utc).isoformat()}
+    db.commit()
+    return {"ok": True, "matched": len(rows)}
 
 
 @router.post("/customers/{customer_id}/portal-token")

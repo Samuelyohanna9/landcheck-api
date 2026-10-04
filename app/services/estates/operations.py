@@ -34,7 +34,7 @@ from app.services.estates.allocations import release_allocation
 from app.services.estates.audit import append_estate_audit_event
 from app.services.estates.authorization import EstatePrincipal
 from app.services.estates.payments import financial_summary
-from app.services.estates import estate_email
+from app.services.estates import estate_email, estate_sms
 
 
 DOCUMENT_REQUIREMENTS = (
@@ -146,13 +146,14 @@ def record_notification_log(
     status: str,
     error_message: str | None = None,
     details: dict | None = None,
+    channel: str = "email",
 ) -> EstateNotificationLog:
     row = EstateNotificationLog(
         organization_id=organization_id,
         estate_id=estate_id,
         customer_id=customer_id,
         allocation_id=allocation_id,
-        channel="email",
+        channel=channel,
         event_key=event_key,
         recipient_email=recipient_email,
         recipient_name=recipient_name,
@@ -402,6 +403,22 @@ def expire_due_reservations(db: Session) -> int:
             subject=f"Reservation deadline approaching - Plot {plot.plot_number}",
             status="sent" if sent else "failed",
         )
+        if customer.phone:
+            sms_message_id = estate_sms.notify_customer_sms(to_phone=customer.phone, org_name=organization.name if organization else "Estate team", estate_name=estate.name, plot_number=plot.plot_number, event="reservation_expiring")
+            record_notification_log(
+                db,
+                organization_id=row.organization_id,
+                estate_id=row.estate_id,
+                customer_id=row.customer_id,
+                allocation_id=row.id,
+                event_key="reservation_expiring",
+                recipient_email=None,
+                recipient_name=customer.full_name,
+                subject=None,
+                status="sent" if sms_message_id else "failed",
+                details={"phone": customer.phone, **({"message_id": sms_message_id} if sms_message_id else {})},
+                channel="sms",
+            )
         if sent:
             row.reservation_reminder_sent_at = now
     rows = db.query(EstateAllocation).filter(
@@ -466,6 +483,22 @@ def send_due_payment_reminders(db: Session, *, reminder_window_days: int = 7) ->
             portal_url=portal_url,
             payment_due_at=due_at,
         )
+        if customer.phone:
+            sms_message_id = estate_sms.notify_customer_sms(to_phone=customer.phone, org_name=organization.name if organization else "Estate team", estate_name=estate.name, plot_number=plot.plot_number, event="payment_reminder", payment_due_at=due_at)
+            record_notification_log(
+                db,
+                organization_id=allocation.organization_id,
+                estate_id=allocation.estate_id,
+                customer_id=allocation.customer_id,
+                allocation_id=allocation.id,
+                event_key="payment_reminder",
+                recipient_email=None,
+                recipient_name=customer.full_name,
+                subject=None,
+                status="sent" if sms_message_id else "failed",
+                details={"phone": customer.phone, **({"message_id": sms_message_id} if sms_message_id else {})},
+                channel="sms",
+            )
         record_notification_log(
             db,
             organization_id=allocation.organization_id,
