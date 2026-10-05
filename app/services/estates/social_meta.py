@@ -183,6 +183,17 @@ def publish_instagram_image(ig_user_id: str, token: str, image_url: str, caption
     return {"external_id": media_id, "url": permalink}
 
 
+def verify_account_token(external_id: str, stored_token: str) -> bool:
+    """True if a connected Page's (or Instagram account's) stored token still works - False if the
+    person's access was revoked, the Page was removed, or the token otherwise stopped working. Lets a
+    dead connection be caught proactively instead of only discovering it when a post fails."""
+    try:
+        _get(external_id, fields="id", access_token=stored_token)
+        return True
+    except MetaError:
+        return False
+
+
 def delete_facebook_post(post_id: str, page_token: str) -> None:
     _delete(post_id, access_token=page_token)
 

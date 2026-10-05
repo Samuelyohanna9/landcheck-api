@@ -516,6 +516,15 @@ def _run_estate_social_job():
     _run_locked_estate_marketing_job(_ESTATE_SOCIAL_LOCK_KEY, run_social_sweeps)
 
 
+_ESTATE_SOCIAL_ACCOUNT_CHECK_LOCK_KEY = 872341007
+
+
+def _run_estate_social_account_check_job():
+    from app.services.estates.social_posts import check_all_accounts
+
+    _run_locked_estate_marketing_job(_ESTATE_SOCIAL_ACCOUNT_CHECK_LOCK_KEY, check_all_accounts)
+
+
 # Preserve the legacy Survey/Green bootstrap; Estate schema is managed by Alembic.
 @app.on_event("startup")
 def startup_event():
@@ -604,6 +613,14 @@ def startup_event():
         replace_existing=True,
         max_instances=1,
         coalesce=True,
+    )
+    # Daily re-check that every connected Facebook/Instagram account's stored token still works, so a
+    # revoked connection is caught and flagged before a company notices posts have silently stopped.
+    scheduler.add_job(
+        _run_estate_social_account_check_job,
+        trigger=CronTrigger(hour=5, minute=30),
+        id="estate_social_account_check",
+        replace_existing=True,
     )
     scheduler.start()
 

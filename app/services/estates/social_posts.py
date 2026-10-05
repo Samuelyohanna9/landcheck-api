@@ -82,6 +82,32 @@ def _account_for(db: Session, organization_id: int, channel: str) -> EstateSocia
     )
 
 
+def check_account(db: Session, account: EstateSocialAccount) -> bool:
+    """Re-verifies a connected account's stored token still works and updates its status to match -
+    True if healthy. Catches a revoked connection proactively rather than waiting for a post to fail."""
+    try:
+        api_token = decrypt_text(account.access_token_enc)
+    except SecretNotConfigured:
+        account.status = "needs_reconnect"
+        db.flush()
+        return False
+    healthy = social_meta.verify_account_token(account.external_id, api_token)
+    account.status = "active" if healthy else "needs_reconnect"
+    db.flush()
+    return healthy
+
+
+def check_all_accounts(db: Session) -> None:
+    """The daily sweep: re-verify every connected account still works, so a revoked connection is
+    caught and flagged before a company notices their posts have silently stopped going out."""
+    accounts = db.query(EstateSocialAccount).filter(EstateSocialAccount.status != "revoked").all()
+    for account in accounts:
+        try:
+            check_account(db, account)
+        except Exception:
+            logger.exception("Social account connection check failed (account=%s)", account.id)
+
+
 # ── Delivery records (shown in Message delivery) ─────────────────────────────────────────────
 def log_delivery(db: Session, post: EstateSocialPost, channel: str, outcome: dict[str, Any], *, account_name: str | None = None, event_key: str = "social_post") -> None:
     """One Message delivery row per channel a post was sent to, so the company has a record of everything

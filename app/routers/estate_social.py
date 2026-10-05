@@ -588,6 +588,20 @@ def meta_callback(code: str | None = None, state: str | None = None, error: str 
     return _back(estate_id, connected=str(stored))
 
 
+@router.post("/marketing/social/accounts/{account_id}/check")
+def check_account_connection(account_id: int, request: Request, db: Session = Depends(get_db)):
+    """On-demand version of the daily background check (see _run_estate_social_account_check_job in
+    main.py) - re-verifies this one account's stored token right now instead of waiting for the
+    scheduled sweep."""
+    account = db.get(EstateSocialAccount, account_id)
+    if account is None:
+        raise HTTPException(404, "Account not found")
+    require_estate_access(db, request, account.organization_id, permission=WRITE)
+    healthy = social_posts.check_account(db, account)
+    db.commit()
+    return {"ok": True, "healthy": healthy, "status": account.status}
+
+
 @router.post("/marketing/social/accounts/{account_id}/set-default")
 def set_default_account(account_id: int, request: Request, db: Session = Depends(get_db)):
     """Which connected Page (or Instagram account) auto-posting uses, when a company has more than
