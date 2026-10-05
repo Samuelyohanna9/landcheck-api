@@ -719,6 +719,7 @@ def disconnect_account(account_id: int, request: Request, db: Session = Depends(
     append_estate_audit_event(db, organization_id=account.organization_id, actor=access.principal, action="social_account.disconnected", entity_type="estate_social_account", entity_id=account.id, after_data={"provider": account.provider, "name": account.name})
     was_default = account.is_default
     db.delete(account)
+    db.flush()  # the old default must be gone before another account can take its place
     if was_default:
         # Auto-posting should not go silently dead because the designated Page was disconnected -
         # promote whichever other account of the same type is left, if any.
