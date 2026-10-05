@@ -173,6 +173,13 @@ def _requires_estate_session(request: Request) -> bool:
         "/estates/public/",
         "/estates/buyer/",
         "/estates/agent-portal/",
+        # Fetched by Facebook/Instagram/WhatsApp's own servers (signed, expiring image tokens) or by
+        # Meta/Termii's webhook systems - none of them carry (or could carry) a staff session cookie,
+        # so each of these is deliberately public and protects itself its own way (a signed token, a
+        # webhook shared secret, or a Meta signature) instead of a logged-in session.
+        "/estates/marketing/social/image/",
+        "/estates/marketing/social/whatsapp-image/",
+        "/estates/webhooks/",
     )
     if any(path.startswith(prefix) for prefix in public_prefixes):
         return False
@@ -180,6 +187,9 @@ def _requires_estate_session(request: Request) -> bool:
         "/estates/billing/plans",
         "/estates/billing/checkout/return",
         "/estates/billing/webhook",
+        "/estates/marketing/social/whatsapp/webhook",
+        "/estates/marketing/social/meta/deauthorize",
+        "/estates/marketing/social/meta/data-deletion",
     }:
         return False
     return True
