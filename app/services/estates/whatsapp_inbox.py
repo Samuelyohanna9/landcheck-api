@@ -157,6 +157,32 @@ def send_reply(db: Session, *, organization_id: int, estate_id: int, phone_digit
     return row
 
 
+def send_media_reply(
+    db: Session, *, organization_id: int, estate_id: int, phone_digits: str, customer_id: int | None,
+    data: bytes, mime_type: str, filename: str, caption: str | None, actor_subject_type: str, actor_subject_id: str,
+) -> EstateWhatsappMessage:
+    """Uploads then sends a photo/document/audio/video reply - same 24-hour-window rule as a text
+    reply, checked by the caller before this runs."""
+    kind = social_whatsapp.media_kind_for(mime_type)
+    row = EstateWhatsappMessage(
+        organization_id=organization_id, estate_id=estate_id, customer_id=customer_id, phone_digits=phone_digits,
+        direction="out", message_type=kind, body=caption or None, media_mime_type=mime_type, status="sent",
+        sent_by_subject_type=actor_subject_type, sent_by_subject_id=str(actor_subject_id),
+    )
+    try:
+        media_id = social_whatsapp.upload_media(data, mime_type, filename)
+        row.media_id = media_id
+        row.wa_message_id = social_whatsapp.send_media(phone_digits, media_id, kind, caption=caption, filename=filename if kind == "document" else None) or None
+    except social_whatsapp.WhatsAppError as exc:
+        row.status = "failed"
+        db.add(row)
+        db.flush()
+        raise
+    db.add(row)
+    db.flush()
+    return row
+
+
 def conversations_for_estate(db: Session, estate_id: int, *, limit: int = 100) -> list[dict[str, Any]]:
     """One row per phone number this estate has exchanged messages with, newest activity first."""
     latest_per_phone = (

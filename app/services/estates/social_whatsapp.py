@@ -160,6 +160,58 @@ def send_text(to_digits: str, body: str) -> str:
     return str(messages[0].get("id")) if messages else ""
 
 
+def media_kind_for(mime_type: str) -> str:
+    """Which WhatsApp message type a file's MIME type sends as - everything that isn't image/audio/
+    video goes as a document, which WhatsApp accepts for any file type."""
+    mime_type = str(mime_type or "").lower()
+    if mime_type.startswith("image/"):
+        return "image"
+    if mime_type.startswith("video/"):
+        return "video"
+    if mime_type.startswith("audio/"):
+        return "audio"
+    return "document"
+
+
+def upload_media(data: bytes, mime_type: str, filename: str) -> str:
+    """Uploads a file to Meta's servers for this phone number and returns a media id - that id is
+    then referenced (not the bytes themselves) in the send_media() call that actually delivers it."""
+    if not configured():
+        raise WhatsAppError("WhatsApp messaging is not configured on this server")
+    response = requests.post(
+        f"https://graph.facebook.com/{api_version()}/{phone_number_id()}/media",
+        headers={"Authorization": f"Bearer {token()}"},
+        data={"messaging_product": "whatsapp"},
+        files={"file": (filename or "file", data, mime_type or "application/octet-stream")},
+        timeout=TIMEOUT,
+    )
+    result = _raise_for(response, context="upload_media")
+    media_id = str(result.get("id") or "")
+    if not media_id:
+        raise WhatsAppError("WhatsApp did not return a media id for this file.")
+    return media_id
+
+
+def send_media(to_digits: str, media_id: str, kind: str, *, caption: str | None = None, filename: str | None = None) -> str:
+    """kind is whatever media_kind_for() returned: image | video | audio | document."""
+    if not configured():
+        raise WhatsAppError("WhatsApp messaging is not configured on this server")
+    media_obj: dict[str, Any] = {"id": media_id}
+    if caption and kind in ("image", "video", "document"):
+        media_obj["caption"] = caption[:1024]
+    if filename and kind == "document":
+        media_obj["filename"] = filename[:240]
+    response = requests.post(
+        f"https://graph.facebook.com/{api_version()}/{phone_number_id()}/messages",
+        headers={"Authorization": f"Bearer {token()}", "Content-Type": "application/json"},
+        json={"messaging_product": "whatsapp", "to": to_digits, "type": kind, kind: media_obj},
+        timeout=TIMEOUT,
+    )
+    data = _raise_for(response, context=f"send_media:{kind}")
+    messages = data.get("messages") or []
+    return str(messages[0].get("id")) if messages else ""
+
+
 def get_business_profile() -> dict[str, Any]:
     response = requests.get(
         f"https://graph.facebook.com/{api_version()}/{phone_number_id()}/whatsapp_business_profile",

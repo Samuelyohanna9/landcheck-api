@@ -9,7 +9,7 @@ import uuid
 from datetime import date, datetime, timedelta, timezone
 from urllib.parse import quote
 
-from fastapi import APIRouter, Body, Depends, Form, HTTPException, Query, Request, Response
+from fastapi import APIRouter, Body, Depends, File, Form, HTTPException, Query, Request, Response, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import func
@@ -826,6 +826,39 @@ def reply_whatsapp_conversation(estate_id: int, phone: str, payload: WhatsappRep
         row = whatsapp_inbox.send_reply(
             db, organization_id=estate.organization_id, estate_id=estate.id, phone_digits=phone, customer_id=customer_id,
             body=payload.body.strip(), actor_subject_type=access.principal.subject_type, actor_subject_id=str(access.principal.subject_id),
+        )
+    except social_whatsapp.WhatsAppError as exc:
+        db.commit()
+        detail = str(exc)
+        if exc.subcode:
+            detail = f"{detail} (code {exc.code}, subcode {exc.subcode})"
+        raise HTTPException(502, detail) from exc
+    db.commit()
+    return _message_payload(row)
+
+
+MAX_WHATSAPP_MEDIA_BYTES = 16 * 1024 * 1024  # WhatsApp's own ceiling varies by type (5MB images to 100MB documents) - Meta enforces the exact limit; this just avoids holding something absurd in memory
+
+
+@router.post("/{estate_id}/marketing/social/whatsapp/conversations/{phone}/reply-media")
+async def reply_whatsapp_conversation_media(estate_id: int, phone: str, request: Request, file: UploadFile = File(...), caption: str = Form(""), db: Session = Depends(get_db)):
+    estate, access = _staff(db, request, estate_id, permission=WRITE)
+    if not social_whatsapp.configured():
+        raise HTTPException(503, "WhatsApp messaging is not switched on for this server yet.")
+    if not whatsapp_inbox.can_reply_freely(db, estate.id, phone):
+        raise HTTPException(409, "It has been more than 24 hours since this customer last messaged - only a template message can reach them now.")
+    data = await file.read()
+    if not data:
+        raise HTTPException(422, "Choose a file to send.")
+    if len(data) > MAX_WHATSAPP_MEDIA_BYTES:
+        raise HTTPException(413, "This file is too large to send over WhatsApp.")
+    rows = whatsapp_inbox.thread(db, estate.id, phone, limit=1)
+    customer_id = rows[0].customer_id if rows else None
+    try:
+        row = whatsapp_inbox.send_media_reply(
+            db, organization_id=estate.organization_id, estate_id=estate.id, phone_digits=phone, customer_id=customer_id,
+            data=data, mime_type=file.content_type or "application/octet-stream", filename=file.filename or "file",
+            caption=caption.strip() or None, actor_subject_type=access.principal.subject_type, actor_subject_id=str(access.principal.subject_id),
         )
     except social_whatsapp.WhatsAppError as exc:
         db.commit()
