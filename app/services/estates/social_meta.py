@@ -31,9 +31,11 @@ TIMEOUT = 30
 
 
 class MetaError(RuntimeError):
-    def __init__(self, message: str, *, code: int | None = None, needs_reconnect: bool = False):
+    def __init__(self, message: str, *, code: int | None = None, subcode: int | None = None, trace_id: str | None = None, needs_reconnect: bool = False):
         super().__init__(message)
         self.code = code
+        self.subcode = subcode
+        self.trace_id = trace_id
         self.needs_reconnect = needs_reconnect
 
 
@@ -88,9 +90,16 @@ def _raise_for(response: requests.Response) -> dict[str, Any]:
     if response.status_code >= 400 or "error" in data:
         error = data.get("error") or {}
         code = error.get("code")
+        subcode = error.get("error_subcode")
+        trace_id = error.get("fbtrace_id")
+        # Meta's user-facing message (error_user_msg/message) is often a generic catch-all - e.g. "Make
+        # sure your Page post includes an image that can be used in an ad" covers everything from a
+        # genuinely bad image to an unrelated permission problem. The subcode and trace id are what
+        # Meta support actually needs to say what went wrong, so keep them attached to the exception
+        # even though the headline message alone is what a company sees.
         message = str(error.get("error_user_msg") or error.get("message") or f"Meta returned HTTP {response.status_code}")
         # 190 = the token is invalid, expired or revoked - the company has to reconnect.
-        raise MetaError(message, code=code, needs_reconnect=code == 190)
+        raise MetaError(message, code=code, subcode=subcode, trace_id=trace_id, needs_reconnect=code == 190)
     return data
 
 
@@ -132,6 +141,14 @@ def exchange_code(code: str) -> dict[str, Any]:
 def publish_facebook_photo(page_id: str, page_token: str, image_url: str, caption: str) -> dict[str, str]:
     data = _post(f"{page_id}/photos", url=image_url, caption=caption, published="true", access_token=page_token)
     post_id = str(data.get("post_id") or data.get("id") or "")
+    return {"external_id": post_id, "url": f"https://www.facebook.com/{post_id}" if post_id else ""}
+
+
+def publish_facebook_text(page_id: str, page_token: str, message: str) -> dict[str, str]:
+    """A plain status update, no image - Instagram has no equivalent (every Instagram post needs media),
+    so this is Facebook-only."""
+    data = _post(f"{page_id}/feed", message=message, access_token=page_token)
+    post_id = str(data.get("id") or "")
     return {"external_id": post_id, "url": f"https://www.facebook.com/{post_id}" if post_id else ""}
 
 

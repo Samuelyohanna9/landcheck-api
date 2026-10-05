@@ -41,6 +41,7 @@ class PostCreate(BaseModel):
     caption: str = Field(min_length=1, max_length=2200)
     channels: list[str] = Field(min_length=1, max_length=5)
     image_style: str = "promo"
+    include_media: bool = True
     plot_id: int | None = None
     campaign_id: int | None = None
     scheduled_at: datetime | None = None
@@ -51,6 +52,7 @@ class PostUpdate(BaseModel):
     caption: str | None = Field(default=None, min_length=1, max_length=2200)
     channels: list[str] | None = Field(default=None, min_length=1, max_length=5)
     image_style: str | None = None
+    include_media: bool | None = None
     scheduled_at: datetime | None = None
     clear_schedule: bool = False
     cancel: bool = False
@@ -110,6 +112,15 @@ def _check_channels(channels: list[str]) -> list[str]:
     return clean
 
 
+def _check_media_channels(include_media: bool, channels: list[str]) -> None:
+    """Instagram (feed post or story) has no text-only post type - every post needs an image."""
+    if include_media:
+        return
+    labels = [CHANNEL_LABEL[channel] for channel in channels if channel in {"instagram", "instagram_story"}]
+    if labels:
+        raise HTTPException(422, f"{' and '.join(labels)} require{'s' if len(labels) == 1 else ''} an image - turn media back on, or remove {'it' if len(labels) == 1 else 'them'} from this post's channels.")
+
+
 def _check_schedule(value: datetime | None) -> datetime | None:
     when = _aware(value)
     if when is not None and when < datetime.now(timezone.utc) - timedelta(minutes=1):
@@ -120,7 +131,7 @@ def _check_schedule(value: datetime | None) -> datetime | None:
 def _post_payload(post: EstateSocialPost) -> dict:
     return {
         "id": post.id, "estate_id": post.estate_id, "plot_id": post.plot_id, "template_key": post.template_key, "caption": post.caption,
-        "channels": list(post.channels or []), "image_style": post.image_style, "status": post.status, "scheduled_at": post.scheduled_at,
+        "channels": list(post.channels or []), "image_style": post.image_style, "include_media": post.include_media, "status": post.status, "scheduled_at": post.scheduled_at,
         "published_at": post.published_at, "reminder_sent_at": post.reminder_sent_at, "results": post.results or {}, "created_at": post.created_at,
         "plan_id": post.plan_id, "auto_caption": bool(post.auto_caption),
         "template_label": social_templates.TEMPLATE_INFO.get(post.template_key, (None,))[0], "strategy": (social_templates.TEMPLATE_INFO.get(post.template_key) or (None, None))[1],
@@ -292,6 +303,7 @@ def create_post(estate_id: int, payload: PostCreate, request: Request, db: Sessi
     if payload.image_style not in STYLES:
         raise HTTPException(422, "Choose the promo or classic design")
     channels = _check_channels(payload.channels)
+    _check_media_channels(payload.include_media, channels)
     when = _check_schedule(payload.scheduled_at)
     if payload.publish_now and when is not None:
         raise HTTPException(422, "Choose either post now or a schedule")
@@ -305,7 +317,7 @@ def create_post(estate_id: int, payload: PostCreate, request: Request, db: Sessi
         _require_automatic_accounts(db, estate.organization_id, channels)
     post = EstateSocialPost(
         organization_id=estate.organization_id, estate_id=estate.id, plot_id=plot.id if plot else None, template_key=payload.template_key[:40],
-        caption=payload.caption.strip(), image_format=CHANNEL_FORMAT[channels[0]], image_style=payload.image_style, source_code=campaign.code if campaign else None,
+        caption=payload.caption.strip(), image_format=CHANNEL_FORMAT[channels[0]], image_style=payload.image_style, include_media=payload.include_media, source_code=campaign.code if campaign else None,
         channels=channels, status="scheduled" if when is not None else "draft", scheduled_at=when, results={},
         created_by_subject_type=access.principal.subject_type, created_by_subject_id=str(access.principal.subject_id),
     )
@@ -340,6 +352,9 @@ def update_post(post_id: int, payload: PostUpdate, request: Request, db: Session
             post.image_style = payload.image_style
         if payload.channels is not None:
             post.channels = _check_channels(payload.channels)
+        if payload.include_media is not None:
+            post.include_media = payload.include_media
+        _check_media_channels(post.include_media, list(post.channels or []))
         if payload.clear_schedule:
             post.scheduled_at = None
             post.status = "draft"

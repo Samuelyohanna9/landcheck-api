@@ -89,6 +89,7 @@ class EstateSocialPost(Base):
     caption = Column(Text, nullable=False)
     image_format = Column(String(16), nullable=False, default="post")
     image_style = Column(String(16), nullable=False, default="promo")
+    include_media = Column(Boolean, nullable=False, default=True)  # False = text-only (Facebook only - Instagram always needs an image)
     source_code = Column(String(120), nullable=True)
     # facebook | instagram | instagram_story | whatsapp_status (manual) | other (manual)
     channels = Column(JSON, nullable=False, default=list)

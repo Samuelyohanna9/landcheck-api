@@ -93,7 +93,11 @@ def log_delivery(db: Session, post: EstateSocialPost, channel: str, outcome: dic
         organization_id=post.organization_id, estate_id=post.estate_id, channel=channel, event_key="social_post",
         recipient_name=(account_name or outcome.get("account") or CHANNEL_LABEL.get(channel, channel))[:255], subject=first_line[:255], status=status,
         error_message=(outcome.get("error") or None) if status != "sent" else None,
-        details={"post_id": post.id, "plan_id": post.plan_id, "template": post.template_key, "url": outcome.get("url") or "", "manual": bool(outcome.get("manual")), "scheduled_at": post.scheduled_at.isoformat() if post.scheduled_at else ""},
+        details={
+            "post_id": post.id, "plan_id": post.plan_id, "template": post.template_key, "url": outcome.get("url") or "",
+            "manual": bool(outcome.get("manual")), "scheduled_at": post.scheduled_at.isoformat() if post.scheduled_at else "",
+            **({"meta_code": outcome.get("meta_code"), "meta_subcode": outcome.get("meta_subcode"), "meta_trace_id": outcome.get("meta_trace_id"), "image_url": outcome.get("image_url")} if status == "failed" else {}),
+        },
         sent_at=datetime.now(timezone.utc) if status == "sent" else None,
     ))
     db.flush()
@@ -113,12 +117,18 @@ def _publish_channel(db: Session, post: EstateSocialPost, channel: str) -> dict[
     except SecretNotConfigured as exc:
         return {"status": "failed", "error": str(exc)}
     caption = caption_for_channel(post.caption, channel)
-    image_url = post_image_url(post, channel)
+    want_media = post.include_media is not False
+    if not want_media and channel != "facebook":
+        # Instagram has no text-only post type - every post needs an image or video. This should
+        # already be blocked at creation time (see _check_channels usage in the router), but stays
+        # a clear failure here too rather than silently attempting it with a missing image.
+        return {"status": "failed", "error": f"{CHANNEL_LABEL[channel]} requires an image - turn media back on for this post, or remove {CHANNEL_LABEL[channel]} from its channels."}
+    image_url = post_image_url(post, channel) if want_media else None
     account_id, account_name = account.external_id, account.name
     db.commit()  # release the connection during the network calls below
     try:
         if channel == "facebook":
-            outcome = social_meta.publish_facebook_photo(account_id, token, image_url, caption)
+            outcome = social_meta.publish_facebook_photo(account_id, token, image_url, caption) if want_media else social_meta.publish_facebook_text(account_id, token, caption)
         else:
             outcome = social_meta.publish_instagram_image(account_id, token, image_url, caption, story=channel == "instagram_story")
     except social_meta.MetaError as exc:
@@ -126,10 +136,13 @@ def _publish_channel(db: Session, post: EstateSocialPost, channel: str) -> dict[
             fresh = db.get(EstateSocialAccount, account.id)
             if fresh is not None:
                 fresh.status = "needs_reconnect"
-        return {"status": "failed", "error": str(exc), "needs_reconnect": exc.needs_reconnect}
+        return {
+            "status": "failed", "error": str(exc), "needs_reconnect": exc.needs_reconnect,
+            "meta_code": exc.code, "meta_subcode": exc.subcode, "meta_trace_id": exc.trace_id, "image_url": image_url,
+        }
     except Exception as exc:  # network trouble etc.
         logger.exception("Social publish failed (post=%s, channel=%s)", post.id, channel)
-        return {"status": "failed", "error": f"Could not reach {CHANNEL_LABEL[channel]}: {exc}"}
+        return {"status": "failed", "error": f"Could not reach {CHANNEL_LABEL[channel]}: {exc}", "image_url": image_url}
     return {"status": "ok", "external_id": outcome.get("external_id"), "url": outcome.get("url"), "account": account_name, "done_at": datetime.now(timezone.utc).isoformat()}
 
 
