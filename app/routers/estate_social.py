@@ -402,6 +402,34 @@ def rewrite_post(post_id: int, request: Request, db: Session = Depends(get_db)):
     return _post_payload(post)
 
 
+@router.post("/marketing/social/posts/{post_id}/channels/{channel}/delete")
+def delete_post_channel(post_id: int, channel: str, request: Request, db: Session = Depends(get_db)):
+    """Removes the live post from Facebook/Instagram. The LandCheck record stays - its status just
+    changes to 'deleted' - so there's still a history of what was posted and when."""
+    post, _estate, access = _post_for_staff(db, request, post_id)
+    if channel not in list(post.channels or []):
+        raise HTTPException(404, "This post was not sent to that channel")
+    if ((post.results or {}).get(channel) or {}).get("status") != "ok":
+        raise HTTPException(409, "There is nothing live on this channel to delete")
+    outcome = social_posts.delete_published(db, post, channel)
+    if outcome.get("status") == "failed":
+        raise HTTPException(502, outcome.get("error") or "The post could not be deleted.")
+    append_estate_audit_event(db, organization_id=post.organization_id, actor=access.principal, action="social_post.deleted", entity_type="estate_social_post", entity_id=post.id, after_data={"channel": channel})
+    db.commit()
+    return _post_payload(post)
+
+
+@router.post("/marketing/social/posts/{post_id}/channels/{channel}/refresh-stats")
+def refresh_post_channel_stats(post_id: int, channel: str, request: Request, db: Session = Depends(get_db)):
+    post, _estate, _access = _post_for_staff(db, request, post_id)
+    if channel not in list(post.channels or []):
+        raise HTTPException(404, "This post was not sent to that channel")
+    outcome = social_posts.refresh_stats(db, post, channel)
+    if outcome.get("status") == "failed":
+        raise HTTPException(502, outcome.get("error") or "Engagement stats could not be loaded.")
+    return _post_payload(post)
+
+
 # ── Content plans (auto-written, auto-scheduled posts) ───────────────────────────────────────
 def _plan_payload(db: Session, plan: EstateSocialPlan) -> dict:
     counts = dict(db.query(EstateSocialPost.status, func.count(EstateSocialPost.id)).filter(EstateSocialPost.plan_id == plan.id).group_by(EstateSocialPost.status).all())

@@ -111,6 +111,10 @@ def _post(path: str, **data: Any) -> dict[str, Any]:
     return _raise_for(requests.post(_graph(path), data=data, timeout=TIMEOUT))
 
 
+def _delete(path: str, **params: Any) -> dict[str, Any]:
+    return _raise_for(requests.delete(_graph(path), params=params, timeout=TIMEOUT))
+
+
 def exchange_code(code: str) -> dict[str, Any]:
     """Authorisation code -> long-lived user token and the Pages (with page tokens and linked Instagram
     Business accounts) that user manages. Page tokens obtained from a long-lived user token do not expire."""
@@ -177,6 +181,31 @@ def publish_instagram_image(ig_user_id: str, token: str, image_url: str, caption
     except MetaError:
         pass
     return {"external_id": media_id, "url": permalink}
+
+
+def delete_facebook_post(post_id: str, page_token: str) -> None:
+    _delete(post_id, access_token=page_token)
+
+
+def delete_instagram_post(media_id: str, token: str) -> None:
+    _delete(media_id, access_token=token)
+
+
+def facebook_post_stats(post_id: str, page_token: str) -> dict[str, int]:
+    """Reactions, comments and shares - available with pages_read_engagement alone, no separate
+    Insights permission needed."""
+    data = _get(post_id, fields="likes.summary(true),comments.summary(true),shares", access_token=page_token)
+    return {
+        "likes": int(((data.get("likes") or {}).get("summary") or {}).get("total_count") or 0),
+        "comments": int(((data.get("comments") or {}).get("summary") or {}).get("total_count") or 0),
+        "shares": int((data.get("shares") or {}).get("count") or 0),
+    }
+
+
+def instagram_media_stats(media_id: str, token: str) -> dict[str, int]:
+    """Likes and comments on media this app published - available with instagram_basic alone."""
+    data = _get(media_id, fields="like_count,comments_count", access_token=token)
+    return {"likes": int(data.get("like_count") or 0), "comments": int(data.get("comments_count") or 0)}
 
 
 def parse_signed_request(signed_request: str) -> dict[str, Any] | None:

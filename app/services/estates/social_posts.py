@@ -83,14 +83,14 @@ def _account_for(db: Session, organization_id: int, channel: str) -> EstateSocia
 
 
 # ── Delivery records (shown in Message delivery) ─────────────────────────────────────────────
-def log_delivery(db: Session, post: EstateSocialPost, channel: str, outcome: dict[str, Any], *, account_name: str | None = None) -> None:
+def log_delivery(db: Session, post: EstateSocialPost, channel: str, outcome: dict[str, Any], *, account_name: str | None = None, event_key: str = "social_post") -> None:
     """One Message delivery row per channel a post was sent to, so the company has a record of everything
     that went out (or failed, or was skipped) in the same place as its customer emails."""
     state = outcome.get("status")
-    status = "sent" if state == "ok" else "skipped" if state == "skipped" else "failed"
+    status = "sent" if state in ("ok", "deleted") else "skipped" if state == "skipped" else "failed"
     first_line = next((line.strip() for line in (post.caption or "").splitlines() if line.strip()), "Marketing post")
     db.add(EstateNotificationLog(
-        organization_id=post.organization_id, estate_id=post.estate_id, channel=channel, event_key="social_post",
+        organization_id=post.organization_id, estate_id=post.estate_id, channel=channel, event_key=event_key,
         recipient_name=(account_name or outcome.get("account") or CHANNEL_LABEL.get(channel, channel))[:255], subject=first_line[:255], status=status,
         error_message=(outcome.get("error") or None) if status != "sent" else None,
         details={
@@ -157,6 +157,83 @@ def _publish_channel(db: Session, post: EstateSocialPost, channel: str) -> dict[
         logger.exception("Social publish failed (post=%s, channel=%s)", post.id, channel)
         return {"status": "failed", "error": f"Could not reach {CHANNEL_LABEL[channel]}: {exc}", "account": account_name, "image_url": image_url}
     return {"status": "ok", "external_id": outcome.get("external_id"), "url": outcome.get("url"), "account": account_name, "done_at": datetime.now(timezone.utc).isoformat()}
+
+
+# ── Deleting a live post ────────────────────────────────────────────────────────────────────
+def _delete_channel(db: Session, post: EstateSocialPost, channel: str, external_id: str) -> dict[str, Any]:
+    account = _account_for(db, post.organization_id, channel)
+    if account is None:
+        return {"status": "failed", "error": f"No {CHANNEL_LABEL[channel]} account is connected."}
+    try:
+        token = decrypt_text(account.access_token_enc)
+    except SecretNotConfigured as exc:
+        return {"status": "failed", "error": str(exc)}
+    db.commit()  # release the connection during the network call below
+    try:
+        if channel == "facebook":
+            social_meta.delete_facebook_post(external_id, token)
+        else:
+            social_meta.delete_instagram_post(external_id, token)
+    except social_meta.MetaError as exc:
+        return {"status": "failed", "error": str(exc), "account": account.name}
+    except Exception as exc:
+        logger.exception("Social delete failed (post=%s, channel=%s)", post.id, channel)
+        return {"status": "failed", "error": f"Could not reach {CHANNEL_LABEL[channel]}: {exc}", "account": account.name}
+    return {"status": "ok", "account": account.name}
+
+
+def delete_published(db: Session, post: EstateSocialPost, channel: str) -> dict[str, Any]:
+    """Removes a channel's live Facebook/Instagram post and records the outcome alongside it in
+    post.results, so the history stays ("sent, then deleted") rather than disappearing."""
+    results = dict(post.results or {})
+    current = results.get(channel) or {}
+    external_id = current.get("external_id")
+    if not external_id:
+        return {"status": "failed", "error": "No published post found for this channel."}
+    outcome = _delete_channel(db, post, channel, external_id)
+    if outcome["status"] == "ok":
+        results[channel] = {**current, "status": "deleted", "deleted_at": datetime.now(timezone.utc).isoformat()}
+        post.results = results
+    log_delivery(db, post, channel, outcome, account_name=outcome.get("account"), event_key="social_post_deleted")
+    db.commit()
+    return results.get(channel, outcome)
+
+
+# ── Engagement stats ────────────────────────────────────────────────────────────────────────
+def _stats_channel(db: Session, post: EstateSocialPost, channel: str, external_id: str) -> dict[str, Any]:
+    account = _account_for(db, post.organization_id, channel)
+    if account is None:
+        return {"status": "failed", "error": f"No {CHANNEL_LABEL[channel]} account is connected."}
+    try:
+        token = decrypt_text(account.access_token_enc)
+    except SecretNotConfigured as exc:
+        return {"status": "failed", "error": str(exc)}
+    db.commit()
+    try:
+        stats = social_meta.facebook_post_stats(external_id, token) if channel == "facebook" else social_meta.instagram_media_stats(external_id, token)
+    except social_meta.MetaError as exc:
+        return {"status": "failed", "error": str(exc)}
+    except Exception as exc:
+        logger.exception("Social stats fetch failed (post=%s, channel=%s)", post.id, channel)
+        return {"status": "failed", "error": f"Could not reach {CHANNEL_LABEL[channel]}: {exc}"}
+    return {"status": "ok", "stats": stats}
+
+
+def refresh_stats(db: Session, post: EstateSocialPost, channel: str) -> dict[str, Any]:
+    """Pulls the latest reaction/comment (and, on Facebook, share) counts for an already-published
+    channel and caches them on post.results, so the dashboard shows them without re-fetching on
+    every page load."""
+    results = dict(post.results or {})
+    current = results.get(channel) or {}
+    external_id = current.get("external_id")
+    if not external_id or current.get("status") != "ok":
+        return {"status": "failed", "error": "This post is not currently live on this channel."}
+    outcome = _stats_channel(db, post, channel, external_id)
+    if outcome["status"] == "ok":
+        results[channel] = {**current, "stats": outcome["stats"], "stats_fetched_at": datetime.now(timezone.utc).isoformat()}
+        post.results = results
+        db.commit()
+    return results.get(channel, outcome)
 
 
 def publish_post(db: Session, post: EstateSocialPost) -> EstateSocialPost:
