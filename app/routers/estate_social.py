@@ -872,6 +872,69 @@ def _message_payload(row: EstateWhatsappMessage) -> dict:
     }
 
 
+@router.get("/{estate_id}/marketing/social/whatsapp/contacts")
+def list_whatsapp_contacts(estate_id: int, request: Request, search: str | None = None, db: Session = Depends(get_db)):
+    """Customers of this company who have a phone number - the people a new WhatsApp chat can start with."""
+    estate, _access = _staff(db, request, estate_id)
+    query = db.query(EstateCustomer).filter(EstateCustomer.organization_id == estate.organization_id, EstateCustomer.phone.isnot(None))
+    if search and search.strip():
+        term = f"%{search.strip().lower()}%"
+        query = query.filter(func.lower(EstateCustomer.full_name).like(term) | EstateCustomer.phone.like(term))
+    items = []
+    for customer in query.order_by(EstateCustomer.full_name.asc()).limit(200).all():
+        digits = normalize_phone_digits(customer.phone)
+        if digits:
+            items.append({"id": customer.id, "name": customer.full_name, "phone_digits": digits, "reference": customer.reference_no})
+    return {"items": items}
+
+
+class WhatsappNewChat(BaseModel):
+    customer_id: int
+    preset: str = Field(min_length=1, max_length=40)
+    detail: str | None = Field(default=None, max_length=200)
+
+
+@router.post("/{estate_id}/marketing/social/whatsapp/conversations/new")
+def start_whatsapp_chat(estate_id: int, payload: WhatsappNewChat, request: Request, db: Session = Depends(get_db)):
+    """Opens a chat with a customer who hasn't messaged yet. WhatsApp only allows an approved template
+    to start a conversation, so the first message is always a template; free-text replies unlock on
+    their side once they answer (handled by the normal reply endpoint)."""
+    estate, access = _staff(db, request, estate_id, permission=WRITE)
+    if not social_whatsapp.configured():
+        raise HTTPException(503, "WhatsApp messaging is not switched on for this server yet.")
+    if payload.preset not in social_whatsapp.PRESETS:
+        raise HTTPException(422, "Choose a message template to start the chat.")
+    customer = db.get(EstateCustomer, payload.customer_id)
+    if customer is None or customer.organization_id != estate.organization_id:
+        raise HTTPException(404, "Customer not found")
+    digits = normalize_phone_digits(customer.phone)
+    if not digits:
+        raise HTTPException(422, "This customer has no valid phone number.")
+    params = [
+        customer.full_name.split(" ")[0] if customer.full_name else "there",
+        estate.name,
+        payload.detail or "an update on your plot",
+        public_page_url(estate),
+    ]
+    try:
+        message_id = social_whatsapp.send_template(digits, social_whatsapp.template_name(payload.preset), params)
+    except social_whatsapp.WhatsAppError as exc:
+        db.commit()
+        detail = str(exc)
+        if exc.subcode:
+            detail = f"{detail} (code {exc.code}, subcode {exc.subcode})"
+        raise HTTPException(502, detail) from exc
+    row = EstateWhatsappMessage(
+        organization_id=estate.organization_id, estate_id=estate.id, customer_id=customer.id, phone_digits=digits,
+        direction="out", message_type="text", body=f"[{social_whatsapp.PRESETS[payload.preset]['label']}] {payload.detail or ''}".strip(),
+        wa_message_id=message_id or None, status="sent", sent_by_subject_type=access.principal.subject_type, sent_by_subject_id=str(access.principal.subject_id),
+    )
+    db.add(row)
+    append_estate_audit_event(db, organization_id=estate.organization_id, actor=access.principal, action="customer.whatsapp_chat_started", entity_type="estate_customer", entity_id=customer.id, after_data={"preset": payload.preset})
+    db.commit()
+    return {"ok": True, "phone_digits": digits}
+
+
 @router.get("/{estate_id}/marketing/social/whatsapp/conversations")
 def list_whatsapp_conversations(estate_id: int, request: Request, db: Session = Depends(get_db)):
     estate, _access = _staff(db, request, estate_id)
