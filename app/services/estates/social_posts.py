@@ -123,6 +123,19 @@ def _publish_channel(db: Session, post: EstateSocialPost, channel: str) -> dict[
         # already be blocked at creation time (see _check_channels usage in the router), but stays
         # a clear failure here too rather than silently attempting it with a missing image.
         return {"status": "failed", "error": f"{CHANNEL_LABEL[channel]} requires an image - turn media back on for this post, or remove {CHANNEL_LABEL[channel]} from its channels."}
+    if want_media:
+        # Rendering is CPU-heavy and can wait on a satellite-tile fetch (see cached_render's own
+        # comment) - the first request for a given post/format/style combination can take several
+        # seconds. Facebook/Instagram's own fetch of the image URL times out far sooner than that, so
+        # a cold render there reads to them as "no usable image" even though the image is perfectly
+        # fine - it just wasn't ready in time. Rendering it here first, synchronously, before Facebook
+        # is ever asked to fetch it, means their fetch always hits the warm cache_render cache instead.
+        estate = db.get(Estate, post.estate_id)
+        if estate is not None:
+            try:
+                render_image(db, estate, fmt=CHANNEL_FORMAT.get(channel, "post"), style=post.image_style, plot_id=post.plot_id, source=post.source_code)
+            except Exception:
+                logger.exception("Pre-render before publish failed (post=%s, channel=%s)", post.id, channel)
     image_url = post_image_url(post, channel) if want_media else None
     account_id, account_name = account.external_id, account.name
     db.commit()  # release the connection during the network calls below
