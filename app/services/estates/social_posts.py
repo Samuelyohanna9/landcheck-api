@@ -137,12 +137,12 @@ def _publish_channel(db: Session, post: EstateSocialPost, channel: str) -> dict[
             if fresh is not None:
                 fresh.status = "needs_reconnect"
         return {
-            "status": "failed", "error": str(exc), "needs_reconnect": exc.needs_reconnect,
+            "status": "failed", "error": str(exc), "needs_reconnect": exc.needs_reconnect, "account": account_name,
             "meta_code": exc.code, "meta_subcode": exc.subcode, "meta_trace_id": exc.trace_id, "image_url": image_url,
         }
     except Exception as exc:  # network trouble etc.
         logger.exception("Social publish failed (post=%s, channel=%s)", post.id, channel)
-        return {"status": "failed", "error": f"Could not reach {CHANNEL_LABEL[channel]}: {exc}", "image_url": image_url}
+        return {"status": "failed", "error": f"Could not reach {CHANNEL_LABEL[channel]}: {exc}", "account": account_name, "image_url": image_url}
     return {"status": "ok", "external_id": outcome.get("external_id"), "url": outcome.get("url"), "account": account_name, "done_at": datetime.now(timezone.utc).isoformat()}
 
 
