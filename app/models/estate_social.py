@@ -90,6 +90,7 @@ class EstateSocialPost(Base):
     image_format = Column(String(16), nullable=False, default="post")
     image_style = Column(String(16), nullable=False, default="promo")
     include_media = Column(Boolean, nullable=False, default=True)  # False = text-only (Facebook only - Instagram always needs an image)
+    custom_image_url = Column(String(500), nullable=True)  # a staff-uploaded photo, used instead of the auto-generated flyer when set
     source_code = Column(String(120), nullable=True)
     # facebook | instagram | instagram_story | whatsapp_status (manual) | other (manual)
     channels = Column(JSON, nullable=False, default=list)

@@ -25,6 +25,7 @@ from app.services.estates.authorization import require_estate_access
 from app.services.estates.marketing_common import client_ip, normalize_phone_digits, public_page_url, throttled, web_url
 from app.services.estates.subscriptions import get_subscription, has_auto_posting_access
 from app.services.estates.social_templates import ALL_CHANNELS, AUTOMATIC_CHANNELS, CHANNEL_FORMAT, CHANNEL_LABEL, MANUAL_CHANNELS
+from app.utils.r2_objects import build_public_url, build_r2_settings, upload_bytes
 from app.utils.secret_box import SecretNotConfigured, decrypt_text, encrypt_text, make_signed_token, read_signed_token, secret_configured
 
 logger = logging.getLogger(__name__)
@@ -327,6 +328,59 @@ def create_post(estate_id: int, payload: PostCreate, request: Request, db: Sessi
     db.commit()
     if payload.publish_now:
         social_posts.publish_post(db, post)
+    return _post_payload(post)
+
+
+MAX_CUSTOM_POST_IMAGE_BYTES = 8 * 1024 * 1024
+
+
+@router.post("/{estate_id}/marketing/social/custom-post")
+async def create_custom_media_post(
+    estate_id: int, request: Request, file: UploadFile = File(...), caption: str = Form(...), channels: str = Form(...),
+    plot_id: int | None = Form(None), campaign_id: int | None = Form(None), db: Session = Depends(get_db),
+):
+    """Posts a staff-uploaded photo instead of the auto-generated flyer - what instagram_content_publish
+    is actually meant for (organic photo/video posts "on behalf of a business"), not just posting a
+    rendered marketing graphic. Publishes immediately; there is no draft/schedule step for these."""
+    estate, access = _staff(db, request, estate_id, permission=WRITE)
+    if not (estate.public_enabled and estate.public_slug):
+        raise HTTPException(409, "Publish this estate's public page first - posts link to it.")
+    channel_list = _check_channels([item.strip() for item in channels.split(",") if item.strip()])
+    if not channel_list:
+        raise HTTPException(422, "Choose at least one channel.")
+    _check_media_channels(True, channel_list)
+    _require_automatic_accounts(db, estate.organization_id, channel_list)
+    if not str(file.content_type or "").startswith("image/"):
+        raise HTTPException(422, "Choose a photo (video posting isn't supported yet).")
+    data = await file.read()
+    if not data:
+        raise HTTPException(422, "Choose a photo to post.")
+    if len(data) > MAX_CUSTOM_POST_IMAGE_BYTES:
+        raise HTTPException(413, "This photo is too large.")
+    settings = build_r2_settings(prefix="R2")
+    if settings is None:
+        raise HTTPException(503, "File storage is not configured on this server.")
+    extension = "png" if "png" in file.content_type else "jpg"
+    object_key = f"estates/{estate.id}/social-uploads/{uuid.uuid4().hex}.{extension}"
+    upload_bytes(settings, object_key, data, content_type=file.content_type, cache_control="public, max-age=3600")
+    plot = None
+    if plot_id:
+        plot = db.get(EstatePlot, plot_id)
+        if plot is None or plot.estate_id != estate.id:
+            raise HTTPException(404, "Plot not found")
+    campaign = _campaign_for_staff(db, estate, campaign_id)
+    post = EstateSocialPost(
+        organization_id=estate.organization_id, estate_id=estate.id, plot_id=plot.id if plot else None, template_key="custom_upload",
+        caption=caption.strip(), image_format=CHANNEL_FORMAT[channel_list[0]], image_style="promo",
+        custom_image_url=build_public_url(settings, object_key), source_code=campaign.code if campaign else None,
+        channels=channel_list, status="draft", results={},
+        created_by_subject_type=access.principal.subject_type, created_by_subject_id=str(access.principal.subject_id),
+    )
+    db.add(post)
+    db.flush()
+    append_estate_audit_event(db, organization_id=estate.organization_id, actor=access.principal, action="social_post.created", entity_type="estate_social_post", entity_id=post.id, after_data={"channels": channel_list, "custom_upload": True})
+    db.commit()
+    social_posts.publish_post(db, post)
     return _post_payload(post)
 
 

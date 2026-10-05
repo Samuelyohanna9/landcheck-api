@@ -36,7 +36,10 @@ def render_image(db: Session, estate: Estate, *, fmt: str, style: str, plot_id: 
 
 
 def post_image_url(post: EstateSocialPost, channel: str) -> str:
-    """A signed, expiring public address Meta can fetch the image from (their servers cannot log in)."""
+    """A signed, expiring public address Meta can fetch the image from (their servers cannot log in) -
+    or, for a post made from a staff-uploaded photo, that photo's own public R2 address directly."""
+    if post.custom_image_url:
+        return post.custom_image_url
     fmt = CHANNEL_FORMAT.get(channel, "post")
     token = make_signed_token("img", post.id, fmt, ttl_seconds=IMAGE_TOKEN_TTL_SECONDS)
     return f"{api_url()}/estates/marketing/social/image/{token}.png"
