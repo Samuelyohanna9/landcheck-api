@@ -70,11 +70,14 @@ def read_image_token(token: str) -> tuple[int, str] | None:
 
 # ── Publishing ───────────────────────────────────────────────────────────────────────────────
 def _account_for(db: Session, organization_id: int, channel: str) -> EstateSocialAccount | None:
+    """When a company has connected several Pages (or several Instagram accounts), the one they marked
+    default wins; otherwise falls back to the first connected, which is also what every organisation
+    with only one connected account per provider already had - so this stays a no-op for them."""
     provider = "facebook" if channel == "facebook" else "instagram"
     return (
         db.query(EstateSocialAccount)
         .filter(EstateSocialAccount.organization_id == organization_id, EstateSocialAccount.provider == provider, EstateSocialAccount.status == "active")
-        .order_by(EstateSocialAccount.id.asc())
+        .order_by(EstateSocialAccount.is_default.desc(), EstateSocialAccount.id.asc())
         .first()
     )
 
@@ -303,4 +306,4 @@ def run_social_sweeps(db: Session) -> None:
 
 def account_public(account: EstateSocialAccount) -> dict[str, Any]:
     """Never includes the token."""
-    return {"id": account.id, "provider": account.provider, "name": account.name, "username": account.username, "status": account.status, "linked_page_id": account.linked_page_id}
+    return {"id": account.id, "provider": account.provider, "name": account.name, "username": account.username, "status": account.status, "linked_page_id": account.linked_page_id, "is_default": account.is_default}

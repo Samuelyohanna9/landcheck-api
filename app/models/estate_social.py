@@ -27,6 +27,7 @@ class EstateSocialAccount(Base):
     access_token_enc = Column(Text, nullable=False)
     token_expires_at = Column(DateTime(timezone=True), nullable=True)
     status = Column(String(16), nullable=False, default="active")  # active | needs_reconnect | revoked
+    is_default = Column(Boolean, nullable=False, default=False)  # the Page/account auto-posting uses when several are connected
     connected_by_subject_type = Column(String(64), nullable=True)
     connected_by_subject_id = Column(String(128), nullable=True)
     created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())

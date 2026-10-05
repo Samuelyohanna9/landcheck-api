@@ -528,7 +528,10 @@ def meta_callback(code: str | None = None, state: str | None = None, error: str 
         for provider, external_id, name, username, linked in candidates:
             row = db.query(EstateSocialAccount).filter(EstateSocialAccount.organization_id == organization_id, EstateSocialAccount.provider == provider, EstateSocialAccount.external_id == external_id).one_or_none()
             if row is None:
-                row = EstateSocialAccount(organization_id=organization_id, provider=provider, external_id=external_id, name=name, username=username, linked_page_id=linked, access_token_enc=token_enc)
+                # The first connected account for this provider becomes the one auto-posting uses by
+                # default - a company connecting several Pages later has to explicitly pick one instead.
+                has_default = db.query(EstateSocialAccount).filter(EstateSocialAccount.organization_id == organization_id, EstateSocialAccount.provider == provider, EstateSocialAccount.is_default.is_(True)).first() is not None
+                row = EstateSocialAccount(organization_id=organization_id, provider=provider, external_id=external_id, name=name, username=username, linked_page_id=linked, access_token_enc=token_enc, is_default=not has_default)
                 db.add(row)
             row.name, row.username, row.linked_page_id = name, username, linked
             row.access_token_enc = token_enc
@@ -542,6 +545,25 @@ def meta_callback(code: str | None = None, state: str | None = None, error: str 
     return _back(estate_id, connected=str(stored))
 
 
+@router.post("/marketing/social/accounts/{account_id}/set-default")
+def set_default_account(account_id: int, request: Request, db: Session = Depends(get_db)):
+    """Which connected Page (or Instagram account) auto-posting uses, when a company has more than
+    one of the same type connected. Only one account per provider can be default at a time."""
+    account = db.get(EstateSocialAccount, account_id)
+    if account is None:
+        raise HTTPException(404, "Account not found")
+    access = require_estate_access(db, request, account.organization_id, permission=WRITE)
+    db.query(EstateSocialAccount).filter(
+        EstateSocialAccount.organization_id == account.organization_id,
+        EstateSocialAccount.provider == account.provider,
+        EstateSocialAccount.id != account.id,
+    ).update({"is_default": False})
+    account.is_default = True
+    append_estate_audit_event(db, organization_id=account.organization_id, actor=access.principal, action="social_account.set_default", entity_type="estate_social_account", entity_id=account.id, after_data={"provider": account.provider, "name": account.name})
+    db.commit()
+    return {"ok": True}
+
+
 @router.delete("/marketing/social/accounts/{account_id}", status_code=204)
 def disconnect_account(account_id: int, request: Request, db: Session = Depends(get_db)):
     account = db.get(EstateSocialAccount, account_id)
@@ -549,7 +571,14 @@ def disconnect_account(account_id: int, request: Request, db: Session = Depends(
         raise HTTPException(404, "Account not found")
     access = require_estate_access(db, request, account.organization_id, permission=WRITE)
     append_estate_audit_event(db, organization_id=account.organization_id, actor=access.principal, action="social_account.disconnected", entity_type="estate_social_account", entity_id=account.id, after_data={"provider": account.provider, "name": account.name})
+    was_default = account.is_default
     db.delete(account)
+    if was_default:
+        # Auto-posting should not go silently dead because the designated Page was disconnected -
+        # promote whichever other account of the same type is left, if any.
+        next_account = db.query(EstateSocialAccount).filter(EstateSocialAccount.organization_id == account.organization_id, EstateSocialAccount.provider == account.provider, EstateSocialAccount.id != account.id, EstateSocialAccount.status == "active").order_by(EstateSocialAccount.id.asc()).first()
+        if next_account is not None:
+            next_account.is_default = True
     db.commit()
     return Response(status_code=204)
 
