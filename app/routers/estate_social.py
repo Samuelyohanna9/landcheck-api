@@ -15,14 +15,14 @@ from pydantic import BaseModel, Field
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
-from app.models.estate_foundation import Estate, EstateOrganization, EstatePlot
-from app.models.estate_social import EstateMarketingOptin, EstateSocialAccount, EstateSocialPlan, EstateSocialPost, EstateWhatsappSend
-from app.routers.estate_marketing import _campaign_for_staff, _png, _staff
+from app.models.estate_foundation import Estate, EstateAllocation, EstateCustomer, EstateOrganization, EstatePlot
+from app.models.estate_social import EstateMarketingOptin, EstateSocialAccount, EstateSocialPlan, EstateSocialPost, EstateWhatsappMessage, EstateWhatsappSend
+from app.routers.estate_marketing import NO_CACHE_PRIVATE, _campaign_for_staff, _png, _staff
 from app.routers.plots import get_db
-from app.services.estates import marketing_render, social_broadcast, social_meta, social_planner, social_posts, social_templates, social_whatsapp
+from app.services.estates import marketing_render, social_broadcast, social_meta, social_planner, social_posts, social_templates, social_whatsapp, whatsapp_inbox
 from app.services.estates.audit import append_estate_audit_event
 from app.services.estates.authorization import require_estate_access
-from app.services.estates.marketing_common import client_ip, throttled, web_url
+from app.services.estates.marketing_common import client_ip, normalize_phone_digits, public_page_url, throttled, web_url
 from app.services.estates.subscriptions import get_subscription, has_auto_posting_access
 from app.services.estates.social_templates import ALL_CHANNELS, AUTOMATIC_CHANNELS, CHANNEL_FORMAT, CHANNEL_LABEL, MANUAL_CHANNELS
 from app.utils.secret_box import SecretNotConfigured, decrypt_text, encrypt_text, make_signed_token, read_signed_token, secret_configured
@@ -756,7 +756,8 @@ def whatsapp_webhook_verify(request: Request):
 
 @router.post("/marketing/social/whatsapp/webhook")
 async def whatsapp_webhook(request: Request, db: Session = Depends(get_db)):
-    """Handles STOP replies so opted-out people are never messaged again."""
+    """Handles STOP replies, and stores every other inbound message in the inbox of whichever estate
+    the sender's number resolves to (see whatsapp_inbox.resolve_estate_for_phone)."""
     raw = await request.body()
     if not social_whatsapp.verify_webhook_signature(raw, request.headers.get("x-hub-signature-256")):
         raise HTTPException(403, "Invalid signature")
@@ -765,11 +766,143 @@ async def whatsapp_webhook(request: Request, db: Session = Depends(get_db)):
     except ValueError:
         return {"ok": True}
     stopped = 0
+    stored = 0
     for entry in body.get("entry") or []:
         for change in entry.get("changes") or []:
             for message in ((change.get("value") or {}).get("messages") or []):
                 text = ((message.get("text") or {}).get("body")) if message.get("type") == "text" else None
                 if social_whatsapp.is_stop_message(text) and message.get("from"):
                     stopped += social_broadcast.revoke_phone_everywhere(db, str(message["from"]))
+                    continue
+                if whatsapp_inbox.record_inbound(db, message):
+                    stored += 1
     db.commit()
-    return {"ok": True, "stopped": stopped}
+    return {"ok": True, "stopped": stopped, "stored": stored}
+
+
+# ── WhatsApp inbox ───────────────────────────────────────────────────────────────────────────
+def _message_payload(row: EstateWhatsappMessage) -> dict:
+    return {
+        "id": row.id, "direction": row.direction, "type": row.message_type, "body": row.body,
+        "has_media": bool(row.media_id), "media_url": f"/estates/marketing/social/whatsapp/media/{row.id}" if row.media_id else None,
+        "status": row.status, "created_at": row.created_at, "read_by_staff_at": row.read_by_staff_at,
+    }
+
+
+@router.get("/{estate_id}/marketing/social/whatsapp/conversations")
+def list_whatsapp_conversations(estate_id: int, request: Request, db: Session = Depends(get_db)):
+    estate, _access = _staff(db, request, estate_id)
+    return {"items": whatsapp_inbox.conversations_for_estate(db, estate.id)}
+
+
+@router.get("/{estate_id}/marketing/social/whatsapp/conversations/{phone}/messages")
+def get_whatsapp_thread(estate_id: int, phone: str, request: Request, db: Session = Depends(get_db)):
+    estate, _access = _staff(db, request, estate_id)
+    rows = whatsapp_inbox.thread(db, estate.id, phone)
+    whatsapp_inbox.mark_read(db, estate.id, phone)
+    db.commit()
+    return {"items": [_message_payload(row) for row in rows], "can_reply_freely": whatsapp_inbox.can_reply_freely(db, estate.id, phone)}
+
+
+class WhatsappReply(BaseModel):
+    body: str = Field(min_length=1, max_length=4096)
+
+
+@router.post("/{estate_id}/marketing/social/whatsapp/conversations/{phone}/reply")
+def reply_whatsapp_conversation(estate_id: int, phone: str, payload: WhatsappReply, request: Request, db: Session = Depends(get_db)):
+    estate, access = _staff(db, request, estate_id, permission=WRITE)
+    if not social_whatsapp.configured():
+        raise HTTPException(503, "WhatsApp messaging is not switched on for this server yet.")
+    if not whatsapp_inbox.can_reply_freely(db, estate.id, phone):
+        raise HTTPException(409, "It has been more than 24 hours since this customer last messaged - only a template message (from an opt-in broadcast) can reach them now, not a free reply.")
+    rows = whatsapp_inbox.thread(db, estate.id, phone, limit=1)
+    customer_id = rows[0].customer_id if rows else None
+    try:
+        row = whatsapp_inbox.send_reply(
+            db, organization_id=estate.organization_id, estate_id=estate.id, phone_digits=phone, customer_id=customer_id,
+            body=payload.body.strip(), actor_subject_type=access.principal.subject_type, actor_subject_id=str(access.principal.subject_id),
+        )
+    except social_whatsapp.WhatsAppError as exc:
+        db.commit()
+        raise HTTPException(502, str(exc)) from exc
+    db.commit()
+    return _message_payload(row)
+
+
+@router.get("/marketing/social/whatsapp/media/{message_id}")
+def get_whatsapp_media(message_id: int, request: Request, db: Session = Depends(get_db)):
+    row = db.get(EstateWhatsappMessage, message_id)
+    if row is None or not row.media_id:
+        raise HTTPException(404, "Media not found")
+    require_estate_access(db, request, row.organization_id, permission="estate.read")
+    try:
+        data, mime_type = social_whatsapp.download_media(row.media_id)
+    except social_whatsapp.WhatsAppError as exc:
+        raise HTTPException(502, str(exc)) from exc
+    return Response(data, media_type=mime_type, headers=dict(NO_CACHE_PRIVATE))
+
+
+@router.get("/{estate_id}/marketing/social/whatsapp/profile")
+def get_whatsapp_profile(estate_id: int, request: Request, db: Session = Depends(get_db)):
+    """Read-only: this is the one WhatsApp number shared by every LandCheck Estates company, so it
+    isn't editable from an individual estate's dashboard - shown here only so staff can see what
+    their customers see when a message arrives from it."""
+    _staff(db, request, estate_id)
+    if not social_whatsapp.configured():
+        return {"configured": False}
+    try:
+        profile = social_whatsapp.get_business_profile()
+    except social_whatsapp.WhatsAppError as exc:
+        raise HTTPException(502, str(exc)) from exc
+    return {"configured": True, **profile}
+
+
+class CustomerWhatsappMessage(BaseModel):
+    preset: str
+    detail: str | None = Field(default=None, max_length=200)
+
+
+@router.post("/customers/{customer_id}/whatsapp-message")
+def send_customer_whatsapp_message(customer_id: int, payload: CustomerWhatsappMessage, request: Request, db: Session = Depends(get_db)):
+    """A single, targeted template message to one customer - not a broadcast. Uses the same approved
+    presets as the opt-in broadcast system, since only pre-approved templates can reliably reach
+    someone who hasn't messaged LandCheck's WhatsApp number in the last 24 hours."""
+    customer = db.get(EstateCustomer, customer_id)
+    if customer is None:
+        raise HTTPException(404, "Customer not found")
+    access = require_estate_access(db, request, customer.organization_id, permission=WRITE)
+    if not customer.phone:
+        raise HTTPException(422, "This customer has no phone number on file.")
+    if payload.preset not in social_whatsapp.PRESETS:
+        raise HTTPException(422, "Unknown message preset")
+    if not social_whatsapp.configured():
+        raise HTTPException(503, "WhatsApp messaging is not switched on for this server yet.")
+    digits = normalize_phone_digits(customer.phone)
+    if not digits:
+        raise HTTPException(422, "This customer's phone number is not valid.")
+    allocation = db.query(EstateAllocation).filter(EstateAllocation.customer_id == customer.id).order_by(EstateAllocation.created_at.desc()).first()
+    estate = db.get(Estate, allocation.estate_id) if allocation else None
+    organization = db.get(EstateOrganization, customer.organization_id)
+    params = [
+        customer.full_name.split(" ")[0] if customer.full_name else "there",
+        estate.name if estate else (organization.name if organization else "your estate"),
+        payload.detail or "an update on your plot",
+        public_page_url(estate) if estate else web_url(),
+    ]
+    try:
+        message_id = social_whatsapp.send_template(digits, social_whatsapp.template_name(payload.preset), params)
+    except social_whatsapp.WhatsAppError as exc:
+        append_estate_audit_event(db, organization_id=customer.organization_id, actor=access.principal, action="customer.whatsapp_message_failed", entity_type="estate_customer", entity_id=customer.id, after_data={"preset": payload.preset, "error": str(exc)})
+        db.commit()
+        raise HTTPException(502, str(exc)) from exc
+    if estate is not None:
+        # Only logged to the inbox when there's an estate to attribute it to - the message itself
+        # still sends either way, this just controls whether it shows up in a conversation thread.
+        db.add(EstateWhatsappMessage(
+            organization_id=customer.organization_id, estate_id=estate.id, customer_id=customer.id, phone_digits=digits,
+            direction="out", message_type="text", body=f"[{social_whatsapp.PRESETS[payload.preset]['label']}] {payload.detail or ''}".strip(),
+            wa_message_id=message_id or None, status="sent", sent_by_subject_type=access.principal.subject_type, sent_by_subject_id=str(access.principal.subject_id),
+        ))
+    append_estate_audit_event(db, organization_id=customer.organization_id, actor=access.principal, action="customer.whatsapp_message_sent", entity_type="estate_customer", entity_id=customer.id, after_data={"preset": payload.preset})
+    db.commit()
+    return {"ok": True}

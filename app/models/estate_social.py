@@ -157,3 +157,35 @@ class EstateWhatsappSend(Base):
     created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
 
     __table_args__ = (Index("ix_estate_whatsapp_sends_batch", "estate_id", "batch_uid"),)
+
+
+class EstateWhatsappMessage(Base):
+    """A real conversation thread, not just the earlier STOP-only handling: every inbound message from
+    a known customer or opted-in contact, and every reply staff send back. Only stored once the sender's
+    phone number resolves to an estate - a message from an unrecognised number is a different company's
+    customer reaching the shared LandCheck WhatsApp number, not something any estate's staff should see."""
+
+    __tablename__ = "estate_whatsapp_messages"
+
+    id = Column(Integer, primary_key=True)
+    organization_id = Column(Integer, ForeignKey("estate_organizations.id", ondelete="CASCADE"), nullable=False)
+    estate_id = Column(Integer, ForeignKey("estate_estates.id", ondelete="CASCADE"), nullable=False)
+    customer_id = Column(Integer, ForeignKey("estate_customers.id", ondelete="SET NULL"), nullable=True)
+    phone_digits = Column(String(20), nullable=False)
+    direction = Column(String(8), nullable=False)  # in | out
+    message_type = Column(String(16), nullable=False, default="text")  # text | image | document | audio | video | other
+    body = Column(Text, nullable=True)
+    media_id = Column(String(120), nullable=True)
+    media_mime_type = Column(String(80), nullable=True)
+    wa_message_id = Column(String(120), nullable=True, unique=True)
+    status = Column(String(16), nullable=False, default="received")  # received | sent | failed
+    sent_by_subject_type = Column(String(64), nullable=True)
+    sent_by_subject_id = Column(String(128), nullable=True)
+    read_by_staff_at = Column(DateTime(timezone=True), nullable=True)
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+    __table_args__ = (
+        CheckConstraint("direction IN ('in', 'out')", name="ck_estate_wa_message_direction"),
+        CheckConstraint("status IN ('received', 'sent', 'failed')", name="ck_estate_wa_message_status"),
+        Index("ix_estate_wa_messages_estate_phone", "estate_id", "phone_digits", "created_at"),
+    )

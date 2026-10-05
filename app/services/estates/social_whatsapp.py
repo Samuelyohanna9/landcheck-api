@@ -126,6 +126,89 @@ def send_template(to_digits: str, name: str, params: list[str], *, language: str
     return str(messages[0].get("id")) if messages else ""
 
 
+def send_text(to_digits: str, body: str) -> str:
+    """A free-form reply - only deliverable within 24 hours of the customer's last message (Meta's
+    customer service window). Outside that window Meta rejects it and a template must be used
+    instead - callers check the window themselves before calling this."""
+    if not configured():
+        raise WhatsAppError("WhatsApp messaging is not configured on this server")
+    response = requests.post(
+        f"https://graph.facebook.com/{api_version()}/{phone_number_id()}/messages",
+        headers={"Authorization": f"Bearer {token()}", "Content-Type": "application/json"},
+        json={"messaging_product": "whatsapp", "to": to_digits, "type": "text", "text": {"body": str(body or "")[:4096]}},
+        timeout=TIMEOUT,
+    )
+    try:
+        data = response.json()
+    except ValueError:
+        data = {}
+    if response.status_code >= 400 or "error" in data:
+        error = data.get("error") or {}
+        raise WhatsAppError(str(error.get("error_user_msg") or error.get("message") or f"WhatsApp returned HTTP {response.status_code}"))
+    messages = data.get("messages") or []
+    return str(messages[0].get("id")) if messages else ""
+
+
+def get_business_profile() -> dict[str, Any]:
+    response = requests.get(
+        f"https://graph.facebook.com/{api_version()}/{phone_number_id()}/whatsapp_business_profile",
+        headers={"Authorization": f"Bearer {token()}"},
+        params={"fields": "about,address,description,email,profile_picture_url,websites,vertical"},
+        timeout=TIMEOUT,
+    )
+    try:
+        data = response.json()
+    except ValueError:
+        data = {}
+    if response.status_code >= 400 or "error" in data:
+        error = data.get("error") or {}
+        raise WhatsAppError(str(error.get("error_user_msg") or error.get("message") or f"WhatsApp returned HTTP {response.status_code}"))
+    rows = data.get("data") or []
+    return rows[0] if rows else {}
+
+
+def update_business_profile(**fields: Any) -> None:
+    """about/address/description/email/vertical are plain strings; websites is a list of up to 2 URLs.
+    Changing this changes what every LandCheck Estates customer sees on this shared number, across
+    every estate - callers must restrict who can do this."""
+    clean = {key: value for key, value in fields.items() if value is not None}
+    if not clean:
+        return
+    response = requests.post(
+        f"https://graph.facebook.com/{api_version()}/{phone_number_id()}/whatsapp_business_profile",
+        headers={"Authorization": f"Bearer {token()}", "Content-Type": "application/json"},
+        json={"messaging_product": "whatsapp", **clean},
+        timeout=TIMEOUT,
+    )
+    try:
+        data = response.json()
+    except ValueError:
+        data = {}
+    if response.status_code >= 400 or "error" in data:
+        error = data.get("error") or {}
+        raise WhatsAppError(str(error.get("error_user_msg") or error.get("message") or f"WhatsApp returned HTTP {response.status_code}"))
+
+
+def download_media(media_id: str) -> tuple[bytes, str]:
+    """Media URLs Meta gives out are short-lived and themselves require the bearer token to fetch, so
+    this always does both steps fresh rather than caching a URL."""
+    lookup = requests.get(
+        f"https://graph.facebook.com/{api_version()}/{media_id}",
+        headers={"Authorization": f"Bearer {token()}"},
+        timeout=TIMEOUT,
+    )
+    try:
+        meta = lookup.json()
+    except ValueError:
+        meta = {}
+    if lookup.status_code >= 400 or "error" in meta or not meta.get("url"):
+        raise WhatsAppError("This media is no longer available from WhatsApp.")
+    download = requests.get(str(meta["url"]), headers={"Authorization": f"Bearer {token()}"}, timeout=TIMEOUT)
+    if download.status_code >= 400:
+        raise WhatsAppError("This media is no longer available from WhatsApp.")
+    return download.content, str(meta.get("mime_type") or "application/octet-stream")
+
+
 def verify_webhook_signature(raw_body: bytes, signature_header: str | None) -> bool:
     secret = str(os.getenv("WHATSAPP_APP_SECRET") or os.getenv("META_APP_SECRET") or "").strip()
     if not secret:
