@@ -135,6 +135,7 @@ def exchange_code(code: str) -> dict[str, Any]:
         params["after"] = after
     expires_in = int(long_lived.get("expires_in") or 0)
     return {
+        "user_token": user_token,
         "facebook_user_id": me.get("id"),
         "facebook_user_name": me.get("name"),
         "user_token_expires_at": (datetime.now(timezone.utc) + timedelta(seconds=expires_in)) if expires_in else None,

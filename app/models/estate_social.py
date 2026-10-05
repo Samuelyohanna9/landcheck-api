@@ -25,6 +25,7 @@ class EstateSocialAccount(Base):
     linked_page_id = Column(String(64), nullable=True)  # for Instagram: the Facebook Page it hangs off
     facebook_user_id = Column(String(64), nullable=True)  # who granted access - needed to honour Meta data-deletion requests
     access_token_enc = Column(Text, nullable=False)
+    user_token_enc = Column(Text, nullable=True)  # the connecting person's user token - needed for Instagram deletion
     token_expires_at = Column(DateTime(timezone=True), nullable=True)
     status = Column(String(16), nullable=False, default="active")  # active | needs_reconnect | revoked
     is_default = Column(Boolean, nullable=False, default=False)  # the Page/account auto-posting uses when several are connected

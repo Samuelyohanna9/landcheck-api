@@ -655,6 +655,8 @@ def meta_callback(code: str | None = None, state: str | None = None, error: str 
                 db.add(row)
             row.name, row.username, row.linked_page_id = name, username, linked
             row.access_token_enc = token_enc
+            if granted.get("user_token"):
+                row.user_token_enc = encrypt_text(granted["user_token"])
             row.status = "active"
             row.facebook_user_id = granted.get("facebook_user_id")
             row.connected_by_subject_type, row.connected_by_subject_id = subject_type, subject_id

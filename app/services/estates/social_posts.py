@@ -197,15 +197,18 @@ def _publish_channel(db: Session, post: EstateSocialPost, channel: str) -> dict[
 
 # ── Deleting a live post ────────────────────────────────────────────────────────────────────
 def _delete_channel(db: Session, post: EstateSocialPost, channel: str, external_id: str) -> dict[str, Any]:
-    if channel != "facebook":
-        # Instagram only allows deleting media with the instagram_manage_contents permission, which this
-        # app doesn't have yet - say so plainly rather than sending a call Meta will refuse.
-        return {"status": "failed", "error": "Instagram posts can't be deleted from LandCheck yet - delete it in the Instagram app."}
     account = _account_for(db, post.organization_id, channel)
     if account is None:
         return {"status": "failed", "error": f"No {CHANNEL_LABEL[channel]} account is connected."}
     try:
-        token = decrypt_text(account.access_token_enc)
+        if channel == "facebook":
+            token = decrypt_text(account.access_token_enc)
+        else:
+            # Instagram deletion is made with the connecting person's user token, and only works once
+            # the instagram_manage_contents permission has been granted to this app.
+            if not account.user_token_enc:
+                return {"status": "failed", "error": "Reconnect this Instagram account to allow deleting posts from LandCheck."}
+            token = decrypt_text(account.user_token_enc)
     except SecretNotConfigured as exc:
         return {"status": "failed", "error": str(exc)}
     db.commit()  # release the connection during the network call below
