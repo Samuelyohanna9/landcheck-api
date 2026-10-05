@@ -178,7 +178,7 @@ class EstateWhatsappMessage(Base):
     media_id = Column(String(120), nullable=True)
     media_mime_type = Column(String(80), nullable=True)
     wa_message_id = Column(String(120), nullable=True, unique=True)
-    status = Column(String(16), nullable=False, default="received")  # received | sent | failed
+    status = Column(String(16), nullable=False, default="received")  # received | sent | delivered | read | failed
     sent_by_subject_type = Column(String(64), nullable=True)
     sent_by_subject_id = Column(String(128), nullable=True)
     read_by_staff_at = Column(DateTime(timezone=True), nullable=True)

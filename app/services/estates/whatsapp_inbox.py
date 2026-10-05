@@ -101,6 +101,27 @@ def record_inbound(db: Session, message: dict[str, Any]) -> bool:
     return True
 
 
+STATUS_RANK = {"sent": 0, "delivered": 1, "read": 2, "failed": 3}
+
+
+def record_status_update(db: Session, status_event: dict[str, Any]) -> bool:
+    """Meta's delivery-status callback for an outbound message (sent/delivered/read/failed) - drives
+    the WhatsApp-style tick in the inbox. Never moves a status backwards (a late "delivered" event
+    arriving after "read" is ignored), and does nothing for a message id we don't recognise."""
+    wa_message_id = str(status_event.get("id") or "")
+    new_status = str(status_event.get("status") or "")
+    if not wa_message_id or new_status not in STATUS_RANK:
+        return False
+    row = db.query(EstateWhatsappMessage).filter(EstateWhatsappMessage.wa_message_id == wa_message_id, EstateWhatsappMessage.direction == "out").one_or_none()
+    if row is None:
+        return False
+    if STATUS_RANK.get(row.status, -1) >= STATUS_RANK[new_status]:
+        return False
+    row.status = new_status
+    db.flush()
+    return True
+
+
 def can_reply_freely(db: Session, estate_id: int, phone_digits: str) -> bool:
     """True within 24 hours of the customer's last inbound message (Meta's customer service window) -
     outside it, only a pre-approved template can reach them."""

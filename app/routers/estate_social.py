@@ -767,17 +767,22 @@ async def whatsapp_webhook(request: Request, db: Session = Depends(get_db)):
         return {"ok": True}
     stopped = 0
     stored = 0
+    status_updates = 0
     for entry in body.get("entry") or []:
         for change in entry.get("changes") or []:
-            for message in ((change.get("value") or {}).get("messages") or []):
+            value = change.get("value") or {}
+            for message in value.get("messages") or []:
                 text = ((message.get("text") or {}).get("body")) if message.get("type") == "text" else None
                 if social_whatsapp.is_stop_message(text) and message.get("from"):
                     stopped += social_broadcast.revoke_phone_everywhere(db, str(message["from"]))
                     continue
                 if whatsapp_inbox.record_inbound(db, message):
                     stored += 1
+            for status_event in value.get("statuses") or []:
+                if whatsapp_inbox.record_status_update(db, status_event):
+                    status_updates += 1
     db.commit()
-    return {"ok": True, "stopped": stopped, "stored": stored}
+    return {"ok": True, "stopped": stopped, "stored": stored, "status_updates": status_updates}
 
 
 # ── WhatsApp inbox ───────────────────────────────────────────────────────────────────────────
