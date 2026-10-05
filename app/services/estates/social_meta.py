@@ -237,3 +237,59 @@ def parse_signed_request(signed_request: str) -> dict[str, Any] | None:
         return json.loads(unb64(payload).decode("utf-8"))
     except Exception:
         return None
+
+
+def _listed(path: str, fields: str, token: str) -> tuple[list[dict[str, Any]], str | None]:
+    """A list endpoint that may need a permission this app doesn't have - a missing permission returns
+    the empty list plus the reason, so the rest of the post's stats still load."""
+    try:
+        return (_get(path, fields=fields, limit=100, access_token=token).get("data") or []), None
+    except MetaError as exc:
+        return [], str(exc)
+
+
+def facebook_post_engagement(post_id: str, page_token: str) -> dict[str, Any]:
+    counts = facebook_post_stats(post_id, page_token)
+    comments, comments_note = _listed(f"{post_id}/comments", "id,message,created_time,from{name,id},like_count", page_token)
+    reactions, reactions_note = _listed(f"{post_id}/reactions", "id,name,type", page_token)
+    return {
+        **counts,
+        "comment_list": [
+            {"id": c.get("id"), "name": (c.get("from") or {}).get("name") or "Someone", "message": c.get("message") or "", "created_time": c.get("created_time"), "likes": c.get("like_count", 0)}
+            for c in comments
+        ],
+        "reaction_list": [{"name": r.get("name") or "Someone", "type": r.get("type") or "LIKE"} for r in reactions],
+        "unavailable": " ".join(note for note in [
+            f"Comment names need the pages_read_user_content permission ({comments_note})" if comments_note else None,
+            f"Reaction names unavailable ({reactions_note})" if reactions_note else None,
+        ] if note) or None,
+    }
+
+
+def instagram_media_engagement(media_id: str, token: str) -> dict[str, Any]:
+    counts = instagram_media_stats(media_id, token)
+    comments, note = _listed(f"{media_id}/comments", "id,text,username,timestamp,like_count", token)
+    return {
+        **counts,
+        "comment_list": [
+            {"id": c.get("id"), "name": c.get("username") or "Someone", "message": c.get("text") or "", "created_time": c.get("timestamp"), "likes": c.get("like_count", 0)}
+            for c in comments
+        ],
+        "reaction_list": [],
+        "unavailable": (
+            "Comment details need instagram_manage_comments permission." if note else None
+        ) or "Instagram doesn't show who liked a post - only the total."
+    }
+
+
+def post_comment(channel: str, object_id: str, token: str, message: str, *, reply_to_id: str | None = None) -> str:
+    """Writes a comment on a post, or a reply under an existing comment. Facebook replies are posted to
+    the comment itself; Instagram replies use the /replies edge. Needs pages_manage_engagement (Facebook)
+    or instagram_manage_comments (Instagram) on the token - Meta refuses the call otherwise."""
+    if channel == "facebook":
+        data = _post(f"{reply_to_id or object_id}/comments", message=message, access_token=token)
+    elif reply_to_id:
+        data = _post(f"{reply_to_id}/replies", message=message, access_token=token)
+    else:
+        data = _post(f"{object_id}/comments", message=message, access_token=token)
+    return str(data.get("id") or "")

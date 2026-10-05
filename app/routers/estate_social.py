@@ -456,6 +456,29 @@ def rewrite_post(post_id: int, request: Request, db: Session = Depends(get_db)):
     return _post_payload(post)
 
 
+class PostComment(BaseModel):
+    message: str = Field(min_length=1, max_length=2200)
+    reply_to_id: str | None = Field(default=None, max_length=120)
+
+
+@router.post("/marketing/social/posts/{post_id}/channels/{channel}/comment")
+def comment_post_channel(post_id: int, channel: str, payload: PostComment, request: Request, db: Session = Depends(get_db)):
+    """Writes a comment on a live post, or replies to a comment (reply_to_id). Meta needs the matching
+    comment permission on the connected account - if it's missing, the reason is returned as-is."""
+    post, _estate, access = _post_for_staff(db, request, post_id)
+    if channel not in list(post.channels or []) or channel not in ("facebook", "instagram"):
+        raise HTTPException(404, "Comments can only be posted on a Facebook or Instagram post")
+    text = payload.message.strip()
+    if not text:
+        raise HTTPException(422, "Write a comment first.")
+    outcome = social_posts.comment_on_post(db, post, channel, text, reply_to_id=payload.reply_to_id)
+    if outcome.get("status") != "ok":
+        raise HTTPException(502, outcome.get("error") or "The comment could not be posted.")
+    append_estate_audit_event(db, organization_id=post.organization_id, actor=access.principal, action="social_post.commented", entity_type="estate_social_post", entity_id=post.id, after_data={"channel": channel, "reply": bool(payload.reply_to_id)})
+    db.commit()
+    return {"ok": True, "comment_id": outcome.get("comment_id")}
+
+
 @router.post("/marketing/social/posts/{post_id}/channels/{channel}/delete")
 def delete_post_channel(post_id: int, channel: str, request: Request, db: Session = Depends(get_db)):
     """Removes the live post from Facebook/Instagram. The LandCheck record stays - its status just

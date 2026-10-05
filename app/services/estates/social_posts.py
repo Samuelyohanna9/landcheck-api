@@ -197,6 +197,10 @@ def _publish_channel(db: Session, post: EstateSocialPost, channel: str) -> dict[
 
 # ── Deleting a live post ────────────────────────────────────────────────────────────────────
 def _delete_channel(db: Session, post: EstateSocialPost, channel: str, external_id: str) -> dict[str, Any]:
+    if channel != "facebook":
+        # Instagram only allows deleting media with the instagram_manage_contents permission, which this
+        # app doesn't have yet - say so plainly rather than sending a call Meta will refuse.
+        return {"status": "failed", "error": "Instagram posts can't be deleted from LandCheck yet - delete it in the Instagram app."}
     account = _account_for(db, post.organization_id, channel)
     if account is None:
         return {"status": "failed", "error": f"No {CHANNEL_LABEL[channel]} account is connected."}
@@ -246,7 +250,7 @@ def _stats_channel(db: Session, post: EstateSocialPost, channel: str, external_i
         return {"status": "failed", "error": str(exc)}
     db.commit()
     try:
-        stats = social_meta.facebook_post_stats(external_id, token) if channel == "facebook" else social_meta.instagram_media_stats(external_id, token)
+        stats = social_meta.facebook_post_engagement(external_id, token) if channel == "facebook" else social_meta.instagram_media_engagement(external_id, token)
     except social_meta.MetaError as exc:
         return {"status": "failed", "error": str(exc)}
     except Exception as exc:
@@ -449,3 +453,27 @@ def account_public(account: EstateSocialAccount) -> dict[str, Any]:
         "id": account.id, "provider": account.provider, "name": account.name, "username": account.username, "status": account.status,
         "linked_page_id": account.linked_page_id, "is_default": account.is_default, "picture_url": account.picture_url, "followers_count": account.followers_count,
     }
+
+
+def comment_on_post(db: Session, post: EstateSocialPost, channel: str, message: str, *, reply_to_id: str | None = None) -> dict[str, Any]:
+    """Posts a comment on a live post, or replies to one of its comments, on the channel the post went to."""
+    current = (post.results or {}).get(channel) or {}
+    external_id = current.get("external_id")
+    if not external_id or current.get("status") != "ok":
+        return {"status": "failed", "error": "This post is not currently live on this channel."}
+    account = _account_for(db, post.organization_id, channel)
+    if account is None:
+        return {"status": "failed", "error": f"No {CHANNEL_LABEL[channel]} account is connected."}
+    try:
+        token = decrypt_text(account.access_token_enc)
+    except SecretNotConfigured as exc:
+        return {"status": "failed", "error": str(exc)}
+    db.commit()
+    try:
+        comment_id = social_meta.post_comment(channel, external_id, token, message, reply_to_id=reply_to_id)
+    except social_meta.MetaError as exc:
+        return {"status": "failed", "error": str(exc)}
+    except Exception as exc:
+        logger.exception("Social comment failed (post=%s, channel=%s)", post.id, channel)
+        return {"status": "failed", "error": f"Could not reach {CHANNEL_LABEL[channel]}: {exc}"}
+    return {"status": "ok", "comment_id": comment_id}
