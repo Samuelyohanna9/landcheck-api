@@ -16,7 +16,7 @@ from sqlalchemy.orm import Session
 
 from app.models.estate_billing import EstateSubscription, EstateSubscriptionCharge
 from app.models.estate_foundation import EstateOrganization
-from app.services.estates.billing_plans import ACTIVE_SUBSCRIPTION_STATUSES, TRIAL_DAYS, plan_amount, plan_includes_auto_posting, plan_includes_hazard_analysis, plan_includes_soil_analysis, plan_label, plan_max_estates
+from app.services.estates.billing_plans import ACTIVE_SUBSCRIPTION_STATUSES, TRIAL_DAYS, plan_amount, plan_includes_auto_posting, plan_includes_hazard_analysis, plan_includes_soil_analysis, plan_includes_sms_notifications, plan_label, plan_max_estates
 from app.services.estates import estate_email
 from app.utils import estate_flutterwave as flw
 
@@ -49,6 +49,10 @@ def has_auto_posting_access(subscription: EstateSubscription | None) -> bool:
 
 def has_soil_analysis_access(subscription: EstateSubscription | None) -> bool:
     return is_access_active(subscription) and plan_includes_soil_analysis(subscription.plan_key)
+
+
+def has_sms_access(subscription: EstateSubscription | None) -> bool:
+    return is_access_active(subscription) and plan_includes_sms_notifications(subscription.plan_key)
 
 
 def estate_limit_for(subscription: EstateSubscription | None) -> int | None:

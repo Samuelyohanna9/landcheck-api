@@ -45,7 +45,7 @@ from app.services.estates.allocations import release_allocation, reserve_or_allo
 from app.services.estates.audit import append_estate_audit_event
 from app.services.estates.authorization import EstatePrincipal, require_estate_access
 from app.services.estates.billing_plans import next_plan_with_estates, plan_label
-from app.services.estates.subscriptions import estate_limit_for, get_subscription, has_hazard_access, has_soil_analysis_access
+from app.services.estates.subscriptions import estate_limit_for, get_subscription, has_hazard_access, has_sms_access, has_soil_analysis_access
 from app.services.estates.survey_requests import transition
 from app.services.estates.survey_adapter import materialize_estate_plot_for_survey
 from app.schemas.estate_survey import SurveyorAssignment
@@ -4314,7 +4314,7 @@ def _notify_allocation_customer(db: Session, *, allocation: EstateAllocation, or
         subject=f"LandCheck Estate update: {event.replace('_', ' ')}",
         status="sent" if notified else ("failed" if customer.email else "skipped"),
     )
-    if customer.phone:
+    if customer.phone and has_sms_access(get_subscription(db, allocation.organization_id)):
         sms_message_id = estate_sms.notify_customer_sms(
             to_phone=customer.phone,
             org_name=org_name,

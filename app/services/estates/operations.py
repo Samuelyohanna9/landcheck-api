@@ -35,6 +35,7 @@ from app.services.estates.audit import append_estate_audit_event
 from app.services.estates.authorization import EstatePrincipal
 from app.services.estates.payments import financial_summary
 from app.services.estates import estate_email, estate_sms
+from app.services.estates.subscriptions import get_subscription, has_sms_access
 
 
 DOCUMENT_REQUIREMENTS = (
@@ -403,7 +404,7 @@ def expire_due_reservations(db: Session) -> int:
             subject=f"Reservation deadline approaching - Plot {plot.plot_number}",
             status="sent" if sent else "failed",
         )
-        if customer.phone:
+        if customer.phone and has_sms_access(get_subscription(db, row.organization_id)):
             sms_message_id = estate_sms.notify_customer_sms(to_phone=customer.phone, org_name=organization.name if organization else "Estate team", estate_name=estate.name, plot_number=plot.plot_number, event="reservation_expiring")
             record_notification_log(
                 db,
@@ -483,7 +484,7 @@ def send_due_payment_reminders(db: Session, *, reminder_window_days: int = 7) ->
             portal_url=portal_url,
             payment_due_at=due_at,
         )
-        if customer.phone:
+        if customer.phone and has_sms_access(get_subscription(db, allocation.organization_id)):
             sms_message_id = estate_sms.notify_customer_sms(to_phone=customer.phone, org_name=organization.name if organization else "Estate team", estate_name=estate.name, plot_number=plot.plot_number, event="payment_reminder", payment_due_at=due_at)
             record_notification_log(
                 db,

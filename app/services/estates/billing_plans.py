@@ -19,6 +19,7 @@ class EstatePlanDefinition(TypedDict):
     hazard_analysis: bool
     auto_posting: bool
     soil_analysis: bool
+    sms_notifications: bool
     max_estates: int | None  # None = unlimited
 
 
@@ -30,6 +31,7 @@ ESTATE_PLANS: Final[dict[str, EstatePlanDefinition]] = {
         "hazard_analysis": False,
         "auto_posting": False,
         "soil_analysis": False,
+        "sms_notifications": False,
         "max_estates": 1,
     },
     "plus": {
@@ -39,6 +41,7 @@ ESTATE_PLANS: Final[dict[str, EstatePlanDefinition]] = {
         "hazard_analysis": True,
         "auto_posting": False,
         "soil_analysis": False,
+        "sms_notifications": False,
         "max_estates": 3,
     },
     "pro": {
@@ -48,6 +51,7 @@ ESTATE_PLANS: Final[dict[str, EstatePlanDefinition]] = {
         "hazard_analysis": True,
         "auto_posting": True,
         "soil_analysis": True,
+        "sms_notifications": True,
         "max_estates": 6,
     },
     "enterprise": {
@@ -57,6 +61,7 @@ ESTATE_PLANS: Final[dict[str, EstatePlanDefinition]] = {
         "hazard_analysis": True,
         "auto_posting": True,
         "soil_analysis": True,
+        "sms_notifications": True,
         "max_estates": None,
     },
 }
@@ -102,3 +107,7 @@ def plan_includes_hazard_analysis(plan_key: str) -> bool:
 
 def plan_includes_soil_analysis(plan_key: str) -> bool:
     return bool(ESTATE_PLANS.get(plan_key, {}).get("soil_analysis", False))
+
+
+def plan_includes_sms_notifications(plan_key: str) -> bool:
+    return bool(ESTATE_PLANS.get(plan_key, {}).get("sms_notifications", False))
