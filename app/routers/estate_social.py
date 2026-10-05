@@ -196,6 +196,12 @@ def social_image(estate_id: int, request: Request, channel: str = "facebook", st
         data = social_posts.render_image(db, estate, fmt=CHANNEL_FORMAT[channel], style=style, plot_id=plot_id, source=source)
     except ValueError as exc:
         raise HTTPException(409, str(exc)) from exc
+    except Exception:
+        logger.exception(
+            "Social post image preview failed (estate_id=%s, channel=%s, style=%s, plot_id=%s)",
+            estate_id, channel, style, plot_id,
+        )
+        raise HTTPException(502, "This image could not be generated - check the estate's cover photo and plot data in Settings, then try again.") from None
     return _png(data, filename=f"{name.replace(' ', '-')}-{channel}.png" if download else None)
 
 
@@ -216,7 +222,13 @@ def public_whatsapp_image(token: str, db: Session = Depends(get_db)):
 
 @router.get("/marketing/social/image/{token}.png")
 def public_social_image(token: str, db: Session = Depends(get_db)):
-    """Fetched by Facebook/Instagram's servers. The link is signed and expires after 24 hours."""
+    """Fetched by Facebook/Instagram's servers. The link is signed and expires after 24 hours.
+
+    If rendering fails, Facebook/Instagram's own error for this ("Make sure your Page post includes
+    an image that can be used in an ad") is a generic catch-all for "we couldn't fetch/parse a usable
+    image from that URL" - it gives no detail at all about what actually went wrong on our side. So this
+    logs the real exception with enough context to diagnose it, instead of letting FastAPI's default
+    500 handler swallow it into an opaque response."""
     parsed = social_posts.read_image_token(token)
     if parsed is None:
         raise HTTPException(404, "Image not found")
@@ -227,7 +239,15 @@ def public_social_image(token: str, db: Session = Depends(get_db)):
         raise HTTPException(404, "Image not found")
     style, plot_id, source = post.image_style, post.plot_id, post.source_code
     db.commit()
-    return _png(social_posts.render_image(db, estate, fmt=fmt, style=style, plot_id=plot_id, source=source), public=True)
+    try:
+        data = social_posts.render_image(db, estate, fmt=fmt, style=style, plot_id=plot_id, source=source)
+    except Exception:
+        logger.exception(
+            "Social post image render failed (post_id=%s, estate_id=%s, fmt=%s, style=%s, plot_id=%s)",
+            post_id, estate.id, fmt, style, plot_id,
+        )
+        raise HTTPException(502, "The post image could not be generated. Check this estate's cover photo and plot data, then try again.") from None
+    return _png(data, public=True)
 
 
 # ── Posts ────────────────────────────────────────────────────────────────────────────────────
