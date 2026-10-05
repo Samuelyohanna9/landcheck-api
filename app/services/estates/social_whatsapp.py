@@ -14,11 +14,14 @@ Only pre-approved templates can start a conversation, so staff pick a preset her
 
 import hashlib
 import hmac
+import logging
 import os
 import re
 from typing import Any
 
 import requests
+
+logger = logging.getLogger(__name__)
 
 TIMEOUT = 30
 MAX_BROADCAST = 250
@@ -85,7 +88,27 @@ def _clean_param(value: Any) -> str:
 
 
 class WhatsAppError(RuntimeError):
-    pass
+    def __init__(self, message: str, *, code: int | None = None, subcode: int | None = None, trace_id: str | None = None):
+        super().__init__(message)
+        self.code = code
+        self.subcode = subcode
+        self.trace_id = trace_id
+
+
+def _raise_for(response: requests.Response, *, context: str) -> dict[str, Any]:
+    try:
+        data = response.json()
+    except ValueError:
+        data = {}
+    if response.status_code >= 400 or "error" in data:
+        error = data.get("error") or {}
+        code, subcode, trace_id = error.get("code"), error.get("error_subcode"), error.get("fbtrace_id")
+        message = str(error.get("error_user_msg") or error.get("message") or f"WhatsApp returned HTTP {response.status_code}")
+        # Logged here (not just raised) so the real reason is in the server's own logs immediately,
+        # rather than only reachable by reproducing the failure and reading the dashboard's toast.
+        logger.error("WhatsApp API error (%s): %s [code=%s subcode=%s trace=%s]", context, message, code, subcode, trace_id)
+        raise WhatsAppError(message, code=code, subcode=subcode, trace_id=trace_id)
+    return data
 
 
 def send_template(to_digits: str, name: str, params: list[str], *, language: str = "en", header_image_url: str | None = None) -> str:
@@ -115,13 +138,7 @@ def send_template(to_digits: str, name: str, params: list[str], *, language: str
         json=body,
         timeout=TIMEOUT,
     )
-    try:
-        data = response.json()
-    except ValueError:
-        data = {}
-    if response.status_code >= 400 or "error" in data:
-        error = data.get("error") or {}
-        raise WhatsAppError(str(error.get("error_user_msg") or error.get("message") or f"WhatsApp returned HTTP {response.status_code}"))
+    data = _raise_for(response, context=f"send_template:{name}")
     messages = data.get("messages") or []
     return str(messages[0].get("id")) if messages else ""
 
@@ -138,13 +155,7 @@ def send_text(to_digits: str, body: str) -> str:
         json={"messaging_product": "whatsapp", "to": to_digits, "type": "text", "text": {"body": str(body or "")[:4096]}},
         timeout=TIMEOUT,
     )
-    try:
-        data = response.json()
-    except ValueError:
-        data = {}
-    if response.status_code >= 400 or "error" in data:
-        error = data.get("error") or {}
-        raise WhatsAppError(str(error.get("error_user_msg") or error.get("message") or f"WhatsApp returned HTTP {response.status_code}"))
+    data = _raise_for(response, context="send_text")
     messages = data.get("messages") or []
     return str(messages[0].get("id")) if messages else ""
 
@@ -156,13 +167,7 @@ def get_business_profile() -> dict[str, Any]:
         params={"fields": "about,address,description,email,profile_picture_url,websites,vertical"},
         timeout=TIMEOUT,
     )
-    try:
-        data = response.json()
-    except ValueError:
-        data = {}
-    if response.status_code >= 400 or "error" in data:
-        error = data.get("error") or {}
-        raise WhatsAppError(str(error.get("error_user_msg") or error.get("message") or f"WhatsApp returned HTTP {response.status_code}"))
+    data = _raise_for(response, context="get_business_profile")
     rows = data.get("data") or []
     return rows[0] if rows else {}
 
@@ -180,13 +185,7 @@ def update_business_profile(**fields: Any) -> None:
         json={"messaging_product": "whatsapp", **clean},
         timeout=TIMEOUT,
     )
-    try:
-        data = response.json()
-    except ValueError:
-        data = {}
-    if response.status_code >= 400 or "error" in data:
-        error = data.get("error") or {}
-        raise WhatsAppError(str(error.get("error_user_msg") or error.get("message") or f"WhatsApp returned HTTP {response.status_code}"))
+    _raise_for(response, context="update_business_profile")
 
 
 def download_media(media_id: str) -> tuple[bytes, str]:

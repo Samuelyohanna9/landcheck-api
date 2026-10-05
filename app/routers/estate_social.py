@@ -824,7 +824,10 @@ def reply_whatsapp_conversation(estate_id: int, phone: str, payload: WhatsappRep
         )
     except social_whatsapp.WhatsAppError as exc:
         db.commit()
-        raise HTTPException(502, str(exc)) from exc
+        detail = str(exc)
+        if exc.subcode:
+            detail = f"{detail} (code {exc.code}, subcode {exc.subcode})"
+        raise HTTPException(502, detail) from exc
     db.commit()
     return _message_payload(row)
 
