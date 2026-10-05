@@ -183,15 +183,19 @@ def publish_instagram_image(ig_user_id: str, token: str, image_url: str, caption
     return {"external_id": media_id, "url": permalink}
 
 
-def verify_account_token(external_id: str, stored_token: str) -> bool:
-    """True if a connected Page's (or Instagram account's) stored token still works - False if the
-    person's access was revoked, the Page was removed, or the token otherwise stopped working. Lets a
-    dead connection be caught proactively instead of only discovering it when a post fails."""
+def account_profile_info(external_id: str, token: str, provider: str) -> dict[str, Any] | None:
+    """The connected Page/Instagram account's own picture and follower count, read with the same
+    request that confirms the stored token still works - None if the token has been revoked. Doing
+    both in one call means refreshing the profile picture/count costs nothing extra beyond the health
+    check that already has to happen."""
+    fields = "picture.type(large){url},fan_count" if provider == "facebook" else "profile_picture_url,followers_count"
     try:
-        _get(external_id, fields="id", access_token=stored_token)
-        return True
+        data = _get(external_id, fields=fields, access_token=token)
     except MetaError:
-        return False
+        return None
+    if provider == "facebook":
+        return {"picture_url": ((data.get("picture") or {}).get("data") or {}).get("url"), "followers": data.get("fan_count")}
+    return {"picture_url": data.get("profile_picture_url"), "followers": data.get("followers_count")}
 
 
 def delete_facebook_post(post_id: str, page_token: str) -> None:

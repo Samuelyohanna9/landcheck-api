@@ -635,6 +635,16 @@ def meta_callback(code: str | None = None, state: str | None = None, error: str 
             row.status = "active"
             row.facebook_user_id = granted.get("facebook_user_id")
             row.connected_by_subject_type, row.connected_by_subject_id = subject_type, subject_id
+            # Best-effort: show the real profile picture/follower count right away rather than
+            # waiting for the next daily connection check to populate it.
+            try:
+                profile = social_meta.account_profile_info(external_id, page["access_token"], provider)
+                if profile:
+                    row.picture_url = profile.get("picture_url") or row.picture_url
+                    if profile.get("followers") is not None:
+                        row.followers_count = int(profile["followers"])
+            except Exception:
+                pass
             stored += 1
     db.commit()
     if not stored:

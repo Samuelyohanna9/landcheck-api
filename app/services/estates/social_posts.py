@@ -87,15 +87,22 @@ def _account_for(db: Session, organization_id: int, channel: str) -> EstateSocia
 
 def check_account(db: Session, account: EstateSocialAccount) -> bool:
     """Re-verifies a connected account's stored token still works and updates its status to match -
-    True if healthy. Catches a revoked connection proactively rather than waiting for a post to fail."""
+    True if healthy. Catches a revoked connection proactively rather than waiting for a post to fail.
+    The same call also refreshes the account's profile picture and follower count."""
     try:
         api_token = decrypt_text(account.access_token_enc)
     except SecretNotConfigured:
         account.status = "needs_reconnect"
         db.flush()
         return False
-    healthy = social_meta.verify_account_token(account.external_id, api_token)
+    profile = social_meta.account_profile_info(account.external_id, api_token, account.provider)
+    healthy = profile is not None
     account.status = "active" if healthy else "needs_reconnect"
+    if profile is not None:
+        account.picture_url = profile.get("picture_url") or account.picture_url
+        followers = profile.get("followers")
+        if followers is not None:
+            account.followers_count = int(followers)
     db.flush()
     return healthy
 
@@ -438,4 +445,7 @@ def run_social_sweeps(db: Session) -> None:
 
 def account_public(account: EstateSocialAccount) -> dict[str, Any]:
     """Never includes the token."""
-    return {"id": account.id, "provider": account.provider, "name": account.name, "username": account.username, "status": account.status, "linked_page_id": account.linked_page_id, "is_default": account.is_default}
+    return {
+        "id": account.id, "provider": account.provider, "name": account.name, "username": account.username, "status": account.status,
+        "linked_page_id": account.linked_page_id, "is_default": account.is_default, "picture_url": account.picture_url, "followers_count": account.followers_count,
+    }
