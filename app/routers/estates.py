@@ -35,7 +35,7 @@ from app.services.estates.authorization import list_estate_access, resolve_estat
 from app.services.estates.identity import generate_temp_password, hash_password, normalize_email, slugify
 from app.services.estates.entitlements import ESTATE_FEATURES, get_estate_entitlement
 from app.models.estate_foundation import Estate, EstateAgentPortalToken, EstateAllocation, EstateAuditEvent, EstateBlock, EstateCommissionPayout, EstateCommissionTier, EstateCustomer, EstateCustomerPortalToken, EstateDocument, EstateDocumentLink, EstateFieldInspection, EstateHazardAssessment, EstateImportReview, EstateLayoutProposal, EstateNotificationLog, EstateOrganization, EstateOrganizationMember, EstatePayment, EstatePaymentInbox, EstatePaymentRule, EstatePlot, EstatePublicReservationRequest, EstateQrCampaign, EstateSoilAssessment, EstateSpatialFeature, EstateStaffRole, EstateSurveyRequest, EstateStakingTask, GeotechSurveyRequest
-from app.schemas.estates import AllocationAction, BlockCreate, BlockUpdate, CommissionPayoutCreate, CommissionTiersUpdate, CustomerCreate, DevelopmentForecastPublishUpdate, DevelopmentStatusUpdate, EstateCreate, EstateLayoutCriteria, EstateLayoutDecision, EstateLayoutFeatureAdd, EstateLayoutFeatureRemove, EstateLayoutProposalEdit, EstateSubdivisionCreate, EstateUpdate, FieldInspectionCreate, GeoreferenceSessionLink, ImportFromGeoreference, ImportReviewCreate, ImportReviewDecision, ImportReviewFromGeoreferenceSession, MemberCreate, MemberUpdate, PaymentInboxCreate, PaymentInboxMatch, PlotCreate, PlotAddressUpdate, PlotGeometryUpdate, PlotListingDefaultsUpdate, PlotPriceUpdate, PortalTokenCreate, PublicEstateSettingsUpdate, PublicReservationConvert, PublicReservationCreate, PublicReservationUpdate, PaymentCreate, QrCampaignCreate, SpatialFeatureCreate, SpatialFeatureUpdate, StaffCreate, StaffRoleCreate, StaffRoleUpdate, StaffUpdate, SurveyEligibilityUpdate, VoidAction
+from app.schemas.estates import AllocationAction, BlockCreate, BlockUpdate, CommissionPayoutCreate, CommissionTiersUpdate, CustomerCreate, DevelopmentForecastPublishUpdate, DevelopmentStatusUpdate, EstateCreate, EstateLayoutCriteria, EstateLayoutDecision, EstateLayoutFeatureAdd, EstateLayoutFeatureRemove, EstateLayoutProposalEdit, EstateSubdivisionCreate, EstateUpdate, FieldInspectionCreate, GeoreferenceSessionLink, ImportFromGeoreference, ImportReviewCreate, ImportReviewDecision, ImportReviewFromGeoreferenceSession, MemberCreate, MemberUpdate, PaymentInboxCreate, PaymentInboxMatch, PlotCreate, PlotAddressUpdate, PlotGeometryUpdate, PlotListingDefaultsUpdate, PlotPriceUpdate, PortalTokenCreate, BulkCustomerSmsCreate, PublicEstateSettingsUpdate, PublicReservationConvert, PublicReservationCreate, PublicReservationUpdate, PaymentCreate, QrCampaignCreate, SpatialFeatureCreate, SpatialFeatureUpdate, StaffCreate, StaffRoleCreate, StaffRoleUpdate, StaffUpdate, SurveyEligibilityUpdate, VoidAction
 from app.services.estates.payments import confirm_payment, financial_summary, record_payment, void_payment
 from app.services.estates.documents import MAX_ESTATE_DOCUMENT_BYTES, read_private_estate_file, store_private_estate_file
 from app.utils.r2_objects import delete_object_best_effort, build_r2_settings
@@ -3922,6 +3922,46 @@ def list_customers(organization_id: int, request: Request, page: int = 1, page_s
     total = ordered.count()
     rows = ordered.offset((safe_page - 1) * safe_page_size).limit(safe_page_size).all()
     return {"items": [{"id": row.id, "name": row.full_name, "reference": row.reference_no} for row in rows], "page": safe_page, "page_size": safe_page_size, "total": total}
+
+
+@router.post("/{estate_id}/customers/sms")
+def send_bulk_customer_sms(estate_id: int, payload: BulkCustomerSmsCreate, request: Request, db: Session = Depends(get_db)):
+    """Hand-written SMS to one or more customers of this estate's company. Phone numbers are looked up
+    here from each customer's own record - the browser only ever sends customer ids and the text."""
+    estate = db.get(Estate, estate_id)
+    if estate is None:
+        raise HTTPException(404, "Estate not found")
+    access = require_estate_access(db, request, estate.organization_id, permission="customer.manage")
+    if not has_sms_access(get_subscription(db, estate.organization_id)):
+        raise HTTPException(403, "Sending SMS to customers is included in the Pro and Enterprise plans.")
+    if not estate_sms.configured():
+        raise HTTPException(503, "SMS is not switched on for this server yet.")
+    message = payload.message.strip()
+    if not message:
+        raise HTTPException(422, "Write a message first.")
+    customers = db.query(EstateCustomer).filter(EstateCustomer.organization_id == estate.organization_id, EstateCustomer.id.in_(set(payload.customer_ids))).all()
+    organization = db.get(EstateOrganization, estate.organization_id)
+    org_name = organization.name if organization else "Estate team"
+    sent = failed = skipped = 0
+    for customer in customers:
+        if not customer.phone:
+            skipped += 1
+            continue
+        message_id = estate_sms.send_manual_sms(to_phone=customer.phone, message=message)
+        status = "sent" if message_id else "failed"
+        if message_id:
+            sent += 1
+        else:
+            failed += 1
+        record_notification_log(
+            db, organization_id=estate.organization_id, estate_id=estate.id, customer_id=customer.id, allocation_id=None,
+            event_key="manual_sms", recipient_email=None, recipient_name=customer.full_name,
+            subject=message[:80], status=status, details={"phone": customer.phone, "message_id": message_id or None, "org": org_name, "chars": len(message)},
+            channel="sms",
+        )
+    append_estate_audit_event(db, organization_id=estate.organization_id, actor=access.principal, action="customer.sms_sent", entity_type="estate", entity_id=estate.id, after_data={"sent": sent, "failed": failed, "skipped_no_phone": skipped})
+    db.commit()
+    return {"sent": sent, "failed": failed, "skipped_no_phone": skipped, "requested": len(payload.customer_ids)}
 
 
 @router.post("/organizations/{organization_id}/customers")

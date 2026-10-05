@@ -123,6 +123,37 @@ def _sms_event_copy(
     return None
 
 
+MANUAL_SMS_MAX_CHARS = 320
+GSM_BASIC = set(
+    "@£$¥èéùìòÇ\nØø\rÅåΔ_ΦΓΛΩΠΨΣΘΞÆæßÉ !\"#¤%&'()*+,-./0123456789:;<=>?"
+    "¡ABCDEFGHIJKLMNOPQRSTUVWXYZÄÖÑÜ§¿abcdefghijklmnopqrstuvwxyzäöñüà"
+)
+GSM_EXTENDED = set("^{}\\[~]|€")
+
+
+def sms_segments(text: str) -> tuple[int, bool]:
+    """Returns (segment count, is_unicode). A single non-GSM character (like the naira sign) switches
+    the whole message to 70-character segments instead of 160 - worth showing staff before sending."""
+    is_gsm = all(ch in GSM_BASIC or ch in GSM_EXTENDED for ch in text)
+    length = sum(2 if ch in GSM_EXTENDED else 1 for ch in text) if is_gsm else len(text)
+    if is_gsm:
+        single, multi = 160, 153
+    else:
+        single, multi = 70, 67
+    if length == 0:
+        return 0, not is_gsm
+    return (1 if length <= single else -(-length // multi)), not is_gsm
+
+
+def send_manual_sms(*, to_phone: str, message: str) -> str | None:
+    """Sends one hand-written SMS. Returns Termii's message id, or None if it wasn't sent."""
+    try:
+        return _send_sms(to_phone=to_phone, message=message) or None
+    except Exception:
+        logger.exception("Manual SMS failed (to=%s)", to_phone)
+        return None
+
+
 def notify_customer_sms(
     *,
     to_phone: str | None,

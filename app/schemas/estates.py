@@ -387,3 +387,8 @@ class PublicReservationConvert(BaseModel):
     initial_payment_amount: Decimal | None = Field(default=None, gt=0)
     initial_payment_method: str | None = Field(default=None, max_length=64)
     notes: str | None = Field(default=None, max_length=4000)
+
+
+class BulkCustomerSmsCreate(BaseModel):
+    customer_ids: list[int] = Field(min_length=1, max_length=50)
+    message: str = Field(min_length=1, max_length=320)
