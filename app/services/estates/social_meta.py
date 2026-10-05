@@ -294,3 +294,9 @@ def post_comment(channel: str, object_id: str, token: str, message: str, *, repl
     else:
         data = _post(f"{object_id}/comments", message=message, access_token=token)
     return str(data.get("id") or "")
+
+
+def like_object(object_id: str, token: str) -> None:
+    """Likes a post, or a comment under it. Facebook needs pages_manage_engagement. Instagram's like
+    endpoint is newer and needs instagram_manage_engagement - its exact path is not yet verified here."""
+    _post(f"{object_id}/likes", access_token=token)

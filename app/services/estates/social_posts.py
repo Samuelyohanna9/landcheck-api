@@ -218,6 +218,7 @@ def _delete_channel(db: Session, post: EstateSocialPost, channel: str, external_
         else:
             social_meta.delete_instagram_post(external_id, token)
     except social_meta.MetaError as exc:
+        logger.error("Social delete refused by Meta (post=%s, channel=%s): %s [code=%s subcode=%s trace=%s]", post.id, channel, exc, exc.code, exc.subcode, exc.trace_id)
         return {"status": "failed", "error": str(exc), "account": account.name}
     except Exception as exc:
         logger.exception("Social delete failed (post=%s, channel=%s)", post.id, channel)
@@ -475,8 +476,34 @@ def comment_on_post(db: Session, post: EstateSocialPost, channel: str, message: 
     try:
         comment_id = social_meta.post_comment(channel, external_id, token, message, reply_to_id=reply_to_id)
     except social_meta.MetaError as exc:
+        logger.error("Social comment refused by Meta (post=%s, channel=%s): %s [code=%s subcode=%s trace=%s]", post.id, channel, exc, exc.code, exc.subcode, exc.trace_id)
         return {"status": "failed", "error": str(exc)}
     except Exception as exc:
         logger.exception("Social comment failed (post=%s, channel=%s)", post.id, channel)
         return {"status": "failed", "error": f"Could not reach {CHANNEL_LABEL[channel]}: {exc}"}
     return {"status": "ok", "comment_id": comment_id}
+
+
+def like_target(db: Session, post: EstateSocialPost, channel: str, target_id: str | None = None) -> dict[str, Any]:
+    """Likes the live post on this channel, or one of its comments when target_id is a comment id."""
+    current = (post.results or {}).get(channel) or {}
+    external_id = current.get("external_id")
+    if not external_id or current.get("status") != "ok":
+        return {"status": "failed", "error": "This post is not currently live on this channel."}
+    account = _account_for(db, post.organization_id, channel)
+    if account is None:
+        return {"status": "failed", "error": f"No {CHANNEL_LABEL[channel]} account is connected."}
+    try:
+        token = decrypt_text(account.access_token_enc)
+    except SecretNotConfigured as exc:
+        return {"status": "failed", "error": str(exc)}
+    db.commit()
+    try:
+        social_meta.like_object(target_id or external_id, token)
+    except social_meta.MetaError as exc:
+        logger.error("Social like refused by Meta (post=%s, channel=%s): %s [code=%s subcode=%s trace=%s]", post.id, channel, exc, exc.code, exc.subcode, exc.trace_id)
+        return {"status": "failed", "error": str(exc)}
+    except Exception as exc:
+        logger.exception("Social like failed (post=%s, channel=%s)", post.id, channel)
+        return {"status": "failed", "error": f"Could not reach {CHANNEL_LABEL[channel]}: {exc}"}
+    return {"status": "ok"}

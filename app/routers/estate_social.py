@@ -461,6 +461,24 @@ class PostComment(BaseModel):
     reply_to_id: str | None = Field(default=None, max_length=120)
 
 
+class PostLike(BaseModel):
+    target_id: str | None = Field(default=None, max_length=120)
+
+
+@router.post("/marketing/social/posts/{post_id}/channels/{channel}/like")
+def like_post_channel(post_id: int, channel: str, request: Request, payload: PostLike | None = None, db: Session = Depends(get_db)):
+    """Likes the live post, or a comment under it when target_id is given."""
+    post, _estate, access = _post_for_staff(db, request, post_id)
+    if channel not in list(post.channels or []) or channel not in ("facebook", "instagram"):
+        raise HTTPException(404, "Likes can only be added on a Facebook or Instagram post")
+    outcome = social_posts.like_target(db, post, channel, payload.target_id if payload else None)
+    if outcome.get("status") != "ok":
+        raise HTTPException(502, outcome.get("error") or "The like could not be added.")
+    append_estate_audit_event(db, organization_id=post.organization_id, actor=access.principal, action="social_post.liked", entity_type="estate_social_post", entity_id=post.id, after_data={"channel": channel, "comment": bool(payload and payload.target_id)})
+    db.commit()
+    return {"ok": True}
+
+
 @router.post("/marketing/social/posts/{post_id}/channels/{channel}/comment")
 def comment_post_channel(post_id: int, channel: str, payload: PostComment, request: Request, db: Session = Depends(get_db)):
     """Writes a comment on a live post, or replies to a comment (reply_to_id). Meta needs the matching
