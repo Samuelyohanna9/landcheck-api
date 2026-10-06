@@ -486,6 +486,9 @@ def comment_on_post(db: Session, post: EstateSocialPost, channel: str, message: 
 
 def like_target(db: Session, post: EstateSocialPost, channel: str, target_id: str | None = None) -> dict[str, Any]:
     """Likes the live post on this channel, or one of its comments when target_id is a comment id."""
+    if channel != "facebook":
+        # Instagram's Graph API has no like endpoint for this app's permissions - refuse here too, not only in the UI.
+        return {"status": "failed", "error": "Instagram does not allow liking through LandCheck."}
     current = (post.results or {}).get(channel) or {}
     external_id = current.get("external_id")
     if not external_id or current.get("status") != "ok":
