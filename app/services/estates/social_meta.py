@@ -26,7 +26,7 @@ import requests
 from app.services.estates.marketing_common import api_url
 from app.utils.secret_box import secret_configured
 
-SCOPES = ["pages_show_list", "pages_manage_posts", "pages_read_engagement", "instagram_basic", "instagram_content_publish", "business_management"]
+SCOPES = ["pages_show_list", "pages_manage_posts", "pages_read_engagement", "instagram_basic", "instagram_content_publish"]
 TIMEOUT = 30
 
 
