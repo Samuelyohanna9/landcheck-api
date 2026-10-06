@@ -671,6 +671,9 @@ def meta_callback(code: str | None = None, state: str | None = None, error: str 
                 has_default = db.query(EstateSocialAccount).filter(EstateSocialAccount.organization_id == organization_id, EstateSocialAccount.provider == provider, EstateSocialAccount.is_default.is_(True)).first() is not None
                 row = EstateSocialAccount(organization_id=organization_id, provider=provider, external_id=external_id, name=name, username=username, linked_page_id=linked, access_token_enc=token_enc, is_default=not has_default)
                 db.add(row)
+                # Autoflush is off, so flush now - otherwise the next candidate's default check
+                # cannot see this row and two accounts get is_default=True in the same INSERT.
+                db.flush()
             row.name, row.username, row.linked_page_id = name, username, linked
             row.access_token_enc = token_enc
             if granted.get("user_token"):
