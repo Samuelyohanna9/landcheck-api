@@ -23,7 +23,7 @@ from app.services.estates import marketing_render, social_broadcast, social_meta
 from app.services.estates.audit import append_estate_audit_event
 from app.services.estates.authorization import require_estate_access
 from app.services.estates.marketing_common import client_ip, normalize_phone_digits, public_page_url, throttled, web_url
-from app.services.estates.subscriptions import get_subscription, has_auto_posting_access
+from app.services.estates.subscriptions import get_subscription, has_auto_posting_access, has_whatsapp_access
 from app.services.estates.social_templates import ALL_CHANNELS, AUTOMATIC_CHANNELS, CHANNEL_FORMAT, CHANNEL_LABEL, MANUAL_CHANNELS
 from app.utils.r2_objects import build_public_url, build_r2_settings, upload_bytes
 from app.utils.secret_box import SecretNotConfigured, decrypt_text, encrypt_text, make_signed_token, read_signed_token, secret_configured
@@ -177,6 +177,7 @@ def social_overview(estate_id: int, request: Request, db: Session = Depends(get_
         "channels": [{"key": key, "label": CHANNEL_LABEL[key], "automatic": key in AUTOMATIC_CHANNELS, "format": CHANNEL_FORMAT[key]} for key in ALL_CHANNELS],
         "published": bool(estate.public_enabled and estate.public_slug),
         "auto_posting": has_auto_posting_access(get_subscription(db, estate.organization_id)),
+        "whatsapp_enabled": has_whatsapp_access(get_subscription(db, estate.organization_id)),
     }
 
 
@@ -555,6 +556,14 @@ def _require_auto_posting(db: Session, organization_id: int) -> None:
         )
 
 
+def _require_whatsapp(db: Session, organization_id: int) -> None:
+    if not has_whatsapp_access(get_subscription(db, organization_id)):
+        raise HTTPException(
+            status_code=402,
+            detail={"code": "upgrade_required", "feature": "whatsapp", "message": "WhatsApp chat with customers is available on the Pro and Enterprise plans. Upgrade to unlock it.", "suggested_plan": "pro"},
+        )
+
+
 @router.post("/{estate_id}/marketing/social/plans/preview")
 def preview_plan(estate_id: int, payload: PlanCreate, request: Request, db: Session = Depends(get_db)):
     estate, _access = _staff(db, request, estate_id, permission=WRITE)
@@ -838,6 +847,7 @@ def list_optins(estate_id: int, request: Request, db: Session = Depends(get_db))
 @router.post("/{estate_id}/marketing/social/whatsapp/broadcast", status_code=202)
 def whatsapp_broadcast(estate_id: int, payload: BroadcastCreate, request: Request, db: Session = Depends(get_db)):
     estate, access = _staff(db, request, estate_id, permission=WRITE)
+    _require_whatsapp(db, estate.organization_id)
     if not social_whatsapp.configured():
         raise HTTPException(503, "WhatsApp messaging is not switched on for this server yet.")
     if not (estate.public_enabled and estate.public_slug):
@@ -923,6 +933,7 @@ def _message_payload(row: EstateWhatsappMessage) -> dict:
 def list_whatsapp_contacts(estate_id: int, request: Request, search: str | None = None, db: Session = Depends(get_db)):
     """Customers of this company who have a phone number - the people a new WhatsApp chat can start with."""
     estate, _access = _staff(db, request, estate_id)
+    _require_whatsapp(db, estate.organization_id)
     query = db.query(EstateCustomer).filter(EstateCustomer.organization_id == estate.organization_id, EstateCustomer.phone.isnot(None))
     if search and search.strip():
         term = f"%{search.strip().lower()}%"
@@ -947,6 +958,7 @@ def start_whatsapp_chat(estate_id: int, payload: WhatsappNewChat, request: Reque
     to start a conversation, so the first message is always a template; free-text replies unlock on
     their side once they answer (handled by the normal reply endpoint)."""
     estate, access = _staff(db, request, estate_id, permission=WRITE)
+    _require_whatsapp(db, estate.organization_id)
     if not social_whatsapp.configured():
         raise HTTPException(503, "WhatsApp messaging is not switched on for this server yet.")
     if payload.preset not in social_whatsapp.PRESETS:
@@ -985,12 +997,14 @@ def start_whatsapp_chat(estate_id: int, payload: WhatsappNewChat, request: Reque
 @router.get("/{estate_id}/marketing/social/whatsapp/conversations")
 def list_whatsapp_conversations(estate_id: int, request: Request, db: Session = Depends(get_db)):
     estate, _access = _staff(db, request, estate_id)
+    _require_whatsapp(db, estate.organization_id)
     return {"items": whatsapp_inbox.conversations_for_estate(db, estate.id)}
 
 
 @router.get("/{estate_id}/marketing/social/whatsapp/conversations/{phone}/messages")
 def get_whatsapp_thread(estate_id: int, phone: str, request: Request, db: Session = Depends(get_db)):
     estate, _access = _staff(db, request, estate_id)
+    _require_whatsapp(db, estate.organization_id)
     rows = whatsapp_inbox.thread(db, estate.id, phone)
     whatsapp_inbox.mark_read(db, estate.id, phone)
     db.commit()
@@ -1004,6 +1018,7 @@ class WhatsappReply(BaseModel):
 @router.post("/{estate_id}/marketing/social/whatsapp/conversations/{phone}/reply")
 def reply_whatsapp_conversation(estate_id: int, phone: str, payload: WhatsappReply, request: Request, db: Session = Depends(get_db)):
     estate, access = _staff(db, request, estate_id, permission=WRITE)
+    _require_whatsapp(db, estate.organization_id)
     if not social_whatsapp.configured():
         raise HTTPException(503, "WhatsApp messaging is not switched on for this server yet.")
     if not whatsapp_inbox.can_reply_freely(db, estate.id, phone):
@@ -1031,6 +1046,7 @@ MAX_WHATSAPP_MEDIA_BYTES = 16 * 1024 * 1024  # WhatsApp's own ceiling varies by 
 @router.post("/{estate_id}/marketing/social/whatsapp/conversations/{phone}/reply-media")
 async def reply_whatsapp_conversation_media(estate_id: int, phone: str, request: Request, file: UploadFile = File(...), caption: str = Form(""), db: Session = Depends(get_db)):
     estate, access = _staff(db, request, estate_id, permission=WRITE)
+    _require_whatsapp(db, estate.organization_id)
     if not social_whatsapp.configured():
         raise HTTPException(503, "WhatsApp messaging is not switched on for this server yet.")
     if not whatsapp_inbox.can_reply_freely(db, estate.id, phone):
@@ -1076,7 +1092,8 @@ def get_whatsapp_profile(estate_id: int, request: Request, db: Session = Depends
     """Read-only: this is the one WhatsApp number shared by every LandCheck Estates company, so it
     isn't editable from an individual estate's dashboard - shown here only so staff can see what
     their customers see when a message arrives from it."""
-    _staff(db, request, estate_id)
+    estate, _access = _staff(db, request, estate_id)
+    _require_whatsapp(db, estate.organization_id)
     if not social_whatsapp.configured():
         return {"configured": False}
     try:
@@ -1100,6 +1117,7 @@ def send_customer_whatsapp_message(customer_id: int, payload: CustomerWhatsappMe
     if customer is None:
         raise HTTPException(404, "Customer not found")
     access = require_estate_access(db, request, customer.organization_id, permission=WRITE)
+    _require_whatsapp(db, customer.organization_id)
     if not customer.phone:
         raise HTTPException(422, "This customer has no phone number on file.")
     if payload.preset not in social_whatsapp.PRESETS:

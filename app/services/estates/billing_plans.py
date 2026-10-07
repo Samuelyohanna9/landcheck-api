@@ -20,6 +20,7 @@ class EstatePlanDefinition(TypedDict):
     auto_posting: bool
     soil_analysis: bool
     sms_notifications: bool
+    whatsapp: bool
     max_estates: int | None  # None = unlimited
 
 
@@ -32,6 +33,7 @@ ESTATE_PLANS: Final[dict[str, EstatePlanDefinition]] = {
         "auto_posting": False,
         "soil_analysis": False,
         "sms_notifications": False,
+        "whatsapp": False,
         "max_estates": 1,
     },
     "plus": {
@@ -42,6 +44,7 @@ ESTATE_PLANS: Final[dict[str, EstatePlanDefinition]] = {
         "auto_posting": False,
         "soil_analysis": False,
         "sms_notifications": False,
+        "whatsapp": False,
         "max_estates": 3,
     },
     "pro": {
@@ -52,6 +55,7 @@ ESTATE_PLANS: Final[dict[str, EstatePlanDefinition]] = {
         "auto_posting": True,
         "soil_analysis": True,
         "sms_notifications": True,
+        "whatsapp": True,
         "max_estates": 6,
     },
     "enterprise": {
@@ -62,6 +66,7 @@ ESTATE_PLANS: Final[dict[str, EstatePlanDefinition]] = {
         "auto_posting": True,
         "soil_analysis": True,
         "sms_notifications": True,
+        "whatsapp": True,
         "max_estates": None,
     },
 }
@@ -111,3 +116,7 @@ def plan_includes_soil_analysis(plan_key: str) -> bool:
 
 def plan_includes_sms_notifications(plan_key: str) -> bool:
     return bool(ESTATE_PLANS.get(plan_key, {}).get("sms_notifications", False))
+
+
+def plan_includes_whatsapp(plan_key: str) -> bool:
+    return bool(ESTATE_PLANS.get(plan_key, {}).get("whatsapp", False))
