@@ -13790,10 +13790,42 @@ def list_public_partner_organizations(db: Session = Depends(get_db)):
         {
             "id": row["id"],
             "name": row["name"],
-            "logo_url": _normalize_logo_asset_path(row["logo_url"]),
+            # Not _normalize_logo_asset_path(row["logo_url"]) - that resolves to the general
+            # /green/uploads/object/<key> route, which the session middleware (app/main.py's
+            # _requires_green_session) correctly keeps private, since that same route can serve
+            # any uploaded object, including private tree/task evidence photos (their storage keys
+            # also happen to start with "organizations/..." - see _build_scoped_upload_folder).
+            # This public listing needs a URL an anonymous visitor's <img> tag can load, so it
+            # points at the dedicated, narrowly-scoped public-logo route below instead, which only
+            # ever serves the one logo already on file for this exact organization id.
+            "logo_url": f"/green/public/organizations/{row['id']}/logo",
         }
         for row in rows
     ]
+
+
+@router.get("/public/organizations/{organization_id}/logo")
+def get_public_organization_logo(organization_id: int, db: Session = Depends(get_db)):
+    """The only public way to read an uploaded photo from Green's object storage - deliberately
+    narrow (one fixed column, looked up by this organization's own id, never a caller-supplied
+    key) so it can't be broadened into exposing any other uploaded object. See the comment on
+    list_public_partner_organizations above for why the general uploads/object route can't be
+    used here."""
+    row = db.execute(
+        text("SELECT logo_url FROM green_organizations WHERE id = :organization_id AND COALESCE(is_active, TRUE) = TRUE"),
+        {"organization_id": organization_id},
+    ).mappings().first()
+    raw_logo_url = str((row or {}).get("logo_url") or "").strip()
+    if not raw_logo_url:
+        raise HTTPException(status_code=404, detail="Logo not found.")
+    normalized = _normalize_logo_asset_path(raw_logo_url)
+    if normalized and normalized.startswith("/green/uploads/object/"):
+        object_key = normalized[len("/green/uploads/object/") :]
+        return _stream_uploaded_photo_object(object_key)
+    candidate = normalized or raw_logo_url
+    if candidate.lower().startswith(("http://", "https://")):
+        return RedirectResponse(candidate, status_code=302)
+    raise HTTPException(status_code=404, detail="Logo not found.")
 
 
 @router.get("/public/impact-stats")
