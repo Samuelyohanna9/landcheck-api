@@ -17,7 +17,7 @@ from sqlalchemy.orm import Session
 
 from app.models.estate_foundation import Estate, EstateAllocation, EstateCustomer, EstateOrganization, EstatePlot
 from app.models.estate_social import EstateMarketingOptin, EstateSocialAccount, EstateSocialPlan, EstateSocialPost, EstateWhatsappMessage, EstateWhatsappSend
-from app.routers.estate_marketing import NO_CACHE_PRIVATE, _campaign_for_staff, _png, _staff
+from app.routers.estate_marketing import NO_CACHE_PRIVATE, _campaign_for_staff, _png, _staff, _staff_view
 from app.routers.plots import get_db
 from app.services.estates import marketing_render, social_broadcast, social_meta, social_planner, social_posts, social_templates, social_whatsapp, whatsapp_inbox
 from app.services.estates.audit import append_estate_audit_event
@@ -168,7 +168,7 @@ def _company_name(db: Session, estate: Estate) -> str:
 # ── Overview, templates, image ───────────────────────────────────────────────────────────────
 @router.get("/{estate_id}/marketing/social/overview")
 def social_overview(estate_id: int, request: Request, db: Session = Depends(get_db)):
-    estate, _access = _staff(db, request, estate_id)
+    estate, _access = _staff_view(db, request, estate_id)
     accounts = db.query(EstateSocialAccount).filter(EstateSocialAccount.organization_id == estate.organization_id).order_by(EstateSocialAccount.provider, EstateSocialAccount.name).all()
     return {
         "meta_available": social_meta.configured(),
