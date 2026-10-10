@@ -133,3 +133,30 @@ def require_estate_access(
         if not is_access_active(subscription):
             raise HTTPException(status_code=402, detail={"code": "subscription_required", "message": "Choose a plan to continue using LandCheck Estates."})
     return access
+
+
+def require_estate_view_access(
+    db: Session,
+    request: Request,
+    organization_id: int,
+    *,
+    permission: str | None = None,
+) -> EstateAccess:
+    """Like require_estate_access, but for read-only endpoints an organisation should still be
+    able to reach after its trial/subscription lapses: the map and plot register, customers,
+    payments, and agents - viewing what's already on record, not performing billed actions.
+
+    A lapsed subscription (past_due/canceled/expired) still has a subscription row, just not an
+    active one - is_access_active() is False for it, but get_subscription() is not None. Only an
+    organisation that never subscribed at all (no row - status "none") is still blocked here, since
+    there is nothing on record to view and no grandfathering ever applied to it.
+
+    Every write/mutating endpoint, every billed feature (hazard analysis, soil analysis, exports,
+    auto-posting, SMS/WhatsApp), and the bulk of Estates endpoints still call the stricter
+    require_estate_access - this exists only for the specific "let them see their own records"
+    views named above.
+    """
+    access = require_estate_access(db, request, organization_id, permission=permission, require_subscription=False)
+    if get_subscription(db, organization_id) is None:
+        raise HTTPException(status_code=402, detail={"code": "subscription_required", "message": "Choose a plan to continue using LandCheck Estates."})
+    return access
