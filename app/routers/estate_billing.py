@@ -157,7 +157,7 @@ def start_checkout(payload: ChoosePlanRequest, organization_id: int, request: Re
 
     existing = get_subscription(db, organization_id)
     if account.trial_claimed_at is not None or (existing and (existing.trial_ends_at is not None or existing.status in {"trialing", "active"})):
-        raise HTTPException(409, "This account has already used its free trial. Use billing recovery to pay for the subscription.")
+        raise HTTPException(409, "This account has already used its free trial. Go to Billing & plan in the dashboard to subscribe.")
 
     email = str(account.email or organization.contact_email or "").strip()
     if not email:
