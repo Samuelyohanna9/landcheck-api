@@ -43,7 +43,7 @@ from app.services.estates.permissions import PERMISSION_CATALOG, has_permission,
 from sqlalchemy import func
 from app.services.estates.allocations import release_allocation, reserve_or_allocate
 from app.services.estates.audit import append_estate_audit_event
-from app.services.estates.authorization import EstatePrincipal, require_estate_access
+from app.services.estates.authorization import EstatePrincipal, require_estate_access, require_estate_view_access
 from app.services.estates.billing_plans import next_plan_with_estates, plan_label
 from app.services.estates.subscriptions import estate_limit_for, get_subscription, has_hazard_access, has_sms_access, has_soil_analysis_access
 from app.services.estates.survey_requests import transition
@@ -1024,7 +1024,7 @@ def approve_estate_map(estate_id: int, request: Request, db: Session = Depends(g
 def estate_dashboard(estate_id: int, request: Request, db: Session = Depends(get_db)):
     estate = db.get(Estate, estate_id)
     if not estate: raise HTTPException(404, "Estate not found")
-    require_estate_access(db, request, estate.organization_id, permission="estate.read"); _enabled(db, estate.organization_id)
+    require_estate_view_access(db, request, estate.organization_id, permission="estate.read"); _enabled(db, estate.organization_id)
     status_rows = db.query(EstatePlot.commercial_status, func.count(EstatePlot.id)).filter(EstatePlot.estate_id == estate_id).group_by(EstatePlot.commercial_status).all()
     development_rows = db.query(EstatePlot.development_status, func.count(EstatePlot.id)).filter(EstatePlot.estate_id == estate_id).group_by(EstatePlot.development_status).all()
     counts = {key: int(dict(status_rows).get(key, 0)) for key in ("available", "reserved", "allocated", "on_hold")}
@@ -1584,7 +1584,7 @@ def convert_public_reservation_request(
 def estate_plots_geojson(estate_id: int, request: Request, db: Session = Depends(get_db)):
     estate=db.get(Estate,estate_id)
     if not estate: raise HTTPException(404,"Estate not found")
-    require_estate_access(db,request,estate.organization_id,permission="plot.read")
+    require_estate_view_access(db,request,estate.organization_id,permission="plot.read")
     rows = db.query(
         EstatePlot.id,
         EstatePlot.plot_number,
@@ -1614,7 +1614,7 @@ def estate_plots_geojson(estate_id: int, request: Request, db: Session = Depends
 def estate_layers_geojson(estate_id:int, request:Request, db:Session=Depends(get_db)):
     estate=db.get(Estate,estate_id)
     if not estate: raise HTTPException(404,"Estate not found")
-    require_estate_access(db,request,estate.organization_id,permission="infrastructure.read")
+    require_estate_view_access(db,request,estate.organization_id,permission="infrastructure.read")
     rows=db.query(EstateSpatialFeature).filter(EstateSpatialFeature.estate_id==estate_id, EstateSpatialFeature.status=="active").all()
     return {"type":"FeatureCollection","features":[{"type":"Feature","id":row.id,"properties":{"id":row.id,"type":row.feature_type,"name":row.name,"status":row.status},"geometry":mapping(to_shape(row.geometry))} for row in rows]}
 
@@ -1624,7 +1624,7 @@ def list_estate_blocks(estate_id: int, request: Request, db: Session = Depends(g
     estate = db.get(Estate, estate_id)
     if not estate:
         raise HTTPException(404, "Estate not found")
-    require_estate_access(db, request, estate.organization_id, permission="plot.read")
+    require_estate_view_access(db, request, estate.organization_id, permission="plot.read")
     rows = db.query(EstateBlock).filter(EstateBlock.estate_id == estate_id).order_by(EstateBlock.label.asc()).all()
     return [{"id": row.id, "label": row.label, "name": row.name, "notes": row.notes, "geometry": mapping(to_shape(row.geometry)) if row.geometry else None} for row in rows]
 
@@ -3905,7 +3905,7 @@ def complete_staking_task(task_id:int,request:Request,db:Session=Depends(get_db)
 
 @router.get("/organizations/{organization_id}/customers")
 def list_customers(organization_id: int, request: Request, page: int = 1, page_size: int = 25, search: str | None = None, db: Session = Depends(get_db)):
-    require_estate_access(db, request, organization_id, permission="customer.read")
+    require_estate_view_access(db, request, organization_id, permission="customer.read")
     query = db.query(EstateCustomer).filter(EstateCustomer.organization_id == organization_id)
     if search and search.strip():
         term = f"%{search.strip().lower()}%"
@@ -4015,7 +4015,7 @@ def list_sales_agents(organization_id: int, request: Request, db: Session = Depe
     """Any active org member can be tagged as the sales agent on a reservation/allocation - not
     just members with the "sales" role, since a manager or owner closing a deal directly should be
     creditable too."""
-    require_estate_access(db, request, organization_id, permission="allocation.manage")
+    require_estate_view_access(db, request, organization_id, permission="allocation.manage")
     rows = db.query(EstateOrganizationMember).filter(EstateOrganizationMember.organization_id == organization_id, EstateOrganizationMember.is_active.is_(True)).all()
     tiers = commissions._tier_dicts(commissions.get_commission_tiers(db, organization_id))
     results = []
@@ -4040,7 +4040,7 @@ def list_sales_agents(organization_id: int, request: Request, db: Session = Depe
 
 @router.get("/organizations/{organization_id}/commission-tiers")
 def get_commission_tiers_endpoint(organization_id: int, request: Request, db: Session = Depends(get_db)):
-    require_estate_access(db, request, organization_id, permission="estate.read")
+    require_estate_view_access(db, request, organization_id, permission="estate.read")
     rows = commissions.get_commission_tiers(db, organization_id)
     if not rows:
         return {"organization_id": organization_id, "tiers": [{"label": t["label"], "min_cumulative_sales": str(t["min_cumulative_sales"]), "rate_percent": str(t["rate_percent"])} for t in commissions.DEFAULT_TIERS], "using_defaults": True}
@@ -4064,7 +4064,7 @@ def set_commission_tiers_endpoint(organization_id: int, payload: CommissionTiers
 
 @router.get("/organizations/{organization_id}/commissions")
 def commission_report(organization_id: int, request: Request, page: int | None = None, page_size: int = 25, db: Session = Depends(get_db)):
-    require_estate_access(db, request, organization_id, permission="payment.read")
+    require_estate_view_access(db, request, organization_id, permission="payment.read")
     rows = db.query(EstateAllocation).filter(
         EstateAllocation.organization_id == organization_id,
         EstateAllocation.status == "allocated",
@@ -4116,7 +4116,7 @@ def sales_agent_detail(organization_id: int, subject_type: str, subject_id: str,
     """Everything tied to one sales agent - every plot they're attached to (reserved or
     allocated), each one's own payment status, and the commission it has actually earned (locked
     in only once a sale reaches Allocated - see commissions.py) versus still pending that."""
-    require_estate_access(db, request, organization_id, permission="payment.read")
+    require_estate_view_access(db, request, organization_id, permission="payment.read")
     display_name = subject_id
     role = None
     if subject_type == "estate_account":
@@ -4569,7 +4569,7 @@ def void(payment_id:int,payload:VoidAction,request:Request,db:Session=Depends(ge
 def allocation_summary(allocation_id:int,request:Request,db:Session=Depends(get_db)):
     allocation=db.get(EstateAllocation,allocation_id)
     if not allocation: raise HTTPException(404,"Allocation not found")
-    require_estate_access(db,request,allocation.organization_id,permission="payment.read"); result=financial_summary(db,allocation)
+    require_estate_view_access(db,request,allocation.organization_id,permission="payment.read"); result=financial_summary(db,allocation)
     return {"agreed_price":str(result.agreed_price),"confirmed_paid":str(result.confirmed_paid),"pending_paid":str(result.pending_paid),"outstanding":str(result.outstanding),"percentage":str(result.percentage),"fully_paid":result.outstanding==0 and result.agreed_price>0}
 
 @router.post("/payments/{payment_id}/evidence")
@@ -4627,7 +4627,7 @@ def download_document(document_id:int, request:Request, db:Session=Depends(get_d
 def customer_statement(customer_id:int, request:Request, estate_id:int|None=None, allocation_id:int|None=None, db:Session=Depends(get_db)):
     customer=db.get(EstateCustomer,customer_id)
     if not customer: raise HTTPException(404,"Customer not found")
-    access=require_estate_access(db,request,customer.organization_id,permission="payment.read")
+    access=require_estate_view_access(db,request,customer.organization_id,permission="payment.read")
     allocations=db.query(EstateAllocation).filter(EstateAllocation.customer_id==customer_id, EstateAllocation.organization_id==customer.organization_id)
     if estate_id: allocations=allocations.filter(EstateAllocation.estate_id==estate_id)
     if allocation_id: allocations=allocations.filter(EstateAllocation.id==allocation_id)
@@ -4704,7 +4704,7 @@ def customer_statement_pdf(customer_id: int, request: Request, estate_id: int | 
 def allocation_financial_detail(allocation_id:int,request:Request,db:Session=Depends(get_db)):
     allocation=db.get(EstateAllocation,allocation_id)
     if not allocation: raise HTTPException(404,"Allocation not found")
-    require_estate_access(db,request,allocation.organization_id,permission="payment.read")
+    require_estate_view_access(db,request,allocation.organization_id,permission="payment.read")
     summary=financial_summary(db,allocation); customer=db.get(EstateCustomer,allocation.customer_id); plot=db.get(EstatePlot,allocation.plot_id); estate=db.get(Estate,allocation.estate_id)
     payments=db.query(EstatePayment).filter(EstatePayment.allocation_id==allocation.id).order_by(EstatePayment.payment_date.desc()).all()
     return {"allocation":{"id":allocation.id,"status":allocation.status,"allocation_date":allocation.allocation_date,"payment_plan":allocation.payment_plan},"customer":{"id":customer.id,"name":customer.full_name,"reference":customer.reference_no,"phone":customer.phone,"email":customer.email},"estate":{"id":estate.id,"name":estate.name},"plot":{"id":plot.id,"number":plot.plot_number},"financial":{"agreed_price":str(summary.agreed_price),"confirmed_paid":str(summary.confirmed_paid),"pending_paid":str(summary.pending_paid),"outstanding":str(summary.outstanding),"percentage":str(summary.percentage),"fully_paid":summary.agreed_price>0 and summary.outstanding==0},"payments":[{"id":p.id,"date":p.payment_date,"amount":str(p.amount),"status":p.status,"method":p.payment_method,"reference":p.reference_no} for p in payments]}
@@ -4714,7 +4714,7 @@ def allocation_record(allocation_id: int, request: Request, db: Session = Depend
     allocation = db.get(EstateAllocation, allocation_id)
     if not allocation:
         raise HTTPException(404, "Allocation not found")
-    require_estate_access(db, request, allocation.organization_id, permission="payment.read")
+    require_estate_view_access(db, request, allocation.organization_id, permission="payment.read")
     customer = db.get(EstateCustomer, allocation.customer_id)
     estate = db.get(Estate, allocation.estate_id)
     plot = db.get(EstatePlot, allocation.plot_id)
@@ -4762,7 +4762,7 @@ def allocation_record(allocation_id: int, request: Request, db: Session = Depend
 def customer_financial_detail(customer_id:int,request:Request,db:Session=Depends(get_db)):
     customer=db.get(EstateCustomer,customer_id)
     if not customer: raise HTTPException(404,"Customer not found")
-    require_estate_access(db,request,customer.organization_id,permission="payment.read")
+    require_estate_view_access(db,request,customer.organization_id,permission="payment.read")
     allocations=db.query(EstateAllocation).filter(EstateAllocation.customer_id==customer_id, EstateAllocation.organization_id==customer.organization_id).all(); rows=[]
     for allocation in allocations:
         summary=financial_summary(db,allocation); estate=db.get(Estate,allocation.estate_id); plot=db.get(EstatePlot,allocation.plot_id)
@@ -4773,7 +4773,7 @@ def customer_financial_detail(customer_id:int,request:Request,db:Session=Depends
 def estate_financial_summary(estate_id:int,request:Request,db:Session=Depends(get_db)):
     estate=db.get(Estate,estate_id)
     if not estate: raise HTTPException(404,"Estate not found")
-    require_estate_access(db,request,estate.organization_id,permission="payment.read")
+    require_estate_view_access(db,request,estate.organization_id,permission="payment.read")
     allocations=db.query(EstateAllocation).filter(EstateAllocation.estate_id==estate_id).all(); summaries=_bulk_financial_summaries(db, allocations).values()
     return {"estate":{"id":estate.id,"name":estate.name},"contracted_sales":str(sum((s["agreed_price"] for s in summaries),Decimal(0))),"confirmed_collections":str(sum((s["confirmed_paid"] for s in summaries),Decimal(0))),"pending_collections":str(sum((s["pending_paid"] for s in summaries),Decimal(0))),"outstanding_balance":str(sum((s["outstanding"] for s in summaries),Decimal(0))),"fully_paid_allocations":sum(1 for s in summaries if s["agreed_price"]>0 and s["outstanding"]==0),"allocations_with_outstanding":sum(1 for s in summaries if s["outstanding"]>0)}
 
@@ -4887,7 +4887,7 @@ def payment_receipt_pdf(payment_id: int, request: Request, db: Session = Depends
 def payment_detail(payment_id:int,request:Request,db:Session=Depends(get_db)):
     payment=db.get(EstatePayment,payment_id)
     if not payment: raise HTTPException(404,"Payment not found")
-    access=require_estate_access(db,request,payment.organization_id,permission="payment.read")
+    access=require_estate_view_access(db,request,payment.organization_id,permission="payment.read")
     allocation=db.get(EstateAllocation,payment.allocation_id); customer=db.get(EstateCustomer,payment.customer_id); plot=db.get(EstatePlot,payment.plot_id); estate=db.get(Estate,allocation.estate_id); summary=financial_summary(db,allocation)
     evidence=db.query(EstateDocument).join(EstateDocumentLink,EstateDocumentLink.document_id==EstateDocument.id).filter(EstateDocumentLink.entity_type=="payment",EstateDocumentLink.entity_id==str(payment_id)).all()
     return {"payment":{"id":payment.id,"amount":str(payment.amount),"currency":payment.currency,"date":payment.payment_date,"method":payment.payment_method,"reference":payment.reference_no,"receipt_number":payment.receipt_number,"notes":payment.notes,"status":payment.status,"recorded_by":payment.recorded_by_subject_id,"confirmed_by":payment.confirmed_by_subject_id,"confirmed_at":payment.confirmed_at,"void_reason":payment.void_reason},"customer":{"id":customer.id,"name":customer.full_name},"estate":{"id":estate.id,"name":estate.name},"plot":{"id":plot.id,"number":plot.plot_number},"allocation_id":allocation.id,"financial":{"agreed_price":str(summary.agreed_price),"confirmed":str(summary.confirmed_paid),"pending":str(summary.pending_paid),"outstanding":str(summary.outstanding)},"capabilities":{"can_confirm":has_permission(access.role_key,"payment.manage") and payment.status in {"recorded","pending_confirmation"},"can_void":has_permission(access.role_key,"payment.manage") and payment.status not in {"voided","reversed"},"can_view_receipt":has_permission(access.role_key,"document.read")},"evidence":[{"id":d.id,"filename":d.original_filename,"mime_type":d.mime_type} for d in evidence]}
@@ -5472,7 +5472,7 @@ def estate_detail(estate_id: int, request: Request, db: Session = Depends(get_db
     estate = db.get(Estate, estate_id)
     if not estate:
         raise HTTPException(404, "Estate not found")
-    require_estate_access(db, request, estate.organization_id, permission="estate.read")
+    require_estate_view_access(db, request, estate.organization_id, permission="estate.read")
     return {
         "id": estate.id,
         "uid": estate.estate_uid,
