@@ -3182,7 +3182,7 @@ def plot_timeline(plot_id: int, request: Request, db: Session = Depends(get_db))
     if not plot:
         raise HTTPException(404, "Plot not found")
     estate = db.get(Estate, plot.estate_id)
-    require_estate_access(db, request, estate.organization_id, permission="audit.read")
+    require_estate_view_access(db, request, estate.organization_id, permission="audit.read")
 
     allocation_ids = [str(row.id) for row in db.query(EstateAllocation.id).filter(EstateAllocation.plot_id == plot_id).all()]
     payment_ids = [str(row.id) for row in db.query(EstatePayment.id).filter(EstatePayment.plot_id == plot_id).all()]
@@ -3492,7 +3492,7 @@ def create_field_inspection(plot_id:int, payload:FieldInspectionCreate, request:
 def list_field_inspections(plot_id:int, request:Request, db:Session=Depends(get_db)):
     plot=db.get(EstatePlot,plot_id)
     if not plot: raise HTTPException(404,"Plot not found")
-    estate=db.get(Estate,plot.estate_id); require_estate_access(db,request,estate.organization_id,permission="field.read")
+    estate=db.get(Estate,plot.estate_id); require_estate_view_access(db,request,estate.organization_id,permission="field.read")
     rows=db.query(EstateFieldInspection).filter(EstateFieldInspection.plot_id==plot.id).order_by(EstateFieldInspection.inspected_at.desc()).all()
     return [{"id":row.id,"type":row.inspection_type,"outcome":row.outcome,"notes":row.notes,"inspected_at":row.inspected_at,"inspected_by":row.inspected_by_subject_id} for row in rows]
 
@@ -3537,7 +3537,7 @@ def list_survey_requests(request: Request, estate_id: int | None = None, page: i
 def survey_request_detail(request_id:int,request:Request,db:Session=Depends(get_db)):
     row=db.get(EstateSurveyRequest,request_id)
     if not row: raise HTTPException(404,"Survey request not found")
-    require_estate_access(db,request,row.organization_id,permission="survey.read")
+    require_estate_view_access(db,request,row.organization_id,permission="survey.read")
     return _survey_payload(db,row)
 
 @router.post("/survey-requests/{request_id}/assign")
@@ -4587,7 +4587,7 @@ async def upload_payment_evidence(payment_id:int, request:Request, file:UploadFi
 def download_payment_evidence(payment_id:int,document_id:int,request:Request,db:Session=Depends(get_db)):
     payment=db.get(EstatePayment,payment_id); document=db.get(EstateDocument,document_id)
     if not payment or not document or document.organization_id != payment.organization_id or not db.query(EstateDocumentLink).filter(EstateDocumentLink.document_id==document_id,EstateDocumentLink.entity_type=="payment",EstateDocumentLink.entity_id==str(payment_id)).first(): raise HTTPException(404,"Evidence not found")
-    access=require_estate_access(db,request,payment.organization_id,permission="document.read"); data,mime=read_private_estate_file(document.object_key); append_estate_audit_event(db,organization_id=payment.organization_id,actor=access.principal,action="payment.evidence_downloaded",entity_type="estate_document",entity_id=document.id); db.commit()
+    access=require_estate_view_access(db,request,payment.organization_id,permission="document.read"); data,mime=read_private_estate_file(document.object_key); append_estate_audit_event(db,organization_id=payment.organization_id,actor=access.principal,action="payment.evidence_downloaded",entity_type="estate_document",entity_id=document.id); db.commit()
     return Response(data,media_type=mime,headers={"Content-Disposition":f'inline; filename="{document.original_filename}"'})
 
 def _linked_entity_organization(db: Session, entity_type: str, entity_id: int) -> int | None:
@@ -4620,7 +4620,7 @@ async def upload_document(entity_type: str, entity_id: int, document_type: str, 
 def download_document(document_id:int, request:Request, db:Session=Depends(get_db)):
     document=db.get(EstateDocument,document_id)
     if not document: raise HTTPException(404,"Document not found")
-    access=require_estate_access(db,request,document.organization_id,permission="document.read"); data,mime=read_private_estate_file(document.object_key); append_estate_audit_event(db,organization_id=document.organization_id,actor=access.principal,action="document.downloaded",entity_type="estate_document",entity_id=document.id); db.commit()
+    access=require_estate_view_access(db,request,document.organization_id,permission="document.read"); data,mime=read_private_estate_file(document.object_key); append_estate_audit_event(db,organization_id=document.organization_id,actor=access.principal,action="document.downloaded",entity_type="estate_document",entity_id=document.id); db.commit()
     return Response(data,media_type=mime,headers={"Content-Disposition":f'inline; filename="{document.original_filename}"'})
 
 @router.get("/customers/{customer_id}/statement")
@@ -4870,7 +4870,7 @@ def payment_receipt_pdf(payment_id: int, request: Request, db: Session = Depends
     payment = db.get(EstatePayment, payment_id)
     if not payment:
         raise HTTPException(404, "Payment not found")
-    access = require_estate_access(db, request, payment.organization_id, permission="document.read")
+    access = require_estate_view_access(db, request, payment.organization_id, permission="document.read")
     allocation = db.get(EstateAllocation, payment.allocation_id); customer = db.get(EstateCustomer, payment.customer_id); plot = db.get(EstatePlot, payment.plot_id); estate = db.get(Estate, allocation.estate_id) if allocation else None
     buffer = io.BytesIO(); pdf = canvas.Canvas(buffer, pagesize=A4); width, height = A4
     pdf.setTitle(payment.receipt_number or f"Payment receipt {payment.id}"); pdf.setFont("Helvetica-Bold", 19); pdf.drawString(42, height - 65, "LandCheck Estate payment receipt")
