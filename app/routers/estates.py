@@ -3166,7 +3166,7 @@ def estate_hazard_dashboard(estate_id: int, request: Request, db: Session = Depe
 def estate_activity(estate_id:int, request:Request, limit:int=100, db:Session=Depends(get_db)):
     estate=db.get(Estate,estate_id)
     if not estate: raise HTTPException(404,"Estate not found")
-    require_estate_access(db,request,estate.organization_id,permission="audit.read")
+    require_estate_view_access(db,request,estate.organization_id,permission="audit.read")
     rows=db.query(EstateAuditEvent).filter(EstateAuditEvent.organization_id==estate.organization_id).order_by(EstateAuditEvent.created_at.desc()).limit(min(max(limit,1),200)).all()
     return [{"id":row.id,"action":row.action,"entity_type":row.entity_type,"entity_id":row.entity_id,"actor":row.actor_subject_id,"created_at":row.created_at,"details":row.after_data} for row in rows]
 
@@ -4935,7 +4935,7 @@ def estate_operations_summary(estate_id: int, request: Request, db: Session = De
     estate = db.get(Estate, estate_id)
     if not estate:
         raise HTTPException(404, "Estate not found")
-    require_estate_access(db, request, estate.organization_id, permission="estate.read")
+    require_estate_view_access(db, request, estate.organization_id, permission="estate.read")
     return build_operations_summary(db, estate)
 
 
@@ -4944,7 +4944,7 @@ def estate_document_readiness(estate_id: int, request: Request, db: Session = De
     estate = db.get(Estate, estate_id)
     if not estate:
         raise HTTPException(404, "Estate not found")
-    require_estate_access(db, request, estate.organization_id, permission="document.read")
+    require_estate_view_access(db, request, estate.organization_id, permission="document.read")
     allocations = db.query(EstateAllocation).filter(EstateAllocation.estate_id == estate_id, EstateAllocation.status.in_(("reserved", "allocated"))).order_by(EstateAllocation.created_at.desc()).all()
     result = []
     for allocation in allocations:
@@ -5393,7 +5393,7 @@ def list_qr_campaigns(estate_id: int, request: Request, db: Session = Depends(ge
     estate = db.get(Estate, estate_id)
     if not estate:
         raise HTTPException(404, "Estate not found")
-    require_estate_access(db, request, estate.organization_id, permission="estate.read")
+    require_estate_view_access(db, request, estate.organization_id, permission="estate.read")
     return [_qr_campaign_payload(row, estate) for row in db.query(EstateQrCampaign).filter(EstateQrCampaign.estate_id == estate_id).order_by(EstateQrCampaign.created_at.desc()).all()]
 
 
@@ -5496,7 +5496,7 @@ def estate_detail(estate_id: int, request: Request, db: Session = Depends(get_db
 
 @router.get("/organizations/{organization_id}/members")
 def list_organization_members(organization_id: int, request: Request, page: int | None = None, page_size: int = 25, search: str | None = None, db: Session = Depends(get_db)):
-    require_estate_access(db, request, organization_id, permission="estate.manage")
+    require_estate_view_access(db, request, organization_id, permission="estate.manage")
     query = db.query(EstateOrganizationMember).filter(EstateOrganizationMember.organization_id == organization_id)
     if search and search.strip():
         term = f"%{search.strip().lower()}%"
