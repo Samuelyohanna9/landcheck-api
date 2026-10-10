@@ -1067,7 +1067,7 @@ def get_public_estate_settings(estate_id: int, request: Request, db: Session = D
     estate = db.get(Estate, estate_id)
     if not estate:
         raise HTTPException(404, "Estate not found")
-    require_estate_access(db, request, estate.organization_id, permission="estate.read")
+    require_estate_view_access(db, request, estate.organization_id, permission="estate.read")
     _enabled(db, estate.organization_id)
     return {
         "estate_id": estate.id,
@@ -1408,7 +1408,7 @@ def list_public_reservation_requests(estate_id: int, request: Request, status: s
     estate = db.get(Estate, estate_id)
     if not estate:
         raise HTTPException(404, "Estate not found")
-    require_estate_access(db, request, estate.organization_id, permission="allocation.read")
+    require_estate_view_access(db, request, estate.organization_id, permission="allocation.read")
     query = db.query(EstatePublicReservationRequest).filter(EstatePublicReservationRequest.estate_id == estate.id)
     if status and status != "all":
         if status not in {"new", "contacted", "converted", "declined"}:
@@ -4968,7 +4968,7 @@ def estate_notification_log(estate_id: int, request: Request, limit: int = 100, 
     estate = db.get(Estate, estate_id)
     if not estate:
         raise HTTPException(404, "Estate not found")
-    require_estate_access(db, request, estate.organization_id, permission="estate.read")
+    require_estate_view_access(db, request, estate.organization_id, permission="estate.read")
     safe_limit = max(1, min(limit, 250))
     base_query = db.query(EstateNotificationLog).filter(
         EstateNotificationLog.estate_id == estate_id,
