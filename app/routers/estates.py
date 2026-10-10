@@ -1913,7 +1913,9 @@ async def import_scanned_layout(
 def list_import_reviews(estate_id:int,request:Request,db:Session=Depends(get_db)):
     estate=db.get(Estate,estate_id)
     if not estate: raise HTTPException(404,"Estate not found")
-    require_estate_access(db,request,estate.organization_id,permission="plot.read")
+    # A lapsed account may inspect prior imports, but creating or deciding an import remains
+    # protected by require_estate_access on the write endpoints below.
+    require_estate_view_access(db,request,estate.organization_id,permission="plot.read")
     rows=db.query(EstateImportReview).filter(EstateImportReview.estate_id==estate_id).order_by(EstateImportReview.created_at.desc()).all()
     result = []
     for row in rows:
@@ -2160,7 +2162,8 @@ def list_layout_proposals(estate_id: int, request: Request, db: Session = Depend
     estate = db.get(Estate, estate_id)
     if not estate:
         raise HTTPException(404, "Estate not found")
-    require_estate_access(db, request, estate.organization_id, permission="plot.read")
+    # Draft layouts are historical records; only the proposal mutations require an active plan.
+    require_estate_view_access(db, request, estate.organization_id, permission="plot.read")
     return [_layout_proposal_payload(row) for row in db.query(EstateLayoutProposal).filter(EstateLayoutProposal.estate_id == estate_id).order_by(EstateLayoutProposal.created_at.desc()).all()]
 
 
