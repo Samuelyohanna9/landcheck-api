@@ -131,7 +131,12 @@ def require_estate_access(
     if require_subscription:
         subscription = get_subscription(db, organization_id)
         if not is_access_active(subscription):
-            raise HTTPException(status_code=402, detail={"code": "subscription_required", "message": "Choose a plan to continue using LandCheck Estates."})
+            message = (
+                "Choose a plan to continue using LandCheck Estates."
+                if subscription is None
+                else "Your Estate subscription has ended. Renew it to make changes; your existing records remain available in read-only mode."
+            )
+            raise HTTPException(status_code=402, detail={"code": "subscription_required", "message": message})
     return access
 
 
