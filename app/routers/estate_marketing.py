@@ -37,7 +37,7 @@ from app.schemas.estate_marketing import (
 )
 from app.services.estates import commissions, marketing_alerts, marketing_field, marketing_pdf, marketing_render
 from app.services.estates.audit import append_estate_audit_event
-from app.services.estates.authorization import EstatePrincipal, require_estate_access
+from app.services.estates.authorization import EstatePrincipal, require_estate_access, require_estate_view_access
 from app.services.estates.marketing_common import (
     agent_member_for,
     client_ip,
@@ -103,6 +103,17 @@ def _require_published(estate: Estate) -> None:
 def _staff(db: Session, request: Request, estate_id: int, permission: str = "estate.read"):
     estate = _estate_or_404(db, estate_id)
     access = require_estate_access(db, request, estate.organization_id, permission=permission)
+    return estate, access
+
+
+def _staff_view(db: Session, request: Request, estate_id: int, permission: str = "estate.read"):
+    """Like _staff, but for the handful of marketing/social read endpoints a lapsed subscription
+    should still reach: lead/QR-campaign performance (the same "agents" visibility already granted
+    elsewhere) and the social channel status check the Marketing tab needs just to render its own
+    locked/unlocked state. Every write and every actually-billed read (WhatsApp conversations,
+    opt-in broadcast history) still goes through the stricter _staff."""
+    estate = _estate_or_404(db, estate_id)
+    access = require_estate_view_access(db, request, estate.organization_id, permission=permission)
     return estate, access
 
 
@@ -560,7 +571,7 @@ def _followup_item(db: Session, row: EstatePublicReservationRequest, *, estate_n
 
 @router.get("/{estate_id}/marketing/overview")
 def staff_marketing_overview(estate_id: int, request: Request, days: int = 30, db: Session = Depends(get_db)):
-    estate, _access = _staff(db, request, estate_id)
+    estate, _access = _staff_view(db, request, estate_id)
     since = _period_start(days)
     campaigns = db.query(EstateQrCampaign).filter(EstateQrCampaign.estate_id == estate.id).order_by(EstateQrCampaign.created_at.desc()).all()
 
