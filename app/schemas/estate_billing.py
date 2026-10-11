@@ -6,6 +6,7 @@ from pydantic import BaseModel
 class ChoosePlanRequest(BaseModel):
     plan_key: str
     billing_cycle: str
+    provider: str = "flutterwave"
 
 
 class ChangePlanRequest(BaseModel):

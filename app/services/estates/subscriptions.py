@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 """LandCheck Estates subscription lifecycle - trial start, recurring charges, dunning retries,
-cancellation, and plan changes. See app/utils/estate_flutterwave.py for the payment plumbing and
+cancellation, and plan changes. Provider-agnostic: every charge dispatches through
+app/utils/estate_payment_provider.py to either app/utils/estate_flutterwave.py or
+app/utils/estate_paystack.py based on subscription.payment_provider, the gateway locked in at
+start_trial() (a card token from one gateway can't be charged via the other). See
 app/main.py's `_run_estate_subscription_billing_job` for the daily driver of this module."""
 
 import logging
@@ -18,7 +21,7 @@ from app.models.estate_billing import EstateSubscription, EstateSubscriptionChar
 from app.models.estate_foundation import EstateOrganization
 from app.services.estates.billing_plans import ACTIVE_SUBSCRIPTION_STATUSES, TRIAL_DAYS, plan_amount, plan_includes_auto_posting, plan_includes_hazard_analysis, plan_includes_soil_analysis, plan_includes_sms_notifications, plan_includes_whatsapp, plan_label, plan_max_estates
 from app.services.estates import estate_email
-from app.utils import estate_flutterwave as flw
+from app.utils.estate_payment_provider import module_for
 
 logger = logging.getLogger(__name__)
 
@@ -79,13 +82,20 @@ def start_trial(
     card_last4: str | None,
     card_brand: str | None,
     payment_method: str = "card",
+    payment_provider: str = "flutterwave",
 ) -> EstateSubscription:
-    """Called after the verification checkout has been refunded; this is a single-use trial."""
+    """Called after the verification checkout has been refunded; this is a single-use trial.
+    `payment_provider` is locked in for the life of the subscription - every future recurring
+    charge (trial conversion, renewal, dunning retry) must reuse the same gateway that
+    tokenized `card_token`, since a token from one gateway can't be charged via the other."""
     payment_method = str(payment_method or "card").strip().lower()
     if payment_method not in {"card", "bank_transfer"}:
         raise ValueError("Unsupported subscription payment method")
     if payment_method == "card" and not card_token:
         raise ValueError("A reusable card token is required to start the free trial")
+    payment_provider = str(payment_provider or "flutterwave").strip().lower()
+    if payment_provider not in {"flutterwave", "paystack"}:
+        raise ValueError("Unsupported payment provider")
     now = datetime.now(timezone.utc)
     trial_ends_at = now + timedelta(days=TRIAL_DAYS)
     subscription = get_subscription(db, organization.id)
@@ -100,6 +110,7 @@ def start_trial(
     subscription.amount = plan_amount(plan_key, billing_cycle)
     subscription.currency = "NGN"
     subscription.payment_method = payment_method
+    subscription.payment_provider = payment_provider
     subscription.trial_ends_at = trial_ends_at
     subscription.current_period_end = None
     subscription.next_charge_at = trial_ends_at
@@ -109,7 +120,7 @@ def start_trial(
     subscription.canceled_at = None
     subscription.trial_reminder_sent_for = None
     subscription.renewal_reminder_sent_for = None
-    subscription.flutterwave_customer_email = email
+    subscription.billing_email = email
     if card_token:
         subscription.card_token = card_token
         subscription.card_last4 = card_last4
@@ -127,8 +138,8 @@ def _record_charge(
     amount: Decimal,
     status: str,
     tx_ref: str,
-    flutterwave_transaction_id: str | None,
-    flutterwave_payload: dict | None,
+    provider_transaction_id: str | None,
+    provider_payload: dict | None,
     failure_reason: str | None,
 ) -> EstateSubscriptionCharge:
     charge = EstateSubscriptionCharge(
@@ -139,8 +150,9 @@ def _record_charge(
         currency=subscription.currency,
         status=status,
         tx_ref=tx_ref,
-        flutterwave_transaction_id=flutterwave_transaction_id,
-        flutterwave_payload=flutterwave_payload,
+        payment_provider=subscription.payment_provider,
+        provider_transaction_id=provider_transaction_id,
+        provider_payload=provider_payload,
         failure_reason=failure_reason,
     )
     db.add(charge)
@@ -177,7 +189,7 @@ def attempt_charge(db: Session, subscription: EstateSubscription, *, charge_type
     tx_ref = new_tx_ref("SUB")
     charge = _record_charge(
         db, subscription=subscription, charge_type=charge_type, amount=subscription.amount, status="pending",
-        tx_ref=tx_ref, flutterwave_transaction_id=None, flutterwave_payload=None, failure_reason=None,
+        tx_ref=tx_ref, provider_transaction_id=None, provider_payload=None, failure_reason=None,
     )
     if not subscription.card_token:
         charge.status = "failed"
@@ -186,23 +198,23 @@ def attempt_charge(db: Session, subscription: EstateSubscription, *, charge_type
         return False
 
     try:
-        result = flw.charge_token(
+        result = module_for(subscription.payment_provider).charge_token(
             token=subscription.card_token,
             amount=subscription.amount,
             currency=subscription.currency,
-            email=subscription.flutterwave_customer_email or (organization.contact_email if organization else ""),
+            email=subscription.billing_email or (organization.contact_email if organization else ""),
             tx_ref=tx_ref,
         )
-    except Exception as exc:  # A lost response may mean Flutterwave already accepted the charge.
+    except Exception as exc:  # A lost response may mean the provider already accepted the charge.
         logger.exception("Estate subscription charge failed (org=%s, type=%s)", subscription.organization_id, charge_type)
         charge.failure_reason = "Payment provider response was not confirmed. Use the billing page to complete payment."
-        charge.flutterwave_payload = {"status": "unknown", "error": type(exc).__name__}
+        charge.provider_payload = {"status": "unknown", "error": type(exc).__name__}
         _handle_pending_charge(db, subscription, organization=organization)
         return False
 
     provider_status = str(result.get("status") or "").lower()
-    charge.flutterwave_transaction_id = str(result.get("id") or "") or None
-    charge.flutterwave_payload = result or None
+    charge.provider_transaction_id = str(result.get("id") or "") or None
+    charge.provider_payload = result or None
     if provider_status in {"successful", "succeeded"}:
         charge.status = "success"
         charge.failure_reason = None
@@ -232,7 +244,7 @@ def _start_bank_transfer_charge(
     past-due state until Flutterwave confirms the transfer through its webhook or a later
     server-side verification.
     """
-    email = str(subscription.flutterwave_customer_email or (organization.contact_email if organization else "") or "").strip()
+    email = str(subscription.billing_email or (organization.contact_email if organization else "") or "").strip()
     if not email:
         subscription.status = "past_due"
         subscription.next_retry_at = None
@@ -245,12 +257,12 @@ def _start_bank_transfer_charge(
         amount=subscription.amount,
         status="pending",
         tx_ref=tx_ref,
-        flutterwave_transaction_id=None,
-        flutterwave_payload=None,
+        provider_transaction_id=None,
+        provider_payload=None,
         failure_reason="Waiting for bank transfer payment.",
     )
     try:
-        link = flw.initiate_checkout(
+        link = module_for(subscription.payment_provider).initiate_checkout(
             tx_ref=tx_ref,
             amount=subscription.amount,
             currency=subscription.currency,
@@ -273,11 +285,11 @@ def _start_bank_transfer_charge(
     except Exception as exc:
         charge.status = "failed"
         charge.failure_reason = "Could not create a bank-transfer checkout."
-        charge.flutterwave_payload = {"error": type(exc).__name__}
+        charge.provider_payload = {"error": type(exc).__name__}
         _handle_failed_charge(db, subscription, organization=organization)
         return False
 
-    charge.flutterwave_payload = {"checkout_url": link, "payment_method": "bank_transfer"}
+    charge.provider_payload = {"checkout_url": link, "payment_method": "bank_transfer"}
     subscription.status = "past_due"
     subscription.next_retry_at = None
     db.flush()
@@ -443,16 +455,16 @@ def change_plan(
         amount=difference,
         status="pending",
         tx_ref=tx_ref,
-        flutterwave_transaction_id=None,
-        flutterwave_payload={
+        provider_transaction_id=None,
+        provider_payload={
             "plan_key": new_plan_key,
             "previous_plan_key": subscription.plan_key,
         },
         failure_reason=None,
     )
-    email = subscription.flutterwave_customer_email or (organization.contact_email if organization else "")
+    email = subscription.billing_email or (organization.contact_email if organization else "")
     try:
-        result = flw.charge_token(
+        result = module_for(subscription.payment_provider).charge_token(
             token=subscription.card_token,
             amount=difference,
             currency=subscription.currency,
@@ -462,7 +474,7 @@ def change_plan(
     except Exception as exc:  # A lost response may mean the provider accepted the charge.
         logger.exception("Estate plan-change charge failed (org=%s)", subscription.organization_id)
         charge.failure_reason = "Payment provider response was not confirmed. Billing will not retry automatically."
-        charge.flutterwave_payload = {
+        charge.provider_payload = {
             "plan_key": new_plan_key,
             "previous_plan_key": subscription.plan_key,
             "provider": {"status": "unknown", "error": type(exc).__name__},
@@ -471,8 +483,8 @@ def change_plan(
         return {"changed": False, "payment_status": "pending", "charged_amount": difference}
 
     provider_status = str(result.get("status") or "").lower()
-    charge.flutterwave_transaction_id = str(result.get("id") or "") or None
-    charge.flutterwave_payload = {
+    charge.provider_transaction_id = str(result.get("id") or "") or None
+    charge.provider_payload = {
         "plan_key": new_plan_key,
         "previous_plan_key": subscription.plan_key,
         "provider": result or None,

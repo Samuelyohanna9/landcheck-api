@@ -34,6 +34,10 @@ class EstateSubscription(Base):
     amount = Column(Numeric(12, 2), nullable=False)
     currency = Column(String(8), nullable=False, default="NGN")
     payment_method = Column(String(24), nullable=False, default="card", server_default="card")
+    # Which gateway processed the trial-verification charge, and therefore which gateway holds
+    # the reusable card_token below - a card tokenized by one gateway cannot be charged through
+    # the other, so this is locked in at start_trial() and reused for every recurring charge.
+    payment_provider = Column(String(16), nullable=False, default="flutterwave", server_default="flutterwave")
 
     trial_ends_at = Column(DateTime(timezone=True), nullable=True)
     current_period_end = Column(DateTime(timezone=True), nullable=True)
@@ -48,7 +52,7 @@ class EstateSubscription(Base):
     card_token = Column(String(255), nullable=True)
     card_last4 = Column(String(8), nullable=True)
     card_brand = Column(String(32), nullable=True)
-    flutterwave_customer_email = Column(String(255), nullable=True)
+    billing_email = Column(String(255), nullable=True)
 
     created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
     updated_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
@@ -63,6 +67,10 @@ class EstateSubscription(Base):
         CheckConstraint(
             "payment_method IN ('card', 'bank_transfer')",
             name="ck_estate_subscriptions_payment_method",
+        ),
+        CheckConstraint(
+            "payment_provider IN ('flutterwave', 'paystack')",
+            name="ck_estate_subscriptions_provider",
         ),
     )
 
@@ -82,8 +90,9 @@ class EstateSubscriptionCharge(Base):
     currency = Column(String(8), nullable=False, default="NGN")
     status = Column(String(16), nullable=False)
     tx_ref = Column(String(64), nullable=False, unique=True)
-    flutterwave_transaction_id = Column(String(64), nullable=True)
-    flutterwave_payload = Column(JSON, nullable=True)
+    payment_provider = Column(String(16), nullable=False, default="flutterwave", server_default="flutterwave")
+    provider_transaction_id = Column(String(64), nullable=True)
+    provider_payload = Column(JSON, nullable=True)
     failure_reason = Column(Text, nullable=True)
     attempted_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
 
@@ -93,6 +102,10 @@ class EstateSubscriptionCharge(Base):
             name="ck_estate_subscription_charges_type",
         ),
         CheckConstraint("status IN ('pending', 'success', 'failed')", name="ck_estate_subscription_charges_status"),
+        CheckConstraint(
+            "payment_provider IN ('flutterwave', 'paystack')",
+            name="ck_estate_subscription_charges_provider",
+        ),
         # A subscription's trial can only convert once - a second attempt after a failure is a
         # dunning "retry", never a second "trial_conversion" row. Enforced in the DB, not just in
         # application code, so a scheduler race can never double-charge a trial conversion.

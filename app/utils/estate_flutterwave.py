@@ -31,6 +31,10 @@ def _flutterwave_secret_key() -> str | None:
     return value or None
 
 
+def configured() -> bool:
+    return bool(_flutterwave_secret_key())
+
+
 def _flutterwave_secret_hash() -> str | None:
     value = str(os.getenv("FLW_SECRET_HASH") or os.getenv("FLUTTERWAVE_SECRET_HASH") or "").strip()
     return value or None

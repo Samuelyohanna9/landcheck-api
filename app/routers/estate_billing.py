@@ -27,6 +27,8 @@ from app.services.estates.subscriptions import (
     start_trial,
 )
 from app.utils import estate_flutterwave as flw
+from app.utils import estate_paystack as pst
+from app.utils.estate_payment_provider import available_providers, module_for
 from app.utils.auth_security import require_signed_flutterwave_webhooks
 
 logger = logging.getLogger(__name__)
@@ -50,7 +52,7 @@ def _decimal(value: object, default: Decimal = Decimal("0")) -> Decimal:
 
 def _subscription_status_payload(subscription: EstateSubscription | None) -> dict:
     if subscription is None:
-        return {"status": "none", "plan_key": None, "hazard_analysis": False, "auto_posting": False, "max_estates": 1}
+        return {"status": "none", "plan_key": None, "hazard_analysis": False, "auto_posting": False, "max_estates": 1, "payment_providers": available_providers()}
     plan = ESTATE_PLANS.get(subscription.plan_key, {})
     return {
         "status": subscription.status,
@@ -60,6 +62,8 @@ def _subscription_status_payload(subscription: EstateSubscription | None) -> dic
         "amount": str(subscription.amount),
         "currency": subscription.currency,
         "payment_method": subscription.payment_method,
+        "payment_provider": subscription.payment_provider,
+        "payment_providers": available_providers(),
         "hazard_analysis": bool(plan.get("hazard_analysis")),
         "auto_posting": bool(plan.get("auto_posting")),
         "max_estates": plan.get("max_estates"),
@@ -88,12 +92,12 @@ def _account_for_access(db: Session, access: EstateAccess, organization_id: int)
     )
 
 
-def _refund_verification(verify_data: dict, organization_id: int) -> None:
-    transaction_id = str(verify_data.get("id") or "")
+def _refund_verification(verify_data: dict, organization_id: int, provider: str = "flutterwave") -> None:
+    transaction_id = str(verify_data.get("id") or verify_data.get("tx_ref") or "")
     if not transaction_id:
         return
     try:
-        flw.refund_transaction(transaction_id, amount=VERIFICATION_CHARGE_AMOUNT)
+        module_for(provider).refund_transaction(transaction_id, amount=VERIFICATION_CHARGE_AMOUNT)
     except Exception:
         logger.exception("Could not auto-refund the verification charge (org=%s)", organization_id)
 
@@ -108,6 +112,7 @@ def billing_status(organization_id: int, request: Request, db: Session = Depends
 def billing_plans():
     return {
         "trial_days": TRIAL_DAYS,
+        "payment_providers": available_providers(),
         "plans": {
             key: {"label": plan["label"], "monthly": str(plan["monthly"]), "yearly": str(plan["yearly"]), "hazard_analysis": plan["hazard_analysis"], "auto_posting": plan["auto_posting"], "max_estates": plan["max_estates"]}
             for key, plan in ESTATE_PLANS.items()
@@ -144,10 +149,15 @@ def start_checkout(payload: ChoosePlanRequest, organization_id: int, request: Re
     access = require_estate_access(db, request, organization_id, permission="billing.manage", require_subscription=False)
     plan_key = str(payload.plan_key or "").strip().lower()
     billing_cycle = str(payload.billing_cycle or "").strip().lower()
+    provider = str(payload.provider or "flutterwave").strip().lower()
     if plan_key not in ESTATE_PLANS:
         raise HTTPException(422, "Choose a valid plan")
     if billing_cycle not in {"monthly", "yearly"}:
         raise HTTPException(422, "Choose monthly or yearly billing")
+    if provider not in {"flutterwave", "paystack"}:
+        raise HTTPException(422, "Choose a supported payment provider")
+    if not available_providers().get(provider):
+        raise HTTPException(503, f"{provider.title()} is not configured on this server yet")
     organization = db.get(EstateOrganization, organization_id)
     if not organization:
         raise HTTPException(404, "Estate organization was not found")
@@ -163,8 +173,13 @@ def start_checkout(payload: ChoosePlanRequest, organization_id: int, request: Re
     if not email:
         raise HTTPException(422, "This account has no billing email on file")
 
-    tx_ref = new_tx_ref("VERIFY")
-    link = flw.initiate_checkout(
+    # The verification checkout has no DB row yet (one is only created once a real subscription
+    # exists), so checkout_return/webhook can't look a provider up in the database the way they
+    # do for every other charge type - the "PSVERIFY" prefix is how they know to verify this one
+    # against Paystack instead of Flutterwave, with zero change to the existing "VERIFY" format
+    # Flutterwave checkouts have always used.
+    tx_ref = new_tx_ref("PSVERIFY" if provider == "paystack" else "VERIFY")
+    link = module_for(provider).initiate_checkout(
         tx_ref=tx_ref,
         amount=VERIFICATION_CHARGE_AMOUNT,
         currency="NGN",
@@ -182,6 +197,7 @@ def start_checkout(payload: ChoosePlanRequest, organization_id: int, request: Re
             "customer_email": email,
             "plan_key": plan_key,
             "billing_cycle": billing_cycle,
+            "provider": provider,
         },
     )
     return {"checkout_url": link, "tx_ref": tx_ref}
@@ -198,6 +214,9 @@ def _complete_verification(db: Session, verify_data: dict) -> dict:
         return {"ok": False, "message": "Could not match this payment to an Estate account."}
     plan_key = str(meta.get("plan_key") or "")
     billing_cycle = str(meta.get("billing_cycle") or "")
+    provider = str(meta.get("provider") or "flutterwave").strip().lower()
+    if provider not in {"flutterwave", "paystack"}:
+        provider = "flutterwave"
     organization = db.get(EstateOrganization, organization_id)
     if account_id:
         account = db.query(EstateAccount).filter(EstateAccount.id == account_id, EstateAccount.organization_id == organization_id).with_for_update().one_or_none()
@@ -220,11 +239,11 @@ def _complete_verification(db: Session, verify_data: dict) -> dict:
 
     existing = db.query(EstateSubscription).filter(EstateSubscription.organization_id == organization_id).with_for_update().one_or_none()
     if account.trial_claimed_at is not None or (existing and (existing.trial_ends_at is not None or existing.status in {"trialing", "active"})):
-        _refund_verification(verify_data, organization_id)
+        _refund_verification(verify_data, organization_id, provider)
         db.commit()
         return {"ok": True, "already_used": True}
 
-    card_token, card_last4, card_brand = flw.extract_card_token(verify_data)
+    card_token, card_last4, card_brand = module_for(provider).extract_card_token(verify_data)
     provider_payment_type = str(
         verify_data.get("payment_type")
         or verify_data.get("payment_method")
@@ -233,7 +252,7 @@ def _complete_verification(db: Session, verify_data: dict) -> dict:
     ).strip().lower()
     payment_method = "bank_transfer" if "bank" in provider_payment_type or "transfer" in provider_payment_type else "card"
     if not card_token and payment_method == "card":
-        _refund_verification(verify_data, organization_id)
+        _refund_verification(verify_data, organization_id, provider)
         return {"ok": False, "message": "This card cannot be saved for recurring billing. Please use another card."}
 
     customer = dict(verify_data.get("customer") or {})
@@ -249,13 +268,14 @@ def _complete_verification(db: Session, verify_data: dict) -> dict:
             card_last4=card_last4,
             card_brand=card_brand,
             payment_method=payment_method,
+            payment_provider=provider,
         )
     except ValueError as exc:
-        _refund_verification(verify_data, organization_id)
+        _refund_verification(verify_data, organization_id, provider)
         return {"ok": False, "message": str(exc)}
 
     account.trial_claimed_at = datetime.now(timezone.utc)
-    _refund_verification(verify_data, organization_id)
+    _refund_verification(verify_data, organization_id, provider)
     db.commit()
     return {"ok": True, "status": subscription.status, "trial_ends_at": subscription.trial_ends_at}
 
@@ -278,13 +298,13 @@ def start_payment_checkout(organization_id: int, request: Request, db: Session =
         .order_by(EstateSubscriptionCharge.id.desc())
         .first()
     )
-    if existing_pending and isinstance(existing_pending.flutterwave_payload, dict) and existing_pending.flutterwave_payload.get("checkout_url"):
-        return {"checkout_url": existing_pending.flutterwave_payload["checkout_url"], "tx_ref": existing_pending.tx_ref}
+    if existing_pending and isinstance(existing_pending.provider_payload, dict) and existing_pending.provider_payload.get("checkout_url"):
+        return {"checkout_url": existing_pending.provider_payload["checkout_url"], "tx_ref": existing_pending.tx_ref}
     if existing_pending:
         existing_pending.status = "failed"
         existing_pending.failure_reason = "Replaced by a new customer-initiated payment checkout."
 
-    email = str(subscription.flutterwave_customer_email or organization.contact_email or "").strip()
+    email = str(subscription.billing_email or organization.contact_email or "").strip()
     if not email:
         raise HTTPException(422, "This organization has no billing email on file")
     tx_ref = new_tx_ref("PAY")
@@ -296,11 +316,12 @@ def start_payment_checkout(organization_id: int, request: Request, db: Session =
         currency=subscription.currency,
         status="pending",
         tx_ref=tx_ref,
+        payment_provider=subscription.payment_provider,
     )
     db.add(charge)
     db.flush()
     try:
-        link = flw.initiate_checkout(
+        link = module_for(subscription.payment_provider).initiate_checkout(
             tx_ref=tx_ref,
             amount=charge.amount,
             currency=charge.currency,
@@ -322,7 +343,7 @@ def start_payment_checkout(organization_id: int, request: Request, db: Session =
     except Exception:
         db.rollback()
         raise
-    charge.flutterwave_payload = {"checkout_url": link}
+    charge.provider_payload = {"checkout_url": link}
     db.commit()
     return {"checkout_url": link, "tx_ref": tx_ref}
 
@@ -334,7 +355,7 @@ def _find_charge(db: Session, verify_data: dict, tx_ref: str | None = None) -> E
     if reference:
         filters.append(EstateSubscriptionCharge.tx_ref == reference)
     if transaction_id:
-        filters.append(EstateSubscriptionCharge.flutterwave_transaction_id == transaction_id)
+        filters.append(EstateSubscriptionCharge.provider_transaction_id == transaction_id)
     if not filters:
         return None
     return db.query(EstateSubscriptionCharge).filter(or_(*filters)).with_for_update().first()
@@ -357,9 +378,9 @@ def _complete_subscription_payment(db: Session, verify_data: dict, tx_ref: str |
     status = str(verify_data.get("status") or "").lower()
     amount = _decimal(verify_data.get("charged_amount") or verify_data.get("amount"))
     currency = str(verify_data.get("currency") or "").upper()
-    charge_metadata = dict(charge.flutterwave_payload or {}) if isinstance(charge.flutterwave_payload, dict) else {}
-    charge.flutterwave_transaction_id = str(verify_data.get("id") or "") or charge.flutterwave_transaction_id
-    charge.flutterwave_payload = {**charge_metadata, "provider": verify_data or charge_metadata.get("provider")}
+    charge_metadata = dict(charge.provider_payload or {}) if isinstance(charge.provider_payload, dict) else {}
+    charge.provider_transaction_id = str(verify_data.get("id") or "") or charge.provider_transaction_id
+    charge.provider_payload = {**charge_metadata, "provider": verify_data or charge_metadata.get("provider")}
     if status in {"pending", "processing", "awaiting_authorization", "queued"}:
         charge.failure_reason = "Payment authorization is pending."
         db.commit()
@@ -370,7 +391,7 @@ def _complete_subscription_payment(db: Session, verify_data: dict, tx_ref: str |
         db.commit()
         return {"ok": False, "message": "Payment was not successful."}
 
-    card_token, card_last4, card_brand = flw.extract_card_token(verify_data)
+    card_token, card_last4, card_brand = module_for(charge.payment_provider).extract_card_token(verify_data)
     provider_payment_type = str(
         verify_data.get("payment_type")
         or verify_data.get("payment_method")
@@ -384,7 +405,7 @@ def _complete_subscription_payment(db: Session, verify_data: dict, tx_ref: str |
         subscription.card_last4 = card_last4
         subscription.card_brand = card_brand
     customer = dict(verify_data.get("customer") or {})
-    subscription.flutterwave_customer_email = str(customer.get("email") or subscription.flutterwave_customer_email or "").strip() or subscription.flutterwave_customer_email
+    subscription.billing_email = str(customer.get("email") or subscription.billing_email or "").strip() or subscription.billing_email
     charge.status = "success"
     charge.failure_reason = None
     organization = db.get(EstateOrganization, subscription.organization_id)
@@ -408,9 +429,26 @@ def _complete_subscription_payment(db: Session, verify_data: dict, tx_ref: str |
     return {"ok": True, "status": subscription.status}
 
 
+def _resolve_provider_for_tx_ref(db: Session, tx_ref: str | None) -> str:
+    """SUB-/PAY- tx_refs already have an EstateSubscriptionCharge row recording which gateway
+    processed them - cheap local lookup, no gateway call needed. The one case with no row yet
+    is the initial VERIFY/PSVERIFY trial-verification checkout (see start_checkout's comment),
+    resolved from the tx_ref prefix instead."""
+    reference = str(tx_ref or "").strip()
+    if reference:
+        charge = db.query(EstateSubscriptionCharge).filter(EstateSubscriptionCharge.tx_ref == reference).first()
+        if charge:
+            return charge.payment_provider
+    return "paystack" if reference.startswith("PSVERIFY") else "flutterwave"
+
+
 @router.get("/checkout/return")
-def checkout_return(transaction_id: str | None = None, tx_ref: str | None = None, status: str | None = None, db: Session = Depends(get_db)):
-    """Re-verify the provider transaction, then redirect to the correct billing page."""
+def checkout_return(transaction_id: str | None = None, tx_ref: str | None = None, reference: str | None = None, trxref: str | None = None, status: str | None = None, db: Session = Depends(get_db)):
+    """Re-verify the provider transaction, then redirect to the correct billing page.
+    Flutterwave's redirect carries transaction_id/tx_ref/status; Paystack's carries
+    reference/trxref (the same string we generated as our own tx_ref) with no separate status
+    param - `reference`/`trxref` are accepted as aliases for `tx_ref` to cover both."""
+    tx_ref = tx_ref or reference or trxref
     is_payment = str(tx_ref or "").startswith("PAY-")
     outcome = "failed"
     if str(status or "").lower() == "cancelled":
@@ -426,7 +464,9 @@ def checkout_return(transaction_id: str | None = None, tx_ref: str | None = None
 
     if transaction_id or tx_ref:
         try:
-            verify_data = flw.verify_transaction(transaction_id) if transaction_id else flw.verify_transaction_by_reference(tx_ref)  # type: ignore[arg-type]
+            provider = _resolve_provider_for_tx_ref(db, tx_ref)
+            gateway = module_for(provider)
+            verify_data = gateway.verify_transaction(transaction_id) if transaction_id else gateway.verify_transaction_by_reference(tx_ref)  # type: ignore[arg-type]
             purpose = str((verify_data.get("meta") or {}).get("purpose") or "")
             is_payment = is_payment or purpose == "estate_subscription_payment"
             result = _complete_subscription_payment(db, verify_data, tx_ref) if is_payment else _complete_verification(db, verify_data)
@@ -440,6 +480,8 @@ def checkout_return(transaction_id: str | None = None, tx_ref: str | None = None
 
 @router.post("/webhook")
 async def billing_webhook(request: Request, db: Session = Depends(get_db)):
+    """Flutterwave's webhook - Paystack's own webhook is the separate endpoint below, since the
+    two gateways sign and shape their payloads too differently to share one route cleanly."""
     raw_body = await request.body()
     signature = request.headers.get("verif-hash") or request.headers.get("flutterwave-signature")
     secret_hash_configured = bool(os.getenv("FLW_SECRET_HASH") or os.getenv("FLUTTERWAVE_SECRET_HASH"))
@@ -466,6 +508,32 @@ async def billing_webhook(request: Request, db: Session = Depends(get_db)):
     return result
 
 
+@router.post("/webhook/paystack")
+async def billing_webhook_paystack(request: Request, db: Session = Depends(get_db)):
+    raw_body = await request.body()
+    signature = request.headers.get("x-paystack-signature")
+    if pst.configured() and not pst.verify_webhook_signature(raw_body, signature):
+        raise HTTPException(401, "Invalid webhook signature")
+    payload = await request.json()
+    if str(payload.get("event") or "") not in {"charge.success", "charge.failed"}:
+        return {"ok": True, "ignored": True}
+    data = dict(payload.get("data") or {})
+    tx_ref = str(data.get("reference") or "")
+    if not tx_ref:
+        return {"ok": True, "ignored": True}
+    try:
+        # Never trust the webhook body's own claimed status - re-verify server-side, same as
+        # the Flutterwave webhook above.
+        verify_data = pst.verify_transaction_by_reference(tx_ref)
+        purpose = str((verify_data.get("meta") or {}).get("purpose") or "")
+        is_payment = purpose == "estate_subscription_payment" or bool(_find_charge(db, verify_data, tx_ref))
+        result = _complete_subscription_payment(db, verify_data, tx_ref) if is_payment else _complete_verification(db, verify_data)
+    except Exception:
+        logger.exception("Estate billing Paystack webhook verification failed (tx_ref=%s)", tx_ref)
+        return {"ok": False}
+    return result
+
+
 @router.post("/cancel")
 def cancel(organization_id: int, request: Request, db: Session = Depends(get_db)):
     require_estate_access(db, request, organization_id, permission="billing.manage", require_subscription=False)
@@ -486,24 +554,24 @@ def _upgrade_checkout(db: Session, subscription: EstateSubscription, organizatio
         .all()
     )
     for row in pending:
-        payload = row.flutterwave_payload if isinstance(row.flutterwave_payload, dict) else {}
+        payload = row.provider_payload if isinstance(row.provider_payload, dict) else {}
         if payload.get("plan_key") == plan_key and payload.get("checkout_url") and Decimal(str(row.amount)) == difference and payload.get("previous_plan_key") == subscription.plan_key:
             return {**_subscription_status_payload(subscription), "plan_change_status": "checkout", "plan_change_amount": str(difference), "checkout_url": payload["checkout_url"]}
         row.status = "failed"
         row.failure_reason = "Replaced by a new upgrade request."
-    email = str(subscription.flutterwave_customer_email or organization.contact_email or "").strip()
+    email = str(subscription.billing_email or organization.contact_email or "").strip()
     if not email:
         raise HTTPException(422, "This organization has no billing email on file")
     tx_ref = new_tx_ref("PAY")
     charge = EstateSubscriptionCharge(
         subscription_id=subscription.id, organization_id=organization.id, charge_type="plan_change", amount=difference,
-        currency=subscription.currency, status="pending", tx_ref=tx_ref,
-        flutterwave_payload={"plan_key": plan_key, "previous_plan_key": subscription.plan_key},
+        currency=subscription.currency, status="pending", tx_ref=tx_ref, payment_provider=subscription.payment_provider,
+        provider_payload={"plan_key": plan_key, "previous_plan_key": subscription.plan_key},
     )
     db.add(charge)
     db.flush()
     try:
-        link = flw.initiate_checkout(
+        link = module_for(subscription.payment_provider).initiate_checkout(
             tx_ref=tx_ref, amount=charge.amount, currency=charge.currency, email=email, name=organization.name,
             redirect_url=f"{_api_public_url()}/estates/billing/checkout/return", title="LandCheck Estates",
             description=f"Upgrade to the {ESTATE_PLANS[plan_key]['label']} plan (price difference for this billing period).",
@@ -513,7 +581,7 @@ def _upgrade_checkout(db: Session, subscription: EstateSubscription, organizatio
     except Exception:
         db.rollback()
         raise
-    charge.flutterwave_payload = {"plan_key": plan_key, "previous_plan_key": subscription.plan_key, "checkout_url": link}
+    charge.provider_payload = {"plan_key": plan_key, "previous_plan_key": subscription.plan_key, "checkout_url": link}
     db.commit()
     return {**_subscription_status_payload(subscription), "plan_change_status": "checkout", "plan_change_amount": str(difference), "checkout_url": link}
 
