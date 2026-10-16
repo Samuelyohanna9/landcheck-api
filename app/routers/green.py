@@ -2960,13 +2960,14 @@ def _send_green_email_verification(*, to_email: str, full_name: str, verificatio
             "<p>Use the button below to verify this email address and activate your LandCheck Work account.</p>"
             "<p>This link expires in 24 hours and can only be used once.</p>"
             f'<p><a href="{html.escape(verification_url, quote=True)}" style="display:inline-block;padding:12px 18px;border-radius:10px;background:#1f8c58;color:#fff;font-weight:700;text-decoration:none;">Verify email</a></p>'
+            '<p style="color:#6b7280;font-size:13px;">Don\'t see this email in your inbox? Check your spam/junk folder.</p>'
         ),
     )
     try:
         _send_html_email(
             to_email=recipient,
             subject="Verify your LandCheck Green email",
-            text_body=f"Verify your LandCheck Green email here: {verification_url}",
+            text_body=f"Verify your LandCheck Green email here: {verification_url}\n\nDon't see this email in your inbox? Check your spam/junk folder.",
             html_body=body_html,
         )
         return True
@@ -28180,7 +28181,7 @@ def green_verify_email(token: str, db: Session = Depends(get_db)):
     )
     db.commit()
     web_url = str(os.getenv("LANDCHECK_WEB_URL") or "https://landcheck.online").rstrip("/")
-    return RedirectResponse(f"{web_url}/green-work/login?verified=1", status_code=303)
+    return RedirectResponse(f"{web_url}/green-work/email-verified", status_code=303)
 
 
 @router.post("/work-auth/login")
