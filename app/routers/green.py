@@ -19246,6 +19246,13 @@ def create_public_log(payload: PublicLogPayload, db: Session = Depends(get_db)):
 
 @router.get("/admin/logs")
 def get_admin_logs(request: Request, db: Session = Depends(get_db)):
+    """Cross-product activity log: every mutating API call across Green (web + the installed
+    Android PWA - X-LC-Client "green-field-pwa"), LandCheck Work, Estates, and the other product
+    surfaces, tagged by source (see classify_request_source/resolveWebClientLabel) and by whichever
+    organization the calling session belonged to (X-LC-Organization-Id, carried in `details`).
+    Resolves that organization_id into a name here - the id space is per-product (a Green org id
+    and an Estate org id are different rows in different tables), so resolution is grouped by
+    source prefix rather than assumed to be one universal organizations table."""
     require_super_admin_request(db, request)
     ensure_activity_log_table()
     rows = db.execute(
@@ -19258,16 +19265,60 @@ def get_admin_logs(request: Request, db: Session = Depends(get_db)):
             """
         )
     ).mappings().all()
-    
+
     items = []
     for row in rows:
         item = dict(row)
-        if isinstance(item.get("details"), str):
+        details = item.get("details")
+        if isinstance(details, str):
             try:
-                item["details"] = json.loads(item["details"])
+                details = json.loads(details)
             except Exception:
-                item["details"] = {}
+                details = {}
+        item["details"] = details or {}
         items.append(item)
+
+    green_org_ids: set[int] = set()
+    estate_org_ids: set[int] = set()
+    for item in items:
+        source = str(item.get("source") or "")
+        raw_org_id = item["details"].get("organization_id")
+        try:
+            org_id = int(raw_org_id) if raw_org_id not in (None, "", "null") else None
+        except (TypeError, ValueError):
+            org_id = None
+        item["organization_id"] = org_id
+        if org_id and source.startswith("estates"):
+            estate_org_ids.add(org_id)
+        elif org_id and source.startswith("green"):
+            green_org_ids.add(org_id)
+
+    green_names: dict[int, str] = {}
+    if green_org_ids:
+        green_names = {
+            int(r["id"]): r["name"]
+            for r in db.execute(
+                text("SELECT id, name FROM green_organizations WHERE id = ANY(:ids)"), {"ids": list(green_org_ids)}
+            ).mappings().all()
+        }
+    estate_names: dict[int, str] = {}
+    if estate_org_ids:
+        estate_names = {
+            int(r["id"]): r["name"]
+            for r in db.execute(
+                text("SELECT id, name FROM estate_organizations WHERE id = ANY(:ids)"), {"ids": list(estate_org_ids)}
+            ).mappings().all()
+        }
+
+    for item in items:
+        source = str(item.get("source") or "")
+        org_id = item.get("organization_id")
+        if org_id and source.startswith("estates"):
+            item["organization_name"] = estate_names.get(org_id)
+        elif org_id and source.startswith("green"):
+            item["organization_name"] = green_names.get(org_id)
+        else:
+            item["organization_name"] = None
     return items
 
 
