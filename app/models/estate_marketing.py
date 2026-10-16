@@ -86,6 +86,51 @@ class EstateInspectionBooking(Base):
     )
 
 
+class EstateLiveInspectionSession(Base):
+    """A scheduled or in-progress live video walkthrough of one plot for one remote buyer - an
+    agent on site joins a video call and streams their GPS position, verified against the plot's
+    real boundary (see verify_location() in app/services/estates/marketing_field.py), so the
+    buyer can see in real time whether the agent is actually standing on the plot being sold."""
+
+    __tablename__ = "estate_live_inspection_sessions"
+
+    id = Column(Integer, primary_key=True)
+    session_uid = Column(String(36), nullable=False, unique=True, default=lambda: str(uuid.uuid4()))
+    buyer_token_hash = Column(String(64), nullable=False, unique=True)
+    organization_id = Column(Integer, ForeignKey("estate_organizations.id", ondelete="CASCADE"), nullable=False)
+    estate_id = Column(Integer, ForeignKey("estate_estates.id", ondelete="CASCADE"), nullable=False)
+    plot_id = Column(Integer, ForeignKey("estate_plots.id", ondelete="CASCADE"), nullable=False)
+    customer_id = Column(Integer, ForeignKey("estate_customers.id", ondelete="SET NULL"), nullable=True)
+    buyer_name = Column(String(255), nullable=False)
+    buyer_phone = Column(String(64), nullable=True)
+    buyer_email = Column(String(255), nullable=True)
+    agent_member_id = Column(Integer, ForeignKey("estate_organization_members.id", ondelete="SET NULL"), nullable=True)
+    status = Column(String(16), nullable=False, default="scheduled")
+    video_room_name = Column(String(255), nullable=True)
+    video_room_url = Column(String(1024), nullable=True)
+    last_lat = Column(Float, nullable=True)
+    last_lng = Column(Float, nullable=True)
+    last_accuracy_m = Column(Float, nullable=True)
+    last_verification = Column(String(16), nullable=True)
+    last_distance_m = Column(Float, nullable=True)
+    last_location_at = Column(DateTime(timezone=True), nullable=True)
+    started_at = Column(DateTime(timezone=True), nullable=True)
+    ended_at = Column(DateTime(timezone=True), nullable=True)
+    created_by_subject_type = Column(String(64), nullable=False)
+    created_by_subject_id = Column(String(128), nullable=False)
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
+
+    __table_args__ = (
+        CheckConstraint("status IN ('scheduled', 'live', 'ended', 'cancelled')", name="ck_estate_live_inspection_status"),
+        CheckConstraint(
+            "last_verification IS NULL OR last_verification IN ('on_plot', 'on_estate', 'near_estate', 'outside')",
+            name="ck_estate_live_inspection_verification",
+        ),
+        Index("ix_estate_live_inspections_estate_status", "estate_id", "status"),
+    )
+
+
 class EstateProgressUpdate(Base):
     """A dated site update (photo / video / drone / milestone) shown on the public page. Location
     is checked against the plot or estate geometry at upload time and the result stored, so buyers

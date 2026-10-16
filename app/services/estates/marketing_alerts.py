@@ -365,3 +365,27 @@ def send_inspection_reminders(db: Session, *, now: datetime | None = None) -> di
     db.flush()
     return {"visitor_reminders": visitor_reminders, "staff_digests": staff_digests}
 
+
+def live_inspection_url(token: str) -> str:
+    return f"{web_url()}/estates/live-inspection/{token}"
+
+
+def send_live_inspection_invite(*, estate: Estate, plot: EstatePlot, buyer_name: str, buyer_email: str | None, token: str) -> bool:
+    """Sent once, at scheduling time - the link itself (PublicLiveInspectionPage) polls for when
+    the agent actually goes live, so this email only needs to go out once, not again at go-live."""
+    if not buyer_email:
+        return False
+    message_html = (
+        f"<p>Hello {html.escape(buyer_name)}, a live video walkthrough of <strong>Plot {html.escape(plot.plot_number)}</strong> "
+        f"at <strong>{html.escape(estate.name)}</strong> has been scheduled.</p>"
+        "<p>When your agent arrives on site and starts the call, this page will update automatically and show you - live - "
+        "whether they are actually standing on the plot, verified by GPS against its real boundary.</p>"
+    )
+    return _send(
+        buyer_email,
+        f"Live inspection scheduled - Plot {plot.plot_number}, {estate.name}",
+        "Your live site inspection",
+        message_html,
+        [("Open your live inspection link", live_inspection_url(token))],
+    )
+

@@ -16,13 +16,14 @@ from app.models.estate_foundation import (
     Estate,
     EstateAllocation,
     EstateCommissionPayout,
+    EstateCustomer,
     EstateOrganization,
     EstateOrganizationMember,
     EstatePlot,
     EstatePublicReservationRequest,
     EstateQrCampaign,
 )
-from app.models.estate_marketing import EstateInspectionBooking, EstateInspectionSlot, EstateProgressUpdate, EstatePublicEvent
+from app.models.estate_marketing import EstateInspectionBooking, EstateInspectionSlot, EstateLiveInspectionSession, EstateProgressUpdate, EstatePublicEvent
 from app.routers.estates import _agent_display_name, _agent_portal_context, _public_estate
 from app.routers.plots import get_db
 from app.schemas.estate_marketing import (
@@ -32,10 +33,12 @@ from app.schemas.estate_marketing import (
     InspectionSlotCreate,
     InspectionSlotUpdate,
     InspectionBookingUpdate,
+    LiveInspectionCreate,
+    LiveInspectionLocationUpdate,
     ProgressUpdatePatch,
     PublicEventCreate,
 )
-from app.services.estates import commissions, marketing_alerts, marketing_field, marketing_pdf, marketing_render
+from app.services.estates import commissions, live_inspection, marketing_alerts, marketing_field, marketing_pdf, marketing_render
 from app.services.estates.audit import append_estate_audit_event
 from app.services.estates.authorization import EstatePrincipal, require_estate_access, require_estate_view_access
 from app.services.estates.marketing_common import (
@@ -1197,3 +1200,183 @@ def agent_update_booking(token: str, booking_id: int, payload: AgentBookingUpdat
     append_estate_audit_event(db, organization_id=organization.id, actor=EstatePrincipal(member.subject_type, member.subject_id, member.subject_id), action="inspection_booking.agent_updated", entity_type="estate_inspection_booking", entity_id=booking.id, after_data={"status": booking.status})
     db.commit()
     return _booking_payload(db, booking)
+
+
+# ─── Live video + live GPS plot verification ────────────────────────────────────────────────
+# An agent on site opens a video call; while live, their GPS position is checked every few
+# seconds against the real plot boundary (marketing_field.verify_location - the same function
+# already used for geo-tagged progress photos) and the result is what the remote buyer's page
+# polls for. See app/services/estates/live_inspection.py for the Daily.co room client.
+
+def _live_session_payload(session: EstateLiveInspectionSession, *, plot: EstatePlot, estate: Estate, include_room: bool) -> dict:
+    data = {
+        "id": session.session_uid,
+        "status": session.status,
+        "estate_name": estate.name,
+        "plot_number": plot.plot_number,
+        "buyer_name": session.buyer_name,
+        "live": {
+            "verification": session.last_verification,
+            "distance_m": session.last_distance_m,
+            "updated_at": session.last_location_at,
+        } if session.status == "live" else None,
+        "started_at": session.started_at,
+        "ended_at": session.ended_at,
+    }
+    if include_room and session.status == "live":
+        data["room_url"] = session.video_room_url
+    return data
+
+
+@router.post("/{estate_id}/marketing/live-inspections", status_code=201)
+def staff_create_live_inspection(estate_id: int, payload: LiveInspectionCreate, request: Request, db: Session = Depends(get_db)):
+    estate, access = _staff(db, request, estate_id, permission="estate.manage")
+    plot = db.query(EstatePlot).filter(EstatePlot.id == payload.plot_id, EstatePlot.estate_id == estate.id).one_or_none()
+    if plot is None:
+        raise HTTPException(404, "Plot not found")
+    customer = None
+    if payload.customer_id:
+        customer = db.query(EstateCustomer).filter(EstateCustomer.id == payload.customer_id, EstateCustomer.organization_id == estate.organization_id).one_or_none()
+        if customer is None:
+            raise HTTPException(404, "Customer not found")
+    agent_member = None
+    if payload.agent_member_id:
+        agent_member = db.query(EstateOrganizationMember).filter(EstateOrganizationMember.id == payload.agent_member_id, EstateOrganizationMember.organization_id == estate.organization_id).one_or_none()
+        if agent_member is None:
+            raise HTTPException(404, "Agent not found")
+    token = secrets.token_urlsafe(24)
+    session = EstateLiveInspectionSession(
+        buyer_token_hash=hash_portal_token(token),
+        organization_id=estate.organization_id,
+        estate_id=estate.id,
+        plot_id=plot.id,
+        customer_id=customer.id if customer else None,
+        buyer_name=(customer.full_name if customer else payload.buyer_name).strip(),
+        buyer_phone=(customer.phone if customer else payload.buyer_phone),
+        buyer_email=(customer.email if customer else payload.buyer_email),
+        agent_member_id=agent_member.id if agent_member else None,
+        status="scheduled",
+        created_by_subject_type=access.principal.subject_type,
+        created_by_subject_id=access.principal.subject_id,
+    )
+    db.add(session)
+    db.flush()
+    append_estate_audit_event(
+        db,
+        organization_id=estate.organization_id,
+        actor=access.principal,
+        action="live_inspection.created",
+        entity_type="estate_live_inspection_session",
+        entity_id=session.id,
+        after_data={"plot_id": plot.id, "buyer_name": session.buyer_name, "agent_member_id": session.agent_member_id},
+    )
+    db.commit()
+    invite_sent = marketing_alerts.send_live_inspection_invite(estate=estate, plot=plot, buyer_name=session.buyer_name, buyer_email=session.buyer_email, token=token)
+    payload_out = _live_session_payload(session, plot=plot, estate=estate, include_room=False)
+    payload_out["buyer_token"] = token
+    payload_out["buyer_link"] = marketing_alerts.live_inspection_url(token)
+    payload_out["invite_email_sent"] = invite_sent
+    return payload_out
+
+
+@router.get("/{estate_id}/marketing/live-inspections")
+def staff_list_live_inspections(estate_id: int, request: Request, db: Session = Depends(get_db)):
+    estate, _access = _staff(db, request, estate_id)
+    rows = (
+        db.query(EstateLiveInspectionSession, EstatePlot)
+        .join(EstatePlot, EstatePlot.id == EstateLiveInspectionSession.plot_id)
+        .filter(EstateLiveInspectionSession.estate_id == estate.id)
+        .order_by(EstateLiveInspectionSession.created_at.desc())
+        .limit(200)
+        .all()
+    )
+    return [_live_session_payload(session, plot=plot, estate=estate, include_room=True) for session, plot in rows]
+
+
+def _agent_live_session(db: Session, member: EstateOrganizationMember, organization: EstateOrganization, session_uid: str) -> tuple[EstateLiveInspectionSession, EstatePlot, Estate]:
+    session = db.query(EstateLiveInspectionSession).filter(EstateLiveInspectionSession.session_uid == session_uid, EstateLiveInspectionSession.organization_id == organization.id).one_or_none()
+    if session is None or session.agent_member_id != member.id:
+        raise HTTPException(404, "Live inspection not found")
+    plot = db.get(EstatePlot, session.plot_id)
+    estate = db.get(Estate, session.estate_id)
+    if plot is None or estate is None:
+        raise HTTPException(404, "Live inspection not found")
+    return session, plot, estate
+
+
+@router.get("/agent-portal/{token}/live-inspections")
+def agent_list_live_inspections(token: str, db: Session = Depends(get_db)):
+    _row, member, organization = _agent_portal_context(db, token)
+    rows = (
+        db.query(EstateLiveInspectionSession, EstatePlot, Estate)
+        .join(EstatePlot, EstatePlot.id == EstateLiveInspectionSession.plot_id)
+        .join(Estate, Estate.id == EstateLiveInspectionSession.estate_id)
+        .filter(EstateLiveInspectionSession.organization_id == organization.id, EstateLiveInspectionSession.agent_member_id == member.id, EstateLiveInspectionSession.status.in_(["scheduled", "live"]))
+        .order_by(EstateLiveInspectionSession.created_at.desc())
+        .limit(50)
+        .all()
+    )
+    return [_live_session_payload(session, plot=plot, estate=estate, include_room=True) for session, plot, estate in rows]
+
+
+@router.post("/agent-portal/{token}/live-inspections/{session_uid}/start")
+def agent_start_live_inspection(token: str, session_uid: str, db: Session = Depends(get_db)):
+    _row, member, organization = _agent_portal_context(db, token)
+    session, plot, estate = _agent_live_session(db, member, organization, session_uid)
+    if session.status != "scheduled":
+        raise HTTPException(409, f"This live inspection is already {session.status}")
+    if not live_inspection.configured():
+        raise HTTPException(503, "Live video inspections are not configured on this server")
+    room_name, room_url = live_inspection.create_room(session_uid=session.session_uid)
+    session.video_room_name = room_name
+    session.video_room_url = room_url
+    session.status = "live"
+    session.started_at = _now()
+    db.flush()
+    append_estate_audit_event(db, organization_id=organization.id, actor=EstatePrincipal(member.subject_type, member.subject_id, member.subject_id), action="live_inspection.started", entity_type="estate_live_inspection_session", entity_id=session.id)
+    db.commit()
+    return _live_session_payload(session, plot=plot, estate=estate, include_room=True)
+
+
+@router.post("/agent-portal/{token}/live-inspections/{session_uid}/location")
+def agent_update_live_location(token: str, session_uid: str, payload: LiveInspectionLocationUpdate, db: Session = Depends(get_db)):
+    _row, member, organization = _agent_portal_context(db, token)
+    session, plot, estate = _agent_live_session(db, member, organization, session_uid)
+    if session.status != "live":
+        raise HTTPException(409, "This live inspection is not currently live")
+    verification, distance = marketing_field.verify_location(lat=payload.lat, lon=payload.lng, accuracy_m=payload.accuracy_m, plots=[], boundary=estate.boundary, focus_plot=plot)
+    session.last_lat = payload.lat
+    session.last_lng = payload.lng
+    session.last_accuracy_m = payload.accuracy_m
+    session.last_verification = verification
+    session.last_distance_m = distance
+    session.last_location_at = _now()
+    db.commit()
+    return {"verification": verification, "distance_m": distance}
+
+
+@router.post("/agent-portal/{token}/live-inspections/{session_uid}/end")
+def agent_end_live_inspection(token: str, session_uid: str, db: Session = Depends(get_db)):
+    _row, member, organization = _agent_portal_context(db, token)
+    session, plot, estate = _agent_live_session(db, member, organization, session_uid)
+    if session.status != "live":
+        raise HTTPException(409, "This live inspection is not currently live")
+    live_inspection.end_room(session.video_room_name or "")
+    session.status = "ended"
+    session.ended_at = _now()
+    db.flush()
+    append_estate_audit_event(db, organization_id=organization.id, actor=EstatePrincipal(member.subject_type, member.subject_id, member.subject_id), action="live_inspection.ended", entity_type="estate_live_inspection_session", entity_id=session.id)
+    db.commit()
+    return _live_session_payload(session, plot=plot, estate=estate, include_room=False)
+
+
+@router.get("/live-inspections/{token}")
+def public_get_live_inspection(token: str, db: Session = Depends(get_db)):
+    session = db.query(EstateLiveInspectionSession).filter(EstateLiveInspectionSession.buyer_token_hash == hash_portal_token(token)).one_or_none()
+    if session is None:
+        raise HTTPException(404, "This live inspection link is invalid")
+    plot = db.get(EstatePlot, session.plot_id)
+    estate = db.get(Estate, session.estate_id)
+    if plot is None or estate is None:
+        raise HTTPException(404, "This live inspection link is invalid")
+    return _live_session_payload(session, plot=plot, estate=estate, include_room=True)

@@ -62,3 +62,18 @@ class AgentLeadUpdate(BaseModel):
 
 class AgentBookingUpdate(BaseModel):
     status: Literal["attended", "no_show"]
+
+
+class LiveInspectionCreate(BaseModel):
+    plot_id: int
+    customer_id: int | None = None
+    buyer_name: str = Field(min_length=2, max_length=255)
+    buyer_phone: str | None = Field(default=None, max_length=64)
+    buyer_email: str | None = Field(default=None, max_length=255)
+    agent_member_id: int | None = None
+
+
+class LiveInspectionLocationUpdate(BaseModel):
+    lat: float = Field(ge=-90, le=90)
+    lng: float = Field(ge=-180, le=180)
+    accuracy_m: float | None = Field(default=None, ge=0)
