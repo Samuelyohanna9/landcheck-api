@@ -71,6 +71,14 @@ def create_room(*, session_uid: str) -> tuple[str, str]:
                 "enable_screenshare": False,
                 "enable_chat": True,
                 "max_participants": 2,
+                # Daily's default prebuilt call shows its own "enter your name / check camera"
+                # lobby screen before actually joining the room - on a 2-person ad-hoc call that
+                # just read as "ask to join, then stuck on waiting for others" with no indication
+                # anything was wrong (both sides were really just sitting on that lobby screen).
+                # Both agent and buyer should land directly in the live call the moment the page
+                # opens and camera/mic permission is granted.
+                "enable_prejoin_ui": False,
+                "enable_knocking": False,
             },
         },
     )
