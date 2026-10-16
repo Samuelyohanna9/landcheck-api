@@ -27677,6 +27677,7 @@ def delete_user(
     user_id: int,
     request: Request,
     db: Session = Depends(get_db),
+    confirm_name: str = Body(..., embed=True),
 ):
     existing = db.execute(
         text(
@@ -27705,20 +27706,36 @@ def delete_user(
         if int(session.user_id or 0) == int(user_id):
             raise HTTPException(status_code=400, detail="You cannot remove your own account")
 
-    deleted_id = db.execute(
-        text("DELETE FROM green_users WHERE id = :user_id RETURNING id"),
+    # Same type-the-name-to-confirm pattern as delete_project, so removal can't happen by
+    # a stray click.
+    expected_name = str(existing.get("full_name") or "").strip()
+    provided_name = str(confirm_name or "").strip()
+    if not provided_name:
+        raise HTTPException(status_code=400, detail="Staff name confirmation is required")
+    if provided_name != expected_name:
+        raise HTTPException(status_code=400, detail="Staff name confirmation does not match")
+
+    # This used to be a hard DELETE. Removing a staff member must revoke their platform
+    # access (enforced immediately via is_active, checked on every request - see
+    # resolve_request_session) without erasing the trees/tasks/records they created, so
+    # this is a deactivation, not a row delete.
+    updated_id = db.execute(
+        text(
+            "UPDATE green_users SET is_active = FALSE, work_password_hash = NULL "
+            "WHERE id = :user_id RETURNING id"
+        ),
         {"user_id": user_id},
     ).scalar()
-    if not deleted_id:
+    if not updated_id:
         raise HTTPException(status_code=404, detail="User not found")
 
     _log_audit_event(
         db,
         project_id=None,
         entity_type="user",
-        entity_id=int(deleted_id),
-        action="user_deleted",
-        actor="super_admin",
+        entity_id=int(updated_id),
+        action="user_access_revoked",
+        actor="super_admin" if session.is_super_admin else "org_admin",
         details={
             "user_uid": existing.get("user_uid"),
             "full_name": existing.get("full_name"),
@@ -27727,11 +27744,10 @@ def delete_user(
             "allow_green": bool(existing.get("allow_green", True)),
             "allow_work": bool(existing.get("allow_work", False)),
             "work_username": existing.get("work_username"),
-            "is_active": bool(existing.get("is_active", True)),
         },
     )
     db.commit()
-    return {"ok": True, "id": int(deleted_id)}
+    return {"ok": True, "id": int(updated_id)}
 
 
 @router.post("/users/{user_id}/reset-password")
