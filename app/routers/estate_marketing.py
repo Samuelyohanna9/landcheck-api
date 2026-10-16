@@ -1370,7 +1370,7 @@ def agent_end_live_inspection(token: str, session_uid: str, db: Session = Depend
     return _live_session_payload(session, plot=plot, estate=estate, include_room=False)
 
 
-@router.get("/live-inspections/{token}")
+@router.get("/public/live-inspections/{token}")
 def public_get_live_inspection(token: str, db: Session = Depends(get_db)):
     session = db.query(EstateLiveInspectionSession).filter(EstateLiveInspectionSession.buyer_token_hash == hash_portal_token(token)).one_or_none()
     if session is None:
