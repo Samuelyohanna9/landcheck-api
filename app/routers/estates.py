@@ -35,7 +35,7 @@ from app.services.estates.authorization import list_estate_access, resolve_estat
 from app.services.estates.identity import generate_temp_password, hash_password, normalize_email, slugify
 from app.services.estates.entitlements import ESTATE_FEATURES, get_estate_entitlement
 from app.models.estate_foundation import Estate, EstateAgentPortalToken, EstateAllocation, EstateAuditEvent, EstateBlock, EstateCommissionPayout, EstateCommissionTier, EstateCustomer, EstateCustomerPortalToken, EstateDocument, EstateDocumentLink, EstateFieldInspection, EstateHazardAssessment, EstateImportReview, EstateLayoutProposal, EstateNotificationLog, EstateOrganization, EstateOrganizationMember, EstatePayment, EstatePaymentInbox, EstatePaymentRule, EstatePlot, EstatePublicReservationRequest, EstateQrCampaign, EstateSoilAssessment, EstateSpatialFeature, EstateStaffRole, EstateSurveyRequest, EstateStakingTask, GeotechSurveyRequest
-from app.schemas.estates import AllocationAction, BlockCreate, BlockUpdate, CommissionPayoutCreate, CommissionTiersUpdate, CustomerCreate, DevelopmentForecastPublishUpdate, DevelopmentStatusUpdate, EstateCreate, EstateLayoutCriteria, EstateLayoutDecision, EstateLayoutFeatureAdd, EstateLayoutFeatureRemove, EstateLayoutProposalEdit, EstateSubdivisionCreate, EstateUpdate, FieldInspectionCreate, GeoreferenceSessionLink, ImportFromGeoreference, ImportReviewCreate, ImportReviewDecision, ImportReviewFromGeoreferenceSession, MemberCreate, MemberUpdate, PaymentInboxCreate, PaymentInboxMatch, PlotCreate, PlotAddressUpdate, PlotGeometryUpdate, PlotListingDefaultsUpdate, PlotPriceUpdate, PortalTokenCreate, BulkCustomerSmsCreate, PublicEstateSettingsUpdate, PublicReservationConvert, PublicReservationCreate, PublicReservationUpdate, PaymentCreate, QrCampaignCreate, SpatialFeatureCreate, SpatialFeatureUpdate, StaffCreate, StaffRoleCreate, StaffRoleUpdate, StaffUpdate, SurveyEligibilityUpdate, VoidAction
+from app.schemas.estates import AllocationAction, BlockCreate, BlockUpdate, CommissionPayoutCreate, CommissionTiersUpdate, CustomerCreate, DevelopmentForecastPublishUpdate, DevelopmentStatusUpdate, EstateCreate, EstateLayoutCriteria, EstateLayoutDecision, EstateLayoutFeatureAdd, EstateLayoutFeatureRemove, EstateLayoutProposalEdit, EstateSubdivisionCreate, EstateUpdate, FieldInspectionCreate, GeoreferenceSessionLink, ImportFromGeoreference, ImportReviewCreate, ImportReviewDecision, ImportReviewFromGeoreferenceSession, MemberCreate, MemberUpdate, PaymentInboxCreate, PaymentInboxMatch, PlotCreate, PlotAddressUpdate, PlotGeometryUpdate, PlotListingDefaultsUpdate, PlotPriceUpdate, PortalTokenCreate, BulkCustomerSmsCreate, PublicEstateSettingsUpdate, PublicReservationConvert, PublicReservationCreate, PublicReservationUpdate, PaymentCreate, QrCampaignCreate, SpatialFeatureCreate, SpatialFeatureUpdate, StaffCreate, StaffRoleCreate, StaffRoleUpdate, StaffUpdate, SurveyEligibilityUpdate, TitleVerificationUpdate, VoidAction
 from app.services.estates.payments import confirm_payment, financial_summary, record_payment, void_payment
 from app.services.estates.documents import MAX_ESTATE_DOCUMENT_BYTES, read_private_estate_file, store_private_estate_file
 from app.utils.r2_objects import delete_object_best_effort, build_r2_settings
@@ -253,6 +253,8 @@ def _public_estate_payload(db: Session, estate: Estate) -> dict:
             "status": plot.commercial_status if plot.commercial_status in visible_statuses else "on_hold",
             "price": str(plot.asking_price) if estate.public_show_prices and plot.asking_price is not None else None,
             "geometry": mapping(to_shape(plot.geometry)),
+            "title_verified": bool(plot.title_verified),
+            "title_verified_at": plot.title_verified_at if plot.title_verified else None,
         }
         for plot in plots
         if plot.geometry and plot.commercial_status in visible_statuses
@@ -1595,6 +1597,8 @@ def estate_plots_geojson(estate_id: int, request: Request, db: Session = Depends
         EstatePlot.public_address,
         EstatePlot.asking_price,
         EstatePlot.block_id,
+        EstatePlot.title_verified,
+        EstatePlot.title_verified_note,
         # Seven decimal places is centimetre-level for the map and avoids returning a large
         # amount of floating-point noise for every vertex in a large layout.
         func.ST_AsGeoJSON(EstatePlot.geometry, 7).label("geometry_json"),
@@ -1607,7 +1611,7 @@ def estate_plots_geojson(estate_id: int, request: Request, db: Session = Depends
             geometry = None
         if geometry is None:
             continue
-        features.append({"type": "Feature", "id": row.id, "properties": {"id": row.id, "plot_number": row.plot_number, "commercial_status": row.commercial_status, "development_status": row.development_status, "geometry_status": row.geometry_status, "area_sqm": float(row.area_sqm or 0), "public_address": row.public_address, "asking_price": str(row.asking_price) if row.asking_price is not None else None, "block_id": row.block_id}, "geometry": geometry})
+        features.append({"type": "Feature", "id": row.id, "properties": {"id": row.id, "plot_number": row.plot_number, "commercial_status": row.commercial_status, "development_status": row.development_status, "geometry_status": row.geometry_status, "area_sqm": float(row.area_sqm or 0), "public_address": row.public_address, "asking_price": str(row.asking_price) if row.asking_price is not None else None, "block_id": row.block_id, "title_verified": bool(row.title_verified), "title_verified_note": row.title_verified_note}, "geometry": geometry})
     return {"type": "FeatureCollection", "features": features}
 
 @router.get("/{estate_id}/layers.geojson")
@@ -3481,6 +3485,21 @@ def update_development_status(plot_id:int, payload:DevelopmentStatusUpdate, requ
         if active_allocation:
             customer_notified = _notify_allocation_customer(db, allocation=active_allocation, org_name=access.organization_name, event="land_developed")
     return {"id":plot.id,"development_status":plot.development_status,"customer_notified":customer_notified}
+
+@router.patch("/plots/{plot_id}/title-verification")
+def update_title_verification(plot_id:int, payload:TitleVerificationUpdate, request:Request, db:Session=Depends(get_db)):
+    # Staff-asserted, not auto-computed - see EstatePlot.title_verified's docstring. The note is
+    # internal context for other staff (which document they checked, who signed off) and is
+    # never sent to _public_estate_payload.
+    plot=db.get(EstatePlot,plot_id)
+    if not plot: raise HTTPException(404,"Plot not found")
+    estate=db.get(Estate,plot.estate_id); access=require_estate_access(db,request,estate.organization_id,permission="estate.manage")
+    previous=plot.title_verified; plot.title_verified=payload.verified
+    plot.title_verified_at = datetime.now(timezone.utc) if payload.verified else None
+    plot.title_verified_note = payload.note.strip() if payload.note else None
+    append_estate_audit_event(db,organization_id=estate.organization_id,actor=access.principal,action="plot.title_verification_changed",entity_type="estate_plot",entity_id=plot.id,before_data={"title_verified":previous},after_data={"title_verified":plot.title_verified})
+    db.commit()
+    return {"id":plot.id,"title_verified":plot.title_verified,"title_verified_at":plot.title_verified_at}
 
 @router.post("/plots/{plot_id}/inspections")
 def create_field_inspection(plot_id:int, payload:FieldInspectionCreate, request:Request, db:Session=Depends(get_db)):

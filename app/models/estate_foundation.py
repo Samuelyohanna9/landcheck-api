@@ -182,6 +182,13 @@ class EstatePlot(Base):
     commercial_status = Column(String(32), nullable=False, default="available")
     development_status = Column(String(32), nullable=False, default="not_started")
     geometry_status = Column(String(32), nullable=False, default="draft")
+    # Staff-asserted, not auto-computed - LandCheck can't confirm land title on its own; this
+    # records that a staff member reviewed the plot's actual title documents (see
+    # ESTATE_DOCUMENT_TYPES: title_document/certificate_of_occupancy/governors_consent/
+    # survey_plan) and is willing to put their name behind it publicly.
+    title_verified = Column(Boolean, nullable=False, default=False)
+    title_verified_at = Column(DateTime(timezone=True), nullable=True)
+    title_verified_note = Column(Text, nullable=True)
     source_type = Column(String(32), nullable=False, default="manual")
     source_reference = Column(String(128), nullable=True)
     created_by_subject_type = Column(String(64), nullable=False)

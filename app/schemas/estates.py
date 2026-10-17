@@ -171,6 +171,11 @@ class DevelopmentStatusUpdate(BaseModel):
     status: str = Field(pattern="^(not_started|site_cleared|foundation|under_construction|developed)$")
 
 
+class TitleVerificationUpdate(BaseModel):
+    verified: bool
+    note: str | None = Field(default=None, max_length=1000)
+
+
 class SurveyEligibilityUpdate(BaseModel):
     is_enabled: bool = True
     percentage: Decimal = Field(default=Decimal("0"), ge=0, le=100)
