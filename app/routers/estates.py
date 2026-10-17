@@ -447,6 +447,48 @@ def public_estate_showcase(slug: str, source: str | None = None, db: Session = D
     return payload
 
 
+@router.get("/public/{slug}/verify")
+def public_verify_listing(slug: str, request: Request, plot_number: str | None = None, agent_code: str | None = None, db: Session = Depends(get_db)):
+    """Lets a buyer who was contacted elsewhere (WhatsApp, a flyer, a stranger at the gate) check
+    on the developer's own real public page whether a plot number or agent code is genuine -
+    addresses the Omo Onile / impersonation-fraud gap. Throttled since an abuser could otherwise
+    hammer this to enumerate valid plot numbers/codes."""
+    if not plot_number and not agent_code:
+        raise HTTPException(422, "Enter a plot number or an agent code to check.")
+    if marketing_common.throttled(marketing_common.client_ip(request), "public-verify", limit=20, window_seconds=60):
+        raise HTTPException(429, "Too many checks. Please try again in a minute.")
+    estate = _public_estate(db, slug)
+    organization = db.get(EstateOrganization, estate.organization_id)
+    result: dict = {}
+    if plot_number:
+        plot = db.query(EstatePlot).filter(
+            EstatePlot.estate_id == estate.id,
+            EstatePlot.plot_number == plot_number.strip(),
+            EstatePlot.geometry_status == "approved",
+        ).one_or_none()
+        if plot:
+            result["plot"] = {"status": "genuine", "plot_number": plot.plot_number, "commercial_status": plot.commercial_status, "title_verified": bool(plot.title_verified)}
+        else:
+            result["plot"] = {"status": "not_found"}
+    if agent_code:
+        campaign = db.query(EstateQrCampaign).filter(
+            EstateQrCampaign.estate_id == estate.id,
+            EstateQrCampaign.code == agent_code.strip(),
+            EstateQrCampaign.is_active.is_(True),
+        ).one_or_none()
+        agent_name = None
+        if campaign and campaign.assigned_agent_subject_type and campaign.assigned_agent_subject_id:
+            agent_name = _agent_display_name(db, organization_id=estate.organization_id, subject_type=campaign.assigned_agent_subject_type, subject_id=campaign.assigned_agent_subject_id)
+        if campaign and agent_name:
+            result["agent"] = {"status": "genuine", "code": campaign.code, "agent_name": agent_name}
+        else:
+            result["agent"] = {"status": "not_found"}
+    result["organization_name"] = organization.name if organization else None
+    result["organization_email"] = organization.contact_email if organization else None
+    result["contact_phone"] = estate.public_contact_phone
+    return result
+
+
 @router.get("/public/{slug}/logo")
 def public_estate_logo(slug: str, db: Session = Depends(get_db)):
     """Serve the deliberately public company logo without exposing its storage object key."""
