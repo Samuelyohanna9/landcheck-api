@@ -767,7 +767,15 @@ async def add_security_headers(request: Request, call_next):
     response.headers.setdefault("X-Content-Type-Options", "nosniff")
     response.headers.setdefault("X-Frame-Options", "DENY")
     response.headers.setdefault("Referrer-Policy", "no-referrer")
-    response.headers.setdefault("Permissions-Policy", "camera=(), microphone=(), geolocation=(self)")
+    # camera/microphone used to be blanket-denied (nothing in the app needed them). The live
+    # video inspection feature does now - both on this origin (the agent/buyer pages requesting
+    # getUserMedia directly) and inside the embedded Daily.co call iframe, which needs the
+    # permission delegated to it. Permissions-Policy allowlists don't support wildcard
+    # subdomains, so rather than hardcode one specific daily.co subdomain (and break this again
+    # the day that subdomain changes), these two are opened to all origins; actual access is
+    # still gated per-site by the browser's own camera/mic permission prompt either way, same as
+    # if this header didn't exist at all.
+    response.headers.setdefault("Permissions-Policy", "camera=*, microphone=*, geolocation=(self)")
     response.headers.setdefault("Cross-Origin-Resource-Policy", "same-site")
     response.headers.setdefault("X-Permitted-Cross-Domain-Policies", "none")
     response.headers.setdefault("Cross-Origin-Opener-Policy", "same-origin")
