@@ -1321,6 +1321,29 @@ def staff_list_live_inspections(estate_id: int, request: Request, db: Session = 
     return [_live_session_payload(session, plot=plot, estate=estate, include_room=True) for session, plot in rows]
 
 
+@router.post("/{estate_id}/marketing/live-inspections/{session_uid}/cancel")
+def staff_cancel_live_inspection(estate_id: int, session_uid: str, request: Request, db: Session = Depends(get_db)):
+    """A staff-side stop for a session the agent can't end themselves (device lost, browser
+    crashed, lost connection) - without this, a stuck "live" session has no way out short of
+    waiting for the Daily room's own exp to lapse."""
+    estate, access = _staff(db, request, estate_id, permission="estate.manage")
+    session = db.query(EstateLiveInspectionSession).filter(EstateLiveInspectionSession.session_uid == session_uid, EstateLiveInspectionSession.estate_id == estate.id).one_or_none()
+    if session is None:
+        raise HTTPException(404, "Live inspection not found")
+    if session.status not in ("scheduled", "live"):
+        raise HTTPException(409, f"This live inspection is already {session.status}")
+    was_live = session.status == "live"
+    if was_live:
+        live_inspection.end_room(session.video_room_name or "")
+    session.status = "cancelled"
+    session.ended_at = _now()
+    db.flush()
+    append_estate_audit_event(db, organization_id=estate.organization_id, actor=access.principal, action="live_inspection.cancelled", entity_type="estate_live_inspection_session", entity_id=session.id, after_data={"was_live": was_live})
+    db.commit()
+    plot = db.get(EstatePlot, session.plot_id)
+    return _live_session_payload(session, plot=plot, estate=estate, include_room=False)
+
+
 def _agent_live_session(db: Session, member: EstateOrganizationMember, organization: EstateOrganization, session_uid: str) -> tuple[EstateLiveInspectionSession, EstatePlot, Estate]:
     session = db.query(EstateLiveInspectionSession).filter(EstateLiveInspectionSession.session_uid == session_uid, EstateLiveInspectionSession.organization_id == organization.id).one_or_none()
     if session is None or session.agent_member_id != member.id:
