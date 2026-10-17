@@ -370,7 +370,16 @@ def live_inspection_url(token: str) -> str:
     return f"{web_url()}/estates/live-inspection/{token}"
 
 
-def send_agent_live_inspection_assignment(*, agent_email: str | None, agent_name: str, estate: Estate, plot: EstatePlot, buyer_name: str, portal_url: str) -> bool:
+def live_inspection_reschedule_url(token: str) -> str:
+    return f"{web_url()}/estates/live-inspection/{token}/reschedule"
+
+
+def format_live_inspection_time(value: datetime) -> str:
+    local = _aware(value).astimezone(WAT)
+    return local.strftime("%A %d %B %Y, %I:%M %p").replace(" 0", " ") + " (WAT)"
+
+
+def send_agent_live_inspection_assignment(*, agent_email: str | None, agent_name: str, estate: Estate, plot: EstatePlot, buyer_name: str, scheduled_at: datetime, portal_url: str) -> bool:
     """Sent once, when the agent is assigned at scheduling time - tells them exactly what to do
     next rather than just dropping a link: go to the plot, open the workspace, go live there."""
     if not agent_email:
@@ -379,9 +388,10 @@ def send_agent_live_inspection_assignment(*, agent_email: str | None, agent_name
         f"<p>Hello {html.escape(agent_name)}, you've been assigned a live video inspection.</p>"
         f"<p><strong>Plot {html.escape(plot.plot_number)}</strong> at <strong>{html.escape(estate.name)}</strong>, "
         f"for buyer <strong>{html.escape(buyer_name)}</strong>, who can't visit in person.</p>"
+        f"<p><strong>When:</strong> {html.escape(format_live_inspection_time(scheduled_at))}</p>"
         "<p><strong>What to do:</strong></p>"
         "<ol>"
-        "<li>When you're ready, travel to the plot.</li>"
+        "<li>At the scheduled time, travel to the plot.</li>"
         "<li>Open your agent workspace (button below) and go to <strong>Live inspections</strong>.</li>"
         "<li>Once you're there, tap <strong>Go live</strong> - this starts the video call and begins sharing your GPS "
         "position, so the buyer can see live that you're really standing on the plot.</li>"
@@ -397,7 +407,7 @@ def send_agent_live_inspection_assignment(*, agent_email: str | None, agent_name
     )
 
 
-def send_live_inspection_invite(*, estate: Estate, plot: EstatePlot, buyer_name: str, buyer_email: str | None, token: str) -> bool:
+def send_live_inspection_invite(*, estate: Estate, plot: EstatePlot, buyer_name: str, buyer_email: str | None, scheduled_at: datetime, token: str) -> bool:
     """Sent once, at scheduling time - the link itself (PublicLiveInspectionPage) polls for when
     the agent actually goes live, so this email only needs to go out once, not again at go-live."""
     if not buyer_email:
@@ -405,14 +415,66 @@ def send_live_inspection_invite(*, estate: Estate, plot: EstatePlot, buyer_name:
     message_html = (
         f"<p>Hello {html.escape(buyer_name)}, a live video walkthrough of <strong>Plot {html.escape(plot.plot_number)}</strong> "
         f"at <strong>{html.escape(estate.name)}</strong> has been scheduled.</p>"
+        f"<p><strong>When:</strong> {html.escape(format_live_inspection_time(scheduled_at))}</p>"
         "<p>When your agent arrives on site and starts the call, this page will update automatically and show you - live - "
         "whether they are actually standing on the plot, verified by GPS against its real boundary.</p>"
+        "<p>If that time doesn't work for you, use the second button below to suggest one or more times that do.</p>"
     )
     return _send(
         buyer_email,
         f"Live inspection scheduled - Plot {plot.plot_number}, {estate.name}",
         "Your live site inspection",
         message_html,
+        [("Open your live inspection link", live_inspection_url(token)), ("Request a different time", live_inspection_reschedule_url(token))],
+    )
+
+
+def send_live_inspection_time_approved(*, estate: Estate, plot: EstatePlot, buyer_name: str, buyer_email: str | None, scheduled_at: datetime, token: str) -> bool:
+    """Sent once staff approve one of the buyer's proposed times (or set a new time directly)."""
+    if not buyer_email:
+        return False
+    message_html = (
+        f"<p>Hello {html.escape(buyer_name)}, your requested time for the live inspection of "
+        f"<strong>Plot {html.escape(plot.plot_number)}</strong> at <strong>{html.escape(estate.name)}</strong> has been confirmed.</p>"
+        f"<p><strong>When:</strong> {html.escape(format_live_inspection_time(scheduled_at))}</p>"
+        "<p>Use the same link below to join when your agent starts the call.</p>"
+    )
+    return _send(
+        buyer_email,
+        f"Your live inspection time is confirmed - Plot {plot.plot_number}, {estate.name}",
+        "Your time has been approved",
+        message_html,
         [("Open your live inspection link", live_inspection_url(token))],
     )
+
+
+def send_live_inspection_rescheduled_notice_to_agent(*, agent_email: str | None, agent_name: str, estate: Estate, plot: EstatePlot, scheduled_at: datetime) -> bool:
+    if not agent_email:
+        return False
+    message_html = (
+        f"<p>Hello {html.escape(agent_name)}, for your notice: the live inspection of "
+        f"<strong>Plot {html.escape(plot.plot_number)}</strong> at <strong>{html.escape(estate.name)}</strong> "
+        f"has been rescheduled to <strong>{html.escape(format_live_inspection_time(scheduled_at))}</strong>.</p>"
+    )
+    return _send(
+        agent_email,
+        f"Live inspection rescheduled - Plot {plot.plot_number}, {estate.name}",
+        "Inspection time changed",
+        message_html,
+    )
+
+
+def notify_staff_of_live_inspection_reschedule(db: Session, *, estate: Estate, plot: EstatePlot, buyer_name: str, proposed_times: list[datetime]) -> int:
+    organization = db.get(EstateOrganization, estate.organization_id)
+    if organization is None:
+        return 0
+    recipients = _dedupe(_member_emails(db, organization.id, SALES_ROLES) + ([organization.contact_email] if organization.contact_email else []))
+    times_html = "".join(f"<li>{html.escape(format_live_inspection_time(value))}</li>" for value in proposed_times)
+    message_html = (
+        f"<p><strong>{html.escape(buyer_name)}</strong> asked for a different time for the live inspection of "
+        f"<strong>Plot {html.escape(plot.plot_number)}</strong> at <strong>{html.escape(estate.name)}</strong>.</p>"
+        f"<p>Times they can do:</p><ul>{times_html}</ul>"
+        "<p>Open Live Inspections on the dashboard to approve one.</p>"
+    )
+    return sum(1 for email in recipients if _send(email, f"Reschedule requested - Plot {plot.plot_number}, {estate.name}", "A buyer requested a different time", message_html))
 

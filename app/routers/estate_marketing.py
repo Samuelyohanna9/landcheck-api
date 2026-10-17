@@ -23,7 +23,7 @@ from app.models.estate_foundation import (
     EstatePublicReservationRequest,
     EstateQrCampaign,
 )
-from app.models.estate_marketing import EstateInspectionBooking, EstateInspectionSlot, EstateLiveInspectionSession, EstateProgressUpdate, EstatePublicEvent
+from app.models.estate_marketing import EstateInspectionBooking, EstateInspectionSlot, EstateLiveInspectionBuyerToken, EstateLiveInspectionSession, EstateProgressUpdate, EstatePublicEvent
 from app.routers.estates import _agent_display_name, _agent_portal_context, _agent_portal_url, _public_estate
 from app.routers.plots import get_db
 from app.schemas.estate_marketing import (
@@ -33,8 +33,10 @@ from app.schemas.estate_marketing import (
     InspectionSlotCreate,
     InspectionSlotUpdate,
     InspectionBookingUpdate,
+    LiveInspectionApproveTime,
     LiveInspectionCreate,
     LiveInspectionLocationUpdate,
+    LiveInspectionRescheduleRequest,
     ProgressUpdatePatch,
     PublicEventCreate,
 )
@@ -1220,6 +1222,26 @@ def _plot_directions_url(plot: EstatePlot) -> str | None:
     return f"https://www.google.com/maps/dir/?api=1&destination={centroid.y},{centroid.x}"
 
 
+def _mint_buyer_token(db: Session, session: EstateLiveInspectionSession) -> str:
+    """Multiple valid links can coexist per session (see EstateLiveInspectionBuyerToken's
+    docstring) - only the hash is ever stored, so a later email that needs a working link has to
+    mint a fresh one rather than recover the original raw token."""
+    raw_token = secrets.token_urlsafe(24)
+    db.add(EstateLiveInspectionBuyerToken(session_id=session.id, token_hash=hash_portal_token(raw_token)))
+    db.flush()
+    return raw_token
+
+
+def _buyer_session_by_token(db: Session, token: str) -> EstateLiveInspectionSession:
+    row = db.query(EstateLiveInspectionBuyerToken).filter(EstateLiveInspectionBuyerToken.token_hash == hash_portal_token(token)).one_or_none()
+    if row is None:
+        raise HTTPException(404, "This live inspection link is invalid")
+    session = db.get(EstateLiveInspectionSession, row.session_id)
+    if session is None:
+        raise HTTPException(404, "This live inspection link is invalid")
+    return session
+
+
 def _live_session_payload(session: EstateLiveInspectionSession, *, plot: EstatePlot, estate: Estate, include_room: bool, include_directions: bool = False) -> dict:
     data = {
         "id": session.session_uid,
@@ -1227,6 +1249,9 @@ def _live_session_payload(session: EstateLiveInspectionSession, *, plot: EstateP
         "estate_name": estate.name,
         "plot_number": plot.plot_number,
         "buyer_name": session.buyer_name,
+        "scheduled_at": session.scheduled_at,
+        "proposed_times": session.proposed_times,
+        "reschedule_requested_at": session.reschedule_requested_at,
         "live": {
             "verification": session.last_verification,
             "distance_m": session.last_distance_m,
@@ -1258,9 +1283,7 @@ def staff_create_live_inspection(estate_id: int, payload: LiveInspectionCreate, 
         agent_member = db.query(EstateOrganizationMember).filter(EstateOrganizationMember.id == payload.agent_member_id, EstateOrganizationMember.organization_id == estate.organization_id).one_or_none()
         if agent_member is None:
             raise HTTPException(404, "Agent not found")
-    token = secrets.token_urlsafe(24)
     session = EstateLiveInspectionSession(
-        buyer_token_hash=hash_portal_token(token),
         organization_id=estate.organization_id,
         estate_id=estate.id,
         plot_id=plot.id,
@@ -1270,11 +1293,13 @@ def staff_create_live_inspection(estate_id: int, payload: LiveInspectionCreate, 
         buyer_email=(customer.email if customer else payload.buyer_email),
         agent_member_id=agent_member.id if agent_member else None,
         status="scheduled",
+        scheduled_at=payload.scheduled_at,
         created_by_subject_type=access.principal.subject_type,
         created_by_subject_id=access.principal.subject_id,
     )
     db.add(session)
     db.flush()
+    token = _mint_buyer_token(db, session)
     append_estate_audit_event(
         db,
         organization_id=estate.organization_id,
@@ -1282,10 +1307,10 @@ def staff_create_live_inspection(estate_id: int, payload: LiveInspectionCreate, 
         action="live_inspection.created",
         entity_type="estate_live_inspection_session",
         entity_id=session.id,
-        after_data={"plot_id": plot.id, "buyer_name": session.buyer_name, "agent_member_id": session.agent_member_id},
+        after_data={"plot_id": plot.id, "buyer_name": session.buyer_name, "agent_member_id": session.agent_member_id, "scheduled_at": session.scheduled_at.isoformat()},
     )
     db.commit()
-    invite_sent = marketing_alerts.send_live_inspection_invite(estate=estate, plot=plot, buyer_name=session.buyer_name, buyer_email=session.buyer_email, token=token)
+    invite_sent = marketing_alerts.send_live_inspection_invite(estate=estate, plot=plot, buyer_name=session.buyer_name, buyer_email=session.buyer_email, scheduled_at=session.scheduled_at, token=token)
     agent_notified = False
     if agent_member:
         _agent_token_row, agent_raw_token = issue_agent_portal_token(db, member=agent_member, actor=access.principal, revoke_existing=False)
@@ -1297,6 +1322,7 @@ def staff_create_live_inspection(estate_id: int, payload: LiveInspectionCreate, 
             estate=estate,
             plot=plot,
             buyer_name=session.buyer_name,
+            scheduled_at=session.scheduled_at,
             portal_url=_agent_portal_url(agent_raw_token),
         )
     payload_out = _live_session_payload(session, plot=plot, estate=estate, include_room=False)
@@ -1319,6 +1345,40 @@ def staff_list_live_inspections(estate_id: int, request: Request, db: Session = 
         .all()
     )
     return [_live_session_payload(session, plot=plot, estate=estate, include_room=True) for session, plot in rows]
+
+
+@router.post("/{estate_id}/marketing/live-inspections/{session_uid}/approve-time")
+def staff_approve_live_inspection_time(estate_id: int, session_uid: str, payload: LiveInspectionApproveTime, request: Request, db: Session = Depends(get_db)):
+    """Confirms one time - typically one of the buyer's own proposed_times, though any datetime
+    is accepted so staff can also just type a time directly without the buyer having asked first.
+    Mints a fresh buyer link for the confirmation email (see _mint_buyer_token) and, only if an
+    agent is already assigned, lets them know the time changed."""
+    estate, access = _staff(db, request, estate_id, permission="estate.manage")
+    session = db.query(EstateLiveInspectionSession).filter(EstateLiveInspectionSession.session_uid == session_uid, EstateLiveInspectionSession.estate_id == estate.id).one_or_none()
+    if session is None:
+        raise HTTPException(404, "Live inspection not found")
+    if session.status not in ("scheduled", "live"):
+        raise HTTPException(409, f"This live inspection is already {session.status}")
+    session.scheduled_at = payload.scheduled_at
+    session.proposed_times = None
+    session.reschedule_requested_at = None
+    db.flush()
+    append_estate_audit_event(db, organization_id=estate.organization_id, actor=access.principal, action="live_inspection.time_approved", entity_type="estate_live_inspection_session", entity_id=session.id, after_data={"scheduled_at": session.scheduled_at.isoformat()})
+    db.commit()
+    plot = db.get(EstatePlot, session.plot_id)
+    buyer_token = _mint_buyer_token(db, session)
+    db.commit()
+    customer_notified = marketing_alerts.send_live_inspection_time_approved(estate=estate, plot=plot, buyer_name=session.buyer_name, buyer_email=session.buyer_email, scheduled_at=session.scheduled_at, token=buyer_token)
+    agent_notified = False
+    if session.agent_member_id:
+        agent_member = db.get(EstateOrganizationMember, session.agent_member_id)
+        if agent_member:
+            agent_name = _agent_display_name(db, organization_id=estate.organization_id, subject_type=agent_member.subject_type, subject_id=agent_member.subject_id)
+            agent_notified = marketing_alerts.send_live_inspection_rescheduled_notice_to_agent(agent_email=agent_member.contact_email, agent_name=agent_name, estate=estate, plot=plot, scheduled_at=session.scheduled_at)
+    payload_out = _live_session_payload(session, plot=plot, estate=estate, include_room=False)
+    payload_out["customer_notified"] = customer_notified
+    payload_out["agent_notified"] = agent_notified
+    return payload_out
 
 
 @router.post("/{estate_id}/marketing/live-inspections/{session_uid}/cancel")
@@ -1423,11 +1483,30 @@ def agent_end_live_inspection(token: str, session_uid: str, db: Session = Depend
 
 @router.get("/public/live-inspections/{token}")
 def public_get_live_inspection(token: str, db: Session = Depends(get_db)):
-    session = db.query(EstateLiveInspectionSession).filter(EstateLiveInspectionSession.buyer_token_hash == hash_portal_token(token)).one_or_none()
-    if session is None:
-        raise HTTPException(404, "This live inspection link is invalid")
+    session = _buyer_session_by_token(db, token)
     plot = db.get(EstatePlot, session.plot_id)
     estate = db.get(Estate, session.estate_id)
     if plot is None or estate is None:
         raise HTTPException(404, "This live inspection link is invalid")
     return _live_session_payload(session, plot=plot, estate=estate, include_room=True)
+
+
+@router.post("/public/live-inspections/{token}/reschedule")
+def public_reschedule_live_inspection(token: str, payload: LiveInspectionRescheduleRequest, request: Request, db: Session = Depends(get_db)):
+    if throttled(client_ip(request), "live-inspection-reschedule", limit=6, window_seconds=3600):
+        raise HTTPException(429, "Too many requests. Please try again later.")
+    session = _buyer_session_by_token(db, token)
+    if session.status not in ("scheduled", "live"):
+        raise HTTPException(409, f"This live inspection is already {session.status}")
+    future_times = sorted({_aware(value) for value in payload.proposed_times if _aware(value) > _now()})
+    if not future_times:
+        raise HTTPException(422, "Choose at least one time in the future")
+    session.proposed_times = [value.isoformat() for value in future_times]
+    session.reschedule_requested_at = _now()
+    db.flush()
+    estate = db.get(Estate, session.estate_id)
+    plot = db.get(EstatePlot, session.plot_id)
+    append_estate_audit_event(db, organization_id=session.organization_id, actor=None, action="live_inspection.reschedule_requested", entity_type="estate_live_inspection_session", entity_id=session.id, after_data={"proposed_times": session.proposed_times})
+    db.commit()
+    marketing_alerts.notify_staff_of_live_inspection_reschedule(db, estate=estate, plot=plot, buyer_name=session.buyer_name, proposed_times=future_times)
+    return _live_session_payload(session, plot=plot, estate=estate, include_room=False)

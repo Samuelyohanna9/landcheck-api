@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import uuid
 
-from sqlalchemy import Boolean, CheckConstraint, Column, DateTime, Float, ForeignKey, Index, Integer, String, Text
+from sqlalchemy import Boolean, CheckConstraint, Column, DateTime, Float, ForeignKey, Index, Integer, JSON, String, Text
 from sqlalchemy.sql import func
 
 from app.db_base import Base
@@ -96,7 +96,6 @@ class EstateLiveInspectionSession(Base):
 
     id = Column(Integer, primary_key=True)
     session_uid = Column(String(36), nullable=False, unique=True, default=lambda: str(uuid.uuid4()))
-    buyer_token_hash = Column(String(64), nullable=False, unique=True)
     organization_id = Column(Integer, ForeignKey("estate_organizations.id", ondelete="CASCADE"), nullable=False)
     estate_id = Column(Integer, ForeignKey("estate_estates.id", ondelete="CASCADE"), nullable=False)
     plot_id = Column(Integer, ForeignKey("estate_plots.id", ondelete="CASCADE"), nullable=False)
@@ -106,6 +105,14 @@ class EstateLiveInspectionSession(Base):
     buyer_email = Column(String(255), nullable=True)
     agent_member_id = Column(Integer, ForeignKey("estate_organization_members.id", ondelete="SET NULL"), nullable=True)
     status = Column(String(16), nullable=False, default="scheduled")
+    # The agreed appointment time - purely informational/coordination, not enforced against
+    # "go live" (an agent can still start early/late; this is what both emails show and what the
+    # reschedule flow negotiates). proposed_times holds the buyer's candidate alternatives from
+    # the reschedule page until staff approve one (which moves it into scheduled_at and clears
+    # both reschedule fields).
+    scheduled_at = Column(DateTime(timezone=True), nullable=True)
+    proposed_times = Column(JSON, nullable=True)
+    reschedule_requested_at = Column(DateTime(timezone=True), nullable=True)
     video_room_name = Column(String(255), nullable=True)
     video_room_url = Column(String(1024), nullable=True)
     last_lat = Column(Float, nullable=True)
@@ -129,6 +136,21 @@ class EstateLiveInspectionSession(Base):
         ),
         Index("ix_estate_live_inspections_estate_status", "estate_id", "status"),
     )
+
+
+class EstateLiveInspectionBuyerToken(Base):
+    """A session can have more than one valid buyer link, unlike the other hashed-token tables in
+    this codebase (customer/agent portal tokens) - the raw token is one-way hashed and never
+    recoverable, so a later email (e.g. "your rescheduled time was approved") that wants to
+    include a working link has to mint a fresh one rather than resend the original. Old links
+    are never revoked, so a buyer's first invite email keeps working even after a reschedule."""
+
+    __tablename__ = "estate_live_inspection_buyer_tokens"
+
+    id = Column(Integer, primary_key=True)
+    session_id = Column(Integer, ForeignKey("estate_live_inspection_sessions.id", ondelete="CASCADE"), nullable=False)
+    token_hash = Column(String(64), nullable=False, unique=True)
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
 
 
 class EstateProgressUpdate(Base):
