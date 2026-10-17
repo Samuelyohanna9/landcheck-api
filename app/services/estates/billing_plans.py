@@ -21,6 +21,7 @@ class EstatePlanDefinition(TypedDict):
     soil_analysis: bool
     sms_notifications: bool
     whatsapp: bool
+    live_inspections: bool
     max_estates: int | None  # None = unlimited
 
 
@@ -34,6 +35,7 @@ ESTATE_PLANS: Final[dict[str, EstatePlanDefinition]] = {
         "soil_analysis": False,
         "sms_notifications": False,
         "whatsapp": False,
+        "live_inspections": False,
         "max_estates": 1,
     },
     "plus": {
@@ -45,6 +47,7 @@ ESTATE_PLANS: Final[dict[str, EstatePlanDefinition]] = {
         "soil_analysis": False,
         "sms_notifications": False,
         "whatsapp": False,
+        "live_inspections": False,
         "max_estates": 3,
     },
     "pro": {
@@ -56,6 +59,7 @@ ESTATE_PLANS: Final[dict[str, EstatePlanDefinition]] = {
         "soil_analysis": True,
         "sms_notifications": True,
         "whatsapp": True,
+        "live_inspections": False,
         "max_estates": 6,
     },
     "enterprise": {
@@ -67,6 +71,7 @@ ESTATE_PLANS: Final[dict[str, EstatePlanDefinition]] = {
         "soil_analysis": True,
         "sms_notifications": True,
         "whatsapp": True,
+        "live_inspections": True,
         "max_estates": None,
     },
 }
@@ -120,3 +125,7 @@ def plan_includes_sms_notifications(plan_key: str) -> bool:
 
 def plan_includes_whatsapp(plan_key: str) -> bool:
     return bool(ESTATE_PLANS.get(plan_key, {}).get("whatsapp", False))
+
+
+def plan_includes_live_inspections(plan_key: str) -> bool:
+    return bool(ESTATE_PLANS.get(plan_key, {}).get("live_inspections", False))

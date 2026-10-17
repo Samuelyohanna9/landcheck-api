@@ -24,7 +24,7 @@ from app.models.estate_foundation import (
     EstateQrCampaign,
 )
 from app.models.estate_marketing import EstateApprovalMilestone, EstateInspectionBooking, EstateInspectionSlot, EstateLiveInspectionBuyerToken, EstateLiveInspectionSession, EstateProgressUpdate, EstatePublicEvent
-from app.routers.estates import APPROVAL_MILESTONE_LABELS, _agent_display_name, _agent_portal_context, _agent_portal_url, _public_estate
+from app.routers.estates import APPROVAL_MILESTONE_LABELS, _agent_display_name, _agent_portal_context, _agent_portal_url, _public_estate, _require_enterprise_plan
 from app.routers.plots import get_db
 from app.schemas.estate_marketing import (
     AgentBookingUpdate,
@@ -1375,6 +1375,7 @@ def _live_session_payload(session: EstateLiveInspectionSession, *, plot: EstateP
 @router.post("/{estate_id}/marketing/live-inspections", status_code=201)
 def staff_create_live_inspection(estate_id: int, payload: LiveInspectionCreate, request: Request, db: Session = Depends(get_db)):
     estate, access = _staff(db, request, estate_id, permission="estate.manage")
+    _require_enterprise_plan(db, estate.organization_id, "Live video inspections")
     plot = db.query(EstatePlot).filter(EstatePlot.id == payload.plot_id, EstatePlot.estate_id == estate.id).one_or_none()
     if plot is None:
         raise HTTPException(404, "Plot not found")
@@ -1622,6 +1623,7 @@ def public_request_live_inspection(slug: str, payload: LiveInspectionRequestCrea
     if throttled(client_ip(request), "live-inspection-request", limit=6, window_seconds=3600):
         raise HTTPException(429, "Too many requests. Please try again later.")
     estate = _public_estate(db, slug)
+    _require_enterprise_plan(db, estate.organization_id, "Live video inspections")
     plot = db.query(EstatePlot).filter(EstatePlot.id == payload.plot_id, EstatePlot.estate_id == estate.id, EstatePlot.geometry_status == "approved").one_or_none()
     if plot is None:
         raise HTTPException(404, "Plot not found")

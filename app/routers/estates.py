@@ -46,7 +46,7 @@ from app.services.estates.allocations import release_allocation, reserve_or_allo
 from app.services.estates.audit import append_estate_audit_event
 from app.services.estates.authorization import EstatePrincipal, require_estate_access, require_estate_view_access
 from app.services.estates.billing_plans import next_plan_with_estates, plan_label
-from app.services.estates.subscriptions import estate_limit_for, get_subscription, has_hazard_access, has_sms_access, has_soil_analysis_access
+from app.services.estates.subscriptions import estate_limit_for, get_subscription, has_hazard_access, has_live_inspection_access, has_sms_access, has_soil_analysis_access
 from app.services.estates.survey_requests import transition
 from app.services.estates.survey_adapter import materialize_estate_plot_for_survey
 from app.schemas.estate_survey import SurveyorAssignment
@@ -317,6 +317,7 @@ def _public_estate_payload(db: Session, estate: Estate) -> dict:
         "plots": public_plots,
         "counts": counts,
         "approval_milestones": estate_milestones,
+        "live_inspections_enabled": has_live_inspection_access(get_subscription(db, estate.organization_id)),
         "development_forecast": forecast,
     }
 
@@ -2762,6 +2763,19 @@ def _require_pro_plan(db: Session, organization_id: int, feature_name: str) -> N
             detail={
                 "code": "upgrade_required",
                 "message": f"{feature_name} is available on the Pro plan. Upgrade to unlock it.",
+            },
+        )
+
+
+def _require_enterprise_plan(db: Session, organization_id: int, feature_name: str) -> None:
+    """Keep Enterprise-only features behind one server-side entitlement check - the strictest of
+    the three plan gates (Plus-and-above, Pro-and-above, Enterprise-only)."""
+    if not has_live_inspection_access(get_subscription(db, organization_id)):
+        raise HTTPException(
+            status_code=402,
+            detail={
+                "code": "upgrade_required",
+                "message": f"{feature_name} is available on the Enterprise plan. Upgrade to unlock it.",
             },
         )
 
@@ -5585,6 +5599,7 @@ def estate_detail(estate_id: int, request: Request, db: Session = Depends(get_db
         "project_owner": estate.project_owner,
         "ownership_details": estate.ownership_details,
         "boundary": mapping(to_shape(estate.boundary)) if estate.boundary else None,
+        "live_inspections_enabled": has_live_inspection_access(get_subscription(db, estate.organization_id)),
     }
 
 
