@@ -38,6 +38,7 @@ from app.schemas.estate_marketing import (
     LiveInspectionApproveTime,
     LiveInspectionCreate,
     LiveInspectionLocationUpdate,
+    LiveInspectionRequestCreate,
     LiveInspectionRescheduleRequest,
     ProgressUpdatePatch,
     PublicEventCreate,
@@ -1347,8 +1348,12 @@ def _live_session_payload(session: EstateLiveInspectionSession, *, plot: EstateP
         "id": session.session_uid,
         "status": session.status,
         "estate_name": estate.name,
+        "plot_id": plot.id,
         "plot_number": plot.plot_number,
         "buyer_name": session.buyer_name,
+        "buyer_phone": session.buyer_phone,
+        "buyer_email": session.buyer_email,
+        "agent_member_id": session.agent_member_id,
         "scheduled_at": session.scheduled_at,
         "proposed_times": session.proposed_times,
         "reschedule_requested_at": session.reschedule_requested_at,
@@ -1451,26 +1456,51 @@ def staff_list_live_inspections(estate_id: int, request: Request, db: Session = 
 def staff_approve_live_inspection_time(estate_id: int, session_uid: str, payload: LiveInspectionApproveTime, request: Request, db: Session = Depends(get_db)):
     """Confirms one time - typically one of the buyer's own proposed_times, though any datetime
     is accepted so staff can also just type a time directly without the buyer having asked first.
-    Mints a fresh buyer link for the confirmation email (see _mint_buyer_token) and, only if an
-    agent is already assigned, lets them know the time changed."""
+    Also handles a buyer's self-service request (status="requested", see
+    public_request_live_inspection): passing agent_member_id here assigns the agent and moves the
+    session to "scheduled" in the same step. Mints a fresh buyer link for the confirmation email
+    (see _mint_buyer_token); the agent gets the full assignment email if newly assigned here, or
+    just a lighter reschedule notice if they were already assigned and only the time changed."""
     estate, access = _staff(db, request, estate_id, permission="estate.manage")
     session = db.query(EstateLiveInspectionSession).filter(EstateLiveInspectionSession.session_uid == session_uid, EstateLiveInspectionSession.estate_id == estate.id).one_or_none()
     if session is None:
         raise HTTPException(404, "Live inspection not found")
-    if session.status not in ("scheduled", "live"):
+    if session.status not in ("requested", "scheduled", "live"):
         raise HTTPException(409, f"This live inspection is already {session.status}")
+    newly_assigned_agent = None
+    if payload.agent_member_id and payload.agent_member_id != session.agent_member_id:
+        newly_assigned_agent = db.query(EstateOrganizationMember).filter(EstateOrganizationMember.id == payload.agent_member_id, EstateOrganizationMember.organization_id == estate.organization_id).one_or_none()
+        if newly_assigned_agent is None:
+            raise HTTPException(404, "Agent not found")
+        session.agent_member_id = newly_assigned_agent.id
+    was_requested = session.status == "requested"
+    if was_requested:
+        session.status = "scheduled"
     session.scheduled_at = payload.scheduled_at
     session.proposed_times = None
     session.reschedule_requested_at = None
     db.flush()
-    append_estate_audit_event(db, organization_id=estate.organization_id, actor=access.principal, action="live_inspection.time_approved", entity_type="estate_live_inspection_session", entity_id=session.id, after_data={"scheduled_at": session.scheduled_at.isoformat()})
+    append_estate_audit_event(db, organization_id=estate.organization_id, actor=access.principal, action="live_inspection.time_approved", entity_type="estate_live_inspection_session", entity_id=session.id, after_data={"scheduled_at": session.scheduled_at.isoformat(), "agent_member_id": session.agent_member_id})
     db.commit()
     plot = db.get(EstatePlot, session.plot_id)
     buyer_token = _mint_buyer_token(db, session)
     db.commit()
     customer_notified = marketing_alerts.send_live_inspection_time_approved(estate=estate, plot=plot, buyer_name=session.buyer_name, buyer_email=session.buyer_email, scheduled_at=session.scheduled_at, token=buyer_token)
     agent_notified = False
-    if session.agent_member_id:
+    if newly_assigned_agent:
+        agent_token_row, agent_raw_token = issue_agent_portal_token(db, member=newly_assigned_agent, actor=access.principal, revoke_existing=False)
+        db.commit()
+        agent_name = _agent_display_name(db, organization_id=estate.organization_id, subject_type=newly_assigned_agent.subject_type, subject_id=newly_assigned_agent.subject_id)
+        agent_notified = marketing_alerts.send_agent_live_inspection_assignment(
+            agent_email=newly_assigned_agent.contact_email,
+            agent_name=agent_name,
+            estate=estate,
+            plot=plot,
+            buyer_name=session.buyer_name,
+            scheduled_at=session.scheduled_at,
+            portal_url=_agent_portal_url(agent_raw_token),
+        )
+    elif session.agent_member_id:
         agent_member = db.get(EstateOrganizationMember, session.agent_member_id)
         if agent_member:
             agent_name = _agent_display_name(db, organization_id=estate.organization_id, subject_type=agent_member.subject_type, subject_id=agent_member.subject_id)
@@ -1579,6 +1609,49 @@ def agent_end_live_inspection(token: str, session_uid: str, db: Session = Depend
     append_estate_audit_event(db, organization_id=organization.id, actor=EstatePrincipal(member.subject_type, member.subject_id, member.subject_id), action="live_inspection.ended", entity_type="estate_live_inspection_session", entity_id=session.id)
     db.commit()
     return _live_session_payload(session, plot=plot, estate=estate, include_room=False)
+
+
+@router.post("/public/{slug}/live-inspections/request", status_code=201)
+def public_request_live_inspection(slug: str, payload: LiveInspectionRequestCreate, request: Request, db: Session = Depends(get_db)):
+    """A buyer who can't visit in person asks for a live video inspection themselves, instead of
+    waiting for staff to schedule one - lands as status="requested" with no agent or time yet, for
+    staff to assign both via the same approve-time endpoint already used for reschedules."""
+    if throttled(client_ip(request), "live-inspection-request", limit=6, window_seconds=3600):
+        raise HTTPException(429, "Too many requests. Please try again later.")
+    estate = _public_estate(db, slug)
+    plot = db.query(EstatePlot).filter(EstatePlot.id == payload.plot_id, EstatePlot.estate_id == estate.id, EstatePlot.geometry_status == "approved").one_or_none()
+    if plot is None:
+        raise HTTPException(404, "Plot not found")
+    future_times = sorted({_aware(value) for value in payload.proposed_times if _aware(value) > _now()})
+    if not future_times:
+        raise HTTPException(422, "Choose at least one time in the future")
+    session = EstateLiveInspectionSession(
+        organization_id=estate.organization_id,
+        estate_id=estate.id,
+        plot_id=plot.id,
+        buyer_name=payload.buyer_name.strip(),
+        buyer_phone=payload.buyer_phone.strip(),
+        buyer_email=str(payload.buyer_email or "").strip().lower() or None,
+        status="requested",
+        proposed_times=[value.isoformat() for value in future_times],
+        created_by_subject_type="public",
+        created_by_subject_id="web",
+    )
+    db.add(session)
+    db.flush()
+    append_estate_audit_event(
+        db,
+        organization_id=estate.organization_id,
+        actor=None,
+        action="live_inspection.requested",
+        entity_type="estate_live_inspection_session",
+        entity_id=session.id,
+        after_data={"plot_id": plot.id, "proposed_times": session.proposed_times},
+        metadata={"source": "public_estate_page"},
+    )
+    db.commit()
+    marketing_alerts.notify_staff_of_live_inspection_request(db, estate=estate, plot=plot, buyer_name=session.buyer_name, buyer_phone=session.buyer_phone, proposed_times=future_times)
+    return {"status": "requested", "session_id": session.session_uid}
 
 
 @router.get("/public/live-inspections/{token}")

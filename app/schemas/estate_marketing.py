@@ -78,8 +78,17 @@ class LiveInspectionRescheduleRequest(BaseModel):
     proposed_times: list[datetime] = Field(min_length=1, max_length=5)
 
 
+class LiveInspectionRequestCreate(BaseModel):
+    plot_id: int
+    buyer_name: str = Field(min_length=2, max_length=255)
+    buyer_phone: str = Field(min_length=5, max_length=64)
+    buyer_email: str | None = Field(default=None, max_length=255)
+    proposed_times: list[datetime] = Field(min_length=1, max_length=5)
+
+
 class LiveInspectionApproveTime(BaseModel):
     scheduled_at: datetime
+    agent_member_id: int | None = None
 
 
 class LiveInspectionLocationUpdate(BaseModel):

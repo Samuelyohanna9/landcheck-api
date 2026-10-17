@@ -90,7 +90,11 @@ class EstateLiveInspectionSession(Base):
     """A scheduled or in-progress live video walkthrough of one plot for one remote buyer - an
     agent on site joins a video call and streams their GPS position, verified against the plot's
     real boundary (see verify_location() in app/services/estates/marketing_field.py), so the
-    buyer can see in real time whether the agent is actually standing on the plot being sold."""
+    buyer can see in real time whether the agent is actually standing on the plot being sold.
+    status="requested" is a buyer self-request from the public page (see
+    public_request_live_inspection in estate_marketing.py) - no agent_member_id or scheduled_at
+    yet, just the buyer's own proposed_times, waiting for staff to pick a time/agent via the same
+    approve-time endpoint used for reschedules."""
 
     __tablename__ = "estate_live_inspection_sessions"
 
@@ -129,7 +133,7 @@ class EstateLiveInspectionSession(Base):
     updated_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
 
     __table_args__ = (
-        CheckConstraint("status IN ('scheduled', 'live', 'ended', 'cancelled')", name="ck_estate_live_inspection_status"),
+        CheckConstraint("status IN ('requested', 'scheduled', 'live', 'ended', 'cancelled')", name="ck_estate_live_inspection_status"),
         CheckConstraint(
             "last_verification IS NULL OR last_verification IN ('on_plot', 'on_estate', 'near_estate', 'outside')",
             name="ck_estate_live_inspection_verification",

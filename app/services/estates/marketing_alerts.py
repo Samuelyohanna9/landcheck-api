@@ -464,6 +464,21 @@ def send_live_inspection_rescheduled_notice_to_agent(*, agent_email: str | None,
     )
 
 
+def notify_staff_of_live_inspection_request(db: Session, *, estate: Estate, plot: EstatePlot, buyer_name: str, buyer_phone: str, proposed_times: list[datetime]) -> int:
+    organization = db.get(EstateOrganization, estate.organization_id)
+    if organization is None:
+        return 0
+    recipients = _dedupe(_member_emails(db, organization.id, SALES_ROLES) + ([organization.contact_email] if organization.contact_email else []))
+    times_html = "".join(f"<li>{html.escape(format_live_inspection_time(value))}</li>" for value in proposed_times)
+    message_html = (
+        f"<p><strong>{html.escape(buyer_name)}</strong> ({html.escape(buyer_phone)}) can't visit in person and requested a "
+        f"live video inspection of <strong>Plot {html.escape(plot.plot_number)}</strong> at <strong>{html.escape(estate.name)}</strong>.</p>"
+        f"<p>Times they can do:</p><ul>{times_html}</ul>"
+        "<p>Open Inspections on the dashboard to assign an agent and confirm a time.</p>"
+    )
+    return sum(1 for email in recipients if _send(email, f"Live inspection requested - Plot {plot.plot_number}, {estate.name}", "A buyer requested a live inspection", message_html))
+
+
 def notify_staff_of_live_inspection_reschedule(db: Session, *, estate: Estate, plot: EstatePlot, buyer_name: str, proposed_times: list[datetime]) -> int:
     organization = db.get(EstateOrganization, estate.organization_id)
     if organization is None:
