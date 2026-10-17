@@ -370,6 +370,33 @@ def live_inspection_url(token: str) -> str:
     return f"{web_url()}/estates/live-inspection/{token}"
 
 
+def send_agent_live_inspection_assignment(*, agent_email: str | None, agent_name: str, estate: Estate, plot: EstatePlot, buyer_name: str, portal_url: str) -> bool:
+    """Sent once, when the agent is assigned at scheduling time - tells them exactly what to do
+    next rather than just dropping a link: go to the plot, open the workspace, go live there."""
+    if not agent_email:
+        return False
+    message_html = (
+        f"<p>Hello {html.escape(agent_name)}, you've been assigned a live video inspection.</p>"
+        f"<p><strong>Plot {html.escape(plot.plot_number)}</strong> at <strong>{html.escape(estate.name)}</strong>, "
+        f"for buyer <strong>{html.escape(buyer_name)}</strong>, who can't visit in person.</p>"
+        "<p><strong>What to do:</strong></p>"
+        "<ol>"
+        "<li>When you're ready, travel to the plot.</li>"
+        "<li>Open your agent workspace (button below) and go to <strong>Live inspections</strong>.</li>"
+        "<li>Once you're there, tap <strong>Go live</strong> - this starts the video call and begins sharing your GPS "
+        "position, so the buyer can see live that you're really standing on the plot.</li>"
+        "<li>When you're done, tap <strong>End live inspection</strong>.</li>"
+        "</ol>"
+    )
+    return _send(
+        agent_email,
+        f"Live inspection assigned - Plot {plot.plot_number}, {estate.name}",
+        "You've been assigned a live inspection",
+        message_html,
+        [("Open your agent workspace", portal_url)],
+    )
+
+
 def send_live_inspection_invite(*, estate: Estate, plot: EstatePlot, buyer_name: str, buyer_email: str | None, token: str) -> bool:
     """Sent once, at scheduling time - the link itself (PublicLiveInspectionPage) polls for when
     the agent actually goes live, so this email only needs to go out once, not again at go-live."""

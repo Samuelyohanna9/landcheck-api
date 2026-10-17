@@ -24,7 +24,7 @@ from app.models.estate_foundation import (
     EstateQrCampaign,
 )
 from app.models.estate_marketing import EstateInspectionBooking, EstateInspectionSlot, EstateLiveInspectionSession, EstateProgressUpdate, EstatePublicEvent
-from app.routers.estates import _agent_display_name, _agent_portal_context, _public_estate
+from app.routers.estates import _agent_display_name, _agent_portal_context, _agent_portal_url, _public_estate
 from app.routers.plots import get_db
 from app.schemas.estate_marketing import (
     AgentBookingUpdate,
@@ -54,7 +54,7 @@ from app.services.estates.marketing_common import (
     api_url,
     whatsapp_link,
 )
-from app.services.estates.operations import hash_portal_token
+from app.services.estates.operations import hash_portal_token, issue_agent_portal_token
 from app.services.estates.permissions import has_permission
 from app.utils.r2_objects import build_r2_settings, delete_object_best_effort
 
@@ -1208,7 +1208,19 @@ def agent_update_booking(token: str, booking_id: int, payload: AgentBookingUpdat
 # already used for geo-tagged progress photos) and the result is what the remote buyer's page
 # polls for. See app/services/estates/live_inspection.py for the Daily.co room client.
 
-def _live_session_payload(session: EstateLiveInspectionSession, *, plot: EstatePlot, estate: Estate, include_room: bool) -> dict:
+def _plot_directions_url(plot: EstatePlot) -> str | None:
+    """A turn-by-turn Google Maps link to the plot's centroid - for the agent travelling there,
+    not the buyer (who isn't going anywhere)."""
+    if plot.geometry is None:
+        return None
+    try:
+        centroid = to_shape(plot.geometry).centroid
+    except Exception:
+        return None
+    return f"https://www.google.com/maps/dir/?api=1&destination={centroid.y},{centroid.x}"
+
+
+def _live_session_payload(session: EstateLiveInspectionSession, *, plot: EstatePlot, estate: Estate, include_room: bool, include_directions: bool = False) -> dict:
     data = {
         "id": session.session_uid,
         "status": session.status,
@@ -1225,6 +1237,8 @@ def _live_session_payload(session: EstateLiveInspectionSession, *, plot: EstateP
     }
     if include_room and session.status == "live":
         data["room_url"] = session.video_room_url
+    if include_directions:
+        data["directions_url"] = _plot_directions_url(plot)
     return data
 
 
@@ -1272,10 +1286,24 @@ def staff_create_live_inspection(estate_id: int, payload: LiveInspectionCreate, 
     )
     db.commit()
     invite_sent = marketing_alerts.send_live_inspection_invite(estate=estate, plot=plot, buyer_name=session.buyer_name, buyer_email=session.buyer_email, token=token)
+    agent_notified = False
+    if agent_member:
+        _agent_token_row, agent_raw_token = issue_agent_portal_token(db, member=agent_member, actor=access.principal, revoke_existing=False)
+        db.commit()
+        agent_name = _agent_display_name(db, organization_id=estate.organization_id, subject_type=agent_member.subject_type, subject_id=agent_member.subject_id)
+        agent_notified = marketing_alerts.send_agent_live_inspection_assignment(
+            agent_email=agent_member.contact_email,
+            agent_name=agent_name,
+            estate=estate,
+            plot=plot,
+            buyer_name=session.buyer_name,
+            portal_url=_agent_portal_url(agent_raw_token),
+        )
     payload_out = _live_session_payload(session, plot=plot, estate=estate, include_room=False)
     payload_out["buyer_token"] = token
     payload_out["buyer_link"] = marketing_alerts.live_inspection_url(token)
     payload_out["invite_email_sent"] = invite_sent
+    payload_out["agent_notified"] = agent_notified
     return payload_out
 
 
@@ -1316,7 +1344,7 @@ def agent_list_live_inspections(token: str, db: Session = Depends(get_db)):
         .limit(50)
         .all()
     )
-    return [_live_session_payload(session, plot=plot, estate=estate, include_room=True) for session, plot, estate in rows]
+    return [_live_session_payload(session, plot=plot, estate=estate, include_room=True, include_directions=True) for session, plot, estate in rows]
 
 
 @router.post("/agent-portal/{token}/live-inspections/{session_uid}/start")
@@ -1335,7 +1363,7 @@ def agent_start_live_inspection(token: str, session_uid: str, db: Session = Depe
     db.flush()
     append_estate_audit_event(db, organization_id=organization.id, actor=EstatePrincipal(member.subject_type, member.subject_id, member.subject_id), action="live_inspection.started", entity_type="estate_live_inspection_session", entity_id=session.id)
     db.commit()
-    return _live_session_payload(session, plot=plot, estate=estate, include_room=True)
+    return _live_session_payload(session, plot=plot, estate=estate, include_room=True, include_directions=True)
 
 
 @router.post("/agent-portal/{token}/live-inspections/{session_uid}/location")
