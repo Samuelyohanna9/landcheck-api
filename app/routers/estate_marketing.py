@@ -942,7 +942,7 @@ def staff_create_progress(
     verification, distance = "unverified", None
     if lat is not None and lon is not None:
         approved = db.query(EstatePlot).filter(EstatePlot.estate_id == estate.id, EstatePlot.geometry_status == "approved").all()
-        verification, distance = marketing_field.verify_location(lat=float(lat), lon=float(lon), accuracy_m=accuracy_m, plots=approved, boundary=estate.boundary, focus_plot=plot)
+        verification, distance, _plot_distance = marketing_field.verify_location(lat=float(lat), lon=float(lon), accuracy_m=accuracy_m, plots=approved, boundary=estate.boundary, focus_plot=plot)
     captured = exif.get("captured_at")
     if captured is None and captured_at:
         try:
@@ -1585,7 +1585,10 @@ def agent_update_live_location(token: str, session_uid: str, payload: LiveInspec
     session, plot, estate = _agent_live_session(db, member, organization, session_uid)
     if session.status != "live":
         raise HTTPException(409, "This live inspection is not currently live")
-    verification, distance = marketing_field.verify_location(lat=payload.lat, lon=payload.lng, accuracy_m=payload.accuracy_m, plots=[], boundary=estate.boundary, focus_plot=plot)
+    verification, estate_distance, plot_distance = marketing_field.verify_location(lat=payload.lat, lon=payload.lng, accuracy_m=payload.accuracy_m, plots=[], boundary=estate.boundary, focus_plot=plot)
+    # The buyer cares about distance to THIS plot, not the estate boundary - plot_distance is
+    # always available since focus_plot (plot) is required on every live inspection session.
+    distance = plot_distance if plot_distance is not None else estate_distance
     session.last_lat = payload.lat
     session.last_lng = payload.lng
     session.last_accuracy_m = payload.accuracy_m

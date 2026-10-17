@@ -108,9 +108,13 @@ def read_progress_media(key: str) -> tuple[bytes, str]:
     return response["Body"].read(), str(response.get("ContentType") or "application/octet-stream")
 
 
-def verify_location(*, lat: float, lon: float, accuracy_m: float | None, plots: list[Any], boundary: Any, focus_plot: Any | None) -> tuple[str, float]:
+def verify_location(*, lat: float, lon: float, accuracy_m: float | None, plots: list[Any], boundary: Any, focus_plot: Any | None) -> tuple[str, float, float | None]:
     """Compare a capture point with the plot (when one was named) and the estate. Distances are
-    measured in a local metric projection centred on the capture point."""
+    measured in a local metric projection centred on the capture point. The third return value is
+    the distance to focus_plot specifically, computed whenever one is given regardless of status -
+    existing callers that only care about "distance to the estate" (e.g. progress-update photo
+    verification) can ignore it; the live-inspection GPS ping uses it to show a buyer how far the
+    agent still is from the actual plot, not just the estate boundary."""
     tolerance = max(8.0, min(float(accuracy_m or 0.0), 40.0))
     local = CRS.from_proj4(f"+proj=aeqd +lat_0={lat} +lon_0={lon} +datum=WGS84 +units=m")
     forward = Transformer.from_crs("EPSG:4326", local, always_xy=True).transform
@@ -120,20 +124,21 @@ def verify_location(*, lat: float, lon: float, accuracy_m: float | None, plots: 
         shape = shapely_transform(forward, to_shape(geometry))
         return 0.0 if shape.contains(origin) else float(shape.distance(origin))
 
+    plot_distance: float | None = None
     if focus_plot is not None and focus_plot.geometry is not None:
         plot_distance = distance_to(focus_plot.geometry)
         if plot_distance <= tolerance:
-            return "on_plot", plot_distance
+            return "on_plot", plot_distance, plot_distance
     if boundary is not None:
         estate_distance = distance_to(boundary)
     else:
         distances = [distance_to(plot.geometry) for plot in plots if plot.geometry is not None]
         estate_distance = min(distances) if distances else float("inf")
     if estate_distance <= tolerance:
-        return "on_estate", estate_distance
+        return "on_estate", estate_distance, plot_distance
     if estate_distance <= 300:
-        return "near_estate", estate_distance
-    return "outside", estate_distance if estate_distance != float("inf") else 0.0
+        return "near_estate", estate_distance, plot_distance
+    return "outside", (estate_distance if estate_distance != float("inf") else 0.0), plot_distance
 
 
 def clean_filename(value: str) -> str:
