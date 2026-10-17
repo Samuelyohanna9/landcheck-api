@@ -153,6 +153,46 @@ class EstateLiveInspectionBuyerToken(Base):
     created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
 
 
+class EstateApprovalMilestone(Base):
+    """Tracks a developer's progress through the government approvals a Nigerian estate needs
+    (survey plan approval, layout approval, Governor's Consent, Certificate of Occupancy) -
+    addresses buyers' fear of "approval delays" by making that progress visible instead of a
+    black box. plot_id is nullable the same way EstateInspectionBooking/EstateProgressUpdate's
+    is: null means the milestone applies to the whole estate (e.g. layout approval), set means
+    it's plot-specific (e.g. one plot's own C of O). is_public mirrors the opt-in shape of
+    Estate.public_development_forecast's "published" key - staff decide when a milestone is
+    ready to show buyers, it isn't shown automatically just because it exists."""
+
+    __tablename__ = "estate_approval_milestones"
+
+    id = Column(Integer, primary_key=True)
+    estate_id = Column(Integer, ForeignKey("estate_estates.id", ondelete="CASCADE"), nullable=False)
+    plot_id = Column(Integer, ForeignKey("estate_plots.id", ondelete="CASCADE"), nullable=True)
+    milestone_type = Column(String(32), nullable=False)
+    status = Column(String(16), nullable=False, default="not_started")
+    reference_number = Column(String(120), nullable=True)
+    note = Column(Text, nullable=True)
+    is_public = Column(Boolean, nullable=False, default=False)
+    submitted_at = Column(DateTime(timezone=True), nullable=True)
+    approved_at = Column(DateTime(timezone=True), nullable=True)
+    created_by_subject_type = Column(String(64), nullable=False)
+    created_by_subject_id = Column(String(128), nullable=False)
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
+
+    __table_args__ = (
+        CheckConstraint(
+            "milestone_type IN ('survey_plan_approval', 'layout_approval', 'governors_consent', 'certificate_of_occupancy')",
+            name="ck_estate_approval_milestone_type",
+        ),
+        CheckConstraint(
+            "status IN ('not_started', 'submitted', 'under_review', 'approved', 'rejected')",
+            name="ck_estate_approval_milestone_status",
+        ),
+        Index("ix_estate_approval_milestones_estate_plot", "estate_id", "plot_id"),
+    )
+
+
 class EstateProgressUpdate(Base):
     """A dated site update (photo / video / drone / milestone) shown on the public page. Location
     is checked against the plot or estate geometry at upload time and the result stored, so buyers

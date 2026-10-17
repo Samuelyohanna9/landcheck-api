@@ -86,3 +86,19 @@ class LiveInspectionLocationUpdate(BaseModel):
     lat: float = Field(ge=-90, le=90)
     lng: float = Field(ge=-180, le=180)
     accuracy_m: float | None = Field(default=None, ge=0)
+
+
+class ApprovalMilestoneCreate(BaseModel):
+    milestone_type: Literal["survey_plan_approval", "layout_approval", "governors_consent", "certificate_of_occupancy"]
+    plot_id: int | None = None
+    status: Literal["not_started", "submitted", "under_review", "approved", "rejected"] = "not_started"
+    reference_number: str | None = Field(default=None, max_length=120)
+    note: str | None = Field(default=None, max_length=2000)
+    is_public: bool = False
+
+
+class ApprovalMilestoneUpdate(BaseModel):
+    status: Literal["not_started", "submitted", "under_review", "approved", "rejected"] | None = None
+    reference_number: str | None = Field(default=None, max_length=120)
+    note: str | None = Field(default=None, max_length=2000)
+    is_public: bool | None = None

@@ -35,6 +35,7 @@ from app.services.estates.authorization import list_estate_access, resolve_estat
 from app.services.estates.identity import generate_temp_password, hash_password, normalize_email, slugify
 from app.services.estates.entitlements import ESTATE_FEATURES, get_estate_entitlement
 from app.models.estate_foundation import Estate, EstateAgentPortalToken, EstateAllocation, EstateAuditEvent, EstateBlock, EstateCommissionPayout, EstateCommissionTier, EstateCustomer, EstateCustomerPortalToken, EstateDocument, EstateDocumentLink, EstateFieldInspection, EstateHazardAssessment, EstateImportReview, EstateLayoutProposal, EstateNotificationLog, EstateOrganization, EstateOrganizationMember, EstatePayment, EstatePaymentInbox, EstatePaymentRule, EstatePlot, EstatePublicReservationRequest, EstateQrCampaign, EstateSoilAssessment, EstateSpatialFeature, EstateStaffRole, EstateSurveyRequest, EstateStakingTask, GeotechSurveyRequest
+from app.models.estate_marketing import EstateApprovalMilestone
 from app.schemas.estates import AllocationAction, BlockCreate, BlockUpdate, CommissionPayoutCreate, CommissionTiersUpdate, CustomerCreate, DevelopmentForecastPublishUpdate, DevelopmentStatusUpdate, EstateCreate, EstateLayoutCriteria, EstateLayoutDecision, EstateLayoutFeatureAdd, EstateLayoutFeatureRemove, EstateLayoutProposalEdit, EstateSubdivisionCreate, EstateUpdate, FieldInspectionCreate, GeoreferenceSessionLink, ImportFromGeoreference, ImportReviewCreate, ImportReviewDecision, ImportReviewFromGeoreferenceSession, MemberCreate, MemberUpdate, PaymentInboxCreate, PaymentInboxMatch, PlotCreate, PlotAddressUpdate, PlotGeometryUpdate, PlotListingDefaultsUpdate, PlotPriceUpdate, PortalTokenCreate, BulkCustomerSmsCreate, PublicEstateSettingsUpdate, PublicReservationConvert, PublicReservationCreate, PublicReservationUpdate, PaymentCreate, QrCampaignCreate, SpatialFeatureCreate, SpatialFeatureUpdate, StaffCreate, StaffRoleCreate, StaffRoleUpdate, StaffUpdate, SurveyEligibilityUpdate, TitleVerificationUpdate, VoidAction
 from app.services.estates.payments import confirm_payment, financial_summary, record_payment, void_payment
 from app.services.estates.documents import MAX_ESTATE_DOCUMENT_BYTES, read_private_estate_file, store_private_estate_file
@@ -234,6 +235,14 @@ def _public_reservation_payload(db: Session, row: EstatePublicReservationRequest
     }
 
 
+APPROVAL_MILESTONE_LABELS = {
+    "survey_plan_approval": "Survey plan approval",
+    "layout_approval": "Layout approval",
+    "governors_consent": "Governor's Consent",
+    "certificate_of_occupancy": "Certificate of Occupancy",
+}
+
+
 def _public_estate_payload(db: Session, estate: Estate) -> dict:
     plots = (
         db.query(EstatePlot)
@@ -243,6 +252,25 @@ def _public_estate_payload(db: Session, estate: Estate) -> dict:
     )
     blocks = {block.id: block.label for block in db.query(EstateBlock).filter(EstateBlock.estate_id == estate.id).all()}
     visible_statuses = {"available", "reserved", "allocated", "on_hold", "under_survey", "under_staking", "developed"}
+    public_milestones = (
+        db.query(EstateApprovalMilestone)
+        .filter(EstateApprovalMilestone.estate_id == estate.id, EstateApprovalMilestone.is_public.is_(True))
+        .all()
+    )
+    milestones_by_plot: dict[int, list] = {}
+    estate_milestones = []
+    for milestone in public_milestones:
+        entry = {
+            "milestone_type": milestone.milestone_type,
+            "milestone_label": APPROVAL_MILESTONE_LABELS.get(milestone.milestone_type, milestone.milestone_type),
+            "status": milestone.status,
+            "submitted_at": milestone.submitted_at,
+            "approved_at": milestone.approved_at,
+        }
+        if milestone.plot_id:
+            milestones_by_plot.setdefault(milestone.plot_id, []).append(entry)
+        else:
+            estate_milestones.append(entry)
     public_plots = [
         {
             "id": plot.id,
@@ -255,6 +283,7 @@ def _public_estate_payload(db: Session, estate: Estate) -> dict:
             "geometry": mapping(to_shape(plot.geometry)),
             "title_verified": bool(plot.title_verified),
             "title_verified_at": plot.title_verified_at if plot.title_verified else None,
+            "approval_milestones": milestones_by_plot.get(plot.id, []),
         }
         for plot in plots
         if plot.geometry and plot.commercial_status in visible_statuses
@@ -287,6 +316,7 @@ def _public_estate_payload(db: Session, estate: Estate) -> dict:
         "boundary": mapping(to_shape(estate.boundary)) if estate.boundary else None,
         "plots": public_plots,
         "counts": counts,
+        "approval_milestones": estate_milestones,
         "development_forecast": forecast,
     }
 

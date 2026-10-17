@@ -23,12 +23,14 @@ from app.models.estate_foundation import (
     EstatePublicReservationRequest,
     EstateQrCampaign,
 )
-from app.models.estate_marketing import EstateInspectionBooking, EstateInspectionSlot, EstateLiveInspectionBuyerToken, EstateLiveInspectionSession, EstateProgressUpdate, EstatePublicEvent
-from app.routers.estates import _agent_display_name, _agent_portal_context, _agent_portal_url, _public_estate
+from app.models.estate_marketing import EstateApprovalMilestone, EstateInspectionBooking, EstateInspectionSlot, EstateLiveInspectionBuyerToken, EstateLiveInspectionSession, EstateProgressUpdate, EstatePublicEvent
+from app.routers.estates import APPROVAL_MILESTONE_LABELS, _agent_display_name, _agent_portal_context, _agent_portal_url, _public_estate
 from app.routers.plots import get_db
 from app.schemas.estate_marketing import (
     AgentBookingUpdate,
     AgentLeadUpdate,
+    ApprovalMilestoneCreate,
+    ApprovalMilestoneUpdate,
     InspectionBookingCreate,
     InspectionSlotCreate,
     InspectionSlotUpdate,
@@ -1020,6 +1022,104 @@ def staff_progress_media(estate_id: int, update_id: int, request: Request, db: S
         raise HTTPException(404, "Media not found")
     data, mime = marketing_field.read_progress_media(row.media_object_key)
     return Response(data, media_type=mime, headers=NO_CACHE_PRIVATE)
+
+
+# ═════════════════════════════════════════════════════════════════════════════════════════════
+# STAFF - government approvals tracker
+# ═════════════════════════════════════════════════════════════════════════════════════════════
+def _approval_milestone_payload(db: Session, row: EstateApprovalMilestone, *, public: bool) -> dict:
+    plot = db.get(EstatePlot, row.plot_id) if row.plot_id else None
+    payload = {
+        "id": row.id,
+        "milestone_type": row.milestone_type,
+        "milestone_label": APPROVAL_MILESTONE_LABELS.get(row.milestone_type, row.milestone_type),
+        "status": row.status,
+        "plot_id": row.plot_id,
+        "plot_number": plot.plot_number if plot else None,
+        "submitted_at": row.submitted_at,
+        "approved_at": row.approved_at,
+    }
+    if not public:
+        payload.update({"reference_number": row.reference_number, "note": row.note, "is_public": row.is_public, "created_at": row.created_at, "updated_at": row.updated_at})
+    return payload
+
+
+@router.get("/{estate_id}/marketing/approvals")
+def staff_list_approvals(estate_id: int, request: Request, db: Session = Depends(get_db)):
+    estate, _access = _staff(db, request, estate_id)
+    rows = db.query(EstateApprovalMilestone).filter(EstateApprovalMilestone.estate_id == estate.id).order_by(EstateApprovalMilestone.created_at.desc()).all()
+    return [_approval_milestone_payload(db, row, public=False) for row in rows]
+
+
+@router.post("/{estate_id}/marketing/approvals", status_code=201)
+def staff_create_approval(estate_id: int, payload: ApprovalMilestoneCreate, request: Request, db: Session = Depends(get_db)):
+    estate, access = _staff(db, request, estate_id, permission="estate.manage")
+    plot = None
+    if payload.plot_id:
+        plot = db.query(EstatePlot).filter(EstatePlot.id == payload.plot_id, EstatePlot.estate_id == estate.id).one_or_none()
+        if plot is None:
+            raise HTTPException(404, "Plot not found")
+    now = _now()
+    row = EstateApprovalMilestone(
+        estate_id=estate.id,
+        plot_id=plot.id if plot else None,
+        milestone_type=payload.milestone_type,
+        status=payload.status,
+        reference_number=str(payload.reference_number or "").strip() or None,
+        note=str(payload.note or "").strip() or None,
+        is_public=payload.is_public,
+        submitted_at=now if payload.status in {"submitted", "under_review", "approved"} else None,
+        approved_at=now if payload.status == "approved" else None,
+        created_by_subject_type=access.principal.subject_type,
+        created_by_subject_id=access.principal.subject_id,
+    )
+    db.add(row)
+    db.flush()
+    append_estate_audit_event(db, organization_id=estate.organization_id, actor=access.principal, action="approval_milestone.created", entity_type="estate_approval_milestone", entity_id=row.id, after_data={"milestone_type": row.milestone_type, "status": row.status, "plot_id": row.plot_id})
+    db.commit()
+    return _approval_milestone_payload(db, row, public=False)
+
+
+@router.patch("/marketing/approvals/{milestone_id}")
+def staff_update_approval(milestone_id: int, payload: ApprovalMilestoneUpdate, request: Request, db: Session = Depends(get_db)):
+    row = db.get(EstateApprovalMilestone, milestone_id)
+    if row is None:
+        raise HTTPException(404, "Milestone not found")
+    estate = db.get(Estate, row.estate_id)
+    access = require_estate_access(db, request, estate.organization_id, permission="estate.manage")
+    values = payload.model_dump(exclude_unset=True)
+    before = {"status": row.status, "is_public": row.is_public}
+    if "status" in values and values["status"] is not None:
+        new_status = values["status"]
+        if new_status in {"submitted", "under_review", "approved"} and row.submitted_at is None:
+            row.submitted_at = _now()
+        if new_status == "approved" and row.approved_at is None:
+            row.approved_at = _now()
+        if new_status != "approved":
+            row.approved_at = None
+        row.status = new_status
+    if "reference_number" in values:
+        row.reference_number = str(values["reference_number"]).strip() if values["reference_number"] else None
+    if "note" in values:
+        row.note = str(values["note"]).strip() if values["note"] else None
+    if "is_public" in values and values["is_public"] is not None:
+        row.is_public = values["is_public"]
+    append_estate_audit_event(db, organization_id=estate.organization_id, actor=access.principal, action="approval_milestone.updated", entity_type="estate_approval_milestone", entity_id=row.id, before_data=before, after_data={"status": row.status, "is_public": row.is_public})
+    db.commit()
+    return _approval_milestone_payload(db, row, public=False)
+
+
+@router.delete("/marketing/approvals/{milestone_id}", status_code=204)
+def staff_delete_approval(milestone_id: int, request: Request, db: Session = Depends(get_db)):
+    row = db.get(EstateApprovalMilestone, milestone_id)
+    if row is None:
+        raise HTTPException(404, "Milestone not found")
+    estate = db.get(Estate, row.estate_id)
+    access = require_estate_access(db, request, estate.organization_id, permission="estate.manage")
+    append_estate_audit_event(db, organization_id=estate.organization_id, actor=access.principal, action="approval_milestone.deleted", entity_type="estate_approval_milestone", entity_id=row.id, before_data={"milestone_type": row.milestone_type, "status": row.status})
+    db.delete(row)
+    db.commit()
+    return Response(status_code=204)
 
 
 # ═════════════════════════════════════════════════════════════════════════════════════════════
