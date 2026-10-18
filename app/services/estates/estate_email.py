@@ -34,6 +34,7 @@ _ESTATE_LINE = "rgba(16,42,39,0.14)"
 _ESTATE_LINE_SOFT = "rgba(16,42,39,0.08)"
 _ESTATE_FAINT = "#8f9d95"
 _ESTATE_SURFACE_TINT = "#faf8f1"
+_ESTATE_LOGO_URL = "https://landcheck.online/logo-wordmark-web.png"
 # Georgia is the closest email-safe fallback to the landing page's "Iowan Old Style" serif - that
 # exact face is Apple-only and would silently fall back anyway in most mail clients.
 _ESTATE_SERIF = "Georgia,'Times New Roman','Noto Serif',serif"
@@ -77,12 +78,23 @@ def _estate_footer_html(*, context_line: str = "", show_landcheck_branding: bool
     """
 
 
-def _estate_shell(*, brand_name: str, logo_text: str, kicker: str, title: str, subtitle: str, body_html: str, footer_html: str, footer_note: str) -> str:
+def _estate_shell(*, brand_name: str, logo_text: str, kicker: str, title: str, subtitle: str, body_html: str, footer_html: str, footer_note: str, logo_image_url: str | None = None) -> str:
     """Estate's own HTML email shell - same structural idea as the shared
     render_branded_email_shell (logo + kicker + title/subtitle header, body, footer, outer
     disclaimer), restyled to the Estate landing page's own palette and serif display type instead
-    of the generic LandCheck dashboard green. Inline styles throughout, no remote images or web
-    fonts, for the same email-client-compatibility reasons the shared shell documents."""
+    of the generic LandCheck dashboard green. Inline styles throughout and no web fonts, for the
+    same email-client-compatibility reasons the shared shell documents - the one exception is
+    logo_image_url (the real wordmark, hosted at a stable landcheck.online path): a logo mark is
+    expected to be a real image in a professional transactional email, and alt text covers the
+    rare client that blocks it, same tradeoff every other SaaS product's emails make."""
+    logo_html = (
+        f'<td style="vertical-align:middle;"><img src="{logo_image_url}" alt="{brand_name}" height="28" style="display:block;height:28px;width:auto;border:0;" /></td>'
+        if logo_image_url
+        else (
+            f'<td style="width:36px;height:36px;vertical-align:middle;border-radius:4px;background:{_ESTATE_INK};color:#ffffff;text-align:center;font:800 13px {_ESTATE_SANS};letter-spacing:-0.02em;">{logo_text}</td>'
+            f'<td style="vertical-align:middle;padding-left:11px;"><span style="font:800 13px {_ESTATE_SANS};letter-spacing:-0.01em;color:{_ESTATE_INK};">{brand_name}</span></td>'
+        )
+    )
     return f"""
     <html>
       <body style="margin:0;padding:0;background:{_ESTATE_PAPER};font-family:{_ESTATE_SANS};color:{_ESTATE_INK};">
@@ -92,10 +104,7 @@ def _estate_shell(*, brand_name: str, logo_text: str, kicker: str, title: str, s
             <div style="padding:30px 34px 24px;border-bottom:1px solid {_ESTATE_LINE_SOFT};">
               <table role="presentation" cellpadding="0" cellspacing="0" style="border-collapse:collapse;">
                 <tr>
-                  <td style="width:36px;height:36px;vertical-align:middle;border-radius:4px;background:{_ESTATE_INK};color:#ffffff;text-align:center;font:800 13px {_ESTATE_SANS};letter-spacing:-0.02em;">{logo_text}</td>
-                  <td style="vertical-align:middle;padding-left:11px;">
-                    <span style="font:800 13px {_ESTATE_SANS};letter-spacing:-0.01em;color:{_ESTATE_INK};">{brand_name}</span>
-                  </td>
+                  {logo_html}
                 </tr>
               </table>
               <div style="margin-top:22px;font:800 11px {_ESTATE_SANS};letter-spacing:0.16em;text-transform:uppercase;color:{_ESTATE_TEAL};">{kicker}</div>
@@ -189,6 +198,7 @@ def _wrap_html(*, org_name: str, heading: str, message_html: str, financial_html
     return _estate_shell(
         brand_name="LandCheck Estates",
         logo_text="LC",
+        logo_image_url=_ESTATE_LOGO_URL,
         kicker=safe_org_name,
         title=html.escape(heading),
         subtitle="A secure update about your Estate property.",
@@ -363,6 +373,7 @@ def _account_wrap_html(*, heading: str, message_html: str, button_html: str = ""
     return _estate_shell(
         brand_name="LandCheck Estates",
         logo_text="LC",
+        logo_image_url=_ESTATE_LOGO_URL,
         kicker="Estate workspace",
         title=html.escape(heading),
         subtitle="Your LandCheck Estates workspace update is ready.",

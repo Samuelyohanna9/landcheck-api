@@ -32,10 +32,7 @@ def _survey_email_shell(*, kicker: str, title: str, subtitle: str, body_html: st
             <div style="padding:30px 34px 24px;border-bottom:1px solid {_SURVEY_LINE_SOFT};">
               <table role="presentation" cellpadding="0" cellspacing="0" style="border-collapse:collapse;">
                 <tr>
-                  <td style="width:36px;height:36px;vertical-align:middle;border-radius:4px;background:{_SURVEY_INK};color:#ffffff;text-align:center;font:800 13px {_SURVEY_SANS};letter-spacing:-0.02em;">LS</td>
-                  <td style="vertical-align:middle;padding-left:11px;">
-                    <span style="font:800 13px {_SURVEY_SANS};letter-spacing:-0.01em;color:{_SURVEY_INK};">LandCheck Survey</span>
-                  </td>
+                  <td style="vertical-align:middle;"><img src="https://landcheck.online/logo-wordmark-web.png" alt="LandCheck Survey" height="28" style="display:block;height:28px;width:auto;border:0;" /></td>
                 </tr>
               </table>
               <div style="margin-top:22px;font:800 11px {_SURVEY_SANS};letter-spacing:0.16em;text-transform:uppercase;color:{_SURVEY_ACCENT};">{kicker}</div>
