@@ -35,7 +35,7 @@ from app.services.estates.authorization import list_estate_access, resolve_estat
 from app.services.estates.identity import generate_temp_password, hash_password, normalize_email, slugify
 from app.services.estates.entitlements import ESTATE_FEATURES, get_estate_entitlement
 from app.models.estate_foundation import Estate, EstateAgentPortalToken, EstateAllocation, EstateAuditEvent, EstateBlock, EstateCommissionPayout, EstateCommissionTier, EstateCustomer, EstateCustomerPortalToken, EstateDocument, EstateDocumentLink, EstateFieldInspection, EstateHazardAssessment, EstateImportReview, EstateLayoutProposal, EstateNotificationLog, EstateOrganization, EstateOrganizationMember, EstatePayment, EstatePaymentInbox, EstatePaymentRule, EstatePlot, EstatePublicReservationRequest, EstateQrCampaign, EstateSoilAssessment, EstateSpatialFeature, EstateStaffRole, EstateSurveyRequest, EstateStakingTask, GeotechSurveyRequest
-from app.models.estate_marketing import EstateApprovalMilestone
+from app.models.estate_marketing import EstateApprovalMilestone, EstateLiveInspectionSession, EstateProgressUpdate
 from app.schemas.estates import AllocationAction, BlockCreate, BlockUpdate, CommissionPayoutCreate, CommissionTiersUpdate, CustomerCreate, DevelopmentForecastPublishUpdate, DevelopmentStatusUpdate, EstateCreate, EstateLayoutCriteria, EstateLayoutDecision, EstateLayoutFeatureAdd, EstateLayoutFeatureRemove, EstateLayoutProposalEdit, EstateSubdivisionCreate, EstateUpdate, FieldInspectionCreate, GeoreferenceSessionLink, ImportFromGeoreference, ImportReviewCreate, ImportReviewDecision, ImportReviewFromGeoreferenceSession, MemberCreate, MemberUpdate, PaymentInboxCreate, PaymentInboxMatch, PlotCreate, PlotAddressUpdate, PlotGeometryUpdate, PlotListingDefaultsUpdate, PlotPriceUpdate, PortalTokenCreate, BulkCustomerSmsCreate, PublicEstateSettingsUpdate, PublicReservationConvert, PublicReservationCreate, PublicReservationUpdate, PaymentCreate, QrCampaignCreate, SpatialFeatureCreate, SpatialFeatureUpdate, StaffCreate, StaffRoleCreate, StaffRoleUpdate, StaffUpdate, SurveyEligibilityUpdate, TitleVerificationUpdate, VoidAction
 from app.services.estates.payments import confirm_payment, financial_summary, record_payment, void_payment
 from app.services.estates.documents import MAX_ESTATE_DOCUMENT_BYTES, read_private_estate_file, store_private_estate_file
@@ -3266,11 +3266,12 @@ def estate_activity(estate_id:int, request:Request, limit:int=100, db:Session=De
 
 @router.get("/plots/{plot_id}/timeline")
 def plot_timeline(plot_id: int, request: Request, db: Session = Depends(get_db)):
-    """A single plot's own history, assembled across every entity type an audit event can be
-    logged against for it - the plot record itself (created/geometry edited/subdivided/...), its
-    reservation/allocation, its payments, its Survey request and its Staking task - since none of
-    those share one common entity_id, a plain `entity_id == plot_id` filter would only ever surface
-    the plot's own direct events and miss everything else that happened to it."""
+    """A single plot's own history ("Plot History" in the UI), assembled across every entity type
+    an audit event can be logged against for it - the plot record itself (created/geometry
+    edited/subdivided/...), its reservation/allocation, its payments, its commission payouts, the
+    customer(s) ever allocated to it, its documents, its Survey request and its Staking task -
+    since none of those share one common entity_id, a plain `entity_id == plot_id` filter would
+    only ever surface the plot's own direct events and miss everything else that happened to it."""
     plot = db.get(EstatePlot, plot_id)
     if not plot:
         raise HTTPException(404, "Plot not found")
@@ -3281,13 +3282,35 @@ def plot_timeline(plot_id: int, request: Request, db: Session = Depends(get_db))
     payment_ids = [str(row.id) for row in db.query(EstatePayment.id).filter(EstatePayment.plot_id == plot_id).all()]
     survey_ids = [str(row.id) for row in db.query(EstateSurveyRequest.id).filter(EstateSurveyRequest.plot_id == plot_id).all()]
     staking_ids = [str(row.id) for row in db.query(EstateStakingTask.id).filter(EstateStakingTask.plot_id == plot_id).all()]
+    progress_update_ids = [str(row.id) for row in db.query(EstateProgressUpdate.id).filter(EstateProgressUpdate.plot_id == plot_id).all()]
+    approval_milestone_ids = [str(row.id) for row in db.query(EstateApprovalMilestone.id).filter(EstateApprovalMilestone.plot_id == plot_id).all()]
+    live_inspection_ids = [str(row.id) for row in db.query(EstateLiveInspectionSession.id).filter(EstateLiveInspectionSession.plot_id == plot_id).all()]
+    allocation_int_ids = [int(value) for value in allocation_ids]
+    payout_ids = [str(row.id) for row in db.query(EstateCommissionPayout.id).filter(EstateCommissionPayout.allocation_id.in_(allocation_int_ids)).all()] if allocation_int_ids else []
+    customer_ids = [str(row[0]) for row in db.query(EstateAllocation.customer_id).filter(EstateAllocation.plot_id == plot_id).distinct().all()]
+    document_link_conditions = [and_(EstateDocumentLink.entity_type == "plot", EstateDocumentLink.entity_id == str(plot_id))]
+    for linked_type, ids in (("payment", payment_ids), ("commission_payout", payout_ids)):
+        if ids:
+            document_link_conditions.append(and_(EstateDocumentLink.entity_type == linked_type, EstateDocumentLink.entity_id.in_(ids)))
+    document_ids = [str(row.id) for row in db.query(EstateDocument.id).join(EstateDocumentLink, EstateDocumentLink.document_id == EstateDocument.id).filter(or_(*document_link_conditions)).distinct().all()]
 
     conditions = [and_(EstateAuditEvent.entity_type == "estate_plot", EstateAuditEvent.entity_id == str(plot_id))]
-    for entity_type, ids in (("estate_allocation", allocation_ids), ("estate_payment", payment_ids), ("estate_survey_request", survey_ids), ("estate_staking_task", staking_ids)):
+    for entity_type, ids in (
+        ("estate_allocation", allocation_ids),
+        ("estate_payment", payment_ids),
+        ("estate_commission_payout", payout_ids),
+        ("estate_customer", customer_ids),
+        ("estate_document", document_ids),
+        ("estate_survey_request", survey_ids),
+        ("estate_staking_task", staking_ids),
+        ("estate_progress_update", progress_update_ids),
+        ("estate_approval_milestone", approval_milestone_ids),
+        ("estate_live_inspection_session", live_inspection_ids),
+    ):
         if ids:
             conditions.append(and_(EstateAuditEvent.entity_type == entity_type, EstateAuditEvent.entity_id.in_(ids)))
 
-    rows = db.query(EstateAuditEvent).filter(EstateAuditEvent.organization_id == estate.organization_id, or_(*conditions)).order_by(EstateAuditEvent.created_at.desc()).limit(100).all()
+    rows = db.query(EstateAuditEvent).filter(EstateAuditEvent.organization_id == estate.organization_id, or_(*conditions)).order_by(EstateAuditEvent.created_at.desc()).limit(150).all()
     return [{"id": row.id, "action": row.action, "entity_type": row.entity_type, "actor": row.actor_subject_id, "created_at": row.created_at, "details": row.after_data} for row in rows]
 
 
