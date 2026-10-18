@@ -6,7 +6,60 @@ import smtplib
 from email.message import EmailMessage
 from email.utils import formatdate, make_msgid
 
-from app.utils.email_branding import render_branded_email_shell
+# Survey's own email palette/typography - mirrors landcheck-web's SurveyPlanLanding.tsx
+# (survey-plan-landing.css's .spl-page scope) rather than the generic LandCheck shell in
+# app/utils/email_branding.py. Deliberately not shared with that util (Estate and Green each have
+# their own near-identical pattern in their own files too) so each product's emails can diverge
+# from the others without touching code the other products depend on.
+_SURVEY_PAPER = "#f5f3eb"
+_SURVEY_INK = "#102a27"
+_SURVEY_MUTED = "#61736e"
+_SURVEY_ACCENT = "#1f8c58"
+_SURVEY_LINE = "rgba(16,42,39,0.18)"
+_SURVEY_LINE_SOFT = "rgba(16,42,39,0.09)"
+_SURVEY_FAINT = "#8d9a96"
+_SURVEY_SERIF = "Georgia,'Times New Roman','Noto Serif',serif"
+_SURVEY_SANS = "Arial,'Segoe UI',Helvetica,sans-serif"
+
+
+def _survey_email_shell(*, kicker: str, title: str, subtitle: str, body_html: str, footer_note: str) -> str:
+    return f"""
+    <html>
+      <body style="margin:0;padding:0;background:{_SURVEY_PAPER};font-family:{_SURVEY_SANS};color:{_SURVEY_INK};">
+        <div style="max-width:600px;margin:0 auto;padding:32px 16px;">
+          <div style="background:#ffffff;border:1px solid {_SURVEY_LINE};border-radius:4px;overflow:hidden;">
+            <div style="height:3px;background:{_SURVEY_ACCENT};font-size:0;line-height:0;">&nbsp;</div>
+            <div style="padding:30px 34px 24px;border-bottom:1px solid {_SURVEY_LINE_SOFT};">
+              <table role="presentation" cellpadding="0" cellspacing="0" style="border-collapse:collapse;">
+                <tr>
+                  <td style="width:36px;height:36px;vertical-align:middle;border-radius:4px;background:{_SURVEY_INK};color:#ffffff;text-align:center;font:800 13px {_SURVEY_SANS};letter-spacing:-0.02em;">LS</td>
+                  <td style="vertical-align:middle;padding-left:11px;">
+                    <span style="font:800 13px {_SURVEY_SANS};letter-spacing:-0.01em;color:{_SURVEY_INK};">LandCheck Survey</span>
+                  </td>
+                </tr>
+              </table>
+              <div style="margin-top:22px;font:800 11px {_SURVEY_SANS};letter-spacing:0.16em;text-transform:uppercase;color:{_SURVEY_ACCENT};">{kicker}</div>
+              <div style="margin-top:9px;font-family:{_SURVEY_SERIF};font-size:24px;font-weight:500;letter-spacing:-0.02em;line-height:1.24;color:{_SURVEY_INK};">{title}</div>
+              <div style="margin-top:10px;font:400 14px/1.7 {_SURVEY_SANS};color:{_SURVEY_MUTED};">{subtitle}</div>
+            </div>
+            <div style="padding:26px 34px 10px;font:400 14.5px/1.7 {_SURVEY_SANS};color:{_SURVEY_INK};">
+              {body_html}
+            </div>
+            <div style="padding:22px 34px 28px;border-top:1px solid {_SURVEY_LINE_SOFT};margin-top:14px;font:400 12.5px/1.75 {_SURVEY_SANS};color:{_SURVEY_MUTED};">
+              <div style="font-family:{_SURVEY_SERIF};font-size:14px;font-weight:600;color:{_SURVEY_INK};">LandCheck Survey</div>
+              <div style="margin-top:10px;">
+                <a href="mailto:admin@landcheck.online" style="color:{_SURVEY_ACCENT};text-decoration:none;">admin@landcheck.online</a>
+                &nbsp;&middot;&nbsp;
+                <a href="https://landcheck.online/survey" style="color:{_SURVEY_ACCENT};text-decoration:none;">landcheck.online/survey</a>
+              </div>
+              <div style="margin-top:14px;padding-top:12px;border-top:1px solid {_SURVEY_LINE_SOFT};font-size:11px;color:{_SURVEY_FAINT};">LandCheck Geospatial Technologies Limited</div>
+            </div>
+          </div>
+          <p style="text-align:center;font:400 11px/1.6 {_SURVEY_SANS};color:{_SURVEY_FAINT};margin:18px 0 0;">{footer_note}</p>
+        </div>
+      </body>
+    </html>
+    """
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -76,16 +129,15 @@ def send_magic_link_email(*, to_email: str, link_url: str, otp_code: str) -> Non
         "Regards,\nLandCheck Survey"
     )
     body_html = f"""
-    <p style="margin:0 0 20px;font-size:15px;line-height:1.7;color:#173624;">Click the button below to sign in, or enter the code where you requested it.</p>
-    <a href="{html.escape(link_url)}" style="display:inline-block;background:linear-gradient(135deg,#1f8c58,#0f6f39);color:#ffffff;text-decoration:none;font-weight:800;font-size:15px;padding:14px 22px;border-radius:999px;box-shadow:0 10px 22px rgba(15,111,57,0.28);">Sign in</a>
-    <div style="margin:22px 0 0;padding:16px;background:#f4f9f5;border:1px solid #dceee0;border-radius:12px;text-align:center;">
-      <div style="font-size:11.5px;font-weight:700;letter-spacing:0.06em;text-transform:uppercase;color:#5c7a68;margin:0 0 8px;">Your sign-in code</div>
-      <div style="font-size:28px;font-weight:800;letter-spacing:0.35em;color:#173624;">{html.escape(otp_code)}</div>
+    <p style="margin:0 0 20px;font-size:15px;line-height:1.7;color:{_SURVEY_INK};">Click the button below to sign in, or enter the code where you requested it.</p>
+    <a href="{html.escape(link_url)}" style="display:inline-block;background:{_SURVEY_ACCENT};color:#ffffff;text-decoration:none;font-weight:700;font-size:14px;padding:13px 22px;border-radius:2px;">Sign in</a>
+    <div style="margin:22px 0 0;padding:16px;background:#faf8f1;border:1px solid {_SURVEY_LINE};border-radius:4px;text-align:center;">
+      <div style="font-size:11.5px;font-weight:700;letter-spacing:0.06em;text-transform:uppercase;color:{_SURVEY_MUTED};margin:0 0 8px;">Your sign-in code</div>
+      <div style="font-size:28px;font-weight:800;letter-spacing:0.35em;color:{_SURVEY_INK};">{html.escape(otp_code)}</div>
     </div>
-    <p style="margin:22px 0 0;font-size:12.5px;line-height:1.6;color:#8199a5;">Either one expires in 15 minutes and can only be used once. If you didn't request this, you can safely ignore this email.</p>
+    <p style="margin:22px 0 0;font-size:12.5px;line-height:1.6;color:{_SURVEY_FAINT};">Either one expires in 15 minutes and can only be used once. If you didn't request this, you can safely ignore this email.</p>
     """
-    body_html = render_branded_email_shell(
-        brand_name="LandCheck Survey",
+    body_html = _survey_email_shell(
         kicker="Secure sign in",
         title="Sign in to LandCheck Survey",
         subtitle="Use the secure link or one-time code below to access your workspace.",
@@ -112,12 +164,11 @@ def send_support_message_email(*, subject: str, message: str, from_email: str, f
         f"{message}\n"
     )
     body_html = f"""
-    <p style="margin:0 0 6px;font-size:13px;color:#5c7a68;">From: {html.escape(from_name)} &lt;{html.escape(from_email)}&gt;</p>
-    <p style="margin:0 0 18px;font-size:13px;color:#5c7a68;">Page: {html.escape(page_context or "dashboard")}</p>
-    <div style="padding:16px;background:#f4f9f5;border:1px solid #dceee0;border-radius:12px;font-size:14.5px;line-height:1.7;color:#173624;white-space:pre-wrap;">{html.escape(message)}</div>
+    <p style="margin:0 0 6px;font-size:13px;color:{_SURVEY_MUTED};">From: {html.escape(from_name)} &lt;{html.escape(from_email)}&gt;</p>
+    <p style="margin:0 0 18px;font-size:13px;color:{_SURVEY_MUTED};">Page: {html.escape(page_context or "dashboard")}</p>
+    <div style="padding:16px;background:#faf8f1;border:1px solid {_SURVEY_LINE};border-radius:4px;font-size:14.5px;line-height:1.7;color:{_SURVEY_INK};white-space:pre-wrap;">{html.escape(message)}</div>
     """
-    body_html = render_branded_email_shell(
-        brand_name="LandCheck Survey",
+    body_html = _survey_email_shell(
         kicker="Support request",
         title=html.escape(safe_subject),
         subtitle="A support request has been submitted from the LandCheck Survey workspace.",
