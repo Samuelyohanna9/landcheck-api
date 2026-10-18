@@ -17,12 +17,103 @@ from decimal import Decimal
 from email.message import EmailMessage
 from email.utils import formatdate, make_msgid
 
-from app.utils.email_branding import render_branded_email_shell
-
 from app.services.estates.billing_plans import ESTATE_PLANS
 
 logger = logging.getLogger(__name__)
 EMAIL_VERIFICATION_TTL_HOURS = 24
+
+# Estate's own email palette/typography - mirrors landcheck-web's estate-portal.css (.estate-portal
+# scope) so every Estate email reads like an extension of the public site and dashboard, rather
+# than the generic LandCheck shell shared Green/Survey emails still use (see
+# app/utils/email_branding.py, intentionally left untouched - this is Estate-specific).
+_ESTATE_PAPER = "#f5f3eb"
+_ESTATE_INK = "#102a27"
+_ESTATE_SLATE = "#5d6f69"
+_ESTATE_TEAL = "#16816e"
+_ESTATE_LINE = "rgba(16,42,39,0.14)"
+_ESTATE_LINE_SOFT = "rgba(16,42,39,0.08)"
+_ESTATE_FAINT = "#8f9d95"
+_ESTATE_SURFACE_TINT = "#faf8f1"
+# Georgia is the closest email-safe fallback to the landing page's "Iowan Old Style" serif - that
+# exact face is Apple-only and would silently fall back anyway in most mail clients.
+_ESTATE_SERIF = "Georgia,'Times New Roman','Noto Serif',serif"
+_ESTATE_SANS = "Arial,'Segoe UI',Helvetica,sans-serif"
+
+
+def _estate_initials(name: str) -> str:
+    import re
+
+    words = [w for w in re.split(r"\s+", str(name or "").strip()) if w]
+    if not words:
+        return "E"
+    if len(words) == 1:
+        return words[0][:2].upper()
+    return (words[0][0] + words[1][0]).upper()
+
+
+def _estate_footer_html(*, context_line: str = "", show_landcheck_branding: bool = True) -> str:
+    """The "official" Estate footer - a consistent block every Estate email ends with. Buyer-facing
+    white-label emails (show_landcheck_branding=False) keep this to just the context line, since
+    those are meant to read as coming from the developer, not LandCheck."""
+    context_html = f'<div style="margin-top:3px;">{context_line}</div>' if context_line else ""
+    if not show_landcheck_branding:
+        return f'<div style="font:400 12.5px/1.75 {_ESTATE_SANS};color:{_ESTATE_SLATE};">{context_html}</div>'
+    return f"""
+    <div style="font:400 12.5px/1.75 {_ESTATE_SANS};color:{_ESTATE_SLATE};">
+      <div style="font-family:{_ESTATE_SERIF};font-size:14px;font-weight:600;color:{_ESTATE_INK};">LandCheck Estates</div>
+      {context_html}
+      <div style="margin-top:10px;">
+        <a href="mailto:support@landcheck.online" style="color:{_ESTATE_TEAL};text-decoration:none;">support@landcheck.online</a>
+        &nbsp;&middot;&nbsp;
+        <a href="https://landcheck.online/estates" style="color:{_ESTATE_TEAL};text-decoration:none;">landcheck.online/estates</a>
+      </div>
+    </div>
+    <div style="margin-top:16px;padding-top:14px;border-top:1px solid {_ESTATE_LINE_SOFT};font-size:11px;color:{_ESTATE_FAINT};">
+      LandCheck Geospatial Technologies Limited<br/>
+      <a href="https://www.instagram.com/land.check/" style="color:{_ESTATE_FAINT};text-decoration:none;">Instagram</a>&nbsp;&middot;&nbsp;
+      <a href="https://www.facebook.com/landcheck/" style="color:{_ESTATE_FAINT};text-decoration:none;">Facebook</a>&nbsp;&middot;&nbsp;
+      <a href="https://www.linkedin.com/company/landcheck-geospatial/" style="color:{_ESTATE_FAINT};text-decoration:none;">LinkedIn</a>
+    </div>
+    """
+
+
+def _estate_shell(*, brand_name: str, logo_text: str, kicker: str, title: str, subtitle: str, body_html: str, footer_html: str, footer_note: str) -> str:
+    """Estate's own HTML email shell - same structural idea as the shared
+    render_branded_email_shell (logo + kicker + title/subtitle header, body, footer, outer
+    disclaimer), restyled to the Estate landing page's own palette and serif display type instead
+    of the generic LandCheck dashboard green. Inline styles throughout, no remote images or web
+    fonts, for the same email-client-compatibility reasons the shared shell documents."""
+    return f"""
+    <html>
+      <body style="margin:0;padding:0;background:{_ESTATE_PAPER};font-family:{_ESTATE_SANS};color:{_ESTATE_INK};">
+        <div style="max-width:620px;margin:0 auto;padding:32px 16px;">
+          <div style="background:#ffffff;border:1px solid {_ESTATE_LINE};border-radius:4px;overflow:hidden;">
+            <div style="height:3px;background:{_ESTATE_INK};font-size:0;line-height:0;">&nbsp;</div>
+            <div style="padding:30px 34px 24px;border-bottom:1px solid {_ESTATE_LINE_SOFT};">
+              <table role="presentation" cellpadding="0" cellspacing="0" style="border-collapse:collapse;">
+                <tr>
+                  <td style="width:36px;height:36px;vertical-align:middle;border-radius:4px;background:{_ESTATE_INK};color:#ffffff;text-align:center;font:800 13px {_ESTATE_SANS};letter-spacing:-0.02em;">{logo_text}</td>
+                  <td style="vertical-align:middle;padding-left:11px;">
+                    <span style="font:800 13px {_ESTATE_SANS};letter-spacing:-0.01em;color:{_ESTATE_INK};">{brand_name}</span>
+                  </td>
+                </tr>
+              </table>
+              <div style="margin-top:22px;font:800 11px {_ESTATE_SANS};letter-spacing:0.16em;text-transform:uppercase;color:{_ESTATE_TEAL};">{kicker}</div>
+              <div style="margin-top:9px;font-family:{_ESTATE_SERIF};font-size:25px;font-weight:500;letter-spacing:-0.02em;line-height:1.24;color:{_ESTATE_INK};">{title}</div>
+              <div style="margin-top:10px;font:400 14px/1.7 {_ESTATE_SANS};color:{_ESTATE_SLATE};">{subtitle}</div>
+            </div>
+            <div style="padding:26px 34px 10px;font:400 14.5px/1.7 {_ESTATE_SANS};color:{_ESTATE_INK};">
+              {body_html}
+            </div>
+            <div style="padding:22px 34px 28px;border-top:1px solid {_ESTATE_LINE_SOFT};margin-top:14px;">
+              {footer_html}
+            </div>
+          </div>
+          <p style="text-align:center;font:400 11px/1.6 {_ESTATE_SANS};color:{_ESTATE_FAINT};margin:18px 0 0;">{footer_note}</p>
+        </div>
+      </body>
+    </html>
+    """
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -88,20 +179,21 @@ def _plot_link_html(plot_link: str | None, *, label: str = "View your plot on sa
         return ""
     return f"""
     <div style="margin:22px 0 0;text-align:center;">
-      <a href="{html.escape(plot_link)}" style="display:inline-block;padding:14px 22px;background:linear-gradient(135deg,#1f8c58,#0f6f39);color:#ffffff;font-size:15px;font-weight:800;text-decoration:none;border-radius:999px;box-shadow:0 10px 22px rgba(15,111,57,0.28);">{html.escape(label)}</a>
+      <a href="{html.escape(plot_link)}" style="display:inline-block;padding:13px 22px;background:{_ESTATE_INK};color:#ffffff;font:700 13px {_ESTATE_SANS};text-decoration:none;border-radius:2px;">{html.escape(label)}</a>
     </div>
     """
 
 
 def _wrap_html(*, org_name: str, heading: str, message_html: str, financial_html: str, plot_link_html: str = "") -> str:
     safe_org_name = html.escape(org_name)
-    return render_branded_email_shell(
+    return _estate_shell(
         brand_name="LandCheck Estates",
+        logo_text="LC",
         kicker=safe_org_name,
         title=html.escape(heading),
         subtitle="A secure update about your Estate property.",
         body_html=f"{message_html}{plot_link_html}{financial_html}",
-        footer_html=f'<div style="font-size:12.5px;color:#7c9186;line-height:1.7;">Sent via <strong style="color:#1f8c58;">LandCheck Estates</strong><br/>{safe_org_name}</div>',
+        footer_html=_estate_footer_html(context_line=f"Sent on behalf of <strong style=\"color:{_ESTATE_INK};\">{safe_org_name}</strong>"),
         footer_note=f"This is an automated update from {safe_org_name} about your property. If anything here looks wrong, please contact {safe_org_name} directly.",
     )
 
@@ -114,13 +206,14 @@ def _public_customer_wrap_html(*, organization_name: str, heading: str, message_
     internal workspace language or LandCheck support details.
     """
     safe_org_name = html.escape(organization_name)
-    return render_branded_email_shell(
+    return _estate_shell(
         brand_name=safe_org_name,
+        logo_text=_estate_initials(organization_name),
         kicker="Estate reservation",
         title=html.escape(heading),
         subtitle="Your reservation enquiry has been received by the Estate team.",
         body_html=f"{message_html}{plot_link_html}",
-        footer_html=f'<div style="font-size:12.5px;color:#7c9186;line-height:1.7;"><strong style="color:#1f8c58;">{safe_org_name}</strong><br/>Estate enquiries</div>',
+        footer_html=_estate_footer_html(context_line=f"<strong style=\"color:{_ESTATE_INK};\">{safe_org_name}</strong><br/>Estate enquiries", show_landcheck_branding=False),
         footer_note=f"This message confirms your enquiry with {safe_org_name}. Please contact the Estate team directly if you need any help.",
     )
 
@@ -128,10 +221,10 @@ def _public_customer_wrap_html(*, organization_name: str, heading: str, message_
 def _financial_block_html(agreed_price: Decimal, confirmed_paid: Decimal, outstanding: Decimal) -> str:
     row = "display:flex;justify-content:space-between;padding:6px 0;font-size:14px;"
     return f"""
-    <div style="margin:22px 0 0;padding:16px 18px;background:#f4f9f5;border:1px solid #dceee0;border-radius:12px;">
-      <div style="{row}"><span style="color:#5c7a68;">Agreed price</span><strong style="color:#173624;">{html.escape(format_naira(agreed_price))}</strong></div>
-      <div style="{row}border-top:1px solid #e2efe4;"><span style="color:#5c7a68;">Total paid so far</span><strong style="color:#1d8a49;">{html.escape(format_naira(confirmed_paid))}</strong></div>
-      <div style="{row}border-top:1px solid #e2efe4;"><span style="color:#5c7a68;">Outstanding balance</span><strong style="color:{'#1d8a49' if outstanding <= 0 else '#b5790a'};">{html.escape(format_naira(outstanding))}</strong></div>
+    <div style="margin:22px 0 0;padding:16px 18px;background:{_ESTATE_SURFACE_TINT};border:1px solid {_ESTATE_LINE};border-radius:4px;">
+      <div style="{row}"><span style="color:{_ESTATE_SLATE};">Agreed price</span><strong style="color:{_ESTATE_INK};">{html.escape(format_naira(agreed_price))}</strong></div>
+      <div style="{row}border-top:1px solid {_ESTATE_LINE_SOFT};"><span style="color:{_ESTATE_SLATE};">Total paid so far</span><strong style="color:{_ESTATE_TEAL};">{html.escape(format_naira(confirmed_paid))}</strong></div>
+      <div style="{row}border-top:1px solid {_ESTATE_LINE_SOFT};"><span style="color:{_ESTATE_SLATE};">Outstanding balance</span><strong style="color:{_ESTATE_TEAL if outstanding <= 0 else '#a3690a'};">{html.escape(format_naira(outstanding))}</strong></div>
     </div>
     """
 
@@ -267,13 +360,14 @@ def _account_wrap_html(*, heading: str, message_html: str, button_html: str = ""
     """Same visual shell as _wrap_html, but for emails about the company's own LandCheck Estates
     account (welcome, billing, password reset) rather than a customer-facing plot update - so it
     isn't signed with a specific estate's org_name, which wouldn't apply here."""
-    return render_branded_email_shell(
+    return _estate_shell(
         brand_name="LandCheck Estates",
+        logo_text="LC",
         kicker="Estate workspace",
         title=html.escape(heading),
         subtitle="Your LandCheck Estates workspace update is ready.",
         body_html=f"{message_html}{button_html}",
-        footer_html='<div style="font-size:12.5px;color:#7c9186;line-height:1.7;">Powered by <strong style="color:#1f8c58;">LandCheck Estates</strong><br/><a href="mailto:support@landcheck.online" style="color:#1f8c58;text-decoration:none;">support@landcheck.online</a></div>',
+        footer_html=_estate_footer_html(),
         footer_note="If you didn't expect this email, you can safely ignore it, or contact us at support@landcheck.online.",
     )
 
@@ -281,7 +375,7 @@ def _account_wrap_html(*, heading: str, message_html: str, button_html: str = ""
 def _account_button_html(*, label: str, url: str) -> str:
     return f"""
     <div style="margin:24px 0 0;text-align:center;">
-      <a href="{html.escape(url)}" style="display:inline-block;padding:14px 22px;background:linear-gradient(135deg,#1f8c58,#0f6f39);color:#ffffff;font-size:15px;font-weight:800;text-decoration:none;border-radius:999px;box-shadow:0 10px 22px rgba(15,111,57,0.28);">{html.escape(label)}</a>
+      <a href="{html.escape(url)}" style="display:inline-block;padding:13px 22px;background:{_ESTATE_INK};color:#ffffff;font:700 13px {_ESTATE_SANS};text-decoration:none;border-radius:2px;">{html.escape(label)}</a>
     </div>
     """
 
@@ -611,8 +705,8 @@ def send_staff_invite_email(
         f"{access_list_html}"
         "<p>Sign in with the temporary password below - you'll be asked to set your own password "
         "the first time you log in.</p>"
-        f"<p style=\"margin:18px 0;padding:14px 16px;background:#f4fbf6;border:1px solid rgba(15,111,57,0.18);"
-        f"border-radius:12px;font-size:15px;\">Email: <strong>{html.escape(to_email)}</strong><br/>"
+        f"<p style=\"margin:18px 0;padding:14px 16px;background:{_ESTATE_SURFACE_TINT};border:1px solid {_ESTATE_LINE};"
+        f"border-radius:4px;font-size:15px;\">Email: <strong>{html.escape(to_email)}</strong><br/>"
         f"Temporary password: <strong style=\"font-family:monospace;font-size:16px;letter-spacing:0.5px;\">"
         f"{html.escape(temp_password)}</strong></p>"
     )
