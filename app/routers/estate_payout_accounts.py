@@ -12,7 +12,8 @@ from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from app.routers.plots import get_db
-from app.services.estates.authorization import require_estate_access
+from app.services.estates import estate_email
+from app.services.estates.authorization import require_estate_owner
 from app.services.estates.payout_accounts import get_payout_account, resolve_bank_account, set_up_payout_account
 from app.utils import estate_flutterwave as flw
 from app.utils import estate_paystack as pst
@@ -58,7 +59,10 @@ def list_banks(provider: str = "flutterwave"):
 
 @router.post("/{organization_id}/resolve")
 def resolve_payout_account(organization_id: int, payload: BankAccountResolveRequest, request: Request, db: Session = Depends(get_db)):
-    require_estate_access(db, request, organization_id, permission="billing.manage", require_subscription=False)
+    # Owner-only, not just billing.manage: this is the account buyer money settles into, so no
+    # custom staff checklist - however billing-permissioned - can reach it. See
+    # app/services/estates/authorization.py::require_estate_owner.
+    require_estate_owner(db, request, organization_id, require_subscription=False)
     try:
         resolved = resolve_bank_account("flutterwave" if flw.configured() else "paystack", payload.bank_code, payload.account_number)
     except HTTPException:
@@ -72,7 +76,7 @@ def resolve_payout_account(organization_id: int, payload: BankAccountResolveRequ
 
 @router.put("/{organization_id}")
 def save_payout_account(organization_id: int, payload: BankAccountSaveRequest, request: Request, db: Session = Depends(get_db)):
-    access = require_estate_access(db, request, organization_id, permission="billing.manage", require_subscription=False)
+    access = require_estate_owner(db, request, organization_id, require_subscription=False)
     organization = db.get(EstateOrganization, organization_id)
     if not organization:
         raise HTTPException(404, "Organization not found")
@@ -82,6 +86,13 @@ def save_payout_account(organization_id: int, payload: BankAccountSaveRequest, r
     except ValueError as exc:
         db.rollback()
         raise HTTPException(422, str(exc))
+    estate_email.send_payout_account_changed_email(
+        organization=organization,
+        account_name=account.account_name,
+        bank_name=account.bank_name,
+        masked_account_number=_mask_account_number(account.account_number),
+        changed_by_display_name=access.principal.display_name,
+    )
     return {
         "bank_code": account.bank_code,
         "bank_name": account.bank_name,
@@ -94,7 +105,7 @@ def save_payout_account(organization_id: int, payload: BankAccountSaveRequest, r
 
 @router.get("/{organization_id}")
 def get_payout_account_status(organization_id: int, request: Request, db: Session = Depends(get_db)):
-    require_estate_access(db, request, organization_id, permission="billing.manage", require_subscription=False)
+    require_estate_owner(db, request, organization_id, require_subscription=False)
     account = get_payout_account(db, organization_id)
     if not account:
         return {"configured": False}

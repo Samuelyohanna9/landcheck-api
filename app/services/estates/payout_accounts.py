@@ -59,6 +59,9 @@ def set_up_payout_account(
         raise ValueError("No payment gateway is configured on this server to create a payout subaccount.")
 
     account = get_payout_account(db, organization.id)
+    before_data = None
+    if account is not None:
+        before_data = {"bank_code": account.bank_code, "account_name": account.account_name, "account_number_last4": account.account_number[-4:] if len(account.account_number) >= 4 else account.account_number}
     if account is None:
         account = EstateOrganizationPayoutAccount(organization_id=organization.id, created_by_subject_type=actor.subject_type, created_by_subject_id=actor.subject_id)
         db.add(account)
@@ -73,9 +76,10 @@ def set_up_payout_account(
         db,
         organization_id=organization.id,
         actor=actor,
-        action="organization.payout_account_configured",
+        action="organization.payout_account_changed" if before_data else "organization.payout_account_configured",
         entity_type="estate_organization_payout_account",
         entity_id=account.id,
+        before_data=before_data,
         after_data={"bank_code": bank_code, "account_name": account_name, "account_number_last4": account_number[-4:] if len(account_number) >= 4 else account_number},
     )
     return account

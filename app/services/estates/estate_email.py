@@ -898,6 +898,30 @@ def send_plan_change_receipt_email(*, organization, subscription, charged_amount
         return False
 
 
+def send_payout_account_changed_email(*, organization, account_name: str, bank_name: str | None, masked_account_number: str, changed_by_display_name: str | None) -> bool:
+    """Security alert sent to the org's own contact email every time the buyer-payment payout
+    account is created or changed - so an owner finds out immediately if a team member (or an
+    attacker) redirected where buyer money settles, even though the change itself is already
+    restricted to owner-only (see app/services/estates/authorization.py::require_estate_owner)."""
+    to_email = _subscription_org_email(organization)
+    if not to_email:
+        return False
+    actor_line = f" by {html.escape(changed_by_display_name)}" if changed_by_display_name else ""
+    message_html = (
+        f"<p>Your buyer-payment payout account was just set{actor_line}:</p>"
+        f"<p><strong>{html.escape(account_name)}</strong><br/>{html.escape(bank_name or '')} - {html.escape(masked_account_number)}</p>"
+        "<p>From now on, buyer online plot payments settle directly into this account. If this wasn't you, "
+        "contact support@landcheck.online immediately.</p>"
+    )
+    body_html = _account_wrap_html(heading="Payout account updated", message_html=message_html)
+    try:
+        _send_email(to_email=to_email, from_display_name="LandCheck Estates", subject="Security alert - your LandCheck Estates payout account changed", body_text=_account_plain_text("Payout account updated", message_html), body_html=body_html)
+        return True
+    except Exception:
+        logger.exception("Estate payout-account-changed email failed (org=%s)", organization.id)
+        return False
+
+
 def send_payment_failed_email(*, organization, subscription) -> bool:
     to_email = _subscription_org_email(organization)
     if not to_email:

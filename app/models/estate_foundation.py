@@ -432,6 +432,11 @@ class EstateAllocationChargeAttempt(Base):
     currency = Column(String(3), nullable=False, default="NGN")
     payment_provider = Column(String(32), nullable=False)
     tx_ref = Column(String(64), nullable=False, unique=True)
+    # Client-supplied, same convention as EstatePayment.idempotency_key - a double-click or a
+    # retried request reuses the same key instead of opening a second gateway checkout. Enforced
+    # by a partial unique index (organization_id, idempotency_key) WHERE NOT NULL, see the
+    # 20261019_0062 migration.
+    idempotency_key = Column(String(128), nullable=True)
     provider_transaction_id = Column(String(64), nullable=True)
     status = Column(String(16), nullable=False, default="pending")
     provider_payload = Column(JSON, nullable=True)

@@ -5239,13 +5239,17 @@ def _resolve_buyer_portal_row(token: str, db: Session) -> EstateCustomerPortalTo
 
 
 @router.post("/buyer/{token}/allocations/{allocation_id}/pay")
-def buyer_initiate_payment(token: str, allocation_id: int, payload: BuyerAllocationPaymentCreate, request: Request, db: Session = Depends(get_db)):
+def buyer_initiate_payment(token: str, allocation_id: int, payload: BuyerAllocationPaymentCreate, request: Request, idempotency_header: str | None = Header(default=None, alias="X-Idempotency-Key"), db: Session = Depends(get_db)):
     """Opens a hosted Paystack/Flutterwave checkout for the buyer to pay their outstanding
     balance online, instead of the staff-mediated bank-transfer flow. See
     app/services/estates/allocation_charges.py for the full initiate->verify->complete pattern,
-    mirrored from app/routers/estate_billing.py's own subscription-payment checkout."""
+    mirrored from app/routers/estate_billing.py's own subscription-payment checkout. The
+    X-Idempotency-Key header (same convention as /allocations/{id}/payments) is the double-click/
+    retry guard - the frontend sends the same key for a given pay-click, so a double submission
+    reuses the same gateway checkout instead of opening a second one."""
     if marketing_common.throttled(marketing_common.client_ip(request), "buyer-pay-initiate", limit=10, window_seconds=60):
         raise HTTPException(429, "Too many payment attempts. Please try again shortly.")
+    idempotency_key = _normalize_idempotency_key(idempotency_header)
     row = _resolve_buyer_portal_row(token, db)
     allocation = db.get(EstateAllocation, allocation_id)
     if not allocation or allocation.customer_id != row.customer_id or allocation.organization_id != row.organization_id:
@@ -5264,6 +5268,7 @@ def buyer_initiate_payment(token: str, allocation_id: int, payload: BuyerAllocat
             organization_name=organization.name,
             return_url=f"{str(os.getenv('LANDCHECK_API_PUBLIC_URL') or 'https://api.landcheck.online').rstrip('/')}/estates/buyer/payments/return",
             portal_token=token,
+            idempotency_key=idempotency_key,
         )
     except ValueError as exc:
         raise HTTPException(409, str(exc))

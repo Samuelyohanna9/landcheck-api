@@ -140,6 +140,26 @@ def require_estate_access(
     return access
 
 
+def require_estate_owner(
+    db: Session,
+    request: Request,
+    organization_id: int,
+    *,
+    require_subscription: bool = True,
+) -> EstateAccess:
+    """A strictly stronger gate than any permission string: no custom staff role, however many
+    checklist items it's been granted, can ever satisfy this - only a member row with
+    role_key == "owner" can. Reserved for actions where the blast radius isn't "mismanaged
+    billing" but "redirect someone else's money" - today just the buyer-payment payout account
+    (app/routers/estate_payout_accounts.py), where any billing.manage-permissioned staff member
+    being able to change the settlement bank account would be a theft/fraud vector, not merely a
+    permissions nicety."""
+    access = require_estate_access(db, request, organization_id, permission=None, require_subscription=require_subscription)
+    if access.role_key != "owner":
+        raise HTTPException(status_code=403, detail="Only an organization owner can do this")
+    return access
+
+
 def require_estate_view_access(
     db: Session,
     request: Request,

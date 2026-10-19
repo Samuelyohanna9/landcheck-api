@@ -12,7 +12,9 @@ import uuid
 from datetime import datetime, timezone
 from decimal import Decimal
 
+from fastapi import HTTPException
 from sqlalchemy import or_
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.models.estate_foundation import (
@@ -51,10 +53,38 @@ def initiate_allocation_payment(
     organization_name: str,
     return_url: str,
     portal_token: str,
+    idempotency_key: str | None = None,
 ) -> dict:
     """Validates the requested amount against the outstanding balance, then opens a hosted
     Paystack/Flutterwave checkout. `portal_token` is stashed on the ledger row's provider_payload
-    so the return/webhook handlers can send the buyer back to their own portal."""
+    so the return/webhook handlers can send the buyer back to their own portal.
+
+    `idempotency_key` is the double-click/retry guard: a network retry or an accidental second
+    click resubmits the same key, so this returns the SAME checkout link instead of opening a
+    second gateway transaction. Enforced at the DB level by a partial unique index on
+    (organization_id, idempotency_key) - the IntegrityError handling below is what makes this
+    safe even if two requests with the same key race each other concurrently, not just
+    sequentially."""
+    if idempotency_key:
+        existing = (
+            db.query(EstateAllocationChargeAttempt)
+            .filter(EstateAllocationChargeAttempt.organization_id == allocation.organization_id, EstateAllocationChargeAttempt.idempotency_key == idempotency_key)
+            .one_or_none()
+        )
+        if existing:
+            if existing.allocation_id != allocation.id:
+                raise ValueError("This idempotency key was already used for a different payment")
+            payload = existing.provider_payload if isinstance(existing.provider_payload, dict) else {}
+            checkout_url = payload.get("checkout_url")
+            if existing.status == "pending" and checkout_url:
+                return {"checkout_url": checkout_url, "tx_ref": existing.tx_ref}
+            if existing.status == "success":
+                raise ValueError("This payment has already been completed")
+            # A prior attempt with this same key failed outright (e.g. the gateway call itself
+            # errored before a checkout_url existed) - fall through and let a fresh attempt be
+            # created under a new key request from the client, rather than ever reusing a
+            # charge_attempts row whose outcome is already decided.
+            raise ValueError("This payment attempt already failed. Please try again.")
     if allocation.status not in {"reserved", "allocated"}:
         raise ValueError("This plot is not in an active allocation")
     payout_account = get_payout_account(db, allocation.organization_id)
@@ -100,9 +130,27 @@ def initiate_allocation_payment(
         payment_provider=provider,
         tx_ref=tx_ref,
         status="pending",
+        idempotency_key=idempotency_key,
     )
     db.add(attempt)
-    db.flush()
+    try:
+        db.flush()
+    except IntegrityError:
+        # Two requests carrying the same idempotency_key raced each other - the other one won
+        # the unique index. Roll back this half-created attempt and hand back whatever the
+        # winner produced, rather than erroring out or creating a second gateway transaction.
+        db.rollback()
+        if not idempotency_key:
+            raise
+        winner = (
+            db.query(EstateAllocationChargeAttempt)
+            .filter(EstateAllocationChargeAttempt.organization_id == allocation.organization_id, EstateAllocationChargeAttempt.idempotency_key == idempotency_key)
+            .one_or_none()
+        )
+        winner_payload = winner.provider_payload if winner and isinstance(winner.provider_payload, dict) else {}
+        if winner and winner_payload.get("checkout_url"):
+            return {"checkout_url": winner_payload["checkout_url"], "tx_ref": winner.tx_ref}
+        raise ValueError("This payment is already being processed. Please wait a moment and refresh.")
     try:
         checkout_url = module_for(provider).initiate_checkout(
             tx_ref=tx_ref,
@@ -221,17 +269,28 @@ def complete_allocation_payment(db: Session, verify_data: dict, tx_ref: str | No
         return {"ok": False, "message": "Payment was not successful."}
 
     organization = db.get(EstateOrganization, attempt.organization_id)
-    payment = record_payment(
-        db,
-        allocation=allocation,
-        amount=Decimal(str(attempt.amount)),
-        payment_date=datetime.now(timezone.utc),
-        method=f"online_{attempt.payment_provider}",
-        reference=attempt.tx_ref,
-        notes="Paid online by the buyer through the Buyer Portal.",
-        actor=_ONLINE_PAYMENT_ACTOR,
-        confirmation_required=False,
-    )
+    try:
+        payment = record_payment(
+            db,
+            allocation=allocation,
+            amount=Decimal(str(attempt.amount)),
+            payment_date=datetime.now(timezone.utc),
+            method=f"online_{attempt.payment_provider}",
+            reference=attempt.tx_ref,
+            notes="Paid online by the buyer through the Buyer Portal.",
+            actor=_ONLINE_PAYMENT_ACTOR,
+            confirmation_required=False,
+        )
+    except HTTPException as exc:
+        # The gateway genuinely captured this money (status was "successful" above), but it
+        # can't be applied as a plot payment - e.g. a second, separately-initiated attempt
+        # pushed the total past the agreed price. This needs a human, not a silent failure or
+        # an unhandled 500/409 that would make a webhook-sending gateway retry indefinitely.
+        attempt.status = "failed"
+        attempt.failure_reason = f"Captured by the gateway but could not be applied: {exc.detail}. Needs manual review - the buyer may be owed a refund."
+        logger.error("Online allocation payment captured but could not be applied (attempt=%s, allocation=%s): %s", attempt.id, allocation.id, exc.detail)
+        db.commit()
+        return {"ok": False, "needs_review": True, "message": str(exc.detail)}
     confirm_payment(db, payment=payment, actor=_ONLINE_PAYMENT_ACTOR)
     advance_payment_schedule_after_payment(db, allocation=allocation, amount=payment.amount)
     attempt.status = "success"
