@@ -368,6 +368,11 @@ class PortalTokenCreate(BaseModel):
 class BuyerAllocationPaymentCreate(BaseModel):
     amount: Decimal | None = Field(default=None, gt=0)
 
+
+class PaymentReminderSend(BaseModel):
+    channel: str = Field(pattern="^(sms|whatsapp|email)$")
+    method: str = Field(pattern="^(online_link|bank_details)$")
+
 class VoidAction(BaseModel):
     reason: str = Field(min_length=1)
 

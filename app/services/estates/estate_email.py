@@ -1067,3 +1067,58 @@ def send_customer_portal_link(
     except Exception:
         logger.exception("Estate buyer portal email failed (to=%s)", to_email)
         return False
+
+
+def send_payment_reminder_email(
+    *,
+    to_email: str | None,
+    customer_name: str,
+    org_name: str,
+    estate_name: str,
+    plot_number: str,
+    outstanding,
+    due_at,
+    method: str,
+    portal_url: str | None = None,
+    payout_account=None,
+) -> bool:
+    """A staff-triggered reminder from the Due Payments board - distinct from the automatic
+    reminder job's notify_customer(event="payment_reminder"), since this one needs to carry
+    either a pay-now link or bank-transfer details, which that fixed-template function has no
+    parameters for."""
+    to_email = str(to_email or "").strip()
+    if not to_email:
+        return False
+    first_name = html.escape((customer_name or "there").split(" ")[0])
+    due_str = due_at.strftime("%d %B %Y") if due_at else "soon"
+    message_html = (
+        f"<p>Hello {first_name},</p>"
+        f"<p>This is a reminder that your next payment of <strong>{html.escape(format_naira(outstanding))}</strong> "
+        f"for Plot {html.escape(plot_number)} at {html.escape(estate_name)} is due on <strong>{html.escape(due_str)}</strong>.</p>"
+    )
+    plot_link_html = ""
+    bank_html = ""
+    if method == "online_link" and portal_url:
+        plot_link_html = _plot_link_html(portal_url, label="Pay online now")
+    elif method == "bank_details" and payout_account is not None:
+        bank_html = f"""
+        <div style="margin:22px 0 0;padding:16px 18px;background:{_ESTATE_SURFACE_TINT};border:1px solid {_ESTATE_LINE};border-radius:4px;">
+          <p style="margin:0 0 8px;color:{_ESTATE_SLATE};font-size:13px;">Pay by bank transfer to:</p>
+          <p style="margin:0;color:{_ESTATE_INK};font-weight:700;">{html.escape(payout_account.bank_name or "")}</p>
+          <p style="margin:0;color:{_ESTATE_INK};">{html.escape(payout_account.account_name or "")} - {html.escape(payout_account.account_number or "")}</p>
+        </div>
+        """
+    subject = f"Payment reminder - {org_name}"
+    body_html = _wrap_html(org_name=org_name, heading="Payment reminder", message_html=message_html + bank_html, financial_html="", plot_link_html=plot_link_html)
+    try:
+        _send_email(
+            to_email=to_email,
+            from_display_name=f"{org_name} (via LandCheck Estates)",
+            subject=subject,
+            body_text=_plain_text("Payment reminder", message_html, None, portal_link=portal_url if method == "online_link" else None),
+            body_html=body_html,
+        )
+        return True
+    except Exception:
+        logger.exception("Estate payment reminder email failed (to=%s)", to_email)
+        return False

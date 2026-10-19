@@ -36,7 +36,7 @@ from app.services.estates.identity import generate_temp_password, hash_password,
 from app.services.estates.entitlements import ESTATE_FEATURES, get_estate_entitlement
 from app.models.estate_foundation import Estate, EstateAgentPortalToken, EstateAllocation, EstateAllocationChargeAttempt, EstateAuditEvent, EstateBlock, EstateCommissionPayout, EstateCommissionTier, EstateCustomer, EstateCustomerPortalToken, EstateDocument, EstateDocumentLink, EstateFieldInspection, EstateHazardAssessment, EstateImportReview, EstateLayoutProposal, EstateNotificationLog, EstateOrganization, EstateOrganizationMember, EstatePayment, EstatePaymentInbox, EstatePaymentRule, EstatePlot, EstatePublicReservationRequest, EstateQrCampaign, EstateSoilAssessment, EstateSpatialFeature, EstateStaffRole, EstateSurveyRequest, EstateStakingTask, GeotechSurveyRequest
 from app.models.estate_marketing import EstateApprovalMilestone, EstateLiveInspectionSession, EstateProgressUpdate
-from app.schemas.estates import AllocationAction, BlockCreate, BlockUpdate, BuyerAllocationPaymentCreate, CommissionPayoutCreate, CommissionTiersUpdate, CustomerCreate, DevelopmentForecastPublishUpdate, DevelopmentStatusUpdate, EstateCreate, EstateLayoutCriteria, EstateLayoutDecision, EstateLayoutFeatureAdd, EstateLayoutFeatureRemove, EstateLayoutProposalEdit, EstateSubdivisionCreate, EstateUpdate, FieldInspectionCreate, GeoreferenceSessionLink, ImportFromGeoreference, ImportReviewCreate, ImportReviewDecision, ImportReviewFromGeoreferenceSession, MemberCreate, MemberUpdate, PaymentInboxCreate, PaymentInboxMatch, PlotCreate, PlotAddressUpdate, PlotGeometryUpdate, PlotListingDefaultsUpdate, PlotPriceUpdate, PortalTokenCreate, BulkCustomerSmsCreate, PublicEstateSettingsUpdate, PublicReservationConvert, PublicReservationCreate, PublicReservationUpdate, PaymentCreate, QrCampaignCreate, SpatialFeatureCreate, SpatialFeatureUpdate, StaffCreate, StaffRoleCreate, StaffRoleUpdate, StaffUpdate, SurveyEligibilityUpdate, TitleVerificationUpdate, VoidAction
+from app.schemas.estates import AllocationAction, BlockCreate, BlockUpdate, BuyerAllocationPaymentCreate, PaymentReminderSend, CommissionPayoutCreate, CommissionTiersUpdate, CustomerCreate, DevelopmentForecastPublishUpdate, DevelopmentStatusUpdate, EstateCreate, EstateLayoutCriteria, EstateLayoutDecision, EstateLayoutFeatureAdd, EstateLayoutFeatureRemove, EstateLayoutProposalEdit, EstateSubdivisionCreate, EstateUpdate, FieldInspectionCreate, GeoreferenceSessionLink, ImportFromGeoreference, ImportReviewCreate, ImportReviewDecision, ImportReviewFromGeoreferenceSession, MemberCreate, MemberUpdate, PaymentInboxCreate, PaymentInboxMatch, PlotCreate, PlotAddressUpdate, PlotGeometryUpdate, PlotListingDefaultsUpdate, PlotPriceUpdate, PortalTokenCreate, BulkCustomerSmsCreate, PublicEstateSettingsUpdate, PublicReservationConvert, PublicReservationCreate, PublicReservationUpdate, PaymentCreate, QrCampaignCreate, SpatialFeatureCreate, SpatialFeatureUpdate, StaffCreate, StaffRoleCreate, StaffRoleUpdate, StaffUpdate, SurveyEligibilityUpdate, TitleVerificationUpdate, VoidAction
 from app.services.estates.payments import confirm_payment, financial_summary, record_payment, void_payment
 from app.services.estates.documents import MAX_ESTATE_DOCUMENT_BYTES, read_private_estate_file, store_private_estate_file
 from app.utils.r2_objects import delete_object_best_effort, build_r2_settings
@@ -65,6 +65,7 @@ from app.services.estates.report_export import render_customer_statement_pdf, re
 from app.services.estates import commissions
 from app.services.estates.operations import DOCUMENT_REQUIREMENTS, ESTATE_DOCUMENT_TYPES, ESTATE_DOCUMENT_TYPE_CODES, PUBLIC_DOCUMENT_TYPES, advance_payment_schedule_after_payment, build_operations_summary, buyer_portal_payload, customer_portal_url, document_readiness, hash_portal_token, issue_agent_portal_token, issue_customer_portal_link, issue_customer_portal_token, linked_documents, record_notification_log
 from app.services.estates import allocation_charges
+from app.services.estates import payment_reminders
 from app.utils import estate_flutterwave as flw
 from app.utils import estate_paystack as pst
 from app.utils.auth_security import require_signed_flutterwave_webhooks
@@ -5018,6 +5019,66 @@ def accounting_aged_debtors(request: Request, db: Session = Depends(get_db)):
         })
     rows.sort(key=lambda row: row["days_outstanding"], reverse=True)
     return {"rows": rows, "bucket_totals": {key: str(value) for key, value in bucket_totals.items()}, "bucket_labels": _AGED_DEBTOR_BUCKET_LABELS}
+
+
+_DUE_PAYMENT_BUCKET_LABELS = {"overdue": "Overdue", "due_soon": "Due soon (7 days)", "upcoming": "Upcoming"}
+
+
+@router.get("/accounting/due-payments")
+def accounting_due_payments(request: Request, db: Session = Depends(get_db)):
+    """The live installment board - every allocation with a scheduled next payment, bucketed by
+    how soon it's due. Distinct from aged-debtors, which buckets by how long since the LAST
+    payment; this one looks forward to the NEXT one."""
+    principal = resolve_estate_principal(db, request)
+    allowed = {a.organization_id for a in list_estate_access(db, principal) if has_permission(a.role_key, "payment.read")}
+    allocations = db.query(EstateAllocation).filter(EstateAllocation.organization_id.in_(allowed), EstateAllocation.status.in_(("reserved", "allocated")), EstateAllocation.next_payment_due_at.isnot(None)).all()
+    summaries = _bulk_financial_summaries(db, allocations)
+    now = datetime.now(timezone.utc)
+    due_soon_cutoff = now + timedelta(days=7)
+    rows = []
+    for allocation in allocations:
+        summary = summaries.get(allocation.id)
+        if not summary or summary["outstanding"] <= 0:
+            continue
+        due_at = allocation.next_payment_due_at
+        if due_at is not None and due_at.tzinfo is None:
+            due_at = due_at.replace(tzinfo=timezone.utc)
+        bucket = "overdue" if due_at < now else "due_soon" if due_at <= due_soon_cutoff else "upcoming"
+        customer = db.get(EstateCustomer, allocation.customer_id)
+        estate = db.get(Estate, allocation.estate_id)
+        plot = db.get(EstatePlot, allocation.plot_id)
+        reminder_sent = allocation.payment_reminder_sent_for_due_at is not None and allocation.payment_reminder_sent_for_due_at == allocation.next_payment_due_at
+        rows.append({
+            "allocation_id": allocation.id,
+            "customer_name": customer.full_name if customer else "-",
+            "customer_phone": customer.phone if customer else None,
+            "customer_email": customer.email if customer else None,
+            "estate_name": estate.name if estate else "-",
+            "plot_number": plot.plot_number if plot else "-",
+            "outstanding": str(summary["outstanding"]),
+            "due_at": due_at,
+            "bucket": bucket,
+            "bucket_label": _DUE_PAYMENT_BUCKET_LABELS[bucket],
+            "reminder_sent": reminder_sent,
+        })
+    rows.sort(key=lambda row: row["due_at"])
+    return {"rows": rows, "bucket_labels": _DUE_PAYMENT_BUCKET_LABELS}
+
+
+@router.post("/accounting/due-payments/{allocation_id}/remind")
+def send_due_payment_reminder(allocation_id: int, payload: PaymentReminderSend, request: Request, db: Session = Depends(get_db)):
+    allocation = db.get(EstateAllocation, allocation_id)
+    if not allocation:
+        raise HTTPException(404, "Allocation not found")
+    access = require_estate_access(db, request, allocation.organization_id, permission="payment.manage")
+    try:
+        result = payment_reminders.send_reminder(db, allocation=allocation, channel=payload.channel, method=payload.method, actor=access.principal)
+        db.commit()
+    except ValueError as exc:
+        db.rollback()
+        raise HTTPException(422, str(exc))
+    return result
+
 
 @router.post("/payment-inbox", status_code=201)
 def create_payment_inbox(payload: PaymentInboxCreate, request: Request, db: Session = Depends(get_db)):
