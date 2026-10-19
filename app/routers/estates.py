@@ -15,7 +15,7 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from types import SimpleNamespace
 from fastapi import APIRouter, Body, Depends, File, Form, Header, HTTPException, Request, UploadFile
-from fastapi.responses import Response
+from fastapi.responses import RedirectResponse, Response
 from reportlab.graphics import renderPDF
 from reportlab.graphics.barcode import qr
 from reportlab.graphics.shapes import Drawing
@@ -34,9 +34,9 @@ from app.routers.plots import _metric_epsg_for_wgs84_polygon, _subdivide_polygon
 from app.services.estates.authorization import list_estate_access, resolve_estate_principal
 from app.services.estates.identity import generate_temp_password, hash_password, normalize_email, slugify
 from app.services.estates.entitlements import ESTATE_FEATURES, get_estate_entitlement
-from app.models.estate_foundation import Estate, EstateAgentPortalToken, EstateAllocation, EstateAuditEvent, EstateBlock, EstateCommissionPayout, EstateCommissionTier, EstateCustomer, EstateCustomerPortalToken, EstateDocument, EstateDocumentLink, EstateFieldInspection, EstateHazardAssessment, EstateImportReview, EstateLayoutProposal, EstateNotificationLog, EstateOrganization, EstateOrganizationMember, EstatePayment, EstatePaymentInbox, EstatePaymentRule, EstatePlot, EstatePublicReservationRequest, EstateQrCampaign, EstateSoilAssessment, EstateSpatialFeature, EstateStaffRole, EstateSurveyRequest, EstateStakingTask, GeotechSurveyRequest
+from app.models.estate_foundation import Estate, EstateAgentPortalToken, EstateAllocation, EstateAllocationChargeAttempt, EstateAuditEvent, EstateBlock, EstateCommissionPayout, EstateCommissionTier, EstateCustomer, EstateCustomerPortalToken, EstateDocument, EstateDocumentLink, EstateFieldInspection, EstateHazardAssessment, EstateImportReview, EstateLayoutProposal, EstateNotificationLog, EstateOrganization, EstateOrganizationMember, EstatePayment, EstatePaymentInbox, EstatePaymentRule, EstatePlot, EstatePublicReservationRequest, EstateQrCampaign, EstateSoilAssessment, EstateSpatialFeature, EstateStaffRole, EstateSurveyRequest, EstateStakingTask, GeotechSurveyRequest
 from app.models.estate_marketing import EstateApprovalMilestone, EstateLiveInspectionSession, EstateProgressUpdate
-from app.schemas.estates import AllocationAction, BlockCreate, BlockUpdate, CommissionPayoutCreate, CommissionTiersUpdate, CustomerCreate, DevelopmentForecastPublishUpdate, DevelopmentStatusUpdate, EstateCreate, EstateLayoutCriteria, EstateLayoutDecision, EstateLayoutFeatureAdd, EstateLayoutFeatureRemove, EstateLayoutProposalEdit, EstateSubdivisionCreate, EstateUpdate, FieldInspectionCreate, GeoreferenceSessionLink, ImportFromGeoreference, ImportReviewCreate, ImportReviewDecision, ImportReviewFromGeoreferenceSession, MemberCreate, MemberUpdate, PaymentInboxCreate, PaymentInboxMatch, PlotCreate, PlotAddressUpdate, PlotGeometryUpdate, PlotListingDefaultsUpdate, PlotPriceUpdate, PortalTokenCreate, BulkCustomerSmsCreate, PublicEstateSettingsUpdate, PublicReservationConvert, PublicReservationCreate, PublicReservationUpdate, PaymentCreate, QrCampaignCreate, SpatialFeatureCreate, SpatialFeatureUpdate, StaffCreate, StaffRoleCreate, StaffRoleUpdate, StaffUpdate, SurveyEligibilityUpdate, TitleVerificationUpdate, VoidAction
+from app.schemas.estates import AllocationAction, BlockCreate, BlockUpdate, BuyerAllocationPaymentCreate, CommissionPayoutCreate, CommissionTiersUpdate, CustomerCreate, DevelopmentForecastPublishUpdate, DevelopmentStatusUpdate, EstateCreate, EstateLayoutCriteria, EstateLayoutDecision, EstateLayoutFeatureAdd, EstateLayoutFeatureRemove, EstateLayoutProposalEdit, EstateSubdivisionCreate, EstateUpdate, FieldInspectionCreate, GeoreferenceSessionLink, ImportFromGeoreference, ImportReviewCreate, ImportReviewDecision, ImportReviewFromGeoreferenceSession, MemberCreate, MemberUpdate, PaymentInboxCreate, PaymentInboxMatch, PlotCreate, PlotAddressUpdate, PlotGeometryUpdate, PlotListingDefaultsUpdate, PlotPriceUpdate, PortalTokenCreate, BulkCustomerSmsCreate, PublicEstateSettingsUpdate, PublicReservationConvert, PublicReservationCreate, PublicReservationUpdate, PaymentCreate, QrCampaignCreate, SpatialFeatureCreate, SpatialFeatureUpdate, StaffCreate, StaffRoleCreate, StaffRoleUpdate, StaffUpdate, SurveyEligibilityUpdate, TitleVerificationUpdate, VoidAction
 from app.services.estates.payments import confirm_payment, financial_summary, record_payment, void_payment
 from app.services.estates.documents import MAX_ESTATE_DOCUMENT_BYTES, read_private_estate_file, store_private_estate_file
 from app.utils.r2_objects import delete_object_best_effort, build_r2_settings
@@ -64,6 +64,10 @@ from app.services.estates.layout_export import render_estate_layout_pdf
 from app.services.estates.report_export import render_customer_statement_pdf, render_estate_report_pdf
 from app.services.estates import commissions
 from app.services.estates.operations import DOCUMENT_REQUIREMENTS, ESTATE_DOCUMENT_TYPES, ESTATE_DOCUMENT_TYPE_CODES, PUBLIC_DOCUMENT_TYPES, advance_payment_schedule_after_payment, build_operations_summary, buyer_portal_payload, customer_portal_url, document_readiness, hash_portal_token, issue_agent_portal_token, issue_customer_portal_link, issue_customer_portal_token, linked_documents, record_notification_log
+from app.services.estates import allocation_charges
+from app.utils import estate_flutterwave as flw
+from app.utils import estate_paystack as pst
+from app.utils.auth_security import require_signed_flutterwave_webhooks
 from app.db import SessionLocal
 from app.utils.hazard_jobs import get_hazard_job, insert_hazard_job, make_progress_reporter, serialize_hazard_job, set_hazard_job_status, find_active_hazard_job, touch_hazard_job
 from app.utils.upload_security import read_limited_upload, upload_extension
@@ -5223,6 +5227,127 @@ def buyer_portal(token: str, db: Session = Depends(get_db)):
     payload = buyer_portal_payload(db, row)
     db.commit()
     return {**payload, "expires_at": expires_at}
+
+
+def _resolve_buyer_portal_row(token: str, db: Session) -> EstateCustomerPortalToken:
+    row = db.query(EstateCustomerPortalToken).filter(EstateCustomerPortalToken.token_hash == hash_portal_token(token)).one_or_none()
+    now = datetime.now(timezone.utc)
+    expires_at = row.expires_at if row and row.expires_at.tzinfo else (row.expires_at.replace(tzinfo=timezone.utc) if row else None)
+    if not row or row.revoked_at is not None or not expires_at or expires_at <= now:
+        raise HTTPException(404, "This buyer portal link is invalid or expired")
+    return row
+
+
+@router.post("/buyer/{token}/allocations/{allocation_id}/pay")
+def buyer_initiate_payment(token: str, allocation_id: int, payload: BuyerAllocationPaymentCreate, request: Request, db: Session = Depends(get_db)):
+    """Opens a hosted Paystack/Flutterwave checkout for the buyer to pay their outstanding
+    balance online, instead of the staff-mediated bank-transfer flow. See
+    app/services/estates/allocation_charges.py for the full initiate->verify->complete pattern,
+    mirrored from app/routers/estate_billing.py's own subscription-payment checkout."""
+    if marketing_common.throttled(marketing_common.client_ip(request), "buyer-pay-initiate", limit=10, window_seconds=60):
+        raise HTTPException(429, "Too many payment attempts. Please try again shortly.")
+    row = _resolve_buyer_portal_row(token, db)
+    allocation = db.get(EstateAllocation, allocation_id)
+    if not allocation or allocation.customer_id != row.customer_id or allocation.organization_id != row.organization_id:
+        raise HTTPException(404, "Allocation not found")
+    customer = db.get(EstateCustomer, allocation.customer_id)
+    organization = db.get(EstateOrganization, allocation.organization_id)
+    if not customer or not organization or not customer.email:
+        raise HTTPException(422, "This customer has no email on file for an online payment receipt")
+    try:
+        result = allocation_charges.initiate_allocation_payment(
+            db,
+            allocation=allocation,
+            amount=payload.amount,
+            customer_email=customer.email,
+            customer_name=customer.full_name,
+            organization_name=organization.name,
+            return_url=f"{str(os.getenv('LANDCHECK_API_PUBLIC_URL') or 'https://api.landcheck.online').rstrip('/')}/estates/buyer/payments/return",
+            portal_token=token,
+        )
+    except ValueError as exc:
+        raise HTTPException(409, str(exc))
+    return result
+
+
+@router.get("/buyer/payments/return")
+def buyer_payment_return(transaction_id: str | None = None, tx_ref: str | None = None, reference: str | None = None, trxref: str | None = None, status: str | None = None, db: Session = Depends(get_db)):
+    """Re-verifies the provider transaction server-side, then redirects the buyer back to their
+    own Buyer Portal page. See estate_billing.py's checkout_return for why both gateways' redirect
+    query params are accepted as aliases."""
+    tx_ref = tx_ref or reference or trxref
+    web_url = str(os.getenv("LANDCHECK_WEB_URL") or "https://landcheck.online").rstrip("/")
+    portal_token = None
+    attempt = db.query(EstateAllocationChargeAttempt).filter(EstateAllocationChargeAttempt.tx_ref == tx_ref).one_or_none() if tx_ref else None
+    if attempt and isinstance(attempt.provider_payload, dict):
+        portal_token = attempt.provider_payload.get("portal_token")
+    back_to = f"{web_url}/estates/buyer/{portal_token}" if portal_token else f"{web_url}/estates/buyer"
+    if str(status or "").lower() == "cancelled":
+        if attempt and attempt.status == "pending":
+            attempt.status = "failed"
+            attempt.failure_reason = "Checkout cancelled by customer."
+            db.commit()
+        return RedirectResponse(f"{back_to}?payment_result=failed", status_code=302)
+    outcome = "failed"
+    if transaction_id or tx_ref:
+        try:
+            provider = attempt.payment_provider if attempt else "flutterwave"
+            gateway = flw if provider == "flutterwave" else pst
+            verify_data = gateway.verify_transaction(transaction_id) if transaction_id else gateway.verify_transaction_by_reference(tx_ref)
+            result = allocation_charges.complete_allocation_payment(db, verify_data, tx_ref)
+            outcome = "success" if result.get("ok") else ("pending" if result.get("pending") else "failed")
+        except Exception:
+            logger.exception("Buyer payment return verification failed (tx_ref=%s)", tx_ref)
+    return RedirectResponse(f"{back_to}?payment_result={outcome}", status_code=302)
+
+
+@router.post("/buyer/payments/webhook")
+async def buyer_payment_webhook(request: Request, db: Session = Depends(get_db)):
+    """Flutterwave's webhook for buyer plot payments - deliberately its own route, not shared
+    with estate_billing.py's subscription webhook, matching that file's own convention of one
+    webhook pair per payment domain."""
+    raw_body = await request.body()
+    signature = request.headers.get("verif-hash") or request.headers.get("flutterwave-signature")
+    secret_hash_configured = bool(os.getenv("FLW_SECRET_HASH") or os.getenv("FLUTTERWAVE_SECRET_HASH"))
+    if require_signed_flutterwave_webhooks() and not secret_hash_configured:
+        raise HTTPException(503, "Flutterwave webhook signing is not configured")
+    if secret_hash_configured and not flw.verify_webhook_signature(raw_body, signature):
+        raise HTTPException(401, "Invalid webhook signature")
+    payload = await request.json()
+    data = dict(payload.get("data") or {})
+    transaction_id = str(data.get("id") or "")
+    tx_ref = str(data.get("tx_ref") or "")
+    if not transaction_id and not tx_ref:
+        return {"ok": True, "ignored": True}
+    try:
+        verify_data = flw.verify_transaction(transaction_id) if transaction_id else flw.verify_transaction_by_reference(tx_ref)
+        result = allocation_charges.complete_allocation_payment(db, verify_data, tx_ref)
+    except Exception:
+        logger.exception("Buyer payment webhook verification failed (tx_ref=%s)", tx_ref)
+        return {"ok": False}
+    return result
+
+
+@router.post("/buyer/payments/webhook/paystack")
+async def buyer_payment_webhook_paystack(request: Request, db: Session = Depends(get_db)):
+    raw_body = await request.body()
+    signature = request.headers.get("x-paystack-signature")
+    if pst.configured() and not pst.verify_webhook_signature(raw_body, signature):
+        raise HTTPException(401, "Invalid webhook signature")
+    payload = await request.json()
+    if str(payload.get("event") or "") not in {"charge.success", "charge.failed"}:
+        return {"ok": True, "ignored": True}
+    data = dict(payload.get("data") or {})
+    tx_ref = str(data.get("reference") or "")
+    if not tx_ref:
+        return {"ok": True, "ignored": True}
+    try:
+        verify_data = pst.verify_transaction_by_reference(tx_ref)
+        result = allocation_charges.complete_allocation_payment(db, verify_data, tx_ref)
+    except Exception:
+        logger.exception("Buyer payment Paystack webhook verification failed (tx_ref=%s)", tx_ref)
+        return {"ok": False}
+    return result
 
 
 @router.get("/buyer/{token}/packet/{allocation_id}.pdf")

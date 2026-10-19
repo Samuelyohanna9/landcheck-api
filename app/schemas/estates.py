@@ -364,6 +364,10 @@ class QrCampaignCreate(BaseModel):
 class PortalTokenCreate(BaseModel):
     expires_in_days: int = Field(default=90, ge=1, le=365)
 
+
+class BuyerAllocationPaymentCreate(BaseModel):
+    amount: Decimal | None = Field(default=None, gt=0)
+
 class VoidAction(BaseModel):
     reason: str = Field(min_length=1)
 

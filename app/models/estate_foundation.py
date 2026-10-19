@@ -395,6 +395,30 @@ class EstatePayment(Base):
     created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
 
 
+class EstateAllocationChargeAttempt(Base):
+    """An allocation-scoped Paystack/Flutterwave ledger row for a buyer paying for their plot
+    online through the Buyer Portal - the online-payment counterpart to EstatePayment's manual
+    bank-transfer flow. Deliberately separate from EstateSubscriptionCharge, which is FK'd to a
+    subscription/organization, not an allocation; this one's grain matches EstatePayment's."""
+
+    __tablename__ = "estate_allocation_charge_attempts"
+    id = Column(Integer, primary_key=True)
+    organization_id = Column(Integer, ForeignKey("estate_organizations.id", ondelete="CASCADE"), nullable=False)
+    allocation_id = Column(Integer, ForeignKey("estate_allocations.id", ondelete="CASCADE"), nullable=False)
+    customer_id = Column(Integer, ForeignKey("estate_customers.id", ondelete="CASCADE"), nullable=False)
+    amount = Column(Numeric(16, 2), nullable=False)
+    currency = Column(String(3), nullable=False, default="NGN")
+    payment_provider = Column(String(32), nullable=False)
+    tx_ref = Column(String(64), nullable=False, unique=True)
+    provider_transaction_id = Column(String(64), nullable=True)
+    status = Column(String(16), nullable=False, default="pending")
+    provider_payload = Column(JSON, nullable=True)
+    resulting_payment_id = Column(Integer, ForeignKey("estate_payments.id", ondelete="SET NULL"), nullable=True)
+    failure_reason = Column(Text, nullable=True)
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    completed_at = Column(DateTime(timezone=True), nullable=True)
+
+
 class EstateNotificationLog(Base):
     """Delivery audit for customer-facing Estate email notifications."""
 
