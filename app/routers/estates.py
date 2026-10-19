@@ -5021,17 +5021,21 @@ def accounting_aged_debtors(request: Request, db: Session = Depends(get_db)):
     return {"rows": rows, "bucket_totals": {key: str(value) for key, value in bucket_totals.items()}, "bucket_labels": _AGED_DEBTOR_BUCKET_LABELS}
 
 
-_DUE_PAYMENT_BUCKET_LABELS = {"overdue": "Overdue", "due_soon": "Due soon (7 days)", "upcoming": "Upcoming"}
+_DUE_PAYMENT_BUCKET_LABELS = {"overdue": "Overdue", "due_soon": "Due soon (7 days)", "upcoming": "Upcoming", "no_schedule": "No schedule set"}
 
 
 @router.get("/accounting/due-payments")
 def accounting_due_payments(request: Request, db: Session = Depends(get_db)):
-    """The live installment board - every allocation with a scheduled next payment, bucketed by
-    how soon it's due. Distinct from aged-debtors, which buckets by how long since the LAST
-    payment; this one looks forward to the NEXT one."""
+    """The live installment board - every active allocation with an outstanding balance, bucketed
+    by how soon its next payment is due. Allocations with no formal instalment schedule
+    (next_payment_due_at never set - common when staff just records ad-hoc payments) still show
+    up, in a separate "No schedule set" bucket, rather than being silently excluded - the point is
+    to surface everyone who still owes money, not just the ones on a tracked plan. Distinct from
+    aged-debtors, which buckets by how long since the LAST payment; this one looks forward to the
+    NEXT one where there is one."""
     principal = resolve_estate_principal(db, request)
     allowed = {a.organization_id for a in list_estate_access(db, principal) if has_permission(a.role_key, "payment.read")}
-    allocations = db.query(EstateAllocation).filter(EstateAllocation.organization_id.in_(allowed), EstateAllocation.status.in_(("reserved", "allocated")), EstateAllocation.next_payment_due_at.isnot(None)).all()
+    allocations = db.query(EstateAllocation).filter(EstateAllocation.organization_id.in_(allowed), EstateAllocation.status.in_(("reserved", "allocated"))).all()
     summaries = _bulk_financial_summaries(db, allocations)
     now = datetime.now(timezone.utc)
     due_soon_cutoff = now + timedelta(days=7)
@@ -5043,7 +5047,10 @@ def accounting_due_payments(request: Request, db: Session = Depends(get_db)):
         due_at = allocation.next_payment_due_at
         if due_at is not None and due_at.tzinfo is None:
             due_at = due_at.replace(tzinfo=timezone.utc)
-        bucket = "overdue" if due_at < now else "due_soon" if due_at <= due_soon_cutoff else "upcoming"
+        if due_at is None:
+            bucket = "no_schedule"
+        else:
+            bucket = "overdue" if due_at < now else "due_soon" if due_at <= due_soon_cutoff else "upcoming"
         customer = db.get(EstateCustomer, allocation.customer_id)
         estate = db.get(Estate, allocation.estate_id)
         plot = db.get(EstatePlot, allocation.plot_id)
@@ -5061,7 +5068,7 @@ def accounting_due_payments(request: Request, db: Session = Depends(get_db)):
             "bucket_label": _DUE_PAYMENT_BUCKET_LABELS[bucket],
             "reminder_sent": reminder_sent,
         })
-    rows.sort(key=lambda row: row["due_at"])
+    rows.sort(key=lambda row: (row["due_at"] is None, row["due_at"] or datetime.max.replace(tzinfo=timezone.utc)))
     return {"rows": rows, "bucket_labels": _DUE_PAYMENT_BUCKET_LABELS}
 
 
