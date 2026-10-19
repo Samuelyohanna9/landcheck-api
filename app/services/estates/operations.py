@@ -26,6 +26,7 @@ from app.models.estate_foundation import (
     EstatePayment,
     EstatePaymentInbox,
     EstateOrganization,
+    EstateOrganizationPayoutAccount,
     EstatePlot,
     EstateStakingTask,
     EstateSurveyRequest,
@@ -525,6 +526,12 @@ def buyer_portal_payload(db: Session, token_row: EstateCustomerPortalToken) -> d
     customer = db.get(EstateCustomer, token_row.customer_id)
     if not customer:
         return {"customer": None, "allocations": []}
+    online_payments_enabled = (
+        db.query(EstateOrganizationPayoutAccount)
+        .filter(EstateOrganizationPayoutAccount.organization_id == customer.organization_id)
+        .first()
+        is not None
+    )
     allocations = db.query(EstateAllocation).filter(
         EstateAllocation.customer_id == customer.id,
         EstateAllocation.organization_id == customer.organization_id,
@@ -546,6 +553,7 @@ def buyer_portal_payload(db: Session, token_row: EstateCustomerPortalToken) -> d
             "payment_plan": allocation.payment_plan,
             "next_payment_due_at": allocation.next_payment_due_at,
             "reservation_expires_at": allocation.reservation_expires_at,
+            "online_payments_enabled": online_payments_enabled,
             "survey_status": survey.status if survey else "not_started",
             "document_readiness": document_readiness(db, allocation),
             "documents": [{"id": doc.id, "filename": doc.original_filename, "type": doc.document_type} for doc in docs if doc.document_type in PUBLIC_DOCUMENT_TYPES],

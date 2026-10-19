@@ -119,12 +119,15 @@ def initiate_checkout(
     meta: dict[str, Any] | None = None,
     payment_options: str | None = None,
     bank_transfer_expiry: int | None = None,
+    subaccount_code: str | None = None,
 ) -> str:
     """Creates a hosted-checkout transaction and returns the link the customer is redirected
     to. `title`/`description`/`bank_transfer_expiry` are Flutterwave-only concepts with no
     Paystack equivalent - accepted for interface compatibility with estate_flutterwave.py,
     silently unused here. `payment_options` ("card", "banktransfer", "card,banktransfer")
-    maps to Paystack's `channels` list."""
+    maps to Paystack's `channels` list. `subaccount_code` (see create_subaccount()) routes the
+    settlement split to a buyer-plot-payment payout account instead of the main account - leave
+    unset for subscription billing, which must always settle to the main account."""
     channels: list[str] = []
     options = str(payment_options or "").lower()
     if "card" in options:
@@ -141,11 +144,40 @@ def initiate_checkout(
     }
     if channels:
         payload["channels"] = channels
+    if subaccount_code:
+        payload["subaccount"] = subaccount_code
     response = call_paystack_api("POST", "/transaction/initialize", payload=payload)
     link = str((response.get("data") or {}).get("authorization_url") or "")
     if not link:
         raise HTTPException(status_code=502, detail="Paystack did not return a checkout link.")
     return link
+
+
+def resolve_account_name(bank_code: str, account_number: str) -> dict[str, Any]:
+    """Looks up the account holder's name for a bank code + account number, so a staff member
+    can visually confirm it's the right account before it's saved as a payout destination."""
+    response = call_paystack_api("GET", "/bank/resolve", params={"account_number": str(account_number).strip(), "bank_code": str(bank_code).strip()})
+    data = dict(response.get("data") or {})
+    return {"account_name": str(data.get("account_name") or ""), "account_number": str(data.get("account_number") or account_number)}
+
+
+def create_subaccount(*, business_name: str, bank_code: str, account_number: str) -> dict[str, Any]:
+    """Creates a Paystack subaccount that future initiate_checkout(subaccount_code=...) calls can
+    settle into directly. `percentage_charge=0` is intended to mean 0% retained by the main
+    (LandCheck) account / 100% settled to the subaccount - THIS MUST BE CONFIRMED WITH A REAL
+    TEST-MODE TRANSACTION before this is relied on for a real buyer payment; Paystack's own docs
+    are ambiguous on which party this percentage benefits."""
+    response = call_paystack_api("POST", "/subaccount", payload={
+        "business_name": business_name,
+        "settlement_bank": str(bank_code).strip(),
+        "account_number": str(account_number).strip(),
+        "percentage_charge": 0,
+    })
+    data = dict(response.get("data") or {})
+    subaccount_code = str(data.get("subaccount_code") or "")
+    if not subaccount_code:
+        raise HTTPException(status_code=502, detail="Paystack did not return a subaccount code.")
+    return {"subaccount_code": subaccount_code}
 
 
 def verify_transaction(transaction_id: str) -> dict[str, Any]:

@@ -27,6 +27,28 @@ class EstateOrganization(Base):
     )
 
 
+class EstateOrganizationPayoutAccount(Base):
+    """The bank account a developer org gets settled into for buyer online plot payments, via a
+    Paystack/Flutterwave subaccount created at setup time - see
+    app/services/estates/payout_accounts.py. One row per organization; a missing row means the
+    org has not set up online payments yet, which initiate_allocation_payment() treats as "online
+    payment not offered" rather than silently falling back to LandCheck's own account."""
+
+    __tablename__ = "estate_organization_payout_accounts"
+    id = Column(Integer, primary_key=True)
+    organization_id = Column(Integer, ForeignKey("estate_organizations.id", ondelete="CASCADE"), nullable=False, unique=True)
+    bank_code = Column(String(16), nullable=False)
+    bank_name = Column(String(160), nullable=True)
+    account_number = Column(String(32), nullable=False)
+    account_name = Column(String(255), nullable=False)
+    paystack_subaccount_code = Column(String(64), nullable=True)
+    flutterwave_subaccount_id = Column(String(64), nullable=True)
+    created_by_subject_type = Column(String(64), nullable=False)
+    created_by_subject_id = Column(String(128), nullable=False)
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
+
+
 class EstateOrganizationMember(Base):
     __tablename__ = "estate_organization_members"
 

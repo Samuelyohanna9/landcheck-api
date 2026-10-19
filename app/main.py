@@ -33,6 +33,7 @@ from app.routers import (
     estates,
     estate_auth,
     estate_billing,
+    estate_payout_accounts,
     estate_marketing,
     estate_social,
     estate_legal,
@@ -821,6 +822,7 @@ app.include_router(field_to_finish.router)
 app.include_router(estates.router)
 app.include_router(estate_auth.router)
 app.include_router(estate_billing.router)
+app.include_router(estate_payout_accounts.router)
 app.include_router(estate_marketing.router)
 app.include_router(estate_social.router)
 app.include_router(estate_legal.router)

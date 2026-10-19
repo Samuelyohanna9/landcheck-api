@@ -77,8 +77,12 @@ def initiate_checkout(
     meta: dict[str, Any] | None = None,
     payment_options: str | None = None,
     bank_transfer_expiry: int | None = None,
+    subaccount_id: str | None = None,
 ) -> str:
-    """Creates a hosted-checkout charge and returns the link the customer is redirected to."""
+    """Creates a hosted-checkout charge and returns the link the customer is redirected to.
+    `subaccount_id` (see create_subaccount()) routes the settlement split to a buyer-plot-payment
+    payout account instead of the main account - leave unset for subscription billing, which must
+    always settle to the main account."""
     payload: dict[str, Any] = {
         "tx_ref": tx_ref,
         "amount": f"{Decimal(amount):.2f}",
@@ -93,6 +97,8 @@ def initiate_checkout(
         payload["payment_options"] = payment_options
     if bank_transfer_expiry is not None:
         payload["bank_transfer_options"] = {"expires": int(bank_transfer_expiry)}
+    if subaccount_id:
+        payload["subaccounts"] = [{"id": subaccount_id}]
     response = call_flutterwave_api(
         "POST",
         "/payments",
@@ -102,6 +108,38 @@ def initiate_checkout(
     if not link:
         raise HTTPException(status_code=502, detail="Flutterwave did not return a checkout link.")
     return link
+
+
+def resolve_account_name(account_bank: str, account_number: str) -> dict[str, Any]:
+    """Looks up the account holder's name for a bank code + account number, so a staff member
+    can visually confirm it's the right account before it's saved as a payout destination. Same
+    call green.py's own sponsor-payout code already makes (POST /accounts/resolve), exposed here
+    as a public function instead of borrowing that module's private helper."""
+    response = call_flutterwave_api("POST", "/accounts/resolve", payload={"account_bank": str(account_bank).strip(), "account_number": str(account_number).strip()})
+    data = dict(response.get("data") or {})
+    return {"account_name": str(data.get("account_name") or ""), "account_number": str(data.get("account_number") or account_number)}
+
+
+def create_subaccount(*, account_bank: str, account_number: str, business_name: str) -> dict[str, Any]:
+    """Creates a Flutterwave subaccount that future initiate_checkout(subaccount_id=...) calls can
+    settle into directly. `split_value=1.0` with `split_type="percentage"` is intended to mean
+    100% settled to the subaccount - THIS MUST BE CONFIRMED WITH A REAL TEST-MODE TRANSACTION
+    before this is relied on for a real buyer payment; Flutterwave has multiple API-version split
+    field conventions and this one is best-effort from docs, not yet verified end to end.
+    (POST /v3/subaccounts - FLUTTERWAVE_API_BASE_URL already ends in /v3, see the top of this
+    file, so the path passed to call_flutterwave_api is just "/subaccounts".)"""
+    response = call_flutterwave_api("POST", "/subaccounts", payload={
+        "account_bank": str(account_bank).strip(),
+        "account_number": str(account_number).strip(),
+        "business_name": business_name,
+        "split_type": "percentage",
+        "split_value": 1.0,
+    })
+    data = dict(response.get("data") or {})
+    subaccount_id = str(data.get("id") or "")
+    if not subaccount_id:
+        raise HTTPException(status_code=502, detail="Flutterwave did not return a subaccount id.")
+    return {"subaccount_id": subaccount_id}
 
 
 def verify_transaction(transaction_id: str) -> dict[str, Any]:

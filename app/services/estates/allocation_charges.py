@@ -29,7 +29,8 @@ from app.services.estates.authorization import EstatePrincipal
 from app.services.estates.commissions import apply_commission
 from app.services.estates.operations import advance_payment_schedule_after_payment, issue_customer_portal_link, record_notification_log
 from app.services.estates.payments import confirm_payment, financial_summary, record_payment
-from app.utils.estate_payment_provider import DEFAULT_PROVIDER, module_for
+from app.services.estates.payout_accounts import get_payout_account
+from app.utils.estate_payment_provider import module_for
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +57,11 @@ def initiate_allocation_payment(
     so the return/webhook handlers can send the buyer back to their own portal."""
     if allocation.status not in {"reserved", "allocated"}:
         raise ValueError("This plot is not in an active allocation")
+    payout_account = get_payout_account(db, allocation.organization_id)
+    if not payout_account:
+        # Never let a buyer payment fall back to settling into LandCheck's own account - online
+        # payment simply isn't offered until the developer links their bank account.
+        raise ValueError("This developer has not set up online payments yet")
     summary = financial_summary(db, allocation)
     if summary.outstanding <= 0:
         raise ValueError("This allocation has no outstanding balance")
@@ -64,6 +70,15 @@ def initiate_allocation_payment(
         raise ValueError("Payment amount must be positive")
     if amount > summary.outstanding + Decimal("0.01"):
         raise ValueError("Payment amount exceeds the outstanding balance")
+
+    if payout_account.paystack_subaccount_code:
+        provider = "paystack"
+        split_kwargs = {"subaccount_code": payout_account.paystack_subaccount_code}
+    elif payout_account.flutterwave_subaccount_id:
+        provider = "flutterwave"
+        split_kwargs = {"subaccount_id": payout_account.flutterwave_subaccount_id}
+    else:
+        raise ValueError("This developer's payout account is not linked to a payment gateway")
 
     existing_pending = (
         db.query(EstateAllocationChargeAttempt)
@@ -75,7 +90,6 @@ def initiate_allocation_payment(
         existing_pending.status = "failed"
         existing_pending.failure_reason = "Replaced by a new buyer-initiated checkout."
 
-    provider = DEFAULT_PROVIDER
     tx_ref = new_tx_ref()
     attempt = EstateAllocationChargeAttempt(
         organization_id=allocation.organization_id,
@@ -100,6 +114,7 @@ def initiate_allocation_payment(
             title=organization_name,
             description=f"Plot payment for {organization_name}",
             payment_options="card,banktransfer",
+            **split_kwargs,
             meta={
                 "purpose": "estate_allocation_payment",
                 "allocation_id": str(allocation.id),
