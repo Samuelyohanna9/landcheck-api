@@ -120,18 +120,21 @@ def resolve_account_name(account_bank: str, account_number: str) -> dict[str, An
     return {"account_name": str(data.get("account_name") or ""), "account_number": str(data.get("account_number") or account_number)}
 
 
-def create_subaccount(*, account_bank: str, account_number: str, business_name: str) -> dict[str, Any]:
+def create_subaccount(*, account_bank: str, account_number: str, business_name: str, business_email: str) -> dict[str, Any]:
     """Creates a Flutterwave subaccount that future initiate_checkout(subaccount_id=...) calls can
     settle into directly. `split_value=1.0` with `split_type="percentage"` is intended to mean
     100% settled to the subaccount - THIS MUST BE CONFIRMED WITH A REAL TEST-MODE TRANSACTION
     before this is relied on for a real buyer payment; Flutterwave has multiple API-version split
     field conventions and this one is best-effort from docs, not yet verified end to end.
     (POST /v3/subaccounts - FLUTTERWAVE_API_BASE_URL already ends in /v3, see the top of this
-    file, so the path passed to call_flutterwave_api is just "/subaccounts".)"""
+    file, so the path passed to call_flutterwave_api is just "/subaccounts". `business_email` is
+    required by this endpoint - confirmed from a live 400 "business_email is required" response,
+    not just docs.)"""
     response = call_flutterwave_api("POST", "/subaccounts", payload={
         "account_bank": str(account_bank).strip(),
         "account_number": str(account_number).strip(),
         "business_name": business_name,
+        "business_email": business_email,
         "split_type": "percentage",
         "split_value": 1.0,
     })

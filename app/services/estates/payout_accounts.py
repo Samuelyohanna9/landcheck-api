@@ -65,11 +65,17 @@ def set_up_payout_account(
         except Exception:
             logger.exception("Paystack subaccount creation failed for org %s - continuing without it", organization.id)
     if flw.configured():
-        try:
-            flutterwave_subaccount_id = flw.create_subaccount(account_bank=bank_code, account_number=account_number, business_name=organization.name)["subaccount_id"]
-        except Exception:
-            logger.exception("Flutterwave subaccount creation failed for org %s - continuing without it", organization.id)
+        business_email = str(getattr(organization, "contact_email", "") or "").strip()
+        if not business_email:
+            logger.warning("Flutterwave subaccount creation skipped for org %s - no contact email on file", organization.id)
+        else:
+            try:
+                flutterwave_subaccount_id = flw.create_subaccount(account_bank=bank_code, account_number=account_number, business_name=organization.name, business_email=business_email)["subaccount_id"]
+            except Exception:
+                logger.exception("Flutterwave subaccount creation failed for org %s - continuing without it", organization.id)
     if not paystack_subaccount_code and not flutterwave_subaccount_id:
+        if flw.configured() and not str(getattr(organization, "contact_email", "") or "").strip():
+            raise ValueError("Add a contact email to this organization first (Settings > Estate details) - Flutterwave requires one to create a payout subaccount.")
         raise ValueError("Could not link this account to any payment gateway right now. Please try again shortly.")
 
     account = get_payout_account(db, organization.id)
