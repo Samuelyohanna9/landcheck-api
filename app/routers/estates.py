@@ -4937,6 +4937,88 @@ def list_payments(request: Request, page: int = 1, page_size: int = 25, search: 
     rows=[(p,SimpleNamespace(id=customer_pk,full_name=customer_name),SimpleNamespace(id=estate_pk,name=estate_name),SimpleNamespace(id=plot_pk,plot_number=plot_number)) for p,customer_pk,customer_name,estate_pk,estate_name,plot_pk,plot_number in rows]
     return {"page":page,"page_size":min(max(page_size,1),100),"total":total,"items":[{"id":p.id,"date":p.payment_date,"amount":str(p.amount),"currency":p.currency,"status":p.status,"method":p.payment_method,"reference":p.reference_no,"receipt_number":p.receipt_number,"customer":{"id":c.id,"name":c.full_name},"estate":{"id":e.id,"name":e.name},"plot":{"id":plot.id,"number":plot.plot_number},"allocation_id":p.allocation_id,"recorded_by":p.recorded_by_subject_id,"confirmed_by":p.confirmed_by_subject_id,"can_confirm":has_permission(memberships[p.organization_id].role_key,"payment.manage") and p.status in {"recorded","pending_confirmation"},"can_void":has_permission(memberships[p.organization_id].role_key,"payment.manage") and p.status not in {"voided","reversed"},"can_view_receipt":has_permission(memberships[p.organization_id].role_key,"document.read")} for p,c,e,plot in rows]}
 
+
+@router.get("/payments/export.csv")
+def export_payments_csv(request: Request, search: str | None = None, status: str | None = None, estate_id: int | None = None, customer_id: int | None = None, method: str | None = None, date_from: str | None = None, date_to: str | None = None, db: Session = Depends(get_db)):
+    """The full filtered ledger (not just one page) as a plain CSV, for pasting into an
+    accountant's own books - same filter params as GET /payments."""
+    principal = resolve_estate_principal(db, request)
+    allowed = {a.organization_id for a in list_estate_access(db, principal) if has_permission(a.role_key, "payment.read")}
+    query = db.query(EstatePayment, EstateCustomer.full_name, Estate.name, EstatePlot.plot_number).join(EstateCustomer, EstateCustomer.id == EstatePayment.customer_id).join(EstatePlot, EstatePlot.id == EstatePayment.plot_id).join(Estate, Estate.id == EstatePlot.estate_id).filter(EstatePayment.organization_id.in_(allowed))
+    if estate_id: query = query.filter(Estate.id == estate_id)
+    if customer_id: query = query.filter(EstateCustomer.id == customer_id)
+    if status: query = query.filter(EstatePayment.status == status)
+    if method: query = query.filter(EstatePayment.payment_method == method)
+    if date_from: query = query.filter(EstatePayment.payment_date >= date_from)
+    if date_to: query = query.filter(EstatePayment.payment_date <= date_to)
+    if search:
+        term = f"%{search.strip()}%"
+        query = query.filter((EstateCustomer.full_name.ilike(term)) | (EstatePlot.plot_number.ilike(term)) | (EstatePayment.reference_no.ilike(term)))
+    rows = query.order_by(EstatePayment.payment_date.desc()).limit(5000).all()
+    buffer = io.StringIO()
+    writer = csv.writer(buffer)
+    writer.writerow(["Date", "Customer", "Estate", "Plot", "Amount", "Currency", "Method", "Status", "Reference", "Receipt number"])
+    for payment, customer_name, estate_name, plot_number in rows:
+        writer.writerow([payment.payment_date.date().isoformat(), customer_name, estate_name, plot_number, str(payment.amount), payment.currency, payment.payment_method, payment.status, payment.reference_no or "", payment.receipt_number or ""])
+    return Response(buffer.getvalue(), media_type="text/csv", headers={"Content-Disposition": "attachment; filename=\"payments-ledger.csv\""})
+
+
+@router.get("/accounting/summary")
+def accounting_summary(request: Request, db: Session = Depends(get_db)):
+    """Collections grouped by payment method (confirmed only), with an online-vs-manual split -
+    the cash-book-style breakdown an accountant would want alongside the raw payments ledger."""
+    principal = resolve_estate_principal(db, request)
+    allowed = {a.organization_id for a in list_estate_access(db, principal) if has_permission(a.role_key, "payment.read")}
+    rows = db.query(EstatePayment.payment_method, func.coalesce(func.sum(EstatePayment.amount), 0), func.count(EstatePayment.id)).filter(EstatePayment.organization_id.in_(allowed), EstatePayment.status == "confirmed").group_by(EstatePayment.payment_method).all()
+    by_method = [{"method": method, "amount": str(Decimal(str(total or 0))), "count": count} for method, total, count in rows]
+    online_total = sum((Decimal(item["amount"]) for item in by_method if item["method"].startswith("online_")), Decimal(0))
+    manual_total = sum((Decimal(item["amount"]) for item in by_method if not item["method"].startswith("online_")), Decimal(0))
+    return {"by_method": by_method, "online_total": str(online_total), "manual_total": str(manual_total), "total_confirmed": str(online_total + manual_total)}
+
+
+_AGED_DEBTOR_BUCKET_LABELS = {"current": "Current (0-30 days)", "31_60": "31-60 days", "61_90": "61-90 days", "90_plus": "90+ days"}
+
+
+@router.get("/accounting/aged-debtors")
+def accounting_aged_debtors(request: Request, db: Session = Depends(get_db)):
+    """Outstanding balances bucketed by how long since the last confirmed payment (or since
+    allocation/reservation if none yet) - the standard collections follow-up report."""
+    principal = resolve_estate_principal(db, request)
+    allowed = {a.organization_id for a in list_estate_access(db, principal) if has_permission(a.role_key, "payment.read")}
+    allocations = db.query(EstateAllocation).filter(EstateAllocation.organization_id.in_(allowed), EstateAllocation.status.in_(("reserved", "allocated"))).all()
+    summaries = _bulk_financial_summaries(db, allocations)
+    outstanding_allocations = [a for a in allocations if summaries.get(a.id, {}).get("outstanding", Decimal(0)) > 0]
+    allocation_ids = [a.id for a in outstanding_allocations]
+    last_payment_rows = dict(
+        db.query(EstatePayment.allocation_id, func.max(EstatePayment.payment_date)).filter(EstatePayment.allocation_id.in_(allocation_ids), EstatePayment.status == "confirmed").group_by(EstatePayment.allocation_id).all()
+    ) if allocation_ids else {}
+    now = datetime.now(timezone.utc)
+    bucket_totals = {"current": Decimal(0), "31_60": Decimal(0), "61_90": Decimal(0), "90_plus": Decimal(0)}
+    rows = []
+    for allocation in outstanding_allocations:
+        summary = summaries[allocation.id]
+        reference_date = last_payment_rows.get(allocation.id) or allocation.allocation_date or allocation.reservation_date or allocation.created_at
+        if reference_date is not None and reference_date.tzinfo is None:
+            reference_date = reference_date.replace(tzinfo=timezone.utc)
+        days = (now - reference_date).days if reference_date is not None else 0
+        bucket = "current" if days <= 30 else "31_60" if days <= 60 else "61_90" if days <= 90 else "90_plus"
+        bucket_totals[bucket] += summary["outstanding"]
+        customer = db.get(EstateCustomer, allocation.customer_id)
+        estate = db.get(Estate, allocation.estate_id)
+        plot = db.get(EstatePlot, allocation.plot_id)
+        rows.append({
+            "allocation_id": allocation.id,
+            "customer_name": customer.full_name if customer else "-",
+            "estate_name": estate.name if estate else "-",
+            "plot_number": plot.plot_number if plot else "-",
+            "outstanding": str(summary["outstanding"]),
+            "days_outstanding": days,
+            "bucket": bucket,
+            "bucket_label": _AGED_DEBTOR_BUCKET_LABELS[bucket],
+        })
+    rows.sort(key=lambda row: row["days_outstanding"], reverse=True)
+    return {"rows": rows, "bucket_totals": {key: str(value) for key, value in bucket_totals.items()}, "bucket_labels": _AGED_DEBTOR_BUCKET_LABELS}
+
 @router.post("/payment-inbox", status_code=201)
 def create_payment_inbox(payload: PaymentInboxCreate, request: Request, db: Session = Depends(get_db)):
     if payload.estate_id is not None:
