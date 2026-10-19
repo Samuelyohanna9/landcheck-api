@@ -36,7 +36,7 @@ from app.services.estates.identity import generate_temp_password, hash_password,
 from app.services.estates.entitlements import ESTATE_FEATURES, get_estate_entitlement
 from app.models.estate_foundation import Estate, EstateAgentPortalToken, EstateAllocation, EstateAllocationChargeAttempt, EstateAuditEvent, EstateBlock, EstateCommissionPayout, EstateCommissionTier, EstateCustomer, EstateCustomerPortalToken, EstateDocument, EstateDocumentLink, EstateFieldInspection, EstateHazardAssessment, EstateImportReview, EstateLayoutProposal, EstateNotificationLog, EstateOrganization, EstateOrganizationMember, EstatePayment, EstatePaymentInbox, EstatePaymentRule, EstatePlot, EstatePublicReservationRequest, EstateQrCampaign, EstateSoilAssessment, EstateSpatialFeature, EstateStaffRole, EstateSurveyRequest, EstateStakingTask, GeotechSurveyRequest
 from app.models.estate_marketing import EstateApprovalMilestone, EstateLiveInspectionSession, EstateProgressUpdate
-from app.schemas.estates import AllocationAction, BlockCreate, BlockUpdate, BuyerAllocationPaymentCreate, PaymentReminderSend, CommissionPayoutCreate, CommissionTiersUpdate, CustomerCreate, DevelopmentForecastPublishUpdate, DevelopmentStatusUpdate, EstateCreate, EstateLayoutCriteria, EstateLayoutDecision, EstateLayoutFeatureAdd, EstateLayoutFeatureRemove, EstateLayoutProposalEdit, EstateSubdivisionCreate, EstateUpdate, FieldInspectionCreate, GeoreferenceSessionLink, ImportFromGeoreference, ImportReviewCreate, ImportReviewDecision, ImportReviewFromGeoreferenceSession, MemberCreate, MemberUpdate, PaymentInboxCreate, PaymentInboxMatch, PlotCreate, PlotAddressUpdate, PlotGeometryUpdate, PlotListingDefaultsUpdate, PlotPriceUpdate, PortalTokenCreate, BulkCustomerSmsCreate, PublicEstateSettingsUpdate, PublicReservationConvert, PublicReservationCreate, PublicReservationUpdate, PaymentCreate, QrCampaignCreate, SpatialFeatureCreate, SpatialFeatureUpdate, StaffCreate, StaffRoleCreate, StaffRoleUpdate, StaffUpdate, SurveyEligibilityUpdate, TitleVerificationUpdate, VoidAction
+from app.schemas.estates import AllocationAction, BlockCreate, BlockUpdate, BuyerAllocationPaymentCreate, PaymentIssueReportCreate, PaymentReminderSend, CommissionPayoutCreate, CommissionTiersUpdate, CustomerCreate, DevelopmentForecastPublishUpdate, DevelopmentStatusUpdate, EstateCreate, EstateLayoutCriteria, EstateLayoutDecision, EstateLayoutFeatureAdd, EstateLayoutFeatureRemove, EstateLayoutProposalEdit, EstateSubdivisionCreate, EstateUpdate, FieldInspectionCreate, GeoreferenceSessionLink, ImportFromGeoreference, ImportReviewCreate, ImportReviewDecision, ImportReviewFromGeoreferenceSession, MemberCreate, MemberUpdate, PaymentInboxCreate, PaymentInboxMatch, PlotCreate, PlotAddressUpdate, PlotGeometryUpdate, PlotListingDefaultsUpdate, PlotPriceUpdate, PortalTokenCreate, BulkCustomerSmsCreate, PublicEstateSettingsUpdate, PublicReservationConvert, PublicReservationCreate, PublicReservationUpdate, PaymentCreate, QrCampaignCreate, SpatialFeatureCreate, SpatialFeatureUpdate, StaffCreate, StaffRoleCreate, StaffRoleUpdate, StaffUpdate, SurveyEligibilityUpdate, TitleVerificationUpdate, VoidAction
 from app.services.estates.payments import confirm_payment, financial_summary, record_payment, void_payment
 from app.services.estates.documents import MAX_ESTATE_DOCUMENT_BYTES, read_private_estate_file, store_private_estate_file
 from app.utils.r2_objects import delete_object_best_effort, build_r2_settings
@@ -66,6 +66,8 @@ from app.services.estates import commissions
 from app.services.estates.operations import DOCUMENT_REQUIREMENTS, ESTATE_DOCUMENT_TYPES, ESTATE_DOCUMENT_TYPE_CODES, PUBLIC_DOCUMENT_TYPES, advance_payment_schedule_after_payment, build_operations_summary, buyer_portal_payload, customer_portal_url, document_readiness, hash_portal_token, issue_agent_portal_token, issue_customer_portal_link, issue_customer_portal_token, linked_documents, record_notification_log
 from app.services.estates import allocation_charges
 from app.services.estates import payment_reminders
+from app.services.estates import settlement_tracking
+from app.models.estate_foundation import EstatePaymentIssueReport
 from app.utils import estate_flutterwave as flw
 from app.utils import estate_paystack as pst
 from app.utils.auth_security import require_signed_flutterwave_webhooks
@@ -5087,6 +5089,136 @@ def send_due_payment_reminder(allocation_id: int, payload: PaymentReminderSend, 
         db.rollback()
         raise HTTPException(422, str(exc))
     return result
+
+
+@router.get("/accounting/ledger")
+def accounting_ledger(request: Request, db: Session = Depends(get_db)):
+    """Every active allocation org-wide - who paid, for which plot, how much is left. The
+    comprehensive companion to aged-debtors (which only lists ones with a balance still owing)."""
+    principal = resolve_estate_principal(db, request)
+    allowed = {a.organization_id for a in list_estate_access(db, principal) if has_permission(a.role_key, "payment.read")}
+    allocations = db.query(EstateAllocation).filter(EstateAllocation.organization_id.in_(allowed), EstateAllocation.status.in_(("reserved", "allocated"))).all()
+    summaries = _bulk_financial_summaries(db, allocations)
+    rows = []
+    for allocation in allocations:
+        summary = summaries.get(allocation.id)
+        if not summary:
+            continue
+        customer = db.get(EstateCustomer, allocation.customer_id)
+        estate = db.get(Estate, allocation.estate_id)
+        plot = db.get(EstatePlot, allocation.plot_id)
+        rows.append({
+            "allocation_id": allocation.id,
+            "customer_name": customer.full_name if customer else "-",
+            "estate_name": estate.name if estate else "-",
+            "plot_number": plot.plot_number if plot else "-",
+            "agreed_price": str(summary["agreed_price"]),
+            "confirmed_paid": str(summary["confirmed_paid"]),
+            "outstanding": str(summary["outstanding"]),
+            "percentage": str(summary["percentage"]),
+        })
+    rows.sort(key=lambda row: Decimal(row["outstanding"]), reverse=True)
+    return {"rows": rows}
+
+
+@router.get("/accounting/online-payments")
+def accounting_online_payments(request: Request, db: Session = Depends(get_db)):
+    """Every successful online (Paystack/Flutterwave) plot payment, with whether it's actually
+    settled into the developer's bank account yet - see settlement_tracking.py for why only
+    Flutterwave attempts get a real settlement check today."""
+    principal = resolve_estate_principal(db, request)
+    allowed = {a.organization_id for a in list_estate_access(db, principal) if has_permission(a.role_key, "payment.read")}
+    attempts = db.query(EstateAllocationChargeAttempt).filter(EstateAllocationChargeAttempt.organization_id.in_(allowed), EstateAllocationChargeAttempt.status == "success").order_by(EstateAllocationChargeAttempt.completed_at.desc()).limit(300).all()
+    rows = []
+    for attempt in attempts:
+        allocation = db.get(EstateAllocation, attempt.allocation_id)
+        customer = db.get(EstateCustomer, attempt.customer_id)
+        plot = db.get(EstatePlot, allocation.plot_id) if allocation else None
+        estate = db.get(Estate, allocation.estate_id) if allocation else None
+        rows.append({
+            "id": attempt.id,
+            "customer_name": customer.full_name if customer else "-",
+            "estate_name": estate.name if estate else "-",
+            "plot_number": plot.plot_number if plot else "-",
+            "amount": str(attempt.amount),
+            "provider": attempt.payment_provider,
+            "tx_ref": attempt.tx_ref,
+            "captured_at": attempt.completed_at,
+            "settlement_status": attempt.settlement_status if attempt.payment_provider == "flutterwave" else "not_tracked",
+            "settled_at": attempt.settled_at,
+            "settlement_checked_at": attempt.settlement_checked_at,
+        })
+    return {"rows": rows}
+
+
+@router.post("/accounting/online-payments/refresh-settlement")
+def refresh_online_payment_settlement(organization_id: int, request: Request, db: Session = Depends(get_db)):
+    require_estate_access(db, request, organization_id, permission="payment.manage")
+    settled_count = settlement_tracking.refresh_settlement_status(db, organization_id=organization_id)
+    db.commit()
+    return {"settled_count": settled_count}
+
+
+@router.post("/accounting/payment-issues", status_code=201)
+def create_payment_issue_report(payload: PaymentIssueReportCreate, request: Request, db: Session = Depends(get_db)):
+    access = require_estate_access(db, request, payload.organization_id, permission="payment.read")
+    customer_name = None
+    plot_number = None
+    context_lines: list[str] = []
+    if payload.charge_attempt_id:
+        attempt = db.get(EstateAllocationChargeAttempt, payload.charge_attempt_id)
+        if attempt and attempt.organization_id == payload.organization_id:
+            customer = db.get(EstateCustomer, attempt.customer_id)
+            allocation = db.get(EstateAllocation, attempt.allocation_id)
+            plot = db.get(EstatePlot, allocation.plot_id) if allocation else None
+            customer_name = customer.full_name if customer else None
+            plot_number = plot.plot_number if plot else None
+            context_lines = [f"Online payment: {attempt.tx_ref} ({attempt.payment_provider})", f"Amount: NGN {attempt.amount}", f"Settlement status: {attempt.settlement_status}"]
+    elif payload.payment_id:
+        payment = db.get(EstatePayment, payload.payment_id)
+        if payment and payment.organization_id == payload.organization_id:
+            customer = db.get(EstateCustomer, payment.customer_id)
+            plot = db.get(EstatePlot, payment.plot_id)
+            customer_name = customer.full_name if customer else None
+            plot_number = plot.plot_number if plot else None
+            context_lines = [f"Payment: {payment.receipt_number or payment.payment_uid}", f"Amount: NGN {payment.amount}"]
+    report = EstatePaymentIssueReport(
+        organization_id=payload.organization_id,
+        charge_attempt_id=payload.charge_attempt_id,
+        payment_id=payload.payment_id,
+        customer_name_snapshot=customer_name,
+        plot_number_snapshot=plot_number,
+        message=payload.message,
+        reported_by_subject_type=access.principal.subject_type,
+        reported_by_subject_id=access.principal.subject_id,
+    )
+    db.add(report)
+    db.commit()
+    organization = db.get(EstateOrganization, payload.organization_id)
+    if organization:
+        estate_email.send_payment_issue_report_email(organization=organization, reported_by_display_name=access.principal.display_name, message=payload.message, context_lines=context_lines)
+    return {"id": report.id, "status": report.status}
+
+
+@router.get("/accounting/payment-issues")
+def list_payment_issue_reports(organization_id: int, request: Request, db: Session = Depends(get_db)):
+    require_estate_access(db, request, organization_id, permission="payment.read")
+    reports = db.query(EstatePaymentIssueReport).filter(EstatePaymentIssueReport.organization_id == organization_id).order_by(EstatePaymentIssueReport.created_at.desc()).limit(100).all()
+    return {"rows": [{"id": r.id, "customer_name": r.customer_name_snapshot, "plot_number": r.plot_number_snapshot, "message": r.message, "status": r.status, "created_at": r.created_at, "resolved_at": r.resolved_at} for r in reports]}
+
+
+@router.patch("/accounting/payment-issues/{report_id}/resolve")
+def resolve_payment_issue_report(report_id: int, request: Request, db: Session = Depends(get_db)):
+    report = db.get(EstatePaymentIssueReport, report_id)
+    if not report:
+        raise HTTPException(404, "Report not found")
+    access = require_estate_access(db, request, report.organization_id, permission="payment.manage")
+    report.status = "resolved"
+    report.resolved_at = datetime.now(timezone.utc)
+    report.resolved_by_subject_type = access.principal.subject_type
+    report.resolved_by_subject_id = access.principal.subject_id
+    db.commit()
+    return {"id": report.id, "status": report.status}
 
 
 @router.post("/payment-inbox", status_code=201)

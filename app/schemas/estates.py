@@ -373,6 +373,13 @@ class PaymentReminderSend(BaseModel):
     channel: str = Field(pattern="^(sms|whatsapp|email)$")
     method: str = Field(pattern="^(online_link|bank_details|both)$")
 
+
+class PaymentIssueReportCreate(BaseModel):
+    organization_id: int
+    charge_attempt_id: int | None = None
+    payment_id: int | None = None
+    message: str = Field(min_length=1, max_length=2000)
+
 class VoidAction(BaseModel):
     reason: str = Field(min_length=1)
 

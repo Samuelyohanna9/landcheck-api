@@ -444,6 +444,36 @@ class EstateAllocationChargeAttempt(Base):
     failure_reason = Column(Text, nullable=True)
     created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
     completed_at = Column(DateTime(timezone=True), nullable=True)
+    # Whether this successful charge has actually settled into the developer's bank account yet -
+    # Flutterwave settles on its own schedule (typically T+1), not instantly at charge time. Only
+    # ever flipped to "settled" by a positive match against Flutterwave's own settlement records
+    # (see app/services/estates/settlement_tracking.py) - never guessed from elapsed time.
+    settlement_status = Column(String(16), nullable=False, default="pending")
+    settled_at = Column(DateTime(timezone=True), nullable=True)
+    settlement_checked_at = Column(DateTime(timezone=True), nullable=True)
+
+
+class EstatePaymentIssueReport(Base):
+    """A developer flagging a problem with a specific payment (most commonly: an online payment
+    that hasn't settled) from the Accounting tab - a lightweight support ticket, not a full
+    workflow. Emailed to LandCheck support on creation; status tracked here so staff can see what
+    they've already reported."""
+
+    __tablename__ = "estate_payment_issue_reports"
+    id = Column(Integer, primary_key=True)
+    organization_id = Column(Integer, ForeignKey("estate_organizations.id", ondelete="CASCADE"), nullable=False)
+    charge_attempt_id = Column(Integer, ForeignKey("estate_allocation_charge_attempts.id", ondelete="SET NULL"), nullable=True)
+    payment_id = Column(Integer, ForeignKey("estate_payments.id", ondelete="SET NULL"), nullable=True)
+    customer_name_snapshot = Column(String(255), nullable=True)
+    plot_number_snapshot = Column(String(64), nullable=True)
+    message = Column(Text, nullable=False)
+    status = Column(String(16), nullable=False, default="open")
+    reported_by_subject_type = Column(String(64), nullable=False)
+    reported_by_subject_id = Column(String(128), nullable=False)
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    resolved_at = Column(DateTime(timezone=True), nullable=True)
+    resolved_by_subject_type = Column(String(64), nullable=True)
+    resolved_by_subject_id = Column(String(128), nullable=True)
 
 
 class EstateNotificationLog(Base):

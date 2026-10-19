@@ -145,6 +145,39 @@ def create_subaccount(*, account_bank: str, account_number: str, business_name: 
     return {"subaccount_id": subaccount_id}
 
 
+def list_settlements(*, subaccount_id: str | None = None, from_date: str | None = None, to_date: str | None = None) -> list[dict[str, Any]]:
+    """Lists settlement batches (GET /v3/settlements) - each batch's `data.transactions` carries
+    per-transaction `subaccount_settlement`/`settlement_amount` fields. UNVERIFIED against a real
+    settled transaction as of writing (no sandbox/live settlement to test against from here) -
+    the exact field names/shape came from Flutterwave's docs and public examples, not a live
+    response, so app/services/estates/settlement_tracking.py must treat an unmatched or
+    unexpected-shape response as "still pending," never as a positive settlement confirmation.
+    `subaccount_id` filters to one developer's payout subaccount when supported by the API; if
+    the API ignores an unsupported filter param, the caller still matches by
+    provider_transaction_id so unrelated settlements are harmless noise, not false positives."""
+    params: dict[str, Any] = {}
+    if subaccount_id:
+        params["subaccount_id"] = subaccount_id
+    if from_date:
+        params["from"] = from_date
+    if to_date:
+        params["to"] = to_date
+    response = call_flutterwave_api("GET", "/settlements", params=params or None)
+    data = response.get("data")
+    return list(data) if isinstance(data, list) else []
+
+
+def get_settlement_detail(settlement_id: str) -> dict[str, Any]:
+    """Fetches one settlement batch by id (GET /v3/settlements/{id}) - per Flutterwave's docs
+    this is where the per-transaction `subaccount_settlement`/`settlement_amount` breakdown
+    actually appears (the list endpoint may only return batch-level summaries), so
+    settlement_tracking.py calls this for each batch from list_settlements() rather than
+    assuming the list response already has transaction detail. Same unverified-shape caveat as
+    list_settlements()."""
+    response = call_flutterwave_api("GET", f"/settlements/{settlement_id}")
+    return dict(response.get("data") or {})
+
+
 def verify_transaction(transaction_id: str) -> dict[str, Any]:
     """Server-side re-verification - never trust a webhook/redirect payload's own claimed status."""
     response = call_flutterwave_api("GET", f"/transactions/{transaction_id}/verify")

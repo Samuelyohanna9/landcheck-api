@@ -922,6 +922,28 @@ def send_payout_account_changed_email(*, organization, account_name: str, bank_n
         return False
 
 
+def send_payment_issue_report_email(*, organization, reported_by_display_name: str | None, message: str, context_lines: list[str]) -> bool:
+    """A staff member flagging a payment problem (most commonly an online payment that hasn't
+    settled) from the Accounting tab - goes to LandCheck support, not the org's own contact
+    email, since this is a report TO LandCheck, not a notification FROM it."""
+    to_email = "support@landcheck.online"
+    reporter = html.escape(reported_by_display_name or "A team member")
+    context_html = "".join(f"<p style=\"margin:4px 0;color:{_ESTATE_SLATE};font-size:13px;\">{html.escape(line)}</p>" for line in context_lines)
+    message_html = (
+        f"<p>{reporter} at <strong>{html.escape(organization.name)}</strong> reported a payment issue:</p>"
+        f"{context_html}"
+        f"<div style=\"margin:16px 0 0;padding:14px 16px;background:{_ESTATE_SURFACE_TINT};border:1px solid {_ESTATE_LINE};border-radius:4px;\">"
+        f"<p style=\"margin:0;color:{_ESTATE_INK};white-space:pre-wrap;\">{html.escape(message)}</p></div>"
+    )
+    body_html = _account_wrap_html(heading="Payment issue reported", message_html=message_html)
+    try:
+        _send_email(to_email=to_email, from_display_name=f"{organization.name} (via LandCheck Estates)", subject=f"Payment issue reported - {organization.name}", body_text=_account_plain_text("Payment issue reported", message_html), body_html=body_html)
+        return True
+    except Exception:
+        logger.exception("Estate payment-issue-report email failed (org=%s)", organization.id)
+        return False
+
+
 def send_payment_failed_email(*, organization, subscription) -> bool:
     to_email = _subscription_org_email(organization)
     if not to_email:
