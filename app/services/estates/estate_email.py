@@ -1098,9 +1098,9 @@ def send_payment_reminder_email(
     )
     plot_link_html = ""
     bank_html = ""
-    if method == "online_link" and portal_url:
+    if method in ("online_link", "both") and portal_url:
         plot_link_html = _plot_link_html(portal_url, label="Pay online now")
-    elif method == "bank_details" and payout_account is not None:
+    if method in ("bank_details", "both") and payout_account is not None:
         bank_html = f"""
         <div style="margin:22px 0 0;padding:16px 18px;background:{_ESTATE_SURFACE_TINT};border:1px solid {_ESTATE_LINE};border-radius:4px;">
           <p style="margin:0 0 8px;color:{_ESTATE_SLATE};font-size:13px;">Pay by bank transfer to:</p>
@@ -1115,7 +1115,7 @@ def send_payment_reminder_email(
             to_email=to_email,
             from_display_name=f"{org_name} (via LandCheck Estates)",
             subject=subject,
-            body_text=_plain_text("Payment reminder", message_html, None, portal_link=portal_url if method == "online_link" else None),
+            body_text=_plain_text("Payment reminder", message_html, None, portal_link=portal_url if method in ("online_link", "both") else None),
             body_html=body_html,
         )
         return True

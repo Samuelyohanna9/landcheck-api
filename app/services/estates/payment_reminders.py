@@ -35,11 +35,12 @@ def compose_reminder_text(
     due_str = due_at.strftime("%d %b %Y") if due_at else "soon"
     amount_str = estate_email.format_naira(outstanding)
     base = f"{org_name}: Hi {first_name}, your payment of {amount_str} for Plot {plot_number} at {estate_name} is due {due_str}."
-    if method == "online_link" and portal_url:
-        return f"{base} Pay online: {portal_url}"
-    if method == "bank_details" and payout_account is not None:
-        return f"{base} Pay by transfer to {payout_account.bank_name or ''} - {payout_account.account_name or ''} - {payout_account.account_number or ''}."
-    return base
+    parts = [base]
+    if method in ("online_link", "both") and portal_url:
+        parts.append(f"Pay online: {portal_url}")
+    if method in ("bank_details", "both") and payout_account is not None:
+        parts.append(f"Or pay by transfer to {payout_account.bank_name or ''} - {payout_account.account_name or ''} - {payout_account.account_number or ''}.")
+    return " ".join(parts)
 
 
 def send_reminder(db: Session, *, allocation: EstateAllocation, channel: str, method: str, actor: EstatePrincipal) -> dict:
@@ -53,13 +54,16 @@ def send_reminder(db: Session, *, allocation: EstateAllocation, channel: str, me
     if summary.outstanding <= 0:
         raise ValueError("This allocation has no outstanding balance")
 
-    payout_account = get_payout_account(db, allocation.organization_id) if method == "bank_details" else None
+    payout_account = get_payout_account(db, allocation.organization_id) if method in ("bank_details", "both") else None
     if method == "bank_details" and not payout_account:
         raise ValueError("This developer has no payout account on file to share bank details from")
 
     portal_url = None
-    if method == "online_link":
+    if method in ("online_link", "both"):
         _, portal_url = issue_customer_portal_link(db, customer=customer, actor=actor)
+
+    if method == "both" and not portal_url and not payout_account:
+        raise ValueError("No payment link or bank details are available yet - set up a payout account first.")
 
     text = compose_reminder_text(
         customer_name=customer.full_name,

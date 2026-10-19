@@ -371,7 +371,7 @@ class BuyerAllocationPaymentCreate(BaseModel):
 
 class PaymentReminderSend(BaseModel):
     channel: str = Field(pattern="^(sms|whatsapp|email)$")
-    method: str = Field(pattern="^(online_link|bank_details)$")
+    method: str = Field(pattern="^(online_link|bank_details|both)$")
 
 class VoidAction(BaseModel):
     reason: str = Field(min_length=1)
