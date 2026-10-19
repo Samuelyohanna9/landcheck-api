@@ -6,6 +6,8 @@ actually settles there. Setting one up creates a Paystack and/or Flutterwave sub
 gateway is configured server-wide) so a future buyer checkout can split-settle directly to the
 developer's own bank account instead of LandCheck's."""
 
+import logging
+
 from sqlalchemy.orm import Session
 
 from app.models.estate_foundation import EstateOrganization, EstateOrganizationPayoutAccount
@@ -13,6 +15,8 @@ from app.services.estates.authorization import EstatePrincipal
 from app.services.estates.audit import append_estate_audit_event
 from app.utils import estate_flutterwave as flw
 from app.utils import estate_paystack as pst
+
+logger = logging.getLogger(__name__)
 
 
 def resolve_bank_account(provider: str, bank_code: str, account_number: str) -> dict:
@@ -49,14 +53,24 @@ def set_up_payout_account(
     if not account_name:
         raise ValueError("Could not verify this account. Double-check the bank and account number.")
 
+    # Each gateway is attempted independently and non-fatally - a Paystack account that's
+    # configured (a secret key is set) but not yet fully verified for live payments must not
+    # block Flutterwave from linking successfully, and vice versa. Whichever gateway(s) actually
+    # succeed are what initiate_allocation_payment has to work with later.
     paystack_subaccount_code: str | None = None
     flutterwave_subaccount_id: str | None = None
     if pst.configured():
-        paystack_subaccount_code = pst.create_subaccount(business_name=organization.name, bank_code=bank_code, account_number=account_number)["subaccount_code"]
+        try:
+            paystack_subaccount_code = pst.create_subaccount(business_name=organization.name, bank_code=bank_code, account_number=account_number)["subaccount_code"]
+        except Exception:
+            logger.exception("Paystack subaccount creation failed for org %s - continuing without it", organization.id)
     if flw.configured():
-        flutterwave_subaccount_id = flw.create_subaccount(account_bank=bank_code, account_number=account_number, business_name=organization.name)["subaccount_id"]
+        try:
+            flutterwave_subaccount_id = flw.create_subaccount(account_bank=bank_code, account_number=account_number, business_name=organization.name)["subaccount_id"]
+        except Exception:
+            logger.exception("Flutterwave subaccount creation failed for org %s - continuing without it", organization.id)
     if not paystack_subaccount_code and not flutterwave_subaccount_id:
-        raise ValueError("No payment gateway is configured on this server to create a payout subaccount.")
+        raise ValueError("Could not link this account to any payment gateway right now. Please try again shortly.")
 
     account = get_payout_account(db, organization.id)
     before_data = None
