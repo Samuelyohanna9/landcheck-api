@@ -5057,6 +5057,8 @@ def accounting_due_payments(request: Request, db: Session = Depends(get_db)):
         reminder_sent = allocation.payment_reminder_sent_for_due_at is not None and allocation.payment_reminder_sent_for_due_at == allocation.next_payment_due_at
         rows.append({
             "allocation_id": allocation.id,
+            "estate_id": allocation.estate_id,
+            "plot_id": allocation.plot_id,
             "customer_name": customer.full_name if customer else "-",
             "customer_phone": customer.phone if customer else None,
             "customer_email": customer.email if customer else None,

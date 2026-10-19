@@ -12,6 +12,7 @@ from sqlalchemy.orm import Session
 
 from app.models.estate_foundation import Estate, EstateAllocation, EstateCustomer, EstateOrganization, EstateOrganizationPayoutAccount, EstatePlot
 from app.services.estates import estate_email, estate_sms, marketing_common, social_whatsapp, whatsapp_inbox
+from app.services.estates.audit import append_estate_audit_event
 from app.services.estates.authorization import EstatePrincipal
 from app.services.estates.operations import issue_customer_portal_link, record_notification_log
 from app.services.estates.payments import financial_summary
@@ -138,5 +139,14 @@ def send_reminder(db: Session, *, allocation: EstateAllocation, channel: str, me
         raise ValueError(error_message or "The reminder could not be sent.")
 
     allocation.payment_reminder_sent_for_due_at = allocation.next_payment_due_at
+    append_estate_audit_event(
+        db,
+        organization_id=allocation.organization_id,
+        actor=actor,
+        action="allocation.payment_reminder_sent",
+        entity_type="estate_allocation",
+        entity_id=allocation.id,
+        after_data={"channel": channel, "method": method},
+    )
     db.flush()
     return {"ok": True, "channel": channel, "method": method}
