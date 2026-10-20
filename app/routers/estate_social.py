@@ -1114,10 +1114,11 @@ def _whatsapp_send_error_detail(exc: "social_whatsapp.WhatsAppError") -> str:
     base = str(exc)
     if exc.code == 100:
         return (
-            f"{base} - this usually means the approved WhatsApp template doesn't match what's being "
-            "sent: either the number of variables in WhatsApp Manager is different from the 4 this "
-            "preset sends (name, estate, detail, link), or the template's approved language doesn't "
-            "match. Check the template in WhatsApp Manager, or send this as an SMS instead."
+            f"{base} - LandCheck already retried this under both WhatsApp's common English language "
+            "codes (en and en_US), so this isn't a language mismatch. The template named in WhatsApp "
+            "Manager most likely either doesn't exist/isn't approved yet, or its approved body doesn't "
+            "have exactly 4 variables (name, estate, detail, link) in that order. Check the template in "
+            "WhatsApp Manager, or send this message as an SMS instead - it needs no template approval."
         )
     return base
 
@@ -1177,6 +1178,25 @@ def send_customer_whatsapp_message(customer_id: int, payload: CustomerWhatsappMe
     _require_whatsapp(db, customer.organization_id)
     if not social_whatsapp.configured():
         raise HTTPException(503, "WhatsApp messaging is not switched on for this server yet.")
+    # Meta only requires an approved TEMPLATE for a message that starts/re-opens a conversation;
+    # once the customer has messaged in the last 24 hours (the "customer service window"), an
+    # ordinary free-form message reaches them just fine and needs no template at all - skip the
+    # whole template-matching problem whenever that's true, same rule the WhatsApp Inbox reply
+    # feature already enforces (see whatsapp_inbox.can_reply_freely).
+    if estate is not None and whatsapp_inbox.can_reply_freely(db, estate.id, digits):
+        body = social_whatsapp.sms_text(payload.preset, params)
+        try:
+            row = whatsapp_inbox.send_reply(
+                db, organization_id=customer.organization_id, estate_id=estate.id, phone_digits=digits, customer_id=customer.id,
+                body=body, actor_subject_type=access.principal.subject_type, actor_subject_id=str(access.principal.subject_id),
+            )
+        except social_whatsapp.WhatsAppError as exc:
+            append_estate_audit_event(db, organization_id=customer.organization_id, actor=access.principal, action="customer.whatsapp_message_failed", entity_type="estate_customer", entity_id=customer.id, after_data={"preset": payload.preset, "error": str(exc)})
+            db.commit()
+            raise HTTPException(502, str(exc)) from exc
+        append_estate_audit_event(db, organization_id=customer.organization_id, actor=access.principal, action="customer.whatsapp_message_sent", entity_type="estate_customer", entity_id=customer.id, after_data={"preset": payload.preset, "mode": "free_text"})
+        db.commit()
+        return _message_payload(row)
     try:
         message_id = social_whatsapp.send_template(digits, social_whatsapp.template_name(payload.preset), params)
     except social_whatsapp.WhatsAppError as exc:
