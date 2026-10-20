@@ -4099,7 +4099,7 @@ def find_duplicate_customers(
 
 
 @router.get("/organizations/{organization_id}/customers")
-def list_customers(organization_id: int, request: Request, page: int = 1, page_size: int = 25, search: str | None = None, db: Session = Depends(get_db)):
+def list_customers(organization_id: int, request: Request, page: int = 1, page_size: int = 25, search: str | None = None, plot_filter: str | None = None, db: Session = Depends(get_db)):
     require_estate_view_access(db, request, organization_id, permission="customer.read")
     query = db.query(EstateCustomer).filter(EstateCustomer.organization_id == organization_id)
     if search and search.strip():
@@ -4111,12 +4111,53 @@ def list_customers(organization_id: int, request: Request, page: int = 1, page_s
                 func.lower(EstateCustomer.email).like(term),
             )
         )
+    if plot_filter in ("multiple_plots", "no_plots"):
+        active_plot_counts = (
+            db.query(EstateAllocation.customer_id, func.count(EstateAllocation.id).label("plot_count"))
+            .filter(EstateAllocation.organization_id == organization_id, EstateAllocation.status.in_(("reserved", "allocated")))
+            .group_by(EstateAllocation.customer_id)
+            .subquery()
+        )
+        query = query.outerjoin(active_plot_counts, active_plot_counts.c.customer_id == EstateCustomer.id)
+        if plot_filter == "multiple_plots":
+            query = query.filter(func.coalesce(active_plot_counts.c.plot_count, 0) > 1)
+        else:
+            query = query.filter(func.coalesce(active_plot_counts.c.plot_count, 0) == 0)
     ordered = query.order_by(EstateCustomer.created_at.desc(), EstateCustomer.id.desc())
     safe_page = max(1, page)
     safe_page_size = min(max(page_size, 1), 100)
     total = ordered.count()
     rows = ordered.offset((safe_page - 1) * safe_page_size).limit(safe_page_size).all()
-    return {"items": [{"id": row.id, "name": row.full_name, "reference": row.reference_no} for row in rows], "page": safe_page, "page_size": safe_page_size, "total": total}
+
+    customer_ids = [row.id for row in rows]
+    allocations = db.query(EstateAllocation).filter(EstateAllocation.customer_id.in_(customer_ids or [-1]), EstateAllocation.status.in_(("reserved", "allocated"))).all() if customer_ids else []
+    summaries = _bulk_financial_summaries(db, allocations)
+    totals_by_customer: dict[int, dict[str, Decimal]] = {}
+    for allocation in allocations:
+        bucket = totals_by_customer.setdefault(allocation.customer_id, {"plot_count": 0, "agreed_price": Decimal(0), "outstanding": Decimal(0)})
+        bucket["plot_count"] += 1
+        summary = summaries.get(allocation.id, {})
+        bucket["agreed_price"] += summary.get("agreed_price", Decimal(0))
+        bucket["outstanding"] += summary.get("outstanding", Decimal(0))
+
+    return {
+        "items": [
+            {
+                "id": row.id,
+                "name": row.full_name,
+                "reference": row.reference_no,
+                "phone": row.phone,
+                "email": row.email,
+                "plot_count": int(totals_by_customer.get(row.id, {}).get("plot_count", 0)),
+                "agreed_price": str(totals_by_customer.get(row.id, {}).get("agreed_price", Decimal(0))),
+                "outstanding": str(totals_by_customer.get(row.id, {}).get("outstanding", Decimal(0))),
+            }
+            for row in rows
+        ],
+        "page": safe_page,
+        "page_size": safe_page_size,
+        "total": total,
+    }
 
 
 @router.post("/{estate_id}/customers/sms")
