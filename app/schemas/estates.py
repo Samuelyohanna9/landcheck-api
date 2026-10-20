@@ -374,6 +374,33 @@ class PaymentReminderSend(BaseModel):
     method: str = Field(pattern="^(online_link|bank_details|both)$")
 
 
+class ImportSheetMapping(BaseModel):
+    entity_types: list[str] = Field(min_length=1)
+    mapping: dict[str, str | None]
+    opening_balance: bool = False
+
+
+class ImportMappingSubmit(BaseModel):
+    sheets: dict[str, ImportSheetMapping]
+    day_first: bool = True
+    opening_balance_cutoff: datetime | None = None
+    save_preset_name: str | None = Field(default=None, max_length=160)
+
+
+class ImportRowOverride(BaseModel):
+    resolution: str = Field(pattern="^(create|update|skip)$")
+
+
+class ImportCommitRequest(BaseModel):
+    row_ids: list[int] | None = None
+
+
+class ImportMappingPresetCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=160)
+    entity_type: str = Field(min_length=1, max_length=32)
+    mapping: dict[str, str | None]
+
+
 class PaymentIssueReportCreate(BaseModel):
     organization_id: int
     charge_attempt_id: int | None = None

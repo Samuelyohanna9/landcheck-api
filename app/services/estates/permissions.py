@@ -36,6 +36,8 @@ ROLE_PERMISSIONS: Final[dict[str, frozenset[str]]] = {
             "report.read",
             "audit.read",
             "marketing.manage",
+            "integration.read",
+            "integration.manage",
         }
     ),
     "accounts": frozenset({"estate.read", "plot.read", "customer.read", "allocation.read", "payment.read", "payment.manage", "document.read", "document.manage", "report.read", "audit.read"}),
@@ -108,6 +110,10 @@ PERMISSION_CATALOG: Final[list[dict]] = [
     ]},
     {"group": "Billing", "items": [
         {"key": "billing.manage", "label": "Manage billing & subscription"},
+    ]},
+    {"group": "Integrations", "items": [
+        {"key": "integration.read", "label": "View connected integrations & import history"},
+        {"key": "integration.manage", "label": "Import spreadsheets & manage integrations"},
     ]},
 ]
 

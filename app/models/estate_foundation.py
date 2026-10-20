@@ -291,6 +291,10 @@ class EstateCustomer(Base):
     idempotency_key = Column(String(128), nullable=True)
     organization_id = Column(Integer, ForeignKey("estate_organizations.id", ondelete="CASCADE"), nullable=False)
     reference_no = Column(String(80), nullable=True)
+    # A durable cross-system id for spreadsheet re-imports (distinct from idempotency_key, which
+    # is single-request retry semantics only) - "this row maps to customer #482 in your
+    # spreadsheet" across repeat imports. Nullable; unique per org when supplied.
+    external_id = Column(String(128), nullable=True)
     full_name = Column(String(255), nullable=False)
     full_name_normalized = Column(String(255), nullable=False)
     phone = Column(String(64), nullable=True)
@@ -312,6 +316,10 @@ class EstateAllocation(Base):
     plot_id = Column(Integer, ForeignKey("estate_plots.id", ondelete="RESTRICT"), nullable=False)
     customer_id = Column(Integer, ForeignKey("estate_customers.id", ondelete="RESTRICT"), nullable=False)
     status = Column(String(32), nullable=False)
+    # A sale/contract reference from an external system (e.g. a spreadsheet's own "Contract No."
+    # column) - nullable, not unique (a developer's old contract numbers aren't guaranteed
+    # globally unique), used only as a match hint on re-import.
+    external_reference = Column(String(160), nullable=True)
     reservation_date = Column(DateTime(timezone=True), nullable=True)
     reservation_expires_at = Column(DateTime(timezone=True), nullable=True)
     reservation_reminder_sent_at = Column(DateTime(timezone=True), nullable=True)
@@ -741,6 +749,83 @@ class EstateImportReview(Base):
     candidate_data = Column(JSON, nullable=False, default=list)
     created_by_subject_type = Column(String(64), nullable=False)
     created_by_subject_id = Column(String(128), nullable=False)
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+
+class EstateImportBatch(Base):
+    """One spreadsheet upload through the "Connect your tools" Integrations feature - customers,
+    plots, sales/allocations and payments, staged for review before anything is committed. The
+    plot-geometry equivalent of this is EstateImportReview above; this one is for business
+    records, following the same "upload -> validate -> stage -> approve" shape."""
+
+    __tablename__ = "estate_import_batches"
+    id = Column(Integer, primary_key=True)
+    batch_uid = Column(String(36), nullable=False, unique=True, default=lambda: str(uuid.uuid4()))
+    organization_id = Column(Integer, ForeignKey("estate_organizations.id", ondelete="CASCADE"), nullable=False)
+    estate_id = Column(Integer, ForeignKey("estate_estates.id", ondelete="CASCADE"), nullable=False)
+    source_filename = Column(String(255), nullable=False)
+    status = Column(String(16), nullable=False, default="uploaded")
+    column_mapping = Column(JSON, nullable=True)
+    # Required only when a batch mixes opening-balance rows with dated transaction rows, so
+    # transactions after this date aren't double-counted against the opening total - see
+    # app/services/estates/data_import.py.
+    opening_balance_cutoff = Column(DateTime(timezone=True), nullable=True)
+    row_counts = Column(JSON, nullable=True)
+    uploaded_by_subject_type = Column(String(64), nullable=False)
+    uploaded_by_subject_id = Column(String(128), nullable=False)
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    committed_at = Column(DateTime(timezone=True), nullable=True)
+    reversed_at = Column(DateTime(timezone=True), nullable=True)
+    reversed_by_subject_type = Column(String(64), nullable=True)
+    reversed_by_subject_id = Column(String(128), nullable=True)
+
+    __table_args__ = (
+        CheckConstraint("status IN ('uploaded', 'previewed', 'committed', 'reversed')", name="ck_estate_import_batches_status"),
+    )
+
+
+class EstateImportRow(Base):
+    """One logical record (a customer + optionally their plot/sale/payment) staged within an
+    EstateImportBatch - normalized to this one shape regardless of whether the source was a
+    single combined sheet or several linked worksheets, see data_import.py."""
+
+    __tablename__ = "estate_import_rows"
+    id = Column(Integer, primary_key=True)
+    batch_id = Column(Integer, ForeignKey("estate_import_batches.id", ondelete="CASCADE"), nullable=False)
+    row_index = Column(Integer, nullable=False)
+    source_data = Column(JSON, nullable=False)
+    match_status = Column(String(16), nullable=False, default="new")
+    matched_entity_type = Column(String(32), nullable=True)
+    matched_entity_id = Column(Integer, nullable=True)
+    resolution = Column(String(16), nullable=False, default="create")
+    issues = Column(JSON, nullable=False, default=list)
+    committed_customer_id = Column(Integer, ForeignKey("estate_customers.id", ondelete="SET NULL"), nullable=True)
+    committed_allocation_id = Column(Integer, ForeignKey("estate_allocations.id", ondelete="SET NULL"), nullable=True)
+    committed_payment_id = Column(Integer, ForeignKey("estate_payments.id", ondelete="SET NULL"), nullable=True)
+    # Distinguishes "this row created a brand-new record" from "this row matched an existing one"
+    # - committed_*_id alone can't tell the two apart, and reversal must only ever undo what the
+    # import itself created, never touch a pre-existing record it just happened to match.
+    created_new_customer = Column(Boolean, nullable=False, default=False)
+    created_new_allocation = Column(Boolean, nullable=False, default=False)
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+    __table_args__ = (
+        CheckConstraint("match_status IN ('new', 'matched', 'ambiguous', 'conflict', 'error')", name="ck_estate_import_rows_match_status"),
+        CheckConstraint("resolution IN ('create', 'update', 'skip')", name="ck_estate_import_rows_resolution"),
+        Index("idx_estate_import_rows_batch", "batch_id"),
+    )
+
+
+class EstateImportMappingPreset(Base):
+    """A saved column-mapping so a developer doesn't have to re-map the same spreadsheet layout
+    on every repeat import/export from their own system."""
+
+    __tablename__ = "estate_import_mapping_presets"
+    id = Column(Integer, primary_key=True)
+    organization_id = Column(Integer, ForeignKey("estate_organizations.id", ondelete="CASCADE"), nullable=False)
+    name = Column(String(160), nullable=False)
+    entity_type = Column(String(32), nullable=False)
+    mapping = Column(JSON, nullable=False)
     created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
 
 

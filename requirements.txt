@@ -17,6 +17,7 @@ osmnx
 pyproj
 numpy
 pandas
+openpyxl
 requests
 earthengine-api
 google-auth
