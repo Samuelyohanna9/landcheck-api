@@ -12,6 +12,8 @@ from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import Response
+from openpyxl import Workbook
+from openpyxl.styles import Font
 from sqlalchemy.orm import Session
 
 from app.models.estate_foundation import (
@@ -43,13 +45,31 @@ def _sheet_summary(rows: list[dict]) -> dict:
 
 @router.get("/field-templates")
 def download_field_template():
-    """A downloadable starting-point CSV - entirely optional, per the product spec; a developer's
-    own column names work fine via the mapping step without ever touching this."""
-    buffer = io.StringIO()
-    writer = csv.writer(buffer)
-    writer.writerow(["Customer ID", "Client Name", "Phone", "Email", "Plot No.", "Block", "Agreed Price", "Sale Date", "Contract No.", "Amount Paid", "Payment Date", "Payment Method", "Reference"])
-    writer.writerow(["", "Jane Doe", "08031234567", "jane@example.com", "A-015", "Block A", "5000000", "2025-03-01", "CN-1001", "500000", "2025-03-01", "bank_transfer", "TXN-001"])
-    return Response(buffer.getvalue(), media_type="text/csv", headers={"Content-Disposition": "attachment; filename=\"landcheck-import-template.csv\""})
+    """A downloadable starting-point workbook - entirely optional, per the product spec; a
+    developer's own column names work fine via the mapping step without ever touching this.
+    A real .xlsx (not a comma-delimited .csv) so every field lands in its own column regardless
+    of the user's Excel locale/list-separator settings, instead of spilling into column A."""
+    headers = ["Customer ID", "Client Name", "Phone", "Email", "Plot No.", "Block", "Agreed Price", "Sale Date", "Contract No.", "Amount Paid", "Payment Date", "Payment Method", "Reference"]
+    sample_row = ["", "Jane Doe", "08031234567", "jane@example.com", "A-015", "Block A", 5000000, "2025-03-01", "CN-1001", 500000, "2025-03-01", "bank_transfer", "TXN-001"]
+
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "Import template"
+    sheet.append(headers)
+    for cell in sheet[1]:
+        cell.font = Font(bold=True)
+    sheet.append(sample_row)
+    for column_cells in sheet.columns:
+        width = max((len(str(cell.value)) for cell in column_cells if cell.value is not None), default=10)
+        sheet.column_dimensions[column_cells[0].column_letter].width = max(10, width + 2)
+
+    buffer = io.BytesIO()
+    workbook.save(buffer)
+    return Response(
+        buffer.getvalue(),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": "attachment; filename=\"landcheck-import-template.xlsx\""},
+    )
 
 
 @router.post("/detect")
