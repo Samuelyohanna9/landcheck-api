@@ -387,6 +387,13 @@ class ImportMappingSubmit(BaseModel):
     save_preset_name: str | None = Field(default=None, max_length=160)
 
 
+class AllocationPaymentPlanUpdate(BaseModel):
+    """None (or an omitted payment_schedule) clears the plan - set via the Customers or Payments
+    page for an allocation already reserved/allocated, distinct from the schedule a staff member
+    can also set at reserve/allocate time (see PaymentScheduleInput / _allocation_payment_fields)."""
+    payment_schedule: PaymentScheduleInput | None = None
+
+
 class ImportRowOverride(BaseModel):
     resolution: str | None = Field(default=None, pattern="^(create|update|skip)$")
     plot_id: int | None = None

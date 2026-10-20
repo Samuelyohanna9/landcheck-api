@@ -50,8 +50,8 @@ def download_field_template():
     developer's own column names work fine via the mapping step without ever touching this.
     A real .xlsx (not a comma-delimited .csv) so every field lands in its own column regardless
     of the user's Excel locale/list-separator settings, instead of spilling into column A."""
-    headers = ["Customer ID", "Client Name", "Phone", "Email", "Plot No.", "Block", "Agreed Price", "Sale Date", "Contract No.", "Amount Paid", "Payment Date", "Payment Method", "Reference"]
-    sample_row = ["", "Jane Doe", "08031234567", "jane@example.com", "A-015", "Block A", 5000000, "2025-03-01", "CN-1001", 500000, "2025-03-01", "bank_transfer", "TXN-001"]
+    headers = ["Customer ID", "Client Name", "Phone", "Email", "Plot No.", "Block", "Agreed Price", "Sale Date", "Contract No.", "Installment Amount", "Installment Interval (months)", "Next Due Date", "Amount Paid", "Payment Date", "Payment Method", "Reference"]
+    sample_row = ["", "Jane Doe", "08031234567", "jane@example.com", "A-015", "Block A", 5000000, "2025-03-01", "CN-1001", 250000, 1, "2026-04-01", 500000, "2025-03-01", "bank_transfer", "TXN-001"]
 
     workbook = Workbook()
     sheet = workbook.active

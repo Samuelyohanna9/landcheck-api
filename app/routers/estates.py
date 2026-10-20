@@ -36,7 +36,7 @@ from app.services.estates.identity import generate_temp_password, hash_password,
 from app.services.estates.entitlements import ESTATE_FEATURES, get_estate_entitlement
 from app.models.estate_foundation import Estate, EstateAgentPortalToken, EstateAllocation, EstateAllocationChargeAttempt, EstateAuditEvent, EstateBlock, EstateCommissionPayout, EstateCommissionTier, EstateCustomer, EstateCustomerPortalToken, EstateDocument, EstateDocumentLink, EstateFieldInspection, EstateHazardAssessment, EstateImportReview, EstateLayoutProposal, EstateNotificationLog, EstateOrganization, EstateOrganizationMember, EstatePayment, EstatePaymentInbox, EstatePaymentRule, EstatePlot, EstatePublicReservationRequest, EstateQrCampaign, EstateSoilAssessment, EstateSpatialFeature, EstateStaffRole, EstateSurveyRequest, EstateStakingTask, GeotechSurveyRequest
 from app.models.estate_marketing import EstateApprovalMilestone, EstateLiveInspectionSession, EstateProgressUpdate
-from app.schemas.estates import AllocationAction, BlockCreate, BlockUpdate, BuyerAllocationPaymentCreate, PaymentIssueReportCreate, PaymentReminderSend, CommissionPayoutCreate, CommissionTiersUpdate, CustomerCreate, DevelopmentForecastPublishUpdate, DevelopmentStatusUpdate, EstateCreate, EstateLayoutCriteria, EstateLayoutDecision, EstateLayoutFeatureAdd, EstateLayoutFeatureRemove, EstateLayoutProposalEdit, EstateSubdivisionCreate, EstateUpdate, FieldInspectionCreate, GeoreferenceSessionLink, ImportFromGeoreference, ImportReviewCreate, ImportReviewDecision, ImportReviewFromGeoreferenceSession, MemberCreate, MemberUpdate, PaymentInboxCreate, PaymentInboxMatch, PlotCreate, PlotAddressUpdate, PlotGeometryUpdate, PlotListingDefaultsUpdate, PlotPriceUpdate, PortalTokenCreate, BulkCustomerSmsCreate, PublicEstateSettingsUpdate, PublicReservationConvert, PublicReservationCreate, PublicReservationUpdate, PaymentCreate, QrCampaignCreate, SpatialFeatureCreate, SpatialFeatureUpdate, StaffCreate, StaffRoleCreate, StaffRoleUpdate, StaffUpdate, SurveyEligibilityUpdate, TitleVerificationUpdate, VoidAction
+from app.schemas.estates import AllocationAction, AllocationPaymentPlanUpdate, BlockCreate, BlockUpdate, BuyerAllocationPaymentCreate, PaymentIssueReportCreate, PaymentReminderSend, CommissionPayoutCreate, CommissionTiersUpdate, CustomerCreate, DevelopmentForecastPublishUpdate, DevelopmentStatusUpdate, EstateCreate, EstateLayoutCriteria, EstateLayoutDecision, EstateLayoutFeatureAdd, EstateLayoutFeatureRemove, EstateLayoutProposalEdit, EstateSubdivisionCreate, EstateUpdate, FieldInspectionCreate, GeoreferenceSessionLink, ImportFromGeoreference, ImportReviewCreate, ImportReviewDecision, ImportReviewFromGeoreferenceSession, MemberCreate, MemberUpdate, PaymentInboxCreate, PaymentInboxMatch, PaymentScheduleInput, PlotCreate, PlotAddressUpdate, PlotGeometryUpdate, PlotListingDefaultsUpdate, PlotPriceUpdate, PortalTokenCreate, BulkCustomerSmsCreate, PublicEstateSettingsUpdate, PublicReservationConvert, PublicReservationCreate, PublicReservationUpdate, PaymentCreate, QrCampaignCreate, SpatialFeatureCreate, SpatialFeatureUpdate, StaffCreate, StaffRoleCreate, StaffRoleUpdate, StaffUpdate, SurveyEligibilityUpdate, TitleVerificationUpdate, VoidAction
 from app.services.estates.payments import confirm_payment, financial_summary, record_payment, void_payment
 from app.services.estates.documents import MAX_ESTATE_DOCUMENT_BYTES, read_private_estate_file, store_private_estate_file
 from app.utils.r2_objects import delete_object_best_effort, build_r2_settings
@@ -4902,10 +4902,51 @@ def customer_financial_detail(customer_id:int,request:Request,db:Session=Depends
     if not customer: raise HTTPException(404,"Customer not found")
     require_estate_view_access(db,request,customer.organization_id,permission="payment.read")
     allocations=db.query(EstateAllocation).filter(EstateAllocation.customer_id==customer_id, EstateAllocation.organization_id==customer.organization_id).all(); rows=[]
+    now=datetime.now(timezone.utc)
+    totals={"agreed_price":Decimal("0"),"confirmed_paid":Decimal("0"),"pending_paid":Decimal("0"),"outstanding":Decimal("0")}
     for allocation in allocations:
         summary=financial_summary(db,allocation); estate=db.get(Estate,allocation.estate_id); plot=db.get(EstatePlot,allocation.plot_id)
-        rows.append({"allocation_id":allocation.id,"allocation_date":allocation.allocation_date,"payment_plan":allocation.payment_plan,"estate":{"id":estate.id,"name":estate.name},"plot":{"id":plot.id,"number":plot.plot_number},"agreed_price":str(summary.agreed_price),"confirmed":str(summary.confirmed_paid),"pending":str(summary.pending_paid),"outstanding":str(summary.outstanding),"percentage":str(summary.percentage),"payment_count":db.query(EstatePayment).filter(EstatePayment.allocation_id==allocation.id).count()})
-    return {"customer":{"id":customer.id,"name":customer.full_name,"reference":customer.reference_no,"phone":customer.phone,"email":customer.email},"allocations":rows}
+        totals["agreed_price"]+=summary.agreed_price; totals["confirmed_paid"]+=summary.confirmed_paid; totals["pending_paid"]+=summary.pending_paid; totals["outstanding"]+=summary.outstanding
+        due_at=allocation.next_payment_due_at
+        if due_at is not None and due_at.tzinfo is None: due_at=due_at.replace(tzinfo=timezone.utc)
+        rows.append({
+            "allocation_id":allocation.id,"status":allocation.status,"allocation_date":allocation.allocation_date,
+            "payment_plan":allocation.payment_plan,"next_payment_due_at":allocation.next_payment_due_at,
+            "is_overdue":bool(due_at and due_at<now and summary.outstanding>0),
+            "estate":{"id":estate.id,"name":estate.name},"plot":{"id":plot.id,"number":plot.plot_number},
+            "agreed_price":str(summary.agreed_price),"confirmed":str(summary.confirmed_paid),"pending":str(summary.pending_paid),"outstanding":str(summary.outstanding),"percentage":str(summary.percentage),
+            "payment_count":db.query(EstatePayment).filter(EstatePayment.allocation_id==allocation.id).count(),
+        })
+    return {"customer":{"id":customer.id,"name":customer.full_name,"reference":customer.reference_no,"phone":customer.phone,"email":customer.email},"totals":{key:str(value) for key,value in totals.items()},"allocations":rows}
+
+
+@router.patch("/allocations/{allocation_id}/payment-plan")
+def update_allocation_payment_plan(allocation_id:int,payload:AllocationPaymentPlanUpdate,request:Request,db:Session=Depends(get_db)):
+    allocation=db.get(EstateAllocation,allocation_id)
+    if not allocation: raise HTTPException(404,"Allocation not found")
+    access=require_estate_access(db,request,allocation.organization_id,permission="payment.manage")
+    if allocation.status not in ("reserved","allocated"):
+        raise HTTPException(409,"Only an active (reserved or allocated) allocation can have a payment plan")
+    before={"payment_plan":allocation.payment_plan,"next_payment_due_at":allocation.next_payment_due_at.isoformat() if allocation.next_payment_due_at else None}
+    if payload.payment_schedule is None:
+        allocation.payment_plan=None
+        allocation.next_payment_due_at=None
+        allocation.payment_reminder_sent_for_due_at=None
+    else:
+        schedule=payload.payment_schedule
+        next_due_at=schedule.next_due_at or schedule.first_due_at
+        if next_due_at is None: raise HTTPException(422,"Enter the next instalment due date.")
+        normalized_due_at=next_due_at if next_due_at.tzinfo else next_due_at.replace(tzinfo=timezone.utc)
+        allocation.payment_plan=json.dumps({"type":"installment","installment_amount":str(schedule.installment_amount),"interval_months":schedule.interval_months,"next_due_at":normalized_due_at.isoformat()})
+        allocation.next_payment_due_at=normalized_due_at
+        allocation.payment_reminder_sent_for_due_at=None
+    append_estate_audit_event(
+        db,organization_id=allocation.organization_id,actor=access.principal,action="allocation.payment_plan_updated",
+        entity_type="estate_allocation",entity_id=allocation.id,before_data=before,
+        after_data={"payment_plan":allocation.payment_plan,"next_payment_due_at":allocation.next_payment_due_at.isoformat() if allocation.next_payment_due_at else None},
+    )
+    db.commit()
+    return {"id":allocation.id,"payment_plan":allocation.payment_plan,"next_payment_due_at":allocation.next_payment_due_at}
 
 @router.get("/{estate_id}/financial-summary")
 def estate_financial_summary(estate_id:int,request:Request,db:Session=Depends(get_db)):

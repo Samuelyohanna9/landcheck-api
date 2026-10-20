@@ -12,6 +12,7 @@ Plots are only ever MATCHED against existing EstatePlot rows, never created from
 row - per the product spec, inventing plot geometry from a row of text would be unsafe."""
 
 import io
+import json
 import logging
 import re
 from dataclasses import dataclass, field
@@ -61,6 +62,12 @@ SALE_FIELD_SYNONYMS: dict[str, list[str]] = {
     "sale_date": ["sale date", "date of sale", "agreement date", "contract date"],
     "agent": ["agent", "sales agent", "sold by"],
     "status": ["status", "sale status", "allocation status"],
+    # An ongoing installment plan the sale is still being paid off on - distinct from a payment
+    # sheet's own individual transaction rows (see PAYMENT_FIELD_SYNONYMS below). All three of
+    # these must be present for a plan to be set; a partial set is flagged, not guessed at.
+    "installment_amount": ["installment amount", "instalment amount", "monthly installment", "monthly instalment", "recurring installment", "recurring instalment"],
+    "interval_months": ["installment interval", "instalment interval", "installment interval months", "instalment interval months", "installment frequency months", "months between installments", "months between instalments"],
+    "next_due_date": ["next due date", "next payment due", "next installment date", "next instalment date", "next due"],
 }
 PAYMENT_FIELD_SYNONYMS: dict[str, list[str]] = {
     "reference_no": ["reference", "ref", "transaction id", "txn id", "receipt no", "receipt number"],
@@ -79,7 +86,7 @@ FIELD_SYNONYMS_BY_ENTITY: dict[str, dict[str, list[str]]] = {
 
 
 def _normalize_header(value: str) -> str:
-    text = re.sub(r"[.\-_/]+", " ", str(value or "").strip().lower())
+    text = re.sub(r"[.\-_/()]+", " ", str(value or "").strip().lower())
     return re.sub(r"\s+", " ", text).strip()
 
 
@@ -167,10 +174,24 @@ def parse_amount(raw: Any) -> Decimal | None:
         return None
 
 
+_ISO_DATE_RE = re.compile(r"^(\d{4})[-/](\d{1,2})[-/](\d{1,2})(?:[ T].*)?$")
+
+
 def parse_date(raw: Any, *, day_first: bool = True) -> datetime | None:
+    """dateutil's own dayfirst flag misreads an unambiguous year-first date like "2026-04-01" as
+    4 Jan instead of 1 Apr - it applies dayfirst's day/month swap even when the leading 4-digit
+    year makes the format unambiguous. Handled directly here before falling back to dateutil for
+    every other (genuinely ambiguous, e.g. "01/04/2026") format."""
     text = str(raw or "").strip()
     if not text:
         return None
+    iso_match = _ISO_DATE_RE.match(text)
+    if iso_match:
+        year, month, day = (int(part) for part in iso_match.groups())
+        try:
+            return datetime(year, month, day, tzinfo=timezone.utc)
+        except ValueError:
+            return None
     try:
         parsed = dateutil_parser.parse(text, dayfirst=day_first, fuzzy=False)
     except (ValueError, OverflowError):
@@ -187,6 +208,34 @@ def normalize_nigerian_phone(raw: Any) -> str | None:
     elif len(digits) == 10:
         digits = "234" + digits
     return digits
+
+
+def resolve_installment_plan(sale_data: dict[str, Any] | None, *, day_first: bool = True) -> tuple[str | None, datetime | None, list[str]]:
+    """An imported sale can carry an ongoing recurring installment plan (deliberately the same
+    {type, installment_amount, interval_months, next_due_at} shape the live reserve/allocate flow
+    writes to EstateAllocation.payment_plan - see _allocation_payment_fields in estates.py -
+    so the exact same Due Payments board, reminders and payment-plan editor pick it up with no
+    special-casing for imported data). next_due_at is accepted even in the past (unlike a brand
+    new plan created today) since importing a customer's real, possibly-already-overdue plan is
+    the whole point."""
+    if not sale_data:
+        return None, None, []
+    amount = parse_amount(sale_data.get("installment_amount"))
+    interval_raw = str(sale_data.get("interval_months") or "").strip()
+    due_date = parse_date(sale_data.get("next_due_date"), day_first=day_first)
+    provided = [bool(amount), bool(interval_raw), bool(due_date)]
+    if not any(provided):
+        return None, None, []
+    if not all(provided):
+        return None, None, ["Incomplete installment schedule - installment amount, interval (months) and next due date are all required; imported without a plan"]
+    try:
+        interval_months = int(float(interval_raw))
+    except ValueError:
+        return None, None, [f"Installment interval \"{interval_raw}\" is not a whole number of months - imported without a plan"]
+    if interval_months <= 0:
+        return None, None, ["Installment interval must be at least 1 month - imported without a plan"]
+    plan = json.dumps({"type": "installment", "installment_amount": str(amount), "interval_months": interval_months, "next_due_at": due_date.isoformat()})
+    return plan, due_date, []
 
 
 # ─── Matching & validation ───────────────────────────────────────────────────────────────────
@@ -322,6 +371,9 @@ def match_and_validate_rows(db: Session, *, organization_id: int, estate: Estate
             if abs(summary.outstanding - supplied_outstanding) > Decimal("1"):
                 issues.append(f"Spreadsheet balance (NGN {supplied_outstanding}) does not match LandCheck's calculated balance (NGN {summary.outstanding}) - will not overwrite either number")
 
+        _, _, installment_issues = resolve_installment_plan(record.get("sale"), day_first=day_first)
+        issues.extend(installment_issues)
+
         statuses = [customer_status, plot_status if record.get("plot") else "new", allocation_status if (record.get("sale") or record.get("payment")) else "new"]
         if "error" in statuses:
             overall = "error"
@@ -442,6 +494,11 @@ def commit_import_rows(db: Session, *, batch: EstateImportBatch, rows: list[Esta
                     row.committed_allocation_id = allocation.id
                     customer = customer or db.get(EstateCustomer, allocation.customer_id)
                     plot = plot or db.get(EstatePlot, allocation.plot_id)
+                    plan, plan_due_at, _ = resolve_installment_plan(sale_data)
+                    if plan is not None:
+                        allocation.payment_plan = plan
+                        allocation.next_payment_due_at = plan_due_at
+                        allocation.payment_reminder_sent_for_due_at = None
 
             payment_data = record.get("payment")
             if payment_data and allocation is not None:
