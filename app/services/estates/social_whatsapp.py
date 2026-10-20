@@ -34,18 +34,23 @@ PRESETS = {
         "env": "WA_TEMPLATE_NEW_PLOTS",
         "default_name": "estate_new_plots",
         "sample": "Hello {{1}}, new plots are now available at {{2}}, from {{3}}. View the live map and prices: {{4}}. Reply STOP to stop updates.",
+        # The plain-text equivalent sent over SMS instead, where there's no template-approval
+        # requirement - {} placeholders filled with the same 4 params (name, estate, detail, link).
+        "sms_body": "Hello {0}, new plots are now available at {1}, from {2}. View: {3}",
     },
     "price_update": {
         "label": "Price or payment-plan update",
         "env": "WA_TEMPLATE_PRICE_UPDATE",
         "default_name": "estate_price_update",
         "sample": "Hello {{1}}, there is an update at {{2}}: {{3}}. Details: {{4}}. Reply STOP to stop updates.",
+        "sms_body": "Hello {0}, update at {1}: {2}. Details: {3}",
     },
     "inspection_invite": {
         "label": "Site inspection invitation",
         "env": "WA_TEMPLATE_INSPECTION",
         "default_name": "estate_inspection_invite",
         "sample": "Hello {{1}}, you are invited to a site inspection at {{2}}: {{3}}. Book your place: {{4}}. Reply STOP to stop updates.",
+        "sms_body": "Hello {0}, you're invited to a site inspection at {1}: {2}. Book: {3}",
     },
 }
 
@@ -87,6 +92,13 @@ def _clean_param(value: Any) -> str:
     return re.sub(r"\s{2,}", " ", re.sub(r"[\r\n\t]+", " ", str(value or ""))).strip()[:200] or "-"
 
 
+def sms_text(preset: str, params: list[str]) -> str:
+    """The plain-text SMS equivalent of a WhatsApp template preset - no Meta template approval
+    needed for SMS, so this is just the same params formatted into ordinary text."""
+    cleaned = [_clean_param(value) for value in params]
+    return PRESETS[preset]["sms_body"].format(*cleaned)[:459]
+
+
 class WhatsAppError(RuntimeError):
     def __init__(self, message: str, *, code: int | None = None, subcode: int | None = None, trace_id: str | None = None):
         super().__init__(message)
@@ -111,17 +123,15 @@ def _raise_for(response: requests.Response, *, context: str) -> dict[str, Any]:
     return data
 
 
-def send_template(to_digits: str, name: str, params: list[str], *, language: str = "en", header_image_url: str | None = None) -> str:
-    """Sends one approved template message. Returns the WhatsApp message id.
+# Meta's template-creation UI offers both a generic "English" (code "en") and a region-specific
+# "English (US)" (code "en_US") option, and it's an easy, common mistake to approve a template
+# under one while the server sends the other - Meta then rejects the send with a generic
+# "(#100) Invalid parameter" rather than a clearer "language not found" error. These are the two
+# codes actually worth auto-retrying between; anything else is a real mismatch worth surfacing.
+_LANGUAGE_FALLBACKS = {"en": "en_US", "en_US": "en"}
 
-    header_image_url only has an effect once the named template was itself approved with an IMAGE
-    header component - see template_images_enabled()."""
-    if not configured():
-        raise WhatsAppError("WhatsApp messaging is not configured on this server")
-    components = []
-    if header_image_url:
-        components.append({"type": "header", "parameters": [{"type": "image", "image": {"link": header_image_url}}]})
-    components.append({"type": "body", "parameters": [{"type": "text", "text": _clean_param(value)} for value in params]})
+
+def _post_template(to_digits: str, name: str, language: str, components: list[dict]) -> dict:
     body = {
         "messaging_product": "whatsapp",
         "to": to_digits,
@@ -138,7 +148,32 @@ def send_template(to_digits: str, name: str, params: list[str], *, language: str
         json=body,
         timeout=TIMEOUT,
     )
-    data = _raise_for(response, context=f"send_template:{name}")
+    return _raise_for(response, context=f"send_template:{name}")
+
+
+def send_template(to_digits: str, name: str, params: list[str], *, language: str = "en", header_image_url: str | None = None) -> str:
+    """Sends one approved template message. Returns the WhatsApp message id.
+
+    header_image_url only has an effect once the named template was itself approved with an IMAGE
+    header component - see template_images_enabled()."""
+    if not configured():
+        raise WhatsAppError("WhatsApp messaging is not configured on this server")
+    components = []
+    if header_image_url:
+        components.append({"type": "header", "parameters": [{"type": "image", "image": {"link": header_image_url}}]})
+    components.append({"type": "body", "parameters": [{"type": "text", "text": _clean_param(value)} for value in params]})
+    try:
+        data = _post_template(to_digits, name, language, components)
+    except WhatsAppError as exc:
+        fallback_language = _LANGUAGE_FALLBACKS.get(language)
+        if exc.code == 100 and fallback_language:
+            logger.warning("WhatsApp template '%s' rejected under language '%s' (code 100) - retrying with '%s'", name, language, fallback_language)
+            try:
+                data = _post_template(to_digits, name, fallback_language, components)
+            except WhatsAppError:
+                raise exc from None
+        else:
+            raise
     messages = data.get("messages") or []
     return str(messages[0].get("id")) if messages else ""
 

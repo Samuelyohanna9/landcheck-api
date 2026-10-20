@@ -19,11 +19,12 @@ from app.models.estate_foundation import Estate, EstateAllocation, EstateCustome
 from app.models.estate_social import EstateMarketingOptin, EstateSocialAccount, EstateSocialPlan, EstateSocialPost, EstateWhatsappMessage, EstateWhatsappSend
 from app.routers.estate_marketing import NO_CACHE_PRIVATE, _campaign_for_staff, _png, _staff, _staff_view
 from app.routers.plots import get_db
-from app.services.estates import marketing_render, social_broadcast, social_meta, social_planner, social_posts, social_templates, social_whatsapp, whatsapp_inbox
+from app.services.estates import estate_sms, marketing_render, social_broadcast, social_meta, social_planner, social_posts, social_templates, social_whatsapp, whatsapp_inbox
 from app.services.estates.audit import append_estate_audit_event
 from app.services.estates.authorization import require_estate_access
 from app.services.estates.marketing_common import client_ip, normalize_phone_digits, public_page_url, throttled, web_url
-from app.services.estates.subscriptions import get_subscription, has_auto_posting_access, has_whatsapp_access
+from app.services.estates.operations import record_notification_log
+from app.services.estates.subscriptions import get_subscription, has_auto_posting_access, has_sms_access, has_whatsapp_access
 from app.services.estates.social_templates import ALL_CHANNELS, AUTOMATIC_CHANNELS, CHANNEL_FORMAT, CHANNEL_LABEL, MANUAL_CHANNELS
 from app.utils.r2_objects import build_public_url, build_r2_settings, upload_bytes
 from app.utils.secret_box import SecretNotConfigured, decrypt_text, encrypt_text, make_signed_token, read_signed_token, secret_configured
@@ -1106,24 +1107,36 @@ def get_whatsapp_profile(estate_id: int, request: Request, db: Session = Depends
 class CustomerWhatsappMessage(BaseModel):
     preset: str
     detail: str | None = Field(default=None, max_length=200)
+    channel: str = Field(default="whatsapp", pattern="^(whatsapp|sms)$")
+
+
+def _whatsapp_send_error_detail(exc: "social_whatsapp.WhatsAppError") -> str:
+    base = str(exc)
+    if exc.code == 100:
+        return (
+            f"{base} - this usually means the approved WhatsApp template doesn't match what's being "
+            "sent: either the number of variables in WhatsApp Manager is different from the 4 this "
+            "preset sends (name, estate, detail, link), or the template's approved language doesn't "
+            "match. Check the template in WhatsApp Manager, or send this as an SMS instead."
+        )
+    return base
 
 
 @router.post("/customers/{customer_id}/whatsapp-message")
 def send_customer_whatsapp_message(customer_id: int, payload: CustomerWhatsappMessage, request: Request, db: Session = Depends(get_db)):
-    """A single, targeted template message to one customer - not a broadcast. Uses the same approved
-    presets as the opt-in broadcast system, since only pre-approved templates can reliably reach
-    someone who hasn't messaged LandCheck's WhatsApp number in the last 24 hours."""
+    """A single, targeted message to one customer - not a broadcast - over WhatsApp (an approved
+    template, same presets as the opt-in broadcast system, since only those can reliably reach
+    someone who hasn't messaged LandCheck's WhatsApp number in the last 24 hours) or, when chosen,
+    plain SMS (no template-approval requirement, so it's also the fallback when a WhatsApp
+    template isn't configured right)."""
     customer = db.get(EstateCustomer, customer_id)
     if customer is None:
         raise HTTPException(404, "Customer not found")
     access = require_estate_access(db, request, customer.organization_id, permission=WRITE)
-    _require_whatsapp(db, customer.organization_id)
-    if not customer.phone:
-        raise HTTPException(422, "This customer has no phone number on file.")
     if payload.preset not in social_whatsapp.PRESETS:
         raise HTTPException(422, "Unknown message preset")
-    if not social_whatsapp.configured():
-        raise HTTPException(503, "WhatsApp messaging is not switched on for this server yet.")
+    if not customer.phone:
+        raise HTTPException(422, "This customer has no phone number on file.")
     digits = normalize_phone_digits(customer.phone)
     if not digits:
         raise HTTPException(422, "This customer's phone number is not valid.")
@@ -1136,12 +1149,40 @@ def send_customer_whatsapp_message(customer_id: int, payload: CustomerWhatsappMe
         payload.detail or "an update on your plot",
         public_page_url(estate) if estate else web_url(),
     ]
+
+    if payload.channel == "sms":
+        if not has_sms_access(get_subscription(db, customer.organization_id)):
+            raise HTTPException(
+                status_code=402,
+                detail={"code": "upgrade_required", "feature": "sms", "message": "SMS to customers is available on the Pro and Enterprise plans. Upgrade to unlock it.", "suggested_plan": "pro"},
+            )
+        if not estate_sms.configured():
+            raise HTTPException(503, "SMS is not switched on for this server yet.")
+        text = social_whatsapp.sms_text(payload.preset, params)
+        message_id = estate_sms.send_manual_sms(to_phone=customer.phone, message=text)
+        record_notification_log(
+            db, organization_id=customer.organization_id, estate_id=estate.id if estate else None, customer_id=customer.id,
+            allocation_id=allocation.id if allocation else None, event_key=f"customer_message_{payload.preset}",
+            recipient_email=None, recipient_name=customer.full_name, subject=social_whatsapp.PRESETS[payload.preset]["label"],
+            status="sent" if message_id else "failed", details={"phone": customer.phone, "message_id": message_id, "preset": payload.preset}, channel="sms",
+        )
+        if not message_id:
+            append_estate_audit_event(db, organization_id=customer.organization_id, actor=access.principal, action="customer.sms_message_failed", entity_type="estate_customer", entity_id=customer.id, after_data={"preset": payload.preset})
+            db.commit()
+            raise HTTPException(502, "The SMS could not be sent. Check your SMS provider is configured correctly.")
+        append_estate_audit_event(db, organization_id=customer.organization_id, actor=access.principal, action="customer.sms_message_sent", entity_type="estate_customer", entity_id=customer.id, after_data={"preset": payload.preset})
+        db.commit()
+        return {"ok": True}
+
+    _require_whatsapp(db, customer.organization_id)
+    if not social_whatsapp.configured():
+        raise HTTPException(503, "WhatsApp messaging is not switched on for this server yet.")
     try:
         message_id = social_whatsapp.send_template(digits, social_whatsapp.template_name(payload.preset), params)
     except social_whatsapp.WhatsAppError as exc:
         append_estate_audit_event(db, organization_id=customer.organization_id, actor=access.principal, action="customer.whatsapp_message_failed", entity_type="estate_customer", entity_id=customer.id, after_data={"preset": payload.preset, "error": str(exc)})
         db.commit()
-        raise HTTPException(502, str(exc)) from exc
+        raise HTTPException(502, _whatsapp_send_error_detail(exc)) from exc
     if estate is not None:
         # Only logged to the inbox when there's an estate to attribute it to - the message itself
         # still sends either way, this just controls whether it shows up in a conversation thread.
