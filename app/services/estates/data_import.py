@@ -254,7 +254,7 @@ class RowResult:
 def _resolve_customer(db: Session, *, organization_id: int, customer_data: dict[str, Any] | None) -> tuple[str, int | None, list[str]]:
     """Returns (match_status, matched_customer_id_or_None, issues)."""
     if not customer_data:
-        return "error", None, ["No customer information on this row"]
+        return "error", None, ["No customer information on this row - go back to Step 2 and map at least a Name, Email or Phone column to Customer fields, or set this row's Resolution to Skip."]
     issues: list[str] = []
     external_id = str(customer_data.get("external_id") or "").strip()
     if external_id:
@@ -274,19 +274,19 @@ def _resolve_customer(db: Session, *, organization_id: int, customer_data: dict[
             query = query.filter(EstateCustomer.phone == phone)
         matches = query.limit(2).all()
         if len(matches) == 1:
-            issues.append("Matched by email/phone - please confirm this is the right customer")
+            issues.append("Matched to an existing customer by email/phone - if this is the WRONG person, set Resolution to Skip so this row doesn't get linked to someone else's record.")
             return "matched", matches[0].id, issues
         if len(matches) > 1:
-            issues.append("More than one existing customer shares this email/phone")
+            issues.append("More than one existing customer shares this email/phone, so LandCheck can't safely pick one - set Resolution to Skip and link this plot to the right customer manually from the Customers page.")
             return "ambiguous", None, issues
 
     full_name = str(customer_data.get("full_name") or "").strip()
     if not full_name:
-        return "error", None, ["Customer has no name, email, phone, or ID to identify them"]
+        return "error", None, ["This row has no name, email, phone or customer ID to identify the buyer - add one of these columns in Step 2, or set Resolution to Skip."]
     normalized_name = _normalized_text(full_name)
     name_matches = db.query(EstateCustomer).filter(EstateCustomer.organization_id == organization_id, EstateCustomer.full_name_normalized == normalized_name).limit(2).all()
     if name_matches:
-        issues.append("A customer with this exact name already exists - name alone is not enough to auto-match; confirm manually")
+        issues.append("A customer with this exact name already exists, but a name match alone isn't reliable enough to auto-link - add their phone or email to the sheet and re-import, or set Resolution to Skip and link them manually.")
         return "ambiguous", name_matches[0].id if len(name_matches) == 1 else None, issues
     return "new", None, issues
 
@@ -297,7 +297,7 @@ def _resolve_plot(db: Session, *, estate_id: int, plot_data: dict[str, Any] | No
     plot_number_normalized = _normalized_text(plot_data.get("plot_number"))
     plot = db.query(EstatePlot).filter(EstatePlot.estate_id == estate_id, EstatePlot.plot_number_normalized == plot_number_normalized).one_or_none()
     if not plot:
-        return "error", None, [f"Unknown plot \"{plot_data.get('plot_number')}\" - plots must already exist in LandCheck before they can be imported against"]
+        return "error", None, [f"Unknown plot \"{plot_data.get('plot_number')}\" - plots must already exist in LandCheck before they can be imported against. Use \"Link existing plot\" or \"Pick on map\" in the Plot column to fix this row, or set Resolution to Skip."]
     return "matched", plot, []
 
 
@@ -313,15 +313,15 @@ def _resolve_allocation(db: Session, *, organization_id: int, estate_id: int, pl
         if existing:
             return "matched", existing, issues
         if plot is None:
-            return "error", None, [f"References sale \"{external_reference}\" which doesn't exist yet in this import or in LandCheck"]
+            return "error", None, [f"References sale \"{external_reference}\" which doesn't exist yet in this import or in LandCheck - check the reference matches an existing sale, or map a Plot No. column so a new sale can be created from this row."]
 
     if plot is None:
-        return "error", None, ["No plot or existing sale reference to attach this record to"]
+        return "error", None, ["No plot or existing sale reference to attach this record to - map a Plot No. column in Step 2, or a Contract/sale reference that matches an existing sale."]
 
     active = db.query(EstateAllocation).filter(EstateAllocation.plot_id == plot.id, EstateAllocation.status.in_(("reserved", "allocated"))).one_or_none()
     if active:
         if customer_id is not None and active.customer_id != customer_id:
-            issues.append("This plot already has an active allocation for a different customer")
+            issues.append("This plot already has an active allocation for a different customer - set Resolution to Skip, or resolve the mismatch in LandCheck (release or reassign the existing allocation) before re-importing this row.")
             return "conflict", active, issues
         return "matched", active, issues
     return "new", None, issues
@@ -356,12 +356,12 @@ def match_and_validate_rows(db: Session, *, organization_id: int, estate: Estate
         if payment_data:
             amount = parse_amount(payment_data.get("amount"))
             if amount is None and not payment_data.get("total_paid"):
-                issues.append("Payment amount could not be read")
+                issues.append("Payment amount could not be read - check the Amount column has a plain number (commas/₦ are fine) in Step 2's mapping.")
             reference_no = str(payment_data.get("reference_no") or "").strip()
             if reference_no and allocation is not None:
                 duplicate = db.query(EstatePayment).filter(EstatePayment.allocation_id == allocation.id, EstatePayment.reference_no == reference_no).one_or_none()
                 if duplicate:
-                    issues.append(f"Payment reference \"{reference_no}\" already recorded on this allocation - will be skipped")
+                    issues.append(f"Payment reference \"{reference_no}\" already recorded on this allocation - this row will be skipped automatically. If it's actually a different payment, give it a unique reference in your file and re-import.")
 
         sale_data = record.get("sale") or {}
         payment_outstanding = payment_data.get("outstanding") if payment_data else None
@@ -369,7 +369,7 @@ def match_and_validate_rows(db: Session, *, organization_id: int, estate: Estate
         if allocation is not None and supplied_outstanding is not None:
             summary = financial_summary(db, allocation)
             if abs(summary.outstanding - supplied_outstanding) > Decimal("1"):
-                issues.append(f"Spreadsheet balance (NGN {supplied_outstanding}) does not match LandCheck's calculated balance (NGN {summary.outstanding}) - will not overwrite either number")
+                issues.append(f"Spreadsheet balance (NGN {supplied_outstanding}) does not match LandCheck's calculated balance (NGN {summary.outstanding}) - neither number will be overwritten; after import, check this allocation's payment history on the Customers or Payments page and correct it there if needed.")
 
         _, _, installment_issues = resolve_installment_plan(record.get("sale"), day_first=day_first)
         issues.extend(installment_issues)

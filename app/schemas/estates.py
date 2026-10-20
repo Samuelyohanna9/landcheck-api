@@ -443,6 +443,10 @@ class PublicReservationConvert(BaseModel):
     initial_payment_amount: Decimal | None = Field(default=None, gt=0)
     initial_payment_method: str | None = Field(default=None, max_length=64)
     notes: str | None = Field(default=None, max_length=4000)
+    # Set when staff confirmed (via the duplicate-customer check) that this public lead is the
+    # same person as an existing customer - attaches the new reservation to that record instead
+    # of creating a second, disconnected one for someone who already has a plot.
+    customer_id: int | None = None
 
 
 class BulkCustomerSmsCreate(BaseModel):

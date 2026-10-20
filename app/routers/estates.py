@@ -60,6 +60,7 @@ from app.utils.survey_auth_security import find_or_create_survey_user, issue_sur
 from app.utils.http_security import SURVEY_SESSION_COOKIE, request_uses_browser_auth, set_session_cookie
 from app.models.plot import Plot
 from app.services.estates import estate_email, estate_sms, marketing_alerts, marketing_common
+from app.services.estates.data_import import normalize_nigerian_phone
 from app.services.estates.layout_export import render_estate_layout_pdf
 from app.services.estates.report_export import render_customer_statement_pdf, render_estate_report_pdf
 from app.services.estates import commissions
@@ -1589,16 +1590,22 @@ def convert_public_reservation_request(
         raise HTTPException(404, "Estate not found")
     if not payload.initial_payment_amount:
         raise HTTPException(422, "Record the customer's first payment before creating a proper reservation.")
-    customer = EstateCustomer(
-        organization_id=row.organization_id,
-        full_name=row.full_name,
-        full_name_normalized=_normalized(row.full_name),
-        phone=row.phone,
-        email=row.email,
-        notes=row.message,
-    )
-    db.add(customer)
-    db.flush()
+    customer = None
+    if payload.customer_id:
+        customer = db.query(EstateCustomer).filter(EstateCustomer.id == payload.customer_id, EstateCustomer.organization_id == row.organization_id).one_or_none()
+        if not customer:
+            raise HTTPException(404, "The selected existing customer was not found")
+    if customer is None:
+        customer = EstateCustomer(
+            organization_id=row.organization_id,
+            full_name=row.full_name,
+            full_name_normalized=_normalized(row.full_name),
+            phone=row.phone,
+            email=row.email,
+            notes=row.message,
+        )
+        db.add(customer)
+        db.flush()
     agreed_price = payload.agreed_price if payload.agreed_price is not None else plot.asking_price
     scheduled_payment_plan = None
     scheduled_next_due_at = payload.next_payment_due_at
@@ -4039,6 +4046,56 @@ def complete_staking_task(task_id:int,request:Request,db:Session=Depends(get_db)
     if active_allocation:
         customer_notified = _notify_allocation_customer(db, allocation=active_allocation, org_name=access.organization_name, event="staked")
     return {"id":task.id,"status":task.status,"completed_at":task.completed_at,"customer_notified":customer_notified}
+
+
+@router.get("/organizations/{organization_id}/customers/find-duplicates")
+def find_duplicate_customers(
+    organization_id: int,
+    request: Request,
+    full_name: str | None = None,
+    phone: str | None = None,
+    email: str | None = None,
+    exclude_customer_id: int | None = None,
+    db: Session = Depends(get_db),
+):
+    """Looks for an existing customer who is likely the SAME person being added - by exact phone,
+    exact email, or exact normalized name - so the UI can offer "use this existing customer and
+    add another plot for them" instead of silently creating a second customer record for someone
+    who already has one (the root cause of the same buyer showing up multiple times in Customers).
+    Called just before a new customer is actually created, from every place that happens: the
+    Customers page's "Add customer", the Map & Plots reserve/allocate flow's inline add-customer
+    form, and the public-reservation conversion flow."""
+    require_estate_view_access(db, request, organization_id, permission="customer.read")
+    normalized_phone = normalize_nigerian_phone(phone) if phone else None
+    normalized_email = email.strip().lower() if email else None
+    normalized_name = _normalized(full_name) if full_name else None
+    if not (normalized_phone or normalized_email or normalized_name):
+        return {"matches": []}
+    query = db.query(EstateCustomer).filter(EstateCustomer.organization_id == organization_id)
+    if exclude_customer_id:
+        query = query.filter(EstateCustomer.id != exclude_customer_id)
+    conditions = []
+    if normalized_phone:
+        conditions.append(EstateCustomer.phone == normalized_phone)
+    if normalized_email:
+        conditions.append(func.lower(EstateCustomer.email) == normalized_email)
+    if normalized_name:
+        conditions.append(EstateCustomer.full_name_normalized == normalized_name)
+    matches = query.filter(or_(*conditions)).order_by(EstateCustomer.created_at.desc()).limit(5).all()
+    results = []
+    for customer in matches:
+        reason = "phone" if normalized_phone and customer.phone == normalized_phone else ("email" if normalized_email and customer.email and customer.email.strip().lower() == normalized_email else "name")
+        allocations = db.query(EstateAllocation).filter(EstateAllocation.customer_id == customer.id).all()
+        allocation_rows = []
+        for allocation in allocations:
+            estate = db.get(Estate, allocation.estate_id)
+            plot = db.get(EstatePlot, allocation.plot_id)
+            allocation_rows.append({"estate_name": estate.name if estate else "-", "plot_number": plot.plot_number if plot else "-", "status": allocation.status})
+        results.append({
+            "id": customer.id, "name": customer.full_name, "phone": customer.phone, "email": customer.email,
+            "address": customer.address, "match_reason": reason, "plots": allocation_rows,
+        })
+    return {"matches": results}
 
 
 @router.get("/organizations/{organization_id}/customers")
