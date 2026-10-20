@@ -388,7 +388,8 @@ class ImportMappingSubmit(BaseModel):
 
 
 class ImportRowOverride(BaseModel):
-    resolution: str = Field(pattern="^(create|update|skip)$")
+    resolution: str | None = Field(default=None, pattern="^(create|update|skip)$")
+    plot_id: int | None = None
 
 
 class ImportCommitRequest(BaseModel):

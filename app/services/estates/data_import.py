@@ -400,7 +400,16 @@ def commit_import_rows(db: Session, *, batch: EstateImportBatch, rows: list[Esta
             plot_data = record.get("plot")
             sale_data = record.get("sale")
             plot = None
-            if plot_data and str(plot_data.get("plot_number") or "").strip():
+            if row.manual_plot_id:
+                # Staff manually linked this row to an existing plot (see the review step's
+                # plot picker) - takes priority over whatever plot text the sheet itself had,
+                # since that text is exactly what failed to auto-match.
+                plot = db.get(EstatePlot, row.manual_plot_id)
+                if not plot or plot.estate_id != batch.estate_id:
+                    outcome.errors.append({"row": row.row_index, "reason": "The manually linked plot could not be found at commit time"})
+                    row.resolution = "skip"
+                    continue
+            elif plot_data and str(plot_data.get("plot_number") or "").strip():
                 plot_status, plot, _ = _resolve_plot(db, estate_id=batch.estate_id, plot_data=plot_data)
                 if plot_status != "matched" or plot is None:
                     outcome.errors.append({"row": row.row_index, "reason": f"Plot \"{plot_data.get('plot_number')}\" not found at commit time"})

@@ -21,6 +21,7 @@ from app.models.estate_foundation import (
     EstateImportBatch,
     EstateImportMappingPreset,
     EstateImportRow,
+    EstatePlot,
 )
 from app.routers.plots import get_db
 from app.schemas.estates import ImportCommitRequest, ImportMappingPresetCreate, ImportMappingSubmit, ImportRowOverride
@@ -191,12 +192,27 @@ def get_import_preview(batch_id: int, request: Request, status: str | None = Non
         query = query.filter(EstateImportRow.resolution == status, EstateImportRow.match_status.notin_(("ambiguous", "conflict", "error")))
     total = query.count()
     rows = query.order_by(EstateImportRow.row_index).offset(max(page - 1, 0) * min(max(page_size, 1), 200)).limit(min(max(page_size, 1), 200)).all()
+    plot_ids = {r.manual_plot_id for r in rows if r.manual_plot_id}
+    plot_numbers = {p.id: p.plot_number for p in db.query(EstatePlot).filter(EstatePlot.id.in_(plot_ids)).all()} if plot_ids else {}
     return {
         "batch": {"id": batch.id, "status": batch.status, "source_filename": batch.source_filename, "row_counts": batch.row_counts, "created_at": batch.created_at},
         "page": page,
         "total": total,
-        "items": [{"id": r.id, "row_index": r.row_index, "source_data": r.source_data, "match_status": r.match_status, "resolution": r.resolution, "issues": r.issues} for r in rows],
+        "items": [{"id": r.id, "row_index": r.row_index, "source_data": r.source_data, "match_status": r.match_status, "resolution": r.resolution, "issues": r.issues, "manual_plot_id": r.manual_plot_id, "manual_plot_number": plot_numbers.get(r.manual_plot_id)} for r in rows],
     }
+
+
+@router.get("/{batch_id}/plot-options")
+def search_batch_plots(batch_id: int, request: Request, q: str = "", db: Session = Depends(get_db)):
+    """Existing plots in this batch's estate, for the review step's "link an existing plot"
+    picker - plots are never created from a spreadsheet row, only matched against real ones."""
+    batch = _get_batch(db, request, batch_id, permission="integration.read")
+    query = db.query(EstatePlot).filter(EstatePlot.estate_id == batch.estate_id)
+    term = q.strip()
+    if term:
+        query = query.filter(EstatePlot.plot_number.ilike(f"%{term}%"))
+    plots = query.order_by(EstatePlot.plot_number_normalized).limit(25).all()
+    return {"rows": [{"id": p.id, "plot_number": p.plot_number, "commercial_status": p.commercial_status, "geometry_status": p.geometry_status} for p in plots]}
 
 
 @router.patch("/{batch_id}/rows/{row_id}")
@@ -205,9 +221,16 @@ def override_import_row(batch_id: int, row_id: int, payload: ImportRowOverride, 
     row = db.query(EstateImportRow).filter(EstateImportRow.id == row_id, EstateImportRow.batch_id == batch.id).one_or_none()
     if not row:
         raise HTTPException(404, "Row not found")
-    row.resolution = payload.resolution
+    if payload.plot_id is not None:
+        plot = db.query(EstatePlot).filter(EstatePlot.id == payload.plot_id, EstatePlot.estate_id == batch.estate_id).one_or_none()
+        if not plot:
+            raise HTTPException(422, "That plot was not found in this estate")
+        row.manual_plot_id = plot.id
+        row.issues = [issue for issue in (row.issues or []) if "plot" not in issue.lower()]
+    if payload.resolution is not None:
+        row.resolution = payload.resolution
     db.commit()
-    return {"id": row.id, "resolution": row.resolution}
+    return {"id": row.id, "resolution": row.resolution, "manual_plot_id": row.manual_plot_id}
 
 
 @router.post("/{batch_id}/commit")

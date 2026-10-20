@@ -802,6 +802,10 @@ class EstateImportRow(Base):
     committed_customer_id = Column(Integer, ForeignKey("estate_customers.id", ondelete="SET NULL"), nullable=True)
     committed_allocation_id = Column(Integer, ForeignKey("estate_allocations.id", ondelete="SET NULL"), nullable=True)
     committed_payment_id = Column(Integer, ForeignKey("estate_payments.id", ondelete="SET NULL"), nullable=True)
+    # Staff-picked plot that overrides automatic plot_number matching for this row (e.g. the
+    # sheet's plot text didn't match anything) - set via the row-override endpoint, takes priority
+    # over source_data.plot at commit time. See data_import.commit_import_rows.
+    manual_plot_id = Column(Integer, ForeignKey("estate_plots.id", ondelete="SET NULL"), nullable=True)
     # Distinguishes "this row created a brand-new record" from "this row matched an existing one"
     # - committed_*_id alone can't tell the two apart, and reversal must only ever undo what the
     # import itself created, never touch a pre-existing record it just happened to match.
