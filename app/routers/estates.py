@@ -35,6 +35,7 @@ from app.services.estates.authorization import list_estate_access, resolve_estat
 from app.services.estates.identity import generate_temp_password, hash_password, normalize_email, slugify
 from app.services.estates.entitlements import ESTATE_FEATURES, get_estate_entitlement
 from app.models.estate_foundation import Estate, EstateAgentPortalToken, EstateAllocation, EstateAllocationChargeAttempt, EstateAuditEvent, EstateBlock, EstateCommissionPayout, EstateCommissionTier, EstateCustomer, EstateCustomerPortalToken, EstateDocument, EstateDocumentLink, EstateFieldInspection, EstateHazardAssessment, EstateImportReview, EstateLayoutProposal, EstateNotificationLog, EstateOrganization, EstateOrganizationMember, EstatePayment, EstatePaymentInbox, EstatePaymentRule, EstatePlot, EstatePublicReservationRequest, EstateQrCampaign, EstateSoilAssessment, EstateSpatialFeature, EstateStaffRole, EstateSurveyRequest, EstateStakingTask, GeotechSurveyRequest
+from app.models.estate_social import EstateWhatsappMessage
 from app.models.estate_marketing import EstateApprovalMilestone, EstateLiveInspectionSession, EstateProgressUpdate
 from app.schemas.estates import AllocationAction, AllocationPaymentPlanUpdate, BlockCreate, BlockUpdate, BuyerAllocationPaymentCreate, PaymentIssueReportCreate, PaymentReminderSend, CommissionPayoutCreate, CommissionTiersUpdate, CustomerCreate, DevelopmentForecastPublishUpdate, DevelopmentStatusUpdate, EstateCreate, EstateLayoutCriteria, EstateLayoutDecision, EstateLayoutFeatureAdd, EstateLayoutFeatureRemove, EstateLayoutProposalEdit, EstateSubdivisionCreate, EstateUpdate, FieldInspectionCreate, GeoreferenceSessionLink, ImportFromGeoreference, ImportReviewCreate, ImportReviewDecision, ImportReviewFromGeoreferenceSession, MemberCreate, MemberUpdate, PaymentInboxCreate, PaymentInboxMatch, PaymentScheduleInput, PlotCreate, PlotAddressUpdate, PlotGeometryUpdate, PlotListingDefaultsUpdate, PlotPriceUpdate, PortalTokenCreate, BulkCustomerSmsCreate, PublicEstateSettingsUpdate, PublicReservationConvert, PublicReservationCreate, PublicReservationUpdate, PaymentCreate, QrCampaignCreate, SpatialFeatureCreate, SpatialFeatureUpdate, StaffCreate, StaffRoleCreate, StaffRoleUpdate, StaffUpdate, SurveyEligibilityUpdate, TitleVerificationUpdate, VoidAction
 from app.services.estates.payments import confirm_payment, financial_summary, record_payment, void_payment
@@ -3328,6 +3329,52 @@ def plot_timeline(plot_id: int, request: Request, db: Session = Depends(get_db))
     return [{"id": row.id, "action": row.action, "entity_type": row.entity_type, "actor": row.actor_subject_id, "created_at": row.created_at, "details": row.after_data} for row in rows]
 
 
+@router.get("/customers/{customer_id}/timeline")
+def customer_timeline(customer_id: int, request: Request, db: Session = Depends(get_db)):
+    """A customer's complete history in one feed - their own record changes, every allocation and
+    payment event across every plot they've ever held, commission payouts, linked documents, AND
+    every WhatsApp/SMS/email message ever sent to or received from them (not just audit actions),
+    since "history of everything including all chats" means the actual message content, not just
+    a log line saying a message happened. Mirrors plot_timeline's same assemble-by-entity-type
+    approach, one level up (customer instead of plot)."""
+    customer = db.get(EstateCustomer, customer_id)
+    if not customer:
+        raise HTTPException(404, "Customer not found")
+    require_estate_view_access(db, request, customer.organization_id, permission="audit.read")
+
+    allocation_ids = [str(row.id) for row in db.query(EstateAllocation.id).filter(EstateAllocation.customer_id == customer_id).all()]
+    allocation_int_ids = [int(value) for value in allocation_ids]
+    payment_ids = [str(row.id) for row in db.query(EstatePayment.id).filter(EstatePayment.customer_id == customer_id).all()]
+    payout_ids = [str(row.id) for row in db.query(EstateCommissionPayout.id).filter(EstateCommissionPayout.allocation_id.in_(allocation_int_ids)).all()] if allocation_int_ids else []
+    document_link_conditions = [and_(EstateDocumentLink.entity_type == "customer", EstateDocumentLink.entity_id == str(customer_id))]
+    for linked_type, ids in (("allocation", allocation_ids), ("payment", payment_ids), ("commission_payout", payout_ids)):
+        if ids:
+            document_link_conditions.append(and_(EstateDocumentLink.entity_type == linked_type, EstateDocumentLink.entity_id.in_(ids)))
+    document_ids = [str(row.id) for row in db.query(EstateDocument.id).join(EstateDocumentLink, EstateDocumentLink.document_id == EstateDocument.id).filter(or_(*document_link_conditions)).distinct().all()]
+
+    conditions = [and_(EstateAuditEvent.entity_type == "estate_customer", EstateAuditEvent.entity_id == str(customer_id))]
+    for entity_type, ids in (
+        ("estate_allocation", allocation_ids),
+        ("estate_payment", payment_ids),
+        ("estate_commission_payout", payout_ids),
+        ("estate_document", document_ids),
+    ):
+        if ids:
+            conditions.append(and_(EstateAuditEvent.entity_type == entity_type, EstateAuditEvent.entity_id.in_(ids)))
+    audit_rows = db.query(EstateAuditEvent).filter(EstateAuditEvent.organization_id == customer.organization_id, or_(*conditions)).order_by(EstateAuditEvent.created_at.desc()).limit(200).all()
+
+    message_rows = db.query(EstateWhatsappMessage).filter(EstateWhatsappMessage.customer_id == customer_id).order_by(EstateWhatsappMessage.created_at.desc()).limit(200).all()
+    notification_rows = db.query(EstateNotificationLog).filter(EstateNotificationLog.customer_id == customer_id).order_by(EstateNotificationLog.created_at.desc()).limit(200).all()
+
+    events = (
+        [{"id": f"audit-{row.id}", "kind": "audit", "created_at": row.created_at, "action": row.action, "entity_type": row.entity_type, "actor": row.actor_subject_id, "details": row.after_data} for row in audit_rows]
+        + [{"id": f"chat-{row.id}", "kind": "chat", "created_at": row.created_at, "direction": row.direction, "body": row.body, "status": row.status, "message_type": row.message_type} for row in message_rows]
+        + [{"id": f"notification-{row.id}", "kind": "notification", "created_at": row.created_at, "channel": row.channel, "event_key": row.event_key, "status": row.status, "subject": row.subject, "error_message": row.error_message} for row in notification_rows]
+    )
+    events.sort(key=lambda item: item["created_at"] or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
+    return {"customer": {"id": customer.id, "name": customer.full_name}, "events": events[:200]}
+
+
 @router.post("/{estate_id}/plots")
 def create_plot(estate_id: int, payload: PlotCreate, request: Request, db: Session = Depends(get_db)):
     estate = db.get(Estate, estate_id)
@@ -5010,7 +5057,10 @@ def customer_financial_detail(customer_id:int,request:Request,db:Session=Depends
         rows.append({
             "allocation_id":allocation.id,"status":allocation.status,"allocation_date":allocation.allocation_date,
             "payment_plan":allocation.payment_plan,"next_payment_due_at":allocation.next_payment_due_at,
-            "is_overdue":bool(due_at and due_at<now and summary.outstanding>0),
+            # Same definition the Due Payments board uses (active allocation + past-due + still
+            # owing) - kept identical on purpose so the two views never disagree about what counts
+            # as overdue (see accounting_due_payments).
+            "is_overdue":bool(due_at and due_at<now and summary.outstanding>0 and allocation.status in ("reserved","allocated")),
             "estate":{"id":estate.id,"name":estate.name},"plot":{"id":plot.id,"number":plot.plot_number},
             "agreed_price":str(summary.agreed_price),"confirmed":str(summary.confirmed_paid),"pending":str(summary.pending_paid),"outstanding":str(summary.outstanding),"percentage":str(summary.percentage),
             "payment_count":db.query(EstatePayment).filter(EstatePayment.allocation_id==allocation.id).count(),

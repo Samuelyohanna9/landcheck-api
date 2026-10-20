@@ -1191,15 +1191,33 @@ def send_customer_whatsapp_message(customer_id: int, payload: CustomerWhatsappMe
                 body=body, actor_subject_type=access.principal.subject_type, actor_subject_id=str(access.principal.subject_id),
             )
         except social_whatsapp.WhatsAppError as exc:
+            record_notification_log(
+                db, organization_id=customer.organization_id, estate_id=estate.id, customer_id=customer.id, allocation_id=allocation.id if allocation else None,
+                event_key=f"customer_message_{payload.preset}", recipient_email=None, recipient_name=customer.full_name,
+                subject=social_whatsapp.PRESETS[payload.preset]["label"], status="failed", error_message=str(exc),
+                details={"phone": customer.phone, "preset": payload.preset, "mode": "free_text"}, channel="whatsapp",
+            )
             append_estate_audit_event(db, organization_id=customer.organization_id, actor=access.principal, action="customer.whatsapp_message_failed", entity_type="estate_customer", entity_id=customer.id, after_data={"preset": payload.preset, "error": str(exc)})
             db.commit()
             raise HTTPException(502, str(exc)) from exc
+        record_notification_log(
+            db, organization_id=customer.organization_id, estate_id=estate.id, customer_id=customer.id, allocation_id=allocation.id if allocation else None,
+            event_key=f"customer_message_{payload.preset}", recipient_email=None, recipient_name=customer.full_name,
+            subject=social_whatsapp.PRESETS[payload.preset]["label"], status="sent",
+            details={"phone": customer.phone, "message_id": row.wa_message_id, "preset": payload.preset, "mode": "free_text"}, channel="whatsapp",
+        )
         append_estate_audit_event(db, organization_id=customer.organization_id, actor=access.principal, action="customer.whatsapp_message_sent", entity_type="estate_customer", entity_id=customer.id, after_data={"preset": payload.preset, "mode": "free_text"})
         db.commit()
         return _message_payload(row)
     try:
         message_id = social_whatsapp.send_template(digits, social_whatsapp.template_name(payload.preset), params)
     except social_whatsapp.WhatsAppError as exc:
+        record_notification_log(
+            db, organization_id=customer.organization_id, estate_id=estate.id if estate else None, customer_id=customer.id, allocation_id=allocation.id if allocation else None,
+            event_key=f"customer_message_{payload.preset}", recipient_email=None, recipient_name=customer.full_name,
+            subject=social_whatsapp.PRESETS[payload.preset]["label"], status="failed", error_message=str(exc),
+            details={"phone": customer.phone, "preset": payload.preset, "mode": "template"}, channel="whatsapp",
+        )
         append_estate_audit_event(db, organization_id=customer.organization_id, actor=access.principal, action="customer.whatsapp_message_failed", entity_type="estate_customer", entity_id=customer.id, after_data={"preset": payload.preset, "error": str(exc)})
         db.commit()
         raise HTTPException(502, _whatsapp_send_error_detail(exc)) from exc
@@ -1211,6 +1229,12 @@ def send_customer_whatsapp_message(customer_id: int, payload: CustomerWhatsappMe
             direction="out", message_type="text", body=f"[{social_whatsapp.PRESETS[payload.preset]['label']}] {payload.detail or ''}".strip(),
             wa_message_id=message_id or None, status="sent", sent_by_subject_type=access.principal.subject_type, sent_by_subject_id=str(access.principal.subject_id),
         ))
+    record_notification_log(
+        db, organization_id=customer.organization_id, estate_id=estate.id if estate else None, customer_id=customer.id, allocation_id=allocation.id if allocation else None,
+        event_key=f"customer_message_{payload.preset}", recipient_email=None, recipient_name=customer.full_name,
+        subject=social_whatsapp.PRESETS[payload.preset]["label"], status="sent",
+        details={"phone": customer.phone, "message_id": message_id, "preset": payload.preset, "mode": "template"}, channel="whatsapp",
+    )
     append_estate_audit_event(db, organization_id=customer.organization_id, actor=access.principal, action="customer.whatsapp_message_sent", entity_type="estate_customer", entity_id=customer.id, after_data={"preset": payload.preset})
     db.commit()
     return {"ok": True}
