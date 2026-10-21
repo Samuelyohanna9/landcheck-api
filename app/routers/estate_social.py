@@ -219,7 +219,7 @@ def social_image(estate_id: int, request: Request, channel: str = "facebook", st
     return _png(data, filename=f"{name.replace(' ', '-')}-{channel}.png" if download else None)
 
 
-@router.get("/marketing/social/whatsapp-image/{token}.png")
+@router.api_route("/marketing/social/whatsapp-image/{token}.png", methods=["GET", "HEAD"])
 def public_whatsapp_image(token: str, db: Session = Depends(get_db)):
     """Fetched by WhatsApp's servers as a template header image. The link is signed and expires after 24 hours."""
     parsed = social_posts.read_broadcast_image_token(token)
@@ -234,9 +234,13 @@ def public_whatsapp_image(token: str, db: Session = Depends(get_db)):
     return _png(data, public=True)
 
 
-@router.get("/marketing/social/image/{token}.png")
+@router.api_route("/marketing/social/image/{token}.png", methods=["GET", "HEAD"])
 def public_social_image(token: str, db: Session = Depends(get_db)):
     """Fetched by Facebook/Instagram's servers. The link is signed and expires after 24 hours.
+
+    Answers HEAD as well as GET - Meta's media fetcher sends a HEAD request to validate a URL before
+    the real GET, and a route defined with only GET returns 405 to that, which Meta reports back as
+    "the media could not be fetched" with no further detail.
 
     If rendering fails, Facebook/Instagram's own error for this ("Make sure your Page post includes
     an image that can be used in an ad") is a generic catch-all for "we couldn't fetch/parse a usable
@@ -264,10 +268,11 @@ def public_social_image(token: str, db: Session = Depends(get_db)):
     return _png(data, public=True)
 
 
-@router.get("/marketing/social/custom-image/{token}")
+@router.api_route("/marketing/social/custom-image/{token}", methods=["GET", "HEAD"])
 def public_custom_social_image(token: str, db: Session = Depends(get_db)):
     """Fetched by Facebook/Instagram's servers for a "Post your own photo" post - streamed back using
-    real R2 credentials rather than handing Meta a raw R2 object URL (see post_image_url's comment)."""
+    real R2 credentials rather than handing Meta a raw R2 object URL (see post_image_url's comment).
+    Answers HEAD as well as GET - see public_social_image's comment on why that matters here too."""
     post_id = social_posts.read_custom_image_token(token)
     if post_id is None:
         raise HTTPException(404, "Image not found")
