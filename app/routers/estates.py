@@ -2893,6 +2893,72 @@ def _run_estate_hazard_assessment_job(job_id: str) -> None:
         db.close()
 
 
+def _run_estate_hazard_boundary_map_job(job_id: str) -> None:
+    """Background worker for an on-demand Estate-boundary map/3D view. Unlike the regular
+    assess-all run, which deliberately strips map overlays and building-footprint data before
+    saving (see _slim_hazard_result's memory-safety note - carrying that through every future
+    dashboard load is what exhausted server memory), this keeps the full result, since it exists
+    purely to answer this one "Show result on map" click rather than being stored forever as a
+    historical record the way estate_hazard_assessments rows are."""
+    db = SessionLocal()
+    try:
+        job = get_hazard_job(db, job_id)
+        if not job:
+            return
+        payload = job.get("request_payload") or {}
+        if isinstance(payload, str):
+            payload = json.loads(payload)
+        estate_id = int(payload["estate_id"])
+
+        set_hazard_job_status(db, job_id, status="running", stage="Preparing the Estate boundary...", progress_pct=5, started=True)
+        estate = db.get(Estate, estate_id)
+        if not estate:
+            set_hazard_job_status(db, job_id, status="failed", stage="Failed", error_text="Estate not found", completed=True)
+            return
+        try:
+            boundary = _estate_forecast_boundary(db, estate)
+        except HTTPException:
+            set_hazard_job_status(db, job_id, status="failed", stage="Failed", error_text="Add an Estate boundary or approve plot geometry before running hazard analysis", completed=True)
+            return
+        db.commit()
+
+        set_hazard_job_status(db, job_id, status="running", stage="Building the map view...", progress_pct=20)
+        results = _calculate_plot_hazards(boundary, None, heartbeat=lambda: touch_hazard_job(db, job_id))
+        set_hazard_job_status(db, job_id, status="completed", stage="Complete", progress_pct=100, result_payload=results, completed=True)
+    except Exception as exc:
+        db.rollback()
+        set_hazard_job_status(db, job_id, status="failed", stage="Failed", error_text=str(getattr(exc, "detail", None) or exc), completed=True)
+    finally:
+        db.close()
+
+
+@router.post("/{estate_id}/hazards/boundary-map")
+def generate_estate_hazard_boundary_map(estate_id: int, request: Request, db: Session = Depends(get_db)):
+    """Recomputes (not stored long-term) the Estate boundary's flood/erosion result WITH its map
+    overlay and 3D building-footprint data, for the "Show result on map" view. Poll
+    GET /hazards/jobs/{job_id} the same way as assess-all; the result here is the raw
+    {flood, erosion} shape (river/floodplain/rainfall each carry their own overlay/interactive),
+    not the slimmed dashboard payload."""
+    estate = db.get(Estate, estate_id)
+    if not estate:
+        raise HTTPException(404, "Estate not found")
+    access = require_estate_access(db, request, estate.organization_id, permission="plot.manage")
+    _require_hazard_plan(db, estate.organization_id)
+    if not estate.boundary and not db.query(EstatePlot.id).filter(EstatePlot.estate_id == estate_id, EstatePlot.geometry_status == "approved", EstatePlot.geometry.isnot(None)).first():
+        raise HTTPException(422, "Add an Estate boundary or approve plot geometry before running hazard analysis")
+    existing = find_active_hazard_job(db, hazard_type="estate_boundary_map", estate_id=estate_id)
+    if existing:
+        return serialize_hazard_job(existing)
+    job = insert_hazard_job(
+        db,
+        hazard_type="estate_boundary_map",
+        output_type="preview",
+        request_payload={"estate_id": estate_id, "subject_type": access.principal.subject_type, "subject_id": access.principal.subject_id},
+        worker=_run_estate_hazard_boundary_map_job,
+    )
+    return serialize_hazard_job(job)
+
+
 @router.post("/{estate_id}/hazards/assess-all")
 def assess_estate_hazards(estate_id: int, request: Request, db: Session = Depends(get_db)):
     """Kicks off flood + erosion screening for every approved plot in this Estate as a background
