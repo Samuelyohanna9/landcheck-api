@@ -181,6 +181,7 @@ def _requires_estate_session(request: Request) -> bool:
         # so each of these is deliberately public and protects itself its own way (a signed token, a
         # webhook shared secret, or a Meta signature) instead of a logged-in session.
         "/estates/marketing/social/image/",
+        "/estates/marketing/social/custom-image/",
         "/estates/marketing/social/whatsapp-image/",
         "/estates/webhooks/",
     )
