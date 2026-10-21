@@ -243,6 +243,20 @@ def delete_published(db: Session, post: EstateSocialPost, channel: str) -> dict[
     return results.get(channel, outcome)
 
 
+def remove_from_dashboard(db: Session, post: EstateSocialPost, channel: str) -> dict[str, Any]:
+    """Hides a channel's result from LandCheck's own views WITHOUT attempting to delete anything on
+    Facebook/Instagram - for stale test data, an already-stale/unreachable connected account, or a
+    post already removed by hand on the platform itself where the normal delete call can't verify
+    success. Deliberately distinct from delete_published(): the live post may still exist, so this
+    is never offered as if it were a real deletion - callers must label it clearly as dashboard-only."""
+    results = dict(post.results or {})
+    current = results.get(channel) or {}
+    results[channel] = {**current, "status": "deleted", "deleted_at": datetime.now(timezone.utc).isoformat(), "removed_locally": True}
+    post.results = results
+    db.commit()
+    return results[channel]
+
+
 # ── Engagement stats ────────────────────────────────────────────────────────────────────────
 def _stats_channel(db: Session, post: EstateSocialPost, channel: str, external_id: str) -> dict[str, Any]:
     account = _account_for(db, post.organization_id, channel)

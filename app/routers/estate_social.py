@@ -516,6 +516,21 @@ def delete_post_channel(post_id: int, channel: str, request: Request, db: Sessio
     return _post_payload(post)
 
 
+@router.post("/marketing/social/posts/{post_id}/channels/{channel}/remove-from-dashboard")
+def remove_post_channel_from_dashboard(post_id: int, channel: str, request: Request, db: Session = Depends(get_db)):
+    """Dashboard-only cleanup - hides this channel's result from LandCheck's views without calling
+    Facebook/Instagram at all. For stale test posts or a channel whose live delete keeps failing
+    (expired token, account disconnected, post already removed by hand on the platform) - the live
+    post may still exist, this only clears LandCheck's own record of it."""
+    post, _estate, access = _post_for_staff(db, request, post_id)
+    if channel not in list(post.channels or []):
+        raise HTTPException(404, "This post was not sent to that channel")
+    social_posts.remove_from_dashboard(db, post, channel)
+    append_estate_audit_event(db, organization_id=post.organization_id, actor=access.principal, action="social_post.removed_from_dashboard", entity_type="estate_social_post", entity_id=post.id, after_data={"channel": channel})
+    db.commit()
+    return _post_payload(post)
+
+
 @router.post("/marketing/social/posts/{post_id}/channels/{channel}/refresh-stats")
 def refresh_post_channel_stats(post_id: int, channel: str, request: Request, db: Session = Depends(get_db)):
     post, _estate, _access = _post_for_staff(db, request, post_id)
