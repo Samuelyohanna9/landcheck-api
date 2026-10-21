@@ -667,6 +667,7 @@ def meta_callback(code: str | None = None, state: str | None = None, error: str 
         logger.exception("Meta connect failed")
         return _back(estate_id, connect_error="Could not reach Facebook. Please try again.")
     stored = 0
+    connected_names: list[str] = []
     for page in granted["pages"]:
         token_enc = encrypt_text(page["access_token"])
         candidates = [("facebook", str(page["id"]), page.get("name") or "Facebook Page", None, None)]
@@ -702,10 +703,11 @@ def meta_callback(code: str | None = None, state: str | None = None, error: str 
             except Exception:
                 pass
             stored += 1
+            connected_names.append(f"{name} ({'Facebook Page' if provider == 'facebook' else 'Instagram'})")
     db.commit()
     if not stored:
         return _back(estate_id, connect_error="No Facebook Pages were shared. Choose at least one Page when asked.")
-    return _back(estate_id, connected=str(stored))
+    return _back(estate_id, connected=str(stored), connected_names="|".join(connected_names))
 
 
 @router.post("/marketing/social/accounts/{account_id}/check")
