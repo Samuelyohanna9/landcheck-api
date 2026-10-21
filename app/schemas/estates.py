@@ -415,6 +415,12 @@ class PaymentIssueReportCreate(BaseModel):
     payment_id: int | None = None
     message: str = Field(min_length=1, max_length=2000)
 
+
+class SettlementRequestCreate(BaseModel):
+    organization_id: int
+    charge_attempt_id: int | None = None
+    note: str | None = Field(default=None, max_length=2000)
+
 class VoidAction(BaseModel):
     reason: str = Field(min_length=1)
 

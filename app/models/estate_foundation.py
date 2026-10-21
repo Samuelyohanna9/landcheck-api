@@ -459,6 +459,17 @@ class EstateAllocationChargeAttempt(Base):
     settlement_status = Column(String(16), nullable=False, default="pending")
     settled_at = Column(DateTime(timezone=True), nullable=True)
     settlement_checked_at = Column(DateTime(timezone=True), nullable=True)
+    # Set only when a LandCheck admin manually triggered an immediate Flutterwave transfer (see
+    # estate_payout_transfers.py) instead of waiting for Flutterwave's own automatic subaccount
+    # settlement to be detected by settlement_tracking.refresh_settlement_status - lets the two
+    # settlement paths be told apart in the Accounting views on both sides.
+    settlement_channel = Column(String(24), nullable=True)
+    manual_transfer_id = Column(String(120), nullable=True)
+    manual_transfer_reference = Column(String(160), nullable=True)
+    manual_transfer_status = Column(String(32), nullable=True)
+    manual_transfer_error = Column(Text, nullable=True)
+    manual_settled_by_subject_type = Column(String(64), nullable=True)
+    manual_settled_by_subject_id = Column(String(128), nullable=True)
 
 
 class EstatePaymentIssueReport(Base):
@@ -482,6 +493,34 @@ class EstatePaymentIssueReport(Base):
     resolved_at = Column(DateTime(timezone=True), nullable=True)
     resolved_by_subject_type = Column(String(64), nullable=True)
     resolved_by_subject_id = Column(String(128), nullable=True)
+
+
+class EstateSettlementRequest(Base):
+    """A developer asking LandCheck to manually initiate an immediate settlement of a captured
+    online payment, ahead of Flutterwave's own next-business-day schedule for that subaccount.
+    Emailed to LandCheck support on creation (see estate_email.send_settlement_request_email);
+    reviewed and actioned from the Estates admin accounting view (app/routers/estate_admin_accounting.py),
+    where "settled" is only ever reached after a real Flutterwave transfer succeeds, never guessed."""
+
+    __tablename__ = "estate_settlement_requests"
+    id = Column(Integer, primary_key=True)
+    request_uid = Column(String(36), nullable=False, unique=True, default=lambda: str(uuid.uuid4()))
+    organization_id = Column(Integer, ForeignKey("estate_organizations.id", ondelete="CASCADE"), nullable=False)
+    charge_attempt_id = Column(Integer, ForeignKey("estate_allocation_charge_attempts.id", ondelete="SET NULL"), nullable=True)
+    amount_snapshot = Column(Numeric(16, 2), nullable=True)
+    note = Column(Text, nullable=True)
+    status = Column(String(16), nullable=False, default="requested")
+    requested_by_subject_type = Column(String(64), nullable=False)
+    requested_by_subject_id = Column(String(128), nullable=False)
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    reviewed_at = Column(DateTime(timezone=True), nullable=True)
+    reviewed_by_subject_type = Column(String(64), nullable=True)
+    reviewed_by_subject_id = Column(String(128), nullable=True)
+    settled_at = Column(DateTime(timezone=True), nullable=True)
+
+    __table_args__ = (
+        CheckConstraint("status IN ('requested', 'in_review', 'settled', 'declined')", name="ck_estate_settlement_requests_status"),
+    )
 
 
 class EstateNotificationLog(Base):

@@ -944,6 +944,44 @@ def send_payment_issue_report_email(*, organization, reported_by_display_name: s
         return False
 
 
+def send_settlement_request_email(*, organization, requested_by_display_name: str | None, amount: str | None, note: str | None) -> bool:
+    """A staff member asking LandCheck to manually initiate an immediate settlement ahead of
+    Flutterwave's own next-business-day schedule - goes to LandCheck support, who review and
+    action it from the Estates admin accounting view."""
+    to_email = "support@landcheck.online"
+    requester = html.escape(requested_by_display_name or "A team member")
+    amount_line = f"<p style=\"margin:4px 0;color:{_ESTATE_SLATE};font-size:13px;\">Amount: {html.escape(amount)}</p>" if amount else ""
+    note_html = f"<div style=\"margin:16px 0 0;padding:14px 16px;background:{_ESTATE_SURFACE_TINT};border:1px solid {_ESTATE_LINE};border-radius:4px;\"><p style=\"margin:0;color:{_ESTATE_INK};white-space:pre-wrap;\">{html.escape(note)}</p></div>" if note else ""
+    message_html = (
+        f"<p>{requester} at <strong>{html.escape(organization.name)}</strong> requested immediate settlement of a captured online payment, "
+        f"ahead of Flutterwave's normal next-business-day schedule.</p>{amount_line}{note_html}"
+    )
+    body_html = _account_wrap_html(heading="Immediate settlement requested", message_html=message_html)
+    try:
+        _send_email(to_email=to_email, from_display_name=f"{organization.name} (via LandCheck Estates)", subject=f"Immediate settlement requested - {organization.name}", body_text=_account_plain_text("Immediate settlement requested", message_html), body_html=body_html)
+        return True
+    except Exception:
+        logger.exception("Estate settlement-request email failed (org=%s)", organization.id)
+        return False
+
+
+def send_settlement_completed_email(*, organization, amount: str, reference: str | None) -> bool:
+    """Confirms to the org that LandCheck has manually transferred a captured payment to their
+    verified bank account - sent once the Flutterwave transfer call succeeds, not merely queued."""
+    to_email = _subscription_org_email(organization)
+    if not to_email:
+        return False
+    reference_line = f"<p style=\"margin:4px 0;color:{_ESTATE_SLATE};font-size:13px;\">Reference: {html.escape(reference)}</p>" if reference else ""
+    message_html = f"<p>LandCheck has transferred {html.escape(amount)} to your verified payout account.</p>{reference_line}"
+    body_html = _account_wrap_html(heading="Settlement completed", message_html=message_html)
+    try:
+        _send_email(to_email=to_email, from_display_name="LandCheck Estates", subject=f"Settlement completed - {html.escape(amount)}", body_text=_account_plain_text("Settlement completed", message_html), body_html=body_html)
+        return True
+    except Exception:
+        logger.exception("Estate settlement-completed email failed (org=%s)", organization.id)
+        return False
+
+
 def send_payment_failed_email(*, organization, subscription) -> bool:
     to_email = _subscription_org_email(organization)
     if not to_email:

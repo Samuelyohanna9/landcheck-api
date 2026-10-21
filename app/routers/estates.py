@@ -37,7 +37,7 @@ from app.services.estates.entitlements import ESTATE_FEATURES, get_estate_entitl
 from app.models.estate_foundation import Estate, EstateAgentPortalToken, EstateAllocation, EstateAllocationChargeAttempt, EstateAuditEvent, EstateBlock, EstateCommissionPayout, EstateCommissionTier, EstateCustomer, EstateCustomerPortalToken, EstateDocument, EstateDocumentLink, EstateFieldInspection, EstateHazardAssessment, EstateImportReview, EstateLayoutProposal, EstateNotificationLog, EstateOrganization, EstateOrganizationMember, EstatePayment, EstatePaymentInbox, EstatePaymentRule, EstatePlot, EstatePublicReservationRequest, EstateQrCampaign, EstateSoilAssessment, EstateSpatialFeature, EstateStaffRole, EstateSurveyRequest, EstateStakingTask, GeotechSurveyRequest
 from app.models.estate_social import EstateWhatsappMessage
 from app.models.estate_marketing import EstateApprovalMilestone, EstateLiveInspectionSession, EstateProgressUpdate
-from app.schemas.estates import AllocationAction, AllocationPaymentPlanUpdate, BlockCreate, BlockUpdate, BuyerAllocationPaymentCreate, PaymentIssueReportCreate, PaymentReminderSend, CommissionPayoutCreate, CommissionTiersUpdate, CustomerCreate, DevelopmentForecastPublishUpdate, DevelopmentStatusUpdate, EstateCreate, EstateLayoutCriteria, EstateLayoutDecision, EstateLayoutFeatureAdd, EstateLayoutFeatureRemove, EstateLayoutProposalEdit, EstateSubdivisionCreate, EstateUpdate, FieldInspectionCreate, GeoreferenceSessionLink, ImportFromGeoreference, ImportReviewCreate, ImportReviewDecision, ImportReviewFromGeoreferenceSession, MemberCreate, MemberUpdate, PaymentInboxCreate, PaymentInboxMatch, PaymentScheduleInput, PlotCreate, PlotAddressUpdate, PlotGeometryUpdate, PlotListingDefaultsUpdate, PlotPriceUpdate, PortalTokenCreate, BulkCustomerSmsCreate, PublicEstateSettingsUpdate, PublicReservationConvert, PublicReservationCreate, PublicReservationUpdate, PaymentCreate, QrCampaignCreate, SpatialFeatureCreate, SpatialFeatureUpdate, StaffCreate, StaffRoleCreate, StaffRoleUpdate, StaffUpdate, SurveyEligibilityUpdate, TitleVerificationUpdate, VoidAction
+from app.schemas.estates import AllocationAction, AllocationPaymentPlanUpdate, BlockCreate, BlockUpdate, BuyerAllocationPaymentCreate, PaymentIssueReportCreate, PaymentReminderSend, CommissionPayoutCreate, CommissionTiersUpdate, CustomerCreate, DevelopmentForecastPublishUpdate, DevelopmentStatusUpdate, EstateCreate, EstateLayoutCriteria, EstateLayoutDecision, EstateLayoutFeatureAdd, EstateLayoutFeatureRemove, EstateLayoutProposalEdit, EstateSubdivisionCreate, EstateUpdate, FieldInspectionCreate, GeoreferenceSessionLink, ImportFromGeoreference, ImportReviewCreate, ImportReviewDecision, ImportReviewFromGeoreferenceSession, MemberCreate, MemberUpdate, PaymentInboxCreate, PaymentInboxMatch, PaymentScheduleInput, PlotCreate, SettlementRequestCreate, PlotAddressUpdate, PlotGeometryUpdate, PlotListingDefaultsUpdate, PlotPriceUpdate, PortalTokenCreate, BulkCustomerSmsCreate, PublicEstateSettingsUpdate, PublicReservationConvert, PublicReservationCreate, PublicReservationUpdate, PaymentCreate, QrCampaignCreate, SpatialFeatureCreate, SpatialFeatureUpdate, StaffCreate, StaffRoleCreate, StaffRoleUpdate, StaffUpdate, SurveyEligibilityUpdate, TitleVerificationUpdate, VoidAction
 from app.services.estates.payments import confirm_payment, financial_summary, record_payment, void_payment
 from app.services.estates.documents import MAX_ESTATE_DOCUMENT_BYTES, read_private_estate_file, store_private_estate_file
 from app.utils.r2_objects import delete_object_best_effort, build_r2_settings
@@ -69,7 +69,7 @@ from app.services.estates.operations import DOCUMENT_REQUIREMENTS, ESTATE_DOCUME
 from app.services.estates import allocation_charges
 from app.services.estates import payment_reminders
 from app.services.estates import settlement_tracking
-from app.models.estate_foundation import EstatePaymentIssueReport
+from app.models.estate_foundation import EstatePaymentIssueReport, EstateSettlementRequest
 from app.utils import estate_flutterwave as flw
 from app.utils import estate_paystack as pst
 from app.utils.auth_security import require_signed_flutterwave_webhooks
@@ -5474,6 +5474,42 @@ def resolve_payment_issue_report(report_id: int, request: Request, db: Session =
     report.resolved_by_subject_id = access.principal.subject_id
     db.commit()
     return {"id": report.id, "status": report.status}
+
+
+@router.post("/accounting/settlement-requests", status_code=201)
+def create_settlement_request(payload: SettlementRequestCreate, request: Request, db: Session = Depends(get_db)):
+    """A developer asking LandCheck to manually initiate an immediate settlement, ahead of
+    Flutterwave's own next-business-day schedule - emailed to LandCheck support; reviewed and
+    actioned from the Estates admin accounting view (estate_admin_accounting.py)."""
+    access = require_estate_access(db, request, payload.organization_id, permission="payment.read")
+    amount_snapshot = None
+    if payload.charge_attempt_id:
+        attempt = db.get(EstateAllocationChargeAttempt, payload.charge_attempt_id)
+        if attempt and attempt.organization_id == payload.organization_id:
+            amount_snapshot = attempt.amount
+    settlement_request = EstateSettlementRequest(
+        organization_id=payload.organization_id,
+        charge_attempt_id=payload.charge_attempt_id,
+        amount_snapshot=amount_snapshot,
+        note=payload.note,
+        requested_by_subject_type=access.principal.subject_type,
+        requested_by_subject_id=access.principal.subject_id,
+    )
+    db.add(settlement_request)
+    db.commit()
+    organization = db.get(EstateOrganization, payload.organization_id)
+    if organization:
+        estate_email.send_settlement_request_email(organization=organization, requested_by_display_name=access.principal.display_name, amount=f"NGN {amount_snapshot}" if amount_snapshot is not None else None, note=payload.note)
+    append_estate_audit_event(db, organization_id=payload.organization_id, actor=access.principal, action="settlement_request.created", entity_type="estate_settlement_request", entity_id=settlement_request.id, after_data={"charge_attempt_id": payload.charge_attempt_id})
+    db.commit()
+    return {"id": settlement_request.id, "status": settlement_request.status}
+
+
+@router.get("/accounting/settlement-requests")
+def list_settlement_requests(organization_id: int, request: Request, db: Session = Depends(get_db)):
+    require_estate_access(db, request, organization_id, permission="payment.read")
+    rows = db.query(EstateSettlementRequest).filter(EstateSettlementRequest.organization_id == organization_id).order_by(EstateSettlementRequest.created_at.desc()).limit(100).all()
+    return {"rows": [{"id": r.id, "charge_attempt_id": r.charge_attempt_id, "amount": str(r.amount_snapshot) if r.amount_snapshot is not None else None, "note": r.note, "status": r.status, "created_at": r.created_at, "settled_at": r.settled_at} for r in rows]}
 
 
 @router.post("/payment-inbox", status_code=201)
