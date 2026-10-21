@@ -137,6 +137,9 @@ def _post_payload(post: EstateSocialPost) -> dict:
         "published_at": post.published_at, "reminder_sent_at": post.reminder_sent_at, "results": post.results or {}, "created_at": post.created_at,
         "plan_id": post.plan_id, "auto_caption": bool(post.auto_caption),
         "template_label": social_templates.TEMPLATE_INFO.get(post.template_key, (None,))[0], "strategy": (social_templates.TEMPLATE_INFO.get(post.template_key) or (None, None))[1],
+        # A staff-uploaded photo's own address - the dashboard preview must show this instead of
+        # regenerating the auto-flyer when the post carries one (see post_image_url's comment).
+        "custom_image_proxy_url": social_posts.post_image_url(post, "facebook") if post.custom_image_url else None,
     }
 
 
