@@ -264,6 +264,23 @@ def public_social_image(token: str, db: Session = Depends(get_db)):
     return _png(data, public=True)
 
 
+@router.get("/marketing/social/custom-image/{token}")
+def public_custom_social_image(token: str, db: Session = Depends(get_db)):
+    """Fetched by Facebook/Instagram's servers for a "Post your own photo" post - streamed back using
+    real R2 credentials rather than handing Meta a raw R2 object URL (see post_image_url's comment)."""
+    post_id = social_posts.read_custom_image_token(token)
+    if post_id is None:
+        raise HTTPException(404, "Image not found")
+    post = db.get(EstateSocialPost, post_id)
+    if post is None or not post.custom_image_url:
+        raise HTTPException(404, "Image not found")
+    fetched = social_posts.fetch_custom_image(post)
+    if fetched is None:
+        raise HTTPException(502, "The uploaded photo could not be retrieved. Try uploading it again.")
+    data, content_type = fetched
+    return Response(data, media_type=content_type, headers={"Cache-Control": "public, max-age=300"})
+
+
 # ── Posts ────────────────────────────────────────────────────────────────────────────────────
 SCOPE_STATUSES = {
     "upcoming": ("scheduled", "publishing"),

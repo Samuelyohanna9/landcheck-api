@@ -15,6 +15,7 @@ from app.services.estates import marketing_render, social_meta
 from app.services.estates.marketing_alerts import _dedupe, _member_emails, _send
 from app.services.estates.marketing_common import api_url, web_url
 from app.services.estates.social_templates import AUTOMATIC_CHANNELS, CHANNEL_FORMAT, CHANNEL_LABEL, MANUAL_CHANNELS, caption_for_channel
+from app.utils.r2_objects import build_r2_settings, create_r2_client, normalize_object_key
 from app.utils.secret_box import SecretNotConfigured, decrypt_text, make_signed_token, read_signed_token
 
 logger = logging.getLogger(__name__)
@@ -36,13 +37,50 @@ def render_image(db: Session, estate: Estate, *, fmt: str, style: str, plot_id: 
 
 
 def post_image_url(post: EstateSocialPost, channel: str) -> str:
-    """A signed, expiring public address Meta can fetch the image from (their servers cannot log in) -
-    or, for a post made from a staff-uploaded photo, that photo's own public R2 address directly."""
+    """A signed, expiring public address Meta can fetch the image from (their servers cannot log in).
+    A staff-uploaded photo is proxied through our own endpoint too, rather than handing Meta R2's raw
+    object address directly - R2's S3-API domain (r2.cloudflarestorage.com) requires a signed AWS
+    request and rejects anonymous fetches, so Meta's servers cannot read it there even when the bucket
+    itself is "public"; only a true public endpoint (R2_PUBLIC_BASE_URL pointed at a custom domain or
+    r2.dev) would work, and this way doesn't depend on that being configured correctly."""
     if post.custom_image_url:
-        return post.custom_image_url
+        token = make_signed_token("cimg", post.id, ttl_seconds=IMAGE_TOKEN_TTL_SECONDS)
+        return f"{api_url()}/estates/marketing/social/custom-image/{token}"
     fmt = CHANNEL_FORMAT.get(channel, "post")
     token = make_signed_token("img", post.id, fmt, ttl_seconds=IMAGE_TOKEN_TTL_SECONDS)
     return f"{api_url()}/estates/marketing/social/image/{token}.png"
+
+
+def read_custom_image_token(token: str) -> int | None:
+    parts = read_signed_token(token, "cimg")
+    if not parts or len(parts) != 1:
+        return None
+    try:
+        return int(parts[0])
+    except ValueError:
+        return None
+
+
+def fetch_custom_image(post: EstateSocialPost) -> tuple[bytes, str] | None:
+    """Reads a staff-uploaded post photo back from R2 using real credentials, so Meta never needs
+    direct access to the bucket. Returns (bytes, content_type), or None if it can't be read."""
+    if not post.custom_image_url:
+        return None
+    settings = build_r2_settings(prefix="R2")
+    if settings is None:
+        return None
+    object_key = normalize_object_key(post.custom_image_url, settings["bucket"])
+    if not object_key:
+        return None
+    try:
+        client = create_r2_client(settings)
+        obj = client.get_object(Bucket=settings["bucket"], Key=object_key)
+        data = obj["Body"].read()
+    except Exception:
+        logger.exception("Could not fetch custom post image from R2 (post=%s)", post.id)
+        return None
+    content_type = obj.get("ContentType") or ("image/png" if object_key.lower().endswith(".png") else "image/jpeg")
+    return data, content_type
 
 
 def broadcast_image_url(estate_id: int, style: str) -> str:
