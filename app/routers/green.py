@@ -23670,95 +23670,192 @@ def delete_admin_organization(
     organization_id = int(existing["id"])
     deletion_counts: dict[str, int] = {}
 
-    def delete_rows(statement: str, table_key: str) -> None:
+    def table_has_columns(table_name: str, columns: tuple[str, ...]) -> bool:
+        if not columns:
+            return bool(
+                db.execute(
+                    text("SELECT to_regclass(:table_name) IS NOT NULL"),
+                    {"table_name": f"public.{table_name}"},
+                ).scalar()
+            )
+        return bool(
+            db.execute(
+                text(
+                    """
+                    SELECT COUNT(*) = :column_count
+                    FROM information_schema.columns
+                    WHERE table_schema = 'public'
+                      AND table_name = :table_name
+                      AND column_name IN :columns
+                    """
+                ).bindparams(bindparam("columns", expanding=True)),
+                {"table_name": table_name, "columns": list(columns), "column_count": len(columns)},
+            ).scalar()
+        )
+
+    def delete_rows(
+        statement: str,
+        table_key: str,
+        *,
+        table_name: str,
+        required_columns: tuple[str, ...] = (),
+    ) -> None:
+        # Older deployments may not have optional tables/columns that newer Work flows create.
+        # Skip those rows safely instead of aborting the whole hard-delete transaction.
+        if not table_has_columns(table_name, required_columns):
+            deletion_counts[table_key] = 0
+            return
         result = db.execute(text(statement), {"org_id": organization_id})
         deletion_counts[table_key] = int(result.rowcount or 0)
 
-    # Invalidate active browser sessions and one-time verification links before removing staff.
-    delete_rows(
-        """
-        DELETE FROM green_auth_sessions
-        WHERE subject_type = 'green_user'
-          AND subject_id IN (SELECT id FROM green_users WHERE organization_id = :org_id)
-        """,
-        "green_auth_sessions",
-    )
-    delete_rows(
-        """
-        DELETE FROM green_email_verification_tokens
-        WHERE subject_type = 'green_user'
-          AND subject_id IN (SELECT id FROM green_users WHERE organization_id = :org_id)
-        """,
-        "green_email_verification_tokens",
-    )
-
-    # Remove direct organization records. The remaining project rows are deleted next; their
-    # database CASCADE rules remove all tree, task, order, export, and monitoring descendants.
-    delete_rows("DELETE FROM green_privacy_consents WHERE organization_id = :org_id", "green_privacy_consents")
-    delete_rows("DELETE FROM green_push_tokens WHERE organization_id = :org_id", "green_push_tokens")
-    delete_rows(
-        "DELETE FROM green_sponsor_agent_bank_accounts WHERE organization_id = :org_id",
-        "green_sponsor_agent_bank_accounts",
-    )
-    delete_rows(
-        "DELETE FROM green_sponsor_agent_payout_requests WHERE organization_id = :org_id",
-        "green_sponsor_agent_payout_requests",
-    )
-    delete_rows(
-        "DELETE FROM green_sponsor_agent_manual_payout_items WHERE organization_id = :org_id",
-        "green_sponsor_agent_manual_payout_items",
-    )
-    delete_rows("DELETE FROM green_export_jobs WHERE organization_id = :org_id", "green_export_jobs")
-
-    # These assignment columns are nullable but use legacy NO ACTION foreign keys. Clear any
-    # cross-project assignments before deleting the staff rows so an old assignment cannot block
-    # a hard delete of the organization.
-    db.execute(
-        text(
+    try:
+        # Invalidate active browser sessions and one-time verification links before removing staff.
+        delete_rows(
             """
-            UPDATE green_sponsorship_units
-            SET assigned_user_id = NULL
-            WHERE assigned_user_id IN (SELECT id FROM green_users WHERE organization_id = :org_id)
+            DELETE FROM green_auth_sessions
+            WHERE subject_type = 'green_user'
+              AND subject_id IN (SELECT id FROM green_users WHERE organization_id = :org_id)
+            """,
+            "green_auth_sessions",
+            table_name="green_auth_sessions",
+            required_columns=("subject_type", "subject_id"),
+        )
+        delete_rows(
             """
-        ),
-        {"org_id": organization_id},
-    )
-    db.execute(
-        text(
-            """
-            UPDATE green_work_orders
-            SET assignee_user_id = NULL
-            WHERE assignee_user_id IN (SELECT id FROM green_users WHERE organization_id = :org_id)
-            """
-        ),
-        {"org_id": organization_id},
-    )
+            DELETE FROM green_email_verification_tokens
+            WHERE subject_type = 'green_user'
+              AND subject_id IN (SELECT id FROM green_users WHERE organization_id = :org_id)
+            """,
+            "green_email_verification_tokens",
+            table_name="green_email_verification_tokens",
+            required_columns=("subject_type", "subject_id"),
+        )
 
-    delete_rows("DELETE FROM tree_projects WHERE organization_id = :org_id", "tree_projects")
-    delete_rows("DELETE FROM green_users WHERE organization_id = :org_id", "green_users")
+        # Remove direct organization records. The remaining project rows are deleted next; their
+        # database CASCADE rules remove all tree, task, order, export, and monitoring descendants.
+        delete_rows(
+            "DELETE FROM green_privacy_consents WHERE organization_id = :org_id",
+            "green_privacy_consents",
+            table_name="green_privacy_consents",
+            required_columns=("organization_id",),
+        )
+        delete_rows(
+            "DELETE FROM green_push_tokens WHERE organization_id = :org_id",
+            "green_push_tokens",
+            table_name="green_push_tokens",
+            required_columns=("organization_id",),
+        )
+        delete_rows(
+            "DELETE FROM green_sponsor_agent_bank_accounts WHERE organization_id = :org_id",
+            "green_sponsor_agent_bank_accounts",
+            table_name="green_sponsor_agent_bank_accounts",
+            required_columns=("organization_id",),
+        )
+        delete_rows(
+            "DELETE FROM green_sponsor_agent_payout_requests WHERE organization_id = :org_id",
+            "green_sponsor_agent_payout_requests",
+            table_name="green_sponsor_agent_payout_requests",
+            required_columns=("organization_id",),
+        )
+        delete_rows(
+            "DELETE FROM green_sponsor_agent_manual_payout_items WHERE organization_id = :org_id",
+            "green_sponsor_agent_manual_payout_items",
+            table_name="green_sponsor_agent_manual_payout_items",
+            required_columns=("organization_id",),
+        )
+        delete_rows(
+            "DELETE FROM green_export_jobs WHERE organization_id = :org_id",
+            "green_export_jobs",
+            table_name="green_export_jobs",
+            required_columns=("organization_id",),
+        )
 
-    # Keep one platform-level deletion event for operational accountability. It has no foreign key
-    # to the deleted tenant and therefore cannot block a later registration with the same details.
-    _log_audit_event(
-        db,
-        project_id=None,
-        entity_type="organization",
-        entity_id=organization_id,
-        action="organization_hard_deleted",
-        actor=f"super_admin:{getattr(session, 'user_id', None) or 'env'}",
-        details={
-            "name": existing.get("name"),
-            "slug": existing.get("slug"),
-            "previous_status": existing.get("status"),
-            "deleted_rows": deletion_counts,
-        },
-    )
+        # These tables intentionally do not use foreign keys because they are created by optional
+        # evidence/AI services. Remove their tenant rows explicitly before deleting projects.
+        delete_rows(
+            "DELETE FROM green_photo_evidence WHERE project_id IN (SELECT id FROM tree_projects WHERE organization_id = :org_id)",
+            "green_photo_evidence",
+            table_name="green_photo_evidence",
+            required_columns=("project_id",),
+        )
+        delete_rows(
+            "DELETE FROM green_tree_health_checks WHERE project_id IN (SELECT id FROM tree_projects WHERE organization_id = :org_id)",
+            "green_tree_health_checks",
+            table_name="green_tree_health_checks",
+            required_columns=("project_id",),
+        )
+        if table_has_columns("green_impact_comments", ("org_slug",)):
+            impact_result = db.execute(
+                text("DELETE FROM green_impact_comments WHERE LOWER(org_slug) = LOWER(:org_slug)"),
+                {"org_slug": str(existing.get("slug") or "").strip()},
+            )
+            deletion_counts["green_impact_comments"] = int(impact_result.rowcount or 0)
 
-    db.execute(
-        text("DELETE FROM green_organizations WHERE id = :org_id"),
-        {"org_id": organization_id},
-    )
-    db.commit()
+        # These assignment columns are nullable but use legacy NO ACTION foreign keys. Clear any
+        # cross-project assignments before deleting staff rows. The columns themselves are lazy
+        # migrations, so never assume they exist in an older production database.
+        if table_has_columns("green_sponsorship_units", ("assigned_user_id",)):
+            db.execute(
+                text(
+                    """
+                    UPDATE green_sponsorship_units
+                    SET assigned_user_id = NULL
+                    WHERE assigned_user_id IN (SELECT id FROM green_users WHERE organization_id = :org_id)
+                    """
+                ),
+                {"org_id": organization_id},
+            )
+        if table_has_columns("green_work_orders", ("assignee_user_id",)):
+            db.execute(
+                text(
+                    """
+                    UPDATE green_work_orders
+                    SET assignee_user_id = NULL
+                    WHERE assignee_user_id IN (SELECT id FROM green_users WHERE organization_id = :org_id)
+                    """
+                ),
+                {"org_id": organization_id},
+            )
+
+        delete_rows(
+            "DELETE FROM tree_projects WHERE organization_id = :org_id",
+            "tree_projects",
+            table_name="tree_projects",
+            required_columns=("organization_id",),
+        )
+        delete_rows(
+            "DELETE FROM green_users WHERE organization_id = :org_id",
+            "green_users",
+            table_name="green_users",
+            required_columns=("organization_id",),
+        )
+
+        # Keep one platform-level deletion event for operational accountability. It has no foreign key
+        # to the deleted tenant and therefore cannot block a later registration with the same details.
+        _log_audit_event(
+            db,
+            project_id=None,
+            entity_type="organization",
+            entity_id=organization_id,
+            action="organization_hard_deleted",
+            actor=f"super_admin:{getattr(session, 'user_id', None) or 'env'}",
+            details={
+                "name": existing.get("name"),
+                "slug": existing.get("slug"),
+                "previous_status": existing.get("status"),
+                "deleted_rows": deletion_counts,
+            },
+        )
+
+        db.execute(
+            text("DELETE FROM green_organizations WHERE id = :org_id"),
+            {"org_id": organization_id},
+        )
+        db.commit()
+    except Exception as exc:
+        db.rollback()
+        logger.exception("Hard delete failed for Green organization %s", organization_id)
+        raise HTTPException(status_code=500, detail="Organization deletion failed. No data was removed.") from exc
     return {
         "ok": True,
         "deleted": True,
