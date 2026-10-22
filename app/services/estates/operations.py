@@ -175,10 +175,15 @@ def issue_agent_portal_token(
     *,
     member,
     actor: EstatePrincipal,
-    expires_in_days: int = 365,
+    expires_in_days: int | None = None,
     revoke_existing: bool = True,
 ) -> tuple[EstateAgentPortalToken, str]:
-    """Issue an agent link while storing only its hash in the database."""
+    """Issue a revocable agent link while storing only its hash in the database.
+
+    Agent workspace links are permanent by default. The optional expiry is retained for
+    controlled internal callers that explicitly need a short-lived link; normal Estate
+    invites remain valid until the organization revokes them.
+    """
     now = _now()
     if revoke_existing:
         db.query(EstateAgentPortalToken).filter(
@@ -190,7 +195,7 @@ def issue_agent_portal_token(
         organization_id=member.organization_id,
         member_id=member.id,
         token_hash=hash_portal_token(raw_token),
-        expires_at=now + timedelta(days=max(1, min(int(expires_in_days), 730))),
+        expires_at=(now + timedelta(days=max(1, min(int(expires_in_days), 730)))) if expires_in_days is not None else None,
         created_by_subject_type=actor.subject_type,
         created_by_subject_id=actor.subject_id,
     )
@@ -203,7 +208,7 @@ def issue_agent_portal_token(
         action="agent.portal_token.created",
         entity_type="estate_agent_portal_token",
         entity_id=row.id,
-        after_data={"member_id": member.id, "expires_at": row.expires_at.isoformat()},
+        after_data={"member_id": member.id, "expires_at": row.expires_at.isoformat() if row.expires_at else None},
     )
     return row, raw_token
 

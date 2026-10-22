@@ -6028,9 +6028,11 @@ def buyer_document_download(token: str, document_id: int, db: Session = Depends(
 def _agent_portal_context(db: Session, token: str):
     row = db.query(EstateAgentPortalToken).filter(EstateAgentPortalToken.token_hash == hash_portal_token(token)).one_or_none()
     now = datetime.now(timezone.utc)
-    expires_at = row.expires_at.replace(tzinfo=timezone.utc) if row and row.expires_at.tzinfo is None else (row.expires_at if row else None)
-    if not row or row.revoked_at is not None or not expires_at or expires_at <= now:
-        raise HTTPException(404, "This agent workspace link is invalid or expired")
+    expires_at = None
+    if row and row.expires_at:
+        expires_at = row.expires_at.replace(tzinfo=timezone.utc) if row.expires_at.tzinfo is None else row.expires_at
+    if not row or row.revoked_at is not None or (expires_at is not None and expires_at <= now):
+        raise HTTPException(404, "This agent workspace link is invalid or revoked")
     member = db.get(EstateOrganizationMember, row.member_id)
     organization = db.get(EstateOrganization, row.organization_id)
     if not member or not member.is_active or not organization or organization.status != "active":
@@ -6417,6 +6419,33 @@ def send_agent_portal_invite(organization_id: int, member_id: int, request: Requ
     organization = db.get(EstateOrganization, organization_id)
     email_sent = estate_email.send_agent_workspace_invite(organization=organization, member=member, portal_url=portal_url) if organization else False
     return {"member_id": member.id, "portal_url": portal_url, "expires_at": token_row.expires_at, "email_sent": email_sent}
+
+
+@router.post("/organizations/{organization_id}/members/{member_id}/portal-revoke")
+def revoke_agent_portal_links(organization_id: int, member_id: int, request: Request, db: Session = Depends(get_db)):
+    access = require_estate_access(db, request, organization_id, permission="estate.manage")
+    member = db.query(EstateOrganizationMember).filter(
+        EstateOrganizationMember.id == member_id,
+        EstateOrganizationMember.organization_id == organization_id,
+    ).one_or_none()
+    if not member or member.role_key not in {"sales", "marketer"}:
+        raise HTTPException(404, "Agent member not found")
+    now = datetime.now(timezone.utc)
+    revoked_count = db.query(EstateAgentPortalToken).filter(
+        EstateAgentPortalToken.member_id == member.id,
+        EstateAgentPortalToken.revoked_at.is_(None),
+    ).update({"revoked_at": now}, synchronize_session=False)
+    append_estate_audit_event(
+        db,
+        organization_id=organization_id,
+        actor=access.principal,
+        action="agent.portal_token.revoked",
+        entity_type="estate_organization_member",
+        entity_id=member.id,
+        after_data={"member_id": member.id, "revoked_count": int(revoked_count or 0)},
+    )
+    db.commit()
+    return {"member_id": member.id, "revoked": bool(revoked_count), "revoked_count": int(revoked_count or 0)}
 
 
 @router.post("/organizations/{organization_id}/members/{member_id}/portal-preview")
