@@ -268,10 +268,30 @@ def get_analytics_overview(db: Session = Depends(get_db)):
 
 @router.get("/public-proof")
 def get_public_survey_proof(response: Response, db: Session = Depends(get_db)):
-    """Return only the aggregate Survey plot count used as public product proof."""
+    """Return aggregate product-use counts safe to show on public landing pages."""
     response.headers["Cache-Control"] = "no-store"
     total_plots = db.execute(text("SELECT COUNT(*) FROM plots")).scalar() or 0
-    return {"total_plots_generated": int(total_plots)}
+    total_hazard_screenings = 0
+    try:
+        # Hazard jobs are created lazily, so older deployments may not have the table yet. Do not
+        # create schema from a public read; simply report zero until the first hazard run exists.
+        has_hazard_jobs = db.execute(text("SELECT to_regclass('public.hazard_analysis_jobs')")).scalar()
+        if has_hazard_jobs:
+            total_hazard_screenings = db.execute(text("""
+                SELECT COUNT(*)
+                FROM hazard_analysis_jobs
+                WHERE status = 'completed'
+                  AND output_type = 'preview'
+                  AND hazard_type IN ('flood', 'erosion', 'lulc')
+            """)).scalar() or 0
+    except Exception:
+        # Public proof is optional UI context; a missing/temporarily unavailable hazard table must
+        # never make the landing page fail.
+        total_hazard_screenings = 0
+    return {
+        "total_plots_generated": int(total_plots),
+        "total_hazard_screenings_completed": int(total_hazard_screenings),
+    }
 
 
 @router.get("/plots/daily")

@@ -16,8 +16,12 @@ class _CountDatabase:
         self.values = iter(values)
 
     def execute(self, statement):
-        assert str(statement).strip().lower() == "select count(*) from plots"
-        return _ScalarResult(next(self.values))
+        normalized = str(statement).strip().lower()
+        if normalized == "select count(*) from plots":
+            return _ScalarResult(next(self.values))
+        if "select to_regclass('public.hazard_analysis_jobs')" in normalized:
+            return _ScalarResult(None)
+        raise AssertionError(f"Unexpected SQL: {statement}")
 
 
 def test_public_survey_proof_is_registered_and_reflects_latest_plot_total():
@@ -31,5 +35,5 @@ def test_public_survey_proof_is_registered_and_reflects_latest_plot_total():
 
     assert first_response.status_code == 200
     assert first_response.headers["cache-control"] == "no-store"
-    assert first == {"total_plots_generated": 42}
-    assert second == {"total_plots_generated": 43}
+    assert first == {"total_plots_generated": 42, "total_hazard_screenings_completed": 0}
+    assert second == {"total_plots_generated": 43, "total_hazard_screenings_completed": 0}
