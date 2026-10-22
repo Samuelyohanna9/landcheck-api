@@ -13837,8 +13837,6 @@ def list_public_partner_organizations(db: Session = Depends(get_db)):
             SELECT id, name, logo_url
             FROM green_organizations
             WHERE COALESCE(is_active, TRUE) = TRUE
-              AND logo_url IS NOT NULL
-              AND logo_url != ''
             ORDER BY name
             """
         )
