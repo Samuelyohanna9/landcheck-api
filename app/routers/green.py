@@ -13986,6 +13986,7 @@ def get_public_org_impact(org_slug: str, db: Session = Depends(get_db)):
             FROM green_organizations
             WHERE LOWER(slug) = :slug
               AND slug IS NOT NULL AND slug != ''
+              AND COALESCE(is_active, TRUE) = TRUE
             LIMIT 1
             """
         ),
@@ -23637,6 +23638,76 @@ def update_admin_organization(
     payload["welcome_email_sent"] = False
     payload["welcome_email_error"] = None
     return payload
+
+
+@router.delete("/admin/organizations/{org_id}")
+def delete_admin_organization(
+    org_id: int,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    """Remove an organization from public surfaces without destroying its field history.
+
+    Organisation records own historical projects, trees, tasks, and audit context. Keep those
+    records available for internal reporting while revoking the organisation's active/public
+    status. The public partner and impact endpoints both honour this flag.
+    """
+    require_super_admin_request(db, request)
+    existing = db.execute(
+        text(
+            """
+            SELECT id, name, slug, status, logo_url, COALESCE(is_active, TRUE) AS is_active
+            FROM green_organizations
+            WHERE id = :org_id
+            """
+        ),
+        {"org_id": org_id},
+    ).mappings().first()
+    if not existing:
+        raise HTTPException(status_code=404, detail="Organization not found")
+
+    if not bool(existing.get("is_active", True)):
+        return {
+            "ok": True,
+            "already_deleted": True,
+            "public_listing_removed": True,
+            "organization": dict(existing),
+        }
+
+    row = db.execute(
+        text(
+            """
+            UPDATE green_organizations
+            SET is_active = FALSE,
+                status = 'deleted',
+                updated_at = NOW()
+            WHERE id = :org_id
+            RETURNING id, name, slug, status, logo_url, is_active, updated_at
+            """
+        ),
+        {"org_id": org_id},
+    ).mappings().first()
+    _log_audit_event(
+        db,
+        project_id=None,
+        entity_type="organization",
+        entity_id=org_id,
+        action="organization_deleted",
+        actor="super_admin",
+        details={
+            "name": existing.get("name"),
+            "slug": existing.get("slug"),
+            "previous_status": existing.get("status"),
+            "preserved_history": True,
+        },
+    )
+    db.commit()
+    return {
+        "ok": True,
+        "already_deleted": False,
+        "public_listing_removed": True,
+        "organization": dict(row),
+    }
 
 
 @router.get("/admin/roles")
