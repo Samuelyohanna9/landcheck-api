@@ -3201,8 +3201,8 @@ def _build_field_public_reset_password_url(token: str, request: Request | None =
     reset_token = str(token or "").strip()
     if not reset_token:
         return None
-    base_url = _build_public_api_base_url(request)
-    return f"{base_url}/green/public/reset-password?token={quote(reset_token)}" if base_url else None
+    web_url = str(os.getenv("LANDCHECK_WEB_URL") or "https://landcheck.online").strip().rstrip("/")
+    return f"{web_url}/reset-password?product=green-work&token={quote(reset_token)}"
 
 
 def _send_field_password_reset_email(*, to_email: str, full_name: str, reset_url: str, expires_at: datetime):
@@ -4235,8 +4235,8 @@ def _build_sponsor_public_reset_password_url(token: str, request: Request | None
     reset_token = str(token or "").strip()
     if not reset_token:
         return None
-    base_url = _build_public_api_base_url(request)
-    return f"{base_url}/green/sponsor/public/reset-password?token={quote(reset_token)}" if base_url else None
+    web_url = str(os.getenv("LANDCHECK_WEB_URL") or "https://landcheck.online").strip().rstrip("/")
+    return f"{web_url}/reset-password?product=green-sponsor&token={quote(reset_token)}"
 
 
 def _build_tree_best_photo_url(tree_id: object, request: Request | None = None) -> str | None:
@@ -14754,6 +14754,21 @@ def sponsor_auth_reset_password(payload: SponsorResetPasswordPayload, db: Sessio
             "password_hash": _hash_password_value(new_password),
         },
     )
+    ensure_auth_security_schema()
+    db.execute(
+        text(
+            """
+            UPDATE green_auth_sessions
+            SET session_state = 'revoked',
+                revoked_at = NOW(),
+                revoke_reason = 'password_reset'
+            WHERE session_state = 'active'
+              AND subject_type = 'sponsor_account'
+              AND sponsor_account_id = :sponsor_id
+            """
+        ),
+        {"sponsor_id": int(row["id"])},
+    )
     _log_audit_event(
         db,
         project_id=None,
@@ -21225,9 +21240,11 @@ def sponsor_public_terms(request: Request):
     return HTMLResponse(content=_render_sponsor_public_terms_html(request=request))
 
 
-@router.get("/sponsor/public/reset-password", response_class=HTMLResponse)
+@router.get("/sponsor/public/reset-password")
 def sponsor_public_reset_password(token: str = Query(default="")):
-    return HTMLResponse(content=_render_sponsor_public_reset_password_html(token))
+    web_url = str(os.getenv("LANDCHECK_WEB_URL") or "https://landcheck.online").strip().rstrip("/")
+    safe_token = quote(str(token or "").strip())
+    return RedirectResponse(f"{web_url}/reset-password?product=green-sponsor&token={safe_token}", status_code=303)
 
 
 @router.get("/agent-payouts/banks")
@@ -28702,8 +28719,8 @@ def green_auth_reset_password(payload: FieldResetPasswordPayload, db: Session = 
     if len(token) < 20:
         raise HTTPException(status_code=400, detail="Invalid reset token")
     new_password = str(payload.new_password or "")
-    if len(new_password) < 6:
-        raise HTTPException(status_code=400, detail="Password must be at least 6 characters")
+    if len(new_password) < 8:
+        raise HTTPException(status_code=400, detail="Password must be at least 8 characters")
     token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
     row = db.execute(
         text(
@@ -28737,6 +28754,21 @@ def green_auth_reset_password(payload: FieldResetPasswordPayload, db: Session = 
             "password_hash": _hash_password_value(new_password),
         },
     )
+    ensure_auth_security_schema()
+    db.execute(
+        text(
+            """
+            UPDATE green_auth_sessions
+            SET session_state = 'revoked',
+                revoked_at = NOW(),
+                revoke_reason = 'password_reset'
+            WHERE session_state = 'active'
+              AND subject_type = 'green_user'
+              AND user_id = :user_id
+            """
+        ),
+        {"user_id": int(row["id"])},
+    )
     _log_audit_event(
         db,
         project_id=None,
@@ -28750,9 +28782,11 @@ def green_auth_reset_password(payload: FieldResetPasswordPayload, db: Session = 
     return {"ok": True, "message": "Password updated successfully. You can sign in now."}
 
 
-@router.get("/public/reset-password", response_class=HTMLResponse)
+@router.get("/public/reset-password")
 def field_public_reset_password(token: str = Query(default="")):
-    return HTMLResponse(content=_render_field_public_reset_password_html(token))
+    web_url = str(os.getenv("LANDCHECK_WEB_URL") or "https://landcheck.online").strip().rstrip("/")
+    safe_token = quote(str(token or "").strip())
+    return RedirectResponse(f"{web_url}/reset-password?product=green-work&token={safe_token}", status_code=303)
 
 
 @router.post("/mobile/push-tokens/register")

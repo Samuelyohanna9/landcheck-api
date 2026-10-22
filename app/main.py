@@ -686,6 +686,8 @@ def _rate_limit_for_path(path: str) -> tuple[int, int] | None:
     if path in {
         "/estates/auth/forgot-password",
         "/estates/auth/reset-password",
+        "/green/sponsor-auth/forgot-password",
+        "/green/sponsor-auth/reset-password",
         "/green/green-auth/forgot-password",
         "/green/green-auth/reset-password",
         "/survey/auth/magic-link/request",

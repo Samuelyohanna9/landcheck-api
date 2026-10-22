@@ -298,7 +298,7 @@ def forgot_password(payload: ForgotPasswordRequest, db: Session = Depends(get_db
     )
     db.commit()
     web_url = str(os.getenv("LANDCHECK_WEB_URL") or "https://landcheck.online").rstrip("/")
-    reset_link = f"{web_url}/estates/reset-password?token={raw_token}"
+    reset_link = f"{web_url}/reset-password?product=estates&token={raw_token}"
     estate_email.send_password_reset_email(account=account, reset_link=reset_link)
     return generic_response
 
