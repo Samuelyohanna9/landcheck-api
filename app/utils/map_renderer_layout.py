@@ -1611,6 +1611,7 @@ def annotate_vertices(
         leader_from=None,
         anchor_from_normal: bool = False,
         restrict_to_normal: bool = False,
+        fixed_position: bool = False,
     ):
         offset_m = max(2.0, (6.0 / 1000.0) * scale_ratio) * max(0.35, normal_offset_mult)
         if normal_offset_mult >= 1.5:
@@ -1652,15 +1653,20 @@ def annotate_vertices(
             # range than bearing/distance labels - on a real, cluttered plot (lots of crossing
             # road/river linework near the middle), letting a station name escalate all the way to
             # 2.8x to dodge that clutter is exactly what made it read as "far away" from its own
-            # beacon instead of just being close to it. Bearing/distance labels (mult=1.0) keep the
-            # original wider escalation range unchanged.
-            multiples = (1.0, 1.2) if normal_offset_mult >= 1.5 else (1.0, 1.5, 2.1, 2.8)
-            candidates = []
-            for multiple in multiples:
-                for direction in ((1,) if restrict_to_normal else (1, -1)):
-                    ddx, ddy = nx * direction, ny * direction
-                    ha, va = anchor_for(ddx, ddy)
-                    candidates.append((x + ddx * offset_m * multiple, y + ddy * offset_m * multiple, ha, va))
+            # beacon instead of just being close to it. Bearing/distance labels can opt out of
+            # escalation entirely when their fixed relationship to the boundary matters more than
+            # avoiding another annotation.
+            if fixed_position:
+                ha, va = anchor_for(nx, ny)
+                candidates = [(x + nx * offset_m, y + ny * offset_m, ha, va)]
+            else:
+                multiples = (1.0, 1.2) if normal_offset_mult >= 1.5 else (1.0, 1.5, 2.1, 2.8)
+                candidates = []
+                for multiple in multiples:
+                    for direction in ((1,) if restrict_to_normal else (1, -1)):
+                        ddx, ddy = nx * direction, ny * direction
+                        ha, va = anchor_for(ddx, ddy)
+                        candidates.append((x + ddx * offset_m * multiple, y + ddy * offset_m * multiple, ha, va))
             if allow_center:
                 candidates.append((x, y, "center", "center"))
             if avoid_geom is not None:
@@ -1684,7 +1690,7 @@ def annotate_vertices(
                             candidates = [(x + nx * offset_m * 2.0 * direction, y + ny * offset_m * 2.0 * direction, ha, va)]
         elif avoid_geom is not None:
             candidates = [c for c in candidates if not avoid_geom.contains(Point(c[0], c[1]))] or candidates
-        offsets = [
+        offsets = [(0, 0)] if fixed_position else [
             (0, 0),
             (span_x * 0.01, 0),
             (-span_x * 0.01, 0),
@@ -1697,14 +1703,12 @@ def annotate_vertices(
         ]
         # Try each candidate position in turn (nearest normal-direction offset first, farther ones
         # only if it collides), refining each with a small jitter for local collision avoidance.
-        # candidates defaults to [(x, y, "center", "center")] when normal/avoid_geom don't apply
-        # (e.g. bearing/distance labels, which compute their own offset position before calling
-        # place_text) - iterating a single-element list here reproduces that existing behavior
-        # exactly.
+        # Fixed-position dimensions intentionally skip that escalation and jitter: their
+        # cartographic relationship to the boundary is more important than avoiding another label.
         for cx, cy, ha, va in candidates:
             for dx, dy in offsets:
                 bx = estimate_box(cx + dx, cy + dy, text, scale_w, scale_h, ha=ha, va=va)
-                if not collides(bx):
+                if fixed_position or not collides(bx):
                     break
             else:
                 continue
@@ -1900,6 +1904,7 @@ def annotate_vertices(
             allow_center=False,
             font_family=bearing_font,
             restrict_to_normal=True,
+            fixed_position=True,
         )
         distance_placed = place_text(
             mx,
@@ -1916,6 +1921,7 @@ def annotate_vertices(
             allow_center=False,
             font_family=bearing_font,
             restrict_to_normal=True,
+            fixed_position=True,
         )
         if not bearing_placed or not distance_placed:
             skipped.append(
