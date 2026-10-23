@@ -804,7 +804,7 @@ app.add_middleware(
     allow_origin_regex=local_origin_regex or None,
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-    allow_headers=["Accept", "Authorization", "Content-Type", "X-LC-Auth-Mode", "X-LC-App-Route", "X-LC-Client", "X-LC-Organization-Id", "X-LC-Role-Key", "X-LC-Session-App-Mode", "X-LC-User-Id", "X-LC-User-Name", "X-Idempotency-Key", "X-Requested-With"],
+    allow_headers=["Accept", "Authorization", "Cache-Control", "Content-Type", "X-LC-Auth-Mode", "X-LC-App-Route", "X-LC-Client", "X-LC-Organization-Id", "X-LC-Role-Key", "X-LC-Session-App-Mode", "X-LC-User-Id", "X-LC-User-Name", "X-Idempotency-Key", "X-Requested-With"],
     expose_headers=["Content-Disposition", "X-Request-Id"],
 )
 
