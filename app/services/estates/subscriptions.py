@@ -19,7 +19,7 @@ from sqlalchemy.orm import Session
 
 from app.models.estate_billing import EstateSubscription, EstateSubscriptionCharge
 from app.models.estate_foundation import EstateOrganization
-from app.services.estates.billing_plans import ACTIVE_SUBSCRIPTION_STATUSES, TRIAL_DAYS, plan_amount, plan_includes_auto_posting, plan_includes_hazard_analysis, plan_includes_live_inspections, plan_includes_soil_analysis, plan_includes_sms_notifications, plan_includes_whatsapp, plan_label, plan_max_estates
+from app.services.estates.billing_plans import ACTIVE_SUBSCRIPTION_STATUSES, TRIAL_DAYS, TRIAL_REMINDER_WINDOW_DAYS, plan_amount, plan_includes_auto_posting, plan_includes_hazard_analysis, plan_includes_live_inspections, plan_includes_soil_analysis, plan_includes_sms_notifications, plan_includes_whatsapp, plan_label, plan_max_estates
 from app.services.estates import estate_email
 from app.utils.estate_payment_provider import module_for
 
@@ -582,7 +582,7 @@ def _as_utc(value: datetime | None) -> datetime | None:
 def send_due_subscription_reminders(db: Session) -> dict[str, int]:
     """Send at-most-once reminders for trials and upcoming subscription renewals."""
     now = datetime.now(timezone.utc)
-    reminder_window = now + timedelta(days=3)
+    reminder_window = now + timedelta(days=TRIAL_REMINDER_WINDOW_DAYS)
     counts = {"trial_reminders": 0, "renewal_reminders": 0}
     subscriptions = (
         db.query(EstateSubscription)

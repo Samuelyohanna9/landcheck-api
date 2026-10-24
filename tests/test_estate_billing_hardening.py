@@ -10,6 +10,7 @@ from app.models.estate_billing import EstateSubscription, EstateSubscriptionChar
 from app.models.estate_foundation import EstateOrganization
 from app.routers.estate_billing import _complete_subscription_payment, _complete_verification
 from app.services.estates import estate_email
+from app.services.estates.billing_plans import TRIAL_DAYS
 from app.services.estates.subscriptions import attempt_charge, change_plan, send_due_subscription_reminders, start_trial
 from app.utils import estate_flutterwave as flw
 
@@ -40,7 +41,8 @@ def test_trial_cannot_be_started_twice(monkeypatch, db_session):
     organization = _organization(db_session)
     monkeypatch.setattr(estate_email, "send_trial_started_email", lambda **kwargs: None)
 
-    start_trial(
+    started_before = datetime.now(timezone.utc)
+    subscription = start_trial(
         db_session,
         organization=organization,
         plan_key="basic",
@@ -51,6 +53,13 @@ def test_trial_cannot_be_started_twice(monkeypatch, db_session):
         card_brand="MASTERCARD",
     )
     db_session.commit()
+
+    assert subscription.trial_ends_at is not None
+    trial_ends_at = subscription.trial_ends_at
+    if trial_ends_at.tzinfo is None:
+        trial_ends_at = trial_ends_at.replace(tzinfo=timezone.utc)
+    trial_duration = trial_ends_at - started_before
+    assert timedelta(days=TRIAL_DAYS - 1) < trial_duration < timedelta(days=TRIAL_DAYS + 1)
 
     with pytest.raises(ValueError, match="already used"):
         start_trial(
@@ -75,7 +84,7 @@ def test_pending_provider_response_is_not_retried_as_a_failure(monkeypatch, db_s
         amount=Decimal("19500"),
         currency="NGN",
         card_token="token-1",
-        flutterwave_customer_email="billing@example.com",
+        billing_email="billing@example.com",
     )
     db_session.add(subscription)
     db_session.commit()
@@ -90,7 +99,7 @@ def test_pending_provider_response_is_not_retried_as_a_failure(monkeypatch, db_s
     assert subscription.status == "past_due"
     assert subscription.next_retry_at is None
     assert charge.status == "pending"
-    assert charge.flutterwave_transaction_id == "tx-pending"
+    assert charge.provider_transaction_id == "tx-pending"
 
 
 def test_verification_without_token_is_refunded_and_does_not_start_trial(monkeypatch, db_session):
@@ -182,7 +191,7 @@ def test_bank_transfer_renewal_creates_payment_checkout(monkeypatch, db_session)
         amount=Decimal("19500"),
         currency="NGN",
         payment_method="bank_transfer",
-        flutterwave_customer_email="billing@example.com",
+        billing_email="billing@example.com",
     )
     db_session.add(subscription)
     db_session.commit()
@@ -194,7 +203,7 @@ def test_bank_transfer_renewal_creates_payment_checkout(monkeypatch, db_session)
     charge = db_session.query(EstateSubscriptionCharge).one()
     assert subscription.status == "past_due"
     assert charge.status == "pending"
-    assert charge.flutterwave_payload["checkout_url"] == "https://checkout.example/bank-transfer"
+    assert charge.provider_payload["checkout_url"] == "https://checkout.example/bank-transfer"
 
 
 def test_subscription_renewal_reminder_is_sent_once(monkeypatch, db_session):
@@ -208,7 +217,7 @@ def test_subscription_renewal_reminder_is_sent_once(monkeypatch, db_session):
         currency="NGN",
         payment_method="bank_transfer",
         next_charge_at=datetime.now(timezone.utc) + timedelta(days=2),
-        flutterwave_customer_email="billing@example.com",
+        billing_email="billing@example.com",
     )
     db_session.add(subscription)
     db_session.commit()
@@ -235,7 +244,7 @@ def test_manual_recovery_payment_reactivates_subscription(monkeypatch, db_sessio
         status="past_due",
         amount=Decimal("19500"),
         currency="NGN",
-        flutterwave_customer_email="billing@example.com",
+        billing_email="billing@example.com",
     )
     db_session.add(subscription)
     db_session.flush()
@@ -286,7 +295,7 @@ def test_active_upgrade_charges_difference_and_preserves_renewal(monkeypatch, db
         current_period_end=renewal,
         next_charge_at=renewal,
         card_token="token-1",
-        flutterwave_customer_email="billing@example.com",
+        billing_email="billing@example.com",
     )
     db_session.add(subscription)
     db_session.commit()

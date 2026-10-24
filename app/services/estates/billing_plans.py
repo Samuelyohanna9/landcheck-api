@@ -4,7 +4,8 @@ from decimal import Decimal
 from typing import Final, TypedDict
 
 
-TRIAL_DAYS: Final[int] = 3
+TRIAL_DAYS: Final[int] = 14
+TRIAL_REMINDER_WINDOW_DAYS: Final[int] = 3
 
 # The ₦50 verification charge exists purely to get a tokenizable card through Flutterwave's
 # hosted checkout during the free trial - it is refunded immediately once the token is captured,

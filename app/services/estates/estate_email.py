@@ -17,7 +17,7 @@ from decimal import Decimal
 from email.message import EmailMessage
 from email.utils import formatdate, make_msgid
 
-from app.services.estates.billing_plans import ESTATE_PLANS
+from app.services.estates.billing_plans import ESTATE_PLANS, TRIAL_DAYS
 
 logger = logging.getLogger(__name__)
 EMAIL_VERIFICATION_TTL_HOURS = 24
@@ -593,6 +593,11 @@ def send_welcome_email(*, organization, account, subscription=None) -> bool:
         if subscription
         else "<p>Choose a plan to activate your workspace trial.</p>"
     )
+    trial_note = (
+        "Your subscription will use scheduled bank-transfer reminders."
+        if subscription and getattr(subscription, "payment_method", "card") == "bank_transfer"
+        else f"Both plans start with a {TRIAL_DAYS}-day free trial, and you can cancel anytime."
+    )
     message_html = f"""
     <p>Welcome to LandCheck Estates, {html.escape(first_name)} - your workspace for
     <strong>{html.escape(str(getattr(organization, "name", "") or "your company"))}</strong> is ready.</p>
@@ -606,7 +611,7 @@ def send_welcome_email(*, organization, account, subscription=None) -> bool:
     </ul>
     <p><strong>Basic</strong> is &#8358;19,500/month (or &#8358;220,000/year) - everything except flood and erosion hazard analysis.<br/>
     <strong>Plus</strong> is &#8358;24,500/month (or &#8358;285,000/year) - everything, including hazard analysis.</p>
-    <p>{"Your subscription will use scheduled bank-transfer reminders." if subscription and getattr(subscription, "payment_method", "card") == "bank_transfer" else "Both plans start with a 3-day free trial, and you can cancel anytime."}</p>
+    <p>{trial_note}</p>
     """
     action_label = "Open your workspace" if subscription else "Choose your plan"
     action_path = "estates/workspace" if subscription else "estates/choose-plan"
@@ -755,7 +760,7 @@ def send_trial_started_email(*, organization, subscription) -> bool:
     if not to_email:
         return False
     plan_label = str(ESTATE_PLANS.get(subscription.plan_key, {}).get("label") or "Basic")
-    trial_ends = subscription.trial_ends_at.strftime("%d %b %Y") if subscription.trial_ends_at else "in 3 days"
+    trial_ends = subscription.trial_ends_at.strftime("%d %b %Y") if subscription.trial_ends_at else f"in {TRIAL_DAYS} days"
     payment_message = (
         f"Your next subscription payment will be {html.escape(format_naira(subscription.amount))}. "
         "Because you selected bank transfer, we will send you a payment reminder and secure payment link before access is renewed."
