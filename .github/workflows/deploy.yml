@@ -41,8 +41,23 @@ jobs:
             cd /root/landcheck-api
             docker compose ps
             printf '\nContainer usage:\n'
-            docker stats --no-stream --format 'table {{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}'
+            docker stats --no-stream --format 'table {{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}' || true
             printf '\nAPI health:\n'
-            curl --fail --silent --show-error --max-time 10 http://127.0.0.1:8000/health/
+            health_check() {
+              if command -v curl >/dev/null 2>&1; then
+                curl --fail --silent --show-error --max-time 10 http://127.0.0.1:8000/health/
+              else
+                docker compose exec -T api python -c "import urllib.request; print(urllib.request.urlopen('http://127.0.0.1:8000/health/', timeout=10).read().decode())"
+              fi
+            }
+            attempt=1
+            until health_check; do
+              if [ "$attempt" -ge 12 ]; then
+                echo "API health did not become ready after ${attempt} attempts" >&2
+                exit 1
+              fi
+              sleep 5
+              attempt=$((attempt + 1))
+            done
             printf '\n'
 # Last updated: 2026-02-04
