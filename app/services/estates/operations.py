@@ -9,7 +9,7 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
 from geoalchemy2.shape import to_shape
-from sqlalchemy import func, or_, tuple_
+from sqlalchemy import and_, func, or_, tuple_
 from sqlalchemy.orm import Session
 
 from app.models.estate_foundation import (
@@ -34,7 +34,7 @@ from app.models.estate_foundation import (
 from app.services.estates.allocations import release_allocation
 from app.services.estates.audit import append_estate_audit_event
 from app.services.estates.authorization import EstatePrincipal
-from app.services.estates.payments import financial_summary
+from app.services.estates.payments import financial_summaries, financial_summary
 from app.services.estates import estate_email, estate_sms
 from app.services.estates.subscriptions import get_subscription, has_sms_access
 
@@ -250,6 +250,54 @@ def document_readiness(db: Session, allocation: EstateAllocation) -> dict:
     }
 
 
+def document_readiness_batch(db: Session, allocations: list[EstateAllocation]) -> dict[int, dict]:
+    """Build readiness for multiple allocations with shared link and document queries."""
+    if not allocations:
+        return {}
+
+    allocation_ids = {str(allocation.id) for allocation in allocations}
+    customer_ids = {str(allocation.customer_id) for allocation in allocations}
+    plot_ids = {str(allocation.plot_id) for allocation in allocations}
+    links = db.query(EstateDocumentLink).filter(or_(
+        and_(EstateDocumentLink.entity_type == "allocation", EstateDocumentLink.entity_id.in_(allocation_ids)),
+        and_(EstateDocumentLink.entity_type == "customer", EstateDocumentLink.entity_id.in_(customer_ids)),
+        and_(EstateDocumentLink.entity_type == "plot", EstateDocumentLink.entity_id.in_(plot_ids)),
+    )).all()
+
+    document_ids_by_entity = {}
+    all_document_ids = set()
+    for link in links:
+        key = (link.entity_type, link.entity_id)
+        document_ids_by_entity.setdefault(key, set()).add(link.document_id)
+        all_document_ids.add(link.document_id)
+    document_types = {
+        document.id: document.document_type
+        for document in db.query(EstateDocument).filter(EstateDocument.id.in_(all_document_ids or {-1})).all()
+    }
+
+    readiness = {}
+    for allocation in allocations:
+        document_ids = set()
+        for key in (
+            ("allocation", str(allocation.id)),
+            ("customer", str(allocation.customer_id)),
+            ("plot", str(allocation.plot_id)),
+        ):
+            document_ids.update(document_ids_by_entity.get(key, set()))
+        types = {document_types[document_id] for document_id in document_ids if document_id in document_types}
+        stages = [
+            {**requirement, "status": "ready" if requirement["type"] in types else "missing"}
+            for requirement in DOCUMENT_REQUIREMENTS
+        ]
+        readiness[allocation.id] = {
+            "allocation_id": allocation.id,
+            "complete": all(item["status"] == "ready" for item in stages if item["required"]),
+            "stages": stages,
+            "linked_document_count": len(document_ids),
+        }
+    return readiness
+
+
 def _payment_plan_items(value: str | None) -> list[dict]:
     if not value:
         return []
@@ -319,8 +367,9 @@ def build_operations_summary(db: Session, estate: Estate) -> dict:
     active_allocations = [row for row in allocations if row.status in {"reserved", "allocated"}]
     surveys = {row.plot_id: row for row in db.query(EstateSurveyRequest).filter(EstateSurveyRequest.estate_id == estate.id).all()}
     staking = {row.plot_id: row for row in db.query(EstateStakingTask).filter(EstateStakingTask.estate_id == estate.id).all()}
-    summaries = {row.id: financial_summary(db, row) for row in active_allocations}
-    missing_documents = sum(1 for row in active_allocations if not document_readiness(db, row)["complete"])
+    summaries = financial_summaries(db, active_allocations)
+    readiness = document_readiness_batch(db, active_allocations)
+    missing_documents = sum(1 for row in active_allocations if not readiness[row.id]["complete"])
     payment_overdue = sum(1 for row in active_allocations if _has_overdue_installment(row, summaries[row.id], now))
     expiring = sum(
         1

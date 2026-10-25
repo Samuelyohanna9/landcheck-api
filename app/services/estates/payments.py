@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
 from fastapi import HTTPException
-from sqlalchemy import func
+from sqlalchemy import case, func
 from sqlalchemy.orm import Session
 from app.models.estate_foundation import EstateAllocation, EstatePayment
 from app.services.estates.audit import append_estate_audit_event
@@ -24,6 +24,53 @@ def financial_summary(db: Session, allocation: EstateAllocation) -> FinancialSum
     price = Decimal(allocation.agreed_price or 0); confirmed = Decimal(confirmed or 0); pending = Decimal(pending or 0)
     outstanding = max(Decimal(0), price - confirmed)
     return FinancialSummary(price, confirmed, pending, outstanding, (confirmed / price * 100 if price else Decimal(0)))
+
+
+def financial_summaries(db: Session, allocations: list[EstateAllocation]) -> dict[int, FinancialSummary]:
+    """Build allocation summaries with one grouped payment query."""
+    if not allocations:
+        return {}
+
+    allocation_ids = [allocation.id for allocation in allocations]
+    confirmed_total = func.coalesce(
+        func.sum(case((EstatePayment.status == "confirmed", EstatePayment.amount), else_=0)),
+        0,
+    )
+    pending_total = func.coalesce(
+        func.sum(
+            case(
+                (EstatePayment.status.in_(("recorded", "pending_confirmation")), EstatePayment.amount),
+                else_=0,
+            )
+        ),
+        0,
+    )
+    payment_totals = {
+        allocation_id: (confirmed, pending)
+        for allocation_id, confirmed, pending in db.query(
+            EstatePayment.allocation_id,
+            confirmed_total,
+            pending_total,
+        ).filter(
+            EstatePayment.allocation_id.in_(allocation_ids),
+        ).group_by(EstatePayment.allocation_id).all()
+    }
+
+    summaries = {}
+    for allocation in allocations:
+        confirmed, pending = payment_totals.get(allocation.id, (0, 0))
+        price = Decimal(allocation.agreed_price or 0)
+        confirmed = Decimal(confirmed or 0)
+        pending = Decimal(pending or 0)
+        outstanding = max(Decimal(0), price - confirmed)
+        summaries[allocation.id] = FinancialSummary(
+            price,
+            confirmed,
+            pending,
+            outstanding,
+            (confirmed / price * 100 if price else Decimal(0)),
+        )
+    return summaries
 
 def record_payment(db: Session, *, allocation: EstateAllocation, amount: Decimal, payment_date: datetime, method: str, reference: str | None, notes: str | None, actor: EstatePrincipal, confirmation_required: bool = True, idempotency_key: str | None = None) -> EstatePayment:
     if allocation.status not in {"reserved", "allocated"}: raise HTTPException(409, "Payments require an active allocation")

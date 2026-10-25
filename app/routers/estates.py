@@ -8,7 +8,6 @@ import logging
 import re
 import tempfile
 import os
-import time
 import math
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -1126,7 +1125,7 @@ def estate_dashboard(estate_id: int, request: Request, db: Session = Depends(get
     survey_rows = db.query(EstateSurveyRequest.plot_id, EstateSurveyRequest.status).filter(EstateSurveyRequest.estate_id == estate_id).all()
     eligible_survey_plot_ids = {plot_id for plot_id, status in survey_rows if plot_id in allocated_plot_ids and status in {"in_progress", "ready_for_review", "approved", "completed"}}
     completed_survey_plot_ids = {plot_id for plot_id, status in survey_rows if status in {"approved", "completed"}}
-    return {
+    payload = {
         "estate": {"id": estate.id, "name": estate.name, "status": estate.status},
         "total_plots": total_plots,
         "statuses": {**counts, "sold": counts["allocated"]},
@@ -1144,6 +1143,10 @@ def estate_dashboard(estate_id: int, request: Request, db: Session = Depends(get
             "outstanding_balance": str(outstanding_balance),
         },
     }
+    # The dashboard has no writes or lazy fields left to load. Return the connection before
+    # FastAPI serializes the response so other requests can use the pool sooner.
+    db.close()
+    return payload
 
 
 @router.get("/{estate_id}/public-settings")
@@ -1691,16 +1694,24 @@ def estate_plots_geojson(estate_id: int, request: Request, db: Session = Depends
         # amount of floating-point noise for every vertex in a large layout.
         func.ST_AsGeoJSON(EstatePlot.geometry, 7).label("geometry_json"),
     ).filter(EstatePlot.estate_id == estate_id, EstatePlot.geometry.isnot(None)).all()
-    features = []
+    # Every field used below is part of the scalar query result; release the connection before
+    # assembling and compressing the large GeoJSON response.
+    db.close()
+    feature_json = []
     for row in rows:
+        geometry_json = row.geometry_json.decode() if isinstance(row.geometry_json, bytes) else str(row.geometry_json or "")
         try:
-            geometry = json.loads(row.geometry_json) if isinstance(row.geometry_json, str) else row.geometry_json
+            geometry = json.loads(geometry_json)
         except (TypeError, ValueError):
-            geometry = None
+            continue
         if geometry is None:
             continue
-        features.append({"type": "Feature", "id": row.id, "properties": {"id": row.id, "plot_number": row.plot_number, "commercial_status": row.commercial_status, "development_status": row.development_status, "geometry_status": row.geometry_status, "area_sqm": float(row.area_sqm or 0), "public_address": row.public_address, "asking_price": str(row.asking_price) if row.asking_price is not None else None, "block_id": row.block_id, "title_verified": bool(row.title_verified), "title_verified_note": row.title_verified_note}, "geometry": geometry})
-    return {"type": "FeatureCollection", "features": features}
+        properties = {"id": row.id, "plot_number": row.plot_number, "commercial_status": row.commercial_status, "development_status": row.development_status, "geometry_status": row.geometry_status, "area_sqm": float(row.area_sqm or 0), "public_address": row.public_address, "asking_price": str(row.asking_price) if row.asking_price is not None else None, "block_id": row.block_id, "title_verified": bool(row.title_verified), "title_verified_note": row.title_verified_note}
+        # PostGIS has already produced valid JSON text. Keep that text in the response instead
+        # of parsing every geometry into Python and encoding it again for large estates.
+        prefix = json.dumps({"type": "Feature", "id": row.id, "properties": properties}, separators=(",", ":"), ensure_ascii=False)
+        feature_json.append(f'{prefix[:-1]},"geometry":{geometry_json}}}')
+    return Response(content=f'{{"type":"FeatureCollection","features":[{",".join(feature_json)}]}}', media_type="application/json")
 
 @router.get("/{estate_id}/layers.geojson")
 def estate_layers_geojson(estate_id:int, request:Request, db:Session=Depends(get_db)):
@@ -1708,6 +1719,7 @@ def estate_layers_geojson(estate_id:int, request:Request, db:Session=Depends(get
     if not estate: raise HTTPException(404,"Estate not found")
     require_estate_view_access(db,request,estate.organization_id,permission="infrastructure.read")
     rows=db.query(EstateSpatialFeature).filter(EstateSpatialFeature.estate_id==estate_id, EstateSpatialFeature.status=="active").all()
+    db.close()
     return {"type":"FeatureCollection","features":[{"type":"Feature","id":row.id,"properties":{"id":row.id,"type":row.feature_type,"name":row.name,"status":row.status},"geometry":mapping(to_shape(row.geometry))} for row in rows]}
 
 
@@ -5646,7 +5658,9 @@ def estate_operations_summary(estate_id: int, request: Request, db: Session = De
     if not estate:
         raise HTTPException(404, "Estate not found")
     require_estate_view_access(db, request, estate.organization_id, permission="estate.read")
-    return build_operations_summary(db, estate)
+    payload = build_operations_summary(db, estate)
+    db.close()
+    return payload
 
 
 @router.get("/{estate_id}/document-readiness")

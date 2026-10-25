@@ -75,7 +75,7 @@ def test_public_showcase_routes_are_safe_and_separate_from_allocations():
     assert "ESTATE_PUBLIC_MAP" in source
     assert "public_reservation.created" in source
     assert "without creating a customer or changing plot ownership" in source
-    assert "require_estate_access(db, request, estate.organization_id, permission=\"allocation.read\")" in source
+    assert "require_estate_view_access(db, request, estate.organization_id, permission=\"allocation.read\")" in source
     assert '@router.patch("/reservation-requests/{request_id}")' in source
     assert '@router.post("/reservation-requests/{request_id}/convert")' in source
     assert "public_reservation.converted" in source

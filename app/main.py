@@ -298,22 +298,6 @@ def _enforce_survey_resource_scope(db, request: Request) -> None:
                 raise HTTPException(status_code=404, detail="Export job not found")
 
 
-def _enforce_private_request_sync(request: Request) -> None:
-    session_db = SessionLocal()
-    try:
-        if _requires_green_session(request):
-            require_authenticated_session(session_db, request, auth_modes={"partner_user", "env_admin", "sponsor_user"})
-        if _requires_estate_session(request):
-            if resolve_estate_session(session_db, request) is None:
-                raise HTTPException(status_code=401, detail="Authentication required")
-        if str(request.url.path or "").lower().startswith(("/plots/", "/hazards/jobs/", "/survey-georeference/sessions/")):
-            survey_session = resolve_survey_session(session_db, request)
-            set_survey_user_context(session_db, survey_session.user_id if survey_session else None)
-        _enforce_survey_resource_scope(session_db, request)
-    finally:
-        session_db.close()
-
-
 def _validate_production_configuration() -> None:
     if not _env_bool("LANDCHECK_ENV_PRODUCTION_CHECKS", True):
         return
@@ -636,7 +620,10 @@ def shutdown_event():
 # ✅ SPEED OPTIMIZATION: Gzip Compression
 # This shrinks large JSON/Report data (like your 210MB I/O) before sending it
 # through the Cloudflare Tunnel, making it up to 10x faster.
-app.add_middleware(GZipMiddleware, minimum_size=1000)
+# Keep the existing level 9 default; staging/load tests can opt into a lower CPU
+# setting after measuring the response-size trade-off.
+_gzip_compresslevel = min(9, max(1, _env_int("LANDCHECK_GZIP_COMPRESSLEVEL", 9)))
+app.add_middleware(GZipMiddleware, minimum_size=1000, compresslevel=_gzip_compresslevel)
 
 # ✅ SECURITY OPTIMIZATION: Custom Domain CORS
 # Replacing "*" with specific origins allows you to set allow_credentials=True
@@ -720,19 +707,27 @@ async def rate_limit_sensitive_requests(request: Request, call_next):
     return await call_next(request)
 
 
-def _resolve_request_session_sync(request: Request) -> None:
-    """Look the bearer token up on a short-lived session and give the connection straight back."""
+def _prepare_private_request_sync(request: Request) -> None:
+    """Resolve shared auth and private-resource scope in one short-lived DB session."""
     session_db = SessionLocal()
     try:
+        # Preserve the generic session lookup's fail-open behavior; route-specific checks below
+        # still reject protected requests without a valid session.
         try:
             resolve_request_session(session_db, request)
         except Exception:
             session_db.rollback()
+        if _requires_green_session(request):
+            require_authenticated_session(session_db, request, auth_modes={"partner_user", "env_admin", "sponsor_user"})
+        if _requires_estate_session(request):
+            if resolve_estate_session(session_db, request) is None:
+                raise HTTPException(status_code=401, detail="Authentication required")
+        if str(request.url.path or "").lower().startswith(("/plots/", "/hazards/jobs/", "/survey-georeference/sessions/")):
+            survey_session = resolve_survey_session(session_db, request)
+            set_survey_user_context(session_db, survey_session.user_id if survey_session else None)
+        _enforce_survey_resource_scope(session_db, request)
     finally:
-        try:
-            session_db.close()
-        except Exception:
-            pass
+        session_db.close()
 
 
 @app.middleware("http")
@@ -740,10 +735,9 @@ async def capture_system_activity(request: Request, call_next):
     started_at = perf_counter()
     try:
         if not _is_cors_preflight_request(request):
-            # Sync database work must never run on the event loop: when the pool is busy it blocks
-            # until a connection frees up, and with the loop blocked nothing can finish and release one.
-            await run_in_threadpool(_resolve_request_session_sync, request)
-            await run_in_threadpool(_enforce_private_request_sync, request)
+            # Keep synchronous auth/scope work off the event loop, but use one thread-pool
+            # dispatch and one short-lived session instead of queueing two independent passes.
+            await run_in_threadpool(_prepare_private_request_sync, request)
             if _requires_super_admin_session(request):
                 session = getattr(request.state, "landcheck_session", None)
                 if session is None:
@@ -753,9 +747,10 @@ async def capture_system_activity(request: Request, call_next):
         response = await call_next(request)
     except HTTPException as exc:
         duration_ms = (perf_counter() - started_at) * 1000
+        response = JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
         if _should_log_request_activity(request, status_code=exc.status_code, duration_ms=duration_ms):
             await run_in_threadpool(log_request_activity, request, status_code=exc.status_code, duration_ms=duration_ms, error_message=str(exc.detail))
-        return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
+        return response
     except Exception as exc:
         duration_ms = (perf_counter() - started_at) * 1000
         if _should_log_request_activity(request, status_code=500, duration_ms=duration_ms):

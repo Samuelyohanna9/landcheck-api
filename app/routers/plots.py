@@ -234,20 +234,22 @@ def ensure_plots_schema_once(db: Session):
 
 def get_db(request: Request):
     db = SessionLocal()
+    survey_path = str(request.url.path or "").lower().startswith(("/plots", "/hazards", "/survey-georeference"))
     try:
         ensure_plots_schema_once(db)
-        ensure_survey_row_security(db)
-        survey_path = str(request.url.path or "").lower()
-        survey_session = resolve_survey_session(db, request) if survey_path.startswith(("/plots", "/hazards", "/survey-georeference")) else None
-        set_survey_user_context(db, survey_session.user_id if survey_session else None)
+        if survey_path:
+            ensure_survey_row_security(db)
+            survey_session = resolve_survey_session(db, request)
+            set_survey_user_context(db, survey_session.user_id if survey_session else None)
         yield db
     finally:
-        try:
-            if db.bind.dialect.name == "postgresql":
-                db.execute(text("RESET app.survey_user_id"))
-                db.commit()
-        except Exception:
-            db.rollback()
+        if survey_path:
+            try:
+                if db.bind.dialect.name == "postgresql":
+                    db.execute(text("RESET app.survey_user_id"))
+                    db.commit()
+            except Exception:
+                db.rollback()
         db.close()
 
 
