@@ -9,6 +9,7 @@ from shapely import wkt as shapely_wkt
 from shapely.affinity import rotate
 from shapely.ops import unary_union, snap
 from sqlalchemy import text
+from sqlalchemy.exc import IntegrityError
 from fastapi.responses import FileResponse, Response
 from app.schemas.plot_create import PlotCreateRequest
 from typing import Optional, Union, List, Any
@@ -29,6 +30,7 @@ import uuid
 import threading
 import mimetypes
 import logging
+from functools import wraps
 from threading import Lock
 
 logger = logging.getLogger(__name__)
@@ -104,13 +106,60 @@ def _export_render_slot_count() -> int:
 # PDF/map exports are CPU- and database-intensive. A thread per click can exhaust PostgreSQL's
 # connection pool while long renders are in progress, so queue surplus export jobs in-process.
 _PLOT_EXPORT_RENDER_SLOTS = threading.BoundedSemaphore(_export_render_slot_count())
+_PLOT_EXPORT_SLOT_LOCK_BASE = 872342000
 
 
 def _limit_plot_export_concurrency(worker):
+    @wraps(worker)
     def run(*args, **kwargs):
         with _PLOT_EXPORT_RENDER_SLOTS:
             return worker(*args, **kwargs)
     return run
+
+
+def _acquire_plot_export_slot() -> tuple[Session, int]:
+    """Acquire one bounded export slot shared by every API worker process.
+
+    The local semaphore above prevents needless thread creation inside one worker. PostgreSQL
+    advisory locks provide the missing cross-worker bound without Redis or a second job system.
+    Waiting attempts close their short-lived sessions, so queued jobs do not occupy a connection
+    while they wait for a renderer slot.
+    """
+    slot_count = _export_render_slot_count()
+    while True:
+        db = SessionLocal()
+        try:
+            for slot_offset in range(slot_count):
+                lock_key = _PLOT_EXPORT_SLOT_LOCK_BASE + slot_offset
+                got_lock = db.execute(
+                    text("SELECT pg_try_advisory_lock(:key)"),
+                    {"key": int(lock_key)},
+                ).scalar()
+                if got_lock:
+                    return db, lock_key
+        except Exception:
+            db.close()
+            raise
+        db.close()
+        time.sleep(0.25)
+
+
+def _release_plot_export_slot(db: Session, lock_key: int) -> None:
+    """Release an export slot even when rendering or status updates fail."""
+    try:
+        db.rollback()
+        db.execute(
+            text("SELECT pg_advisory_unlock(:key)"),
+            {"key": int(lock_key)},
+        )
+        db.commit()
+    except Exception:
+        # Closing the session in the worker's finally block is the final PostgreSQL-level release
+        # fallback. Do not mask the original export failure with unlock cleanup errors.
+        try:
+            db.rollback()
+        except Exception:
+            pass
 
 
 class PlotGeometryUpdateRequest(BaseModel):
@@ -634,6 +683,11 @@ def ensure_plot_export_jobs_table(db: Session):
         "CREATE INDEX IF NOT EXISTS idx_plot_export_jobs_batch_created ON plot_export_jobs(subdivision_batch_id, created_at DESC)",
         "CREATE INDEX IF NOT EXISTS idx_plot_export_jobs_type_batch_created ON plot_export_jobs(export_type, subdivision_batch_id, created_at DESC)",
         "CREATE INDEX IF NOT EXISTS idx_plot_export_jobs_plot_cache_created ON plot_export_jobs(plot_id, export_type, cache_key, created_at DESC)",
+        # A request can race another worker between cache-key lookup and insert. This keeps one
+        # active/completed job per rendered plot variant; failed jobs remain retryable.
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_plot_export_jobs_unique_live_cache_key "
+        "ON plot_export_jobs(plot_id, export_type, cache_key) "
+        "WHERE cache_key IS NOT NULL AND status <> 'failed'",
     ]:
         try:
             db.execute(text(ddl))
@@ -3888,7 +3942,9 @@ def _render_survey_plan_pdf_for_plot(db: Session, plot_id: int, output_pdf_path:
         fct_title_prefix=meta.get("fct_title_prefix") or "",
         unit_system=_resolve_unit_system_for_plot(db, plot_id),
     )
-    report = get_plot_report(plot_id, db)
+    db.commit()
+    report = _build_plot_report_from_area(plot_id, measurement_area_m2, db)
+    db.commit()
     generate_plot_report_pdf(report, output_pdf_path, map_path, paper_size=meta["paper_size"])
     safe_remove(map_path)
 
@@ -4838,7 +4894,7 @@ def _generate_subdivision_batch_clean_copy_pdf(
 
 @_limit_plot_export_concurrency
 def _run_subdivision_batch_export_job(job_id: str):
-    db = SessionLocal()
+    db, slot_key = _acquire_plot_export_slot()
     try:
         job = _get_plot_export_job(db, job_id)
         if not job:
@@ -4871,12 +4927,13 @@ def _run_subdivision_batch_export_job(job_id: str):
         except Exception:
             db.rollback()
     finally:
+        _release_plot_export_slot(db, slot_key)
         db.close()
 
 
 @_limit_plot_export_concurrency
 def _run_subdivision_batch_clean_copy_export_job(job_id: str):
-    db = SessionLocal()
+    db, slot_key = _acquire_plot_export_slot()
     try:
         job = _get_plot_export_job(db, job_id)
         if not job:
@@ -4928,6 +4985,7 @@ def _run_subdivision_batch_clean_copy_export_job(job_id: str):
         except Exception:
             db.rollback()
     finally:
+        _release_plot_export_slot(db, slot_key)
         db.close()
 
 
@@ -4966,6 +5024,10 @@ def create_subdivision_batch_export_job(
     db: Session = Depends(get_db),
 ):
     context = _get_subdivision_batch_export_context(db, batch_id)
+    db.execute(
+        text("SELECT pg_advisory_xact_lock(hashtextextended(:cache_lock_key, 0))"),
+        {"cache_lock_key": f"subdivision-export:{int(batch_id)}:survey-plans"},
+    )
     existing = db.execute(
         text(
             """
@@ -5155,7 +5217,7 @@ def _cache_single_plot_export_file(
 
 @_limit_plot_export_concurrency
 def _run_single_plot_export_job(job_id: str):
-    db = SessionLocal()
+    db, slot_key = _acquire_plot_export_slot()
     source_path = ""
     cleanup_dir = ""
     try:
@@ -5191,6 +5253,13 @@ def _run_single_plot_export_job(job_id: str):
             response = download_survey_plan_shapefile(plot_id=plot_id, db=db, background_tasks=None)
             source_path = str(getattr(response, "path", "") or "").strip()
             cleanup_dir = os.path.dirname(source_path) if source_path else ""
+        elif export_type == "back-computation.pdf":
+            response = download_back_computation_pdf(
+                plot_id=plot_id,
+                db=db,
+                background_tasks=None,
+                **payload,
+            )
         elif export_type == "technical-report.docx":
             response = download_plot_technical_report_docx(plot_id=plot_id, db=db, **payload)
         else:
@@ -5205,7 +5274,14 @@ def _run_single_plot_export_job(job_id: str):
         # plot. Archive every completed job under its cache key so this job remains the exact
         # bytes the user requested, including its station labels and appearance choices.
         local_path = source_path
-        if export_type in {"survey-plan.pdf", "orthophoto.pdf", "topomap.pdf", "survey-plan.shapefile", "technical-report.docx"}:
+        if export_type in {
+            "survey-plan.pdf",
+            "orthophoto.pdf",
+            "topomap.pdf",
+            "survey-plan.shapefile",
+            "back-computation.pdf",
+            "technical-report.docx",
+        }:
             local_path = _cache_single_plot_export_file(
                 plot_id=plot_id,
                 export_type=export_type,
@@ -5230,6 +5306,7 @@ def _run_single_plot_export_job(job_id: str):
     finally:
         if cleanup_dir:
             safe_rmtree(cleanup_dir)
+        _release_plot_export_slot(db, slot_key)
         db.close()
 
 
@@ -5242,44 +5319,77 @@ def _insert_single_plot_export_job(
     file_name: str,
     request_payload: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    job_id = uuid.uuid4().hex
+    # Re-check under a transaction-scoped advisory lock. The route-level lookup is intentionally
+    # fast, but two workers can otherwise both pass it before either INSERT commits.
     db.execute(
         text(
-            """
-            INSERT INTO plot_export_jobs (
-                id,
-                export_type,
-                plot_id,
-                cache_key,
-                status,
-                file_name,
-                request_payload,
-                created_at,
-                updated_at
-            )
-            VALUES (
-                :id,
-                :export_type,
-                :plot_id,
-                :cache_key,
-                'queued',
-                :file_name,
-                CAST(:request_payload AS JSONB),
-                NOW(),
-                NOW()
-            )
-            """
+            "SELECT pg_advisory_xact_lock(hashtextextended(:cache_lock_key, 0))"
         ),
         {
-            "id": job_id,
-            "export_type": export_type,
-            "plot_id": int(plot_id),
-            "cache_key": cache_key,
-            "file_name": file_name,
-            "request_payload": json.dumps(request_payload or {}),
+            "cache_lock_key": f"plot-export:{int(plot_id)}:{str(export_type)}:{str(cache_key)}",
         },
     )
-    db.commit()
+    existing = _find_plot_export_job_by_cache_key(
+        db,
+        plot_id=int(plot_id),
+        export_type=export_type,
+        cache_key=cache_key,
+    )
+    if existing:
+        return existing
+
+    job_id = uuid.uuid4().hex
+    try:
+        db.execute(
+            text(
+                """
+                INSERT INTO plot_export_jobs (
+                    id,
+                    export_type,
+                    plot_id,
+                    cache_key,
+                    status,
+                    file_name,
+                    request_payload,
+                    created_at,
+                    updated_at
+                )
+                VALUES (
+                    :id,
+                    :export_type,
+                    :plot_id,
+                    :cache_key,
+                    'queued',
+                    :file_name,
+                    CAST(:request_payload AS JSONB),
+                    NOW(),
+                    NOW()
+                )
+                """
+            ),
+            {
+                "id": job_id,
+                "export_type": export_type,
+                "plot_id": int(plot_id),
+                "cache_key": cache_key,
+                "file_name": file_name,
+                "request_payload": json.dumps(request_payload or {}),
+            },
+        )
+        db.commit()
+    except IntegrityError:
+        # Two workers can legitimately submit the same export at once. The unique live-cache
+        # index makes one the owner; return that existing job instead of surfacing a transient 500.
+        db.rollback()
+        existing = _find_plot_export_job_by_cache_key(
+            db,
+            plot_id=int(plot_id),
+            export_type=export_type,
+            cache_key=cache_key,
+        )
+        if existing:
+            return existing
+        raise
     threading.Thread(target=_run_single_plot_export_job, args=(job_id,), daemon=True).start()
     return _get_plot_export_job(db, job_id) or {"id": job_id, "status": "queued"}
 
@@ -5624,6 +5734,53 @@ def create_plot_shapefile_export_job(
     return _serialize_plot_export_job(job, request=request)
 
 
+@router.post("/{plot_id}/export-jobs/back-computation.pdf")
+def create_plot_back_computation_export_job(
+    plot_id: int,
+    request: Request,
+    db: Session = Depends(get_db),
+    coordinate_system: str = Body("wgs84"),
+    station_names: list[str] = Body(default=[]),
+    survey_input_coordinates: Optional[list] = Body(default=None),
+):
+    """Queue the calculation sheet instead of rendering it in the request worker."""
+    request_payload = {
+        "coordinate_system": coordinate_system,
+        "station_names": station_names or [],
+        # None means "use the persisted survey input coordinates" in the legacy renderer. Do not
+        # normalize it to [] here or the queued path could change the measurement basis.
+        "survey_input_coordinates": survey_input_coordinates,
+    }
+    cache_key = _build_plot_export_cache_key(
+        db,
+        plot_id=int(plot_id),
+        export_type="back-computation.pdf",
+        payload=request_payload,
+    )
+    existing = _find_plot_export_job_by_cache_key(
+        db,
+        plot_id=int(plot_id),
+        export_type="back-computation.pdf",
+        cache_key=cache_key,
+    )
+    if existing:
+        return _serialize_plot_export_job(existing, request=request)
+    job = _insert_single_plot_export_job(
+        db,
+        plot_id=int(plot_id),
+        export_type="back-computation.pdf",
+        cache_key=cache_key,
+        file_name=_build_plot_export_filename(
+            plot_id,
+            get_plot_meta(db, plot_id),
+            "Back_Computation",
+            "pdf",
+        ),
+        request_payload=request_payload,
+    )
+    return _serialize_plot_export_job(job, request=request)
+
+
 @router.post("/subdivision/batches/{batch_id}/export-jobs/clean-copy.pdf")
 def create_subdivision_batch_clean_copy_export_job(
     batch_id: int,
@@ -5701,6 +5858,10 @@ def create_subdivision_batch_clean_copy_export_job(
         station_size=station_size,
         bearing_font=bearing_font,
         bearing_size=bearing_size,
+    )
+    db.execute(
+        text("SELECT pg_advisory_xact_lock(hashtextextended(:cache_lock_key, 0))"),
+        {"cache_lock_key": f"subdivision-export:{int(batch_id)}:clean-copy:{context.get('pdf_name') or ''}"},
     )
     existing = db.execute(
         text(
@@ -6741,17 +6902,7 @@ def delete_feature_override(plot_id: int, override_id: int, db: Session = Depend
 
 # ---------------- REPORT DATA ----------------
 
-@router.get("/{plot_id}/report")
-def get_plot_report(plot_id: int, db: Session = Depends(get_db)):
-    meta = get_plot_meta(db, plot_id)
-    plot_geom = _load_plot_polygon_wgs84(db, plot_id)
-    measurement_context = _resolve_measurement_polygon_context(
-        plot_geom,
-        meta.get("coordinate_system"),
-        meta.get("survey_input_coordinates"),
-    )
-    area = measurement_context["measurement_area_m2"]
-
+def _build_plot_report_from_area(plot_id: int, area: float | None, db: Session):
     rows = db.execute(text("""
         SELECT feature_type, location, COUNT(*) as count
         FROM detected_features
@@ -6770,6 +6921,18 @@ def get_plot_report(plot_id: int, db: Session = Depends(get_db)):
         "area_m2": round(area, 2) if area else None,
         "features": {"inside": inside, "buffer": buffer}
     }
+
+
+@router.get("/{plot_id}/report")
+def get_plot_report(plot_id: int, db: Session = Depends(get_db)):
+    meta = get_plot_meta(db, plot_id)
+    plot_geom = _load_plot_polygon_wgs84(db, plot_id)
+    measurement_context = _resolve_measurement_polygon_context(
+        plot_geom,
+        meta.get("coordinate_system"),
+        meta.get("survey_input_coordinates"),
+    )
+    return _build_plot_report_from_area(plot_id, measurement_context["measurement_area_m2"], db)
 
 
 # ---------------- SURVEY PLAN PDF ----------------
@@ -7061,7 +7224,9 @@ def download_plot_report_pdf(plot_id: int, db: Session = Depends(get_db), backgr
         unit_system=_resolve_unit_system_for_plot(db, plot_id),
     )
 
-    report = get_plot_report(plot_id, db)
+    db.commit()
+    report = _build_plot_report_from_area(plot_id, measurement_area_m2, db)
+    db.commit()
     generate_plot_report_pdf(report, pdf_path, map_path, paper_size=paper_size)
 
     safe_remove(map_path)
@@ -7131,6 +7296,7 @@ def download_plot_technical_report_docx(plot_id: int, db: Session = Depends(get_
     )
     area_m2 = measurement_context["measurement_area_m2"] or 0
 
+    db.commit()
     _render_technical_report_docx(meta, float(area_m2), docx_path)
 
     filename = _build_plot_export_filename(plot_id, meta, "Technical_Report", "docx")
@@ -7274,7 +7440,9 @@ def simple_download_pdf(plot_id: int, db: Session = Depends(get_db), background_
         unit_system=_resolve_unit_system_for_plot(db, plot_id),
     )
 
+    db.commit()
     report = get_plot_report(plot_id, db)
+    db.commit()
     generate_plot_report_pdf(report, pdf_path, map_path)
 
     safe_remove(map_path)
@@ -7732,6 +7900,7 @@ def download_back_computation_pdf(plot_id: int, db: Session = Depends(get_db), b
     area_m2 = measurement_context["measurement_area_m2"]
     crs_name = measurement_context["crs_name"]
 
+    db.commit()
     # Use custom station names if provided
     labels = station_names if station_names else None
 
@@ -7959,6 +8128,7 @@ def orthophoto_pdf(plot_id: int, db: Session = Depends(get_db), background_tasks
         north_arrow_color=north_arrow_color,
     )
 
+    db.commit()
     render_orthophoto_pdf_from_png(png_path, pdf_path, paper_size=paper_size)
 
     filename = _build_plot_export_filename(
@@ -8002,6 +8172,7 @@ def download_survey_plan_dwg(plot_id: int, db: Session = Depends(get_db)):
         export_epsg_override=measurement_context["epsg_code"],
     )
 
+    db.commit()
     return FileResponse(
         dxf_path,
         media_type="application/dxf",
@@ -8022,6 +8193,7 @@ def download_survey_plan_shapefile(
     meta = get_plot_meta(db, plot_id)
     plot_geom = wkb.loads(plot_wkb)
     feature_sets = get_plot_features_geojson(plot_id, db)
+    db.commit()
 
     tmp_dir = tempfile.mkdtemp(prefix=f"plot_{plot_id}_shp_")
     export_filename = _build_plot_export_filename(plot_id, meta, "Survey_Plan_Shapefile", "zip")
@@ -8206,7 +8378,9 @@ def get_saved_survey_plan_pdf(plot_id: int, refresh: bool = False, db: Session =
             fct_title_prefix=meta.get("fct_title_prefix") or "",
             unit_system=_resolve_unit_system_for_plot(db, plot_id),
         )
-        report = get_plot_report(plot_id, db)
+        db.commit()
+        report = _build_plot_report_from_area(plot_id, measurement_context["measurement_area_m2"], db)
+        db.commit()
         generate_plot_report_pdf(report, pdf_path, map_path, paper_size=meta["paper_size"])
         safe_remove(map_path)
     if not pdf_path or not os.path.exists(pdf_path):
@@ -8272,6 +8446,7 @@ def get_saved_orthophoto_pdf(plot_id: int, map_type: str = "satellite", refresh:
             north_arrow_style="one_side_stem",
             north_arrow_color="blue",
         )
+        db.commit()
         render_orthophoto_pdf_from_png(png_path, pdf_path, paper_size=meta["paper_size"])
         safe_remove(png_path)
     if not pdf_path or not os.path.exists(pdf_path):

@@ -1,7 +1,10 @@
 # Database migrations
 
-Estate schema changes are managed with Alembic. Existing Survey and Green bootstrap behavior is
-unchanged; do not add Estate tables to runtime `create_all` or `CREATE TABLE IF NOT EXISTS` paths.
+Estate schema changes are managed with Alembic. The Green mutation idempotency ledger and the
+optimization indexes/columns introduced for Survey retries and export jobs are also versioned here.
+Legacy Survey tables and the remaining Green bootstrap tables are still created/extended by their
+existing startup paths; the optimization revision upgrades those tables when they already exist.
+Do not add Estate tables to runtime `create_all` or `CREATE TABLE IF NOT EXISTS` paths.
 
 Run from `landcheck-api` with the target environment's `DATABASE_URL` configured:
 

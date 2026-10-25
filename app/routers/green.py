@@ -1,4 +1,4 @@
-from fastapi import APIRouter, BackgroundTasks, Body, Depends, HTTPException, Query, UploadFile, File, Form, Request
+from fastapi import APIRouter, BackgroundTasks, Body, Depends, Header, HTTPException, Query, UploadFile, File, Form, Request
 from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse, Response, StreamingResponse
 from sqlalchemy.orm import Session
 from sqlalchemy import bindparam, text
@@ -907,6 +907,117 @@ def _require_project_member_access(db: Session, request: Request, project_id: in
     if int(project_org_id or 0) != int(session.organization_id or 0):
         raise HTTPException(status_code=403, detail="This project does not belong to your organization")
     return session
+
+
+def _normalize_green_idempotency_key(value: str | None) -> str | None:
+    clean = str(value or "").strip()
+    if not clean:
+        return None
+    if len(clean) > 128:
+        raise HTTPException(status_code=400, detail="X-Idempotency-Key must be 128 characters or fewer")
+    return clean
+
+
+def _green_idempotency_fingerprint(payload: object) -> str:
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _green_idempotency_scope(session, operation: str, project_id: int | None = None) -> str:
+    actor_id = (
+        "env-admin"
+        if str(session.auth_mode or "").strip().lower() == "env_admin"
+        else session.user_id or session.sponsor_account_id or session.session_uid or "unknown"
+    )
+    organization_id = session.organization_id or "none"
+    role_key = session.role_key or "unknown"
+    project_part = str(int(project_id)) if project_id is not None else "none"
+    return f"green:{session.auth_mode}:{actor_id}:org:{organization_id}:role:{role_key}:{operation}:project:{project_part}"
+
+
+def _begin_green_idempotent_mutation(
+    db: Session,
+    *,
+    session,
+    operation: str,
+    request_payload: object,
+    idempotency_header: str | None,
+    project_id: int | None = None,
+) -> tuple[dict | None, dict | None]:
+    """Reserve a retry key or return the committed response for a previous attempt.
+
+    The unique scope/key constraint serializes concurrent retries. A key is never reused for a
+    different payload, and an in-flight key fails closed instead of executing the mutation twice.
+    """
+    _ensure_green_schema_ready(db)
+    key = _normalize_green_idempotency_key(idempotency_header)
+    if not key:
+        return None, None
+    scope_key = _green_idempotency_scope(session, operation, project_id)
+    request_hash = _green_idempotency_fingerprint(request_payload)
+    existing = db.execute(
+        text(
+            """
+            SELECT request_hash, response_body
+            FROM green_mutation_idempotency
+            WHERE scope_key = :scope_key AND idempotency_key = :idempotency_key
+            FOR UPDATE
+            """
+        ),
+        {"scope_key": scope_key, "idempotency_key": key},
+    ).mappings().first()
+    if existing:
+        if str(existing.get("request_hash") or "") != request_hash:
+            raise HTTPException(status_code=409, detail="Idempotency key was already used for a different request")
+        if existing.get("response_body") is not None:
+            return None, dict(existing["response_body"])
+        raise HTTPException(status_code=409, detail="The same mutation is already being processed")
+
+    inserted = db.execute(
+        text(
+            """
+            INSERT INTO green_mutation_idempotency (scope_key, idempotency_key, request_hash)
+            VALUES (:scope_key, :idempotency_key, :request_hash)
+            ON CONFLICT (scope_key, idempotency_key) DO NOTHING
+            """
+        ),
+        {"scope_key": scope_key, "idempotency_key": key, "request_hash": request_hash},
+    )
+    if int(inserted.rowcount or 0) != 1:
+        committed = db.execute(
+            text(
+                """
+                SELECT request_hash, response_body
+                FROM green_mutation_idempotency
+                WHERE scope_key = :scope_key AND idempotency_key = :idempotency_key
+                FOR UPDATE
+                """
+            ),
+            {"scope_key": scope_key, "idempotency_key": key},
+        ).mappings().first()
+        if committed and str(committed.get("request_hash") or "") == request_hash and committed.get("response_body") is not None:
+            return None, dict(committed["response_body"])
+        raise HTTPException(status_code=409, detail="The same mutation is already being processed")
+    return {"scope_key": scope_key, "idempotency_key": key}, None
+
+
+def _complete_green_idempotent_mutation(db: Session, context: dict | None, response_body: dict) -> None:
+    if not context:
+        return
+    db.execute(
+        text(
+            """
+            UPDATE green_mutation_idempotency
+            SET response_body = CAST(:response_body AS JSONB), updated_at = NOW()
+            WHERE scope_key = :scope_key AND idempotency_key = :idempotency_key
+            """
+        ),
+        {
+            "scope_key": context["scope_key"],
+            "idempotency_key": context["idempotency_key"],
+            "response_body": json.dumps(response_body, default=str),
+        },
+    )
 
 
 def _load_session_subject_mfa_row(db: Session, session) -> dict | None:
@@ -7532,6 +7643,17 @@ def ensure_green_tables(db: Session):
             updated_at TIMESTAMP DEFAULT NOW()
         )
     """))
+    db.execute(text("""
+        CREATE TABLE IF NOT EXISTS green_mutation_idempotency (
+            scope_key TEXT NOT NULL,
+            idempotency_key TEXT NOT NULL,
+            request_hash TEXT NOT NULL,
+            response_body JSONB,
+            created_at TIMESTAMP DEFAULT NOW(),
+            updated_at TIMESTAMP DEFAULT NOW(),
+            PRIMARY KEY (scope_key, idempotency_key)
+        )
+    """))
     db.execute(text("ALTER TABLE green_export_jobs ADD COLUMN IF NOT EXISTS lng DOUBLE PRECISION"))
     db.execute(text("ALTER TABLE green_export_jobs ADD COLUMN IF NOT EXISTS lat DOUBLE PRECISION"))
     db.execute(text("ALTER TABLE green_export_jobs ADD COLUMN IF NOT EXISTS zoom DOUBLE PRECISION"))
@@ -7598,6 +7720,7 @@ def ensure_green_tables(db: Session):
     db.execute(text("CREATE INDEX IF NOT EXISTS idx_green_export_jobs_status_created ON green_export_jobs(status, created_at DESC)"))
     db.execute(text("CREATE INDEX IF NOT EXISTS idx_green_export_jobs_project_created ON green_export_jobs(project_id, created_at DESC)"))
     db.execute(text("CREATE INDEX IF NOT EXISTS idx_green_export_jobs_type_cache_created ON green_export_jobs(export_type, cache_key, created_at DESC)"))
+    db.execute(text("CREATE INDEX IF NOT EXISTS idx_green_mutation_idempotency_created ON green_mutation_idempotency(created_at)"))
     db.execute(text("CREATE INDEX IF NOT EXISTS idx_green_remote_monitoring_project_created ON green_remote_monitoring_areas(project_id, created_at DESC)"))
     db.execute(text("CREATE INDEX IF NOT EXISTS idx_green_remote_monitoring_cache_project_updated ON green_remote_monitoring_cache(project_id, updated_at DESC)"))
     db.execute(text("CREATE INDEX IF NOT EXISTS idx_green_remote_monitoring_cache_area_updated ON green_remote_monitoring_cache(area_id, updated_at DESC)"))
@@ -8984,10 +9107,12 @@ async def upload_photo_to_r2(
     folder: str = Form(default="trees"),
     tree_id: int | None = Form(default=None),
     task_id: int | None = Form(default=None),
+    idempotency_header: str | None = Header(default=None, alias="X-Idempotency-Key"),
 ):
     # Previously had no auth at all - anyone could upload arbitrary images (storage-cost abuse)
     # and attach them to any tree/task (evidence-record tampering).
-    require_authenticated_session(db, request, auth_modes={"partner_user", "env_admin"})
+    session = require_authenticated_session(db, request, auth_modes={"partner_user", "env_admin"})
+    upload_project_id: int | None = None
     if tree_id is not None and task_id is not None:
         raise HTTPException(status_code=400, detail="Provide either tree_id or task_id, not both.")
     if tree_id is not None:
@@ -9007,6 +9132,23 @@ async def upload_photo_to_r2(
 
     max_bytes = 10 * 1024 * 1024
     payload = await read_limited_upload(file, max_bytes=max_bytes)
+    idempotency_context, replay = _begin_green_idempotent_mutation(
+        db,
+        session=session,
+        operation="upload-photo",
+        project_id=upload_project_id if "upload_project_id" in locals() else None,
+        idempotency_header=idempotency_header,
+        request_payload={
+            "folder": folder,
+            "tree_id": tree_id,
+            "task_id": task_id,
+            "filename": file.filename,
+            "content_type": content_type,
+            "payload_sha256": hashlib.sha256(payload).hexdigest(),
+        },
+    )
+    if replay is not None:
+        return replay
 
     # Cheap, local, no-AI fraud/mistake signals - perceptual-hash near-duplicate detection and an
     # EXIF GPS/capture-time sanity check against the tree's own recorded location. Computed
@@ -9060,7 +9202,8 @@ async def upload_photo_to_r2(
         task_id=task_id,
     )
     date_path = datetime.utcnow().strftime("%Y/%m")
-    object_key = f"{safe_folder}/{date_path}/{uuid.uuid4().hex}{ext}"
+    object_stem = hashlib.sha256(str(idempotency_context["idempotency_key"]).encode("utf-8")).hexdigest()[:32] if idempotency_context else uuid.uuid4().hex
+    object_key = f"{safe_folder}/{date_path}/{object_stem}{ext}"
 
     try:
         client = _make_r2_client(settings)
@@ -9152,7 +9295,6 @@ async def upload_photo_to_r2(
             exif_lat=exif_data.get("lat"), exif_lng=exif_data.get("lng"), exif_captured_at=exif_data.get("captured_at"),
             checks=photo_checks,
         )
-        db.commit()
     elif task_id is not None:
         locked = db.execute(
             text("""
@@ -9199,9 +9341,7 @@ async def upload_photo_to_r2(
                 photo_urls = CAST(:photo_urls AS JSONB)
             WHERE id = :tree_id
         """), {"photo_url": proxy_url, "photo_urls": _safe_json(merged_tree_urls), "tree_id": linked_tree_id})
-        db.commit()
-
-    return {
+    response_body = {
         "url": proxy_url,
         "key": object_key,
         "public_url": public_url,
@@ -9209,6 +9349,9 @@ async def upload_photo_to_r2(
         "linked_task_id": linked_task_id,
         "photo_checks": photo_checks,
     }
+    _complete_green_idempotent_mutation(db, idempotency_context, response_body)
+    db.commit()
+    return response_body
 
 
 @router.post("/projects")
@@ -14469,6 +14612,7 @@ def download_org_impact_pdf(org_slug: str, request: Request, db: Session = Depen
     from app.utils.green_pdf import render_green_donor_impact_pdf
     data = get_public_org_impact(org_slug=org_slug, db=db)
     base_url = _build_public_api_base_url(request)
+    db.commit()
     pdf_bytes = render_green_donor_impact_pdf(data, base_url=base_url)
     org_name_safe = re.sub(r"[^a-zA-Z0-9]+", "-", str(data["org"].get("name") or org_slug)).strip("-").lower()
     filename = f"LandCheck-Impact-{org_name_safe}-{datetime.utcnow().strftime('%Y%m%d')}.pdf"
@@ -16282,6 +16426,7 @@ def get_merchant_report_pdf(request: Request, merchant_id: int = Query(...), db:
     merchant_row = _get_active_merchant_account_row(db, merchant_id)
     report_rows = _build_merchant_report_rows(db, merchant_id)
     summary = _summarize_merchant_report_rows(report_rows)
+    db.commit()
     try:
         pdf_bytes = render_green_merchant_report_pdf(merchant_row, summary, report_rows)
     except Exception:
@@ -26471,8 +26616,44 @@ def add_tree(
     record_profile_data: dict | None = Body(default=None),
     created_by_user_id: int | None = Body(default=None),
     created_by_organization_id: int | None = Body(default=None),
+    idempotency_header: str | None = Header(default=None, alias="X-Idempotency-Key"),
 ):
-    _require_project_member_access(db, request, int(project_id))
+    access = _require_project_member_access(db, request, int(project_id))
+    idempotency_context, replay = _begin_green_idempotent_mutation(
+        db,
+        session=access,
+        operation="create-tree",
+        project_id=int(project_id),
+        idempotency_header=idempotency_header,
+        request_payload={
+            "project_id": project_id,
+            "lng": lng,
+            "lat": lat,
+            "species": species,
+            "planting_date": planting_date,
+            "status": status,
+            "notes": notes,
+            "photo_url": photo_url,
+            "photo_urls": photo_urls,
+            "created_by": created_by,
+            "tree_origin": tree_origin,
+            "custodian_id": custodian_id,
+            "custody_started_at": custody_started_at,
+            "attribution_scope": attribution_scope,
+            "count_in_planting_kpis": count_in_planting_kpis,
+            "count_in_carbon_scope": count_in_carbon_scope,
+            "source_project_id": source_project_id,
+            "tree_height_m": tree_height_m,
+            "tree_age_months": tree_age_months,
+            "inventory_tree_count": inventory_tree_count,
+            "existing_area_geojson": existing_area_geojson,
+            "record_profile_data": record_profile_data,
+            "created_by_user_id": created_by_user_id,
+            "created_by_organization_id": created_by_organization_id,
+        },
+    )
+    if replay is not None:
+        return replay
     project_settings = _get_project_settings(db, int(project_id))
     origin = _normalize_tree_origin(tree_origin)
     if origin not in TREE_ORIGIN_VALUES:
@@ -26791,14 +26972,16 @@ def add_tree(
         },
     )
     _refresh_project_alerts(db, project_id)
-    db.commit()
-    return {
+    response_body = {
         "id": row,
         "project_tree_no": project_tree_no,
         "review_task_id": review_task_id,
         "auto_first_cycle_task_ids": auto_first_cycle_task_ids,
         "status": "submitted_for_review" if review_task_id else "created",
     }
+    _complete_green_idempotent_mutation(db, idempotency_context, response_body)
+    db.commit()
+    return response_body
 
 
 @router.patch("/trees/{tree_id}")
@@ -26828,11 +27011,46 @@ def update_tree(
     existing_area_geojson: dict | str | None = Body(default=None),
     clear_existing_area_geojson: bool = Body(default=False),
     record_profile_data: dict | None = Body(default=None),
+    idempotency_header: str | None = Header(default=None, alias="X-Idempotency-Key"),
 ):
     tree_project_id = db.execute(text("SELECT project_id FROM trees WHERE id = :tree_id"), {"tree_id": tree_id}).scalar()
     if tree_project_id is None:
         raise HTTPException(status_code=404, detail="Tree not found")
-    _require_project_member_access(db, request, int(tree_project_id))
+    access = _require_project_member_access(db, request, int(tree_project_id))
+    idempotency_context, replay = _begin_green_idempotent_mutation(
+        db,
+        session=access,
+        operation="update-tree",
+        project_id=int(tree_project_id),
+        idempotency_header=idempotency_header,
+        request_payload={
+            "tree_id": tree_id,
+            "lng": lng,
+            "lat": lat,
+            "species": species,
+            "planting_date": planting_date,
+            "status": status,
+            "notes": notes,
+            "photo_url": photo_url,
+            "photo_urls": photo_urls,
+            "actor_name": actor_name,
+            "tree_origin": tree_origin,
+            "custodian_id": custodian_id,
+            "custody_started_at": custody_started_at,
+            "attribution_scope": attribution_scope,
+            "count_in_planting_kpis": count_in_planting_kpis,
+            "count_in_carbon_scope": count_in_carbon_scope,
+            "source_project_id": source_project_id,
+            "tree_height_m": tree_height_m,
+            "tree_age_months": tree_age_months,
+            "inventory_tree_count": inventory_tree_count,
+            "existing_area_geojson": existing_area_geojson,
+            "clear_existing_area_geojson": clear_existing_area_geojson,
+            "record_profile_data": record_profile_data,
+        },
+    )
+    if replay is not None:
+        return replay
     if (lng is None) != (lat is None):
         raise HTTPException(status_code=400, detail="Both lng and lat are required together")
     if lng is not None and not (-180 <= float(lng) <= 180):
@@ -27161,8 +27379,10 @@ def update_tree(
             },
         },
     )
+    response_body = {"status": "ok"}
+    _complete_green_idempotent_mutation(db, idempotency_context, response_body)
     db.commit()
-    return {"status": "ok"}
+    return response_body
 
 
 @router.delete("/trees/{tree_id}")
@@ -28938,11 +29158,33 @@ def update_task(
     activity_lat: float | None = Body(default=None),
     activity_recorded_at: str | None = Body(default=None),
     actor_name: str | None = Body(default=None),
+    idempotency_header: str | None = Header(default=None, alias="X-Idempotency-Key"),
 ):
     task_project_id = _get_project_id_for_task(db, task_id)
     if task_project_id is None:
         raise HTTPException(status_code=404, detail="Task not found")
-    _require_project_member_access(db, request, int(task_project_id))
+    access = _require_project_member_access(db, request, int(task_project_id))
+    idempotency_context, replay = _begin_green_idempotent_mutation(
+        db,
+        session=access,
+        operation="update-task",
+        project_id=int(task_project_id),
+        idempotency_header=idempotency_header,
+        request_payload={
+            "task_id": task_id,
+            "status": status,
+            "notes": notes,
+            "photo_url": photo_url,
+            "photo_urls": photo_urls,
+            "tree_status": tree_status,
+            "activity_lng": activity_lng,
+            "activity_lat": activity_lat,
+            "activity_recorded_at": activity_recorded_at,
+            "actor_name": actor_name,
+        },
+    )
+    if replay is not None:
+        return replay
     if status and status not in TASK_STATUS_VALUES:
         raise HTTPException(status_code=400, detail="Invalid status")
     normalized_tree_status = _normalize_tree_status(tree_status) if tree_status is not None else None
@@ -29103,8 +29345,10 @@ def update_task(
     else:
         _resolve_task_alerts(db, task_id)
     _refresh_project_alerts(db, project_id)
+    response_body = {"status": "ok"}
+    _complete_green_idempotent_mutation(db, idempotency_context, response_body)
     db.commit()
-    return {"status": "ok"}
+    return response_body
 
 
 @router.get("/tasks/review-queue")
@@ -29158,11 +29402,32 @@ def submit_task_for_review(
     activity_lat: float | None = Body(default=None),
     activity_recorded_at: str | None = Body(default=None),
     actor_name: str | None = Body(default=None),
+    idempotency_header: str | None = Header(default=None, alias="X-Idempotency-Key"),
 ):
     submit_project_id = _get_project_id_for_task(db, task_id)
     if submit_project_id is None:
         raise HTTPException(status_code=404, detail="Task not found")
-    _require_project_member_access(db, request, int(submit_project_id))
+    access = _require_project_member_access(db, request, int(submit_project_id))
+    idempotency_context, replay = _begin_green_idempotent_mutation(
+        db,
+        session=access,
+        operation="submit-task",
+        project_id=int(submit_project_id),
+        idempotency_header=idempotency_header,
+        request_payload={
+            "task_id": task_id,
+            "notes": notes,
+            "photo_url": photo_url,
+            "photo_urls": photo_urls,
+            "tree_status": tree_status,
+            "activity_lng": activity_lng,
+            "activity_lat": activity_lat,
+            "activity_recorded_at": activity_recorded_at,
+            "actor_name": actor_name,
+        },
+    )
+    if replay is not None:
+        return replay
     normalized_tree_status = _normalize_tree_status(tree_status) if tree_status is not None else None
     if normalized_tree_status is not None and normalized_tree_status not in TREE_STATUS_VALUES:
         raise HTTPException(status_code=400, detail="Invalid tree status")
@@ -29280,8 +29545,10 @@ def submit_task_for_review(
         task_id=task_id,
     )
     _refresh_project_alerts(db, project_id)
+    response_body = {"status": "submitted", "task_id": task_id}
+    _complete_green_idempotent_mutation(db, idempotency_context, response_body)
     db.commit()
-    return {"status": "submitted", "task_id": task_id}
+    return response_body
 
 
 @router.post("/tasks/{task_id}/review")
@@ -37821,6 +38088,9 @@ def _run_work_report_export_job(job_id: str):
             pitch=job.get("pitch"),
             pdf_path=pdf_path,
         )
+        # The renderer has completed its database reads. Release that transaction before the
+        # network-bound object-storage upload so the export does not hold a pool connection idle.
+        db.commit()
         upload_meta = upload_export_file_best_effort(
             pdf_path,
             filename,
@@ -38026,6 +38296,7 @@ def _run_green_file_export_job(job_id: str):
         if not local_path or not os.path.exists(local_path):
             raise RuntimeError("Export generated without a readable output file.")
         file_name = _resolve_file_response_filename(response, fallback=str(job.get("file_name") or ""))
+        db.commit()
         upload_meta = upload_export_file_best_effort(
             local_path,
             file_name,

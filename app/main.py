@@ -325,51 +325,75 @@ def _validate_production_configuration() -> None:
 scheduler = BackgroundScheduler(timezone="Africa/Lagos")
 
 
-def _run_birthday_gift_celebration_check_job():
+def _run_scheduler_job_once(lock_key: int, work) -> None:
+    """Run a scheduled unit once across all API worker processes.
+
+    APScheduler is process-local, so every Uvicorn worker can fire the same cron callback.
+    A session-level PostgreSQL advisory lock keeps the existing transaction/session behavior
+    while making the callback a no-op in every worker that did not win the lock.
+    """
     session_db = SessionLocal()
     try:
-        green._run_birthday_gift_celebration_check(session_db)
-        session_db.commit()
-    except Exception:
-        session_db.rollback()
-        raise
+        got_lock = session_db.execute(
+            text("SELECT pg_try_advisory_lock(:key)"),
+            {"key": int(lock_key)},
+        ).scalar()
+        if not got_lock:
+            return
+        try:
+            work(session_db)
+            session_db.commit()
+        except Exception:
+            session_db.rollback()
+            raise
+        finally:
+            # Session-level locks survive commit/rollback, so always explicitly release them
+            # before returning the connection to the pool. Closing the session is a final
+            # fallback because PostgreSQL also releases the lock when the connection closes.
+            try:
+                session_db.execute(
+                    text("SELECT pg_advisory_unlock(:key)"),
+                    {"key": int(lock_key)},
+                )
+                session_db.commit()
+            except Exception:
+                session_db.rollback()
     finally:
         session_db.close()
+
+
+_GREEN_BIRTHDAY_CHECK_LOCK_KEY = 872341008
+_GREEN_SPONSOR_ENGAGEMENT_LOCK_KEY = 872341009
+_SURVEY_GEOREFERENCE_CLEANUP_LOCK_KEY = 872341010
+_SURVEY_EXPORT_SWEEP_LOCK_KEY = 872341011
+
+
+def _run_birthday_gift_celebration_check_job():
+    _run_scheduler_job_once(
+        _GREEN_BIRTHDAY_CHECK_LOCK_KEY,
+        lambda db: green._run_birthday_gift_celebration_check(db),
+    )
 
 
 def _run_sponsor_engagement_email_check_job():
-    session_db = SessionLocal()
-    try:
-        green._run_sponsor_engagement_email_check(session_db)
-        session_db.commit()
-    except Exception:
-        session_db.rollback()
-        raise
-    finally:
-        session_db.close()
+    _run_scheduler_job_once(
+        _GREEN_SPONSOR_ENGAGEMENT_LOCK_KEY,
+        lambda db: green._run_sponsor_engagement_email_check(db),
+    )
 
 
 def _run_georeference_retention_cleanup_job():
-    session_db = SessionLocal()
-    try:
-        survey_georeference.cleanup_expired_georeference_sessions(session_db)
-        session_db.commit()
-    except Exception:
-        session_db.rollback()
-        raise
-    finally:
-        session_db.close()
+    _run_scheduler_job_once(
+        _SURVEY_GEOREFERENCE_CLEANUP_LOCK_KEY,
+        survey_georeference.cleanup_expired_georeference_sessions,
+    )
 
 
 def _run_stale_plot_export_job_sweep():
-    session_db = SessionLocal()
-    try:
-        plots.sweep_stale_plot_export_jobs(session_db)
-    except Exception:
-        session_db.rollback()
-        raise
-    finally:
-        session_db.close()
+    _run_scheduler_job_once(
+        _SURVEY_EXPORT_SWEEP_LOCK_KEY,
+        plots.sweep_stale_plot_export_jobs,
+    )
 
 
 # Arbitrary fixed key for the estate-billing Postgres advisory lock below - any bigint works as
