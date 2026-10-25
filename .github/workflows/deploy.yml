@@ -22,4 +22,27 @@ jobs:
             git reset --hard origin/main
             docker compose up -d --build
             docker system prune -f
+      - name: Verify production resources and API health
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SERVER_IP }}
+          username: root
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          fingerprint: ""
+          script: |
+            set -eu
+            printf 'CPU cores: '
+            nproc
+            printf '\nMemory:\n'
+            free -m
+            printf '\nRoot filesystem:\n'
+            df -h /
+            printf '\nCompose services:\n'
+            cd /root/landcheck-api
+            docker compose ps
+            printf '\nContainer usage:\n'
+            docker stats --no-stream --format 'table {{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}'
+            printf '\nAPI health:\n'
+            curl --fail --silent --show-error --max-time 10 http://127.0.0.1:8000/health/
+            printf '\n'
 # Last updated: 2026-02-04
