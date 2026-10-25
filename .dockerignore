@@ -9,3 +9,26 @@ __pycache__/
 venv/
 scratch/
 *.log
+
+# Never send credentials, local configuration, Git metadata, or developer tooling to Docker.
+.env
+.env.*
+.git/
+.github/
+.vscode/
+.idea/
+.aws/
+
+# Exclude local outputs and database dumps that are not application runtime inputs.
+backups/
+coverage/
+dist/
+build/
+*.db
+*.sqlite
+*.sqlite3
+*.sql
+*.sql.gz
+*.pem
+*.key
+*.crt

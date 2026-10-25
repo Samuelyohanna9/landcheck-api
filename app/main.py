@@ -39,6 +39,7 @@ from app.routers import (
     estate_social,
     estate_legal,
     estate_admin_accounting,
+    commercial,
 )
 from app.db_init import init_db
 from app.utils.activity_logger import ensure_activity_log_table, log_request_activity, should_skip_request_logging
@@ -852,6 +853,7 @@ app.include_router(estate_marketing.router)
 app.include_router(estate_social.router)
 app.include_router(estate_legal.router)
 app.include_router(estate_admin_accounting.router)
+app.include_router(commercial.router)
 
 @app.get("/")
 def root():

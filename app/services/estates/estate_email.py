@@ -451,6 +451,59 @@ def notify_reservation_request(
         return False
 
 
+def send_estate_demo_request_notification(
+    *,
+    request_id: str,
+    company_name: str,
+    contact_name: str,
+    email: str,
+    phone: str,
+    message: str | None = None,
+    source_path: str | None = None,
+) -> bool:
+    """Send a new public Estates demo enquiry to LandCheck's configured business inbox.
+
+    The database row is committed before this function is called. SMTP failure therefore marks
+    the notification as failed without losing the enquiry or blocking the public form response.
+    """
+    to_email = str(
+        os.getenv("ESTATE_DEMO_NOTIFY_EMAIL")
+        or os.getenv("LANDCHECK_SUPPORT_EMAIL")
+        or os.getenv("SUPPORT_NOTIFY_EMAIL")
+        or "admin@landcheck.online"
+    ).strip()
+    contact_html = (
+        f"<p><strong>Company:</strong> {html.escape(company_name)}</p>"
+        f"<p><strong>Contact:</strong> {html.escape(contact_name)}</p>"
+        f"<p><strong>Email:</strong> {html.escape(email)}</p>"
+        f"<p><strong>Phone / WhatsApp:</strong> {html.escape(phone)}</p>"
+    )
+    if source_path:
+        contact_html += f"<p><strong>Source page:</strong> {html.escape(source_path)}</p>"
+    if message:
+        contact_html += f"<p><strong>Requirement:</strong><br/>{html.escape(message)}</p>"
+    safe_company_subject = " ".join(str(company_name).replace("\r", " ").replace("\n", " ").split())[:120]
+    message_html = (
+        f"<p>A company requested a practical LandCheck Estates demonstration.</p>"
+        f"{contact_html}"
+        f"<p><strong>Request ID:</strong> {html.escape(request_id)}</p>"
+    )
+    body_html = _account_wrap_html(heading="New LandCheck Estates demo request", message_html=message_html)
+    body_text = _account_plain_text("New LandCheck Estates demo request", message_html)
+    try:
+        _send_email(
+            to_email=to_email,
+            from_display_name="LandCheck Estates",
+            subject=f"New Estates demo request - {safe_company_subject}",
+            body_text=body_text,
+            body_html=body_html,
+        )
+        return True
+    except Exception:
+        logger.exception("Estate demo notification failed (request_id=%s)", request_id)
+        return False
+
+
 def notify_geotech_survey_request(
     *,
     organization_name: str,

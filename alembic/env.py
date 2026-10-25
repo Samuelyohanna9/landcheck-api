@@ -20,6 +20,7 @@ from app.models import estate_marketing  # noqa: F401 - register Estate marketin
 from app.models import estate_social  # noqa: F401 - register Estate social posting models.
 from app.models import estate_legal  # noqa: F401 - register Estate DPA acceptance table.
 from app.models import estate_auth  # noqa: F401 - register Estate identity tables for autogeneration.
+from app.models import commercial  # noqa: F401 - register public commercial enquiry tables.
 
 config = context.config
 if config.config_file_name is not None:

@@ -17,11 +17,18 @@ jobs:
           key: ${{ secrets.SSH_PRIVATE_KEY }}
           fingerprint: ""
           script: |
+            set -eu
             cd /root/landcheck-api
             git fetch origin main
-            git reset --hard origin/main
+            if [ -n "$(git status --porcelain)" ]; then
+              echo "Refusing deployment: production checkout has local modifications." >&2
+              exit 1
+            fi
+            if [ "$(git branch --show-current)" != "main" ]; then
+              git switch main
+            fi
+            git merge --ff-only origin/main
             docker compose up -d --build
-            docker system prune -f
       - name: Verify production resources and API health
         uses: appleboy/ssh-action@v1.0.3
         with:
