@@ -1717,7 +1717,9 @@ def estate_plots_geojson(estate_id: int, request: Request, db: Session = Depends
 def estate_layers_geojson(estate_id:int, request:Request, db:Session=Depends(get_db)):
     estate=db.get(Estate,estate_id)
     if not estate: raise HTTPException(404,"Estate not found")
-    require_estate_view_access(db,request,estate.organization_id,permission="infrastructure.read")
+    # Boundary layers are part of the plot/map view, so plot readers must be able to see them
+    # even when they do not have the separate infrastructure permission.
+    require_estate_view_access(db,request,estate.organization_id,permission="plot.read")
     rows=db.query(EstateSpatialFeature).filter(EstateSpatialFeature.estate_id==estate_id, EstateSpatialFeature.status=="active").all()
     db.close()
     return {"type":"FeatureCollection","features":[{"type":"Feature","id":row.id,"properties":{"id":row.id,"type":row.feature_type,"name":row.name,"status":row.status},"geometry":mapping(to_shape(row.geometry))} for row in rows]}
@@ -2039,6 +2041,7 @@ def decide_import_review(review_id:int,payload:ImportReviewDecision,request:Requ
             normalized_candidates.append(_import_candidate(row_number=index, plot_number=str(candidate.get("plot_number") or ""), geometry=candidate.get("geometry") or {}))
         row.candidate_data = normalized_candidates
     created=0
+    created_features=0
     if payload.status == "approved":
         estate=db.get(Estate,row.estate_id)
         if payload.as_boundary:
@@ -2049,15 +2052,28 @@ def decide_import_review(review_id:int,payload:ImportReviewDecision,request:Requ
             _, issues = validate_polygon(geometry)
             if any(issue.severity == "error" for issue in issues):
                 raise HTTPException(422, detail=[issue.message for issue in issues])
-            estate.boundary = from_shape(shape(geometry), srid=4326)
-            row.notes=(payload.notes or row.notes or "") + "; set as the Estate boundary"
+            if estate.boundary is None:
+                estate.boundary = from_shape(shape(geometry), srid=4326)
+                row.notes=(payload.notes or row.notes or "") + "; set as the Estate boundary"
+            else:
+                db.add(EstateSpatialFeature(
+                    organization_id=row.organization_id,
+                    estate_id=row.estate_id,
+                    feature_type="boundary",
+                    name=f"Imported boundary {row.id}",
+                    geometry=from_shape(shape(geometry), srid=4326),
+                    created_by_subject_type=access.principal.subject_type,
+                    created_by_subject_id=access.principal.subject_id,
+                ))
+                created_features = 1
+                row.notes=(payload.notes or row.notes or "") + "; added as an additional Estate boundary layer"
         else:
             created=_create_plots_from_candidates(db,estate=estate,candidates=row.candidate_data or [],source_type=row.source_type,source_reference=str(row.id),actor=access.principal)
             row.notes=(payload.notes or row.notes or "") + f"; {created} operational plot(s) created"
     else: row.notes=payload.notes or row.notes
     row.status=payload.status
-    append_estate_audit_event(db,organization_id=row.organization_id,actor=access.principal,action=f"import_review.{row.status}",entity_type="estate_import_review",entity_id=row.id,after_data={"status":row.status}); db.commit()
-    return {"id":row.id,"status":row.status,"created_plots":created}
+    append_estate_audit_event(db,organization_id=row.organization_id,actor=access.principal,action=f"import_review.{row.status}",entity_type="estate_import_review",entity_id=row.id,after_data={"status":row.status,"created_plots":created,"created_features":created_features}); db.commit()
+    return {"id":row.id,"status":row.status,"created_plots":created,"created_features":created_features}
 
 
 def _plot_number_from_georeference_feature(feature: dict, index: int, prefix: str) -> str:
@@ -2607,16 +2623,25 @@ def decide_layout_proposal(
     db.commit()
     return {"id": row.id, "status": row.status, "created_plots": len(created_plots), "created_features": len(created_features), "replaced_plots": replaced_plot_count, "replaced_features": replaced_feature_count, "estate_id": estate.id}
 
-_LAYER_TYPE_LABELS = {"road": "Road", "drainage": "Drainage", "open_space": "Open space", "infrastructure": "Infrastructure"}
+_LAYER_TYPE_LABELS = {"boundary": "Boundary", "road": "Road", "drainage": "Drainage", "open_space": "Open space", "infrastructure": "Infrastructure"}
+
+
+def _spatial_feature_write_permission(feature_type: str) -> str:
+    return "plot.manage" if feature_type == "boundary" else "infrastructure.manage"
 
 
 @router.post("/{estate_id}/layers")
 def create_estate_layer(estate_id:int,payload:SpatialFeatureCreate,request:Request,db:Session=Depends(get_db)):
     estate=db.get(Estate,estate_id)
     if not estate: raise HTTPException(404,"Estate not found")
-    access=require_estate_access(db,request,estate.organization_id,permission="infrastructure.manage")
-    try: geometry=from_shape(shape(payload.geometry),srid=4326)
+    access=require_estate_access(db,request,estate.organization_id,permission=_spatial_feature_write_permission(payload.feature_type))
+    try: geometry_shape = shape(payload.geometry)
     except Exception: raise HTTPException(422,"Layer geometry is invalid")
+    if geometry_shape.is_empty or not geometry_shape.is_valid:
+        raise HTTPException(422,"Layer geometry is empty or invalid")
+    if payload.feature_type == "boundary" and geometry_shape.geom_type not in {"Polygon", "MultiPolygon"}:
+        raise HTTPException(422,"An Estate boundary layer must be a polygon")
+    geometry=from_shape(geometry_shape,srid=4326)
     name=(payload.name or "").strip()
     if not name:
         # "Layer name" is an optional field in the UI - a manually added road left unnamed still
@@ -2635,17 +2660,25 @@ def update_estate_layer(estate_id: int, feature_id: int, payload: SpatialFeature
     row = db.get(EstateSpatialFeature, feature_id)
     if not estate or not row or row.estate_id != estate_id:
         raise HTTPException(404, "Spatial layer was not found")
-    access = require_estate_access(db, request, estate.organization_id, permission="infrastructure.manage")
-    before = {"feature_type": row.feature_type, "name": row.name, "status": row.status}
     values = payload.model_dump(exclude_unset=True)
+    target_type = str(values.get("feature_type") or row.feature_type)
+    access = require_estate_access(db, request, estate.organization_id, permission=_spatial_feature_write_permission(target_type))
+    before = {"feature_type": row.feature_type, "name": row.name, "status": row.status}
     if "feature_type" in values:
         row.feature_type = values["feature_type"]
     if "name" in values:
         row.name = (values["name"] or "").strip() or None
     if "status" in values:
         row.status = values["status"]
+    if target_type == "boundary" and ("geometry" not in values or values["geometry"] is None):
+        current_geometry = to_shape(row.geometry)
+        if current_geometry.geom_type not in {"Polygon", "MultiPolygon"}:
+            raise HTTPException(422, "An Estate boundary layer must be a polygon")
     if "geometry" in values and values["geometry"] is not None:
-        row.geometry = from_shape(_geojson_geometry(values["geometry"]), srid=4326)
+        geometry = _geojson_geometry(values["geometry"])
+        if target_type == "boundary" and geometry.geom_type not in {"Polygon", "MultiPolygon"}:
+            raise HTTPException(422, "An Estate boundary layer must be a polygon")
+        row.geometry = from_shape(geometry, srid=4326)
     append_estate_audit_event(db, organization_id=estate.organization_id, actor=access.principal, action="spatial_layer.updated", entity_type="estate_spatial_feature", entity_id=row.id, before_data=before, after_data={"feature_type": row.feature_type, "name": row.name, "status": row.status})
     db.commit()
     return {"id": row.id, "type": row.feature_type, "name": row.name, "status": row.status}
@@ -2657,7 +2690,12 @@ def archive_estate_layer(estate_id: int, feature_id: int, request: Request, db: 
     row = db.get(EstateSpatialFeature, feature_id)
     if not estate or not row or row.estate_id != estate_id:
         raise HTTPException(404, "Spatial layer was not found")
-    access = require_estate_access(db, request, estate.organization_id, permission="infrastructure.manage")
+    access = require_estate_access(db, request, estate.organization_id, permission=_spatial_feature_write_permission(row.feature_type))
+    if row.feature_type == "boundary":
+        db.delete(row)
+        append_estate_audit_event(db, organization_id=estate.organization_id, actor=access.principal, action="spatial_layer.deleted", entity_type="estate_spatial_feature", entity_id=feature_id, before_data={"feature_type": row.feature_type, "name": row.name})
+        db.commit()
+        return {"deleted": True, "id": feature_id}
     if row.status != "archived":
         row.status = "archived"
         append_estate_audit_event(db, organization_id=estate.organization_id, actor=access.principal, action="spatial_layer.archived", entity_type="estate_spatial_feature", entity_id=row.id)

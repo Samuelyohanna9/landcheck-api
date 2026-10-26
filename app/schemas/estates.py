@@ -187,12 +187,12 @@ class FieldInspectionCreate(BaseModel):
     notes: str | None = Field(default=None, max_length=4000)
 
 class SpatialFeatureCreate(BaseModel):
-    feature_type: str = Field(pattern="^(road|drainage|open_space|infrastructure)$")
+    feature_type: str = Field(pattern="^(boundary|road|drainage|open_space|infrastructure)$")
     name: str | None = Field(default=None, max_length=160)
     geometry: dict[str, Any]
 
 class SpatialFeatureUpdate(BaseModel):
-    feature_type: str | None = Field(default=None, pattern="^(road|drainage|open_space|infrastructure)$")
+    feature_type: str | None = Field(default=None, pattern="^(boundary|road|drainage|open_space|infrastructure)$")
     name: str | None = Field(default=None, max_length=160)
     geometry: dict[str, Any] | None = None
     status: str | None = Field(default=None, pattern="^(active|archived)$")
