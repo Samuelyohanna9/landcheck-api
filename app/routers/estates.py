@@ -46,7 +46,7 @@ from app.services.estates.allocations import release_allocation, reserve_or_allo
 from app.services.estates.audit import append_estate_audit_event
 from app.services.estates.authorization import EstatePrincipal, require_estate_access, require_estate_view_access
 from app.services.estates.billing_plans import next_plan_with_estates, plan_label
-from app.services.estates.subscriptions import estate_limit_for, get_subscription, has_hazard_access, has_live_inspection_access, has_sms_access, has_soil_analysis_access
+from app.services.estates.subscriptions import estate_limit_for_organization, get_subscription, has_hazard_access_for_organization, has_live_inspection_access_for_organization, has_sms_access_for_organization, has_soil_analysis_access_for_organization
 from app.services.estates.survey_requests import transition
 from app.services.estates.survey_adapter import materialize_estate_plot_for_survey
 from app.schemas.estate_survey import SurveyorAssignment
@@ -325,7 +325,7 @@ def _public_estate_payload(db: Session, estate: Estate) -> dict:
         "plots": public_plots,
         "counts": counts,
         "approval_milestones": estate_milestones,
-        "live_inspections_enabled": has_live_inspection_access(get_subscription(db, estate.organization_id)),
+        "live_inspections_enabled": has_live_inspection_access_for_organization(db, estate.organization_id),
         "development_forecast": forecast,
     }
 
@@ -965,7 +965,7 @@ def create_estate(organization_id: int, payload: EstateCreate, request: Request,
     access = require_estate_access(db, request, organization_id, permission="estate.manage")
     _enabled(db, organization_id)
     subscription = get_subscription(db, organization_id)
-    limit = estate_limit_for(subscription)
+    limit = estate_limit_for_organization(db, organization_id)
     if limit is not None:
         in_use = db.query(Estate).filter(Estate.organization_id == organization_id, Estate.archived_at.is_(None)).count()
         if in_use >= limit:
@@ -1253,7 +1253,7 @@ def _run_estate_development_forecast_job(job_id: str) -> None:
         if not estate:
             set_hazard_job_status(db, job_id, status="failed", stage="Failed", error_text="Estate not found", completed=True)
             return
-        if not has_hazard_access(get_subscription(db, estate.organization_id)):
+        if not has_hazard_access_for_organization(db, estate.organization_id):
             set_hazard_job_status(
                 db,
                 job_id,
@@ -2766,7 +2766,7 @@ def _persist_hazard_results(db: Session, *, estate: Estate, plot_id: int | None,
 
 def _require_plus_plan(db: Session, organization_id: int, feature_name: str) -> None:
     """Keep Plus-only geospatial features behind one server-side entitlement check."""
-    if not has_hazard_access(get_subscription(db, organization_id)):
+    if not has_hazard_access_for_organization(db, organization_id):
         raise HTTPException(
             status_code=402,
             detail={
@@ -2784,7 +2784,7 @@ def _require_hazard_plan(db: Session, organization_id: int) -> None:
 def _require_pro_plan(db: Session, organization_id: int, feature_name: str) -> None:
     """Keep Pro-and-above-only features behind one server-side entitlement check - a stricter
     gate than _require_plus_plan's (Plus-and-above)."""
-    if not has_soil_analysis_access(get_subscription(db, organization_id)):
+    if not has_soil_analysis_access_for_organization(db, organization_id):
         raise HTTPException(
             status_code=402,
             detail={
@@ -2797,7 +2797,7 @@ def _require_pro_plan(db: Session, organization_id: int, feature_name: str) -> N
 def _require_enterprise_plan(db: Session, organization_id: int, feature_name: str) -> None:
     """Keep Enterprise-only features behind one server-side entitlement check - the strictest of
     the three plan gates (Plus-and-above, Pro-and-above, Enterprise-only)."""
-    if not has_live_inspection_access(get_subscription(db, organization_id)):
+    if not has_live_inspection_access_for_organization(db, organization_id):
         raise HTTPException(
             status_code=402,
             detail={
@@ -4293,7 +4293,7 @@ def send_bulk_customer_sms(estate_id: int, payload: BulkCustomerSmsCreate, reque
     if estate is None:
         raise HTTPException(404, "Estate not found")
     access = require_estate_access(db, request, estate.organization_id, permission="customer.manage")
-    if not has_sms_access(get_subscription(db, estate.organization_id)):
+    if not has_sms_access_for_organization(db, estate.organization_id):
         raise HTTPException(403, "Sending SMS to customers is included in the Pro and Enterprise plans.")
     if not estate_sms.configured():
         raise HTTPException(503, "SMS is not switched on for this server yet.")
@@ -4715,7 +4715,7 @@ def _notify_allocation_customer(db: Session, *, allocation: EstateAllocation, or
         subject=f"LandCheck Estate update: {event.replace('_', ' ')}",
         status="sent" if notified else ("failed" if customer.email else "skipped"),
     )
-    if customer.phone and has_sms_access(get_subscription(db, allocation.organization_id)):
+    if customer.phone and has_sms_access_for_organization(db, allocation.organization_id):
         sms_message_id = estate_sms.notify_customer_sms(
             to_phone=customer.phone,
             org_name=org_name,
@@ -6343,7 +6343,7 @@ def estate_detail(estate_id: int, request: Request, db: Session = Depends(get_db
         "project_owner": estate.project_owner,
         "ownership_details": estate.ownership_details,
         "boundary": mapping(to_shape(estate.boundary)) if estate.boundary else None,
-        "live_inspections_enabled": has_live_inspection_access(get_subscription(db, estate.organization_id)),
+        "live_inspections_enabled": has_live_inspection_access_for_organization(db, estate.organization_id),
     }
 
 

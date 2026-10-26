@@ -8,7 +8,7 @@ from sqlalchemy.orm import Session
 from app.models.estate_foundation import EstateOrganization, EstateOrganizationMember
 from app.services.estates.permissions import has_permission
 from app.services.estates.identity import resolve_session
-from app.services.estates.subscriptions import get_subscription, is_access_active
+from app.services.estates.subscriptions import get_subscription, is_access_active, is_agent_workspace
 from app.utils.auth_security import resolve_request_session
 from app.utils.survey_auth_security import resolve_survey_session
 
@@ -128,7 +128,7 @@ def require_estate_access(
         )
         if not allowed:
             raise HTTPException(status_code=403, detail="You do not have permission for this Estate action")
-    if require_subscription:
+    if require_subscription and not is_agent_workspace(db, organization_id):
         subscription = get_subscription(db, organization_id)
         if not is_access_active(subscription):
             message = (
@@ -182,6 +182,6 @@ def require_estate_view_access(
     views named above.
     """
     access = require_estate_access(db, request, organization_id, permission=permission, require_subscription=False)
-    if get_subscription(db, organization_id) is None:
+    if not is_agent_workspace(db, organization_id) and get_subscription(db, organization_id) is None:
         raise HTTPException(status_code=402, detail={"code": "subscription_required", "message": "Choose a plan to continue using LandCheck Estates."})
     return access

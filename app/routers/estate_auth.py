@@ -87,18 +87,24 @@ def _account_payload(db: Session, account: EstateAccount) -> dict:
         "organization_id": int(account.organization_id),
         "organization_name": organization.name if organization else None,
         "organization_slug": organization.slug if organization else None,
+        "workspace_type": (
+            str((organization.settings or {}).get("workspace_type") or "estate").strip().lower()
+            if organization and isinstance(organization.settings, dict)
+            else "estate"
+        ),
     }
 
 
 @router.post("/register", status_code=201)
 def register(payload: EstateRegister, request: Request, db: Session = Depends(get_db)):
+    workspace_type = payload.workspace_type
     email = normalize_email(payload.email)
     if not EMAIL_PATTERN.fullmatch(email):
-        raise HTTPException(status_code=422, detail="Enter a valid company email address")
+        raise HTTPException(status_code=422, detail="Enter a valid email address")
     if not payload.accept_dpa:
         raise HTTPException(status_code=422, detail="Accept the Data Processing Agreement to create an account")
     if db.query(EstateAccount).filter(EstateAccount.email_normalized == email).first():
-        raise HTTPException(status_code=409, detail="An Estate account already exists for this email")
+        raise HTTPException(status_code=409, detail="An account already exists for this email")
     base_slug = slugify(payload.organization_slug or payload.organization_name)
     slug = base_slug
     for suffix in range(2, 100):
@@ -106,12 +112,13 @@ def register(payload: EstateRegister, request: Request, db: Session = Depends(ge
             break
         slug = f"{base_slug[: max(1, 108 - len(str(suffix)) - 1)]}-{suffix}"
     else:
-        raise HTTPException(status_code=409, detail="Could not create a unique company address")
+        raise HTTPException(status_code=409, detail="Could not create a unique workspace address")
     organization = EstateOrganization(
         name=payload.organization_name.strip(),
         slug=slug,
         contact_email=email,
         status="active",
+        settings={"workspace_type": workspace_type},
     )
     db.add(organization)
     db.flush()
@@ -150,7 +157,7 @@ def register(payload: EstateRegister, request: Request, db: Session = Depends(ge
         db.commit()
     except IntegrityError as exc:
         db.rollback()
-        raise HTTPException(status_code=409, detail="This Estate company or account already exists") from exc
+        raise HTTPException(status_code=409, detail="This workspace or account already exists") from exc
     raw_token = secrets.token_urlsafe(32)
     db.add(
         EstateEmailVerificationToken(
@@ -163,14 +170,15 @@ def register(payload: EstateRegister, request: Request, db: Session = Depends(ge
     estate_email.send_email_verification_email(
         organization=organization,
         account=account,
-        verification_url=f"{str(os.getenv('LANDCHECK_API_PUBLIC_URL') or 'https://api.landcheck.online').rstrip('/')}/estates/auth/verify-email?token={raw_token}",
+        workspace_type=workspace_type,
+        verification_url=f"{str(os.getenv('LANDCHECK_API_PUBLIC_URL') or 'https://api.landcheck.online').rstrip('/')}/estates/auth/verify-email?token={raw_token}&workspace={workspace_type}",
     )
     return {
         "user": _account_payload(db, account),
         "organization": {"id": organization.id, "name": organization.name, "slug": organization.slug},
         "verification_required": True,
         "email": account.email,
-        "message": "Check your email to verify your address before signing in.",
+        "message": f"Check your email to verify your address before signing in to LandCheck {'Agents' if workspace_type == 'agent' else 'Estates'}.",
     }
 
 
@@ -178,15 +186,24 @@ def register(payload: EstateRegister, request: Request, db: Session = Depends(ge
 def login(payload: EstateLogin, request: Request, response: Response, db: Session = Depends(get_db)):
     email = normalize_email(payload.email)
     if not EMAIL_PATTERN.fullmatch(email):
-        raise HTTPException(status_code=422, detail="Enter a valid company email address")
+        raise HTTPException(status_code=422, detail="Enter a valid email address")
     account = db.query(EstateAccount).filter(EstateAccount.email_normalized == email).one_or_none()
     if not account or account.status != "active" or not verify_password(payload.password, account.password_hash):
-        raise HTTPException(status_code=401, detail="Invalid Estate email or password")
+        raise HTTPException(status_code=401, detail="Invalid email or password")
     if account.email_verified_at is None:
         raise HTTPException(status_code=403, detail="Verify your email address before signing in")
     organization = db.get(EstateOrganization, account.organization_id)
     if not organization or organization.status != "active":
-        raise HTTPException(status_code=403, detail="This Estate company is not active")
+        raise HTTPException(status_code=403, detail="This account is not active")
+    settings = dict(organization.settings or {}) if isinstance(organization.settings, dict) else {}
+    stored_workspace_type = str(settings.get("workspace_type") or "").strip().lower()
+    if stored_workspace_type not in {"estate", "agent"}:
+        # Accounts created before the agent workspace existed have no marker. The explicit
+        # product route selected at login establishes the mode once; later logins cannot switch
+        # an already classified organization between free agent and paid Estate workspaces.
+        stored_workspace_type = payload.workspace_type
+        organization.settings = {**settings, "workspace_type": stored_workspace_type}
+    workspace_type = stored_workspace_type
     account.last_login_at = datetime.utcnow()
     session = issue_session(db, account, request)
     db.commit()
@@ -197,11 +214,12 @@ def login(payload: EstateLogin, request: Request, response: Response, db: Sessio
     # only runs after first paint - this makes "does this account still need to choose a plan"
     # part of the login response itself, so the frontend can send them there immediately instead
     # of racing a second request against the dashboard mounting.
-    needs_plan = not is_access_active(get_subscription(db, organization.id))
+    needs_plan = workspace_type != "agent" and not is_access_active(get_subscription(db, organization.id))
     payload_out = {
         **session,
         "user": _account_payload(db, account),
         "organization": {"id": organization.id, "name": organization.name, "slug": organization.slug},
+        "workspace_type": workspace_type,
         "needs_plan": needs_plan,
     }
     if request_uses_browser_auth(request):
@@ -210,7 +228,7 @@ def login(payload: EstateLogin, request: Request, response: Response, db: Sessio
 
 
 @router.get("/verify-email")
-def verify_email(token: str, db: Session = Depends(get_db)):
+def verify_email(token: str, workspace: str = "estate", db: Session = Depends(get_db)):
     token_hash = _hash_reset_token(str(token or ""))
     row = db.query(EstateEmailVerificationToken).filter(EstateEmailVerificationToken.token_hash == token_hash).one_or_none()
     now = datetime.now(timezone.utc)
@@ -223,11 +241,13 @@ def verify_email(token: str, db: Session = Depends(get_db)):
     account.email_verified_at = now
     row.used_at = now
     db.commit()
+    workspace_type = "agent" if workspace == "agent" else "estate"
     organization = db.get(EstateOrganization, account.organization_id)
     if organization:
-        estate_email.send_welcome_email(organization=organization, account=account)
+        estate_email.send_welcome_email(organization=organization, account=account, workspace_type=workspace_type)
     web_url = str(os.getenv("LANDCHECK_WEB_URL") or "https://landcheck.online").rstrip("/")
-    return RedirectResponse(f"{web_url}/estates/email-verified", status_code=303)
+    verification_path = "agents/email-verified" if workspace_type == "agent" else "estates/email-verified"
+    return RedirectResponse(f"{web_url}/{verification_path}", status_code=303)
 
 
 @router.post("/logout")

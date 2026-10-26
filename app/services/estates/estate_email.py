@@ -440,7 +440,7 @@ def notify_reservation_request(
     try:
         _send_email(
             to_email=to_email,
-            from_display_name="LandCheck Estates",
+            from_display_name=organization_name,
             subject=f"New reservation request - Plot {plot_number}",
             body_text=body_text,
             body_html=body_html,
@@ -631,75 +631,105 @@ def send_public_reservation_welcome(
         return False
 
 
-def send_welcome_email(*, organization, account, subscription=None) -> bool:
-    """Sent right after a new company registers - the first email a customer ever gets from us,
-    so it doubles as a mini product tour and pricing reference rather than a bare "you're in"."""
+def send_welcome_email(*, organization, account, subscription=None, workspace_type: str = "estate") -> bool:
+    """Send the post-verification onboarding email for a company or independent agent."""
     to_email = str(getattr(account, "email", "") or "").strip()
     if not to_email:
         return False
     first_name = str(getattr(account, "full_name", "") or "there").split(" ")[0]
     web_url = os.getenv("LANDCHECK_WEB_URL") or "https://landcheck.online"
-    trial_context = (
-        f"<p>Your {html.escape(str(subscription.plan_key).title())} plan trial is active until "
-        f"<strong>{html.escape(subscription.trial_ends_at.strftime('%d %b %Y') if subscription.trial_ends_at else 'the trial end date')}</strong>. "
-        "Your workspace access is ready now.</p>"
-        if subscription
-        else "<p>Choose a plan to activate your workspace trial.</p>"
-    )
-    trial_note = (
-        "Your subscription will use scheduled bank-transfer reminders."
-        if subscription and getattr(subscription, "payment_method", "card") == "bank_transfer"
-        else f"Both plans start with a {TRIAL_DAYS}-day free trial, and you can cancel anytime."
-    )
-    message_html = f"""
-    <p>Welcome to LandCheck Estates, {html.escape(first_name)} - your workspace for
-    <strong>{html.escape(str(getattr(organization, "name", "") or "your company"))}</strong> is ready.</p>
-    {trial_context}
-    <ul style="padding-left:18px;line-height:1.9;">
-      <li>Bring in a layout (survey coordinates, CAD, CSV, or a scanned plan) and manage every plot from one map</li>
-      <li>Track customers, reservations, allocations, payments and receipts</li>
-      <li>Run a tiered sales-agent commission ladder with payout tracking</li>
-      <li>Produce survey plans, staking coordinates and DGPS exports</li>
-      <li>Screen flood and erosion risk for a whole layout (Plus plan)</li>
-    </ul>
-    <p><strong>Basic</strong> is &#8358;19,500/month (or &#8358;220,000/year) - everything except flood and erosion hazard analysis.<br/>
-    <strong>Plus</strong> is &#8358;24,500/month (or &#8358;285,000/year) - everything, including hazard analysis.</p>
-    <p>{trial_note}</p>
-    """
-    action_label = "Open your workspace" if subscription else "Choose your plan"
-    action_path = "estates/workspace" if subscription else "estates/choose-plan"
-    body_html = _account_wrap_html(heading=f"Welcome to LandCheck Estates, {first_name}!", message_html=message_html, button_html=_account_button_html(label=action_label, url=f"{web_url.rstrip('/')}/{action_path}"))
+    if workspace_type == "agent":
+        message_html = f"""
+        <p>Welcome to LandCheck Agents, {html.escape(first_name)} - your professional property sales workspace for
+        <strong>{html.escape(str(getattr(organization, "name", "") or "your agency"))}</strong> is ready.</p>
+        <p>Your access is currently free. Use LandCheck to present land and property clearly, verify what you publish,
+        and keep buyer follow-up organised from one place.</p>
+        <ul style="padding-left:18px;line-height:1.9;">
+          <li>Add a property with photos, price, location, size and contact details</li>
+          <li>Draw the property boundary on the map or enter the individual coordinates</li>
+          <li>Publish a professional mini webpage buyers can view and use to request a reservation</li>
+          <li>Generate an advert, flyer, property webpage and map ready to share</li>
+          <li>Share your listing through your existing Facebook, WhatsApp and Instagram channels</li>
+          <li>Manage buyer enquiries, SMS follow-up and inspection requests from your workspace</li>
+        </ul>
+        <p>Start with one property, publish it when the details are accurate, and keep your map and buyer information
+        up to date so every enquiry begins with confidence.</p>
+        """
+        action_label = "Open your agent workspace"
+        action_path = "agents"
+        heading = f"Welcome to LandCheck Agents, {first_name}!"
+        subject = "Welcome to LandCheck Agents - start selling property professionally"
+        from_display_name = "LandCheck Agents"
+        plain_title = "Welcome to LandCheck Agents"
+    else:
+        trial_context = (
+            f"<p>Your {html.escape(str(subscription.plan_key).title())} plan trial is active until "
+            f"<strong>{html.escape(subscription.trial_ends_at.strftime('%d %b %Y') if subscription.trial_ends_at else 'the trial end date')}</strong>. "
+            "Your workspace access is ready now.</p>"
+            if subscription
+            else "<p>Choose a plan to activate your workspace trial.</p>"
+        )
+        trial_note = (
+            "Your subscription will use scheduled bank-transfer reminders."
+            if subscription and getattr(subscription, "payment_method", "card") == "bank_transfer"
+            else f"Both plans start with a {TRIAL_DAYS}-day free trial, and you can cancel anytime."
+        )
+        message_html = f"""
+        <p>Welcome to LandCheck Estates, {html.escape(first_name)} - your workspace for
+        <strong>{html.escape(str(getattr(organization, "name", "") or "your company"))}</strong> is ready.</p>
+        {trial_context}
+        <ul style="padding-left:18px;line-height:1.9;">
+          <li>Bring in a layout (survey coordinates, CAD, CSV, or a scanned plan) and manage every plot from one map</li>
+          <li>Track customers, reservations, allocations, payments and receipts</li>
+          <li>Run a tiered sales-agent commission ladder with payout tracking</li>
+          <li>Produce survey plans, staking coordinates and DGPS exports</li>
+          <li>Screen flood and erosion risk for a whole layout (Plus plan)</li>
+        </ul>
+        <p><strong>Basic</strong> is &#8358;19,500/month (or &#8358;220,000/year) - everything except flood and erosion hazard analysis.<br/>
+        <strong>Plus</strong> is &#8358;24,500/month (or &#8358;285,000/year) - everything, including hazard analysis.</p>
+        <p>{trial_note}</p>
+        """
+        action_label = "Open your workspace" if subscription else "Choose your plan"
+        action_path = "estates/workspace" if subscription else "estates/choose-plan"
+        heading = f"Welcome to LandCheck Estates, {first_name}!"
+        subject = "Welcome to LandCheck Estates"
+        from_display_name = "LandCheck Estates"
+        plain_title = "Welcome to LandCheck Estates"
+    body_html = _account_wrap_html(heading=heading, message_html=message_html, button_html=_account_button_html(label=action_label, url=f"{web_url.rstrip('/')}/{action_path}"))
     try:
-        _send_email(to_email=to_email, from_display_name="LandCheck Estates", subject="Welcome to LandCheck Estates", body_text=_account_plain_text("Welcome to LandCheck Estates", message_html, f"{web_url.rstrip('/')}/{action_path}"), body_html=body_html)
+        _send_email(to_email=to_email, from_display_name=from_display_name, subject=subject, body_text=_account_plain_text(plain_title, message_html, f"{web_url.rstrip('/')}/{action_path}"), body_html=body_html)
         return True
     except Exception:
         logger.exception("Estate welcome email failed (to=%s)", to_email)
         return False
 
 
-def send_email_verification_email(*, organization, account, verification_url: str) -> bool:
+def send_email_verification_email(*, organization, account, verification_url: str, workspace_type: str = "estate") -> bool:
     to_email = str(getattr(account, "email", "") or "").strip()
     if not to_email or not verification_url:
         return False
     first_name = str(getattr(account, "full_name", "") or "there").split(" ")[0]
     organization_name = str(getattr(organization, "name", "your company") or "your company")
+    is_agent = workspace_type == "agent"
+    product_name = "LandCheck Agents" if is_agent else "LandCheck Estates"
+    workspace_label = "agent workspace" if is_agent else "company workspace"
     message_html = (
         f"<p>Hello {html.escape(first_name)},</p>"
-        f"<p>Confirm this email address to activate the LandCheck Estates workspace for "
+        f"<p>Confirm this email address to activate your LandCheck {workspace_label} for "
         f"<strong>{html.escape(organization_name)}</strong>.</p>"
         f"<p>This verification link expires in {EMAIL_VERIFICATION_TTL_HOURS} hours.</p>"
     )
     body_html = _account_wrap_html(
-        heading="Verify your company email",
+        heading=f"Verify your {('agent' if is_agent else 'company')} email",
         message_html=message_html,
         button_html=_account_button_html(label="Verify email address", url=verification_url),
     )
     try:
         _send_email(
             to_email=to_email,
-            from_display_name="LandCheck Estates",
-            subject="Verify your LandCheck Estates email",
-            body_text=_account_plain_text("Verify your company email", message_html, verification_url),
+            from_display_name=product_name,
+            subject=f"Verify your {product_name} email",
+            body_text=_account_plain_text(f"Verify your {('agent' if is_agent else 'company')} email", message_html, verification_url),
             body_html=body_html,
         )
         return True

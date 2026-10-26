@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Literal
+
 from pydantic import BaseModel, Field
 
 
@@ -10,8 +12,10 @@ class EstateRegister(BaseModel):
     email: str = Field(min_length=5, max_length=255)
     password: str = Field(min_length=8, max_length=200)
     accept_dpa: bool = Field(default=False)
+    workspace_type: Literal["estate", "agent"] = "estate"
 
 
 class EstateLogin(BaseModel):
     email: str = Field(min_length=5, max_length=255)
     password: str = Field(min_length=1, max_length=200)
+    workspace_type: Literal["estate", "agent"] = "estate"

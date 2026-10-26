@@ -24,7 +24,7 @@ from app.services.estates.audit import append_estate_audit_event
 from app.services.estates.authorization import require_estate_access
 from app.services.estates.marketing_common import client_ip, normalize_phone_digits, public_page_url, throttled, web_url
 from app.services.estates.operations import record_notification_log
-from app.services.estates.subscriptions import get_subscription, has_auto_posting_access, has_sms_access, has_whatsapp_access
+from app.services.estates.subscriptions import has_auto_posting_access_for_organization, has_sms_access_for_organization, has_whatsapp_access_for_organization
 from app.services.estates.social_templates import ALL_CHANNELS, AUTOMATIC_CHANNELS, CHANNEL_FORMAT, CHANNEL_LABEL, MANUAL_CHANNELS
 from app.utils.r2_objects import build_public_url, build_r2_settings, upload_bytes
 from app.utils.secret_box import SecretNotConfigured, decrypt_text, encrypt_text, make_signed_token, read_signed_token, secret_configured
@@ -180,8 +180,8 @@ def social_overview(estate_id: int, request: Request, db: Session = Depends(get_
         "accounts": [social_posts.account_public(item) for item in accounts],
         "channels": [{"key": key, "label": CHANNEL_LABEL[key], "automatic": key in AUTOMATIC_CHANNELS, "format": CHANNEL_FORMAT[key]} for key in ALL_CHANNELS],
         "published": bool(estate.public_enabled and estate.public_slug),
-        "auto_posting": has_auto_posting_access(get_subscription(db, estate.organization_id)),
-        "whatsapp_enabled": has_whatsapp_access(get_subscription(db, estate.organization_id)),
+        "auto_posting": has_auto_posting_access_for_organization(db, estate.organization_id),
+        "whatsapp_enabled": has_whatsapp_access_for_organization(db, estate.organization_id),
     }
 
 
@@ -590,7 +590,7 @@ def _preview_item(item: dict) -> dict:
 
 
 def _require_auto_posting(db: Session, organization_id: int) -> None:
-    if not has_auto_posting_access(get_subscription(db, organization_id)):
+    if not has_auto_posting_access_for_organization(db, organization_id):
         raise HTTPException(
             status_code=402,
             detail={"code": "upgrade_required", "feature": "auto_posting", "message": "Automatic posting plans are available on the Pro and Enterprise plans. Upgrade to unlock them.", "suggested_plan": "pro"},
@@ -598,7 +598,7 @@ def _require_auto_posting(db: Session, organization_id: int) -> None:
 
 
 def _require_whatsapp(db: Session, organization_id: int) -> None:
-    if not has_whatsapp_access(get_subscription(db, organization_id)):
+    if not has_whatsapp_access_for_organization(db, organization_id):
         raise HTTPException(
             status_code=402,
             detail={"code": "upgrade_required", "feature": "whatsapp", "message": "WhatsApp chat with customers is available on the Pro and Enterprise plans. Upgrade to unlock it.", "suggested_plan": "pro"},
@@ -1194,7 +1194,7 @@ def send_customer_whatsapp_message(customer_id: int, payload: CustomerWhatsappMe
     ]
 
     if payload.channel == "sms":
-        if not has_sms_access(get_subscription(db, customer.organization_id)):
+        if not has_sms_access_for_organization(db, customer.organization_id):
             raise HTTPException(
                 status_code=402,
                 detail={"code": "upgrade_required", "feature": "sms", "message": "SMS to customers is available on the Pro and Enterprise plans. Upgrade to unlock it.", "suggested_plan": "pro"},

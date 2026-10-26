@@ -38,6 +38,18 @@ def get_subscription(db: Session, organization_id: int) -> EstateSubscription | 
     return db.query(EstateSubscription).filter(EstateSubscription.organization_id == int(organization_id)).one_or_none()
 
 
+def is_agent_workspace(db: Session, organization_id: int) -> bool:
+    """Return whether an organization is using the currently free agent workspace.
+
+    The workspace marker lives in the existing organization settings JSON so this rollout does not
+    require a schema migration. It is written during self-registration and, for legacy accounts
+    created before the agent route existed, during their first explicit agent login.
+    """
+    organization = db.get(EstateOrganization, int(organization_id))
+    settings = organization.settings if organization and isinstance(organization.settings, dict) else {}
+    return str(settings.get("workspace_type") or "estate").strip().lower() == "agent"
+
+
 def is_access_active(subscription: EstateSubscription | None) -> bool:
     return bool(subscription and subscription.status in ACTIVE_SUBSCRIPTION_STATUSES)
 
@@ -66,9 +78,37 @@ def has_live_inspection_access(subscription: EstateSubscription | None) -> bool:
     return is_access_active(subscription) and plan_includes_live_inspections(subscription.plan_key)
 
 
+def has_hazard_access_for_organization(db: Session, organization_id: int) -> bool:
+    return is_agent_workspace(db, organization_id) or has_hazard_access(get_subscription(db, organization_id))
+
+
+def has_auto_posting_access_for_organization(db: Session, organization_id: int) -> bool:
+    return is_agent_workspace(db, organization_id) or has_auto_posting_access(get_subscription(db, organization_id))
+
+
+def has_soil_analysis_access_for_organization(db: Session, organization_id: int) -> bool:
+    return is_agent_workspace(db, organization_id) or has_soil_analysis_access(get_subscription(db, organization_id))
+
+
+def has_sms_access_for_organization(db: Session, organization_id: int) -> bool:
+    return is_agent_workspace(db, organization_id) or has_sms_access(get_subscription(db, organization_id))
+
+
+def has_whatsapp_access_for_organization(db: Session, organization_id: int) -> bool:
+    return is_agent_workspace(db, organization_id) or has_whatsapp_access(get_subscription(db, organization_id))
+
+
+def has_live_inspection_access_for_organization(db: Session, organization_id: int) -> bool:
+    return is_agent_workspace(db, organization_id) or has_live_inspection_access(get_subscription(db, organization_id))
+
+
 def estate_limit_for(subscription: EstateSubscription | None) -> int | None:
     """None means unlimited. An organisation with no subscription record keeps the Basic limit."""
     return plan_max_estates(subscription.plan_key if subscription else None)
+
+
+def estate_limit_for_organization(db: Session, organization_id: int) -> int | None:
+    return None if is_agent_workspace(db, organization_id) else estate_limit_for(get_subscription(db, organization_id))
 
 
 def _advance_period(start: datetime, billing_cycle: str) -> datetime:

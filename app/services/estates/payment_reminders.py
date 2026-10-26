@@ -17,7 +17,7 @@ from app.services.estates.authorization import EstatePrincipal
 from app.services.estates.operations import issue_customer_portal_link, record_notification_log
 from app.services.estates.payments import financial_summary
 from app.services.estates.payout_accounts import get_payout_account
-from app.services.estates.subscriptions import get_subscription, has_sms_access
+from app.services.estates.subscriptions import has_sms_access_for_organization
 
 
 def compose_reminder_text(
@@ -83,7 +83,7 @@ def send_reminder(db: Session, *, allocation: EstateAllocation, channel: str, me
     if channel == "sms":
         if not customer.phone:
             raise ValueError("This customer has no phone number on file")
-        if not has_sms_access(get_subscription(db, allocation.organization_id)):
+        if not has_sms_access_for_organization(db, allocation.organization_id):
             raise ValueError("SMS reminders require the Pro or Enterprise plan")
         sent = bool(estate_sms.send_manual_sms(to_phone=customer.phone, message=text))
         if not sent:
