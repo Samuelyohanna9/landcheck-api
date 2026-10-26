@@ -15,6 +15,12 @@ def test_boundary_layers_use_plot_permissions_and_accept_polygon_geometry():
     assert _spatial_feature_write_permission("road") == "infrastructure.manage"
 
 
+def test_layer_visibility_preserves_plot_and_infrastructure_permission_paths():
+    source = (Path(__file__).parents[1] / "app" / "routers" / "estates.py").read_text(encoding="utf-8")
+    assert "require_estate_view_access_any" in source
+    assert 'permissions=("plot.read", "infrastructure.read", "plot.manage", "infrastructure.manage")' in source
+
+
 def test_boundary_update_type_is_supported_and_migration_protects_downgrade():
     payload = SpatialFeatureUpdate(feature_type="boundary")
     assert payload.feature_type == "boundary"

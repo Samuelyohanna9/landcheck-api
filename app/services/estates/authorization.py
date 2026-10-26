@@ -185,3 +185,25 @@ def require_estate_view_access(
     if not is_agent_workspace(db, organization_id) and get_subscription(db, organization_id) is None:
         raise HTTPException(status_code=402, detail={"code": "subscription_required", "message": "Choose a plan to continue using LandCheck Estates."})
     return access
+
+
+def require_estate_view_access_any(
+    db: Session,
+    request: Request,
+    organization_id: int,
+    *,
+    permissions: tuple[str, ...],
+) -> EstateAccess:
+    """Authorize a read view when legacy and newer Estate permissions both grant visibility.
+
+    Spatial layers historically used infrastructure.read, while the plot/map view now also
+    contains boundary layers and may be granted through plot.read. Custom staff roles can carry
+    either permission independently, so requiring only one would hide valid Estate data.
+    """
+    access = require_estate_view_access(db, request, organization_id, permission=None)
+    granted = access.custom_permissions if access.custom_permissions is not None else frozenset(
+        permission for permission in permissions if has_permission(access.role_key, permission)
+    )
+    if not any(permission in granted for permission in permissions):
+        raise HTTPException(status_code=403, detail="You do not have permission to view these Estate layers")
+    return access

@@ -44,7 +44,7 @@ from app.services.estates.permissions import PERMISSION_CATALOG, has_permission,
 from sqlalchemy import func
 from app.services.estates.allocations import release_allocation, reserve_or_allocate
 from app.services.estates.audit import append_estate_audit_event
-from app.services.estates.authorization import EstatePrincipal, require_estate_access, require_estate_view_access
+from app.services.estates.authorization import EstatePrincipal, require_estate_access, require_estate_view_access, require_estate_view_access_any
 from app.services.estates.billing_plans import next_plan_with_estates, plan_label
 from app.services.estates.subscriptions import estate_limit_for_organization, get_subscription, has_hazard_access_for_organization, has_live_inspection_access_for_organization, has_sms_access_for_organization, has_soil_analysis_access_for_organization
 from app.services.estates.survey_requests import transition
@@ -1717,9 +1717,14 @@ def estate_plots_geojson(estate_id: int, request: Request, db: Session = Depends
 def estate_layers_geojson(estate_id:int, request:Request, db:Session=Depends(get_db)):
     estate=db.get(Estate,estate_id)
     if not estate: raise HTTPException(404,"Estate not found")
-    # Boundary layers are part of the plot/map view, so plot readers must be able to see them
-    # even when they do not have the separate infrastructure permission.
-    require_estate_view_access(db,request,estate.organization_id,permission="plot.read")
+    # Preserve visibility for existing infrastructure readers while also allowing plot readers
+    # to see boundary layers added through the Map & Plots workflow.
+    require_estate_view_access_any(
+        db,
+        request,
+        estate.organization_id,
+        permissions=("plot.read", "infrastructure.read", "plot.manage", "infrastructure.manage"),
+    )
     rows=db.query(EstateSpatialFeature).filter(EstateSpatialFeature.estate_id==estate_id, EstateSpatialFeature.status=="active").all()
     db.close()
     return {"type":"FeatureCollection","features":[{"type":"Feature","id":row.id,"properties":{"id":row.id,"type":row.feature_type,"name":row.name,"status":row.status},"geometry":mapping(to_shape(row.geometry))} for row in rows]}
