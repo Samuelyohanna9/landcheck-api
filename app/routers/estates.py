@@ -1726,8 +1726,20 @@ def estate_layers_geojson(estate_id:int, request:Request, db:Session=Depends(get
         permissions=("plot.read", "infrastructure.read", "plot.manage", "infrastructure.manage"),
     )
     rows=db.query(EstateSpatialFeature).filter(EstateSpatialFeature.estate_id==estate_id, EstateSpatialFeature.status=="active").all()
+    # Materialize the complete GeoJSON payload before releasing the session. This keeps the
+    # layer response deterministic for geometry columns and avoids a detached/lazy geometry
+    # read dropping a newly-created boundary from the editor response.
+    features = [
+        {
+            "type": "Feature",
+            "id": row.id,
+            "properties": {"id": row.id, "type": row.feature_type, "name": row.name, "status": row.status},
+            "geometry": mapping(to_shape(row.geometry)),
+        }
+        for row in rows
+    ]
     db.close()
-    return {"type":"FeatureCollection","features":[{"type":"Feature","id":row.id,"properties":{"id":row.id,"type":row.feature_type,"name":row.name,"status":row.status},"geometry":mapping(to_shape(row.geometry))} for row in rows]}
+    return {"type": "FeatureCollection", "features": features}
 
 
 @router.get("/{estate_id}/blocks")
