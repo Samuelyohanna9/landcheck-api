@@ -5565,6 +5565,7 @@ def create_plot_orthophoto_export_job(
     coordinate_system: str = Body("wgs84"),
     paper_size: str = Body("A4"),
     use_topo_map: bool = Body(False),
+    building_hatch_type: str = Body("solid"),
     north_arrow_style: str = Body("one_side_stem"),
     north_arrow_color: str = Body("blue"),
 ):
@@ -5580,6 +5581,7 @@ def create_plot_orthophoto_export_job(
         "coordinate_system": coordinate_system,
         "paper_size": paper_size,
         "use_topo_map": False,
+        "building_hatch_type": building_hatch_type or "solid",
         "north_arrow_style": north_arrow_style,
         "north_arrow_color": north_arrow_color,
     }
@@ -5624,6 +5626,7 @@ def create_plot_topomap_export_job(
     coordinate_system: str = Body("wgs84"),
     paper_size: str = Body("A4"),
     topo_source: str = Body("opentopomap"),
+    elevation_points: list = Body(default=[]),
     contour_interval: float | None = Body(None),
     building_hatch_type: str = Body("solid"),
     north_arrow_style: str = Body("one_side_stem"),
@@ -5642,6 +5645,7 @@ def create_plot_topomap_export_job(
         "paper_size": paper_size,
         "use_topo_map": True,
         "topo_source": topo_source or "opentopomap",
+        "elevation_points": elevation_points if (topo_source or "opentopomap") == "userdata" else [],
         "contour_interval": contour_interval,
         "building_hatch_type": building_hatch_type or "solid",
         "north_arrow_style": north_arrow_style,
@@ -8055,6 +8059,7 @@ def orthophoto_pdf(plot_id: int, db: Session = Depends(get_db), background_tasks
     use_topo_map: bool = Body(False),
     topo_source: str = Body("opentopomap"),
     contour_interval: float | None = Body(None),
+    elevation_points: list = Body(default=[]),
     building_hatch_type: str = Body("solid"),
     north_arrow_style: str = Body("one_side_stem"),
     north_arrow_color: str = Body("blue")):
@@ -8095,7 +8100,7 @@ def orthophoto_pdf(plot_id: int, db: Session = Depends(get_db), background_tasks
 
     elevation_points = None
     if use_topo_map and topo_source == "userdata":
-        elevation_points = get_plot_meta(db, plot_id).get("elevation_points") or None
+        elevation_points = elevation_points or get_plot_meta(db, plot_id).get("elevation_points") or None
 
     if use_topo_map:
         topo_source_footer = "SOURCE: Your uploaded elevation data" if topo_source == "userdata" else "SOURCE: Global satellite elevation model (Copernicus/NASA DEM)"
