@@ -124,6 +124,22 @@ def test_export_failure_is_reported_without_download(canva_env, monkeypatch):
     assert error.value.code == "approval_required"
 
 
+def test_jpg_export_includes_required_quality(canva_env, monkeypatch):
+    captured = {}
+    db = DummyDb()
+    connection = _connection()
+    monkeypatch.setattr(
+        canva_connect,
+        "request_json",
+        lambda *args, **kwargs: captured.update(kwargs) or {"job": {"id": "export-1"}},
+    )
+    monkeypatch.setattr(canva_connect, "poll_job", lambda *args, **kwargs: {"urls": ["https://exports.test/flyer.jpg"]})
+    monkeypatch.setattr(canva_connect.requests, "get", lambda *args, **kwargs: FakeResponse(200, content=b"\xff\xd8\xffjpg"))
+
+    assert canva_connect.export_design(db, connection, "design-1", "jpg").startswith(b"\xff\xd8\xff")
+    assert captured["json_body"] == {"design_id": "design-1", "format": {"type": "jpg", "quality": 90}}
+
+
 def test_invalid_return_token_is_rejected_before_network_access(canva_env):
     with pytest.raises(canva_connect.CanvaApiError) as error:
         canva_connect.verify_correlation_jwt("not-a-jwt")

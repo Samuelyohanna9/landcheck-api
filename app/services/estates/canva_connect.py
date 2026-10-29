@@ -273,7 +273,11 @@ def create_design(db: Session, connection: EstateCanvaConnection, *, asset_id: s
 
 def export_design(db: Session, connection: EstateCanvaConnection, design_id: str, export_format: str) -> bytes:
     export_format = "jpg" if export_format == "jpg" else "png"
-    created = request_json(db, connection, "POST", "/exports", json_body={"design_id": design_id, "format": {"type": export_format}})
+    export_spec: dict[str, object] = {"type": export_format}
+    if export_format == "jpg":
+        # Canva requires an explicit compression quality for JPEG exports.
+        export_spec["quality"] = 90
+    created = request_json(db, connection, "POST", "/exports", json_body={"design_id": design_id, "format": export_spec})
     job_id = str((created.get("job") or {}).get("id") or "")
     if not job_id:
         raise CanvaApiError("Canva did not return an export job.")
