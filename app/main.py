@@ -37,6 +37,7 @@ from app.routers import (
     estate_imports,
     estate_marketing,
     estate_social,
+    estate_canva,
     estate_legal,
     estate_admin_accounting,
     commercial,
@@ -851,6 +852,7 @@ app.include_router(estate_payout_accounts.router)
 app.include_router(estate_imports.router)
 app.include_router(estate_marketing.router)
 app.include_router(estate_social.router)
+app.include_router(estate_canva.router)
 app.include_router(estate_legal.router)
 app.include_router(estate_admin_accounting.router)
 app.include_router(commercial.router)

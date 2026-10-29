@@ -16,6 +16,7 @@ from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app.models.estate_foundation import Estate, EstateAllocation, EstateCustomer, EstateOrganization, EstatePlot
+from app.models.estate_canva import EstateCanvaDesign
 from app.models.estate_social import EstateMarketingOptin, EstateSocialAccount, EstateSocialPlan, EstateSocialPost, EstateWhatsappMessage, EstateWhatsappSend
 from app.routers.estate_marketing import NO_CACHE_PRIVATE, _campaign_for_staff, _png, _staff, _staff_view
 from app.routers.plots import get_db
@@ -48,6 +49,7 @@ class PostCreate(BaseModel):
     campaign_id: int | None = None
     scheduled_at: datetime | None = None
     publish_now: bool = False
+    canva_design_id: int | None = None
 
 
 class PostUpdate(BaseModel):
@@ -340,12 +342,31 @@ def create_post(estate_id: int, payload: PostCreate, request: Request, db: Sessi
         plot = db.get(EstatePlot, payload.plot_id)
         if plot is None or plot.estate_id != estate.id:
             raise HTTPException(404, "Plot not found")
+    canva_design = None
+    canva_image_url = None
+    if payload.canva_design_id is not None:
+        if not payload.include_media:
+            raise HTTPException(422, "A Canva design requires an image post.")
+        canva_design = db.query(EstateCanvaDesign).filter(
+            EstateCanvaDesign.id == payload.canva_design_id,
+            EstateCanvaDesign.estate_id == estate.id,
+            EstateCanvaDesign.organization_id == estate.organization_id,
+            EstateCanvaDesign.status == "imported",
+            EstateCanvaDesign.r2_object_key.is_not(None),
+        ).one_or_none()
+        if canva_design is None:
+            raise HTTPException(409, "Import the Canva design into LandCheck before using it in a post.")
+        settings = build_r2_settings(prefix="R2")
+        if settings is None:
+            raise HTTPException(503, "File storage is not configured on this server.")
+        canva_image_url = build_public_url(settings, canva_design.r2_object_key)
     campaign = _campaign_for_staff(db, estate, payload.campaign_id)
     if payload.publish_now or when is not None:
         _require_automatic_accounts(db, estate.organization_id, channels)
     post = EstateSocialPost(
-        organization_id=estate.organization_id, estate_id=estate.id, plot_id=plot.id if plot else None, template_key=payload.template_key[:40],
+        organization_id=estate.organization_id, estate_id=estate.id, plot_id=plot.id if plot else None, template_key="canva_design" if canva_design else payload.template_key[:40],
         caption=payload.caption.strip(), image_format=CHANNEL_FORMAT[channels[0]], image_style=payload.image_style, include_media=payload.include_media, source_code=campaign.code if campaign else None,
+        custom_image_url=canva_image_url,
         channels=channels, status="scheduled" if when is not None else "draft", scheduled_at=when, results={},
         created_by_subject_type=access.principal.subject_type, created_by_subject_id=str(access.principal.subject_id),
     )
