@@ -22,21 +22,29 @@ jobs:
             git fetch origin main
             if [ -n "$(git status --porcelain)" ]; then
               # A previous release may have left generated, tracked artifacts removed from the
-              # worktree. If the resulting worktree already matches the fetched main tree, it is
-              # safe to reconcile it with the fast-forward below; real source drift still stops
-              # the deployment. Never auto-stash or overwrite an untracked production file.
+              # worktree. Compare only actual local edits against the incoming commit: the old
+              # checkout will naturally differ from origin/main in every changed source file
+              # before the fast-forward. Never auto-stash or overwrite an untracked production file.
               if [ -n "$(git ls-files --others --exclude-standard)" ]; then
                 echo "Refusing deployment: production checkout has untracked files." >&2
                 git status --short >&2
                 exit 1
               fi
-              if ! git diff --quiet origin/main --; then
-                echo "Refusing deployment: production checkout has changes not present in origin/main." >&2
-                git status --short >&2
-                git diff --stat origin/main -- >&2 || true
-                exit 1
-              fi
-              echo "Production worktree already matches origin/main; reconciling the checkout." >&2
+              local_files="$(git diff --name-only; git diff --cached --name-only | sort -u)"
+              incoming_files="$(git diff --name-only HEAD origin/main)"
+              for path in $local_files; do
+                if ! printf '%s\n' "$incoming_files" | grep -Fxq -- "$path"; then
+                  echo "Refusing deployment: local production change is not part of origin/main: $path" >&2
+                  git status --short >&2
+                  exit 1
+                fi
+                if ! git diff --quiet origin/main -- "$path"; then
+                  echo "Refusing deployment: local production content differs from origin/main: $path" >&2
+                  git status --short >&2
+                  exit 1
+                fi
+              done
+              echo "Production local changes match the incoming commit; reconciling the checkout." >&2
             fi
             if [ "$(git branch --show-current)" != "main" ]; then
               git switch main
