@@ -77,6 +77,8 @@ ADAMAWA_FONT_FAMILY = "DejaVu Serif"
 ADAMAWA_BLUE = "#1f2f8a"
 # Roads need to remain secondary to boundary and station work on printed plans.
 SURVEY_ROAD_COLOR = "#68737D"
+# Rivers are contextual linework and should stay lighter than the survey boundary and labels.
+SURVEY_RIVER_LINE_MM = 0.18
 
 # Detail-only OSM ways are intentionally omitted from printed survey maps. They are useful in a
 # navigation map, but at site-plan scale they make roundabouts and junctions unreadable.
@@ -4009,7 +4011,7 @@ def _render_plot_map_layout_adamawa(
     visible_rivers = filter_features_by_scale(rivers, display_epsg, scale_ratio, min_paper_mm=2.0)
     if visible_rivers:
         gpd.GeoDataFrame(geometry=visible_rivers, crs="EPSG:4326").to_crs(epsg=display_epsg).plot(
-            ax=ax, color=river_color, lw=scaled_line_weight(0.3, font_scale, scale_ratio), zorder=5
+            ax=ax, color=river_color, lw=scaled_line_weight(SURVEY_RIVER_LINE_MM, font_scale, scale_ratio, allow_scale_boost=False), zorder=5
         )
 
     road_edge_lines = []
@@ -4986,7 +4988,7 @@ def _render_plot_map_layout_cadastral(
     visible_rivers = filter_features_by_scale(rivers, display_epsg, scale_ratio, min_paper_mm=2.0)
     if visible_rivers:
         gpd.GeoDataFrame(geometry=visible_rivers, crs="EPSG:4326").to_crs(epsg=display_epsg).plot(
-            ax=ax, color=river_color, lw=scaled_line_weight(0.3, font_scale, scale_ratio), zorder=5
+            ax=ax, color=river_color, lw=scaled_line_weight(SURVEY_RIVER_LINE_MM, font_scale, scale_ratio, allow_scale_boost=False), zorder=5
         )
 
     road_geom_width = []
@@ -5598,7 +5600,7 @@ def _render_plot_map_layout_fct(
     visible_rivers = filter_features_by_scale(rivers, display_epsg, scale_ratio, min_paper_mm=2.0)
     if visible_rivers:
         gpd.GeoDataFrame(geometry=visible_rivers, crs="EPSG:4326").to_crs(epsg=display_epsg).plot(
-            ax=ax, color=river_color, lw=scaled_line_weight(0.3, font_scale, scale_ratio), zorder=5
+            ax=ax, color=river_color, lw=scaled_line_weight(SURVEY_RIVER_LINE_MM, font_scale, scale_ratio, allow_scale_boost=False), zorder=5
         )
 
     road_geom_width = []
@@ -6346,7 +6348,7 @@ def _render_plot_map_layout_site_plan(
     visible_rivers = filter_features_by_scale(rivers, display_epsg, scale_ratio, min_paper_mm=2.0)
     if visible_rivers:
         gpd.GeoDataFrame(geometry=visible_rivers, crs="EPSG:4326").to_crs(epsg=display_epsg).plot(
-            ax=ax, color=river_color, lw=scaled_line_weight(0.3, font_scale, scale_ratio), zorder=5
+            ax=ax, color=river_color, lw=scaled_line_weight(SURVEY_RIVER_LINE_MM, font_scale, scale_ratio, allow_scale_boost=False), zorder=5
         )
 
     road_geom_width = []
@@ -6969,7 +6971,7 @@ def render_plot_map_layout(
     visible_rivers = filter_features_by_scale(rivers, display_epsg, scale_ratio, min_paper_mm=2.0)
     if visible_rivers:
         gpd.GeoDataFrame(geometry=visible_rivers, crs="EPSG:4326").to_crs(epsg=display_epsg).plot(
-            ax=ax, color=river_color, lw=scaled_line_weight(0.3, font_scale, scale_ratio), zorder=5
+            ax=ax, color=river_color, lw=scaled_line_weight(SURVEY_RIVER_LINE_MM, font_scale, scale_ratio, allow_scale_boost=False), zorder=5
         )
 
     from shapely.geometry import box
