@@ -76,7 +76,7 @@ DEFAULT_ADAMAWA_PREPARED_BY_TEXT = "Plan Prepared by Office of the Surveyor Gene
 ADAMAWA_FONT_FAMILY = "DejaVu Serif"
 ADAMAWA_BLUE = "#1f2f8a"
 # Roads need to remain secondary to boundary and station work on printed plans.
-SURVEY_ROAD_COLOR = "#56616B"
+SURVEY_ROAD_COLOR = "#68737D"
 
 # Detail-only OSM ways are intentionally omitted from printed survey maps. They are useful in a
 # navigation map, but at site-plan scale they make roundabouts and junctions unreadable.
@@ -3161,7 +3161,9 @@ def _draw_road_edges(
             )
         except Exception:
             pass
-    lw = scaled_line_weight(0.3, font_scale, scale_ratio)
+    # Keep the two road edges light at smaller printed scales. The previous scale boost made
+    # dashed roads read as heavy dark bands beside the survey boundary.
+    lw = scaled_line_weight(0.24, font_scale, scale_ratio, allow_scale_boost=False)
     draw_lines = edge_lines
     try:
         network = unary_union(edge_lines)
