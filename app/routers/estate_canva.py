@@ -17,9 +17,11 @@ from sqlalchemy.orm import Session
 
 from app.models.estate_canva import EstateCanvaConnection, EstateCanvaDesign, EstateCanvaOAuthState, new_canva_return_key
 from app.models.estate_foundation import Estate
-from app.routers.estate_marketing import AD_FORMATS, AD_STYLES, _build_ctx, _ctx_plot, _render_estate_ad, _render_plot_ad, _staff, _staff_view
+from app.routers.estate_marketing import AD_FORMATS, AD_STYLES, _build_ctx, _ctx_plot, _render_estate_ad, _render_flyer, _render_plot_ad, _staff, _staff_view
 from app.routers.plots import get_db
-from app.services.estates import canva_connect
+from app.services.estates import canva_connect, marketing_render
+from app.services.estates.canva_editability import AUTOFILL_SCOPES, PDF_IMPORT_SCOPE, autofill_data, autofill_payload
+from app.services.estates.documents import read_private_estate_file
 from app.services.estates.audit import append_estate_audit_event
 from app.utils.r2_objects import build_public_url, build_r2_settings, create_r2_client, delete_object_best_effort, normalize_object_key, upload_bytes
 
@@ -36,6 +38,15 @@ class CanvaEditRequest(BaseModel):
 
 class CanvaImportRequest(BaseModel):
     format: str = Field(default="png", pattern="^(png|jpg)$")
+
+
+class CanvaPdfImportRequest(BaseModel):
+    style: str = Field(default="luxury", max_length=32)
+    campaign_id: int | None = None
+
+
+class CanvaAutofillRequest(BaseModel):
+    campaign_id: int | None = None
 
 
 def _hash(value: str) -> str:
@@ -96,6 +107,42 @@ def _frontend_redirect(path: str, **params: str) -> RedirectResponse:
     return RedirectResponse(f"{base}{path}{separator}{urlencode(clean)}" if clean else f"{base}{path}", status_code=302)
 
 
+def _persist_created_design(
+    db: Session,
+    *,
+    estate: Estate,
+    access,
+    connection: EstateCanvaConnection,
+    design: dict,
+    source_format: str,
+    source_style: str,
+    title_fallback: str,
+) -> tuple[EstateCanvaDesign, str]:
+    design_id = str(design.get("id") or "")
+    edit_url = str((design.get("urls") or {}).get("edit_url") or "")
+    if not design_id or not edit_url.startswith("https://www.canva.com/"):
+        raise canva_connect.CanvaApiError("Canva returned an incomplete or unsafe design link.")
+    return_key = new_canva_return_key()
+    row = EstateCanvaDesign(
+        organization_id=estate.organization_id,
+        estate_id=estate.id,
+        connection_id=connection.id,
+        canva_design_id=design_id,
+        canva_user_id=connection.canva_user_id,
+        canva_team_id=connection.canva_team_id,
+        title=str(design.get("title") or title_fallback)[:255],
+        source_format=source_format,
+        source_style=source_style,
+        return_key_hash=_hash(return_key),
+        status="created",
+        created_by_subject_type=access.principal.subject_type,
+        created_by_subject_id=str(access.principal.subject_id),
+    )
+    db.add(row)
+    db.commit()
+    return row, canva_connect.prepare_edit_url(edit_url, return_key)
+
+
 @router.get("/{estate_id}/marketing/canva")
 def canva_status(estate_id: int, request: Request, db: Session = Depends(get_db)):
     estate, _access = _staff_view(db, request, estate_id, permission="estate.read")
@@ -106,7 +153,13 @@ def canva_status(estate_id: int, request: Request, db: Session = Depends(get_db)
         .first()
     )
     designs = db.query(EstateCanvaDesign).filter(EstateCanvaDesign.estate_id == estate.id).order_by(EstateCanvaDesign.created_at.desc()).limit(20).all()
-    return {"configured": canva_connect.configured(), "connection": _connection_payload(connection), "designs": [_design_payload(item) for item in designs]}
+    return {
+        "configured": canva_connect.configured(),
+        "autofill_configured": canva_connect.autofill_configured(),
+        "autofill_ready": bool(connection and connection.status == "active" and canva_connect.connection_has_scopes(connection, set(AUTOFILL_SCOPES)) and canva_connect.autofill_configured()),
+        "connection": _connection_payload(connection),
+        "designs": [_design_payload(item) for item in designs],
+    }
 
 
 @router.post("/{estate_id}/marketing/canva/connect")
@@ -254,6 +307,123 @@ def canva_create_design(estate_id: int, payload: CanvaEditRequest, request: Requ
         db.rollback()
         logger.exception("Canva design creation failed for estate %s", estate_id)
         raise HTTPException(502, "Canva could not open this flyer for editing.") from exc
+
+
+@router.post("/{estate_id}/marketing/canva/pdf-import")
+def canva_import_pdf_design(estate_id: int, payload: CanvaPdfImportRequest, request: Request, db: Session = Depends(get_db)):
+    """Open the existing luxury PDF as a Canva design-import job.
+
+    The other flyer families are deliberately kept on the existing image path:
+    their source PDFs are full-page raster posters and cannot provide useful
+    element-level editing.
+    """
+    estate, access = _staff(db, request, estate_id, permission="marketing.manage")
+    if payload.style not in AD_STYLES:
+        raise HTTPException(422, "Choose a valid design style")
+    if payload.style != "luxury":
+        raise HTTPException(422, "Element-level PDF import is currently available for the Luxury flyer only.")
+    connection = _connection(db, estate.organization_id)
+    if not canva_connect.connection_has_scopes(connection, {PDF_IMPORT_SCOPE}):
+        raise HTTPException(409, "Reconnect Canva to grant the design:content:write permission required for PDF import.")
+    campaign = None
+    if payload.campaign_id:
+        from app.routers.estate_marketing import _campaign_for_staff
+        campaign = _campaign_for_staff(db, estate, payload.campaign_id)
+    ctx = _build_ctx(db, estate, campaign.code if campaign else None)
+    try:
+        pdf = _render_flyer(ctx, "luxury")
+        design = canva_connect.import_pdf(db, connection, pdf, f"{estate.name} · LandCheck editable flyer")
+        row, edit_url = _persist_created_design(
+            db,
+            estate=estate,
+            access=access,
+            connection=connection,
+            design=design,
+            source_format="pdf",
+            source_style="luxury",
+            title_fallback=f"{estate.name} · LandCheck editable flyer",
+        )
+        return {"id": row.id, "design_id": row.canva_design_id, "edit_url": edit_url, "title": row.title, "mode": "pdf-import"}
+    except canva_connect.CanvaApiError as exc:
+        db.rollback()
+        raise HTTPException(exc.status or 502, str(exc)) from exc
+    except HTTPException:
+        db.rollback()
+        raise
+    except Exception as exc:
+        db.rollback()
+        logger.exception("Canva PDF import failed for estate %s", estate_id)
+        raise HTTPException(502, "The flyer PDF could not be opened in Canva.") from exc
+
+
+@router.post("/{estate_id}/marketing/canva/autofill")
+def canva_autofill_design(estate_id: int, payload: CanvaAutofillRequest, request: Request, db: Session = Depends(get_db)):
+    """Create an editable design from the configured LandCheck Canva template."""
+    estate, access = _staff(db, request, estate_id, permission="marketing.manage")
+    if not canva_connect.autofill_configured():
+        raise HTTPException(503, "Autofill is not configured. Add CANVA_AUTOFILL_BRAND_TEMPLATE_ID first.")
+    connection = _connection(db, estate.organization_id)
+    if not canva_connect.connection_has_scopes(connection, set(AUTOFILL_SCOPES)):
+        raise HTTPException(409, "Reconnect Canva to grant the brand-template and Autofill permissions.")
+    campaign = None
+    if payload.campaign_id:
+        from app.routers.estate_marketing import _campaign_for_staff
+        campaign = _campaign_for_staff(db, estate, payload.campaign_id)
+    ctx = _build_ctx(db, estate, campaign.code if campaign else None)
+    try:
+        map_bytes = marketing_render.layout_png_for_documents(ctx, width=1500, height=1000)
+        cover_bytes = None
+        if getattr(ctx.estate, "public_cover_object_key", None):
+            try:
+                cover_bytes, _mime = read_private_estate_file(ctx.estate.public_cover_object_key)
+            except Exception:
+                logger.info("Estate cover could not be loaded for Canva Autofill; using layout map.", exc_info=True)
+        hero_bytes = cover_bytes or map_bytes
+        hero_asset_id = canva_connect.upload_image(db, connection, hero_bytes, f"{estate.name}-hero.png") if hero_bytes else None
+        map_asset_id = canva_connect.upload_image(db, connection, map_bytes, f"{estate.name}-layout.png") if map_bytes else None
+        logo_asset_id = canva_connect.upload_image(db, connection, ctx.logo_bytes, f"{estate.name}-logo.png") if ctx.logo_bytes else None
+        areas = [float(plot.area_sqm) for plot in ctx.available_plots if plot.area_sqm is not None]
+        if areas:
+            low, high = min(areas), max(areas)
+            size_text = marketing_render.area_text(low) if low == high else f"{marketing_render.area_text(low)} – {marketing_render.area_text(high)}"
+        else:
+            size_text = "Size on request"
+        data = autofill_data(
+            estate_name=estate.name,
+            location=ctx.location or "Location available on request",
+            price_text=marketing_render.naira_short(ctx.min_price) if ctx.min_price is not None else "Price on request",
+            size_text=size_text,
+            headline=estate.public_tagline or f"{estate.name} · available plots",
+            description=estate.public_description or "Explore the published estate layout and available plots.",
+            contact_name=ctx.agent_name or ctx.organization_name,
+            contact_phone=ctx.contact_phone or "",
+            contact_email=ctx.contact_email or "",
+            hero_asset_id=hero_asset_id,
+            logo_asset_id=logo_asset_id,
+            map_asset_id=map_asset_id,
+        )
+        design = canva_connect.autofill_design(db, connection, autofill_payload(canva_connect.autofill_template_id(), data))
+        row, edit_url = _persist_created_design(
+            db,
+            estate=estate,
+            access=access,
+            connection=connection,
+            design=design,
+            source_format="autofill",
+            source_style="template",
+            title_fallback=f"{estate.name} · LandCheck template flyer",
+        )
+        return {"id": row.id, "design_id": row.canva_design_id, "edit_url": edit_url, "title": row.title, "mode": "autofill"}
+    except canva_connect.CanvaApiError as exc:
+        db.rollback()
+        raise HTTPException(exc.status or 502, str(exc)) from exc
+    except HTTPException:
+        db.rollback()
+        raise
+    except Exception as exc:
+        db.rollback()
+        logger.exception("Canva Autofill failed for estate %s", estate_id)
+        raise HTTPException(502, "The Canva template could not be prepared.") from exc
 
 
 @router.get("/{estate_id}/marketing/canva/designs")

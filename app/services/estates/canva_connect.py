@@ -19,12 +19,15 @@ from cryptography.fernet import Fernet, InvalidToken
 from sqlalchemy.orm import Session
 
 from app.models.estate_canva import EstateCanvaConnection
+from app.services.estates.canva_editability import AUTOFILL_SCOPES, PDF_IMPORT_SCOPE
 
 logger = logging.getLogger(__name__)
 
 CANVA_API = "https://api.canva.com/rest/v1"
 CANVA_AUTHORIZE = "https://www.canva.com/api/oauth/authorize"
 CANVA_KEYS = f"{CANVA_API}/connect/keys"
+# Keep the existing connection request stable. Autofill scopes are opt-in via
+# CANVA_SCOPES after they are enabled in the Canva developer portal.
 DEFAULT_SCOPES = "asset:read asset:write design:content:read design:content:write design:meta:read"
 
 
@@ -91,6 +94,19 @@ def api_public_url() -> str:
 
 def scopes() -> str:
     return " ".join((str(os.getenv("CANVA_SCOPES") or DEFAULT_SCOPES).split()))
+
+
+def autofill_template_id() -> str:
+    return str(os.getenv("CANVA_AUTOFILL_BRAND_TEMPLATE_ID") or "").strip()
+
+
+def autofill_configured() -> bool:
+    return configured() and bool(autofill_template_id())
+
+
+def connection_has_scopes(connection: EstateCanvaConnection, required: tuple[str, ...] | set[str]) -> bool:
+    granted = set(str(connection.scopes or "").split())
+    return set(required).issubset(granted)
 
 
 def _fernet() -> Fernet:
@@ -269,6 +285,47 @@ def create_design(db: Session, connection: EstateCanvaConnection, *, asset_id: s
         width, height = max(40, int(width * scale)), max(40, int(height * scale))
     data = request_json(db, connection, "POST", "/designs", json_body={"type": "type_and_asset", "design_type": {"type": "custom", "width": width, "height": height}, "asset_id": asset_id, "title": title[:255]})
     return data.get("design") or {}
+
+
+def import_pdf(db: Session, connection: EstateCanvaConnection, pdf_bytes: bytes, title: str) -> dict:
+    """Import a PDF through Canva's design-import API and return one design summary."""
+    metadata_title = str(title or "LandCheck flyer").strip()[:50] or "LandCheck flyer"
+    metadata = {
+        "title_base64": base64.b64encode(metadata_title.encode("utf-8")).decode("ascii"),
+        "mime_type": "application/pdf",
+    }
+    created = request_json(
+        db,
+        connection,
+        "POST",
+        "/imports",
+        body=bytes(pdf_bytes),
+        headers={
+            "Content-Type": "application/octet-stream",
+            "Import-Metadata": json.dumps(metadata, separators=(",", ":")),
+        },
+    )
+    job_id = str((created.get("job") or {}).get("id") or "")
+    if not job_id:
+        raise CanvaApiError("Canva did not return a PDF import job.")
+    job = poll_job(db, connection, f"/imports/{job_id}")
+    designs = ((job.get("result") or {}).get("designs") or [])
+    if len(designs) != 1:
+        raise CanvaApiError("Canva returned an unexpected number of designs for this one-page flyer.", code="unexpected_design_count")
+    return designs[0] if isinstance(designs[0], dict) else {}
+
+
+def autofill_design(db: Session, connection: EstateCanvaConnection, payload: dict) -> dict:
+    """Create an Autofill design and return Canva's design summary."""
+    created = request_json(db, connection, "POST", "/autofills", json_body=payload)
+    job_id = str((created.get("job") or {}).get("id") or "")
+    if not job_id:
+        raise CanvaApiError("Canva did not return an Autofill job.")
+    job = poll_job(db, connection, f"/autofills/{job_id}")
+    design = ((job.get("result") or {}).get("design") or {})
+    if not isinstance(design, dict) or not design.get("id"):
+        raise CanvaApiError("Canva completed Autofill without returning a design.")
+    return design
 
 
 def export_design(db: Session, connection: EstateCanvaConnection, design_id: str, export_format: str) -> bytes:
