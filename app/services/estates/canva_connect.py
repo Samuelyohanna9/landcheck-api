@@ -68,6 +68,19 @@ def return_url() -> str:
     return value or f"{api_public_url()}/estates/marketing/canva/return"
 
 
+def return_navigation_enabled() -> bool:
+    """Use Canva correlation state only after Return navigation is enabled in Canva."""
+    return _env_bool("CANVA_RETURN_NAVIGATION_ENABLED")
+
+
+def prepare_edit_url(edit_url: str, correlation_state: str) -> str:
+    """Add Canva return state only when the app is configured for Return navigation."""
+    if not return_navigation_enabled():
+        return edit_url
+    separator = "&" if "?" in edit_url else "?"
+    return f"{edit_url}{separator}{urlencode({'correlation_state': correlation_state})}"
+
+
 def web_url() -> str:
     return str(os.getenv("LANDCHECK_WEB_URL") or "https://landcheck.online").strip().rstrip("/")
 

@@ -245,8 +245,7 @@ def canva_create_design(estate_id: int, payload: CanvaEditRequest, request: Requ
         )
         db.add(row)
         db.commit()
-        connector = "&" if "?" in edit_url else "?"
-        edit_url = f"{edit_url}{connector}{urlencode({'correlation_state': return_key})}"
+        edit_url = canva_connect.prepare_edit_url(edit_url, return_key)
         return {"id": row.id, "design_id": design_id, "edit_url": edit_url, "title": row.title}
     except canva_connect.CanvaApiError as exc:
         db.rollback()

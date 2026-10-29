@@ -61,6 +61,16 @@ def test_pkce_pair_and_authorization_url_use_s256(canva_env):
     assert "design%3Acontent%3Aread" in url
 
 
+def test_edit_url_does_not_use_return_state_until_return_navigation_is_enabled(canva_env, monkeypatch):
+    edit_url = "https://www.canva.com/api/design/example/edit"
+
+    assert canva_connect.prepare_edit_url(edit_url, "return-key") == edit_url
+
+    monkeypatch.setenv("CANVA_RETURN_NAVIGATION_ENABLED", "true")
+    prepared = canva_connect.prepare_edit_url(edit_url, "return-key")
+    assert prepared.endswith("?correlation_state=return-key")
+
+
 def test_oauth_exchange_surfaces_provider_failure(canva_env, monkeypatch):
     monkeypatch.setattr(canva_connect.requests, "post", lambda *args, **kwargs: FakeResponse(400, {"message": "invalid_grant"}))
 
