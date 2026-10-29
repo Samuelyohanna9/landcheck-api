@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+import json
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -157,3 +159,25 @@ def test_revoke_uses_backend_only_token_endpoint(canva_env, monkeypatch):
     assert calls[0][0][0].endswith("/oauth/revoke")
     assert calls[0][1]["data"] == {"token": "refresh-token"}
     assert calls[0][1]["auth"] == ("client-id", "client-secret")
+
+
+def test_upload_uses_canva_name_base64_metadata(canva_env, monkeypatch):
+    captured = {}
+    monkeypatch.setattr(
+        canva_connect,
+        "request_json",
+        lambda *args, **kwargs: captured.update(kwargs) or {"job": {"id": "upload-1"}},
+    )
+    monkeypatch.setattr(
+        canva_connect,
+        "poll_job",
+        lambda *args, **kwargs: {"asset": {"id": "asset-1"}},
+    )
+
+    assert canva_connect.upload_image(DummyDb(), _connection(), b"png", "LandCheck Flyer 🚀 with a long estate name") == "asset-1"
+
+    metadata = json.loads(captured["headers"]["Asset-Upload-Metadata"])
+    decoded_name = base64.b64decode(metadata["name_base64"]).decode("utf-8")
+    assert "name" not in metadata
+    assert len(decoded_name) <= 50
+    assert decoded_name.startswith("LandCheck Flyer")

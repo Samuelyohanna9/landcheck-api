@@ -215,7 +215,11 @@ def current_user(db: Session, connection: EstateCanvaConnection) -> tuple[str, s
 
 
 def upload_image(db: Session, connection: EstateCanvaConnection, data: bytes, name: str) -> str:
-    metadata = base64.b64encode(json.dumps({"name": name}).encode()).decode()
+    safe_name = str(name or "LandCheck flyer").strip()[:50] or "LandCheck flyer"
+    metadata = json.dumps(
+        {"name_base64": base64.b64encode(safe_name.encode("utf-8")).decode("ascii")},
+        separators=(",", ":"),
+    )
     created = request_json(db, connection, "POST", "/asset-uploads", body=data, headers={"Content-Type": "application/octet-stream", "Asset-Upload-Metadata": metadata})
     job = created.get("job") or {}
     job_id = str(job.get("id") or "")
