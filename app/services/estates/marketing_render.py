@@ -94,9 +94,24 @@ def _hex(rgb: tuple[int, int, int]) -> str:
 
 
 # ── Fonts ────────────────────────────────────────────────────────────────────────────────────
-_FONT_DIR = os.path.join(matplotlib.get_data_path(), "fonts", "ttf")
-REGULAR_TTF = os.path.join(_FONT_DIR, "DejaVuSans.ttf")
-BOLD_TTF = os.path.join(_FONT_DIR, "DejaVuSans-Bold.ttf")
+_BUNDLED_FONT_DIR = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+    "assets",
+    "fonts",
+)
+_FALLBACK_FONT_DIR = os.path.join(matplotlib.get_data_path(), "fonts", "ttf")
+
+
+def _font_path(filename: str, fallback_filename: str) -> str:
+    bundled = os.path.join(_BUNDLED_FONT_DIR, filename)
+    return bundled if os.path.exists(bundled) else os.path.join(_FALLBACK_FONT_DIR, fallback_filename)
+
+
+# Keep the legacy renderer consistent with the current flyer families. If the bundled
+# brand font assets are unavailable in a minimal deployment, retain the safe Matplotlib
+# fallback rather than failing image generation.
+REGULAR_TTF = _font_path("Manrope-Regular.ttf", "DejaVuSans.ttf")
+BOLD_TTF = _font_path("Manrope-Bold.ttf", "DejaVuSans-Bold.ttf")
 
 
 @lru_cache(maxsize=64)
