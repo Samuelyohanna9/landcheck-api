@@ -32,19 +32,31 @@ jobs:
                 git status --short >&2
                 exit 1
               fi
-              local_files="$(git diff --name-only; git diff --cached --name-only | sort -u)"
+              staged_files="$(git diff --cached --name-only)"
+              if [ -n "$staged_files" ]; then
+                echo "Refusing deployment: production checkout has staged changes." >&2
+                git status --short >&2
+                exit 1
+              fi
+              local_files="$(git diff --name-only)"
               incoming_files="$(git diff --name-only HEAD "$target_ref")"
               for path in $local_files; do
                 if ! printf '%s\n' "$incoming_files" | grep -Fxq -- "$path"; then
-                  echo "Refusing deployment: local production change is not part of origin/main: $path" >&2
+                  echo "Refusing deployment: local production change is not part of the fetched release: $path" >&2
                   git status --short >&2
                   exit 1
                 fi
                 if ! git diff --quiet "$target_ref" -- "$path"; then
-                  echo "Refusing deployment: local production content differs from origin/main: $path" >&2
+                  echo "Refusing deployment: local production content differs from the fetched release: $path" >&2
                   git status --short >&2
                   exit 1
                 fi
+              done
+              # Every local file passed the exact-content check above. Restore only those
+              # matching tracked files to HEAD so Git can fast-forward without overwriting
+              # unrelated production edits. Untracked and staged files were rejected above.
+              for path in $local_files; do
+                git restore --source=HEAD --worktree -- "$path"
               done
               echo "Production local changes match the incoming commit; reconciling the checkout." >&2
             fi
