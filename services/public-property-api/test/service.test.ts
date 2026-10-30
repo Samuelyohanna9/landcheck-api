@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { fetchPublicProperty, PublicPropertyError, toPublicPropertyPayload } from "../src/service.js";
+import { fetchPublicProperty, PublicPropertyError, toPublicPropertyPayload } from "../src/service";
 
 const estatePayload = {
   id: 12,
