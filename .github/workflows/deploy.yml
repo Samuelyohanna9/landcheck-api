@@ -20,6 +20,8 @@ jobs:
             set -eu
             cd /root/landcheck-api
             git fetch origin main
+            target_ref="$(git rev-parse FETCH_HEAD)"
+            echo "Deploying fetched commit: $target_ref"
             if [ -n "$(git status --porcelain)" ]; then
               # A previous release may have left generated, tracked artifacts removed from the
               # worktree. Compare only actual local edits against the incoming commit: the old
@@ -31,14 +33,14 @@ jobs:
                 exit 1
               fi
               local_files="$(git diff --name-only; git diff --cached --name-only | sort -u)"
-              incoming_files="$(git diff --name-only HEAD origin/main)"
+              incoming_files="$(git diff --name-only HEAD "$target_ref")"
               for path in $local_files; do
                 if ! printf '%s\n' "$incoming_files" | grep -Fxq -- "$path"; then
                   echo "Refusing deployment: local production change is not part of origin/main: $path" >&2
                   git status --short >&2
                   exit 1
                 fi
-                if ! git diff --quiet origin/main -- "$path"; then
+                if ! git diff --quiet "$target_ref" -- "$path"; then
                   echo "Refusing deployment: local production content differs from origin/main: $path" >&2
                   git status --short >&2
                   exit 1
@@ -49,7 +51,7 @@ jobs:
             if [ "$(git branch --show-current)" != "main" ]; then
               git switch main
             fi
-            git merge --ff-only origin/main
+            git merge --ff-only "$target_ref"
             docker compose up -d --build
       - name: Verify production resources and API health
         uses: appleboy/ssh-action@v1.0.3
