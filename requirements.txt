@@ -28,4 +28,5 @@ apscheduler
 tzdata
 alembic
 psutil
+prometheus-client>=0.21,<1.0
 cryptography

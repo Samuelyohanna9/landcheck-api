@@ -51,6 +51,7 @@ from app.utils.row_security import set_survey_user_context
 from app.services.estates.identity import resolve_session as resolve_estate_session
 from app.utils.survey_auth_security import require_survey_session
 from app.utils.survey_auth_security import resolve_survey_session
+from app.metrics import PrometheusMiddleware, cleanup_worker_metrics
 
 app = FastAPI(title="LandCheck API")
 
@@ -641,7 +642,10 @@ def startup_event():
 
 @app.on_event("shutdown")
 def shutdown_event():
-    scheduler.shutdown(wait=False)
+    try:
+        scheduler.shutdown(wait=False)
+    finally:
+        cleanup_worker_metrics()
 
 # ✅ SPEED OPTIMIZATION: Gzip Compression
 # This shrinks large JSON/Report data (like your 210MB I/O) before sending it
@@ -828,6 +832,11 @@ app.add_middleware(
     allow_headers=["Accept", "Authorization", "Cache-Control", "Content-Type", "X-LC-Auth-Mode", "X-LC-App-Route", "X-LC-Client", "X-LC-Organization-Id", "X-LC-Role-Key", "X-LC-Session-App-Mode", "X-LC-User-Id", "X-LC-User-Name", "X-Idempotency-Key", "X-Requested-With"],
     expose_headers=["Content-Disposition", "X-Request-Id"],
 )
+
+# Keep this outermost so request timing includes every existing middleware,
+# including CORS, rate limiting, authentication/scope checks and compression.
+# Metrics are exported by a private sibling process; FastAPI has no /metrics route.
+app.add_middleware(PrometheusMiddleware)
 
 
 # Routers
