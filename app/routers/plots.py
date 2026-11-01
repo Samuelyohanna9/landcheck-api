@@ -4513,6 +4513,67 @@ def _get_plot_export_job(db: Session, job_id: str) -> dict[str, Any] | None:
     return dict(row) if row else None
 
 
+def _get_plot_owner_user_id(db: Session, plot_id: int | None) -> int | None:
+    if not plot_id:
+        return None
+    row = db.execute(
+        text("SELECT owner_user_id FROM plots WHERE id = :plot_id LIMIT 1"),
+        {"plot_id": int(plot_id)},
+    ).scalar()
+    return int(row) if row is not None else None
+
+
+def _get_plot_export_owner_user_id(db: Session, job: dict[str, Any]) -> int | None:
+    """Resolve ownership only from existing source references, never from request data."""
+    row = db.execute(
+        text(
+            """
+            SELECT COALESCE(p.owner_user_id, parent_plot.owner_user_id)
+            FROM plot_export_jobs j
+            LEFT JOIN plots p ON p.id = j.plot_id
+            LEFT JOIN plot_subdivision_batches b ON b.id = j.subdivision_batch_id
+            LEFT JOIN plots parent_plot ON parent_plot.id = b.parent_plot_id
+            WHERE j.id = :job_id
+            LIMIT 1
+            """
+        ),
+        {"job_id": str(job.get("id") or "")},
+    ).scalar()
+    return int(row) if row is not None else None
+
+
+def _require_plot_export_submission_access(
+    plot_id: int,
+    request: Request,
+    db: Session = Depends(get_db),
+) -> int:
+    """Require an authenticated owner for export submission or final-file access."""
+    session = require_survey_session(db, request)
+    owner_user_id = _get_plot_owner_user_id(db, int(plot_id))
+    if owner_user_id is None or owner_user_id != int(session.user_id):
+        raise HTTPException(status_code=404, detail="Plot not found")
+    return int(session.user_id)
+
+
+def _require_subdivision_batch_export_access(
+    db: Session,
+    request: Request,
+    parent_plot_id: int | None,
+) -> int:
+    session = require_survey_session(db, request)
+    owner_user_id = _get_plot_owner_user_id(db, parent_plot_id)
+    if owner_user_id is None or owner_user_id != int(session.user_id):
+        raise HTTPException(status_code=404, detail="Subdivision batch not found")
+    return int(session.user_id)
+
+
+def _require_plot_export_job_access(db: Session, request: Request, job: dict[str, Any]) -> None:
+    session = require_survey_session(db, request)
+    owner_user_id = _get_plot_export_owner_user_id(db, job)
+    if owner_user_id is None or owner_user_id != int(session.user_id):
+        raise HTTPException(status_code=404, detail="Export job not found")
+
+
 def _set_plot_export_job_status(
     db: Session,
     job_id: str,
@@ -4992,10 +5053,16 @@ def _run_subdivision_batch_clean_copy_export_job(job_id: str):
 @router.get("/subdivision/batches/{batch_id}/export/survey-plans.zip")
 def export_subdivision_batch_survey_plans(
     batch_id: int,
+    request: Request,
     db: Session = Depends(get_db),
     background_tasks: BackgroundTasks = None,
 ):
     context = _get_subdivision_batch_export_context(db, batch_id)
+    _require_subdivision_batch_export_access(
+        db,
+        request,
+        int(context["batch"].get("parent_plot_id") or 0) or None,
+    )
     served_path, cleanup_dir = _generate_subdivision_batch_zip(
         db,
         batch_id=batch_id,
@@ -5024,6 +5091,11 @@ def create_subdivision_batch_export_job(
     db: Session = Depends(get_db),
 ):
     context = _get_subdivision_batch_export_context(db, batch_id)
+    _require_subdivision_batch_export_access(
+        db,
+        request,
+        int(context["batch"].get("parent_plot_id") or 0) or None,
+    )
     db.execute(
         text("SELECT pg_advisory_xact_lock(hashtextextended(:cache_lock_key, 0))"),
         {"cache_lock_key": f"subdivision-export:{int(batch_id)}:survey-plans"},
@@ -5149,6 +5221,7 @@ def get_plot_export_job_status(
     job = _get_plot_export_job(db, job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Plot export job not found.")
+    _require_plot_export_job_access(db, request, job)
     return _serialize_plot_export_job(job, request=request)
 
 
@@ -5161,6 +5234,7 @@ def download_plot_export_job(
     job = _get_plot_export_job(db, job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Plot export job not found.")
+    _require_plot_export_job_access(db, request, job)
     if str(job.get("status") or "").strip().lower() != "completed":
         raise HTTPException(status_code=409, detail="Plot export job is not finished yet.")
 
@@ -5461,6 +5535,7 @@ def create_plot_survey_report_export_job(
     fct_title_prefix: str = Body(""),
     survey_input_coordinates: Optional[list] = Body(default=None),
 ):
+    _require_plot_export_submission_access(plot_id=plot_id, request=request, db=db)
     request_payload = {
         "title_text": title_text,
         "location_text": location_text,
@@ -5569,6 +5644,7 @@ def create_plot_orthophoto_export_job(
     north_arrow_style: str = Body("one_side_stem"),
     north_arrow_color: str = Body("blue"),
 ):
+    _require_plot_export_submission_access(plot_id=plot_id, request=request, db=db)
     request_payload = {
         "title_text": title_text,
         "location_text": location_text,
@@ -5632,6 +5708,7 @@ def create_plot_topomap_export_job(
     north_arrow_style: str = Body("one_side_stem"),
     north_arrow_color: str = Body("blue"),
 ):
+    _require_plot_export_submission_access(plot_id=plot_id, request=request, db=db)
     request_payload = {
         "title_text": title_text,
         "location_text": location_text,
@@ -5682,6 +5759,7 @@ def create_plot_dxf_export_job(
     request: Request,
     db: Session = Depends(get_db),
 ):
+    _require_plot_export_submission_access(plot_id=plot_id, request=request, db=db)
     cache_key = _build_plot_export_cache_key(
         db,
         plot_id=int(plot_id),
@@ -5713,6 +5791,7 @@ def create_plot_shapefile_export_job(
     request: Request,
     db: Session = Depends(get_db),
 ):
+    _require_plot_export_submission_access(plot_id=plot_id, request=request, db=db)
     cache_key = _build_plot_export_cache_key(
         db,
         plot_id=int(plot_id),
@@ -5748,6 +5827,7 @@ def create_plot_back_computation_export_job(
     survey_input_coordinates: Optional[list] = Body(default=None),
 ):
     """Queue the calculation sheet instead of rendering it in the request worker."""
+    _require_plot_export_submission_access(plot_id=plot_id, request=request, db=db)
     request_payload = {
         "coordinate_system": coordinate_system,
         "station_names": station_names or [],
@@ -5813,6 +5893,8 @@ def create_subdivision_batch_clean_copy_export_job(
     bearing_font: str | None = Body(None),
     bearing_size: int | None = Body(None),
 ):
+    # The context below is needed for the output name and parent plot id, but it is not an
+    # authorization boundary by itself.
     payload = {
         "title_text": str(title_text or ""),
         "area_labels": area_labels if isinstance(area_labels, list) else [],
@@ -5862,6 +5944,11 @@ def create_subdivision_batch_clean_copy_export_job(
         station_size=station_size,
         bearing_font=bearing_font,
         bearing_size=bearing_size,
+    )
+    _require_subdivision_batch_export_access(
+        db,
+        request,
+        int(context.get("parent_plot_id") or 0) or None,
     )
     db.execute(
         text("SELECT pg_advisory_xact_lock(hashtextextended(:cache_lock_key, 0))"),
@@ -5990,6 +6077,7 @@ def create_subdivision_batch_clean_copy_export_job(
 @router.post("/subdivision/batches/{batch_id}/export/clean-copy.pdf")
 def export_subdivision_batch_clean_copy_pdf(
     batch_id: int,
+    request: Request,
     db: Session = Depends(get_db),
     title_text: str = Body(""),
     area_labels: list[dict] | None = Body(None),
@@ -6039,6 +6127,11 @@ def export_subdivision_batch_clean_copy_pdf(
         station_size=station_size,
         bearing_font=bearing_font,
         bearing_size=bearing_size,
+    )
+    _require_subdivision_batch_export_access(
+        db,
+        request,
+        int(context.get("parent_plot_id") or 0) or None,
     )
     cached_pdf_path = _generate_subdivision_batch_clean_copy_pdf(db, context=context)
     return _pdf_response_with_r2(
@@ -7027,7 +7120,7 @@ def save_plot_metadata(
     return {"ok": True, "plot_id": int(plot_id)}
 
 
-@router.post("/{plot_id}/report/pdf")
+@router.post("/{plot_id}/report/pdf", dependencies=[Depends(_require_plot_export_submission_access)])
 def download_plot_report_pdf(plot_id: int, db: Session = Depends(get_db), background_tasks: BackgroundTasks = None,
     title_text: str = Body("SURVEY PLAN"),
     location_text: str = Body(""),
@@ -7350,6 +7443,7 @@ def create_plot_technical_report_export_job(
     technical_report_plotting_software_text: str = Body(""),
     technical_report_general_observation_text: str = Body(""),
 ):
+    _require_plot_export_submission_access(plot_id=plot_id, request=request, db=db)
     request_payload = {
         "title_text": title_text,
         "location_text": location_text,
@@ -7411,7 +7505,7 @@ def create_plot_technical_report_export_job(
 
 # ---------------- SIMPLE PDF DOWNLOAD (GET) ----------------
 
-@router.get("/{plot_id}/download/pdf")
+@router.get("/{plot_id}/download/pdf", dependencies=[Depends(_require_plot_export_submission_access)])
 def simple_download_pdf(plot_id: int, db: Session = Depends(get_db), background_tasks: BackgroundTasks = None):
     """Simple GET endpoint for basic PDF download from dashboard"""
     reports_dir = REPORTS_DIR
@@ -7875,7 +7969,7 @@ def preview_plot_map(plot_id: int, request: Request, db: Session = Depends(get_d
 
 # ---------------- BACK COMPUTATION ----------------
 
-@router.post("/{plot_id}/back-computation/pdf")
+@router.post("/{plot_id}/back-computation/pdf", dependencies=[Depends(_require_plot_export_submission_access)])
 def download_back_computation_pdf(plot_id: int, db: Session = Depends(get_db), background_tasks: BackgroundTasks = None,
     coordinate_system: str = Body("wgs84"),
     station_names: list[str] = Body(default=[]),
@@ -8044,7 +8138,7 @@ def orthophoto_preview(plot_id: int, db: Session = Depends(get_db), background_t
     )
 
 
-@router.post("/{plot_id}/orthophoto/pdf")
+@router.post("/{plot_id}/orthophoto/pdf", dependencies=[Depends(_require_plot_export_submission_access)])
 def orthophoto_pdf(plot_id: int, db: Session = Depends(get_db), background_tasks: BackgroundTasks = None,
     title_text: str = Body("ORTHOPHOTO"),
     location_text: str = Body(""),
@@ -8148,7 +8242,7 @@ def orthophoto_pdf(plot_id: int, db: Session = Depends(get_db), background_tasks
         category="orthophoto" if not use_topo_map else "topo-map",
         project_id=plot_id,
     )
-@router.get("/{plot_id}/survey-plan/dwg")
+@router.get("/{plot_id}/survey-plan/dwg", dependencies=[Depends(_require_plot_export_submission_access)])
 def download_survey_plan_dwg(plot_id: int, db: Session = Depends(get_db)):
     meta = get_plot_meta(db, plot_id)
 
@@ -8185,7 +8279,7 @@ def download_survey_plan_dwg(plot_id: int, db: Session = Depends(get_db)):
     )
 
 
-@router.get("/{plot_id}/survey-plan/shapefile")
+@router.get("/{plot_id}/survey-plan/shapefile", dependencies=[Depends(_require_plot_export_submission_access)])
 def download_survey_plan_shapefile(
     plot_id: int,
     db: Session = Depends(get_db),
@@ -8306,7 +8400,7 @@ def download_survey_plan_shapefile(
     )
 
 
-@router.get("/{plot_id}/reports/survey-plan")
+@router.get("/{plot_id}/reports/survey-plan", dependencies=[Depends(_require_plot_export_submission_access)])
 def get_saved_survey_plan_pdf(plot_id: int, refresh: bool = False, db: Session = Depends(get_db)):
     pdf_path = resolve_existing_path([
         os.path.join(REPORTS_DIR, f"plot_{plot_id}_report_{SURVEY_REPORT_RENDER_VERSION}.pdf"),
@@ -8401,7 +8495,7 @@ def get_saved_survey_plan_pdf(plot_id: int, refresh: bool = False, db: Session =
     )
 
 
-@router.get("/{plot_id}/reports/orthophoto")
+@router.get("/{plot_id}/reports/orthophoto", dependencies=[Depends(_require_plot_export_submission_access)])
 def get_saved_orthophoto_pdf(plot_id: int, map_type: str = "satellite", refresh: bool = False, db: Session = Depends(get_db)):
     safe_type = "topo" if str(map_type).lower() in ["topo", "topomap", "topo_map"] else "satellite"
     pdf_path = resolve_existing_path([
@@ -8467,7 +8561,7 @@ def get_saved_orthophoto_pdf(plot_id: int, map_type: str = "satellite", refresh:
     )
 
 
-@router.get("/{plot_id}/reports/back-computation")
+@router.get("/{plot_id}/reports/back-computation", dependencies=[Depends(_require_plot_export_submission_access)])
 def get_saved_back_computation_pdf(plot_id: int, refresh: bool = False, db: Session = Depends(get_db)):
     pdf_path = resolve_existing_path([
         os.path.join(REPORTS_DIR, f"plot_{plot_id}_back_computation.pdf"),
