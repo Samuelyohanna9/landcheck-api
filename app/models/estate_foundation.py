@@ -648,6 +648,10 @@ class EstateDocument(Base):
     checksum = Column(String(128), nullable=True)
     document_type = Column(String(64), nullable=False, default="other")
     description = Column(Text, nullable=True)
+    # Nullable self-reference: when set, this upload is an explicit new version of an earlier
+    # drawing rather than a disconnected file - lets the UI show "version 3 of 3" instead of a flat
+    # pile of same-named uploads. EstateDocument otherwise has no versioning (see documents.py).
+    supersedes_document_id = Column(Integer, ForeignKey("estate_documents.id", ondelete="SET NULL"), nullable=True)
     uploaded_by_subject_type = Column(String(64), nullable=False)
     uploaded_by_subject_id = Column(String(128), nullable=False)
     created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
@@ -897,3 +901,273 @@ class EstateLayoutProposal(Base):
     __table_args__ = (
         CheckConstraint("status IN ('review_required', 'approved', 'rejected')", name="ck_estate_layout_proposals_status"),
     )
+
+
+# ── Construction / build tracking (developers who build houses themselves, not just sell plots) ──
+
+class EstatePlotConstructionBudget(Base):
+    """One budget per plot that's actually being built, not just sold. `total_budget` is the
+    developer's own top-line figure; `EstateConstructionBudgetLine` rows are the breakdown, and
+    each line's actual_amount is a running total kept in sync from confirmed EstateContractorPayment
+    rows against draw requests on that line - never recomputed ad hoc at read time from scratch."""
+
+    __tablename__ = "estate_plot_construction_budgets"
+    id = Column(Integer, primary_key=True)
+    plot_id = Column(Integer, ForeignKey("estate_plots.id", ondelete="CASCADE"), nullable=False, unique=True)
+    organization_id = Column(Integer, ForeignKey("estate_organizations.id", ondelete="CASCADE"), nullable=False)
+    total_budget = Column(Numeric(16, 2), nullable=True)
+    currency = Column(String(3), nullable=False, default="NGN")
+    created_by_subject_type = Column(String(64), nullable=False)
+    created_by_subject_id = Column(String(128), nullable=False)
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
+
+
+class EstateConstructionBudgetLine(Base):
+    """A single cost category on a plot's construction budget (foundation, structure, roofing,
+    finishing, electrical, plumbing, or a developer-defined label). `actual_amount` is maintained by
+    the draw-payment flow, not hand-edited."""
+
+    __tablename__ = "estate_construction_budget_lines"
+    id = Column(Integer, primary_key=True)
+    budget_id = Column(Integer, ForeignKey("estate_plot_construction_budgets.id", ondelete="CASCADE"), nullable=False)
+    category = Column(String(120), nullable=False)
+    budgeted_amount = Column(Numeric(16, 2), nullable=False, default=0)
+    actual_amount = Column(Numeric(16, 2), nullable=False, default=0)
+    notes = Column(Text, nullable=True)
+    sort_order = Column(Integer, nullable=False, default=0)
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
+
+
+class EstateContractor(Base):
+    """An organization-wide directory of contractors/trades a developer works with across estates -
+    deliberately not plot- or estate-scoped, since the same electrician works on several plots."""
+
+    __tablename__ = "estate_contractors"
+    id = Column(Integer, primary_key=True)
+    contractor_uid = Column(String(36), nullable=False, unique=True, default=lambda: str(uuid.uuid4()))
+    organization_id = Column(Integer, ForeignKey("estate_organizations.id", ondelete="CASCADE"), nullable=False)
+    name = Column(String(255), nullable=False)
+    trade = Column(String(120), nullable=True)
+    contact_phone = Column(String(32), nullable=True)
+    contact_email = Column(String(255), nullable=True)
+    payment_terms = Column(Text, nullable=True)
+    is_active = Column(Boolean, nullable=False, default=True)
+    created_by_subject_type = Column(String(64), nullable=False)
+    created_by_subject_id = Column(String(128), nullable=False)
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+
+class EstateConstructionDrawRequest(Base):
+    """A contractor draw/milestone payment request against one budget line - mirrors
+    EstateSettlementRequest's shape exactly: requested -> in_review/declined -> paid, where "paid" is
+    only ever reached after a real EstateContractorPayment is recorded against it, never guessed."""
+
+    __tablename__ = "estate_construction_draw_requests"
+    id = Column(Integer, primary_key=True)
+    request_uid = Column(String(36), nullable=False, unique=True, default=lambda: str(uuid.uuid4()))
+    organization_id = Column(Integer, ForeignKey("estate_organizations.id", ondelete="CASCADE"), nullable=False)
+    budget_line_id = Column(Integer, ForeignKey("estate_construction_budget_lines.id", ondelete="CASCADE"), nullable=False)
+    contractor_id = Column(Integer, ForeignKey("estate_contractors.id", ondelete="RESTRICT"), nullable=False)
+    amount_requested = Column(Numeric(16, 2), nullable=False)
+    percent_complete_claimed = Column(Integer, nullable=True)
+    retention_amount = Column(Numeric(16, 2), nullable=True)
+    note = Column(Text, nullable=True)
+    status = Column(String(16), nullable=False, default="requested")
+    requested_by_subject_type = Column(String(64), nullable=False)
+    requested_by_subject_id = Column(String(128), nullable=False)
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    reviewed_at = Column(DateTime(timezone=True), nullable=True)
+    reviewed_by_subject_type = Column(String(64), nullable=True)
+    reviewed_by_subject_id = Column(String(128), nullable=True)
+    paid_at = Column(DateTime(timezone=True), nullable=True)
+
+    __table_args__ = (
+        CheckConstraint("status IN ('requested', 'in_review', 'declined', 'paid')", name="ck_estate_construction_draw_requests_status"),
+    )
+
+
+class EstateContractorPayment(Base):
+    """A real payment made to a contractor against an approved draw request - shaped like
+    EstatePayment (amount/method/reference/confirmation), not the Flutterwave transfer flow, since
+    contractor payments are typically bank transfers a staff member records, not an in-app payout."""
+
+    __tablename__ = "estate_contractor_payments"
+    id = Column(Integer, primary_key=True)
+    payment_uid = Column(String(36), nullable=False, unique=True, default=lambda: str(uuid.uuid4()))
+    organization_id = Column(Integer, ForeignKey("estate_organizations.id", ondelete="CASCADE"), nullable=False)
+    draw_request_id = Column(Integer, ForeignKey("estate_construction_draw_requests.id", ondelete="RESTRICT"), nullable=False)
+    contractor_id = Column(Integer, ForeignKey("estate_contractors.id", ondelete="RESTRICT"), nullable=False)
+    amount = Column(Numeric(16, 2), nullable=False)
+    currency = Column(String(3), nullable=False, default="NGN")
+    payment_date = Column(DateTime(timezone=True), nullable=False)
+    payment_method = Column(String(80), nullable=False)
+    reference_no = Column(String(160), nullable=True)
+    notes = Column(Text, nullable=True)
+    status = Column(String(32), nullable=False, default="confirmed")
+    recorded_by_subject_type = Column(String(64), nullable=False)
+    recorded_by_subject_id = Column(String(128), nullable=False)
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+
+class EstateBillOfQuantities(Base):
+    """One BOQ per plot. `category` on each line is deliberately freeform text, not a hardcoded
+    NIQS BESMM4 enum - that standard's exact category breakdown needs confirming with the developer
+    or a quantity surveyor before this product bakes in a specific list that might be wrong."""
+
+    __tablename__ = "estate_bills_of_quantities"
+    id = Column(Integer, primary_key=True)
+    plot_id = Column(Integer, ForeignKey("estate_plots.id", ondelete="CASCADE"), nullable=False, unique=True)
+    organization_id = Column(Integer, ForeignKey("estate_organizations.id", ondelete="CASCADE"), nullable=False)
+    title = Column(String(255), nullable=True)
+    created_by_subject_type = Column(String(64), nullable=False)
+    created_by_subject_id = Column(String(128), nullable=False)
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
+
+
+class EstateBOQLineItem(Base):
+    __tablename__ = "estate_boq_line_items"
+    id = Column(Integer, primary_key=True)
+    boq_id = Column(Integer, ForeignKey("estate_bills_of_quantities.id", ondelete="CASCADE"), nullable=False)
+    category = Column(String(120), nullable=True)
+    description = Column(String(500), nullable=False)
+    unit = Column(String(32), nullable=True)
+    quantity = Column(Numeric(16, 3), nullable=False, default=0)
+    rate = Column(Numeric(16, 2), nullable=False, default=0)
+    amount = Column(Numeric(16, 2), nullable=False, default=0)
+    sort_order = Column(Integer, nullable=False, default=0)
+
+
+class EstateSnagItem(Base):
+    """A defect/outstanding-item record for a plot's handover - open until fixed, fixed until an
+    independent verifier (an Architect, in Phase 11, or owner/manager today) confirms it. Photo
+    evidence reuses the existing EstateDocument/EstateDocumentLink upload path (entity_type
+    "estate_snag_item") rather than a new upload mechanism."""
+
+    __tablename__ = "estate_snag_items"
+    id = Column(Integer, primary_key=True)
+    organization_id = Column(Integer, ForeignKey("estate_organizations.id", ondelete="CASCADE"), nullable=False)
+    plot_id = Column(Integer, ForeignKey("estate_plots.id", ondelete="CASCADE"), nullable=False)
+    description = Column(Text, nullable=False)
+    status = Column(String(16), nullable=False, default="open")
+    assigned_to_contractor_id = Column(Integer, ForeignKey("estate_contractors.id", ondelete="SET NULL"), nullable=True)
+    raised_by_subject_type = Column(String(64), nullable=False)
+    raised_by_subject_id = Column(String(128), nullable=False)
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    fixed_at = Column(DateTime(timezone=True), nullable=True)
+    verified_at = Column(DateTime(timezone=True), nullable=True)
+    verified_by_subject_type = Column(String(64), nullable=True)
+    verified_by_subject_id = Column(String(128), nullable=True)
+
+    __table_args__ = (
+        CheckConstraint("status IN ('open', 'fixed', 'verified')", name="ck_estate_snag_items_status"),
+    )
+
+
+class EstateMemberEstateScope(Base):
+    """Opt-in per-estate restriction for one organization member. No rows for a member = that
+    member is unrestricted across every estate in the org (today's behavior for everyone,
+    unchanged). One or more rows = that member can only act on those specific estates, checked by
+    require_estate_access_for_estate() in authorization.py. Introduced for collaborators (e.g. an
+    Architect) who should only see the one estate they're actually working on - but it applies to
+    any member, not a specific role, since scoping is a property of the person, not the role name."""
+
+    __tablename__ = "estate_member_estate_scopes"
+    id = Column(Integer, primary_key=True)
+    member_id = Column(Integer, ForeignKey("estate_organization_members.id", ondelete="CASCADE"), nullable=False)
+    estate_id = Column(Integer, ForeignKey("estate_estates.id", ondelete="CASCADE"), nullable=False)
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+    __table_args__ = (
+        UniqueConstraint("member_id", "estate_id", name="uq_estate_member_estate_scope"),
+    )
+
+
+class EstateDrawingApproval(Base):
+    """The submit -> review -> approve cycle for one EstateDocument upload (a drawing). One row per
+    submission - a later revision uploaded via supersedes_document_id gets its own approval row,
+    not a reused one, so the history of what was approved/rejected and when stays intact."""
+
+    __tablename__ = "estate_drawing_approvals"
+    id = Column(Integer, primary_key=True)
+    document_id = Column(Integer, ForeignKey("estate_documents.id", ondelete="CASCADE"), nullable=False, unique=True)
+    organization_id = Column(Integer, ForeignKey("estate_organizations.id", ondelete="CASCADE"), nullable=False)
+    status = Column(String(20), nullable=False, default="submitted")
+    note = Column(Text, nullable=True)
+    submitted_by_subject_type = Column(String(64), nullable=False)
+    submitted_by_subject_id = Column(String(128), nullable=False)
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    reviewed_at = Column(DateTime(timezone=True), nullable=True)
+    reviewed_by_subject_type = Column(String(64), nullable=True)
+    reviewed_by_subject_id = Column(String(128), nullable=True)
+
+    __table_args__ = (
+        CheckConstraint("status IN ('submitted', 'approved', 'revision_requested')", name="ck_estate_drawing_approvals_status"),
+    )
+
+
+class EstateRFI(Base):
+    """A Request For Information - a threaded question tied to a plot, between an architect,
+    contractor or staff member, instead of a WhatsApp message that gets lost."""
+
+    __tablename__ = "estate_rfis"
+    id = Column(Integer, primary_key=True)
+    organization_id = Column(Integer, ForeignKey("estate_organizations.id", ondelete="CASCADE"), nullable=False)
+    plot_id = Column(Integer, ForeignKey("estate_plots.id", ondelete="CASCADE"), nullable=False)
+    question = Column(Text, nullable=False)
+    status = Column(String(16), nullable=False, default="open")
+    raised_by_subject_type = Column(String(64), nullable=False)
+    raised_by_subject_id = Column(String(128), nullable=False)
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    answer = Column(Text, nullable=True)
+    answered_by_subject_type = Column(String(64), nullable=True)
+    answered_by_subject_id = Column(String(128), nullable=True)
+    answered_at = Column(DateTime(timezone=True), nullable=True)
+    closed_at = Column(DateTime(timezone=True), nullable=True)
+
+    __table_args__ = (
+        CheckConstraint("status IN ('open', 'answered', 'closed')", name="ck_estate_rfis_status"),
+    )
+
+
+class EstateDrawingAnnotation(Base):
+    """A saved calibration, measurement or markup pin on one drawing document - lets the live
+    measurement tool persist what a user drew instead of losing it on page refresh. `data` holds the
+    kind-specific shape: calibration {pixel_points: [[x,y],[x,y]], real_length_m: float}; measurement
+    {pixel_points: [[x,y],...], kind: "distance"|"area", value_m or value_sqm}; markup {x, y, note}.
+    Scale is per-document (the most recent calibration row for that document), not per-annotation,
+    so re-calibrating updates every later measurement's interpretation without rewriting them."""
+
+    __tablename__ = "estate_drawing_annotations"
+    id = Column(Integer, primary_key=True)
+    document_id = Column(Integer, ForeignKey("estate_documents.id", ondelete="CASCADE"), nullable=False)
+    organization_id = Column(Integer, ForeignKey("estate_organizations.id", ondelete="CASCADE"), nullable=False)
+    kind = Column(String(20), nullable=False)
+    data = Column(JSON, nullable=False)
+    label = Column(String(255), nullable=True)
+    created_by_subject_type = Column(String(64), nullable=False)
+    created_by_subject_id = Column(String(128), nullable=False)
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+    __table_args__ = (
+        CheckConstraint("kind IN ('calibration', 'measurement', 'markup')", name="ck_estate_drawing_annotations_kind"),
+    )
+
+
+class EstateSiteInspection(Base):
+    """A structured inspection-visit log entry for a plot under construction - photos attached via
+    the existing EstateDocument/EstateDocumentLink pattern (entity_type "estate_site_inspection")."""
+
+    __tablename__ = "estate_site_inspections"
+    id = Column(Integer, primary_key=True)
+    organization_id = Column(Integer, ForeignKey("estate_organizations.id", ondelete="CASCADE"), nullable=False)
+    plot_id = Column(Integer, ForeignKey("estate_plots.id", ondelete="CASCADE"), nullable=False)
+    inspector_subject_type = Column(String(64), nullable=False)
+    inspector_subject_id = Column(String(128), nullable=False)
+    visit_date = Column(DateTime(timezone=True), nullable=False)
+    notes = Column(Text, nullable=True)
+    phase_at_inspection = Column(String(32), nullable=True)
+    signed_off = Column(Boolean, nullable=False, default=False)
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())

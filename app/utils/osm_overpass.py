@@ -28,6 +28,7 @@ import pandas as pd
 from shapely.geometry.base import BaseGeometry
 from sqlalchemy import text
 from sqlalchemy.orm import Session
+from app.utils.schema_bootstrap import require_table, runtime_schema_bootstrap_enabled
 
 logger = logging.getLogger(__name__)
 
@@ -84,6 +85,11 @@ def _rough_country_hint(lat: float, lon: float) -> str:
 def ensure_osm_overpass_schema(db: Session) -> None:
     global _SCHEMA_READY
     if _SCHEMA_READY:
+        return
+    if not runtime_schema_bootstrap_enabled():
+        for table_name in ("osm_overpass_cache_buckets", "osm_overpass_cache_features", "osm_overpass_usage_log"):
+            require_table(db, table_name)
+        _SCHEMA_READY = True
         return
     db.execute(text("""
         CREATE TABLE IF NOT EXISTS osm_overpass_cache_buckets (

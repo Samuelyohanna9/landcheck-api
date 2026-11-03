@@ -2,9 +2,9 @@ from collections import deque
 from threading import Lock
 from time import perf_counter
 
-from sqlalchemy import create_engine, event
+from sqlalchemy import create_engine, event, text
 from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import QueuePool
 import os
 from dotenv import load_dotenv
@@ -130,6 +130,73 @@ def attach_pool_instrumentation(target_engine) -> None:
     target_engine._landcheck_pool_instrumented = True
 
 
+def _reset_survey_context_on_dbapi_connection(dbapi_connection) -> None:
+    """Remove the session-level Survey tenant context from a PostgreSQL connection.
+
+    Survey currently needs a session-level setting because handlers may commit more than once
+    during one request. The setting is therefore scrubbed both before checkout and after pool
+    reset so it cannot survive connection reuse. A rollback first discards any aborted or pending
+    transaction; the reset itself is then committed as connection housekeeping only.
+    """
+
+    try:
+        dbapi_connection.rollback()
+        cursor = dbapi_connection.cursor()
+        try:
+            cursor.execute("RESET app.survey_user_id")
+        finally:
+            cursor.close()
+        dbapi_connection.commit()
+    except Exception:
+        try:
+            dbapi_connection.rollback()
+        except Exception:
+            pass
+        raise
+
+
+def _on_survey_context_checkout(dbapi_connection, _connection_record, _connection_proxy) -> None:
+    _reset_survey_context_on_dbapi_connection(dbapi_connection)
+
+
+def _on_survey_context_reset(dbapi_connection, _connection_record, reset_state) -> None:
+    if getattr(reset_state, "terminate_only", False):
+        return
+    _reset_survey_context_on_dbapi_connection(dbapi_connection)
+
+
+def _on_survey_session_after_begin(session, _transaction, connection) -> None:
+    """Restore the requested Survey context whenever a Session starts a new transaction.
+
+    SQLAlchemy releases a connection on ``Session.commit()``.  Pool scrubbing must therefore be
+    paired with Session-level intent: a later transaction in the same request/job must receive the
+    same context before its first query, while a different Session still starts with no context.
+    """
+
+    if connection.dialect.name != "postgresql" or "survey_user_id" not in session.info:
+        return
+    user_id = session.info.get("survey_user_id")
+    connection.execute(
+        text("SELECT set_config('app.survey_user_id', :user_id, false)"),
+        {"user_id": str(int(user_id)) if user_id is not None else ""},
+    )
+
+
+event.listen(Session, "after_begin", _on_survey_session_after_begin)
+
+
+def attach_survey_context_cleanup(target_engine) -> None:
+    """Install connection-pool scrubbing for the session-scoped Survey RLS setting."""
+
+    if target_engine.dialect.name != "postgresql":
+        return
+    if getattr(target_engine, "_landcheck_survey_context_cleanup", False):
+        return
+    event.listen(target_engine, "checkout", _on_survey_context_checkout)
+    event.listen(target_engine, "reset", _on_survey_context_reset)
+    target_engine._landcheck_survey_context_cleanup = True
+
+
 def pool_metrics_enabled() -> bool:
     return _POOL_METRICS_ENABLED
 
@@ -215,6 +282,7 @@ if _POOL_METRICS_ENABLED and str(DATABASE_URL or "").startswith(("postgresql", "
     _engine_options["poolclass"] = InstrumentedQueuePool
 
 engine = create_engine(DATABASE_URL, **_engine_options)
+attach_survey_context_cleanup(engine)
 if _POOL_METRICS_ENABLED:
     attach_pool_instrumentation(engine)
 

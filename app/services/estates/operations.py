@@ -63,6 +63,8 @@ ESTATE_DOCUMENT_TYPES = (
     {"code": "consent", "label": "Consent", "public": False},
     {"code": "tax_clearance", "label": "Tax clearance", "public": False},
     {"code": "building_plan", "label": "Building plan", "public": False},
+    {"code": "structural_drawing", "label": "Structural drawing", "public": False},
+    {"code": "mep_drawing", "label": "MEP drawing (mechanical/electrical/plumbing)", "public": False},
     {"code": "site_plan", "label": "Site plan", "public": False},
     {"code": "handover_pack", "label": "Handover pack", "public": True},
     {"code": "proof_of_identity", "label": "Proof of identity", "public": False},

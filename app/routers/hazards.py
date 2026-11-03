@@ -30,7 +30,7 @@ from app.utils.hazard_jobs import (
 )
 from app.utils.r2_exports import upload_export_file_best_effort
 from app.utils.survey_auth_security import require_survey_session, resolve_survey_session
-from app.utils.row_security import ensure_survey_row_security, set_survey_user_context
+from app.utils.row_security import clear_survey_user_context, set_survey_user_context
 from app.utils.upload_security import read_limited_upload
 
 
@@ -46,13 +46,10 @@ def get_db(request: Request):
     try:
         survey_session = resolve_survey_session(db, request)
         set_survey_user_context(db, survey_session.user_id if survey_session else None)
-        ensure_survey_row_security(db)
         yield db
     finally:
         try:
-            if db.bind.dialect.name == "postgresql":
-                db.execute(text("RESET app.survey_user_id"))
-                db.commit()
+            clear_survey_user_context(db)
         except Exception:
             db.rollback()
         db.close()
@@ -911,9 +908,13 @@ async def upload_hazard_boundary(file: UploadFile = File(...)):
 # to a background thread immediately and let the client poll for status/progress instead, which
 # also lets the frontend show real stage-by-stage progress rather than a blank spinner.
 
-def _run_hazard_analysis_job(job_id: str) -> None:
+def _run_hazard_analysis_job(job_id: str, owner_user_id: int | None = None) -> None:
     db = SessionLocal()
     try:
+        # This worker opens a fresh SessionLocal outside the request dependency. Establish the
+        # same Survey RLS context before reading the job, then let the Session hook reapply it
+        # after each internal commit.
+        set_survey_user_context(db, owner_user_id)
         job = get_hazard_job(db, job_id)
         if not job:
             return
@@ -1080,6 +1081,10 @@ def _run_hazard_analysis_job(job_id: str) -> None:
         except Exception:
             db.rollback()
     finally:
+        try:
+            clear_survey_user_context(db)
+        except Exception:
+            db.rollback()
         db.close()
 
 

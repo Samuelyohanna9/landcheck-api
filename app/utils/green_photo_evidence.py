@@ -10,6 +10,7 @@ import imagehash
 from PIL import ExifTags, Image
 from sqlalchemy import text
 from sqlalchemy.orm import Session
+from app.utils.schema_bootstrap import require_table, runtime_schema_bootstrap_enabled
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +38,9 @@ _PHOTO_AGE_WARNING_DAYS = 3  # a "fresh evidence" photo older than this is worth
 
 
 def ensure_photo_evidence_schema(db: Session) -> None:
+    if not runtime_schema_bootstrap_enabled():
+        require_table(db, "green_photo_evidence")
+        return
     db.execute(text("""
         CREATE TABLE IF NOT EXISTS green_photo_evidence (
             id SERIAL PRIMARY KEY,

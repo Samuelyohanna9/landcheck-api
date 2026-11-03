@@ -11,6 +11,7 @@ from typing import Any, Dict, List, Optional
 import requests
 from sqlalchemy import text
 from sqlalchemy.orm import Session
+from app.utils.schema_bootstrap import require_table, runtime_schema_bootstrap_enabled
 
 logger = logging.getLogger(__name__)
 
@@ -24,6 +25,9 @@ DAILY_READING_LIMIT = 2
 
 
 def ensure_plan_reader_usage_schema(db: Session) -> None:
+    if not runtime_schema_bootstrap_enabled():
+        require_table(db, "plan_reader_usage")
+        return
     db.execute(text("""
         CREATE TABLE IF NOT EXISTS plan_reader_usage (
             id SERIAL PRIMARY KEY,

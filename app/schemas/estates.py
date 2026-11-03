@@ -243,6 +243,11 @@ class StaffUpdate(BaseModel):
     is_active: bool | None = None
     phone: str | None = Field(default=None, max_length=64)
 
+class EstateScopesUpdate(BaseModel):
+    """Replaces the full set of estates a member is restricted to - an empty list means
+    unrestricted (see EstateMemberEstateScope's own docstring)."""
+    estate_ids: list[int] = Field(default_factory=list)
+
 class ImportReviewCreate(BaseModel):
     source_type: str = Field(pattern="^(coordinates|csv|gis|cad|raster|pdf)$")
     survey_georeference_session_id: str | None = Field(default=None, max_length=128)

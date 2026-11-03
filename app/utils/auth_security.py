@@ -19,6 +19,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from app.db import engine
+from app.utils.schema_bootstrap import require_table, runtime_schema_bootstrap_enabled
 from app.utils.http_security import GREEN_SESSION_COOKIE, cookie_token
 
 _AUTH_SECURITY_SCHEMA_READY = False
@@ -148,6 +149,11 @@ def ensure_auth_security_schema() -> None:
         return
     with _AUTH_SECURITY_SCHEMA_LOCK:
         if _AUTH_SECURITY_SCHEMA_READY:
+            return
+        if not runtime_schema_bootstrap_enabled():
+            with engine.connect() as connection:
+                require_table(connection, "green_auth_sessions")
+            _AUTH_SECURITY_SCHEMA_READY = True
             return
         with engine.begin() as connection:
             connection.execute(

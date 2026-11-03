@@ -6,12 +6,14 @@ set -eu
 export PROMETHEUS_MULTIPROC_DIR="${PROMETHEUS_MULTIPROC_DIR:-/var/lib/landcheck/prometheus}"
 mkdir -p "$PROMETHEUS_MULTIPROC_DIR"
 
-# The Compose lifecycle stops the previous API container before starting this
-# fresh container. Only metric files are removed; the exporter and workers never
-# perform this cleanup during their own startup.
-find "$PROMETHEUS_MULTIPROC_DIR" -mindepth 1 -maxdepth 1 -type f -delete
+# A shared multiprocess directory may also contain live worker metrics. Never clear it implicitly:
+# an API-only restart must not delete files written by the still-running Survey worker or exporter.
+# Operators may set this flag only during a coordinated cold start after every metrics writer has
+# been stopped. Counters and histograms are otherwise preserved across API restarts.
+if [ "${LANDCHECK_PROMETHEUS_CLEAN_ON_START:-false}" = "true" ]; then
+  find "$PROMETHEUS_MULTIPROC_DIR" -mindepth 1 -maxdepth 1 -type f -delete
+fi
 
-alembic upgrade head
 exec uvicorn app.main:app \
   --host 0.0.0.0 \
   --port 8000 \

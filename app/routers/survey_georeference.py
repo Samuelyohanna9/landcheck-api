@@ -23,7 +23,8 @@ from starlette.concurrency import run_in_threadpool
 from app.db import SessionLocal
 from app.routers.plots import COORDINATE_SYSTEMS, get_db, _safe_filename_fragment
 from app.utils.survey_auth_security import require_survey_session, resolve_survey_session
-from app.utils.row_security import ensure_survey_row_security, set_survey_user_context
+from app.utils.row_security import set_survey_user_context
+from app.utils.schema_bootstrap import require_table, runtime_schema_bootstrap_enabled
 from app.utils.survey_activity import ensure_survey_activity_table, log_survey_activity
 from app.utils.coordinate_converter import is_nigeria_auto_utm_coordinate_system, resolve_coordinate_system_key
 from app.utils.r2_objects import build_r2_settings, create_r2_client, delete_object_best_effort, upload_bytes
@@ -183,6 +184,10 @@ def _ensure_schema(db: Session):
     with _SCHEMA_LOCK:
         if _SCHEMA_READY:
             return
+        if not runtime_schema_bootstrap_enabled():
+            require_table(db, "survey_georeference_sessions")
+            _SCHEMA_READY = True
+            return
         db.execute(
             text(
                 """
@@ -230,7 +235,6 @@ def _ensure_schema(db: Session):
             )
         )
         db.commit()
-        ensure_survey_row_security(db)
         _SCHEMA_READY = True
 
 

@@ -140,6 +140,44 @@ def require_estate_access(
     return access
 
 
+def require_estate_access_for_estate(
+    db: Session,
+    request: Request,
+    estate_id: int,
+    *,
+    permission: str | None = None,
+    require_subscription: bool = True,
+) -> EstateAccess:
+    """Like require_estate_access, but additionally enforces per-estate scoping where one has been
+    set up for this member (EstateMemberEstateScope) - built for collaborators (e.g. an Architect)
+    who should only reach the one estate they're actually working on. A member with zero scope
+    rows is unrestricted, exactly like require_estate_access today - scoping is opt-in per member,
+    never a silent new restriction on everyone else."""
+    from app.models.estate_foundation import Estate, EstateMemberEstateScope
+
+    estate = db.get(Estate, estate_id)
+    if estate is None:
+        raise HTTPException(status_code=404, detail="Estate not found")
+    access = require_estate_access(db, request, estate.organization_id, permission=permission, require_subscription=require_subscription)
+    member = (
+        db.query(EstateOrganizationMember)
+        .filter(
+            EstateOrganizationMember.organization_id == estate.organization_id,
+            EstateOrganizationMember.subject_type == access.principal.subject_type,
+            EstateOrganizationMember.subject_id == access.principal.subject_id,
+        )
+        .one_or_none()
+    )
+    if member is not None:
+        scoped_estate_ids = {
+            row.estate_id
+            for row in db.query(EstateMemberEstateScope).filter(EstateMemberEstateScope.member_id == member.id).all()
+        }
+        if scoped_estate_ids and int(estate_id) not in scoped_estate_ids:
+            raise HTTPException(status_code=403, detail="You do not have access to this estate")
+    return access
+
+
 def require_estate_owner(
     db: Session,
     request: Request,

@@ -15,11 +15,15 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from app.utils.survey_auth_security import resolve_survey_session
+from app.utils.schema_bootstrap import require_table, runtime_schema_bootstrap_enabled
 
 logger = logging.getLogger(__name__)
 
 
 def ensure_survey_activity_table(db: Session) -> None:
+    if not runtime_schema_bootstrap_enabled():
+        require_table(db, "survey_activity_events")
+        return
     db.execute(text("""
         CREATE TABLE IF NOT EXISTS survey_activity_events (
             id BIGSERIAL PRIMARY KEY,

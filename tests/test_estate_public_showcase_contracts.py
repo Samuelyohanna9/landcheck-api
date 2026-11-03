@@ -107,8 +107,12 @@ def test_public_address_is_generated_from_estate_name():
 def test_container_startup_applies_migrations_before_serving_api():
     compose = (ROOT / "docker-compose.yml").read_text(encoding="utf-8")
     assert "alembic upgrade head" in compose
-    assert "exec uvicorn app.main:app" in compose
-    assert compose.index("alembic upgrade head") < compose.index("exec uvicorn app.main:app")
+    migrate_block = compose.split("  migrate:", 1)[1].split("  survey-export-worker:", 1)[0]
+    assert "python -m scripts.initialize_api_schema" in migrate_block
+    assert "python -m scripts.verify_runtime_schema" in migrate_block
+    assert "service_completed_successfully" in compose
+    start_script = (ROOT / "scripts" / "start_api.sh").read_text(encoding="utf-8")
+    assert "exec uvicorn app.main:app" in start_script
 
 
 def test_schema_is_owned_by_alembic_not_runtime_create_all():

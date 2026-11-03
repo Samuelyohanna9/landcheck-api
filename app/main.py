@@ -40,14 +40,14 @@ from app.routers import (
     estate_canva,
     estate_legal,
     estate_admin_accounting,
+    estate_construction,
     commercial,
 )
-from app.db_init import init_db
-from app.utils.activity_logger import ensure_activity_log_table, log_request_activity, should_skip_request_logging
+from app.utils.activity_logger import log_request_activity, should_skip_request_logging
 from app.utils.auth_security import resolve_request_session
 from app.utils.auth_security import require_authenticated_session
 from app.utils.rate_limit import allow_request
-from app.utils.row_security import set_survey_user_context
+from app.utils.row_security import clear_survey_user_context, set_survey_user_context, verify_survey_row_security
 from app.services.estates.identity import resolve_session as resolve_estate_session
 from app.utils.survey_auth_security import require_survey_session
 from app.utils.survey_auth_security import resolve_survey_session
@@ -278,7 +278,10 @@ def _enforce_survey_resource_scope(db, request: Request) -> None:
 
     if path.startswith("/plots/export-jobs/"):
         parts = [part for part in path.split("/") if part]
-        if len(parts) >= 3 and parts[2].isdigit():
+        # Survey export job IDs are opaque UUID strings, not numeric plot IDs. Keep this
+        # middleware guard aligned with the route-level authorization check so an owner check is
+        # not skipped merely because a job identifier contains letters.
+        if len(parts) >= 3 and parts[2]:
             if not table_exists("plot_export_jobs"):
                 return
             owner_id = db.execute(
@@ -292,7 +295,7 @@ def _enforce_survey_resource_scope(db, request: Request) -> None:
                     WHERE j.id = :job_id
                     """
                 ),
-                {"job_id": int(parts[2])},
+                {"job_id": str(parts[2])},
             ).scalar()
             if owner_id is None:
                 return
@@ -540,13 +543,17 @@ def _run_estate_social_account_check_job():
     _run_locked_estate_marketing_job(_ESTATE_SOCIAL_ACCOUNT_CHECK_LOCK_KEY, check_all_accounts)
 
 
-# Preserve the legacy Survey/Green bootstrap; Estate schema is managed by Alembic.
+# Alembic and the legacy Survey/Green bootstrap run once in scripts/start_api.sh before Uvicorn
+# forks workers. Keeping schema writes out of this hook prevents duplicate sequence/table races.
 @app.on_event("startup")
 def startup_event():
     _validate_production_configuration()
-    init_db()
-    ensure_activity_log_table()
-    green.bootstrap_green_schema()
+    # Read-only gate: policy DDL is installed by the one-shot migrator, never by API workers.
+    startup_db = SessionLocal()
+    try:
+        verify_survey_row_security(startup_db)
+    finally:
+        startup_db.close()
     # Persistent on-disk cache for basemap tiles (orthophoto/topo rendering) so a plot rendered
     # more than once reuses already-fetched tiles instead of re-hitting the external imagery
     # provider every time - see app/utils/orthophoto_renderer.py.
@@ -740,6 +747,7 @@ async def rate_limit_sensitive_requests(request: Request, call_next):
 def _prepare_private_request_sync(request: Request) -> None:
     """Resolve shared auth and private-resource scope in one short-lived DB session."""
     session_db = SessionLocal()
+    survey_context_set = False
     try:
         # Preserve the generic session lookup's fail-open behavior; route-specific checks below
         # still reject protected requests without a valid session.
@@ -755,8 +763,14 @@ def _prepare_private_request_sync(request: Request) -> None:
         if str(request.url.path or "").lower().startswith(("/plots/", "/hazards/jobs/", "/survey-georeference/sessions/")):
             survey_session = resolve_survey_session(session_db, request)
             set_survey_user_context(session_db, survey_session.user_id if survey_session else None)
+            survey_context_set = True
         _enforce_survey_resource_scope(session_db, request)
     finally:
+        if survey_context_set:
+            try:
+                clear_survey_user_context(session_db)
+            except Exception:
+                session_db.rollback()
         session_db.close()
 
 
@@ -864,6 +878,7 @@ app.include_router(estate_social.router)
 app.include_router(estate_canva.router)
 app.include_router(estate_legal.router)
 app.include_router(estate_admin_accounting.router)
+app.include_router(estate_construction.router)
 app.include_router(commercial.router)
 
 @app.get("/")

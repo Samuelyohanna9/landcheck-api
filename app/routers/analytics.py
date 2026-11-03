@@ -16,6 +16,7 @@ from app.utils.plan_reader import DAILY_READING_LIMIT, ensure_plan_reader_usage_
 from app.utils.field_to_finish import DAILY_IMPORT_LIMIT
 from app.utils.georeference_ai_digitize import AI_DIGITIZE_DAILY_LIMIT
 from app.utils.hazard_jobs import ensure_hazard_analysis_jobs_table
+from app.utils.schema_bootstrap import require_table, runtime_schema_bootstrap_enabled
 
 router = APIRouter(prefix="/analytics", tags=["analytics"])
 
@@ -32,6 +33,9 @@ def get_db():
 
 
 def ensure_plot_meta_table(db: Session):
+    if not runtime_schema_bootstrap_enabled():
+        require_table(db, "plot_meta")
+        return
     db.execute(text("""
         CREATE TABLE IF NOT EXISTS plot_meta (
             plot_id INTEGER PRIMARY KEY REFERENCES plots(id) ON DELETE CASCADE,
@@ -74,6 +78,9 @@ def ensure_plot_meta_table(db: Session):
 
 
 def ensure_plot_export_jobs_table(db: Session):
+    if not runtime_schema_bootstrap_enabled():
+        require_table(db, "plot_export_jobs")
+        return
     db.execute(text("""
         CREATE TABLE IF NOT EXISTS plot_export_jobs (
             id TEXT PRIMARY KEY,
@@ -113,6 +120,9 @@ def ensure_plot_export_jobs_table(db: Session):
 
 
 def ensure_plots_created_at(db: Session):
+    if not runtime_schema_bootstrap_enabled():
+        require_table(db, "plots")
+        return
     try:
         db.execute(text("ALTER TABLE plots ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT NOW()"))
         db.commit()

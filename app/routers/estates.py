@@ -36,7 +36,7 @@ from app.services.estates.entitlements import ESTATE_FEATURES, get_estate_entitl
 from app.models.estate_foundation import Estate, EstateAgentPortalToken, EstateAllocation, EstateAllocationChargeAttempt, EstateAuditEvent, EstateBlock, EstateCommissionPayout, EstateCommissionTier, EstateCustomer, EstateCustomerPortalToken, EstateDocument, EstateDocumentLink, EstateFieldInspection, EstateHazardAssessment, EstateImportReview, EstateLayoutProposal, EstateNotificationLog, EstateOrganization, EstateOrganizationMember, EstatePayment, EstatePaymentInbox, EstatePaymentRule, EstatePlot, EstatePublicReservationRequest, EstateQrCampaign, EstateSoilAssessment, EstateSpatialFeature, EstateStaffRole, EstateSurveyRequest, EstateStakingTask, GeotechSurveyRequest
 from app.models.estate_social import EstateWhatsappMessage
 from app.models.estate_marketing import EstateApprovalMilestone, EstateLiveInspectionSession, EstateProgressUpdate
-from app.schemas.estates import AllocationAction, AllocationPaymentPlanUpdate, BlockCreate, BlockUpdate, BuyerAllocationPaymentCreate, PaymentIssueReportCreate, PaymentReminderSend, CommissionPayoutCreate, CommissionTiersUpdate, CustomerCreate, DevelopmentForecastPublishUpdate, DevelopmentStatusUpdate, EstateCreate, EstateLayoutCriteria, EstateLayoutDecision, EstateLayoutFeatureAdd, EstateLayoutFeatureRemove, EstateLayoutProposalEdit, EstateSubdivisionCreate, EstateUpdate, FieldInspectionCreate, GeoreferenceSessionLink, ImportFromGeoreference, ImportReviewCreate, ImportReviewDecision, ImportReviewFromGeoreferenceSession, MemberCreate, MemberUpdate, PaymentInboxCreate, PaymentInboxMatch, PaymentScheduleInput, PlotCreate, SettlementRequestCreate, PlotAddressUpdate, PlotGeometryUpdate, PlotListingDefaultsUpdate, PlotPriceUpdate, PortalTokenCreate, BulkCustomerSmsCreate, PublicEstateSettingsUpdate, PublicReservationConvert, PublicReservationCreate, PublicReservationUpdate, PaymentCreate, QrCampaignCreate, SpatialFeatureCreate, SpatialFeatureUpdate, StaffCreate, StaffRoleCreate, StaffRoleUpdate, StaffUpdate, SurveyEligibilityUpdate, TitleVerificationUpdate, VoidAction
+from app.schemas.estates import AllocationAction, AllocationPaymentPlanUpdate, BlockCreate, BlockUpdate, BuyerAllocationPaymentCreate, PaymentIssueReportCreate, PaymentReminderSend, CommissionPayoutCreate, CommissionTiersUpdate, CustomerCreate, DevelopmentForecastPublishUpdate, DevelopmentStatusUpdate, EstateCreate, EstateScopesUpdate, EstateLayoutCriteria, EstateLayoutDecision, EstateLayoutFeatureAdd, EstateLayoutFeatureRemove, EstateLayoutProposalEdit, EstateSubdivisionCreate, EstateUpdate, FieldInspectionCreate, GeoreferenceSessionLink, ImportFromGeoreference, ImportReviewCreate, ImportReviewDecision, ImportReviewFromGeoreferenceSession, MemberCreate, MemberUpdate, PaymentInboxCreate, PaymentInboxMatch, PaymentScheduleInput, PlotCreate, SettlementRequestCreate, PlotAddressUpdate, PlotGeometryUpdate, PlotListingDefaultsUpdate, PlotPriceUpdate, PortalTokenCreate, BulkCustomerSmsCreate, PublicEstateSettingsUpdate, PublicReservationConvert, PublicReservationCreate, PublicReservationUpdate, PaymentCreate, QrCampaignCreate, SpatialFeatureCreate, SpatialFeatureUpdate, StaffCreate, StaffRoleCreate, StaffRoleUpdate, StaffUpdate, SurveyEligibilityUpdate, TitleVerificationUpdate, VoidAction
 from app.services.estates.payments import confirm_payment, financial_summary, record_payment, void_payment
 from app.services.estates.documents import MAX_ESTATE_DOCUMENT_BYTES, read_private_estate_file, store_private_estate_file
 from app.utils.r2_objects import delete_object_best_effort, build_r2_settings
@@ -69,6 +69,8 @@ from app.services.estates import allocation_charges
 from app.services.estates import payment_reminders
 from app.services.estates import settlement_tracking
 from app.models.estate_foundation import EstatePaymentIssueReport, EstateSettlementRequest
+from app.models.estate_foundation import EstateSnagItem
+from app.models.estate_foundation import EstateMemberEstateScope
 from app.utils import estate_flutterwave as flw
 from app.utils import estate_paystack as pst
 from app.utils.auth_security import require_signed_flutterwave_webhooks
@@ -5007,7 +5009,7 @@ def download_payment_evidence(payment_id:int,document_id:int,request:Request,db:
     return Response(data,media_type=mime,headers={"Content-Disposition":f'inline; filename="{document.original_filename}"'})
 
 def _linked_entity_organization(db: Session, entity_type: str, entity_id: int) -> int | None:
-    model = {"estate": Estate, "plot": EstatePlot, "customer": EstateCustomer, "allocation": EstateAllocation, "payment": EstatePayment, "staking_task": EstateStakingTask, "field_inspection": EstateFieldInspection, "import_review": EstateImportReview, "commission_payout": EstateCommissionPayout}.get(entity_type)
+    model = {"estate": Estate, "plot": EstatePlot, "customer": EstateCustomer, "allocation": EstateAllocation, "payment": EstatePayment, "staking_task": EstateStakingTask, "field_inspection": EstateFieldInspection, "import_review": EstateImportReview, "commission_payout": EstateCommissionPayout, "estate_snag_item": EstateSnagItem}.get(entity_type)
     row = db.get(model, entity_id) if model else None
     return getattr(row, "organization_id", None)
 
@@ -5019,17 +5021,21 @@ def estate_document_types(request: Request, db: Session = Depends(get_db)):
     return list(ESTATE_DOCUMENT_TYPES)
 
 @router.post("/documents")
-async def upload_document(entity_type: str, entity_id: int, document_type: str, request: Request, file: UploadFile = File(...), description: str | None = None, db: Session = Depends(get_db)):
+async def upload_document(entity_type: str, entity_id: int, document_type: str, request: Request, file: UploadFile = File(...), description: str | None = None, supersedes_document_id: int | None = None, db: Session = Depends(get_db)):
     organization_id = _linked_entity_organization(db, entity_type, entity_id)
     if not organization_id: raise HTTPException(404, "Linked Estate entity was not found")
     access = require_estate_access(db, request, organization_id, permission="document.manage")
     normalized_document_type = document_type.strip().lower()
     if normalized_document_type not in ESTATE_DOCUMENT_TYPE_CODES:
         raise HTTPException(422, "Choose a supported Estate document type")
+    if supersedes_document_id is not None:
+        previous = db.get(EstateDocument, supersedes_document_id)
+        if previous is None or previous.organization_id != organization_id:
+            raise HTTPException(404, "The drawing this is meant to replace was not found")
     organization = db.get(EstateOrganization, organization_id)
     stored = store_private_estate_file(organization_uid=organization.organization_uid, category="documents", entity_uid=f"{entity_type}_{entity_id}", filename=file.filename or "document", content_type=file.content_type or "", data=await read_limited_upload(file, max_bytes=MAX_ESTATE_DOCUMENT_BYTES))
-    document = EstateDocument(organization_id=organization_id, object_key=stored.object_key, original_filename=stored.filename, mime_type=stored.mime_type, size_bytes=stored.size_bytes, checksum=stored.checksum, document_type=normalized_document_type, description=description, uploaded_by_subject_type=access.principal.subject_type, uploaded_by_subject_id=access.principal.subject_id)
-    db.add(document); db.flush(); db.add(EstateDocumentLink(document_id=document.id, entity_type=entity_type, entity_id=str(entity_id))); append_estate_audit_event(db, organization_id=organization_id, actor=access.principal, action="document.uploaded", entity_type="estate_document", entity_id=document.id, after_data={"linked_entity":entity_type,"linked_id":entity_id}); db.commit()
+    document = EstateDocument(organization_id=organization_id, object_key=stored.object_key, original_filename=stored.filename, mime_type=stored.mime_type, size_bytes=stored.size_bytes, checksum=stored.checksum, document_type=normalized_document_type, description=description, supersedes_document_id=supersedes_document_id, uploaded_by_subject_type=access.principal.subject_type, uploaded_by_subject_id=access.principal.subject_id)
+    db.add(document); db.flush(); db.add(EstateDocumentLink(document_id=document.id, entity_type=entity_type, entity_id=str(entity_id))); append_estate_audit_event(db, organization_id=organization_id, actor=access.principal, action="document.uploaded", entity_type="estate_document", entity_id=document.id, after_data={"linked_entity":entity_type,"linked_id":entity_id,"supersedes_document_id":supersedes_document_id}); db.commit()
     return {"id":document.id,"filename":document.original_filename}
 
 @router.get("/documents/{document_id}/download")
@@ -6791,6 +6797,38 @@ def update_staff(organization_id: int, member_id: int, payload: StaffUpdate, req
     append_estate_audit_event(db, organization_id=organization_id, actor=access.principal, action="staff.updated", entity_type="estate_organization_member", entity_id=member.id, before_data=before, after_data=_staff_member_payload(db, member, account, role_name))
     db.commit()
     return _staff_member_payload(db, member, account, role_name)
+
+
+@router.get("/organizations/{organization_id}/staff/{member_id}/estate-scopes")
+def get_staff_estate_scopes(organization_id: int, member_id: int, request: Request, db: Session = Depends(get_db)):
+    """No rows = this member is unrestricted across every estate in the org (the default for
+    everyone). One or more rows = restricted to only those estates - see
+    require_estate_access_for_estate() in authorization.py for where this is enforced."""
+    require_estate_access(db, request, organization_id, permission="estate.manage")
+    member = db.query(EstateOrganizationMember).filter(EstateOrganizationMember.id == member_id, EstateOrganizationMember.organization_id == organization_id).one_or_none()
+    if not member:
+        raise HTTPException(404, "Staff member not found")
+    rows = db.query(EstateMemberEstateScope).filter(EstateMemberEstateScope.member_id == member_id).all()
+    return {"estate_ids": [row.estate_id for row in rows]}
+
+
+@router.put("/organizations/{organization_id}/staff/{member_id}/estate-scopes")
+def set_staff_estate_scopes(organization_id: int, member_id: int, payload: EstateScopesUpdate, request: Request, db: Session = Depends(get_db)):
+    access = require_estate_access(db, request, organization_id, permission="estate.manage")
+    member = db.query(EstateOrganizationMember).filter(EstateOrganizationMember.id == member_id, EstateOrganizationMember.organization_id == organization_id).one_or_none()
+    if not member:
+        raise HTTPException(404, "Staff member not found")
+    requested_ids = set(payload.estate_ids)
+    if requested_ids:
+        valid_count = db.query(Estate).filter(Estate.id.in_(requested_ids), Estate.organization_id == organization_id).count()
+        if valid_count != len(requested_ids):
+            raise HTTPException(422, "One or more estates don't belong to this organization")
+    db.query(EstateMemberEstateScope).filter(EstateMemberEstateScope.member_id == member_id).delete()
+    for estate_id in requested_ids:
+        db.add(EstateMemberEstateScope(member_id=member_id, estate_id=estate_id))
+    append_estate_audit_event(db, organization_id=organization_id, actor=access.principal, action="staff.estate_scopes_updated", entity_type="estate_organization_member", entity_id=member.id, after_data={"estate_ids": sorted(requested_ids)})
+    db.commit()
+    return {"estate_ids": sorted(requested_ids)}
 
 
 @router.post("/organizations/{organization_id}/staff/{member_id}/resend-invite")

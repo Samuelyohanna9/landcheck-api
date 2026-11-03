@@ -38,15 +38,28 @@ ROLE_PERMISSIONS: Final[dict[str, frozenset[str]]] = {
             "marketing.manage",
             "integration.read",
             "integration.manage",
+            "construction.read",
+            "construction.manage",
         }
     ),
-    "accounts": frozenset({"estate.read", "plot.read", "customer.read", "allocation.read", "payment.read", "payment.manage", "document.read", "document.manage", "report.read", "audit.read"}),
+    "accounts": frozenset({"estate.read", "plot.read", "customer.read", "allocation.read", "payment.read", "payment.manage", "document.read", "document.manage", "report.read", "audit.read", "construction.read", "construction.manage"}),
     "surveyor": frozenset({"estate.read", "plot.read", "survey.read", "survey.manage", "staking.read", "staking.manage", "document.read", "document.manage", "audit.read"}),
-    "field_officer": frozenset({"estate.read", "plot.read", "staking.read", "field.read", "field.manage", "document.read", "document.manage"}),
+    "field_officer": frozenset({"estate.read", "plot.read", "staking.read", "field.read", "field.manage", "document.read", "document.manage", "construction.read", "construction.manage"}),
     "sales": frozenset({"estate.read", "plot.read", "customer.read", "customer.manage", "allocation.read", "allocation.manage", "payment.read", "payment.manage", "document.read", "document.manage"}),
     "marketer": frozenset({"estate.read", "plot.read", "customer.read", "customer.manage", "allocation.read", "allocation.manage", "payment.read", "document.read", "marketing.manage"}),
-    "viewer": frozenset({"estate.read", "plot.read", "customer.read", "allocation.read", "document.read", "survey.read", "staking.read", "field.read", "infrastructure.read", "report.read"}),
+    "viewer": frozenset({"estate.read", "plot.read", "customer.read", "allocation.read", "document.read", "survey.read", "staking.read", "field.read", "infrastructure.read", "report.read", "construction.read"}),
 }
+
+# An "Architect" collaborator is deliberately NOT a new fixed role_key here - the frontend's real
+# invite flow (EstateStaffAccessPage.tsx) only ever creates role_key="staff" with an explicit
+# permissions list via the custom EstateStaffRole system; the older fixed roles above have no
+# reachable UI to assign them. So "Architect" is just a suggested custom-role permission set an
+# owner can create today through Team & Access, using the existing checklist - no new role_key,
+# no migration. No payment/customer/allocation permissions, by design: an architect works on
+# drawings, construction progress and RFIs, not buyer records or money. construction.manage (not
+# just .read) is included because verifying/closing a snag item is a manage action - see
+# estate_construction.py's verify_snag_item - and that's a core part of what an architect does.
+ARCHITECT_SUGGESTED_PERMISSIONS: Final[frozenset[str]] = frozenset({"estate.read", "plot.read", "document.read", "document.manage", "construction.read", "construction.manage"})
 
 
 def has_permission(role_key: str, permission: str) -> bool:
@@ -98,6 +111,10 @@ PERMISSION_CATALOG: Final[list[dict]] = [
     {"group": "Infrastructure & development", "items": [
         {"key": "infrastructure.read", "label": "View infrastructure & development forecast"},
         {"key": "infrastructure.manage", "label": "Manage infrastructure & development forecast"},
+    ]},
+    {"group": "Construction", "items": [
+        {"key": "construction.read", "label": "View construction budgets, contractors & progress"},
+        {"key": "construction.manage", "label": "Manage construction budgets, contractors & progress"},
     ]},
     {"group": "Reports", "items": [
         {"key": "report.read", "label": "View reports"},
