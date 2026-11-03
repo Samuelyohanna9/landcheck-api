@@ -18,8 +18,8 @@ services:
   api:
     build: .
     image: ${LANDCHECK_API_IMAGE:-landcheck-api:local}
-    # The one-shot migrate service owns Alembic and legacy bootstrap writes. API workers only serve
-    # traffic with the least-privilege runtime role.
+    # The one-shot migrate service owns Alembic. API workers only serve traffic with the
+    # least-privilege runtime role.
     command: ["sh", "/app/scripts/start_api.sh"]
     init: true
     depends_on:
@@ -58,7 +58,9 @@ services:
   migrate:
     build: .
     image: ${LANDCHECK_API_IMAGE:-landcheck-api:local}
-    command: ["sh", "-c", "python -m scripts.initialize_api_schema && alembic upgrade head && python -m scripts.verify_runtime_schema"]
+    # Existing legacy schemas are a release prerequisite. This service must not attempt
+    # runtime DDL as the least-privilege migrator role; Alembic is the only schema writer here.
+    command: ["sh", "-c", "alembic upgrade head && python -m scripts.verify_runtime_schema"]
     init: true
     depends_on:
       db:
@@ -68,7 +70,7 @@ services:
     environment:
       # Use only the dedicated migration connection. Missing role configuration must fail closed.
       DATABASE_URL: ${LANDCHECK_MIGRATOR_DATABASE_URL:?LANDCHECK_MIGRATOR_DATABASE_URL must be set for the migration service}
-      LANDCHECK_RUNTIME_SCHEMA_BOOTSTRAP: "true"
+      LANDCHECK_RUNTIME_SCHEMA_BOOTSTRAP: "false"
     restart: "no"
 
   survey-export-worker:

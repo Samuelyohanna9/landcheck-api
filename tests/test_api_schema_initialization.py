@@ -73,9 +73,10 @@ class _FakeSession:
 def test_one_shot_schema_service_runs_before_api_workers():
     compose = (ROOT / "docker-compose.yml").read_text(encoding="utf-8")
     migrate_block = compose.split("  migrate:", 1)[1].split("  survey-export-worker:", 1)[0]
-    assert "python -m scripts.initialize_api_schema" in migrate_block
+    assert "python -m scripts.initialize_api_schema" not in migrate_block
     assert "alembic upgrade head" in migrate_block
     assert "python -m scripts.verify_runtime_schema" in migrate_block
+    assert 'LANDCHECK_RUNTIME_SCHEMA_BOOTSTRAP: "false"' in migrate_block
     assert "service_completed_successfully" in compose
 
     start_script = (ROOT / "scripts" / "start_api.sh").read_text(encoding="utf-8")

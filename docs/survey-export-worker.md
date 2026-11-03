@@ -148,12 +148,14 @@ test -n "$RELEASE_API_IMAGE"
 docker image inspect "$RELEASE_API_IMAGE" >/dev/null
 ```
 
-The Compose `migrate` service runs `scripts/initialize_api_schema.py`, `alembic upgrade head`
-and `scripts/verify_runtime_schema` once, using `LANDCHECK_MIGRATOR_DATABASE_URL`, before API
-workers start. The bootstrap is fail-fast: if it cannot complete, Uvicorn is not started. This
-prevents two Uvicorn workers from creating the same legacy tables or sequences concurrently. The
-API entrypoint only starts Uvicorn, and the worker waits for the API healthcheck; neither runtime
-service runs migrations or schema initialization.
+The Compose `migrate` service runs `alembic upgrade head` and
+`scripts/verify_runtime_schema` once, using `LANDCHECK_MIGRATOR_DATABASE_URL`, before API workers
+start. It deliberately does not run the legacy runtime schema bootstrap: existing legacy tables
+must already be present, and their versioned changes must be represented by a reviewed migration
+or a separately approved administrator operation. This is required because the migrator is not
+the owner of every historical Green/Work table and must not attempt ad-hoc `ALTER TABLE` work.
+The API entrypoint only starts Uvicorn, and the worker waits for the API healthcheck; neither
+runtime service runs migrations or schema initialization.
 
 The Release B role layout is applied separately by a reviewed administrator procedure. The
 version-controlled `scripts/provision_least_privilege_roles.sql` contains no passwords and is not
@@ -176,7 +178,8 @@ check complete. PostgreSQL is not recreated or restarted.
 
 ```sh
 # Start the one-shot migration service and wait for it to exit successfully. This is the only
-# service allowed to run the legacy bootstrap and Alembic migrations.
+# service allowed to run Alembic migrations. It must fail closed if a required legacy table is
+# missing; do not substitute the legacy admin role or enable runtime bootstrap in production.
 docker compose up migrate
 MIGRATE_ID="$(docker compose ps -q migrate)"
 test -n "$MIGRATE_ID"
