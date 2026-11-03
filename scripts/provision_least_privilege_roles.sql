@@ -12,7 +12,11 @@ BEGIN
     IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'landcheck_migrator') THEN
         CREATE ROLE landcheck_migrator NOLOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NOINHERIT;
     ELSE
-        ALTER ROLE landcheck_migrator NOLOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NOINHERIT;
+        -- Unlike the branch above, this must not include NOLOGIN: an admin sets LOGIN/password on
+        -- an existing role through the separate secret-handling procedure, and re-running this
+        -- script (e.g. after adding a newly created app table to ownership) must not silently
+        -- revoke that - it already did once, taking the migrate service down.
+        ALTER ROLE landcheck_migrator NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NOINHERIT;
     END IF;
 
     IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'landcheck_api') THEN
