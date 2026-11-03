@@ -64,29 +64,36 @@ BEGIN
 END
 $$;
 
--- Tenant-protected Survey tables and queue metadata are owned by the migration role, never by the
--- runtime roles.  Missing optional legacy tables are skipped so this remains safe on an older
--- staging restore; the release preflight must still fail if a required runtime table is absent.
+-- Every pre-existing application table (Survey, Estates, Green, Work - all of them) must be owned
+-- by the migration role, because Alembic connects as landcheck_migrator and DDL requires table
+-- ownership (or an explicit grant) on anything it creates, alters or references via a foreign key.
+-- These tables were created by an earlier admin role before this least-privilege layout existed, so
+-- a hardcoded per-app table list here goes stale the moment a migration touches a table this script
+-- doesn't already know about (that is exactly what broke the Estate construction-tracking release:
+-- estate_plots was never in the old Survey-only list). Reassign anything in the public schema not
+-- already owned by one of the roles this script manages. PostGIS's own catalog tables
+-- (spatial_ref_sys, geometry_columns, etc.) are extension members, not application tables, and are
+-- deliberately skipped.
 DO $$
 DECLARE
-    table_name text;
+    rec record;
 BEGIN
-    FOREACH table_name IN ARRAY ARRAY[
-        'plots',
-        'hazard_analysis_jobs',
-        'survey_georeference_sessions',
-        'survey_users',
-        'survey_auth_sessions',
-        'survey_magic_link_tokens',
-        'plot_export_jobs',
-        'plot_meta',
-        'plot_feature_overrides',
-        'plot_subdivision_batches',
-        'plot_subdivision_items'
-    ] LOOP
-        IF to_regclass('public.' || table_name) IS NOT NULL THEN
-            EXECUTE format('ALTER TABLE public.%I OWNER TO landcheck_migrator', table_name);
-        END IF;
+    FOR rec IN
+        SELECT c.relname AS table_name
+        FROM pg_class c
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        JOIN pg_roles r ON r.oid = c.relowner
+        WHERE n.nspname = 'public'
+          AND c.relkind = 'r'
+          AND r.rolname NOT IN (
+              'landcheck_migrator', 'landcheck_api', 'landcheck_survey_worker',
+              'landcheck_maintenance', 'landcheck_superadmin'
+          )
+          AND NOT EXISTS (
+              SELECT 1 FROM pg_depend d WHERE d.objid = c.oid AND d.deptype = 'e'
+          )
+    LOOP
+        EXECUTE format('ALTER TABLE public.%I OWNER TO landcheck_migrator', rec.table_name);
     END LOOP;
 END
 $$;
