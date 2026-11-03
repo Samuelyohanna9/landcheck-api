@@ -5011,6 +5011,11 @@ def download_payment_evidence(payment_id:int,document_id:int,request:Request,db:
 def _linked_entity_organization(db: Session, entity_type: str, entity_id: int) -> int | None:
     model = {"estate": Estate, "plot": EstatePlot, "customer": EstateCustomer, "allocation": EstateAllocation, "payment": EstatePayment, "staking_task": EstateStakingTask, "field_inspection": EstateFieldInspection, "import_review": EstateImportReview, "commission_payout": EstateCommissionPayout, "estate_snag_item": EstateSnagItem}.get(entity_type)
     row = db.get(model, entity_id) if model else None
+    if row is None:
+        return None
+    if entity_type == "plot":
+        estate = db.get(Estate, row.estate_id)
+        return getattr(estate, "organization_id", None)
     return getattr(row, "organization_id", None)
 
 @router.get("/document-types")
