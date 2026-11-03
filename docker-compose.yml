@@ -18,8 +18,8 @@ services:
   api:
     build: .
     image: ${LANDCHECK_API_IMAGE:-landcheck-api:local}
-    # The one-shot migrate service owns Alembic and legacy bootstrap writes. API workers only serve
-    # traffic with the least-privilege runtime role.
+    # The one-shot migrate service owns Alembic. API workers only serve traffic with the
+    # least-privilege runtime role.
     command: ["sh", "/app/scripts/start_api.sh"]
     init: true
     depends_on:
@@ -32,7 +32,7 @@ services:
     env_file:
       - .env
     environment:
-      DATABASE_URL: ${LANDCHECK_API_DATABASE_URL:-${DATABASE_URL}}
+      DATABASE_URL: ${LANDCHECK_API_DATABASE_URL:?LANDCHECK_API_DATABASE_URL must be set for the API service}
       ESTATES_ENABLED: ${ESTATES_ENABLED:-true}
       ESTATE_PUBLIC_MAP: ${ESTATE_PUBLIC_MAP:-true}
       PROMETHEUS_MULTIPROC_DIR: /var/lib/landcheck/prometheus
@@ -58,7 +58,9 @@ services:
   migrate:
     build: .
     image: ${LANDCHECK_API_IMAGE:-landcheck-api:local}
-    command: ["sh", "-c", "python -m scripts.initialize_api_schema && alembic upgrade head && python -m scripts.verify_runtime_schema"]
+    # Existing legacy schemas are a release prerequisite. This service must not attempt
+    # runtime DDL as the least-privilege migrator role; Alembic is the only schema writer here.
+    command: ["sh", "-c", "alembic upgrade head && python -m scripts.verify_runtime_schema"]
     init: true
     depends_on:
       db:
@@ -66,10 +68,9 @@ services:
     env_file:
       - .env
     environment:
-      # Use a dedicated migration connection in staging/production. The fallback keeps local
-      # development compatible until that variable is configured.
-      DATABASE_URL: ${LANDCHECK_MIGRATOR_DATABASE_URL:-${DATABASE_URL}}
-      LANDCHECK_RUNTIME_SCHEMA_BOOTSTRAP: "true"
+      # Use only the dedicated migration connection. Missing role configuration must fail closed.
+      DATABASE_URL: ${LANDCHECK_MIGRATOR_DATABASE_URL:?LANDCHECK_MIGRATOR_DATABASE_URL must be set for the migration service}
+      LANDCHECK_RUNTIME_SCHEMA_BOOTSTRAP: "false"
     restart: "no"
 
   survey-export-worker:
@@ -85,7 +86,7 @@ services:
     env_file:
       - .env
     environment:
-      DATABASE_URL: ${SURVEY_EXPORT_DATABASE_URL:-${DATABASE_URL}}
+      DATABASE_URL: ${SURVEY_EXPORT_DATABASE_URL:?SURVEY_EXPORT_DATABASE_URL must be set for the Survey worker}
       PROMETHEUS_MULTIPROC_DIR: /var/lib/landcheck/prometheus
       SURVEY_EXPORT_SHARED_DIR: /app/app/reports/export_jobs
       SURVEY_EXPORT_WORKER_CONCURRENCY: ${SURVEY_EXPORT_WORKER_CONCURRENCY:-1}

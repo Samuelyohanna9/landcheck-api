@@ -208,17 +208,19 @@ checks. Never drop the old role or revoke its access before the rollback window 
 
 ## Initialization and overlapping containers
 
-The Compose file now has one `migrate` service. It runs
-`python -m scripts.initialize_api_schema`, `alembic upgrade head` and
+The Compose file now has one `migrate` service. It runs `alembic upgrade head` and
 `python -m scripts.verify_runtime_schema` once, using the dedicated migrator connection, before
-the API dependency is allowed to start. The API entrypoint only prepares Prometheus metrics and
-executes Uvicorn; it no longer performs schema writes. The Uvicorn workers and Survey worker do
-not run migrations or legacy schema bootstrap.
+the API dependency is allowed to start. It deliberately does not run legacy runtime schema
+bootstrap DDL: existing legacy tables are a release prerequisite and must be changed through a
+reviewed migration or a separately approved administrator operation. This keeps the least-
+privilege migrator from attempting `ALTER TABLE` on historical tables owned by another role. The
+API entrypoint only prepares Prometheus metrics and executes Uvicorn; it no longer performs schema
+writes. The Uvicorn workers and Survey worker do not run migrations or legacy schema bootstrap.
 
 The deployment must not bypass the `migrate` service with `docker compose up --no-deps api`, and
 must not start two release migration jobs against the same database. If a blue/green or parallel
-deployment is later required, keep the one-shot migration/bootstrap step as a separately locked
-release job before either API set starts.
+deployment is later required, keep the one-shot migration step as a separately locked release job
+before either API set starts. A missing legacy table is a hard stop; do not fall back to `sam_admin`.
 
 Because the API and Survey worker share the Prometheus multiprocess directory, the API entrypoint
 does not clear metric files by default. `LANDCHECK_PROMETHEUS_CLEAN_ON_START=true` is permitted
