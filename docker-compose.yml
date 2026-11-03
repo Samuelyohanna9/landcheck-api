@@ -17,22 +17,31 @@ services:
 
   api:
     build: .
-    # scripts/start_api.sh runs `alembic upgrade head` and then `exec uvicorn app.main:app` once before Uvicorn forks workers.
+    image: ${LANDCHECK_API_IMAGE:-landcheck-api:local}
+    # The one-shot migrate service owns Alembic and legacy bootstrap writes. API workers only serve
+    # traffic with the least-privilege runtime role.
     command: ["sh", "/app/scripts/start_api.sh"]
     init: true
     depends_on:
       db:
         condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
     ports:
       - "8000:8000"
     env_file:
       - .env
     environment:
+      DATABASE_URL: ${LANDCHECK_API_DATABASE_URL:?LANDCHECK_API_DATABASE_URL must be set for the API service}
       ESTATES_ENABLED: ${ESTATES_ENABLED:-true}
       ESTATE_PUBLIC_MAP: ${ESTATE_PUBLIC_MAP:-true}
       PROMETHEUS_MULTIPROC_DIR: /var/lib/landcheck/prometheus
+      LANDCHECK_PROMETHEUS_CLEAN_ON_START: ${LANDCHECK_PROMETHEUS_CLEAN_ON_START:-false}
+      SURVEY_EXPORT_SHARED_DIR: /app/app/reports/export_jobs
+      LANDCHECK_RUNTIME_SCHEMA_BOOTSTRAP: ${LANDCHECK_RUNTIME_SCHEMA_BOOTSTRAP:-false}
     volumes:
       - prometheus_multiproc:/var/lib/landcheck/prometheus
+      - survey_export_files:/app/app/reports/export_jobs
     restart: unless-stopped
     stop_grace_period: 20s
     healthcheck:
@@ -45,6 +54,60 @@ services:
       options:
         max-size: "10m"
         max-file: "5"
+
+  migrate:
+    build: .
+    image: ${LANDCHECK_API_IMAGE:-landcheck-api:local}
+    command: ["sh", "-c", "python -m scripts.initialize_api_schema && alembic upgrade head && python -m scripts.verify_runtime_schema"]
+    init: true
+    depends_on:
+      db:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      # Use only the dedicated migration connection. Missing role configuration must fail closed.
+      DATABASE_URL: ${LANDCHECK_MIGRATOR_DATABASE_URL:?LANDCHECK_MIGRATOR_DATABASE_URL must be set for the migration service}
+      LANDCHECK_RUNTIME_SCHEMA_BOOTSTRAP: "true"
+    restart: "no"
+
+  survey-export-worker:
+    build: .
+    image: ${LANDCHECK_API_IMAGE:-landcheck-api:local}
+    command: ["sh", "/app/scripts/start_survey_export_worker.sh"]
+    init: true
+    depends_on:
+      db:
+        condition: service_healthy
+      api:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: ${SURVEY_EXPORT_DATABASE_URL:?SURVEY_EXPORT_DATABASE_URL must be set for the Survey worker}
+      PROMETHEUS_MULTIPROC_DIR: /var/lib/landcheck/prometheus
+      SURVEY_EXPORT_SHARED_DIR: /app/app/reports/export_jobs
+      SURVEY_EXPORT_WORKER_CONCURRENCY: ${SURVEY_EXPORT_WORKER_CONCURRENCY:-1}
+      SURVEY_EXPORT_WORKER_POLL_SECONDS: ${SURVEY_EXPORT_WORKER_POLL_SECONDS:-2}
+      SURVEY_EXPORT_WORKER_LEASE_SECONDS: ${SURVEY_EXPORT_WORKER_LEASE_SECONDS:-900}
+      SURVEY_EXPORT_WORKER_HEARTBEAT_SECONDS: ${SURVEY_EXPORT_WORKER_HEARTBEAT_SECONDS:-30}
+      SURVEY_EXPORT_WORKER_MAX_ATTEMPTS: ${SURVEY_EXPORT_WORKER_MAX_ATTEMPTS:-3}
+      SQLALCHEMY_POOL_SIZE: ${SURVEY_EXPORT_DB_POOL_SIZE:-2}
+      SQLALCHEMY_MAX_OVERFLOW: ${SURVEY_EXPORT_DB_MAX_OVERFLOW:-0}
+      SQLALCHEMY_POOL_TIMEOUT: ${SURVEY_EXPORT_DB_POOL_TIMEOUT:-15}
+    volumes:
+      - prometheus_multiproc:/var/lib/landcheck/prometheus
+      - survey_export_files:/app/app/reports/export_jobs
+    restart: unless-stopped
+    stop_grace_period: 30s
+    cpus: "0.75"
+    mem_limit: 768m
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import os,time; p='/tmp/landcheck-survey-export-worker.health'; raise SystemExit(0 if os.path.exists(p) and time.time()-os.path.getmtime(p) < 90 else 1)\""]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
 
   metrics-exporter:
     build: .
@@ -74,6 +137,7 @@ services:
 volumes:
   pgdata:
   prometheus_multiproc:
+  survey_export_files:
 
 networks:
   landcheck_monitoring:

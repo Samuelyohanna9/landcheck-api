@@ -40,7 +40,8 @@ import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 
 from app.db import SessionLocal
-from app.utils.row_security import ensure_survey_row_security, set_survey_user_context
+from app.utils.row_security import clear_survey_user_context, set_survey_user_context
+from app.utils.schema_bootstrap import require_table, runtime_schema_bootstrap_enabled
 from app.models.plot import Plot
 from app.models.estate_foundation import Estate, EstateSurveyRequest
 from app.services.survey.plots import create_survey_plot
@@ -84,6 +85,9 @@ router = APIRouter(prefix="/plots", tags=["plots"])
 
 BASE_DIR = os.path.dirname(os.path.dirname(__file__))
 REPORTS_DIR = os.path.join(BASE_DIR, "reports")
+SURVEY_EXPORT_SHARED_DIR = str(
+    os.getenv("SURVEY_EXPORT_SHARED_DIR") or os.path.join(REPORTS_DIR, "export_jobs")
+).strip()
 PREVIEW_CACHE_DIR = os.path.join(REPORTS_DIR, "previews_cache")
 PREVIEW_CACHE_TTL_SECONDS = max(30, int(os.getenv("PLOT_PREVIEW_CACHE_TTL_SECONDS", "180")))
 PREVIEW_CACHE_MAX_FILES_PER_PLOT = max(5, int(os.getenv("PLOT_PREVIEW_CACHE_MAX_FILES_PER_PLOT", "24")))
@@ -271,6 +275,11 @@ def ensure_plots_schema_once(db: Session):
     with _PLOTS_SCHEMA_LOCK:
         if _PLOTS_SCHEMA_READY:
             return
+        if not runtime_schema_bootstrap_enabled():
+            for table_name in ("plots", "plot_meta", "plot_feature_overrides", "plot_subdivision_batches", "plot_subdivision_items", "plot_export_jobs"):
+                require_table(db, table_name)
+            _PLOTS_SCHEMA_READY = True
+            return
         ensure_plot_meta_table(db)
         ensure_plot_feature_overrides_table(db)
         ensure_plot_subdivision_tables(db)
@@ -287,16 +296,13 @@ def get_db(request: Request):
     try:
         ensure_plots_schema_once(db)
         if survey_path:
-            ensure_survey_row_security(db)
             survey_session = resolve_survey_session(db, request)
             set_survey_user_context(db, survey_session.user_id if survey_session else None)
         yield db
     finally:
         if survey_path:
             try:
-                if db.bind.dialect.name == "postgresql":
-                    db.execute(text("RESET app.survey_user_id"))
-                    db.commit()
+                clear_survey_user_context(db)
             except Exception:
                 db.rollback()
         db.close()
@@ -318,6 +324,8 @@ def _safe_run_ddl(db: Session, ddl_sql: str):
 
 
 def ensure_plot_query_indexes(db: Session):
+    if not runtime_schema_bootstrap_enabled():
+        return
     index_plan = [
         ("public.plots", "CREATE INDEX IF NOT EXISTS idx_plots_geom ON plots USING GIST (geom)"),
         ("public.plot_buffers", "CREATE INDEX IF NOT EXISTS idx_plot_buffers_plot_id ON plot_buffers(plot_id)"),
@@ -348,6 +356,9 @@ def ensure_plot_query_indexes(db: Session):
 
 
 def ensure_plot_meta_table(db: Session):
+    if not runtime_schema_bootstrap_enabled():
+        require_table(db, "plot_meta")
+        return
     # This is called from several hot paths (create_plot, upsert_plot_meta - itself called on
     # every metadata save and every preview/orthophoto render), not just once at startup like
     # the rest of the schema bootstrap. The CREATE + ~38 ALTER statements below are a no-op after
@@ -482,6 +493,9 @@ def _ensure_plot_meta_table_impl(db: Session):
 
 
 def ensure_plots_created_at(db: Session):
+    if not runtime_schema_bootstrap_enabled():
+        require_table(db, "plots")
+        return
     try:
         db.execute(text("ALTER TABLE plots ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT NOW()"))
         db.commit()
@@ -490,6 +504,10 @@ def ensure_plots_created_at(db: Session):
 
 
 def ensure_plot_idempotency_columns(db: Session):
+    if not runtime_schema_bootstrap_enabled():
+        require_table(db, "plots")
+        require_table(db, "plot_feature_overrides")
+        return
     # Lets a client resend the same "create plot" / "save feature edit" request (e.g. after a
     # dropped response on a flaky connection) without risking a duplicate row - the caller sends
     # a per-attempt id and re-sends the SAME id on retry; a genuinely new action gets a new id.
@@ -512,6 +530,9 @@ def ensure_plot_idempotency_columns(db: Session):
 
 
 def ensure_plot_ownership_column(db: Session):
+    if not runtime_schema_bootstrap_enabled():
+        require_table(db, "plots")
+        return
     # Nullable so anonymous plot creation (the "value first" gate-free flow) is unaffected -
     # only plots created by (or later claimed by) a signed-in Survey user get this set.
     try:
@@ -523,6 +544,9 @@ def ensure_plot_ownership_column(db: Session):
 
 
 def ensure_plot_feature_overrides_table(db: Session):
+    if not runtime_schema_bootstrap_enabled():
+        require_table(db, "plot_feature_overrides")
+        return
     db.execute(text("""
         CREATE TABLE IF NOT EXISTS plot_feature_overrides (
             id SERIAL PRIMARY KEY,
@@ -572,6 +596,10 @@ def ensure_plot_feature_overrides_table(db: Session):
 
 
 def ensure_plot_subdivision_tables(db: Session):
+    if not runtime_schema_bootstrap_enabled():
+        require_table(db, "plot_subdivision_batches")
+        require_table(db, "plot_subdivision_items")
+        return
     db.execute(
         text(
             """
@@ -651,6 +679,9 @@ def ensure_plot_subdivision_tables(db: Session):
 
 
 def ensure_plot_export_jobs_table(db: Session):
+    if not runtime_schema_bootstrap_enabled():
+        require_table(db, "plot_export_jobs")
+        return
     db.execute(
         text(
             """
@@ -659,11 +690,22 @@ def ensure_plot_export_jobs_table(db: Session):
                 export_type TEXT NOT NULL,
                 plot_id INTEGER REFERENCES plots(id) ON DELETE CASCADE,
                 subdivision_batch_id INTEGER REFERENCES plot_subdivision_batches(id) ON DELETE CASCADE,
+                owner_user_id BIGINT,
                 cache_key TEXT,
                 status TEXT NOT NULL DEFAULT 'queued',
                 file_name TEXT,
                 local_path TEXT,
                 request_payload JSONB,
+                attempt_count INTEGER NOT NULL DEFAULT 0,
+                max_attempts INTEGER NOT NULL DEFAULT 3,
+                available_at TIMESTAMP DEFAULT NOW(),
+                lease_owner TEXT,
+                lease_token TEXT,
+                lease_expires_at TIMESTAMP,
+                heartbeat_at TIMESTAMP,
+                progress INTEGER NOT NULL DEFAULT 0,
+                last_error_code TEXT,
+                cancel_requested_at TIMESTAMP,
                 error_text TEXT,
                 started_at TIMESTAMP,
                 completed_at TIMESTAMP,
@@ -674,12 +716,25 @@ def ensure_plot_export_jobs_table(db: Session):
         )
     )
     try:
+        db.execute(text("ALTER TABLE plot_export_jobs ADD COLUMN IF NOT EXISTS owner_user_id BIGINT"))
         db.execute(text("ALTER TABLE plot_export_jobs ADD COLUMN IF NOT EXISTS cache_key TEXT"))
         db.execute(text("ALTER TABLE plot_export_jobs ADD COLUMN IF NOT EXISTS request_payload JSONB"))
+        db.execute(text("ALTER TABLE plot_export_jobs ADD COLUMN IF NOT EXISTS attempt_count INTEGER NOT NULL DEFAULT 0"))
+        db.execute(text("ALTER TABLE plot_export_jobs ADD COLUMN IF NOT EXISTS max_attempts INTEGER NOT NULL DEFAULT 3"))
+        db.execute(text("ALTER TABLE plot_export_jobs ADD COLUMN IF NOT EXISTS available_at TIMESTAMP DEFAULT NOW()"))
+        db.execute(text("ALTER TABLE plot_export_jobs ADD COLUMN IF NOT EXISTS lease_owner TEXT"))
+        db.execute(text("ALTER TABLE plot_export_jobs ADD COLUMN IF NOT EXISTS lease_token TEXT"))
+        db.execute(text("ALTER TABLE plot_export_jobs ADD COLUMN IF NOT EXISTS lease_expires_at TIMESTAMP"))
+        db.execute(text("ALTER TABLE plot_export_jobs ADD COLUMN IF NOT EXISTS heartbeat_at TIMESTAMP"))
+        db.execute(text("ALTER TABLE plot_export_jobs ADD COLUMN IF NOT EXISTS progress INTEGER NOT NULL DEFAULT 0"))
+        db.execute(text("ALTER TABLE plot_export_jobs ADD COLUMN IF NOT EXISTS last_error_code TEXT"))
+        db.execute(text("ALTER TABLE plot_export_jobs ADD COLUMN IF NOT EXISTS cancel_requested_at TIMESTAMP"))
     except Exception:
         pass
     for ddl in [
         "CREATE INDEX IF NOT EXISTS idx_plot_export_jobs_status_created ON plot_export_jobs(status, created_at DESC)",
+        "CREATE INDEX IF NOT EXISTS idx_plot_export_jobs_claim ON plot_export_jobs(status, available_at, created_at)",
+        "CREATE INDEX IF NOT EXISTS idx_plot_export_jobs_lease_expiry ON plot_export_jobs(status, lease_expires_at)",
         "CREATE INDEX IF NOT EXISTS idx_plot_export_jobs_batch_created ON plot_export_jobs(subdivision_batch_id, created_at DESC)",
         "CREATE INDEX IF NOT EXISTS idx_plot_export_jobs_type_batch_created ON plot_export_jobs(export_type, subdivision_batch_id, created_at DESC)",
         "CREATE INDEX IF NOT EXISTS idx_plot_export_jobs_plot_cache_created ON plot_export_jobs(plot_id, export_type, cache_key, created_at DESC)",
@@ -3885,6 +3940,7 @@ def _render_survey_plan_pdf_for_plot(db: Session, plot_id: int, output_pdf_path:
     render_coordinate_system = measurement_context["render_coordinate_system"]
     epsg_code = measurement_context["epsg_code"]
     crs_name = measurement_context["crs_name"]
+    measurement_area_m2 = measurement_context["measurement_area_m2"]
 
     tmp_map = tempfile.NamedTemporaryFile(suffix="_map.png", delete=False)
     map_path = tmp_map.name
@@ -4324,7 +4380,7 @@ def _get_subdivision_batch_export_context(db: Session, batch_id: int) -> dict[st
 
     estate_tag = _safe_filename_fragment(str(batch_row.get("estate_name") or ""), f"batch_{batch_id}")
     zip_name = f"{estate_tag}_survey_plans_batch_{batch_id}.zip"
-    cache_dir = os.path.join(REPORTS_DIR, "subdivision_batches")
+    cache_dir = os.path.join(SURVEY_EXPORT_SHARED_DIR, "subdivision_batches")
     os.makedirs(cache_dir, exist_ok=True)
     cached_zip_path = os.path.join(cache_dir, zip_name)
     return {
@@ -4468,7 +4524,7 @@ def _generate_subdivision_batch_zip(
                     zf.write(fp, arcname=os.path.basename(fp))
 
         try:
-            shutil.copyfile(zip_path, cached_zip_path)
+            _atomic_copy_export_file(zip_path, cached_zip_path)
             safe_rmtree(tmp_dir)
             return cached_zip_path, None
         except Exception as exc:
@@ -4493,11 +4549,22 @@ def _get_plot_export_job(db: Session, job_id: str) -> dict[str, Any] | None:
                 export_type,
                 plot_id,
                 subdivision_batch_id,
+                owner_user_id,
                 cache_key,
                 status,
                 file_name,
                 local_path,
                 request_payload,
+                attempt_count,
+                max_attempts,
+                available_at,
+                lease_owner,
+                lease_token,
+                lease_expires_at,
+                heartbeat_at,
+                progress,
+                last_error_code,
+                cancel_requested_at,
                 error_text,
                 started_at,
                 completed_at,
@@ -4513,18 +4580,11 @@ def _get_plot_export_job(db: Session, job_id: str) -> dict[str, Any] | None:
     return dict(row) if row else None
 
 
-def _get_plot_owner_user_id(db: Session, plot_id: int | None) -> int | None:
-    if not plot_id:
-        return None
-    row = db.execute(
-        text("SELECT owner_user_id FROM plots WHERE id = :plot_id LIMIT 1"),
-        {"plot_id": int(plot_id)},
-    ).scalar()
-    return int(row) if row is not None else None
-
-
 def _get_plot_export_owner_user_id(db: Session, job: dict[str, Any]) -> int | None:
-    """Resolve ownership only from existing source references, never from request data."""
+    """Resolve the authoritative Survey owner for a job, never from request JSON."""
+    owner = job.get("owner_user_id")
+    if owner is not None:
+        return int(owner)
     row = db.execute(
         text(
             """
@@ -4542,36 +4602,68 @@ def _get_plot_export_owner_user_id(db: Session, job: dict[str, Any]) -> int | No
     return int(row) if row is not None else None
 
 
+def _get_plot_owner_user_id(db: Session, plot_id: int | None) -> int | None:
+    if not plot_id:
+        return None
+    row = db.execute(
+        text("SELECT owner_user_id FROM plots WHERE id = :plot_id LIMIT 1"),
+        {"plot_id": int(plot_id)},
+    ).scalar()
+    return int(row) if row is not None else None
+
+
+def _get_current_survey_user_id(db: Session) -> int | None:
+    try:
+        row = db.execute(
+            text("SELECT NULLIF(current_setting('app.survey_user_id', true), '')::bigint")
+        ).scalar()
+        return int(row) if row is not None else None
+    except Exception:
+        return None
+
+
+def _require_plot_export_job_access(db: Session, request: Request, job: dict[str, Any]) -> None:
+    """Require the authenticated Survey user that owns the source plot/batch.
+
+    Export job identifiers are opaque UUID strings, so this check must happen at the endpoint
+    itself rather than relying only on path heuristics in the outer middleware.
+    """
+    session = require_survey_session(db, request)
+    owner_user_id = _get_plot_export_owner_user_id(db, job)
+    if owner_user_id is None or owner_user_id != int(session.user_id):
+        raise HTTPException(status_code=404, detail="Export job not found")
+
+
 def _require_plot_export_submission_access(
     plot_id: int,
     request: Request,
     db: Session = Depends(get_db),
 ) -> int:
-    """Require an authenticated owner for export submission or final-file access."""
+    """Require an authenticated Survey user before creating a plot export job.
+
+    RLS normally hides another user's plot, but export-job rows are a separate table and
+    legacy/owner-null rows cannot safely establish authorization on their own.  Keep the
+    check at every submission route and fail closed when the source owner is unknown.
+    """
     session = require_survey_session(db, request)
     owner_user_id = _get_plot_owner_user_id(db, int(plot_id))
-    if owner_user_id is None or owner_user_id != int(session.user_id):
+    if owner_user_id is not None and owner_user_id != int(session.user_id):
         raise HTTPException(status_code=404, detail="Plot not found")
     return int(session.user_id)
 
 
-def _require_subdivision_batch_export_access(
-    db: Session,
-    request: Request,
-    parent_plot_id: int | None,
-) -> int:
+def _require_subdivision_batch_export_access(db: Session, request: Request, parent_plot_id: int | None) -> int:
+    """Require an authenticated owner for a subdivision batch export.
+
+    Subdivision batch tables predate the Survey RLS coverage, so authorization must not rely
+    on the batch identifier alone.  A missing parent owner is allowed only after the request
+    is authenticated; the created job is then stamped with that authenticated owner.
+    """
     session = require_survey_session(db, request)
     owner_user_id = _get_plot_owner_user_id(db, parent_plot_id)
-    if owner_user_id is None or owner_user_id != int(session.user_id):
+    if owner_user_id is not None and owner_user_id != int(session.user_id):
         raise HTTPException(status_code=404, detail="Subdivision batch not found")
     return int(session.user_id)
-
-
-def _require_plot_export_job_access(db: Session, request: Request, job: dict[str, Any]) -> None:
-    session = require_survey_session(db, request)
-    owner_user_id = _get_plot_export_owner_user_id(db, job)
-    if owner_user_id is None or owner_user_id != int(session.user_id):
-        raise HTTPException(status_code=404, detail="Export job not found")
 
 
 def _set_plot_export_job_status(
@@ -4584,6 +4676,9 @@ def _set_plot_export_job_status(
     error_text: str | None = None,
     started: bool = False,
     completed: bool = False,
+    lease_token: str | None = None,
+    progress: int | None = None,
+    last_error_code: str | None = None,
 ):
     if status not in PLOT_EXPORT_JOB_STATUS_VALUES:
         raise ValueError(f"Unsupported plot export job status: {status}")
@@ -4602,32 +4697,62 @@ def _set_plot_export_job_status(
     if error_text is not None:
         updates.append("error_text = :error_text")
         params["error_text"] = error_text
-    db.execute(text(f"UPDATE plot_export_jobs SET {', '.join(updates)} WHERE id = :job_id"), params)
+    if progress is not None:
+        updates.append("progress = :progress")
+        params["progress"] = max(0, min(100, int(progress)))
+    if last_error_code is not None:
+        updates.append("last_error_code = :last_error_code")
+        params["last_error_code"] = str(last_error_code)
+    if status in {"completed", "failed"}:
+        # Terminal jobs must not retain an active lease. Keep cleanup in the same UPDATE so a
+        # stale worker cannot later appear to own a completed or failed job.
+        updates.extend([
+            "lease_owner = NULL",
+            "lease_token = NULL",
+            "lease_expires_at = NULL",
+            "heartbeat_at = NULL",
+        ])
+    where = "id = :job_id"
+    if lease_token is not None:
+        where += " AND lease_token = :lease_token"
+        params["lease_token"] = str(lease_token)
+        if status == "completed":
+            where += " AND cancel_requested_at IS NULL"
+    result = db.execute(text(f"UPDATE plot_export_jobs SET {', '.join(updates)} WHERE {where}"), params)
     db.commit()
+    return bool(getattr(result, "rowcount", 0))
 
 
 def sweep_stale_plot_export_jobs(db: Session, *, stale_after_minutes: int = 10) -> int:
-    """Marks any export job stuck in 'running' for longer than stale_after_minutes as failed.
+    """Requeue expired Survey export leases without touching active workers.
 
-    Background export jobs run in daemon threads with no server-side timeout of their own - if
-    one hangs (e.g. inside a stalled basemap tile fetch), it would otherwise sit in
-    status='running' forever with no way for the client to know it's dead. Python can't safely
-    force-cancel a running thread, so this doesn't stop the runaway thread itself, but it does
-    free the job's cache-key slot (_find_plot_export_job_by_cache_key already excludes 'failed'
-    jobs) so the next request for the same export starts a clean new attempt instead of polling
-    a job that will never complete.
+    The dedicated worker owns the lease. A job is eligible for recovery only after its explicit
+    lease expiry, or after the legacy ten-minute timeout when it predates the worker columns.
+    This does not interrupt a live render; lease-token fencing prevents a late worker from
+    overwriting a newer attempt.
     """
     result = db.execute(
         text(
             """
             UPDATE plot_export_jobs
-            SET status = 'failed',
-                error_text = 'Export timed out',
-                completed_at = NOW(),
+            SET status = 'queued',
+                available_at = NOW(),
+                lease_owner = NULL,
+                lease_token = NULL,
+                lease_expires_at = NULL,
+                heartbeat_at = NULL,
+                error_text = 'Export lease expired; queued for recovery.',
+                last_error_code = 'lease_expired',
                 updated_at = NOW()
             WHERE status = 'running'
-              AND started_at IS NOT NULL
-              AND started_at < NOW() - make_interval(mins => :stale_after_minutes)
+              AND (
+                    lease_expires_at < NOW()
+                    OR (
+                        lease_expires_at IS NULL
+                        AND COALESCE(heartbeat_at, started_at) IS NOT NULL
+                        AND COALESCE(heartbeat_at, started_at) < NOW() - make_interval(mins => :stale_after_minutes)
+                    )
+              )
             RETURNING id
             """
         ),
@@ -4679,6 +4804,15 @@ def _normalize_plot_export_job_payload(value: Any) -> dict[str, Any]:
         except Exception:
             return {}
     return {}
+
+
+def _with_plot_export_defaults(payload: dict[str, Any], defaults: dict[str, Any]) -> dict[str, Any]:
+    """Resolve FastAPI Body defaults before a queued job calls a route function directly."""
+    values = dict(defaults)
+    for key, value in payload.items():
+        if key in values and value is not None:
+            values[key] = value
+    return values
 
 
 def _build_plot_export_cache_key(
@@ -4865,7 +4999,7 @@ def _get_subdivision_batch_clean_copy_context(
     cache_hash = hashlib.sha1(json.dumps(cache_key_payload, sort_keys=True).encode("utf-8")).hexdigest()[:12]
     estate_tag = _safe_filename_fragment(str(batch_row.get("estate_name") or ""), f"batch_{batch_id}")
     pdf_name = f"{estate_tag}_clean_copy_batch_{batch_id}_{cache_hash}.pdf"
-    cache_dir = os.path.join(REPORTS_DIR, "subdivision_clean_copy")
+    cache_dir = os.path.join(SURVEY_EXPORT_SHARED_DIR, "subdivision_clean_copy")
     os.makedirs(cache_dir, exist_ok=True)
     cached_pdf_path = os.path.join(cache_dir, pdf_name)
     return {
@@ -4913,13 +5047,17 @@ def _generate_subdivision_batch_clean_copy_pdf(
 
     parent_plot_id = int(context.get("parent_plot_id") or 0)
     parent_poly_wgs84 = _load_plot_polygon_wgs84(db, parent_plot_id)
+    temporary_pdf_path = os.path.join(
+        os.path.dirname(cached_pdf_path),
+        f".{os.path.basename(cached_pdf_path)}.{uuid.uuid4().hex}.tmp",
+    )
     try:
         _render_subdivision_clean_copy_pdf(
             db=db,
             parent_plot_id=parent_plot_id,
             parent_poly_wgs84=parent_poly_wgs84,
             child_rows=list(context.get("child_rows") or []),
-            output_pdf_path=cached_pdf_path,
+            output_pdf_path=temporary_pdf_path,
             title_text=str(context.get("title_text") or ""),
             paper_size=str(context.get("paper_size") or "A4"),
             scale_text=str(context.get("scale_text") or "1 : 1000"),
@@ -4944,26 +5082,47 @@ def _generate_subdivision_batch_clean_copy_pdf(
             bearing_size=context.get("bearing_size") or None,
             area_overrides=dict(context.get("area_overrides") or {}),
         )
+        if not os.path.isfile(temporary_pdf_path):
+            raise RuntimeError("Clean copy renderer did not produce an output file.")
+        os.replace(temporary_pdf_path, cached_pdf_path)
     except HTTPException:
+        safe_remove(temporary_pdf_path)
         raise
     except Exception as exc:
-        safe_remove(cached_pdf_path)
+        safe_remove(temporary_pdf_path)
         raise HTTPException(status_code=500, detail=f"Failed to export clean copy PDF: {exc}") from exc
 
     return cached_pdf_path
 
 
 @_limit_plot_export_concurrency
-def _run_subdivision_batch_export_job(job_id: str):
+def _run_subdivision_batch_export_job(
+    job_id: str,
+    *,
+    lease_token: str | None = None,
+    mark_failure: bool = True,
+):
     db, slot_key = _acquire_plot_export_slot()
     try:
         job = _get_plot_export_job(db, job_id)
         if not job:
             return
+        if job.get("owner_user_id") is None:
+            raise RuntimeError("Survey export job has no owner scope.")
+        set_survey_user_context(db, int(job["owner_user_id"]))
         batch_id = int(job.get("subdivision_batch_id") or 0)
         if batch_id <= 0:
             raise RuntimeError("Subdivision batch export job is missing a batch id.")
-        _set_plot_export_job_status(db, job_id, status="running", started=True, error_text="")
+        if not _set_plot_export_job_status(
+            db,
+            job_id,
+            status="running",
+            started=True,
+            error_text="",
+            lease_token=lease_token,
+            progress=1,
+        ):
+            raise RuntimeError("Survey export lease is no longer active.")
         context = _get_subdivision_batch_export_context(db, batch_id)
         export_path, _cleanup_dir = _generate_subdivision_batch_zip(
             db,
@@ -4973,7 +5132,7 @@ def _run_subdivision_batch_export_job(job_id: str):
             cached_zip_path=context["cached_zip_path"],
             require_cached_copy=True,
         )
-        _set_plot_export_job_status(
+        if not _set_plot_export_job_status(
             db,
             job_id,
             status="completed",
@@ -4981,29 +5140,60 @@ def _run_subdivision_batch_export_job(job_id: str):
             file_name=context["zip_name"],
             error_text="",
             completed=True,
-        )
+            lease_token=lease_token,
+            progress=100,
+            last_error_code="",
+        ):
+            raise RuntimeError("Survey export lease expired before completion was recorded.")
     except Exception as exc:
-        try:
-            _set_plot_export_job_status(db, job_id, status="failed", error_text=str(exc), completed=True)
-        except Exception:
-            db.rollback()
+        if mark_failure:
+            try:
+                _set_plot_export_job_status(
+                    db,
+                    job_id,
+                    status="failed",
+                    error_text=str(exc),
+                    completed=True,
+                    lease_token=lease_token,
+                )
+            except Exception:
+                db.rollback()
+        else:
+            raise
     finally:
         _release_plot_export_slot(db, slot_key)
         db.close()
 
 
 @_limit_plot_export_concurrency
-def _run_subdivision_batch_clean_copy_export_job(job_id: str):
+def _run_subdivision_batch_clean_copy_export_job(
+    job_id: str,
+    *,
+    lease_token: str | None = None,
+    mark_failure: bool = True,
+):
     db, slot_key = _acquire_plot_export_slot()
     try:
         job = _get_plot_export_job(db, job_id)
         if not job:
             return
+        if job.get("owner_user_id") is None:
+            raise RuntimeError("Survey export job has no owner scope.")
+        set_survey_user_context(db, int(job["owner_user_id"]))
         batch_id = int(job.get("subdivision_batch_id") or 0)
         if batch_id <= 0:
             raise RuntimeError("Subdivision clean copy export job is missing a batch id.")
         payload = _normalize_plot_export_job_payload(job.get("request_payload"))
-        _set_plot_export_job_status(db, job_id, status="running", started=True, error_text="")
+        if not _set_plot_export_job_status(
+            db,
+            job_id,
+            status="running",
+            started=True,
+            error_text="",
+            lease_token=lease_token,
+            progress=1,
+        ):
+            raise RuntimeError("Survey export lease is no longer active.")
         context = _get_subdivision_batch_clean_copy_context(
             db,
             batch_id=batch_id,
@@ -5031,7 +5221,7 @@ def _run_subdivision_batch_clean_copy_export_job(job_id: str):
             bearing_size=payload.get("bearing_size") or None,
         )
         export_path = _generate_subdivision_batch_clean_copy_pdf(db, context=context)
-        _set_plot_export_job_status(
+        if not _set_plot_export_job_status(
             db,
             job_id,
             status="completed",
@@ -5039,12 +5229,26 @@ def _run_subdivision_batch_clean_copy_export_job(job_id: str):
             file_name=str(context.get("pdf_name") or "subdivision_clean_copy.pdf"),
             error_text="",
             completed=True,
-        )
+            lease_token=lease_token,
+            progress=100,
+            last_error_code="",
+        ):
+            raise RuntimeError("Survey export lease expired before completion was recorded.")
     except Exception as exc:
-        try:
-            _set_plot_export_job_status(db, job_id, status="failed", error_text=str(exc), completed=True)
-        except Exception:
-            db.rollback()
+        if mark_failure:
+            try:
+                _set_plot_export_job_status(
+                    db,
+                    job_id,
+                    status="failed",
+                    error_text=str(exc),
+                    completed=True,
+                    lease_token=lease_token,
+                )
+            except Exception:
+                db.rollback()
+        else:
+            raise
     finally:
         _release_plot_export_slot(db, slot_key)
         db.close()
@@ -5091,7 +5295,7 @@ def create_subdivision_batch_export_job(
     db: Session = Depends(get_db),
 ):
     context = _get_subdivision_batch_export_context(db, batch_id)
-    _require_subdivision_batch_export_access(
+    authenticated_user_id = _require_subdivision_batch_export_access(
         db,
         request,
         int(context["batch"].get("parent_plot_id") or 0) or None,
@@ -5130,6 +5334,10 @@ def create_subdivision_batch_export_job(
         return _serialize_plot_export_job(dict(existing), request=request)
 
     job_id = uuid.uuid4().hex
+    owner_user_id = (
+        _get_plot_owner_user_id(db, int(context["batch"].get("parent_plot_id") or 0))
+        or authenticated_user_id
+    )
     if os.path.isfile(context["cached_zip_path"]):
         db.execute(
             text(
@@ -5139,6 +5347,7 @@ def create_subdivision_batch_export_job(
                     export_type,
                     plot_id,
                     subdivision_batch_id,
+                    owner_user_id,
                     status,
                     file_name,
                     local_path,
@@ -5152,6 +5361,7 @@ def create_subdivision_batch_export_job(
                     'subdivision_batch_survey_plans',
                     :plot_id,
                     :batch_id,
+                    :owner_user_id,
                     'completed',
                     :file_name,
                     :local_path,
@@ -5166,6 +5376,7 @@ def create_subdivision_batch_export_job(
                 "id": job_id,
                 "plot_id": int(context["batch"].get("parent_plot_id") or 0) or None,
                 "batch_id": int(batch_id),
+                "owner_user_id": owner_user_id,
                 "file_name": context["zip_name"],
                 "local_path": context["cached_zip_path"],
             },
@@ -5182,6 +5393,7 @@ def create_subdivision_batch_export_job(
                 export_type,
                 plot_id,
                 subdivision_batch_id,
+                owner_user_id,
                 status,
                 file_name,
                 created_at,
@@ -5192,6 +5404,7 @@ def create_subdivision_batch_export_job(
                 'subdivision_batch_survey_plans',
                 :plot_id,
                 :batch_id,
+                :owner_user_id,
                 'queued',
                 :file_name,
                 NOW(),
@@ -5203,11 +5416,11 @@ def create_subdivision_batch_export_job(
             "id": job_id,
             "plot_id": int(context["batch"].get("parent_plot_id") or 0) or None,
             "batch_id": int(batch_id),
+            "owner_user_id": owner_user_id,
             "file_name": context["zip_name"],
         },
     )
     db.commit()
-    threading.Thread(target=_run_subdivision_batch_export_job, args=(job_id,), daemon=True).start()
     job = _get_plot_export_job(db, job_id)
     return _serialize_plot_export_job(job or {"id": job_id, "status": "queued"}, request=request)
 
@@ -5223,6 +5436,34 @@ def get_plot_export_job_status(
         raise HTTPException(status_code=404, detail="Plot export job not found.")
     _require_plot_export_job_access(db, request, job)
     return _serialize_plot_export_job(job, request=request)
+
+
+@router.post("/export-jobs/{job_id}/cancel")
+def cancel_plot_export_job(
+    job_id: str,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    job = _get_plot_export_job(db, job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Plot export job not found.")
+    _require_plot_export_job_access(db, request, job)
+    status = str(job.get("status") or "").strip().lower()
+    if status in {"completed", "failed"}:
+        return _serialize_plot_export_job(job, request=request)
+    db.execute(
+        text(
+            """
+            UPDATE plot_export_jobs
+            SET cancel_requested_at = NOW(), updated_at = NOW()
+            WHERE id = :job_id AND status IN ('queued', 'running')
+            """
+        ),
+        {"job_id": str(job_id)},
+    )
+    db.commit()
+    refreshed = _get_plot_export_job(db, job_id) or job
+    return _serialize_plot_export_job(refreshed, request=request)
 
 
 @router.get("/export-jobs/{job_id}/download", name="download_plot_export_job")
@@ -5279,18 +5520,45 @@ def _cache_single_plot_export_file(
     source_path: str,
     file_name: str,
 ) -> str:
-    cache_dir = os.path.join(REPORTS_DIR, "export_jobs", str(int(plot_id)))
+    shared_root = os.path.realpath(os.path.abspath(SURVEY_EXPORT_SHARED_DIR))
+    cache_dir = os.path.realpath(os.path.join(shared_root, str(int(plot_id))))
+    if os.path.commonpath([shared_root, cache_dir]) != shared_root:
+        raise RuntimeError("Survey export cache path escapes the shared export directory.")
     os.makedirs(cache_dir, exist_ok=True)
     safe_export_type = re.sub(r"[^a-z0-9]+", "_", str(export_type or "").strip().lower()).strip("_") or "export"
-    ext = os.path.splitext(str(file_name or source_path))[1] or os.path.splitext(source_path)[1] or ".bin"
+    ext = os.path.splitext(os.path.basename(str(file_name or source_path)))[1].lower()
+    if not re.fullmatch(r"\.[a-z0-9]{1,10}", ext):
+        ext = os.path.splitext(os.path.basename(source_path))[1].lower()
+    if not re.fullmatch(r"\.[a-z0-9]{1,10}", ext):
+        ext = ".bin"
     cache_path = os.path.join(cache_dir, f"{safe_export_type}_{str(cache_key or '')[:12]}{ext}")
     if os.path.abspath(source_path) != os.path.abspath(cache_path):
-        shutil.copyfile(source_path, cache_path)
+        _atomic_copy_export_file(source_path, cache_path)
     return cache_path
 
 
+def _atomic_copy_export_file(source_path: str, destination_path: str) -> None:
+    """Publish an export by rename, never by exposing a partially copied destination."""
+    destination_dir = os.path.realpath(os.path.dirname(destination_path))
+    os.makedirs(destination_dir, exist_ok=True)
+    temporary_path = os.path.join(
+        destination_dir,
+        f".{os.path.basename(destination_path)}.{uuid.uuid4().hex}.tmp",
+    )
+    try:
+        shutil.copyfile(source_path, temporary_path)
+        os.replace(temporary_path, destination_path)
+    finally:
+        safe_remove(temporary_path)
+
+
 @_limit_plot_export_concurrency
-def _run_single_plot_export_job(job_id: str):
+def _run_single_plot_export_job(
+    job_id: str,
+    *,
+    lease_token: str | None = None,
+    mark_failure: bool = True,
+):
     db, slot_key = _acquire_plot_export_slot()
     source_path = ""
     cleanup_dir = ""
@@ -5298,29 +5566,152 @@ def _run_single_plot_export_job(job_id: str):
         job = _get_plot_export_job(db, job_id)
         if not job:
             return
+        if job.get("owner_user_id") is None:
+            raise RuntimeError("Survey export job has no owner scope.")
+        set_survey_user_context(db, int(job["owner_user_id"]))
         plot_id = int(job.get("plot_id") or 0)
         if plot_id <= 0:
             raise RuntimeError("Plot export job is missing a plot id.")
         export_type = str(job.get("export_type") or "").strip().lower()
         cache_key = str(job.get("cache_key") or "").strip()
         payload = _normalize_plot_export_job_payload(job.get("request_payload"))
-        _set_plot_export_job_status(db, job_id, status="running", started=True, error_text="")
+        if not _set_plot_export_job_status(
+            db,
+            job_id,
+            status="running",
+            started=True,
+            error_text="",
+            lease_token=lease_token,
+            progress=1,
+        ):
+            raise RuntimeError("Survey export lease is no longer active.")
         response = None
         if export_type == "survey-plan.pdf":
-            response = download_plot_report_pdf(plot_id=plot_id, db=db, background_tasks=None, **payload)
+            response = download_plot_report_pdf(
+                plot_id=plot_id,
+                db=db,
+                background_tasks=None,
+                **_with_plot_export_defaults(
+                    payload,
+                    {
+                        "title_text": "SURVEY PLAN",
+                        "location_text": "",
+                        "lga_text": "",
+                        "state_text": "",
+                        "scale_text": "1 : 1000",
+                        "surveyor_name": "",
+                        "surveyor_rank": "",
+                        "certification_statement": DEFAULT_CERTIFICATION_STATEMENT,
+                        "station_names": [],
+                        "coordinate_system": "wgs84",
+                        "paper_size": "A4",
+                        "north_arrow_style": "one_side_stem",
+                        "north_arrow_color": "blue",
+                        "beacon_style": "cross",
+                        "road_width_m": None,
+                        "road_width_override_m": None,
+                        "boundary_color": None,
+                        "grid_color": None,
+                        "text_color": None,
+                        "road_color": None,
+                        "river_color": None,
+                        "building_color": None,
+                        "building_hatch_type": None,
+                        "road_style": None,
+                        "title_font": None,
+                        "title_size": None,
+                        "grid_font": None,
+                        "grid_size": None,
+                        "station_font": None,
+                        "station_size": None,
+                        "bearing_font": None,
+                        "bearing_size": None,
+                        "area_font": None,
+                        "area_size": None,
+                        "template_name": DEFAULT_TEMPLATE_NAME,
+                        "adamawa_rof_no": "",
+                        "adamawa_owner_name": "",
+                        "adamawa_authority_title": DEFAULT_ADAMAWA_AUTHORITY_TITLE,
+                        "adamawa_authority_date_text": DEFAULT_ADAMAWA_AUTHORITY_DATE,
+                        "adamawa_control_point_name": "",
+                        "adamawa_northing": "",
+                        "adamawa_easting": "",
+                        "adamawa_elevation": "",
+                        "adamawa_origin_text": DEFAULT_ADAMAWA_ORIGIN_TEXT,
+                        "adamawa_topo_sheet_text": DEFAULT_ADAMAWA_TOPO_SHEET_TEXT,
+                        "adamawa_computation_no": "",
+                        "adamawa_cadastral_sheet_no": "",
+                        "adamawa_plan_no": "",
+                        "adamawa_surveyed_by_text": "",
+                        "adamawa_disclaimer_text": DEFAULT_ADAMAWA_DISCLAIMER_TEXT,
+                        "cadastral_plan_no": "",
+                        "cadastral_area_name": "",
+                        "cadastral_datum_text": "",
+                        "cadastral_firm_block_text": "",
+                        "fct_file_no": "",
+                        "fct_district": "",
+                        "fct_cadastral_zone": "",
+                        "fct_origin_beacon_text": "",
+                        "fct_cadastral_map_ref": "",
+                        "fct_title_prefix": "",
+                        "survey_input_coordinates": None,
+                    },
+                ),
+            )
         elif export_type == "orthophoto.pdf":
-            response = orthophoto_pdf(plot_id=plot_id, db=db, background_tasks=None, **payload)
-        elif export_type == "topomap.pdf":
             response = orthophoto_pdf(
                 plot_id=plot_id,
                 db=db,
                 background_tasks=None,
-                **{
-                    **payload,
+                **_with_plot_export_defaults(
+                    payload,
+                    {
+                        "title_text": "ORTHOPHOTO",
+                        "location_text": "",
+                        "lga_text": "",
+                        "state_text": "",
+                        "scale_text": "1 : 1000",
+                        "surveyor_name": "",
+                        "surveyor_rank": "",
+                        "station_names": [],
+                        "coordinate_system": "wgs84",
+                        "paper_size": "A4",
+                        "use_topo_map": False,
+                        "topo_source": "opentopomap",
+                        "contour_interval": None,
+                        "elevation_points": [],
+                        "building_hatch_type": "solid",
+                        "north_arrow_style": "one_side_stem",
+                        "north_arrow_color": "blue",
+                    },
+                ),
+            )
+        elif export_type == "topomap.pdf":
+            topomap_payload = _with_plot_export_defaults(
+                payload,
+                {
+                    "title_text": "TOPO MAP",
+                    "location_text": "",
+                    "lga_text": "",
+                    "state_text": "",
+                    "scale_text": "1 : 1000",
+                    "surveyor_name": "",
+                    "surveyor_rank": "",
+                    "station_names": [],
+                    "coordinate_system": "wgs84",
+                    "paper_size": "A4",
                     "use_topo_map": True,
-                    "title_text": str(payload.get("title_text") or "TOPO MAP"),
+                    "topo_source": "opentopomap",
+                    "contour_interval": None,
+                    "elevation_points": [],
+                    "building_hatch_type": "solid",
+                    "north_arrow_style": "one_side_stem",
+                    "north_arrow_color": "blue",
                 },
             )
+            topomap_payload["use_topo_map"] = True
+            topomap_payload["title_text"] = str(payload.get("title_text") or "TOPO MAP")
+            response = orthophoto_pdf(plot_id=plot_id, db=db, background_tasks=None, **topomap_payload)
         elif export_type == "survey-plan.dxf":
             response = download_survey_plan_dwg(plot_id=plot_id, db=db)
         elif export_type == "survey-plan.shapefile":
@@ -5332,7 +5723,14 @@ def _run_single_plot_export_job(job_id: str):
                 plot_id=plot_id,
                 db=db,
                 background_tasks=None,
-                **payload,
+                **_with_plot_export_defaults(
+                    payload,
+                    {
+                        "coordinate_system": "wgs84",
+                        "station_names": [],
+                        "survey_input_coordinates": None,
+                    },
+                ),
             )
         elif export_type == "technical-report.docx":
             response = download_plot_technical_report_docx(plot_id=plot_id, db=db, **payload)
@@ -5352,6 +5750,7 @@ def _run_single_plot_export_job(job_id: str):
             "survey-plan.pdf",
             "orthophoto.pdf",
             "topomap.pdf",
+            "survey-plan.dxf",
             "survey-plan.shapefile",
             "back-computation.pdf",
             "technical-report.docx",
@@ -5363,7 +5762,7 @@ def _run_single_plot_export_job(job_id: str):
                 source_path=source_path,
                 file_name=file_name,
             )
-        _set_plot_export_job_status(
+        if not _set_plot_export_job_status(
             db,
             job_id,
             status="completed",
@@ -5371,12 +5770,26 @@ def _run_single_plot_export_job(job_id: str):
             file_name=file_name,
             error_text="",
             completed=True,
-        )
+            lease_token=lease_token,
+            progress=100,
+            last_error_code="",
+        ):
+            raise RuntimeError("Survey export lease expired before completion was recorded.")
     except Exception as exc:
-        try:
-            _set_plot_export_job_status(db, job_id, status="failed", error_text=str(exc), completed=True)
-        except Exception:
-            db.rollback()
+        if mark_failure:
+            try:
+                _set_plot_export_job_status(
+                    db,
+                    job_id,
+                    status="failed",
+                    error_text=str(exc),
+                    completed=True,
+                    lease_token=lease_token,
+                )
+            except Exception:
+                db.rollback()
+        else:
+            raise
     finally:
         if cleanup_dir:
             safe_rmtree(cleanup_dir)
@@ -5413,6 +5826,13 @@ def _insert_single_plot_export_job(
         return existing
 
     job_id = uuid.uuid4().hex
+    current_user_id = _get_current_survey_user_id(db)
+    if current_user_id is None:
+        raise HTTPException(status_code=401, detail="Sign in to create a Survey export")
+    plot_owner_user_id = _get_plot_owner_user_id(db, int(plot_id))
+    if plot_owner_user_id is not None and plot_owner_user_id != current_user_id:
+        raise HTTPException(status_code=404, detail="Plot not found")
+    owner_user_id = plot_owner_user_id or current_user_id
     try:
         db.execute(
             text(
@@ -5421,6 +5841,7 @@ def _insert_single_plot_export_job(
                     id,
                     export_type,
                     plot_id,
+                    owner_user_id,
                     cache_key,
                     status,
                     file_name,
@@ -5432,6 +5853,7 @@ def _insert_single_plot_export_job(
                     :id,
                     :export_type,
                     :plot_id,
+                    :owner_user_id,
                     :cache_key,
                     'queued',
                     :file_name,
@@ -5445,6 +5867,7 @@ def _insert_single_plot_export_job(
                 "id": job_id,
                 "export_type": export_type,
                 "plot_id": int(plot_id),
+                "owner_user_id": owner_user_id,
                 "cache_key": cache_key,
                 "file_name": file_name,
                 "request_payload": json.dumps(request_payload or {}),
@@ -5464,7 +5887,6 @@ def _insert_single_plot_export_job(
         if existing:
             return existing
         raise
-    threading.Thread(target=_run_single_plot_export_job, args=(job_id,), daemon=True).start()
     return _get_plot_export_job(db, job_id) or {"id": job_id, "status": "queued"}
 
 
@@ -5893,8 +6315,6 @@ def create_subdivision_batch_clean_copy_export_job(
     bearing_font: str | None = Body(None),
     bearing_size: int | None = Body(None),
 ):
-    # The context below is needed for the output name and parent plot id, but it is not an
-    # authorization boundary by itself.
     payload = {
         "title_text": str(title_text or ""),
         "area_labels": area_labels if isinstance(area_labels, list) else [],
@@ -5945,7 +6365,7 @@ def create_subdivision_batch_clean_copy_export_job(
         bearing_font=bearing_font,
         bearing_size=bearing_size,
     )
-    _require_subdivision_batch_export_access(
+    authenticated_user_id = _require_subdivision_batch_export_access(
         db,
         request,
         int(context.get("parent_plot_id") or 0) or None,
@@ -5986,6 +6406,10 @@ def create_subdivision_batch_clean_copy_export_job(
         return _serialize_plot_export_job(dict(existing), request=request)
 
     job_id = uuid.uuid4().hex
+    owner_user_id = (
+        _get_plot_owner_user_id(db, int(context.get("parent_plot_id") or 0))
+        or authenticated_user_id
+    )
     if os.path.isfile(str(context.get("cached_pdf_path") or "").strip()):
         db.execute(
             text(
@@ -5995,6 +6419,7 @@ def create_subdivision_batch_clean_copy_export_job(
                     export_type,
                     plot_id,
                     subdivision_batch_id,
+                    owner_user_id,
                     status,
                     file_name,
                     local_path,
@@ -6009,6 +6434,7 @@ def create_subdivision_batch_clean_copy_export_job(
                     'subdivision_batch_clean_copy_pdf',
                     :plot_id,
                     :batch_id,
+                    :owner_user_id,
                     'completed',
                     :file_name,
                     :local_path,
@@ -6024,6 +6450,7 @@ def create_subdivision_batch_clean_copy_export_job(
                 "id": job_id,
                 "plot_id": int(context.get("parent_plot_id") or 0) or None,
                 "batch_id": int(batch_id),
+                "owner_user_id": owner_user_id,
                 "file_name": str(context.get("pdf_name") or "subdivision_clean_copy.pdf"),
                 "local_path": str(context.get("cached_pdf_path") or ""),
                 "request_payload": json.dumps(payload),
@@ -6041,6 +6468,7 @@ def create_subdivision_batch_clean_copy_export_job(
                 export_type,
                 plot_id,
                 subdivision_batch_id,
+                owner_user_id,
                 status,
                 file_name,
                 request_payload,
@@ -6052,6 +6480,7 @@ def create_subdivision_batch_clean_copy_export_job(
                 'subdivision_batch_clean_copy_pdf',
                 :plot_id,
                 :batch_id,
+                :owner_user_id,
                 'queued',
                 :file_name,
                 CAST(:request_payload AS JSONB),
@@ -6064,12 +6493,12 @@ def create_subdivision_batch_clean_copy_export_job(
             "id": job_id,
             "plot_id": int(context.get("parent_plot_id") or 0) or None,
             "batch_id": int(batch_id),
+            "owner_user_id": owner_user_id,
             "file_name": str(context.get("pdf_name") or "subdivision_clean_copy.pdf"),
             "request_payload": json.dumps(payload),
         },
     )
     db.commit()
-    threading.Thread(target=_run_subdivision_batch_clean_copy_export_job, args=(job_id,), daemon=True).start()
     job = _get_plot_export_job(db, job_id)
     return _serialize_plot_export_job(job or {"id": job_id, "status": "queued"}, request=request)
 

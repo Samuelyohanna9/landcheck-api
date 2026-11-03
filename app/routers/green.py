@@ -107,6 +107,7 @@ from app.utils.auth_security import (
     revoke_request_session,
     verify_totp_code,
 )
+from app.utils.schema_bootstrap import require_table, runtime_schema_bootstrap_enabled
 from app.utils.http_security import GREEN_SESSION_COOKIE, clear_session_cookie, request_uses_browser_auth, set_session_cookie
 from app.utils.carbon import (
     compute_project_carbon,
@@ -692,6 +693,12 @@ def _ensure_green_schema_ready(db: Session):
 
     with _GREEN_SCHEMA_BOOTSTRAP_LOCK:
         if _GREEN_SCHEMA_READY:
+            return
+
+        if not runtime_schema_bootstrap_enabled():
+            for table_name in ("green_organizations", "tree_projects", "trees", "green_users", "green_sponsor_accounts", "green_work_orders"):
+                require_table(db, table_name)
+            _GREEN_SCHEMA_READY = True
             return
 
         advisory_lock_acquired = False

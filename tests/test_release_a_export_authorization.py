@@ -15,11 +15,11 @@ os.environ.setdefault(
 from app.routers import plots
 
 
-def test_clean_release_reads_only_existing_export_job_columns():
+def test_release_b_reads_worker_export_job_columns_after_migration():
     source = inspect.getsource(plots._get_plot_export_job)
-    assert "owner_user_id" not in source
-    assert "attempt_count" not in source
-    assert "lease_token" not in source
+    assert "owner_user_id" in source
+    assert "attempt_count" in source
+    assert "lease_token" in source
 
 
 def test_status_and_download_require_source_owner(monkeypatch):

@@ -7,6 +7,7 @@ from datetime import datetime
 
 from app.db import SessionLocal
 from app.utils.survey_auth_security import require_survey_session
+from app.utils.schema_bootstrap import require_table, runtime_schema_bootstrap_enabled
 
 router = APIRouter(prefix="/feedback", tags=["feedback"])
 
@@ -21,6 +22,9 @@ def get_db():
 
 # Ensure feedback table exists
 def ensure_feedback_table(db: Session):
+    if not runtime_schema_bootstrap_enabled():
+        require_table(db, "feedback")
+        return
     db.execute(text("""
         CREATE TABLE IF NOT EXISTS feedback (
             id SERIAL PRIMARY KEY,
@@ -78,6 +82,9 @@ def submit_feedback(
 
 
 def ensure_support_messages_table(db: Session):
+    if not runtime_schema_bootstrap_enabled():
+        require_table(db, "survey_support_messages")
+        return
     db.execute(text("""
         CREATE TABLE IF NOT EXISTS survey_support_messages (
             id SERIAL PRIMARY KEY,

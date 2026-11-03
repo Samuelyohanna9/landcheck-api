@@ -10,6 +10,7 @@ from typing import Any, Dict, Optional
 import requests
 from sqlalchemy import text
 from sqlalchemy.orm import Session
+from app.utils.schema_bootstrap import require_table, runtime_schema_bootstrap_enabled
 
 logger = logging.getLogger(__name__)
 
@@ -186,6 +187,9 @@ def assess_tree_health(image_bytes: bytes, content_type: str, species: Optional[
 
 
 def ensure_tree_health_schema(db: Session) -> None:
+    if not runtime_schema_bootstrap_enabled():
+        require_table(db, "green_tree_health_checks")
+        return
     db.execute(text("""
         CREATE TABLE IF NOT EXISTS green_tree_health_checks (
             id SERIAL PRIMARY KEY,

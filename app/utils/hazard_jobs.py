@@ -11,7 +11,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from app.utils.survey_auth_security import ensure_survey_auth_schema
-from app.utils.row_security import ensure_survey_row_security
+from app.utils.schema_bootstrap import require_table, runtime_schema_bootstrap_enabled
 
 HAZARD_JOB_STATUS_VALUES = {"queued", "running", "completed", "failed"}
 
@@ -43,6 +43,10 @@ def ensure_hazard_analysis_jobs_table(db: Session) -> None:
         return
     with _HAZARD_JOBS_TABLE_LOCK:
         if _HAZARD_JOBS_TABLE_READY:
+            return
+        if not runtime_schema_bootstrap_enabled():
+            require_table(db, "hazard_analysis_jobs")
+            _HAZARD_JOBS_TABLE_READY = True
             return
         # owner_user_id below references survey_users - make sure that table exists first,
         # since this can run before any Survey auth endpoint ever has (e.g. the very first
@@ -83,7 +87,6 @@ def ensure_hazard_analysis_jobs_table(db: Session) -> None:
             "ON hazard_analysis_jobs(owner_user_id, created_at DESC)"
         ))
         db.commit()
-        ensure_survey_row_security(db)
         _HAZARD_JOBS_TABLE_READY = True
 
 
@@ -93,7 +96,7 @@ def insert_hazard_job(
     hazard_type: str,
     output_type: str,
     request_payload: Dict[str, Any],
-    worker: Callable[[str], None],
+    worker: Callable[[str, Optional[int]], None],
     owner_user_id: Optional[int] = None,
 ) -> Dict[str, Any]:
     ensure_hazard_analysis_jobs_table(db)
@@ -112,7 +115,11 @@ def insert_hazard_job(
         "owner_user_id": owner_user_id,
     })
     db.commit()
-    (_BULK_LANE if hazard_type in _BULK_JOB_TYPES else _INTERACTIVE_LANE).submit(worker, job_id)
+    (_BULK_LANE if hazard_type in _BULK_JOB_TYPES else _INTERACTIVE_LANE).submit(
+        worker,
+        job_id,
+        owner_user_id,
+    )
     return get_hazard_job(db, job_id) or {"id": job_id, "status": "queued"}
 
 

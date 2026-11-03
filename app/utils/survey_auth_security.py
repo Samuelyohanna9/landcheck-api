@@ -14,6 +14,7 @@ from sqlalchemy.orm import Session
 
 from app.db import engine
 from app.utils.http_security import SURVEY_SESSION_COOKIE, cookie_token
+from app.utils.schema_bootstrap import require_table, runtime_schema_bootstrap_enabled
 
 # Parallel to app.utils.auth_security's Green auth pattern (hashed opaque tokens, SES-style
 # session ids, expiry-based sessions) but against its own tables - issue_auth_session /
@@ -58,6 +59,12 @@ def ensure_survey_auth_schema() -> None:
         return
     with _SURVEY_AUTH_SCHEMA_LOCK:
         if _SURVEY_AUTH_SCHEMA_READY:
+            return
+        if not runtime_schema_bootstrap_enabled():
+            with engine.connect() as connection:
+                for table_name in ("survey_users", "survey_auth_sessions", "survey_magic_link_tokens"):
+                    require_table(connection, table_name)
+            _SURVEY_AUTH_SCHEMA_READY = True
             return
         with engine.begin() as connection:
             connection.execute(

@@ -10,6 +10,7 @@ from sqlalchemy.orm import Session
 
 from app.db import SessionLocal, engine
 from app.utils.auth_security import AuthSessionContext
+from app.utils.schema_bootstrap import require_table, runtime_schema_bootstrap_enabled
 
 _ACTIVITY_LOG_SCHEMA_READY = False
 _ACTIVITY_LOG_SCHEMA_LOCK = Lock()
@@ -51,6 +52,11 @@ def ensure_activity_log_table() -> None:
         return
     with _ACTIVITY_LOG_SCHEMA_LOCK:
         if _ACTIVITY_LOG_SCHEMA_READY:
+            return
+        if not runtime_schema_bootstrap_enabled():
+            with engine.connect() as connection:
+                require_table(connection, "green_activity_logs")
+            _ACTIVITY_LOG_SCHEMA_READY = True
             return
         with engine.begin() as connection:
             connection.execute(
