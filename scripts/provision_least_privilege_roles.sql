@@ -53,6 +53,17 @@ ALTER DEFAULT PRIVILEGES FOR ROLE landcheck_migrator IN SCHEMA public
 ALTER DEFAULT PRIVILEGES FOR ROLE landcheck_migrator IN SCHEMA public
     GRANT USAGE, SELECT, UPDATE ON SEQUENCES TO landcheck_api, landcheck_survey_worker;
 
+-- Alembic's metadata table may predate the dedicated migrator and therefore remain owned by
+-- the legacy administrator.  The migrator needs only version-table DML to advance the release;
+-- it does not need ownership or broad privileges on unrelated application tables.
+DO $$
+BEGIN
+    IF to_regclass('public.alembic_version') IS NOT NULL THEN
+        EXECUTE 'GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE public.alembic_version TO landcheck_migrator';
+    END IF;
+END
+$$;
+
 -- Tenant-protected Survey tables and queue metadata are owned by the migration role, never by the
 -- runtime roles.  Missing optional legacy tables are skipped so this remains safe on an older
 -- staging restore; the release preflight must still fail if a required runtime table is absent.
