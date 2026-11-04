@@ -1907,7 +1907,7 @@ def _csv_coordinate_pair(record: dict) -> tuple[object, object] | None:
 
 
 @router.post("/{estate_id}/import-reviews/csv")
-async def import_estate_csv(estate_id: int, request: Request, source_crs: str | None = None, file: UploadFile = File(...), db: Session = Depends(get_db)):
+async def import_estate_csv(estate_id: int, request: Request, source_crs: str | None = None, as_boundary: bool = False, file: UploadFile = File(...), db: Session = Depends(get_db)):
     estate=db.get(Estate,estate_id)
     if not estate: raise HTTPException(404,"Estate not found")
     access=require_estate_access_for_estate(db, request, estate.id,permission="plot.manage")
@@ -1925,6 +1925,38 @@ async def import_estate_csv(estate_id: int, request: Request, source_crs: str | 
                 candidates.append(_import_candidate(row_number=index, plot_number=str(record.get("plotnumber") or ""), geometry=geometry))
             except Exception:
                 candidates.append({"row": index, "plot_number": str(record.get("plotnumber") or "").strip(), "valid": False, "issues": ["geometry must be a GeoJSON Polygon"]})
+    elif as_boundary:
+        # A boundary-only CSV is just one ordered list of outline vertices - there is no
+        # plot_number column to group rows by (that's the per-plot shape below), so every row
+        # with usable coordinates becomes a vertex of the single boundary ring in file order.
+        try:
+            coordinate_transformer = Transformer.from_crs((source_crs or "EPSG:4326").strip(), "EPSG:4326", always_xy=True)
+        except Exception as exc:
+            raise HTTPException(status_code=422, detail="CSV source_crs is invalid") from exc
+        boundary_points: list[list[float]] = []
+        first_row: int | None = None
+        for index, record in enumerate(records, 1):
+            x_value = _first_csv_value(record, _CSV_X_KEYS)
+            y_value = _first_csv_value(record, _CSV_Y_KEYS)
+            if x_value in (None, "") or y_value in (None, ""):
+                coordinate_pair = _csv_coordinate_pair(record)
+                if coordinate_pair:
+                    x_value, y_value = coordinate_pair
+            try:
+                if x_value in (None, "") or y_value in (None, ""):
+                    raise ValueError
+                x, y = coordinate_transformer.transform(float(x_value), float(y_value))
+            except (TypeError, ValueError):
+                candidates.append({"row": index, "plot_number": "", "valid": False, "issues": ["CSV rows require longitude/latitude (or x/y) coordinates"]})
+                continue
+            boundary_points.append([x, y])
+            if first_row is None:
+                first_row = index
+        if len(boundary_points) >= 3:
+            ring = boundary_points if boundary_points[0] == boundary_points[-1] else boundary_points + [boundary_points[0]]
+            candidates.append(_import_candidate(row_number=first_row or 1, plot_number="Estate boundary", geometry={"type": "Polygon", "coordinates": [ring]}))
+        else:
+            candidates.append({"row": first_row or 1, "plot_number": "", "valid": False, "issues": ["A boundary requires at least three coordinate rows"]})
     else:
         grouped: dict[str, list[list[float]]] = {}
         first_rows: dict[str, int] = {}
