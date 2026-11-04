@@ -154,7 +154,7 @@ ESTATE_LOOKUP_SELECT_TABLES: tuple[str, ...] = (
     "estate_canva_designs", "estate_notification_logs", "estate_marketing_optins", "estate_customers",
     "estate_estates", "estate_agent_portal_tokens", "estate_customer_portal_tokens",
     "estate_inspection_bookings", "estate_live_inspection_buyer_tokens", "estate_accounts",
-    "estate_social_posts", "estate_whatsapp_messages",
+    "estate_auth_sessions", "estate_organization_members", "estate_social_posts", "estate_whatsapp_messages",
 )
 # estate_organizations also needs INSERT under the 'lookup' bypass: registration creates a brand
 # new organization row, whose id can't already be in the (not-yet-known) allow-list.
@@ -277,13 +277,36 @@ def verify_estate_row_security(db: Session) -> None:
         f"{table}:lc_{table}_tenant_policy" for table in expected_tables
         if (table, f"lc_{table}_tenant_policy") not in installed
     ]
+    lookup_tables = ("estate_auth_sessions", "estate_organization_members")
+    lookup_policy_rows = db.execute(
+        text(
+            """
+            SELECT tablename, policyname
+            FROM pg_policies
+            WHERE schemaname = 'public'
+              AND tablename = ANY(:table_names)
+              AND policyname = ANY(:policy_names)
+            """
+        ),
+        {
+            "table_names": list(lookup_tables),
+            "policy_names": [f"lc_{name}_lookup_select_policy" for name in lookup_tables],
+        },
+    ).mappings().all()
+    installed_lookup = {(str(row["tablename"]), str(row["policyname"])) for row in lookup_policy_rows}
+    missing_lookup_policies = [
+        f"{table}:lc_{table}_lookup_select_policy" for table in lookup_tables
+        if (table, f"lc_{table}_lookup_select_policy") not in installed_lookup
+    ]
     not_enabled = [table for table in expected_tables if not bool(by_table[table]["rls_enabled"])]
-    if missing_policies or not_enabled:
+    if missing_policies or missing_lookup_policies or not_enabled:
         details = []
         if not_enabled:
             details.append("RLS disabled on " + ", ".join(not_enabled))
         if missing_policies:
             details.append("missing policies " + ", ".join(missing_policies))
+        if missing_lookup_policies:
+            details.append("missing lookup policies " + ", ".join(missing_lookup_policies))
         raise RuntimeError("Estate RLS verification failed: " + "; ".join(details))
 
 

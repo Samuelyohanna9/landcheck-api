@@ -114,6 +114,11 @@ def test_migration_installed_rls_on_every_table(admin_engine):
         verify_estate_row_security(session)
 
 
+def test_identity_bootstrap_lookup_policies_are_declared():
+    assert "estate_auth_sessions" in ESTATE_LOOKUP_SELECT_TABLES
+    assert "estate_organization_members" in ESTATE_LOOKUP_SELECT_TABLES
+
+
 def test_unset_context_is_fail_closed(restricted_sessionmaker, two_orgs):
     result = _query_as(restricted_sessionmaker, organization_ids="", bypass="", two_orgs=two_orgs)
     assert result["orgs"] == set()
@@ -143,6 +148,8 @@ def test_lookup_bypass_is_narrow_to_carve_out_tables(restricted_sessionmaker, tw
     (not a carve-out table) - the whole point of scoping the bypass per-table."""
     assert "estate_customers" in ESTATE_LOOKUP_SELECT_TABLES
     assert "estate_organizations" not in ESTATE_LOOKUP_SELECT_TABLES
+    assert "estate_auth_sessions" in ESTATE_LOOKUP_SELECT_TABLES
+    assert "estate_organization_members" in ESTATE_LOOKUP_SELECT_TABLES
     result = _query_as(restricted_sessionmaker, organization_ids="", bypass="lookup", two_orgs=two_orgs)
     assert result["customers"] == {two_orgs["customer_a"]}
     assert result["orgs"] == set()

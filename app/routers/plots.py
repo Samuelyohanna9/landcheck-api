@@ -43,6 +43,7 @@ from app.db import SessionLocal
 from app.utils.row_security import (
     clear_estate_tenant_context,
     clear_survey_user_context,
+    set_estate_bypass,
     set_estate_tenant_context,
     set_survey_user_context,
 )
@@ -322,7 +323,15 @@ def get_db(request: Request):
             survey_session = resolve_survey_session(db, request)
             set_survey_user_context(db, survey_session.user_id if survey_session else None)
         if estate_path:
-            set_estate_tenant_context(db, _resolve_estate_organization_ids(db, request))
+            # Establishing the Estate principal necessarily reads the auth session and membership
+            # rows before an organization allow-list is known. The migration installs narrow
+            # SELECT-only lookup policies for exactly those two tables. Switch back to the real
+            # tenant context before yielding the session so route handlers never run under lookup.
+            set_estate_bypass(db, "lookup")
+            try:
+                set_estate_tenant_context(db, _resolve_estate_organization_ids(db, request))
+            finally:
+                set_estate_bypass(db, None)
         yield db
     finally:
         if survey_path:

@@ -108,6 +108,8 @@ _LOOKUP_SELECT_TABLES = (
     "estate_inspection_bookings",
     "estate_live_inspection_buyer_tokens",
     "estate_accounts",
+    "estate_auth_sessions",
+    "estate_organization_members",
     "estate_social_posts",
     "estate_whatsapp_messages",
 )
