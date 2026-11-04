@@ -3,6 +3,9 @@ from __future__ import annotations
 import pytest
 from fastapi import HTTPException
 
+from app.models.estate_foundation import EstateDocumentLink
+from app.routers.estate_construction import DRAWING_TYPES
+from app.routers.estates import _make_estate_document_link
 from app.services.estates import documents
 
 
@@ -43,3 +46,17 @@ def test_private_store_rejects_oversize_upload(r2, monkeypatch):
     with pytest.raises(HTTPException) as error:
         documents.store_private_estate_file(organization_uid="org", category="documents", entity_uid="document", filename="a.pdf", content_type="application/pdf", data=b"%PDF-too-large")
     assert error.value.status_code == 413
+
+
+def test_estate_document_links_include_the_rls_tenant_key():
+    link = _make_estate_document_link(organization_id=42, document_id=7, entity_type="plot", entity_id=19)
+
+    assert isinstance(link, EstateDocumentLink)
+    assert link.organization_id == 42
+    assert link.document_id == 7
+    assert link.entity_id == "19"
+    assert EstateDocumentLink.__table__.c.organization_id.nullable is False
+
+
+def test_construction_site_plans_use_the_same_approval_workflow_as_other_drawings():
+    assert "site_plan" in DRAWING_TYPES

@@ -24,9 +24,13 @@ class FakeResponse:
 class DummyDb:
     def __init__(self):
         self.flushes = 0
+        self.commits = 0
 
     def flush(self):
         self.flushes += 1
+
+    def commit(self):
+        self.commits += 1
 
 
 @pytest.fixture()
@@ -94,6 +98,22 @@ def test_expired_access_token_refreshes_and_rotates_refresh_token(canva_env, mon
     assert canva_connect.decrypt_token(connection.access_token_enc) == "new-access"
     assert canva_connect.decrypt_token(connection.refresh_token_enc) == "new-refresh"
     assert db.flushes == 1
+
+
+def test_refresh_failure_marks_connection_for_reconnect(canva_env, monkeypatch):
+    db = DummyDb()
+    connection = _connection()
+    monkeypatch.setattr(canva_connect.requests, "post", lambda *args, **kwargs: FakeResponse(400, {}))
+
+    with pytest.raises(canva_connect.CanvaApiError) as error:
+        canva_connect.access_token(db, connection)
+
+    assert error.value.status == 409
+    assert error.value.code == "connection_needs_reconnect"
+    assert connection.status == "needs_reconnect"
+    assert "Reconnect Canva" in (connection.last_error or "")
+    assert db.flushes == 1
+    assert db.commits == 1
 
 
 def test_request_retries_once_after_expired_token(canva_env, monkeypatch):

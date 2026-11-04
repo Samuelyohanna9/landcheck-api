@@ -587,7 +587,7 @@ def verify_snag_item(snag_id: int, request: Request, db: Session = Depends(get_d
 
 
 # ── Drawing approvals ────────────────────────────────────────────────────────────────────────
-DRAWING_TYPES = ("building_plan", "structural_drawing", "mep_drawing")
+DRAWING_TYPES = ("building_plan", "structural_drawing", "mep_drawing", "site_plan")
 
 
 def _drawing_payload(document: EstateDocument, approval: EstateDrawingApproval | None) -> dict:
@@ -620,7 +620,7 @@ def submit_drawing_for_approval(document_id: int, request: Request, db: Session 
     if document is None:
         raise HTTPException(404, "Document not found")
     if document.document_type not in DRAWING_TYPES:
-        raise HTTPException(422, "Only drawing-type documents (building plan, structural, MEP) go through approval")
+        raise HTTPException(422, "Only drawing-type documents (building plan, structural, MEP, or site plan) go through approval")
     estate = _estate_for_document(db, document)
     access = require_estate_access_for_estate(db, request, estate.id, permission=WRITE)
     existing = db.query(EstateDrawingApproval).filter(EstateDrawingApproval.document_id == document_id).one_or_none()

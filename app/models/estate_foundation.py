@@ -660,6 +660,10 @@ class EstateDocument(Base):
 class EstateDocumentLink(Base):
     __tablename__ = "estate_document_links"
     id = Column(Integer, primary_key=True)
+    # Added by the Estate RLS backfill migration (20261104_0082). Keep the tenant on the
+    # link itself so the row can be filtered before a linked entity is resolved, and so new
+    # links satisfy the database NOT NULL constraint under the tenant policy.
+    organization_id = Column(Integer, ForeignKey("estate_organizations.id", ondelete="CASCADE"), nullable=False)
     document_id = Column(Integer, ForeignKey("estate_documents.id", ondelete="CASCADE"), nullable=False)
     entity_type = Column(String(64), nullable=False)
     entity_id = Column(String(128), nullable=False)

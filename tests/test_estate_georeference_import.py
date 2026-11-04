@@ -1,8 +1,16 @@
 from app.routers.estates import (
+    _CSV_COORDINATE_KEYS,
+    _CSV_PLOT_NUMBER_KEYS,
+    _CSV_X_KEYS,
+    _CSV_Y_KEYS,
+    _first_csv_value,
+    _polygonize_dxf_linework,
+    _read_estate_csv_records,
     _normalize_csv_records,
     _plot_number_from_georeference_feature,
     _polygon_geometry_from_georeference_feature,
 )
+from types import SimpleNamespace
 
 
 def test_normalize_csv_records_matches_capitalized_excel_headers():
@@ -15,6 +23,45 @@ def test_normalize_csv_records_strips_units_and_spacing():
     raw = [{" Easting (m) ": "241123.5", "Northing (m)": "1006432.1"}]
     normalized = _normalize_csv_records(raw)
     assert normalized == [{"eastingm": "241123.5", "northingm": "1006432.1"}]
+
+
+def test_estate_csv_reader_accepts_semicolon_delimited_survey_exports():
+    records = _read_estate_csv_records(
+        "Plot Number;Easting (m);Northing (m)\nP-001;241123.5;1006432.1\n".encode()
+    )
+    normalized = _normalize_csv_records(records)
+    assert _first_csv_value(normalized[0], _CSV_PLOT_NUMBER_KEYS) == "P-001"
+    assert _first_csv_value(normalized[0], _CSV_X_KEYS) == "241123.5"
+    assert _first_csv_value(normalized[0], _CSV_Y_KEYS) == "1006432.1"
+
+
+def test_estate_csv_reader_accepts_coordinate_pair_alias():
+    normalized = _normalize_csv_records([{"Parcel ID": "P-002", "Coordinates": "7.10, 9.10"}])[0]
+    assert _first_csv_value(normalized, _CSV_PLOT_NUMBER_KEYS) == "P-002"
+    assert _first_csv_value(normalized, _CSV_COORDINATE_KEYS) == "7.10, 9.10"
+
+
+def test_dxf_linework_fallback_polygonizes_independent_closed_edges():
+    def line(x1, y1, x2, y2):
+        return SimpleNamespace(
+            dxftype=lambda: "LINE",
+            dxf=SimpleNamespace(
+                start=SimpleNamespace(x=x1, y=y1),
+                end=SimpleNamespace(x=x2, y=y2),
+            ),
+        )
+
+    document = SimpleNamespace(
+        modelspace=lambda: [
+            line(0, 0, 10, 0),
+            line(10, 0, 10, 10),
+            line(10, 10, 0, 10),
+            line(0, 10, 0, 0),
+        ]
+    )
+    polygons = _polygonize_dxf_linework(document)
+    assert len(polygons) == 1
+    assert polygons[0].area == 100
 
 
 def test_plot_number_falls_back_when_label_is_the_tool_default():

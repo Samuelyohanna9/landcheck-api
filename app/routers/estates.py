@@ -23,8 +23,8 @@ from reportlab.pdfgen import canvas
 from geoalchemy2.shape import from_shape, to_shape
 from pyproj import Transformer
 import ezdxf
-from shapely.geometry import mapping, shape
-from shapely.ops import transform as shapely_transform, unary_union
+from shapely.geometry import LineString, mapping, shape
+from shapely.ops import polygonize, transform as shapely_transform, unary_union
 from sqlalchemy import and_, or_, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, aliased
@@ -81,7 +81,7 @@ from app.models.estate_foundation import EstateMemberEstateScope
 from app.utils import estate_flutterwave as flw
 from app.utils import estate_paystack as pst
 from app.utils.auth_security import require_signed_flutterwave_webhooks
-from app.utils.row_security import set_estate_bypass, set_estate_tenant_context
+from app.utils.row_security import clear_estate_tenant_context, set_estate_bypass, set_estate_tenant_context
 from app.db import SessionLocal
 from app.utils.hazard_jobs import get_hazard_job, insert_hazard_job, make_progress_reporter, serialize_hazard_job, set_hazard_job_status, find_active_hazard_job, touch_hazard_job
 from app.utils.upload_security import read_limited_upload, upload_extension
@@ -1238,6 +1238,25 @@ def _estate_forecast_boundary(db: Session, estate: Estate) -> dict:
     return mapping(unary_union(geometries).convex_hull)
 
 
+def _load_estate_background_job_estate(db: Session, estate_id: int) -> Estate | None:
+    """Load an Estate job's target under a narrow lookup context, then switch to its tenant.
+
+    Estate analysis workers run outside an HTTP request, so ``get_db`` cannot establish the
+    organization context for them.  The job carries only an Estate id; lookup is allowed for
+    resolving that id, after which every subsequent Estate read/write runs under the exact
+    organization context.  This keeps the worker compatible with Estate RLS without granting a
+    broad superadmin bypass for the analysis itself.
+    """
+    set_estate_bypass(db, "lookup")
+    try:
+        estate = db.get(Estate, int(estate_id))
+    finally:
+        set_estate_bypass(db, None)
+    if estate is not None:
+        set_estate_tenant_context(db, [estate.organization_id])
+    return estate
+
+
 @router.get("/{estate_id}/development-forecast")
 def get_estate_development_forecast(estate_id: int, request: Request, db: Session = Depends(get_db)):
     estate = db.get(Estate, estate_id)
@@ -1253,7 +1272,7 @@ def get_estate_development_forecast(estate_id: int, request: Request, db: Sessio
     return {"estate_id": estate.id, "forecast": estate.public_development_forecast}
 
 
-def _run_estate_development_forecast_job(job_id: str) -> None:
+def _run_estate_development_forecast_job(job_id: str, _owner_user_id: int | None = None) -> None:
     """Run the three geospatial inputs away from the request thread, then persist one reviewed result."""
     db = SessionLocal()
     try:
@@ -1263,7 +1282,7 @@ def _run_estate_development_forecast_job(job_id: str) -> None:
         payload = job.get("request_payload") or {}
         if isinstance(payload, str):
             payload = json.loads(payload)
-        estate = db.get(Estate, int(payload["estate_id"]))
+        estate = _load_estate_background_job_estate(db, int(payload["estate_id"]))
         if not estate:
             set_hazard_job_status(db, job_id, status="failed", stage="Failed", error_text="Estate not found", completed=True)
             return
@@ -1329,6 +1348,10 @@ def _run_estate_development_forecast_job(job_id: str) -> None:
         db.rollback()
         set_hazard_job_status(db, job_id, status="failed", stage="Failed", error_text=str(exc), completed=True)
     finally:
+        try:
+            clear_estate_tenant_context(db)
+        except Exception:
+            db.rollback()
         db.close()
 
 
@@ -1834,6 +1857,55 @@ def _normalize_csv_records(raw_records: list[dict]) -> list[dict]:
     return [{_normalize_csv_header(key): value for key, value in record.items()} for record in raw_records]
 
 
+def _read_estate_csv_records(payload: bytes) -> list[dict]:
+    """Read the small coordinate CSV used by Estate layout import.
+
+    Surveyors commonly export semicolon- or tab-delimited files from CAD/GIS tools.  The old
+    parser always assumed commas, which turned the complete header into one field and made every
+    row look as if it had no plot or coordinates.  Sniff only the delimiter (never the data type),
+    keep UTF-8 BOM support, and leave all values as strings for the explicit validation below.
+    """
+    text_payload = payload.decode("utf-8-sig")
+    sample = text_payload[:8192]
+    try:
+        dialect = csv.Sniffer().sniff(sample, delimiters=",;\t|")
+    except csv.Error:
+        dialect = csv.excel
+    reader = csv.DictReader(io.StringIO(text_payload), dialect=dialect, skipinitialspace=True)
+    if not reader.fieldnames:
+        return []
+    return list(reader)
+
+
+_CSV_PLOT_NUMBER_KEYS = (
+    "plotnumber", "plotno", "plotid", "plotref", "plotreference", "parcelnumber", "parcelno",
+    "parcelid", "parcel", "lotnumber", "lotno", "lotid", "unitnumber", "unitno", "unitid", "lot", "unit", "plot",
+)
+_CSV_X_KEYS = (
+    "longitude", "lng", "lon", "easting", "eastingm", "east", "x", "xcoordinate", "eastingcoordinate", "utm easting",
+)
+_CSV_Y_KEYS = (
+    "latitude", "lat", "northing", "northingm", "north", "y", "ycoordinate", "northingcoordinate", "utm northing",
+)
+_CSV_COORDINATE_KEYS = ("coordinates", "coordinate", "coord", "pointcoordinate", "xy")
+
+
+def _first_csv_value(record: dict, keys: tuple[str, ...]) -> object:
+    for key in keys:
+        value = record.get(_normalize_csv_header(key))
+        if value is not None and str(value).strip():
+            return value
+    return None
+
+
+def _csv_coordinate_pair(record: dict) -> tuple[object, object] | None:
+    raw = _first_csv_value(record, _CSV_COORDINATE_KEYS)
+    if raw is None:
+        return None
+    values = re.findall(r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?", str(raw))
+    return (values[0], values[1]) if len(values) >= 2 else None
+
+
 @router.post("/{estate_id}/import-reviews/csv")
 async def import_estate_csv(estate_id: int, request: Request, source_crs: str | None = None, file: UploadFile = File(...), db: Session = Depends(get_db)):
     estate=db.get(Estate,estate_id)
@@ -1841,7 +1913,7 @@ async def import_estate_csv(estate_id: int, request: Request, source_crs: str | 
     access=require_estate_access_for_estate(db, request, estate.id,permission="plot.manage")
     if upload_extension(file) not in {".csv", ".txt"}:
         raise HTTPException(422, "Upload a CSV file")
-    try: raw_records=list(csv.DictReader(io.StringIO((await read_limited_upload(file)).decode("utf-8-sig"))))
+    try: raw_records=_read_estate_csv_records(await read_limited_upload(file))
     except Exception as exc: raise HTTPException(422,"CSV could not be read") from exc
     records = _normalize_csv_records(raw_records)
     candidates = []
@@ -1861,9 +1933,13 @@ async def import_estate_csv(estate_id: int, request: Request, source_crs: str | 
         except Exception as exc:
             raise HTTPException(status_code=422, detail="CSV source_crs is invalid") from exc
         for index, record in enumerate(records, 1):
-            number = str(record.get("plotnumber") or record.get("plot") or record.get("plotno") or record.get("plotid") or "").strip()
-            x_value = record.get("longitude") or record.get("lng") or record.get("lon") or record.get("easting") or record.get("eastingm") or record.get("x")
-            y_value = record.get("latitude") or record.get("lat") or record.get("northing") or record.get("northingm") or record.get("y")
+            number = str(_first_csv_value(record, _CSV_PLOT_NUMBER_KEYS) or "").strip()
+            x_value = _first_csv_value(record, _CSV_X_KEYS)
+            y_value = _first_csv_value(record, _CSV_Y_KEYS)
+            if x_value in (None, "") or y_value in (None, ""):
+                coordinate_pair = _csv_coordinate_pair(record)
+                if coordinate_pair:
+                    x_value, y_value = coordinate_pair
             try:
                 if not number or x_value in (None, "") or y_value in (None, ""):
                     raise ValueError
@@ -1927,6 +2003,35 @@ def _closed_ring_points(entity, raw_points: list[tuple[float, float]]) -> list[t
     return None
 
 
+def _polygonize_dxf_linework(document) -> list:
+    """Recover polygons from a CAD drawing made from separate LINE entities.
+
+    A number of survey/CAD exports draw a parcel boundary as four independent LINE records
+    instead of one closed polyline.  That is still deterministic geometry: polygonize only the
+    linework that actually closes, and leave the result in the import-review queue for a human to
+    approve.  We deliberately do not infer polygons from text, dimensions, splines or arbitrary
+    raster content.
+    """
+    segments = []
+    for entity in document.modelspace():
+        try:
+            if entity.dxftype() != "LINE":
+                continue
+            start = entity.dxf.start
+            end = entity.dxf.end
+            line = LineString([(float(start.x), float(start.y)), (float(end.x), float(end.y))])
+            if not line.is_empty and line.length > 0:
+                segments.append(line)
+        except Exception:
+            continue
+    if not segments:
+        return []
+    try:
+        return list(polygonize(unary_union(segments)))
+    except Exception:
+        return []
+
+
 @router.post("/{estate_id}/import-reviews/dxf")
 async def import_estate_dxf(estate_id:int,source_crs:str,request:Request,file:UploadFile=File(...),db:Session=Depends(get_db)):
     estate=db.get(Estate,estate_id)
@@ -1958,7 +2063,29 @@ async def import_estate_dxf(estate_id:int,source_crs:str,request:Request,file:Up
             layer_name = str(entity.dxf.layer or "CAD").strip() or "CAD"
             candidates.append({"row":index,"plot_number":layer_name if index == 1 else f"{layer_name}-{index}","geometry":geometry,"valid":not errors,"issues":errors})
         except Exception: continue
-    if not candidates: raise HTTPException(422,"DXF contains no closed polygon polylines")
+    # Some survey exports use independent LINE records for each boundary edge.  Only use that
+    # conservative polygonize fallback when no explicit closed polyline was found; all results
+    # still require the normal import-review approval before becoming Estate plots.
+    if not candidates:
+        for index, polygon in enumerate(_polygonize_dxf_linework(document), 1):
+            try:
+                transformed = shapely_transform(
+                    lambda x, y, z=None: transformer.transform(x, y),
+                    polygon,
+                )
+                geometry = json.loads(json.dumps(mapping(transformed)))
+                _, issues = validate_polygon(geometry)
+                errors = [issue.message for issue in issues if issue.severity == "error"]
+                candidates.append({
+                    "row": index,
+                    "plot_number": f"CAD-{index}",
+                    "geometry": geometry,
+                    "valid": not errors,
+                    "issues": errors,
+                })
+            except Exception:
+                continue
+    if not candidates: raise HTTPException(422,"DXF contains no closed polygon or polygonizable linework")
     row=EstateImportReview(organization_id=estate.organization_id,estate_id=estate.id,source_type="cad",notes=f"{len(candidates)} candidate parcel(s) imported from {file.filename or 'DXF'} using {src}",candidate_data=candidates,created_by_subject_type=access.principal.subject_type,created_by_subject_id=access.principal.subject_id)
     db.add(row); db.flush(); append_estate_audit_event(db,organization_id=estate.organization_id,actor=access.principal,action="import_review.dxf_uploaded",entity_type="estate_import_review",entity_id=row.id,after_data={"candidate_count":len(candidates),"source_crs":src}); db.commit()
     return {"id":row.id,"status":row.status,"candidate_count":len(candidates),"valid_count":sum(1 for candidate in candidates if candidate["valid"]),"source_crs":src}
@@ -2032,7 +2159,7 @@ async def import_scanned_layout(
     )
     db.add(document)
     db.flush()
-    db.add(EstateDocumentLink(document_id=document.id, entity_type="import_review", entity_id=str(review.id)))
+    db.add(_make_estate_document_link(organization_id=estate.organization_id, document_id=document.id, entity_type="import_review", entity_id=review.id))
     append_estate_audit_event(
         db,
         organization_id=estate.organization_id,
@@ -2919,7 +3046,7 @@ def assess_plot_hazards(plot_id: int, request: Request, db: Session = Depends(ge
     return {"plot_id": plot_id, "persisted": True, "assessments": [_hazard_row_payload(row) for row in rows], **results}
 
 
-def _run_estate_hazard_assessment_job(job_id: str) -> None:
+def _run_estate_hazard_assessment_job(job_id: str, _owner_user_id: int | None = None) -> None:
     """Background worker for the Estate-level hazard run. Screens the Estate boundary once (flood +
     erosion) instead of every plot separately: a plot-by-plot run made hundreds of Earth Engine
     round-trips and slowed the whole API, while the boundary answers the question that matters at
@@ -2937,7 +3064,7 @@ def _run_estate_hazard_assessment_job(job_id: str) -> None:
         access = SimpleNamespace(principal=SimpleNamespace(subject_type=payload.get("subject_type"), subject_id=payload.get("subject_id")))
 
         set_hazard_job_status(db, job_id, status="running", stage="Preparing the Estate boundary...", progress_pct=5, started=True)
-        estate = db.get(Estate, estate_id)
+        estate = _load_estate_background_job_estate(db, estate_id)
         if not estate:
             set_hazard_job_status(db, job_id, status="failed", stage="Failed", error_text="Estate not found", completed=True)
             return
@@ -2958,7 +3085,7 @@ def _run_estate_hazard_assessment_job(job_id: str) -> None:
             print(f"[hazard-save] {label}: {time.monotonic() - step_started:.1f}s, api memory {_own_rss_mb():.0f} MB", flush=True)
             step_started = time.monotonic()
         step("analysis received")
-        estate = db.get(Estate, estate_id)
+        estate = _load_estate_background_job_estate(db, estate_id)
         _persist_hazard_results(db, estate=estate, plot_id=None, results=results, access=access)
         append_estate_audit_event(db, organization_id=estate.organization_id, actor=access.principal, action="hazard.estate_assessment_completed", entity_type="estate", entity_id=estate.id, after_data={"scope": "estate_boundary"})
         db.commit()
@@ -2971,10 +3098,14 @@ def _run_estate_hazard_assessment_job(job_id: str) -> None:
         db.rollback()
         set_hazard_job_status(db, job_id, status="failed", stage="Failed", error_text=str(getattr(exc, "detail", None) or exc), completed=True)
     finally:
+        try:
+            clear_estate_tenant_context(db)
+        except Exception:
+            db.rollback()
         db.close()
 
 
-def _run_estate_hazard_boundary_map_job(job_id: str) -> None:
+def _run_estate_hazard_boundary_map_job(job_id: str, _owner_user_id: int | None = None) -> None:
     """Background worker for an on-demand Estate-boundary map/3D view. Unlike the regular
     assess-all run, which deliberately strips map overlays and building-footprint data before
     saving (see _slim_hazard_result's memory-safety note - carrying that through every future
@@ -2992,7 +3123,7 @@ def _run_estate_hazard_boundary_map_job(job_id: str) -> None:
         estate_id = int(payload["estate_id"])
 
         set_hazard_job_status(db, job_id, status="running", stage="Preparing the Estate boundary...", progress_pct=5, started=True)
-        estate = db.get(Estate, estate_id)
+        estate = _load_estate_background_job_estate(db, estate_id)
         if not estate:
             set_hazard_job_status(db, job_id, status="failed", stage="Failed", error_text="Estate not found", completed=True)
             return
@@ -3010,6 +3141,10 @@ def _run_estate_hazard_boundary_map_job(job_id: str) -> None:
         db.rollback()
         set_hazard_job_status(db, job_id, status="failed", stage="Failed", error_text=str(getattr(exc, "detail", None) or exc), completed=True)
     finally:
+        try:
+            clear_estate_tenant_context(db)
+        except Exception:
+            db.rollback()
         db.close()
 
 
@@ -3219,7 +3354,7 @@ def estate_soil_dashboard(estate_id: int, request: Request, db: Session = Depend
     return _estate_soil_dashboard_payload(db, estate)
 
 
-def _run_estate_soil_assessment_job(job_id: str) -> None:
+def _run_estate_soil_assessment_job(job_id: str, _owner_user_id: int | None = None) -> None:
     """Background worker for the Estate-level soil analysis run - same shape as
     _run_estate_hazard_assessment_job, screening the Estate boundary once rather than every plot
     separately."""
@@ -3235,7 +3370,7 @@ def _run_estate_soil_assessment_job(job_id: str) -> None:
         access = SimpleNamespace(principal=SimpleNamespace(subject_type=payload.get("subject_type"), subject_id=payload.get("subject_id")))
 
         set_hazard_job_status(db, job_id, status="running", stage="Preparing the Estate boundary...", progress_pct=5, started=True)
-        estate = db.get(Estate, estate_id)
+        estate = _load_estate_background_job_estate(db, estate_id)
         if not estate:
             set_hazard_job_status(db, job_id, status="failed", stage="Failed", error_text="Estate not found", completed=True)
             return
@@ -3250,7 +3385,7 @@ def _run_estate_soil_assessment_job(job_id: str) -> None:
         results = _calculate_plot_soil(boundary, None, heartbeat=lambda: touch_hazard_job(db, job_id))
 
         set_hazard_job_status(db, job_id, status="running", stage="Saving results...", progress_pct=90)
-        estate = db.get(Estate, estate_id)
+        estate = _load_estate_background_job_estate(db, estate_id)
         _persist_soil_result(db, estate=estate, plot_id=None, result=results["soil"], access=access)
         append_estate_audit_event(db, organization_id=estate.organization_id, actor=access.principal, action="soil_analysis.estate_completed", entity_type="estate", entity_id=estate.id, after_data={"scope": "estate_boundary"})
         db.commit()
@@ -3260,6 +3395,10 @@ def _run_estate_soil_assessment_job(job_id: str) -> None:
         db.rollback()
         set_hazard_job_status(db, job_id, status="failed", stage="Failed", error_text=str(getattr(exc, "detail", None) or exc), completed=True)
     finally:
+        try:
+            clear_estate_tenant_context(db)
+        except Exception:
+            db.rollback()
         db.close()
 
 
@@ -5027,7 +5166,7 @@ async def upload_payment_evidence(payment_id:int, request:Request, file:UploadFi
     organization=db.get(EstateOrganization,payment.organization_id)
     stored=store_private_estate_file(organization_uid=organization.organization_uid,category="payments",entity_uid=payment.payment_uid,filename=file.filename or "receipt",content_type=file.content_type or "",data=await read_limited_upload(file, max_bytes=MAX_ESTATE_DOCUMENT_BYTES))
     document=EstateDocument(organization_id=payment.organization_id,object_key=stored.object_key,original_filename=stored.filename,mime_type=stored.mime_type,size_bytes=stored.size_bytes,checksum=stored.checksum,document_type="receipt",uploaded_by_subject_type=access.principal.subject_type,uploaded_by_subject_id=access.principal.subject_id)
-    db.add(document); db.flush(); db.add(EstateDocumentLink(document_id=document.id,entity_type="payment",entity_id=str(payment.id))); append_estate_audit_event(db,organization_id=payment.organization_id,actor=access.principal,action="payment.evidence_uploaded",entity_type="estate_document",entity_id=document.id,after_data={"payment_id":payment.id,"filename":stored.filename}); db.commit()
+    db.add(document); db.flush(); db.add(_make_estate_document_link(organization_id=payment.organization_id, document_id=document.id,entity_type="payment",entity_id=payment.id)); append_estate_audit_event(db,organization_id=payment.organization_id,actor=access.principal,action="payment.evidence_uploaded",entity_type="estate_document",entity_id=document.id,after_data={"payment_id":payment.id,"filename":stored.filename}); db.commit()
     return {"id":document.id,"filename":document.original_filename}
 
 @router.get("/payments/{payment_id}/evidence/{document_id}/download")
@@ -5081,6 +5220,21 @@ def _linked_entity_estate_id(db: Session, entity_type: str, entity_id: int) -> i
         return allocation.estate_id if allocation else None
     return None
 
+
+def _make_estate_document_link(*, organization_id: int, document_id: int, entity_type: str, entity_id: int | str) -> EstateDocumentLink:
+    """Build a tenant-scoped document link for the post-RLS schema.
+
+    ``estate_document_links.organization_id`` is denormalized and NOT NULL so RLS can filter
+    links without resolving the linked entity first. Keeping construction of every new link in
+    one helper prevents a new upload path from accidentally omitting that tenant key.
+    """
+    return EstateDocumentLink(
+        organization_id=organization_id,
+        document_id=document_id,
+        entity_type=entity_type,
+        entity_id=str(entity_id),
+    )
+
 @router.get("/document-types")
 def estate_document_types(request: Request, db: Session = Depends(get_db)):
     principal = resolve_estate_principal(db, request)
@@ -5104,7 +5258,7 @@ async def upload_document(entity_type: str, entity_id: int, document_type: str, 
     organization = db.get(EstateOrganization, organization_id)
     stored = store_private_estate_file(organization_uid=organization.organization_uid, category="documents", entity_uid=f"{entity_type}_{entity_id}", filename=file.filename or "document", content_type=file.content_type or "", data=await read_limited_upload(file, max_bytes=MAX_ESTATE_DOCUMENT_BYTES))
     document = EstateDocument(organization_id=organization_id, object_key=stored.object_key, original_filename=stored.filename, mime_type=stored.mime_type, size_bytes=stored.size_bytes, checksum=stored.checksum, document_type=normalized_document_type, description=description, supersedes_document_id=supersedes_document_id, uploaded_by_subject_type=access.principal.subject_type, uploaded_by_subject_id=access.principal.subject_id)
-    db.add(document); db.flush(); db.add(EstateDocumentLink(document_id=document.id, entity_type=entity_type, entity_id=str(entity_id))); append_estate_audit_event(db, organization_id=organization_id, actor=access.principal, action="document.uploaded", entity_type="estate_document", entity_id=document.id, after_data={"linked_entity":entity_type,"linked_id":entity_id,"supersedes_document_id":supersedes_document_id}); db.commit()
+    db.add(document); db.flush(); db.add(_make_estate_document_link(organization_id=organization_id, document_id=document.id, entity_type=entity_type, entity_id=entity_id)); append_estate_audit_event(db, organization_id=organization_id, actor=access.principal, action="document.uploaded", entity_type="estate_document", entity_id=document.id, after_data={"linked_entity":entity_type,"linked_id":entity_id,"supersedes_document_id":supersedes_document_id}); db.commit()
     return {"id":document.id,"filename":document.original_filename}
 
 @router.get("/documents/{document_id}/download")

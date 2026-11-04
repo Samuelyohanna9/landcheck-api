@@ -317,9 +317,22 @@ def get_db(request: Request):
     path = str(request.url.path or "").lower()
     survey_path = path.startswith(("/plots", "/hazards", "/survey-georeference"))
     estate_path = path.startswith(("/estates", "/estate-admin"))
+    # Estate's scanned-layout handoff is a cross-product request: the browser may already carry a
+    # Survey session that owns the newly-created georeference row, while the request itself is
+    # routed under /estates.  Apply that same short-lived Survey context for only the three
+    # georeference-link/import operations.  Without it, PostgreSQL RLS correctly hides an owned
+    # session and the Estate UI reports the misleading "Georeference session not found".  This is
+    # not an authorization grant: the Estate permission check remains the gate, and the Survey
+    # policy still exposes only an anonymous row or the current Survey user's row.
+    estate_georeference_path = estate_path and (
+        "/import-reviews/from-georeference-session" in path
+        or path.endswith("/georeference-session")
+        or "/import-from-georeference" in path
+    )
+    survey_context_path = survey_path or estate_georeference_path
     try:
         ensure_plots_schema_once(db)
-        if survey_path:
+        if survey_context_path:
             survey_session = resolve_survey_session(db, request)
             set_survey_user_context(db, survey_session.user_id if survey_session else None)
         if estate_path:
@@ -334,7 +347,7 @@ def get_db(request: Request):
                 set_estate_bypass(db, None)
         yield db
     finally:
-        if survey_path:
+        if survey_context_path:
             try:
                 clear_survey_user_context(db)
             except Exception:

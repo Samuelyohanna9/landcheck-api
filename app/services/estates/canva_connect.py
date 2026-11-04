@@ -192,7 +192,25 @@ def _refresh(db: Session, connection: EstateCanvaConnection) -> str:
         data={"grant_type": "refresh_token", "refresh_token": refresh},
         timeout=15,
     )
-    data = _json_response(response)
+    try:
+        data = _json_response(response)
+    except CanvaApiError as exc:
+        # A revoked/expired refresh token is recoverable only through a fresh OAuth
+        # connection. Do not leave the row looking active: every later Canva action
+        # would otherwise retry the same dead token and surface an opaque provider
+        # 400 page to the user.
+        connection.status = "needs_reconnect"
+        connection.last_error = "Canva connection expired or was revoked. Reconnect Canva to continue."
+        db.flush()
+        # Persist this recovery state before the request-level dependency performs its
+        # normal rollback/cleanup. Without this checkpoint the row would remain active,
+        # causing every later Canva action to retry the same rejected refresh token.
+        db.commit()
+        raise CanvaApiError(
+            "Reconnect Canva to continue editing flyers.",
+            409,
+            "connection_needs_reconnect",
+        ) from exc
     access = str(data.get("access_token") or "").strip()
     new_refresh = str(data.get("refresh_token") or "").strip()
     if not access or not new_refresh:
