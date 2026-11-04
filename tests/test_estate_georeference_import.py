@@ -4,6 +4,8 @@ from app.routers.estates import (
     _CSV_X_KEYS,
     _CSV_Y_KEYS,
     _first_csv_value,
+    _csv_number,
+    _repeated_csv_plot_key,
     _polygonize_dxf_linework,
     _read_estate_csv_records,
     _normalize_csv_records,
@@ -39,6 +41,38 @@ def test_estate_csv_reader_accepts_coordinate_pair_alias():
     normalized = _normalize_csv_records([{"Parcel ID": "P-002", "Coordinates": "7.10, 9.10"}])[0]
     assert _first_csv_value(normalized, _CSV_PLOT_NUMBER_KEYS) == "P-002"
     assert _first_csv_value(normalized, _CSV_COORDINATE_KEYS) == "7.10, 9.10"
+
+
+def test_estate_csv_header_aliases_cover_surveyor_unit_labels():
+    normalized = _normalize_csv_records([{
+        "Plot No.": "B-024",
+        "Easting (metres)": "241123.5",
+        "Northing (metres)": "1006432.1",
+    }])[0]
+    assert _first_csv_value(normalized, _CSV_PLOT_NUMBER_KEYS) == "B-024"
+    assert _first_csv_value(normalized, _CSV_X_KEYS, fuzzy=True) == "241123.5"
+    assert _first_csv_value(normalized, _CSV_Y_KEYS, fuzzy=True) == "1006432.1"
+
+
+def test_repeated_point_label_can_group_a_parcel_but_unique_points_cannot():
+    repeated = _normalize_csv_records([
+        {"Point": "P-001", "X (m)": "1", "Y (m)": "2"},
+        {"Point": "P-001", "X (m)": "2", "Y (m)": "2"},
+        {"Point": "P-001", "X (m)": "2", "Y (m)": "1"},
+    ])
+    assert _repeated_csv_plot_key(repeated) == "point"
+
+    unique = _normalize_csv_records([
+        {"Point": "A", "X (m)": "1", "Y (m)": "2"},
+        {"Point": "B", "X (m)": "2", "Y (m)": "2"},
+        {"Point": "C", "X (m)": "2", "Y (m)": "1"},
+    ])
+    assert _repeated_csv_plot_key(unique) is None
+
+
+def test_csv_number_accepts_decimal_comma_and_thousands_separator():
+    assert _csv_number("241123,5") == 241123.5
+    assert _csv_number("241,123.5") == 241123.5
 
 
 def test_dxf_linework_fallback_polygonizes_independent_closed_edges():

@@ -1894,16 +1894,35 @@ def _read_estate_csv_records(payload: bytes) -> list[dict]:
 
 
 _CSV_PLOT_NUMBER_KEYS = (
-    "plotnumber", "plotno", "plotid", "plotref", "plotreference", "parcelnumber", "parcelno",
-    "parcelid", "parcel", "lotnumber", "lotno", "lotid", "unitnumber", "unitno", "unitid", "lot", "unit", "plot",
+    "plotnumber", "plotnum", "plotno", "plotid", "plotref", "plotreference", "plotrefno",
+    "parcelnumber", "parcelnum", "parcelno", "parcelid", "parcel", "lotnumber", "lotnum", "lotno",
+    "lotid", "unitnumber", "unitnum", "unitno", "unitid", "propertynumber", "propertyno",
+    "propertyid", "property", "lot", "unit", "plot",
 )
 _CSV_X_KEYS = (
-    "longitude", "lng", "lon", "easting", "eastingm", "east", "x", "xcoordinate", "eastingcoordinate", "utm easting", "e",
+    "longitude", "lng", "lon", "easting", "eastingm", "eastingmeter", "eastingmeters", "eastingmetre",
+    "eastingmetres", "eastings", "east", "x", "xm", "xcoord", "xcoordinate", "xmeters", "xmetres",
+    "eastingcoordinate", "eastcoordinate", "utmeasting", "utm easting", "gridx", "e",
 )
 _CSV_Y_KEYS = (
-    "latitude", "lat", "northing", "northingm", "north", "y", "ycoordinate", "northingcoordinate", "utm northing", "n",
+    "latitude", "lat", "northing", "northingm", "northingmeter", "northingmeters", "northingmetre",
+    "northingmetres", "northings", "north", "y", "ym", "ycoord", "ycoordinate", "ymeters", "ymetres",
+    "northingcoordinate", "northcoordinate", "utmnorthing", "utm northing", "gridy", "n",
 )
-_CSV_COORDINATE_KEYS = ("coordinates", "coordinate", "coord", "pointcoordinate", "xy")
+_CSV_COORDINATE_KEYS = (
+    "coordinates", "coordinate", "coord", "pointcoordinate", "pointcoordinates", "latlon", "latlng",
+    "xy", "xycoordinates",
+)
+
+# Some survey exports label the repeated parcel key as a point/station/vertex field.  We only use
+# one of these as a parcel key when a value is repeated at least three times; a file containing
+# unique point names is not silently interpreted as a set of plots (it should be imported as one
+# boundary, or supplied with an explicit plot-number column).
+_CSV_REPEATED_PLOT_KEYS = (
+    "pointnumber", "pointnum", "pointno", "point", "stationnumber", "stationnum", "stationno",
+    "station", "vertexnumber", "vertexnum", "vertexno", "vertex", "cornernumber", "cornernum",
+    "cornerno", "corner",
+)
 
 
 def _first_csv_value(record: dict, keys: tuple[str, ...], *, fuzzy: bool = False) -> object:
@@ -1935,6 +1954,34 @@ def _first_csv_value(record: dict, keys: tuple[str, ...], *, fuzzy: bool = False
             if value is not None and str(value).strip():
                 return value
     return None
+
+
+def _repeated_csv_plot_key(records: list[dict]) -> str | None:
+    """Return a safe fallback parcel column for exports that repeat a point/station label.
+
+    This is deliberately conservative.  A unique point number identifies a vertex, not a plot,
+    and treating it as a plot would produce a long list of one-point invalid parcels.  Only an
+    explicit, survey-style key with at least one value occurring three or more times is eligible.
+    """
+    for key in _CSV_REPEATED_PLOT_KEYS:
+        counts: dict[str, int] = {}
+        for record in records:
+            value = str(record.get(key) or "").strip()
+            if value:
+                counts[value] = counts.get(value, 0) + 1
+        if any(count >= 3 for count in counts.values()):
+            return key
+    return None
+
+
+def _csv_number(value: object) -> float:
+    """Parse common spreadsheet number spellings without weakening coordinate validation."""
+    text_value = str(value).strip().replace("\u00a0", "")
+    if "," in text_value and "." not in text_value:
+        text_value = text_value.replace(",", ".")
+    elif "," in text_value and "." in text_value:
+        text_value = text_value.replace(",", "")
+    return float(text_value)
 
 
 def _csv_coordinate_pair(record: dict) -> tuple[object, object] | None:
@@ -1984,7 +2031,7 @@ async def import_estate_csv(estate_id: int, request: Request, source_crs: str | 
             try:
                 if x_value in (None, "") or y_value in (None, ""):
                     raise ValueError
-                x, y = coordinate_transformer.transform(float(x_value), float(y_value))
+                x, y = coordinate_transformer.transform(_csv_number(x_value), _csv_number(y_value))
             except (TypeError, ValueError):
                 candidates.append({"row": index, "plot_number": "", "valid": False, "issues": ["CSV rows require longitude/latitude (or x/y) coordinates"]})
                 continue
@@ -1999,12 +2046,15 @@ async def import_estate_csv(estate_id: int, request: Request, source_crs: str | 
     else:
         grouped: dict[str, list[list[float]]] = {}
         first_rows: dict[str, int] = {}
+        repeated_plot_key = _repeated_csv_plot_key(records)
         try:
             coordinate_transformer = Transformer.from_crs((source_crs or "EPSG:4326").strip(), "EPSG:4326", always_xy=True)
         except Exception as exc:
             raise HTTPException(status_code=422, detail="CSV source_crs is invalid") from exc
         for index, record in enumerate(records, 1):
             number = str(_first_csv_value(record, _CSV_PLOT_NUMBER_KEYS) or "").strip()
+            if not number and repeated_plot_key:
+                number = str(record.get(repeated_plot_key) or "").strip()
             x_value = _first_csv_value(record, _CSV_X_KEYS, fuzzy=True)
             y_value = _first_csv_value(record, _CSV_Y_KEYS, fuzzy=True)
             if x_value in (None, "") or y_value in (None, ""):
@@ -2014,7 +2064,7 @@ async def import_estate_csv(estate_id: int, request: Request, source_crs: str | 
             try:
                 if not number or x_value in (None, "") or y_value in (None, ""):
                     raise ValueError
-                x, y = coordinate_transformer.transform(float(x_value), float(y_value))
+                x, y = coordinate_transformer.transform(_csv_number(x_value), _csv_number(y_value))
                 grouped.setdefault(number, []).append([x, y])
                 first_rows.setdefault(number, index)
             except (TypeError, ValueError):
