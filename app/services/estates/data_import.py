@@ -77,11 +77,19 @@ PAYMENT_FIELD_SYNONYMS: dict[str, list[str]] = {
     "outstanding": ["balance", "outstanding", "amount owed", "balance due"],
     "total_paid": ["total paid", "amount paid so far", "cumulative paid"],
 }
+BOQ_FIELD_SYNONYMS: dict[str, list[str]] = {
+    "category": ["category", "trade", "section", "division"],
+    "description": ["description", "item", "item description", "particulars", "work item", "scope"],
+    "unit": ["unit", "uom", "unit of measure", "units"],
+    "quantity": ["quantity", "qty", "qnty"],
+    "rate": ["rate", "unit rate", "unit price", "price", "rate ngn"],
+}
 FIELD_SYNONYMS_BY_ENTITY: dict[str, dict[str, list[str]]] = {
     "customer": CUSTOMER_FIELD_SYNONYMS,
     "plot": PLOT_FIELD_SYNONYMS,
     "sale": SALE_FIELD_SYNONYMS,
     "payment": PAYMENT_FIELD_SYNONYMS,
+    "boq": BOQ_FIELD_SYNONYMS,
 }
 
 
@@ -132,6 +140,37 @@ def build_normalized_records(sheet_rows: list[dict[str, Any]], mapping: dict[str
 
 
 # ─── Spreadsheet parsing ──────────────────────────────────────────────────────────────────────
+
+def build_boq_lines(sheet_rows: list[dict[str, Any]], mapping: dict[str, str | None]) -> tuple[list[dict[str, Any]], int]:
+    """Converts one sheet's raw rows + its {source_header: boq_field} mapping (from
+    suggest_column_mapping(headers, "boq")) into BOQLineInput-shaped dicts. A row needs at least a
+    description and a positive quantity or rate to be worth keeping - silently-blank rows
+    (a spreadsheet's trailing empty rows) are skipped, not counted as failures. Returns
+    (lines, skipped_count)."""
+    field_by_header = {header: field for header, field in mapping.items() if field}
+    lines: list[dict[str, Any]] = []
+    skipped = 0
+    for raw_row in sheet_rows:
+        values: dict[str, Any] = {}
+        for header, field in field_by_header.items():
+            values[field] = raw_row.get(header, "")
+        description = str(values.get("description") or "").strip()
+        if not description and not any(str(v).strip() for v in values.values()):
+            continue  # a genuinely blank row, not a row someone meant to fill in
+        quantity = parse_amount(values.get("quantity")) or Decimal("0")
+        rate = parse_amount(values.get("rate")) or Decimal("0")
+        if not description or (quantity <= 0 and rate <= 0):
+            skipped += 1
+            continue
+        lines.append({
+            "category": str(values.get("category") or "").strip() or None,
+            "description": description,
+            "unit": str(values.get("unit") or "").strip() or None,
+            "quantity": float(quantity),
+            "rate": float(rate),
+        })
+    return lines, skipped
+
 
 def parse_spreadsheet(data: bytes, filename: str) -> dict[str, list[dict[str, Any]]]:
     """Returns {sheet_name: [row_dict, ...]} - every value kept as a plain string (or empty

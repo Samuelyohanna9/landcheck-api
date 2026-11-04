@@ -6,10 +6,14 @@ flow deliberately mirrors EstateSettlementRequest's shape (requested -> in_revie
 from estates.py's accounting endpoints: a read permission is enough to ask for a draw, a manage
 permission is required to approve or record the real payment that actually reaches "paid"."""
 
+import io
 import logging
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile
+from fastapi.responses import Response
+from openpyxl import Workbook
+from openpyxl.styles import Font
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
@@ -32,8 +36,10 @@ from app.models.estate_foundation import (
     EstateSnagItem,
 )
 from app.routers.plots import get_db
+from app.services.estates import data_import
 from app.services.estates.audit import append_estate_audit_event
 from app.services.estates.authorization import require_estate_access, require_estate_access_for_estate
+from app.utils.upload_security import MAX_IMPORT_UPLOAD_BYTES, read_limited_upload, upload_extension
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/estates", tags=["estate-construction"])
@@ -311,6 +317,71 @@ def apply_boq_to_budget(plot_id: int, request: Request, db: Session = Depends(ge
     db.commit()
     lines = db.query(EstateConstructionBudgetLine).filter(EstateConstructionBudgetLine.budget_id == budget.id).all()
     return _budget_payload(budget, lines)
+
+
+@router.get("/boq/field-template")
+def download_boq_field_template():
+    """A downloadable starting-point workbook for BOQ import, matching the "Connect your tools"
+    import wizard's own template pattern (app/routers/estate_imports.py) - entirely optional,
+    since column headers are auto-detected either way via data_import.suggest_column_mapping."""
+    headers = ["Category", "Description", "Unit", "Quantity", "Rate (NGN)"]
+    sample_row = ["Foundation", "Excavation for foundation trench", "m3", 45, 3500]
+
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "BOQ template"
+    sheet.append(headers)
+    for cell in sheet[1]:
+        cell.font = Font(bold=True)
+    sheet.append(sample_row)
+    for column_cells in sheet.columns:
+        width = max((len(str(cell.value)) for cell in column_cells if cell.value is not None), default=10)
+        sheet.column_dimensions[column_cells[0].column_letter].width = max(10, width + 2)
+
+    buffer = io.BytesIO()
+    workbook.save(buffer)
+    return Response(
+        buffer.getvalue(),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": "attachment; filename=\"landcheck-boq-template.xlsx\""},
+    )
+
+
+@router.post("/plots/{plot_id}/boq/import")
+async def import_boq_lines(plot_id: int, request: Request, file: UploadFile = File(...), db: Session = Depends(get_db)):
+    """Parses an uploaded Excel/CSV BOQ and returns ready-to-review line items - it does not save
+    anything itself. The frontend appends the returned lines to whatever's already in the BOQ
+    editor, so the architect can review, edit or remove rows before clicking Save BOQ, the same
+    upsert_boq endpoint a manually-typed line already goes through. Column headers are
+    auto-detected (category/description/unit/quantity/rate and common synonyms - see
+    data_import.BOQ_FIELD_SYNONYMS); there is no manual mapping step because, unlike the generic
+    "Connect your tools" wizard, a BOQ row never has to be matched against an existing entity."""
+    plot, estate = _plot_and_estate(db, plot_id)
+    require_estate_access_for_estate(db, request, estate.id, permission=WRITE)
+    if upload_extension(file) not in {".xlsx", ".xls", ".csv"}:
+        raise HTTPException(422, "Upload a .xlsx or .csv file")
+    data = await read_limited_upload(file, max_bytes=MAX_IMPORT_UPLOAD_BYTES)
+    try:
+        sheets = data_import.parse_spreadsheet(data, file.filename or "upload")
+    except ValueError as exc:
+        raise HTTPException(422, str(exc))
+
+    lines: list[dict] = []
+    skipped = 0
+    unmapped_headers: set[str] = set()
+    for rows in sheets.values():
+        if not rows:
+            continue
+        headers = list(rows[0].keys())
+        mapping = data_import.suggest_column_mapping(headers, "boq")
+        unmapped_headers.update(header for header, field in mapping.items() if not field)
+        sheet_lines, sheet_skipped = data_import.build_boq_lines(rows, mapping)
+        lines.extend(sheet_lines)
+        skipped += sheet_skipped
+
+    if not lines:
+        raise HTTPException(422, "No usable BOQ rows were found - every row needs at least a description and a quantity or rate. Check the column headers match Category/Description/Unit/Quantity/Rate (or download the template).")
+    return {"lines": lines, "imported": len(lines), "skipped": skipped}
 
 
 # ── Contractors ──────────────────────────────────────────────────────────────────────────────
