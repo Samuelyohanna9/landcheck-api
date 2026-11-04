@@ -141,7 +141,7 @@ def _persist_created_design(
     )
     db.add(row)
     db.commit()
-    return row, canva_connect.prepare_edit_url(edit_url, return_key)
+    return row, canva_connect.stable_edit_url(design_id, return_key)
 
 
 @router.get("/{estate_id}/marketing/canva")
@@ -303,7 +303,7 @@ def canva_create_design(estate_id: int, payload: CanvaEditRequest, request: Requ
         )
         db.add(row)
         db.commit()
-        edit_url = canva_connect.prepare_edit_url(edit_url, return_key)
+        edit_url = canva_connect.stable_edit_url(design_id, return_key)
         return {"id": row.id, "design_id": design_id, "edit_url": edit_url, "title": row.title}
     except canva_connect.CanvaApiError as exc:
         db.rollback()

@@ -9,7 +9,7 @@ import secrets
 import time
 from datetime import datetime, timedelta, timezone
 from io import BytesIO
-from urllib.parse import urlencode
+from urllib.parse import quote, urlencode
 
 import requests
 from cryptography.exceptions import InvalidSignature
@@ -82,6 +82,24 @@ def prepare_edit_url(edit_url: str, correlation_state: str) -> str:
         return edit_url
     separator = "&" if "?" in edit_url else "?"
     return f"{edit_url}{separator}{urlencode({'correlation_state': correlation_state})}"
+
+
+def stable_edit_url(design_id: str, correlation_state: str | None = None) -> str:
+    """Build Canva's stable design editor URL from a validated design id.
+
+    Canva also returns a temporary ``/api/design/.../edit`` handoff URL.  Those
+    links can become invalid when a browser session changes or the handoff token
+    expires.  The canonical design URL remains tied to the authenticated Canva
+    account and is suitable for opening a design from LandCheck.  Return
+    navigation is still opt-in and appends the documented correlation state.
+    """
+    design_id = str(design_id or "").strip()
+    if not design_id:
+        raise CanvaApiError("Canva did not return a design id.")
+    url = f"https://www.canva.com/design/{quote(design_id, safe='')}/edit"
+    if return_navigation_enabled() and correlation_state:
+        url = f"{url}?{urlencode({'correlation_state': correlation_state})}"
+    return url
 
 
 def web_url() -> str:

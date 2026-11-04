@@ -75,6 +75,13 @@ def test_edit_url_does_not_use_return_state_until_return_navigation_is_enabled(c
     assert prepared.endswith("?correlation_state=return-key")
 
 
+def test_stable_edit_url_uses_design_id_and_optional_return_state(canva_env, monkeypatch):
+    assert canva_connect.stable_edit_url("DA/design id") == "https://www.canva.com/design/DA%2Fdesign%20id/edit"
+
+    monkeypatch.setenv("CANVA_RETURN_NAVIGATION_ENABLED", "true")
+    assert canva_connect.stable_edit_url("DA123", "return-key") == "https://www.canva.com/design/DA123/edit?correlation_state=return-key"
+
+
 def test_oauth_exchange_surfaces_provider_failure(canva_env, monkeypatch):
     monkeypatch.setattr(canva_connect.requests, "post", lambda *args, **kwargs: FakeResponse(400, {"message": "invalid_grant"}))
 
