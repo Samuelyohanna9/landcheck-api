@@ -83,3 +83,7 @@ def test_estate_organization_is_available_for_identity_lookup_only():
 
 def test_estates_router_imports_estate_scoped_read_authorizer():
     assert callable(estates_router.require_estate_view_access_for_estate)
+
+
+def test_estates_router_imports_estate_scoped_write_authorizer():
+    assert callable(estates_router.require_estate_access_for_estate)

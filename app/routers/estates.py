@@ -47,6 +47,7 @@ from app.services.estates.audit import append_estate_audit_event
 from app.services.estates.authorization import (
     EstatePrincipal,
     require_estate_access,
+    require_estate_access_for_estate,
     require_estate_view_access,
     require_estate_view_access_any,
     require_estate_view_access_for_estate,
