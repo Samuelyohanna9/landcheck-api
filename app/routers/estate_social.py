@@ -22,7 +22,7 @@ from app.routers.estate_marketing import NO_CACHE_PRIVATE, _campaign_for_staff, 
 from app.routers.plots import get_db
 from app.services.estates import estate_sms, marketing_render, social_broadcast, social_meta, social_planner, social_posts, social_templates, social_whatsapp, whatsapp_inbox
 from app.services.estates.audit import append_estate_audit_event
-from app.services.estates.authorization import require_estate_access
+from app.services.estates.authorization import require_estate_access, require_estate_access_for_estate
 from app.services.estates.marketing_common import client_ip, normalize_phone_digits, public_page_url, throttled, web_url
 from app.services.estates.operations import record_notification_log
 from app.services.estates.subscriptions import has_auto_posting_access_for_organization, has_sms_access_for_organization, has_whatsapp_access_for_organization
@@ -152,7 +152,7 @@ def _post_for_staff(db: Session, request: Request, post_id: int, permission: str
     estate = db.get(Estate, post.estate_id)
     if estate is None:
         raise HTTPException(404, "Estate not found")
-    access = require_estate_access(db, request, post.organization_id, permission=permission)
+    access = require_estate_access_for_estate(db, request, post.estate_id, permission=permission)
     return post, estate, access
 
 
@@ -673,7 +673,7 @@ def update_plan(plan_id: int, payload: PlanUpdate, request: Request, db: Session
     plan = db.get(EstateSocialPlan, plan_id)
     if plan is None:
         raise HTTPException(404, "Plan not found")
-    access = require_estate_access(db, request, plan.organization_id, permission=WRITE)
+    access = require_estate_access_for_estate(db, request, plan.estate_id, permission=WRITE)
     if payload.auto_renew is not None:
         plan.auto_renew = payload.auto_renew
     action = payload.action
@@ -936,7 +936,7 @@ def revoke_optin(optin_id: int, request: Request, db: Session = Depends(get_db))
     row = db.get(EstateMarketingOptin, optin_id)
     if row is None:
         raise HTTPException(404, "Contact not found")
-    require_estate_access(db, request, row.organization_id, permission=WRITE)
+    require_estate_access_for_estate(db, request, row.estate_id, permission=WRITE)
     row.status = "revoked"
     row.revoked_at = datetime.now(timezone.utc)
     db.commit()
@@ -1143,7 +1143,7 @@ def get_whatsapp_media(message_id: int, request: Request, db: Session = Depends(
     row = db.get(EstateWhatsappMessage, message_id)
     if row is None or not row.media_id:
         raise HTTPException(404, "Media not found")
-    require_estate_access(db, request, row.organization_id, permission="estate.read")
+    require_estate_access_for_estate(db, request, row.estate_id, permission="estate.read")
     try:
         data, mime_type = social_whatsapp.download_media(row.media_id)
     except social_whatsapp.WhatsAppError as exc:

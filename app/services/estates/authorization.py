@@ -140,29 +140,19 @@ def require_estate_access(
     return access
 
 
-def require_estate_access_for_estate(
-    db: Session,
-    request: Request,
-    estate_id: int,
-    *,
-    permission: str | None = None,
-    require_subscription: bool = True,
-) -> EstateAccess:
-    """Like require_estate_access, but additionally enforces per-estate scoping where one has been
-    set up for this member (EstateMemberEstateScope) - built for collaborators (e.g. an Architect)
-    who should only reach the one estate they're actually working on. A member with zero scope
-    rows is unrestricted, exactly like require_estate_access today - scoping is opt-in per member,
-    never a silent new restriction on everyone else."""
-    from app.models.estate_foundation import Estate, EstateMemberEstateScope
+def _enforce_estate_member_scope(db: Session, estate_id: int, organization_id: int, access: EstateAccess) -> None:
+    """Shared by require_estate_access_for_estate and require_estate_view_access_for_estate: once
+    access to the organization is already established, additionally enforce per-estate scoping
+    where one has been set up for this member (EstateMemberEstateScope) - built for collaborators
+    (e.g. an Architect) who should only reach the one estate they're actually working on. A member
+    with zero scope rows is unrestricted, exactly like the org-wide checks today - scoping is
+    opt-in per member, never a silent new restriction on everyone else."""
+    from app.models.estate_foundation import EstateMemberEstateScope
 
-    estate = db.get(Estate, estate_id)
-    if estate is None:
-        raise HTTPException(status_code=404, detail="Estate not found")
-    access = require_estate_access(db, request, estate.organization_id, permission=permission, require_subscription=require_subscription)
     member = (
         db.query(EstateOrganizationMember)
         .filter(
-            EstateOrganizationMember.organization_id == estate.organization_id,
+            EstateOrganizationMember.organization_id == organization_id,
             EstateOrganizationMember.subject_type == access.principal.subject_type,
             EstateOrganizationMember.subject_id == access.principal.subject_id,
         )
@@ -175,6 +165,25 @@ def require_estate_access_for_estate(
         }
         if scoped_estate_ids and int(estate_id) not in scoped_estate_ids:
             raise HTTPException(status_code=403, detail="You do not have access to this estate")
+
+
+def require_estate_access_for_estate(
+    db: Session,
+    request: Request,
+    estate_id: int,
+    *,
+    permission: str | None = None,
+    require_subscription: bool = True,
+) -> EstateAccess:
+    """Like require_estate_access, but additionally enforces per-estate scoping - see
+    _enforce_estate_member_scope."""
+    from app.models.estate_foundation import Estate
+
+    estate = db.get(Estate, estate_id)
+    if estate is None:
+        raise HTTPException(status_code=404, detail="Estate not found")
+    access = require_estate_access(db, request, estate.organization_id, permission=permission, require_subscription=require_subscription)
+    _enforce_estate_member_scope(db, estate_id, estate.organization_id, access)
     return access
 
 
@@ -222,6 +231,26 @@ def require_estate_view_access(
     access = require_estate_access(db, request, organization_id, permission=permission, require_subscription=False)
     if not is_agent_workspace(db, organization_id) and get_subscription(db, organization_id) is None:
         raise HTTPException(status_code=402, detail={"code": "subscription_required", "message": "Choose a plan to continue using LandCheck Estates."})
+    return access
+
+
+def require_estate_view_access_for_estate(
+    db: Session,
+    request: Request,
+    estate_id: int,
+    *,
+    permission: str | None = None,
+) -> EstateAccess:
+    """The read-only counterpart to require_estate_access_for_estate: like require_estate_view_access
+    (reachable with a lapsed subscription), but additionally enforces per-estate scoping - see
+    _enforce_estate_member_scope."""
+    from app.models.estate_foundation import Estate
+
+    estate = db.get(Estate, estate_id)
+    if estate is None:
+        raise HTTPException(status_code=404, detail="Estate not found")
+    access = require_estate_view_access(db, request, estate.organization_id, permission=permission)
+    _enforce_estate_member_scope(db, estate_id, estate.organization_id, access)
     return access
 
 

@@ -45,7 +45,7 @@ from app.schemas.estate_marketing import (
 )
 from app.services.estates import commissions, live_inspection, marketing_alerts, marketing_field, marketing_pdf, marketing_render
 from app.services.estates.audit import append_estate_audit_event
-from app.services.estates.authorization import EstatePrincipal, require_estate_access, require_estate_view_access
+from app.services.estates.authorization import EstatePrincipal, require_estate_access, require_estate_access_for_estate, require_estate_view_access, require_estate_view_access_for_estate
 from app.services.estates.marketing_common import (
     agent_member_for,
     client_ip,
@@ -110,7 +110,7 @@ def _require_published(estate: Estate) -> None:
 
 def _staff(db: Session, request: Request, estate_id: int, permission: str = "estate.read"):
     estate = _estate_or_404(db, estate_id)
-    access = require_estate_access(db, request, estate.organization_id, permission=permission)
+    access = require_estate_access_for_estate(db, request, estate.id, permission=permission)
     return estate, access
 
 
@@ -121,7 +121,7 @@ def _staff_view(db: Session, request: Request, estate_id: int, permission: str =
     locked/unlocked state. Every write and every actually-billed read (WhatsApp conversations,
     opt-in broadcast history) still goes through the stricter _staff."""
     estate = _estate_or_404(db, estate_id)
-    access = require_estate_view_access(db, request, estate.organization_id, permission=permission)
+    access = require_estate_view_access_for_estate(db, request, estate.id, permission=permission)
     return estate, access
 
 
@@ -814,7 +814,7 @@ def staff_update_slot(slot_id: int, payload: InspectionSlotUpdate, request: Requ
     slot = db.get(EstateInspectionSlot, slot_id)
     if slot is None:
         raise HTTPException(404, "Inspection time not found")
-    access = require_estate_access(db, request, slot.organization_id, permission="estate.manage")
+    access = require_estate_access_for_estate(db, request, slot.estate_id, permission="estate.manage")
     values = payload.model_dump(exclude_unset=True)
     was_cancelled = slot.status == "cancelled"
     if "capacity" in values and values["capacity"] is not None:
@@ -853,7 +853,7 @@ def staff_update_booking(booking_id: int, payload: InspectionBookingUpdate, requ
     booking = db.get(EstateInspectionBooking, booking_id)
     if booking is None:
         raise HTTPException(404, "Booking not found")
-    access = require_estate_access(db, request, booking.organization_id, permission="estate.read")
+    access = require_estate_access_for_estate(db, request, booking.estate_id, permission="estate.read")
     is_manager = has_permission(access.role_key, "estate.manage")
     is_own = booking.assigned_agent_subject_type == access.principal.subject_type and booking.assigned_agent_subject_id == access.principal.subject_id
     if not (is_manager or is_own or has_permission(access.role_key, "field.manage")):
@@ -982,7 +982,7 @@ def staff_update_progress(update_id: int, payload: ProgressUpdatePatch, request:
     row = db.get(EstateProgressUpdate, update_id)
     if row is None:
         raise HTTPException(404, "Update not found")
-    access = require_estate_access(db, request, row.organization_id, permission="field.manage")
+    access = require_estate_access_for_estate(db, request, row.estate_id, permission="field.manage")
     values = payload.model_dump(exclude_unset=True)
     if values.get("title"):
         row.title = values["title"].strip()
@@ -1000,7 +1000,7 @@ def staff_delete_progress(update_id: int, request: Request, db: Session = Depend
     row = db.get(EstateProgressUpdate, update_id)
     if row is None:
         raise HTTPException(404, "Update not found")
-    access = require_estate_access(db, request, row.organization_id, permission="field.manage")
+    access = require_estate_access_for_estate(db, request, row.estate_id, permission="field.manage")
     append_estate_audit_event(db, organization_id=row.organization_id, actor=access.principal, action="progress_update.deleted", entity_type="estate_progress_update", entity_id=row.id, before_data={"title": row.title})
     key = row.media_object_key
     db.delete(row)
@@ -1087,7 +1087,7 @@ def staff_update_approval(milestone_id: int, payload: ApprovalMilestoneUpdate, r
     if row is None:
         raise HTTPException(404, "Milestone not found")
     estate = db.get(Estate, row.estate_id)
-    access = require_estate_access(db, request, estate.organization_id, permission="estate.manage")
+    access = require_estate_access_for_estate(db, request, row.estate_id, permission="estate.manage")
     values = payload.model_dump(exclude_unset=True)
     before = {"status": row.status, "is_public": row.is_public}
     if "status" in values and values["status"] is not None:
@@ -1116,7 +1116,7 @@ def staff_delete_approval(milestone_id: int, request: Request, db: Session = Dep
     if row is None:
         raise HTTPException(404, "Milestone not found")
     estate = db.get(Estate, row.estate_id)
-    access = require_estate_access(db, request, estate.organization_id, permission="estate.manage")
+    access = require_estate_access_for_estate(db, request, row.estate_id, permission="estate.manage")
     append_estate_audit_event(db, organization_id=estate.organization_id, actor=access.principal, action="approval_milestone.deleted", entity_type="estate_approval_milestone", entity_id=row.id, before_data={"milestone_type": row.milestone_type, "status": row.status})
     db.delete(row)
     db.commit()

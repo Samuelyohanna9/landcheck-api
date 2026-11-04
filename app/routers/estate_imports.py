@@ -27,7 +27,7 @@ from app.routers.plots import get_db
 from app.schemas.estates import ImportCommitRequest, ImportMappingPresetCreate, ImportMappingSubmit, ImportRowOverride
 from app.services.estates import data_import
 from app.services.estates.audit import append_estate_audit_event
-from app.services.estates.authorization import list_estate_access, require_estate_access, resolve_estate_principal
+from app.services.estates.authorization import list_estate_access, require_estate_access, require_estate_access_for_estate, resolve_estate_principal
 from app.services.estates.permissions import has_permission
 from app.utils.upload_security import MAX_IMPORT_UPLOAD_BYTES, read_limited_upload, upload_extension
 
@@ -80,7 +80,7 @@ async def detect_spreadsheet(request: Request, estate_id: int = Form(...), file:
     estate = db.get(Estate, estate_id)
     if not estate:
         raise HTTPException(404, "Estate not found")
-    require_estate_access(db, request, estate.organization_id, permission="integration.manage")
+    require_estate_access_for_estate(db, request, estate.id, permission="integration.manage")
     if upload_extension(file) not in ALLOWED_IMPORT_EXTENSIONS:
         raise HTTPException(422, "Upload a .xlsx or .csv file")
     data = await read_limited_upload(file, max_bytes=MAX_IMPORT_UPLOAD_BYTES)
@@ -102,7 +102,7 @@ async def create_import_batch(
     estate = db.get(Estate, estate_id)
     if not estate:
         raise HTTPException(404, "Estate not found")
-    access = require_estate_access(db, request, estate.organization_id, permission="integration.manage")
+    access = require_estate_access_for_estate(db, request, estate.id, permission="integration.manage")
     if upload_extension(file) not in ALLOWED_IMPORT_EXTENSIONS:
         raise HTTPException(422, "Upload a .xlsx or .csv file")
     try:
@@ -178,7 +178,7 @@ def _get_batch(db: Session, request: Request, batch_id: int, *, permission: str)
     batch = db.get(EstateImportBatch, batch_id)
     if not batch:
         raise HTTPException(404, "Import batch not found")
-    require_estate_access(db, request, batch.organization_id, permission=permission)
+    require_estate_access_for_estate(db, request, batch.estate_id, permission=permission)
     return batch
 
 
@@ -236,7 +236,7 @@ def override_import_row(batch_id: int, row_id: int, payload: ImportRowOverride, 
 @router.post("/{batch_id}/commit")
 def commit_import_batch(batch_id: int, payload: ImportCommitRequest, request: Request, db: Session = Depends(get_db)):
     batch = _get_batch(db, request, batch_id, permission="integration.manage")
-    access = require_estate_access(db, request, batch.organization_id, permission="integration.manage")
+    access = require_estate_access_for_estate(db, request, batch.estate_id, permission="integration.manage")
     if batch.status == "committed":
         raise HTTPException(409, "This batch has already been committed")
     query = db.query(EstateImportRow).filter(EstateImportRow.batch_id == batch.id, EstateImportRow.resolution != "skip")
@@ -266,7 +266,7 @@ def download_import_errors(batch_id: int, request: Request, db: Session = Depend
 @router.post("/{batch_id}/reverse")
 def reverse_import_batch(batch_id: int, request: Request, db: Session = Depends(get_db)):
     batch = _get_batch(db, request, batch_id, permission="integration.manage")
-    access = require_estate_access(db, request, batch.organization_id, permission="integration.manage")
+    access = require_estate_access_for_estate(db, request, batch.estate_id, permission="integration.manage")
     if batch.status != "committed":
         raise HTTPException(409, "Only a committed batch can be reversed")
     blockers = data_import.reverse_import_batch(db, batch=batch, actor=access.principal)

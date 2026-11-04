@@ -1025,7 +1025,7 @@ def update_estate(estate_id: int, payload: EstateUpdate, request: Request, db: S
     estate = db.get(Estate, estate_id)
     if not estate:
         raise HTTPException(404, "Estate not found")
-    access = require_estate_access(db, request, estate.organization_id, permission="estate.manage")
+    access = require_estate_access_for_estate(db, request, estate.id, permission="estate.manage")
     before = _estate_metadata_snapshot(estate)
     values = payload.model_dump(exclude_unset=True)
     if "boundary" in values:
@@ -1066,7 +1066,7 @@ def delete_estate(estate_id: int, request: Request, db: Session = Depends(get_db
     estate = db.get(Estate, estate_id)
     if not estate:
         raise HTTPException(404, "Estate not found")
-    access = require_estate_access(db, request, estate.organization_id, permission="estate.manage")
+    access = require_estate_access_for_estate(db, request, estate.id, permission="estate.manage")
     if estate.archived_at is not None:
         raise HTTPException(409, "This Estate has already been deleted")
     allocated_count = db.query(EstateAllocation).join(EstatePlot, EstateAllocation.plot_id == EstatePlot.id).filter(EstatePlot.estate_id == estate_id).count()
@@ -1083,7 +1083,7 @@ def approve_estate_map(estate_id: int, request: Request, db: Session = Depends(g
     estate = db.get(Estate, estate_id)
     if not estate:
         raise HTTPException(404, "Estate not found")
-    access = require_estate_access(db, request, estate.organization_id, permission="estate.manage")
+    access = require_estate_access_for_estate(db, request, estate.id, permission="estate.manage")
     quality = estate_quality_check(estate_id, request, db)
     if not quality["plot_count"]:
         raise HTTPException(409, "Add at least one approved plot before publishing the Estate map")
@@ -1109,7 +1109,7 @@ def approve_estate_map(estate_id: int, request: Request, db: Session = Depends(g
 def estate_dashboard(estate_id: int, request: Request, db: Session = Depends(get_db)):
     estate = db.get(Estate, estate_id)
     if not estate: raise HTTPException(404, "Estate not found")
-    require_estate_view_access(db, request, estate.organization_id, permission="estate.read"); _enabled(db, estate.organization_id)
+    require_estate_view_access_for_estate(db, request, estate.id, permission="estate.read"); _enabled(db, estate.organization_id)
     status_rows = db.query(EstatePlot.commercial_status, func.count(EstatePlot.id)).filter(EstatePlot.estate_id == estate_id).group_by(EstatePlot.commercial_status).all()
     development_rows = db.query(EstatePlot.development_status, func.count(EstatePlot.id)).filter(EstatePlot.estate_id == estate_id).group_by(EstatePlot.development_status).all()
     counts = {key: int(dict(status_rows).get(key, 0)) for key in ("available", "reserved", "allocated", "on_hold")}
@@ -1156,7 +1156,7 @@ def get_public_estate_settings(estate_id: int, request: Request, db: Session = D
     estate = db.get(Estate, estate_id)
     if not estate:
         raise HTTPException(404, "Estate not found")
-    require_estate_view_access(db, request, estate.organization_id, permission="estate.read")
+    require_estate_view_access_for_estate(db, request, estate.id, permission="estate.read")
     _enabled(db, estate.organization_id)
     return {
         "estate_id": estate.id,
@@ -1181,7 +1181,7 @@ def update_public_estate_settings(estate_id: int, payload: PublicEstateSettingsU
     estate = db.get(Estate, estate_id)
     if not estate:
         raise HTTPException(404, "Estate not found")
-    access = require_estate_access(db, request, estate.organization_id, permission="estate.manage")
+    access = require_estate_access_for_estate(db, request, estate.id, permission="estate.manage")
     _enabled(db, estate.organization_id)
     approved_plot_count = db.query(EstatePlot).filter(EstatePlot.estate_id == estate.id, EstatePlot.geometry_status == "approved").count()
     if payload.public_enabled and (estate.status != "active" or approved_plot_count == 0):
@@ -1231,7 +1231,7 @@ def get_estate_development_forecast(estate_id: int, request: Request, db: Sessio
     estate = db.get(Estate, estate_id)
     if not estate:
         raise HTTPException(404, "Estate not found")
-    require_estate_access(db, request, estate.organization_id, permission="estate.read")
+    require_estate_access_for_estate(db, request, estate.id, permission="estate.read")
     _enabled(db, estate.organization_id)
     _require_plus_plan(
         db,
@@ -1325,7 +1325,7 @@ def run_estate_development_forecast(estate_id: int, request: Request, db: Sessio
     estate = db.get(Estate, estate_id)
     if not estate:
         raise HTTPException(404, "Estate not found")
-    access = require_estate_access(db, request, estate.organization_id, permission="estate.manage")
+    access = require_estate_access_for_estate(db, request, estate.id, permission="estate.manage")
     _enabled(db, estate.organization_id)
     _require_plus_plan(
         db,
@@ -1356,7 +1356,7 @@ def publish_estate_development_forecast(estate_id: int, payload: DevelopmentFore
     estate = db.get(Estate, estate_id)
     if not estate:
         raise HTTPException(404, "Estate not found")
-    access = require_estate_access(db, request, estate.organization_id, permission="estate.manage")
+    access = require_estate_access_for_estate(db, request, estate.id, permission="estate.manage")
     _enabled(db, estate.organization_id)
     _require_plus_plan(
         db,
@@ -1388,7 +1388,7 @@ async def upload_public_estate_logo(estate_id: int, request: Request, file: Uplo
     estate = db.get(Estate, estate_id)
     if not estate:
         raise HTTPException(404, "Estate not found")
-    access = require_estate_access(db, request, estate.organization_id, permission="estate.manage")
+    access = require_estate_access_for_estate(db, request, estate.id, permission="estate.manage")
     _enabled(db, estate.organization_id)
     if str(file.content_type or "").lower() not in {"image/png", "image/jpeg"}:
         raise HTTPException(422, "Upload a PNG or JPEG logo")
@@ -1430,7 +1430,7 @@ async def upload_public_estate_cover(estate_id: int, request: Request, file: Upl
     estate = db.get(Estate, estate_id)
     if not estate:
         raise HTTPException(404, "Estate not found")
-    access = require_estate_access(db, request, estate.organization_id, permission="estate.manage")
+    access = require_estate_access_for_estate(db, request, estate.id, permission="estate.manage")
     _enabled(db, estate.organization_id)
     if str(file.content_type or "").lower() not in {"image/png", "image/jpeg"}:
         raise HTTPException(422, "Upload a PNG or JPEG photo")
@@ -1471,7 +1471,7 @@ def remove_public_estate_cover(estate_id: int, request: Request, db: Session = D
     estate = db.get(Estate, estate_id)
     if not estate:
         raise HTTPException(404, "Estate not found")
-    access = require_estate_access(db, request, estate.organization_id, permission="estate.manage")
+    access = require_estate_access_for_estate(db, request, estate.id, permission="estate.manage")
     _enabled(db, estate.organization_id)
     previous_key = estate.public_cover_object_key
     if not previous_key:
@@ -1497,7 +1497,7 @@ def list_public_reservation_requests(estate_id: int, request: Request, status: s
     estate = db.get(Estate, estate_id)
     if not estate:
         raise HTTPException(404, "Estate not found")
-    require_estate_view_access(db, request, estate.organization_id, permission="allocation.read")
+    require_estate_view_access_for_estate(db, request, estate.id, permission="allocation.read")
     query = db.query(EstatePublicReservationRequest).filter(EstatePublicReservationRequest.estate_id == estate.id)
     if status and status != "all":
         if status not in {"new", "contacted", "converted", "declined"}:
@@ -1529,7 +1529,7 @@ def update_public_reservation_request(request_id: int, payload: PublicReservatio
     row = db.get(EstatePublicReservationRequest, request_id)
     if not row:
         raise HTTPException(404, "Reservation request not found")
-    access = require_estate_access(db, request, row.organization_id, permission="allocation.manage")
+    access = require_estate_access_for_estate(db, request, row.estate_id, permission="allocation.manage")
     if payload.status == "converted" and not row.allocation_id:
         raise HTTPException(status_code=409, detail="Use Migrate to customer to create the customer and reserve this plot")
     previous = row.status
@@ -1572,7 +1572,7 @@ def convert_public_reservation_request(
     row = db.get(EstatePublicReservationRequest, request_id)
     if not row:
         raise HTTPException(404, "Reservation request not found")
-    access = require_estate_access(db, request, row.organization_id, permission="allocation.manage")
+    access = require_estate_access_for_estate(db, request, row.estate_id, permission="allocation.manage")
     idempotency_key = _normalize_idempotency_key(idempotency_header)
     if row.allocation_id:
         return {**_public_reservation_payload(db, row), "customer_notified": False, "already_converted": True}
@@ -1679,7 +1679,7 @@ def convert_public_reservation_request(
 def estate_plots_geojson(estate_id: int, request: Request, db: Session = Depends(get_db)):
     estate=db.get(Estate,estate_id)
     if not estate: raise HTTPException(404,"Estate not found")
-    require_estate_view_access(db,request,estate.organization_id,permission="plot.read")
+    require_estate_view_access_for_estate(db, request, estate.id,permission="plot.read")
     rows = db.query(
         EstatePlot.id,
         EstatePlot.plot_number,
@@ -1749,7 +1749,7 @@ def list_estate_blocks(estate_id: int, request: Request, db: Session = Depends(g
     estate = db.get(Estate, estate_id)
     if not estate:
         raise HTTPException(404, "Estate not found")
-    require_estate_view_access(db, request, estate.organization_id, permission="plot.read")
+    require_estate_view_access_for_estate(db, request, estate.id, permission="plot.read")
     rows = db.query(EstateBlock).filter(EstateBlock.estate_id == estate_id).order_by(EstateBlock.label.asc()).all()
     return [{"id": row.id, "label": row.label, "name": row.name, "notes": row.notes, "geometry": mapping(to_shape(row.geometry)) if row.geometry else None} for row in rows]
 
@@ -1759,7 +1759,7 @@ def create_estate_block(estate_id: int, payload: BlockCreate, request: Request, 
     estate = db.get(Estate, estate_id)
     if not estate:
         raise HTTPException(404, "Estate not found")
-    access = require_estate_access(db, request, estate.organization_id, permission="infrastructure.manage")
+    access = require_estate_access_for_estate(db, request, estate.id, permission="infrastructure.manage")
     if db.query(EstateBlock).filter(EstateBlock.estate_id == estate_id, EstateBlock.label == payload.label.strip()).first():
         raise HTTPException(409, "Block label already exists in this estate")
     geometry = _geojson_geometry(payload.geometry) if payload.geometry else None
@@ -1779,7 +1779,7 @@ def update_estate_block(estate_id: int, block_id: int, payload: BlockUpdate, req
     row = db.get(EstateBlock, block_id)
     if not estate or not row or row.estate_id != estate_id:
         raise HTTPException(404, "Block not found")
-    access = require_estate_access(db, request, estate.organization_id, permission="infrastructure.manage")
+    access = require_estate_access_for_estate(db, request, estate.id, permission="infrastructure.manage")
     before = {"label": row.label, "name": row.name, "notes": row.notes}
     values = payload.model_dump(exclude_unset=True)
     if "label" in values:
@@ -1803,7 +1803,7 @@ def update_estate_block(estate_id: int, block_id: int, payload: BlockUpdate, req
 def create_import_review(estate_id:int,payload:ImportReviewCreate,request:Request,db:Session=Depends(get_db)):
     estate=db.get(Estate,estate_id)
     if not estate: raise HTTPException(404,"Estate not found")
-    access=require_estate_access(db,request,estate.organization_id,permission="plot.manage")
+    access=require_estate_access_for_estate(db, request, estate.id,permission="plot.manage")
     row=EstateImportReview(organization_id=estate.organization_id,estate_id=estate.id,source_type=payload.source_type,survey_georeference_session_id=payload.survey_georeference_session_id,notes=payload.notes,created_by_subject_type=access.principal.subject_type,created_by_subject_id=access.principal.subject_id)
     db.add(row); db.flush(); append_estate_audit_event(db,organization_id=estate.organization_id,actor=access.principal,action="import_review.created",entity_type="estate_import_review",entity_id=row.id,after_data={"source_type":row.source_type}); db.commit()
     return {"id":row.id,"status":row.status}
@@ -1826,7 +1826,7 @@ def _normalize_csv_records(raw_records: list[dict]) -> list[dict]:
 async def import_estate_csv(estate_id: int, request: Request, source_crs: str | None = None, file: UploadFile = File(...), db: Session = Depends(get_db)):
     estate=db.get(Estate,estate_id)
     if not estate: raise HTTPException(404,"Estate not found")
-    access=require_estate_access(db,request,estate.organization_id,permission="plot.manage")
+    access=require_estate_access_for_estate(db, request, estate.id,permission="plot.manage")
     if upload_extension(file) not in {".csv", ".txt"}:
         raise HTTPException(422, "Upload a CSV file")
     try: raw_records=list(csv.DictReader(io.StringIO((await read_limited_upload(file)).decode("utf-8-sig"))))
@@ -1875,7 +1875,7 @@ async def import_estate_csv(estate_id: int, request: Request, source_crs: str | 
 async def import_estate_geojson(estate_id:int,request:Request,file:UploadFile=File(...),db:Session=Depends(get_db)):
     estate=db.get(Estate,estate_id)
     if not estate: raise HTTPException(404,"Estate not found")
-    access=require_estate_access(db,request,estate.organization_id,permission="plot.manage")
+    access=require_estate_access_for_estate(db, request, estate.id,permission="plot.manage")
     if upload_extension(file) not in {".geojson", ".json"}:
         raise HTTPException(422, "Upload a GeoJSON file")
     try: document=json.loads((await read_limited_upload(file)).decode("utf-8-sig")); features=document.get("features",[]) if document.get("type")=="FeatureCollection" else [document]
@@ -1919,7 +1919,7 @@ def _closed_ring_points(entity, raw_points: list[tuple[float, float]]) -> list[t
 async def import_estate_dxf(estate_id:int,source_crs:str,request:Request,file:UploadFile=File(...),db:Session=Depends(get_db)):
     estate=db.get(Estate,estate_id)
     if not estate: raise HTTPException(404,"Estate not found")
-    access=require_estate_access(db,request,estate.organization_id,permission="plot.manage")
+    access=require_estate_access_for_estate(db, request, estate.id,permission="plot.manage")
     handle=None
     if upload_extension(file) != ".dxf":
         raise HTTPException(422, "Upload a DXF file")
@@ -1970,7 +1970,7 @@ async def import_scanned_layout(
     estate = db.get(Estate, estate_id)
     if not estate:
         raise HTTPException(404, "Estate not found")
-    access = require_estate_access(db, request, estate.organization_id, permission="plot.manage")
+    access = require_estate_access_for_estate(db, request, estate.id, permission="plot.manage")
     candidates = []
     if candidate_data:
         try:
@@ -2040,7 +2040,7 @@ def list_import_reviews(estate_id:int,request:Request,db:Session=Depends(get_db)
     if not estate: raise HTTPException(404,"Estate not found")
     # A lapsed account may inspect prior imports, but creating or deciding an import remains
     # protected by require_estate_access on the write endpoints below.
-    require_estate_view_access(db,request,estate.organization_id,permission="plot.read")
+    require_estate_view_access_for_estate(db, request, estate.id,permission="plot.read")
     rows=db.query(EstateImportReview).filter(EstateImportReview.estate_id==estate_id).order_by(EstateImportReview.created_at.desc()).all()
     result = []
     for row in rows:
@@ -2052,7 +2052,7 @@ def list_import_reviews(estate_id:int,request:Request,db:Session=Depends(get_db)
 def decide_import_review(review_id:int,payload:ImportReviewDecision,request:Request,db:Session=Depends(get_db)):
     row=db.get(EstateImportReview,review_id)
     if not row: raise HTTPException(404,"Import review not found")
-    access=require_estate_access(db,request,row.organization_id,permission="survey.manage")
+    access=require_estate_access_for_estate(db,request,row.estate_id,permission="survey.manage")
     if row.status != "review_required": raise HTTPException(409,"Import review has already been decided")
     if payload.candidate_data is not None:
         normalized_candidates = []
@@ -2143,7 +2143,7 @@ def create_import_review_from_georeference_session(estate_id: int, payload: Impo
     estate = db.get(Estate, estate_id)
     if not estate:
         raise HTTPException(404, "Estate not found")
-    access = require_estate_access(db, request, estate.organization_id, permission="plot.manage")
+    access = require_estate_access_for_estate(db, request, estate.id, permission="plot.manage")
     session_id = payload.survey_georeference_session_id.strip()
     exists = db.execute(text("SELECT 1 FROM survey_georeference_sessions WHERE id = :id"), {"id": session_id}).scalar()
     if not exists:
@@ -2175,7 +2175,7 @@ def link_import_review_georeference_session(review_id: int, payload: Georeferenc
     row = db.get(EstateImportReview, review_id)
     if not row:
         raise HTTPException(404, "Import review not found")
-    access = require_estate_access(db, request, row.organization_id, permission="plot.manage")
+    access = require_estate_access_for_estate(db, request, row.estate_id, permission="plot.manage")
     if row.status != "review_required":
         raise HTTPException(409, "Import review has already been decided")
     session_id = payload.survey_georeference_session_id.strip()
@@ -2200,7 +2200,7 @@ def import_plots_from_georeference(review_id: int, payload: ImportFromGeoreferen
     row = db.get(EstateImportReview, review_id)
     if not row:
         raise HTTPException(404, "Import review not found")
-    access = require_estate_access(db, request, row.organization_id, permission="survey.manage")
+    access = require_estate_access_for_estate(db, request, row.estate_id, permission="survey.manage")
     if row.status != "review_required":
         raise HTTPException(409, "Import review has already been decided")
     session_id = str(row.survey_georeference_session_id or "").strip()
@@ -2257,7 +2257,7 @@ def generate_layout_proposal(
     estate = db.get(Estate, estate_id)
     if not estate:
         raise HTTPException(404, "Estate not found")
-    access = require_estate_access(db, request, estate.organization_id, permission="plot.manage")
+    access = require_estate_access_for_estate(db, request, estate.id, permission="plot.manage")
     _enabled(db, estate.organization_id)
     if not estate.boundary:
         raise HTTPException(409, "Add a valid Estate boundary before creating a layout")
@@ -2302,7 +2302,7 @@ def list_layout_proposals(estate_id: int, request: Request, db: Session = Depend
     if not estate:
         raise HTTPException(404, "Estate not found")
     # Draft layouts are historical records; only the proposal mutations require an active plan.
-    require_estate_view_access(db, request, estate.organization_id, permission="plot.read")
+    require_estate_view_access_for_estate(db, request, estate.id, permission="plot.read")
     return [_layout_proposal_payload(row) for row in db.query(EstateLayoutProposal).filter(EstateLayoutProposal.estate_id == estate_id).order_by(EstateLayoutProposal.created_at.desc()).all()]
 
 
@@ -2653,7 +2653,7 @@ def _spatial_feature_write_permission(feature_type: str) -> str:
 def create_estate_layer(estate_id:int,payload:SpatialFeatureCreate,request:Request,db:Session=Depends(get_db)):
     estate=db.get(Estate,estate_id)
     if not estate: raise HTTPException(404,"Estate not found")
-    access=require_estate_access(db,request,estate.organization_id,permission=_spatial_feature_write_permission(payload.feature_type))
+    access=require_estate_access_for_estate(db, request, estate.id,permission=_spatial_feature_write_permission(payload.feature_type))
     try: geometry_shape = shape(payload.geometry)
     except Exception: raise HTTPException(422,"Layer geometry is invalid")
     if geometry_shape.is_empty or not geometry_shape.is_valid:
@@ -2681,7 +2681,7 @@ def update_estate_layer(estate_id: int, feature_id: int, payload: SpatialFeature
         raise HTTPException(404, "Spatial layer was not found")
     values = payload.model_dump(exclude_unset=True)
     target_type = str(values.get("feature_type") or row.feature_type)
-    access = require_estate_access(db, request, estate.organization_id, permission=_spatial_feature_write_permission(target_type))
+    access = require_estate_access_for_estate(db, request, estate.id, permission=_spatial_feature_write_permission(target_type))
     before = {"feature_type": row.feature_type, "name": row.name, "status": row.status}
     if "feature_type" in values:
         row.feature_type = values["feature_type"]
@@ -2709,7 +2709,7 @@ def archive_estate_layer(estate_id: int, feature_id: int, request: Request, db: 
     row = db.get(EstateSpatialFeature, feature_id)
     if not estate or not row or row.estate_id != estate_id:
         raise HTTPException(404, "Spatial layer was not found")
-    access = require_estate_access(db, request, estate.organization_id, permission=_spatial_feature_write_permission(row.feature_type))
+    access = require_estate_access_for_estate(db, request, estate.id, permission=_spatial_feature_write_permission(row.feature_type))
     if row.feature_type == "boundary":
         db.delete(row)
         append_estate_audit_event(db, organization_id=estate.organization_id, actor=access.principal, action="spatial_layer.deleted", entity_type="estate_spatial_feature", entity_id=feature_id, before_data={"feature_type": row.feature_type, "name": row.name})
@@ -2725,7 +2725,7 @@ def archive_estate_layer(estate_id: int, feature_id: int, request: Request, db: 
 def estate_quality_check(estate_id:int, request:Request, db:Session=Depends(get_db)):
     estate=db.get(Estate,estate_id)
     if not estate: raise HTTPException(404,"Estate not found")
-    require_estate_access(db,request,estate.organization_id,permission="plot.read")
+    require_estate_access_for_estate(db, request, estate.id,permission="plot.read")
     plots=db.query(EstatePlot).filter(EstatePlot.estate_id==estate_id).all(); issues=[]
     seen={}
     plot_by_id = {}
@@ -2871,7 +2871,7 @@ def plot_hazards(plot_id: int, request: Request, db: Session = Depends(get_db)):
     if not plot:
         raise HTTPException(404, "Plot not found")
     estate = db.get(Estate, plot.estate_id)
-    require_estate_access(db, request, estate.organization_id, permission="plot.read")
+    require_estate_access_for_estate(db, request, estate.id, permission="plot.read")
     _require_hazard_plan(db, estate.organization_id)
     if plot.geometry_status != "approved":
         raise HTTPException(409, "Only approved plot geometry can be screened")
@@ -2892,7 +2892,7 @@ def assess_plot_hazards(plot_id: int, request: Request, db: Session = Depends(ge
     if not plot:
         raise HTTPException(404, "Plot not found")
     estate = db.get(Estate, plot.estate_id)
-    access = require_estate_access(db, request, estate.organization_id, permission="plot.manage")
+    access = require_estate_access_for_estate(db, request, estate.id, permission="plot.manage")
     _require_hazard_plan(db, estate.organization_id)
     if plot.geometry_status != "approved":
         raise HTTPException(409, "Only approved plot geometry can be screened")
@@ -3011,7 +3011,7 @@ def generate_estate_hazard_boundary_map(estate_id: int, request: Request, db: Se
     estate = db.get(Estate, estate_id)
     if not estate:
         raise HTTPException(404, "Estate not found")
-    access = require_estate_access(db, request, estate.organization_id, permission="plot.manage")
+    access = require_estate_access_for_estate(db, request, estate.id, permission="plot.manage")
     _require_hazard_plan(db, estate.organization_id)
     if not estate.boundary and not db.query(EstatePlot.id).filter(EstatePlot.estate_id == estate_id, EstatePlot.geometry_status == "approved", EstatePlot.geometry.isnot(None)).first():
         raise HTTPException(422, "Add an Estate boundary or approve plot geometry before running hazard analysis")
@@ -3038,7 +3038,7 @@ def assess_estate_hazards(estate_id: int, request: Request, db: Session = Depend
     estate = db.get(Estate, estate_id)
     if not estate:
         raise HTTPException(404, "Estate not found")
-    access = require_estate_access(db, request, estate.organization_id, permission="plot.manage")
+    access = require_estate_access_for_estate(db, request, estate.id, permission="plot.manage")
     _require_hazard_plan(db, estate.organization_id)
     if not estate.boundary and not db.query(EstatePlot.id).filter(EstatePlot.estate_id == estate_id, EstatePlot.geometry_status == "approved", EstatePlot.geometry.isnot(None)).first():
         raise HTTPException(422, "Add an Estate boundary or approve plot geometry before running hazard analysis")
@@ -3141,7 +3141,7 @@ def plot_soil_analysis(plot_id: int, request: Request, db: Session = Depends(get
     if not plot:
         raise HTTPException(404, "Plot not found")
     estate = db.get(Estate, plot.estate_id)
-    require_estate_access(db, request, estate.organization_id, permission="plot.read")
+    require_estate_access_for_estate(db, request, estate.id, permission="plot.read")
     _require_soil_plan(db, estate.organization_id)
     if plot.geometry_status != "approved":
         raise HTTPException(409, "Only approved plot geometry can be screened")
@@ -3157,7 +3157,7 @@ def assess_plot_soil(plot_id: int, request: Request, db: Session = Depends(get_d
     if not plot:
         raise HTTPException(404, "Plot not found")
     estate = db.get(Estate, plot.estate_id)
-    access = require_estate_access(db, request, estate.organization_id, permission="plot.manage")
+    access = require_estate_access_for_estate(db, request, estate.id, permission="plot.manage")
     _require_soil_plan(db, estate.organization_id)
     if plot.geometry_status != "approved":
         raise HTTPException(409, "Only approved plot geometry can be screened")
@@ -3202,7 +3202,7 @@ def estate_soil_dashboard(estate_id: int, request: Request, db: Session = Depend
     estate = db.get(Estate, estate_id)
     if not estate:
         raise HTTPException(404, "Estate not found")
-    require_estate_access(db, request, estate.organization_id, permission="plot.read")
+    require_estate_access_for_estate(db, request, estate.id, permission="plot.read")
     _require_soil_plan(db, estate.organization_id)
     return _estate_soil_dashboard_payload(db, estate)
 
@@ -3256,7 +3256,7 @@ def assess_estate_soil(estate_id: int, request: Request, db: Session = Depends(g
     estate = db.get(Estate, estate_id)
     if not estate:
         raise HTTPException(404, "Estate not found")
-    access = require_estate_access(db, request, estate.organization_id, permission="plot.manage")
+    access = require_estate_access_for_estate(db, request, estate.id, permission="plot.manage")
     _require_soil_plan(db, estate.organization_id)
     if not estate.boundary and not db.query(EstatePlot.id).filter(EstatePlot.estate_id == estate_id, EstatePlot.geometry_status == "approved", EstatePlot.geometry.isnot(None)).first():
         raise HTTPException(422, "Add an Estate boundary or approve plot geometry before running soil analysis")
@@ -3315,7 +3315,7 @@ def request_plot_geotech_survey(plot_id: int, request: Request, payload: dict = 
     if not plot:
         raise HTTPException(404, "Plot not found")
     estate = db.get(Estate, plot.estate_id)
-    access = require_estate_access(db, request, estate.organization_id, permission="plot.manage")
+    access = require_estate_access_for_estate(db, request, estate.id, permission="plot.manage")
     _require_soil_plan(db, estate.organization_id)
     row = _create_geotech_survey_request(db, estate=estate, plot_id=plot.id, plot_number=plot.plot_number, access=access, payload=payload)
     return {"id": row.id, "request_uid": row.request_uid, "status": row.status}
@@ -3326,7 +3326,7 @@ def request_estate_geotech_survey(estate_id: int, request: Request, payload: dic
     estate = db.get(Estate, estate_id)
     if not estate:
         raise HTTPException(404, "Estate not found")
-    access = require_estate_access(db, request, estate.organization_id, permission="plot.manage")
+    access = require_estate_access_for_estate(db, request, estate.id, permission="plot.manage")
     _require_soil_plan(db, estate.organization_id)
     row = _create_geotech_survey_request(db, estate=estate, plot_id=None, plot_number=None, access=access, payload=payload)
     return {"id": row.id, "request_uid": row.request_uid, "status": row.status}
@@ -3401,7 +3401,7 @@ def estate_hazard_dashboard(estate_id: int, request: Request, db: Session = Depe
     estate = db.get(Estate, estate_id)
     if not estate:
         raise HTTPException(404, "Estate not found")
-    require_estate_access(db, request, estate.organization_id, permission="plot.read")
+    require_estate_access_for_estate(db, request, estate.id, permission="plot.read")
     _require_hazard_plan(db, estate.organization_id)
     return _estate_hazard_dashboard_payload(db, estate)
 
@@ -3409,7 +3409,7 @@ def estate_hazard_dashboard(estate_id: int, request: Request, db: Session = Depe
 def estate_activity(estate_id:int, request:Request, limit:int=100, db:Session=Depends(get_db)):
     estate=db.get(Estate,estate_id)
     if not estate: raise HTTPException(404,"Estate not found")
-    require_estate_view_access(db,request,estate.organization_id,permission="audit.read")
+    require_estate_view_access_for_estate(db, request, estate.id,permission="audit.read")
     rows=db.query(EstateAuditEvent).filter(EstateAuditEvent.organization_id==estate.organization_id).order_by(EstateAuditEvent.created_at.desc()).limit(min(max(limit,1),200)).all()
     return [{"id":row.id,"action":row.action,"entity_type":row.entity_type,"entity_id":row.entity_id,"actor":row.actor_subject_id,"created_at":row.created_at,"details":row.after_data} for row in rows]
 
@@ -3426,7 +3426,7 @@ def plot_timeline(plot_id: int, request: Request, db: Session = Depends(get_db))
     if not plot:
         raise HTTPException(404, "Plot not found")
     estate = db.get(Estate, plot.estate_id)
-    require_estate_view_access(db, request, estate.organization_id, permission="audit.read")
+    require_estate_view_access_for_estate(db, request, estate.id, permission="audit.read")
 
     allocation_ids = [str(row.id) for row in db.query(EstateAllocation.id).filter(EstateAllocation.plot_id == plot_id).all()]
     payment_ids = [str(row.id) for row in db.query(EstatePayment.id).filter(EstatePayment.plot_id == plot_id).all()]
@@ -3514,7 +3514,7 @@ def customer_timeline(customer_id: int, request: Request, db: Session = Depends(
 def create_plot(estate_id: int, payload: PlotCreate, request: Request, db: Session = Depends(get_db)):
     estate = db.get(Estate, estate_id)
     if not estate: raise HTTPException(404, "Estate not found")
-    access = require_estate_access(db, request, estate.organization_id, permission="plot.manage"); _enabled(db, estate.organization_id)
+    access = require_estate_access_for_estate(db, request, estate.id, permission="plot.manage"); _enabled(db, estate.organization_id)
     area, issues = validate_polygon(payload.geometry)
     if any(issue.severity == "error" for issue in issues): raise HTTPException(422, detail=[issue.message for issue in issues])
     normalized = _normalized(payload.plot_number)
@@ -3531,7 +3531,7 @@ def update_plot_public_price(plot_id: int, payload: PlotPriceUpdate, request: Re
     if not plot:
         raise HTTPException(404, "Plot not found")
     estate = db.get(Estate, plot.estate_id)
-    access = require_estate_access(db, request, estate.organization_id, permission="plot.manage")
+    access = require_estate_access_for_estate(db, request, estate.id, permission="plot.manage")
     previous = str(plot.asking_price) if plot.asking_price is not None else None
     plot.asking_price = payload.asking_price
     append_estate_audit_event(
@@ -3554,7 +3554,7 @@ def update_plot_public_address(plot_id: int, payload: PlotAddressUpdate, request
     if not plot:
         raise HTTPException(404, "Plot not found")
     estate = db.get(Estate, plot.estate_id)
-    access = require_estate_access(db, request, estate.organization_id, permission="plot.manage")
+    access = require_estate_access_for_estate(db, request, estate.id, permission="plot.manage")
     previous = plot.public_address
     plot.public_address = payload.public_address.strip() if payload.public_address else None
     append_estate_audit_event(
@@ -3577,7 +3577,7 @@ def update_plot_listing_defaults(estate_id: int, payload: PlotListingDefaultsUpd
     estate = db.get(Estate, estate_id)
     if not estate:
         raise HTTPException(404, "Estate not found")
-    access = require_estate_access(db, request, estate.organization_id, permission="plot.manage")
+    access = require_estate_access_for_estate(db, request, estate.id, permission="plot.manage")
     _enabled(db, estate.organization_id)
     if not payload.apply_address and not payload.apply_price:
         raise HTTPException(422, "Choose an address or price to apply")
@@ -3620,7 +3620,7 @@ def update_plot_geometry(estate_id: int, plot_id: int, payload: PlotGeometryUpda
     if not estate: raise HTTPException(404, "Estate not found")
     plot = db.get(EstatePlot, plot_id)
     if not plot or plot.estate_id != estate_id: raise HTTPException(404, "Plot not found")
-    access = require_estate_access(db, request, estate.organization_id, permission="plot.manage")
+    access = require_estate_access_for_estate(db, request, estate.id, permission="plot.manage")
     if plot.commercial_status != "available":
         raise HTTPException(409, "Only available plots can have their boundary edited - reserved, allocated or developed plots are locked.")
     area, issues = validate_polygon(payload.geometry)
@@ -3640,7 +3640,7 @@ def delete_estate_plot(estate_id: int, plot_id: int, request: Request, db: Sessi
     if not estate: raise HTTPException(404, "Estate not found")
     plot = db.get(EstatePlot, plot_id)
     if not plot or plot.estate_id != estate_id: raise HTTPException(404, "Plot not found")
-    access = require_estate_access(db, request, estate.organization_id, permission="plot.manage")
+    access = require_estate_access_for_estate(db, request, estate.id, permission="plot.manage")
     if db.query(EstateAllocation).filter(EstateAllocation.plot_id == plot_id).first():
         raise HTTPException(409, "This plot has a customer reservation or allocation on record - remove that first before deleting the plot.")
     plot_number = plot.plot_number
@@ -3660,7 +3660,7 @@ def reset_estate_layout(estate_id: int, request: Request, db: Session = Depends(
     so it still shows up in its own history."""
     estate = db.get(Estate, estate_id)
     if not estate: raise HTTPException(404, "Estate not found")
-    access = require_estate_access(db, request, estate.organization_id, permission="estate.manage")
+    access = require_estate_access_for_estate(db, request, estate.id, permission="estate.manage")
     plots = db.query(EstatePlot).filter(EstatePlot.estate_id == estate_id).all()
     allocated_count = db.query(EstateAllocation).join(EstatePlot, EstateAllocation.plot_id == EstatePlot.id).filter(EstatePlot.estate_id == estate_id).count()
     if allocated_count:
@@ -3701,7 +3701,7 @@ def subdivide_estate_plot(
     plot = db.get(EstatePlot, plot_id)
     if not estate or not plot or plot.estate_id != estate_id:
         raise HTTPException(404, "Plot not found")
-    access = require_estate_access(db, request, estate.organization_id, permission="plot.manage")
+    access = require_estate_access_for_estate(db, request, estate.id, permission="plot.manage")
     _enabled(db, estate.organization_id)
     if plot.geometry_status != "approved":
         raise HTTPException(409, "Only an approved plot can be subdivided")
@@ -3780,7 +3780,7 @@ def subdivide_estate_plot(
 def update_development_status(plot_id:int, payload:DevelopmentStatusUpdate, request:Request, db:Session=Depends(get_db)):
     plot=db.get(EstatePlot,plot_id)
     if not plot: raise HTTPException(404,"Plot not found")
-    estate=db.get(Estate,plot.estate_id); access=require_estate_access(db,request,estate.organization_id,permission="plot.manage")
+    estate=db.get(Estate,plot.estate_id); access=require_estate_access_for_estate(db, request, estate.id,permission="plot.manage")
     previous=plot.development_status; plot.development_status=payload.status
     append_estate_audit_event(db,organization_id=estate.organization_id,actor=access.principal,action="plot.development_status_changed",entity_type="estate_plot",entity_id=plot.id,before_data={"development_status":previous},after_data={"development_status":plot.development_status})
     db.commit()
@@ -3798,7 +3798,7 @@ def update_title_verification(plot_id:int, payload:TitleVerificationUpdate, requ
     # never sent to _public_estate_payload.
     plot=db.get(EstatePlot,plot_id)
     if not plot: raise HTTPException(404,"Plot not found")
-    estate=db.get(Estate,plot.estate_id); access=require_estate_access(db,request,estate.organization_id,permission="estate.manage")
+    estate=db.get(Estate,plot.estate_id); access=require_estate_access_for_estate(db, request, estate.id,permission="estate.manage")
     previous=plot.title_verified; plot.title_verified=payload.verified
     plot.title_verified_at = datetime.now(timezone.utc) if payload.verified else None
     plot.title_verified_note = payload.note.strip() if payload.note else None
@@ -3810,7 +3810,7 @@ def update_title_verification(plot_id:int, payload:TitleVerificationUpdate, requ
 def create_field_inspection(plot_id:int, payload:FieldInspectionCreate, request:Request, db:Session=Depends(get_db)):
     plot=db.get(EstatePlot,plot_id)
     if not plot: raise HTTPException(404,"Plot not found")
-    estate=db.get(Estate,plot.estate_id); access=require_estate_access(db,request,estate.organization_id,permission="field.manage")
+    estate=db.get(Estate,plot.estate_id); access=require_estate_access_for_estate(db, request, estate.id,permission="field.manage")
     inspection=EstateFieldInspection(organization_id=estate.organization_id,estate_id=estate.id,plot_id=plot.id,inspection_type=payload.inspection_type.strip(),outcome=payload.outcome,notes=payload.notes,inspected_by_subject_type=access.principal.subject_type,inspected_by_subject_id=access.principal.subject_id)
     db.add(inspection); db.flush(); append_estate_audit_event(db,organization_id=estate.organization_id,actor=access.principal,action="field_inspection.recorded",entity_type="estate_field_inspection",entity_id=inspection.id,after_data={"plot_id":plot.id,"outcome":inspection.outcome}); db.commit()
     return {"id":inspection.id,"plot_id":plot.id,"outcome":inspection.outcome,"inspected_at":inspection.inspected_at}
@@ -3819,7 +3819,7 @@ def create_field_inspection(plot_id:int, payload:FieldInspectionCreate, request:
 def list_field_inspections(plot_id:int, request:Request, db:Session=Depends(get_db)):
     plot=db.get(EstatePlot,plot_id)
     if not plot: raise HTTPException(404,"Plot not found")
-    estate=db.get(Estate,plot.estate_id); require_estate_view_access(db,request,estate.organization_id,permission="field.read")
+    estate=db.get(Estate,plot.estate_id); require_estate_view_access_for_estate(db, request, estate.id,permission="field.read")
     rows=db.query(EstateFieldInspection).filter(EstateFieldInspection.plot_id==plot.id).order_by(EstateFieldInspection.inspected_at.desc()).all()
     return [{"id":row.id,"type":row.inspection_type,"outcome":row.outcome,"notes":row.notes,"inspected_at":row.inspected_at,"inspected_by":row.inspected_by_subject_id} for row in rows]
 
@@ -3827,7 +3827,7 @@ def list_field_inspections(plot_id:int, request:Request, db:Session=Depends(get_
 def create_survey_request(plot_id:int, request:Request, db:Session=Depends(get_db)):
     plot=db.get(EstatePlot,plot_id)
     if not plot: raise HTTPException(404,"Plot not found")
-    estate=db.get(Estate,plot.estate_id); access=require_estate_access(db,request,estate.organization_id,permission="survey.manage")
+    estate=db.get(Estate,plot.estate_id); access=require_estate_access_for_estate(db, request, estate.id,permission="survey.manage")
     if plot.geometry_status != "approved": raise HTTPException(409,"Only approved plot geometry can be sent to Survey")
     _,issues=validate_polygon(to_shape(plot.geometry).__geo_interface__)
     if any(i.severity=="error" for i in issues): raise HTTPException(422,"Plot geometry is not valid")
@@ -3864,14 +3864,14 @@ def list_survey_requests(request: Request, estate_id: int | None = None, page: i
 def survey_request_detail(request_id:int,request:Request,db:Session=Depends(get_db)):
     row=db.get(EstateSurveyRequest,request_id)
     if not row: raise HTTPException(404,"Survey request not found")
-    require_estate_view_access(db,request,row.organization_id,permission="survey.read")
+    require_estate_view_access_for_estate(db,request,row.estate_id,permission="survey.read")
     return _survey_payload(db,row)
 
 @router.post("/survey-requests/{request_id}/assign")
 def assign_survey_request(request_id:int,payload:SurveyorAssignment,request:Request,db:Session=Depends(get_db)):
     row=db.get(EstateSurveyRequest,request_id)
     if not row: raise HTTPException(404,"Survey request not found")
-    access=require_estate_access(db,request,row.organization_id,permission="survey.manage")
+    access=require_estate_access_for_estate(db,request,row.estate_id,permission="survey.manage")
     from app.models.estate_foundation import EstateOrganizationMember
     member=db.query(EstateOrganizationMember).filter(EstateOrganizationMember.organization_id==row.organization_id,EstateOrganizationMember.subject_type==payload.subject_type,EstateOrganizationMember.subject_id==payload.subject_id,EstateOrganizationMember.is_active.is_(True)).one_or_none()
     if not member or not has_permission(member.role_key,"survey.manage"): raise HTTPException(422,"Assignee is not a Survey-capable organization member")
@@ -3882,7 +3882,7 @@ def assign_survey_request(request_id:int,payload:SurveyorAssignment,request:Requ
 def cancel_survey_request(request_id:int,request:Request,db:Session=Depends(get_db)):
     row=db.get(EstateSurveyRequest,request_id)
     if not row: raise HTTPException(404,"Survey request not found")
-    access=require_estate_access(db,request,row.organization_id,permission="survey.manage")
+    access=require_estate_access_for_estate(db,request,row.estate_id,permission="survey.manage")
     transition(row,"cancelled")
     append_estate_audit_event(db,organization_id=row.organization_id,actor=access.principal,action="survey_request.cancelled",entity_type="estate_survey_request",entity_id=row.id)
     db.commit(); return _survey_payload(db,row)
@@ -3908,7 +3908,7 @@ def _resolve_survey_owner_user_id(db: Session, principal) -> int:
 def start_survey_request(request_id:int,request:Request,db:Session=Depends(get_db)):
     row=db.get(EstateSurveyRequest,request_id)
     if not row: raise HTTPException(404,"Survey request not found")
-    access=require_estate_access(db,request,row.organization_id,permission="survey.manage")
+    access=require_estate_access_for_estate(db,request,row.estate_id,permission="survey.manage")
     if row.survey_working_plot_id: return _survey_payload(db,row)
     survey_owner_user_id = _resolve_survey_owner_user_id(db, access.principal)
     eligibility = survey_eligibility(db, db.get(EstateAllocation, row.allocation_id) if row.allocation_id else None)
@@ -3934,7 +3934,7 @@ def issue_survey_request_session(request_id: int, request: Request, response: Re
     regardless of who started it or what Survey session happened to already be active."""
     row=db.get(EstateSurveyRequest,request_id)
     if not row: raise HTTPException(404,"Survey request not found")
-    require_estate_access(db,request,row.organization_id,permission="survey.manage")
+    require_estate_access_for_estate(db,request,row.estate_id,permission="survey.manage")
     if not row.survey_working_plot_id: raise HTTPException(409,"Survey has not been started for this request yet")
     plot=db.get(Plot,row.survey_working_plot_id)
     if not plot or not plot.owner_user_id: raise HTTPException(404,"Survey working plot not found")
@@ -3950,7 +3950,7 @@ def complete_survey_request(request_id: int, request: Request, db: Session = Dep
     row = db.get(EstateSurveyRequest, request_id)
     if not row:
         raise HTTPException(404, "Survey request not found")
-    access = require_estate_access(db, request, row.organization_id, permission="survey.manage")
+    access = require_estate_access_for_estate(db, request, row.estate_id, permission="survey.manage")
     if not row.survey_working_plot_id:
         raise HTTPException(409, "Survey must be opened before it can be completed")
     if row.status == "completed":
@@ -3969,7 +3969,7 @@ def complete_survey_request(request_id: int, request: Request, db: Session = Dep
 def create_staking_task(request_id:int,request:Request,db:Session=Depends(get_db)):
     survey=db.get(EstateSurveyRequest,request_id)
     if not survey: raise HTTPException(404,"Survey request not found")
-    access=require_estate_access(db,request,survey.organization_id,permission="staking.manage")
+    access=require_estate_access_for_estate(db,request,survey.estate_id,permission="staking.manage")
     if not survey.survey_working_plot_id: raise HTTPException(409,"Survey must be started before staking")
     existing=db.query(EstateStakingTask).filter(EstateStakingTask.survey_request_id==survey.id,EstateStakingTask.status.in_(("pending","assigned","in_progress"))).one_or_none()
     if existing: return {"id":existing.id,"status":existing.status}
@@ -4006,7 +4006,7 @@ def export_staking_task_dgps_csv(task_id:int, request:Request, raw:bool=False, d
     """Export a plot's authoritative vertices for field DGPS stakeout."""
     task=db.get(EstateStakingTask,task_id)
     if not task: raise HTTPException(404,"Staking task not found")
-    access=require_estate_access(db,request,task.organization_id,permission="staking.read")
+    access=require_estate_access_for_estate(db,request,task.estate_id,permission="staking.read")
     plot=db.get(EstatePlot,task.plot_id)
     if not plot or not plot.geometry: raise HTTPException(422,"Staking task has no plot geometry")
     if plot.geometry_status != "approved": raise HTTPException(409,"Only approved plot geometry can be exported for staking")
@@ -4040,7 +4040,7 @@ def export_plot_dgps_csv(estate_id: int, plot_id: int, request: Request, coordin
     plot = db.query(EstatePlot).filter(EstatePlot.id == plot_id, EstatePlot.estate_id == estate_id).one_or_none()
     if not plot: raise HTTPException(404, "Plot not found")
     estate = db.get(Estate, estate_id)
-    access = require_estate_access(db, request, estate.organization_id, permission="plot.read")
+    access = require_estate_access_for_estate(db, request, estate.id, permission="plot.read")
     if not plot.geometry: raise HTTPException(422, "Plot has no geometry to export")
     if plot.geometry_status != "approved": raise HTTPException(409, "Only approved plot geometry can be exported")
     polygon = to_shape(plot.geometry)
@@ -4083,7 +4083,7 @@ def export_estate_layout_dgps_csv(estate_id: int, request: Request, coordinate_s
     vertices are mixed into a single job."""
     estate = db.get(Estate, estate_id)
     if not estate: raise HTTPException(404, "Estate not found")
-    access = require_estate_access(db, request, estate.organization_id, permission="plot.read")
+    access = require_estate_access_for_estate(db, request, estate.id, permission="plot.read")
     plots = db.query(EstatePlot).filter(EstatePlot.estate_id == estate_id, EstatePlot.geometry_status == "approved").order_by(EstatePlot.plot_number).all()
     plots = [plot for plot in plots if plot.geometry]
     if not plots:
@@ -4138,7 +4138,7 @@ def export_estate_layout_pdf(estate_id: int, request: Request, paper_size: str =
         raise HTTPException(422, "paper_size must be one of A0, A1, A2, A3, A4")
     estate = db.get(Estate, estate_id)
     if not estate: raise HTTPException(404, "Estate not found")
-    access = require_estate_access(db, request, estate.organization_id, permission="plot.read")
+    access = require_estate_access_for_estate(db, request, estate.id, permission="plot.read")
     plots = db.query(EstatePlot).filter(EstatePlot.estate_id == estate_id, EstatePlot.geometry_status == "approved").order_by(EstatePlot.plot_number).all()
     plots = [plot for plot in plots if plot.geometry]
     features = db.query(EstateSpatialFeature).filter(EstateSpatialFeature.estate_id == estate_id, EstateSpatialFeature.status == "active").all()
@@ -4175,7 +4175,7 @@ def export_estate_report_pdf(estate_id: int, request: Request, db: Session = Dep
     browser Print of the on-screen Reports page."""
     estate = db.get(Estate, estate_id)
     if not estate: raise HTTPException(404, "Estate not found")
-    access = require_estate_access(db, request, estate.organization_id, permission="estate.read")
+    access = require_estate_access_for_estate(db, request, estate.id, permission="estate.read")
     dashboard = estate_dashboard(estate_id, request, db)
     quality = estate_quality_check(estate_id, request, db)
     hazard_data = estate_hazard_dashboard(estate_id, request, db)
@@ -4204,7 +4204,7 @@ def export_estate_report_pdf(estate_id: int, request: Request, db: Session = Dep
 def start_staking_task(task_id:int,request:Request,db:Session=Depends(get_db)):
     task=db.get(EstateStakingTask,task_id)
     if not task: raise HTTPException(404,"Staking task not found")
-    access=require_estate_access(db,request,task.organization_id,permission="staking.manage")
+    access=require_estate_access_for_estate(db,request,task.estate_id,permission="staking.manage")
     if task.status not in {"pending","assigned"}: raise HTTPException(409,"Staking task cannot be started")
     task.status="in_progress"
     task.assigned_subject_type = task.assigned_subject_type or access.principal.subject_type
@@ -4216,7 +4216,7 @@ def start_staking_task(task_id:int,request:Request,db:Session=Depends(get_db)):
 def complete_staking_task(task_id:int,request:Request,db:Session=Depends(get_db)):
     task=db.get(EstateStakingTask,task_id)
     if not task: raise HTTPException(404,"Staking task not found")
-    access=require_estate_access(db,request,task.organization_id,permission="staking.manage")
+    access=require_estate_access_for_estate(db,request,task.estate_id,permission="staking.manage")
     if task.status != "in_progress": raise HTTPException(409,"Only in-progress staking tasks can be completed")
     from datetime import datetime, timezone
     task.status="completed"; task.completed_at=datetime.now(timezone.utc)
@@ -4349,7 +4349,7 @@ def send_bulk_customer_sms(estate_id: int, payload: BulkCustomerSmsCreate, reque
     estate = db.get(Estate, estate_id)
     if estate is None:
         raise HTTPException(404, "Estate not found")
-    access = require_estate_access(db, request, estate.organization_id, permission="customer.manage")
+    access = require_estate_access_for_estate(db, request, estate.id, permission="customer.manage")
     if not has_sms_access_for_organization(db, estate.organization_id):
         raise HTTPException(403, "Sending SMS to customers is included in the Pro and Enterprise plans.")
     if not estate_sms.configured():
@@ -4632,7 +4632,7 @@ def pay_commission(allocation_id: int, payload: CommissionPayoutCreate, request:
     allocation = db.get(EstateAllocation, allocation_id)
     if not allocation:
         raise HTTPException(404, "Allocation not found")
-    access = require_estate_access(db, request, allocation.organization_id, permission="payment.manage")
+    access = require_estate_access_for_estate(db, request, allocation.estate_id, permission="payment.manage")
     idempotency_key = _normalize_idempotency_key(idempotency_header)
     if idempotency_key:
         existing = db.query(EstateCommissionPayout).filter(EstateCommissionPayout.organization_id == access.organization_id, EstateCommissionPayout.idempotency_key == idempotency_key).one_or_none()
@@ -4835,7 +4835,7 @@ def reserve_plot(estate_id: int, plot_id: int, payload: AllocationAction, reques
     plot = db.query(EstatePlot).filter(EstatePlot.id == plot_id, EstatePlot.estate_id == estate_id).one_or_none()
     if not plot: raise HTTPException(404, "Plot not found")
     estate = db.get(Estate, estate_id)
-    access = require_estate_access(db, request, estate.organization_id, permission="allocation.manage")
+    access = require_estate_access_for_estate(db, request, estate.id, permission="allocation.manage")
     if idempotency_key:
         existing = db.query(EstateAllocation).filter(EstateAllocation.organization_id == access.organization_id, EstateAllocation.idempotency_key == idempotency_key).one_or_none()
         if existing:
@@ -4877,7 +4877,7 @@ def allocate_plot(estate_id: int, plot_id: int, payload: AllocationAction, reque
     plot = db.query(EstatePlot).filter(EstatePlot.id == plot_id, EstatePlot.estate_id == estate_id).one_or_none()
     if not plot: raise HTTPException(404, "Plot not found")
     estate = db.get(Estate, estate_id)
-    access = require_estate_access(db, request, estate.organization_id, permission="allocation.manage")
+    access = require_estate_access_for_estate(db, request, estate.id, permission="allocation.manage")
     if idempotency_key:
         existing = db.query(EstateAllocation).filter(EstateAllocation.organization_id == access.organization_id, EstateAllocation.idempotency_key == idempotency_key).one_or_none()
         if existing:
@@ -4924,7 +4924,7 @@ def allocate_plot(estate_id: int, plot_id: int, payload: AllocationAction, reque
 def release_plot(allocation_id: int, request: Request, db: Session = Depends(get_db)):
     record = db.get(EstateAllocation, allocation_id)
     if not record: raise HTTPException(404, "Allocation not found")
-    access = require_estate_access(db, request, record.organization_id, permission="allocation.manage")
+    access = require_estate_access_for_estate(db, request, record.estate_id, permission="allocation.manage")
     release_allocation(db, allocation=record, actor=access.principal, reason="Released by authorized user"); db.commit(); return {"id": record.id, "status": record.status}
 
 @router.post("/allocations/{allocation_id}/payments")
@@ -4932,7 +4932,7 @@ def add_payment(allocation_id: int, payload: PaymentCreate, request: Request, id
     idempotency_key = _normalize_idempotency_key(idempotency_header)
     allocation=db.get(EstateAllocation, allocation_id)
     if not allocation: raise HTTPException(404,"Allocation not found")
-    access=require_estate_access(db,request,allocation.organization_id,permission="payment.manage")
+    access=require_estate_access_for_estate(db,request,allocation.estate_id,permission="payment.manage")
     if idempotency_key:
         existing = db.query(EstatePayment).filter(EstatePayment.organization_id == access.organization_id, EstatePayment.idempotency_key == idempotency_key).one_or_none()
         if existing:
@@ -4954,9 +4954,9 @@ def add_payment(allocation_id: int, payload: PaymentCreate, request: Request, id
 def confirm(payment_id:int, request:Request, db:Session=Depends(get_db)):
     payment=db.get(EstatePayment,payment_id)
     if not payment: raise HTTPException(404,"Payment not found")
-    access=require_estate_access(db,request,payment.organization_id,permission="payment.manage")
-    confirm_payment(db,payment=payment,actor=access.principal)
     allocation = db.get(EstateAllocation, payment.allocation_id)
+    access=require_estate_access_for_estate(db,request,allocation.estate_id,permission="payment.manage") if allocation else require_estate_access(db,request,payment.organization_id,permission="payment.manage")
+    confirm_payment(db,payment=payment,actor=access.principal)
     if allocation:
         advance_payment_schedule_after_payment(db, allocation=allocation, amount=payment.amount)
     db.commit()
@@ -4981,20 +4981,23 @@ def confirm(payment_id:int, request:Request, db:Session=Depends(get_db)):
 def void(payment_id:int,payload:VoidAction,request:Request,db:Session=Depends(get_db)):
     payment=db.get(EstatePayment,payment_id)
     if not payment: raise HTTPException(404,"Payment not found")
-    access=require_estate_access(db,request,payment.organization_id,permission="payment.manage"); void_payment(db,payment=payment,actor=access.principal,reason=payload.reason); db.commit(); return {"id":payment.id,"status":payment.status}
+    allocation=db.get(EstateAllocation, payment.allocation_id)
+    access=require_estate_access_for_estate(db,request,allocation.estate_id,permission="payment.manage") if allocation else require_estate_access(db,request,payment.organization_id,permission="payment.manage")
+    void_payment(db,payment=payment,actor=access.principal,reason=payload.reason); db.commit(); return {"id":payment.id,"status":payment.status}
 
 @router.get("/allocations/{allocation_id}/financial-summary")
 def allocation_summary(allocation_id:int,request:Request,db:Session=Depends(get_db)):
     allocation=db.get(EstateAllocation,allocation_id)
     if not allocation: raise HTTPException(404,"Allocation not found")
-    require_estate_view_access(db,request,allocation.organization_id,permission="payment.read"); result=financial_summary(db,allocation)
+    require_estate_view_access_for_estate(db,request,allocation.estate_id,permission="payment.read"); result=financial_summary(db,allocation)
     return {"agreed_price":str(result.agreed_price),"confirmed_paid":str(result.confirmed_paid),"pending_paid":str(result.pending_paid),"outstanding":str(result.outstanding),"percentage":str(result.percentage),"fully_paid":result.outstanding==0 and result.agreed_price>0}
 
 @router.post("/payments/{payment_id}/evidence")
 async def upload_payment_evidence(payment_id:int, request:Request, file:UploadFile=File(...), db:Session=Depends(get_db)):
     payment=db.get(EstatePayment,payment_id)
     if not payment: raise HTTPException(404,"Payment not found")
-    access=require_estate_access(db,request,payment.organization_id,permission="document.manage")
+    allocation=db.get(EstateAllocation, payment.allocation_id)
+    access=require_estate_access_for_estate(db,request,allocation.estate_id,permission="document.manage") if allocation else require_estate_access(db,request,payment.organization_id,permission="document.manage")
     organization=db.get(EstateOrganization,payment.organization_id)
     stored=store_private_estate_file(organization_uid=organization.organization_uid,category="payments",entity_uid=payment.payment_uid,filename=file.filename or "receipt",content_type=file.content_type or "",data=await read_limited_upload(file, max_bytes=MAX_ESTATE_DOCUMENT_BYTES))
     document=EstateDocument(organization_id=payment.organization_id,object_key=stored.object_key,original_filename=stored.filename,mime_type=stored.mime_type,size_bytes=stored.size_bytes,checksum=stored.checksum,document_type="receipt",uploaded_by_subject_type=access.principal.subject_type,uploaded_by_subject_id=access.principal.subject_id)
@@ -5005,7 +5008,9 @@ async def upload_payment_evidence(payment_id:int, request:Request, file:UploadFi
 def download_payment_evidence(payment_id:int,document_id:int,request:Request,db:Session=Depends(get_db)):
     payment=db.get(EstatePayment,payment_id); document=db.get(EstateDocument,document_id)
     if not payment or not document or document.organization_id != payment.organization_id or not db.query(EstateDocumentLink).filter(EstateDocumentLink.document_id==document_id,EstateDocumentLink.entity_type=="payment",EstateDocumentLink.entity_id==str(payment_id)).first(): raise HTTPException(404,"Evidence not found")
-    access=require_estate_view_access(db,request,payment.organization_id,permission="document.read"); data,mime=read_private_estate_file(document.object_key); append_estate_audit_event(db,organization_id=payment.organization_id,actor=access.principal,action="payment.evidence_downloaded",entity_type="estate_document",entity_id=document.id); db.commit()
+    allocation=db.get(EstateAllocation, payment.allocation_id)
+    access=require_estate_view_access_for_estate(db,request,allocation.estate_id,permission="document.read") if allocation else require_estate_view_access(db,request,payment.organization_id,permission="document.read")
+    data,mime=read_private_estate_file(document.object_key); append_estate_audit_event(db,organization_id=payment.organization_id,actor=access.principal,action="payment.evidence_downloaded",entity_type="estate_document",entity_id=document.id); db.commit()
     return Response(data,media_type=mime,headers={"Content-Disposition":f'inline; filename="{document.original_filename}"'})
 
 def _linked_entity_organization(db: Session, entity_type: str, entity_id: int) -> int | None:
@@ -5018,6 +5023,38 @@ def _linked_entity_organization(db: Session, entity_type: str, entity_id: int) -
         return getattr(estate, "organization_id", None)
     return getattr(row, "organization_id", None)
 
+
+def _linked_entity_estate_id(db: Session, entity_type: str, entity_id: int) -> int | None:
+    """Like _linked_entity_organization, but resolves to a single estate_id where the linked
+    entity cleanly belongs to one estate, so document upload/download can enforce per-estate
+    scoping. Returns None for entity types with no single-estate home (e.g. a customer, who can
+    have allocations across multiple estates in the org) - callers fall back to the org-wide
+    check in that case, same as before this existed."""
+    if entity_type == "estate":
+        return entity_id
+    if entity_type == "plot":
+        plot = db.get(EstatePlot, entity_id)
+        return plot.estate_id if plot else None
+    if entity_type == "estate_snag_item":
+        snag = db.get(EstateSnagItem, entity_id)
+        if not snag:
+            return None
+        plot = db.get(EstatePlot, snag.plot_id)
+        return plot.estate_id if plot else None
+    if entity_type in ("staking_task", "field_inspection", "import_review"):
+        model = {"staking_task": EstateStakingTask, "field_inspection": EstateFieldInspection, "import_review": EstateImportReview}[entity_type]
+        row = db.get(model, entity_id)
+        return getattr(row, "estate_id", None) if row else None
+    if entity_type == "allocation":
+        allocation = db.get(EstateAllocation, entity_id)
+        return allocation.estate_id if allocation else None
+    if entity_type in ("payment", "commission_payout"):
+        model = EstatePayment if entity_type == "payment" else EstateCommissionPayout
+        row = db.get(model, entity_id)
+        allocation = db.get(EstateAllocation, row.allocation_id) if row else None
+        return allocation.estate_id if allocation else None
+    return None
+
 @router.get("/document-types")
 def estate_document_types(request: Request, db: Session = Depends(get_db)):
     principal = resolve_estate_principal(db, request)
@@ -5029,7 +5066,8 @@ def estate_document_types(request: Request, db: Session = Depends(get_db)):
 async def upload_document(entity_type: str, entity_id: int, document_type: str, request: Request, file: UploadFile = File(...), description: str | None = None, supersedes_document_id: int | None = None, db: Session = Depends(get_db)):
     organization_id = _linked_entity_organization(db, entity_type, entity_id)
     if not organization_id: raise HTTPException(404, "Linked Estate entity was not found")
-    access = require_estate_access(db, request, organization_id, permission="document.manage")
+    estate_id = _linked_entity_estate_id(db, entity_type, entity_id)
+    access = require_estate_access_for_estate(db, request, estate_id, permission="document.manage") if estate_id else require_estate_access(db, request, organization_id, permission="document.manage")
     normalized_document_type = document_type.strip().lower()
     if normalized_document_type not in ESTATE_DOCUMENT_TYPE_CODES:
         raise HTTPException(422, "Choose a supported Estate document type")
@@ -5047,7 +5085,10 @@ async def upload_document(entity_type: str, entity_id: int, document_type: str, 
 def download_document(document_id:int, request:Request, db:Session=Depends(get_db)):
     document=db.get(EstateDocument,document_id)
     if not document: raise HTTPException(404,"Document not found")
-    access=require_estate_view_access(db,request,document.organization_id,permission="document.read"); data,mime=read_private_estate_file(document.object_key); append_estate_audit_event(db,organization_id=document.organization_id,actor=access.principal,action="document.downloaded",entity_type="estate_document",entity_id=document.id); db.commit()
+    link = db.query(EstateDocumentLink).filter(EstateDocumentLink.document_id == document_id).first()
+    estate_id = _linked_entity_estate_id(db, link.entity_type, int(link.entity_id)) if link else None
+    access=require_estate_view_access_for_estate(db,request,estate_id,permission="document.read") if estate_id else require_estate_view_access(db,request,document.organization_id,permission="document.read")
+    data,mime=read_private_estate_file(document.object_key); append_estate_audit_event(db,organization_id=document.organization_id,actor=access.principal,action="document.downloaded",entity_type="estate_document",entity_id=document.id); db.commit()
     return Response(data,media_type=mime,headers={"Content-Disposition":f'inline; filename="{document.original_filename}"'})
 
 @router.get("/customers/{customer_id}/statement")
@@ -5131,7 +5172,7 @@ def customer_statement_pdf(customer_id: int, request: Request, estate_id: int | 
 def allocation_financial_detail(allocation_id:int,request:Request,db:Session=Depends(get_db)):
     allocation=db.get(EstateAllocation,allocation_id)
     if not allocation: raise HTTPException(404,"Allocation not found")
-    require_estate_view_access(db,request,allocation.organization_id,permission="payment.read")
+    require_estate_view_access_for_estate(db,request,allocation.estate_id,permission="payment.read")
     summary=financial_summary(db,allocation); customer=db.get(EstateCustomer,allocation.customer_id); plot=db.get(EstatePlot,allocation.plot_id); estate=db.get(Estate,allocation.estate_id)
     payments=db.query(EstatePayment).filter(EstatePayment.allocation_id==allocation.id).order_by(EstatePayment.payment_date.desc()).all()
     return {"allocation":{"id":allocation.id,"status":allocation.status,"allocation_date":allocation.allocation_date,"payment_plan":allocation.payment_plan},"customer":{"id":customer.id,"name":customer.full_name,"reference":customer.reference_no,"phone":customer.phone,"email":customer.email},"estate":{"id":estate.id,"name":estate.name},"plot":{"id":plot.id,"number":plot.plot_number},"financial":{"agreed_price":str(summary.agreed_price),"confirmed_paid":str(summary.confirmed_paid),"pending_paid":str(summary.pending_paid),"outstanding":str(summary.outstanding),"percentage":str(summary.percentage),"fully_paid":summary.agreed_price>0 and summary.outstanding==0},"payments":[{"id":p.id,"date":p.payment_date,"amount":str(p.amount),"status":p.status,"method":p.payment_method,"reference":p.reference_no} for p in payments]}
@@ -5141,7 +5182,7 @@ def allocation_record(allocation_id: int, request: Request, db: Session = Depend
     allocation = db.get(EstateAllocation, allocation_id)
     if not allocation:
         raise HTTPException(404, "Allocation not found")
-    require_estate_view_access(db, request, allocation.organization_id, permission="payment.read")
+    require_estate_view_access_for_estate(db, request, allocation.estate_id, permission="payment.read")
     customer = db.get(EstateCustomer, allocation.customer_id)
     estate = db.get(Estate, allocation.estate_id)
     plot = db.get(EstatePlot, allocation.plot_id)
@@ -5216,7 +5257,7 @@ def customer_financial_detail(customer_id:int,request:Request,db:Session=Depends
 def update_allocation_payment_plan(allocation_id:int,payload:AllocationPaymentPlanUpdate,request:Request,db:Session=Depends(get_db)):
     allocation=db.get(EstateAllocation,allocation_id)
     if not allocation: raise HTTPException(404,"Allocation not found")
-    access=require_estate_access(db,request,allocation.organization_id,permission="payment.manage")
+    access=require_estate_access_for_estate(db,request,allocation.estate_id,permission="payment.manage")
     if allocation.status not in ("reserved","allocated"):
         raise HTTPException(409,"Only an active (reserved or allocated) allocation can have a payment plan")
     before={"payment_plan":allocation.payment_plan,"next_payment_due_at":allocation.next_payment_due_at.isoformat() if allocation.next_payment_due_at else None}
@@ -5244,7 +5285,7 @@ def update_allocation_payment_plan(allocation_id:int,payload:AllocationPaymentPl
 def estate_financial_summary(estate_id:int,request:Request,db:Session=Depends(get_db)):
     estate=db.get(Estate,estate_id)
     if not estate: raise HTTPException(404,"Estate not found")
-    require_estate_view_access(db,request,estate.organization_id,permission="payment.read")
+    require_estate_view_access_for_estate(db, request, estate.id,permission="payment.read")
     allocations=db.query(EstateAllocation).filter(EstateAllocation.estate_id==estate_id).all(); summaries=_bulk_financial_summaries(db, allocations).values()
     return {"estate":{"id":estate.id,"name":estate.name},"contracted_sales":str(sum((s["agreed_price"] for s in summaries),Decimal(0))),"confirmed_collections":str(sum((s["confirmed_paid"] for s in summaries),Decimal(0))),"pending_collections":str(sum((s["pending_paid"] for s in summaries),Decimal(0))),"outstanding_balance":str(sum((s["outstanding"] for s in summaries),Decimal(0))),"fully_paid_allocations":sum(1 for s in summaries if s["agreed_price"]>0 and s["outstanding"]==0),"allocations_with_outstanding":sum(1 for s in summaries if s["outstanding"]>0)}
 
@@ -5414,7 +5455,7 @@ def send_due_payment_reminder(allocation_id: int, payload: PaymentReminderSend, 
     allocation = db.get(EstateAllocation, allocation_id)
     if not allocation:
         raise HTTPException(404, "Allocation not found")
-    access = require_estate_access(db, request, allocation.organization_id, permission="payment.manage")
+    access = require_estate_access_for_estate(db, request, allocation.estate_id, permission="payment.manage")
     try:
         result = payment_reminders.send_reminder(db, allocation=allocation, channel=payload.channel, method=payload.method, actor=access.principal)
         db.commit()
@@ -5596,7 +5637,7 @@ def create_payment_inbox(payload: PaymentInboxCreate, request: Request, db: Sess
         estate = db.get(Estate, payload.estate_id)
         if not estate:
             raise HTTPException(404, "Estate not found")
-        access = require_estate_access(db, request, estate.organization_id, permission="payment.manage")
+        access = require_estate_access_for_estate(db, request, estate.id, permission="payment.manage")
         organization_id = estate.organization_id
     else:
         principal = resolve_estate_principal(db, request)
@@ -5627,7 +5668,7 @@ def match_payment_inbox(inbox_id: int, payload: PaymentInboxMatch, request: Requ
     inbox = db.get(EstatePaymentInbox, inbox_id)
     if not inbox:
         raise HTTPException(404, "Payment inbox item not found")
-    access = require_estate_access(db, request, inbox.organization_id, permission="payment.manage")
+    access = require_estate_access_for_estate(db, request, inbox.estate_id, permission="payment.manage") if inbox.estate_id else require_estate_access(db, request, inbox.organization_id, permission="payment.manage")
     if inbox.status != "unmatched":
         raise HTTPException(409, "This payment inbox item has already been resolved")
     allocation = db.get(EstateAllocation, payload.allocation_id)
@@ -5645,7 +5686,7 @@ def ignore_payment_inbox(inbox_id: int, request: Request, db: Session = Depends(
     inbox = db.get(EstatePaymentInbox, inbox_id)
     if not inbox:
         raise HTTPException(404, "Payment inbox item not found")
-    access = require_estate_access(db, request, inbox.organization_id, permission="payment.manage")
+    access = require_estate_access_for_estate(db, request, inbox.estate_id, permission="payment.manage") if inbox.estate_id else require_estate_access(db, request, inbox.organization_id, permission="payment.manage")
     if inbox.status != "unmatched":
         raise HTTPException(409, "This payment inbox item has already been resolved")
     inbox.status = "ignored"; inbox.matched_at = datetime.now(timezone.utc); inbox.matched_by_subject_type = access.principal.subject_type; inbox.matched_by_subject_id = access.principal.subject_id
@@ -5658,8 +5699,9 @@ def payment_receipt_pdf(payment_id: int, request: Request, db: Session = Depends
     payment = db.get(EstatePayment, payment_id)
     if not payment:
         raise HTTPException(404, "Payment not found")
-    access = require_estate_view_access(db, request, payment.organization_id, permission="document.read")
-    allocation = db.get(EstateAllocation, payment.allocation_id); customer = db.get(EstateCustomer, payment.customer_id); plot = db.get(EstatePlot, payment.plot_id); estate = db.get(Estate, allocation.estate_id) if allocation else None
+    allocation = db.get(EstateAllocation, payment.allocation_id)
+    access = require_estate_view_access_for_estate(db, request, allocation.estate_id, permission="document.read") if allocation else require_estate_view_access(db, request, payment.organization_id, permission="document.read")
+    customer = db.get(EstateCustomer, payment.customer_id); plot = db.get(EstatePlot, payment.plot_id); estate = db.get(Estate, allocation.estate_id) if allocation else None
     buffer = io.BytesIO(); pdf = canvas.Canvas(buffer, pagesize=A4); width, height = A4
     pdf.setTitle(payment.receipt_number or f"Payment receipt {payment.id}"); pdf.setFont("Helvetica-Bold", 19); pdf.drawString(42, height - 65, "LandCheck Estate payment receipt")
     pdf.setFont("Helvetica", 11); y = height - 105
@@ -5675,8 +5717,9 @@ def payment_receipt_pdf(payment_id: int, request: Request, db: Session = Depends
 def payment_detail(payment_id:int,request:Request,db:Session=Depends(get_db)):
     payment=db.get(EstatePayment,payment_id)
     if not payment: raise HTTPException(404,"Payment not found")
-    access=require_estate_view_access(db,request,payment.organization_id,permission="payment.read")
-    allocation=db.get(EstateAllocation,payment.allocation_id); customer=db.get(EstateCustomer,payment.customer_id); plot=db.get(EstatePlot,payment.plot_id); estate=db.get(Estate,allocation.estate_id); summary=financial_summary(db,allocation)
+    allocation=db.get(EstateAllocation,payment.allocation_id)
+    access=require_estate_view_access_for_estate(db,request,allocation.estate_id,permission="payment.read") if allocation else require_estate_view_access(db,request,payment.organization_id,permission="payment.read")
+    customer=db.get(EstateCustomer,payment.customer_id); plot=db.get(EstatePlot,payment.plot_id); estate=db.get(Estate,allocation.estate_id); summary=financial_summary(db,allocation)
     evidence=db.query(EstateDocument).join(EstateDocumentLink,EstateDocumentLink.document_id==EstateDocument.id).filter(EstateDocumentLink.entity_type=="payment",EstateDocumentLink.entity_id==str(payment_id)).all()
     return {"payment":{"id":payment.id,"amount":str(payment.amount),"currency":payment.currency,"date":payment.payment_date,"method":payment.payment_method,"reference":payment.reference_no,"receipt_number":payment.receipt_number,"notes":payment.notes,"status":payment.status,"recorded_by":payment.recorded_by_subject_id,"confirmed_by":payment.confirmed_by_subject_id,"confirmed_at":payment.confirmed_at,"void_reason":payment.void_reason},"customer":{"id":customer.id,"name":customer.full_name},"estate":{"id":estate.id,"name":estate.name},"plot":{"id":plot.id,"number":plot.plot_number},"allocation_id":allocation.id,"financial":{"agreed_price":str(summary.agreed_price),"confirmed":str(summary.confirmed_paid),"pending":str(summary.pending_paid),"outstanding":str(summary.outstanding)},"capabilities":{"can_confirm":has_permission(access.role_key,"payment.manage") and payment.status in {"recorded","pending_confirmation"},"can_void":has_permission(access.role_key,"payment.manage") and payment.status not in {"voided","reversed"},"can_view_receipt":has_permission(access.role_key,"document.read")},"evidence":[{"id":d.id,"filename":d.original_filename,"mime_type":d.mime_type} for d in evidence]}
 
@@ -5723,7 +5766,7 @@ def estate_operations_summary(estate_id: int, request: Request, db: Session = De
     estate = db.get(Estate, estate_id)
     if not estate:
         raise HTTPException(404, "Estate not found")
-    require_estate_view_access(db, request, estate.organization_id, permission="estate.read")
+    require_estate_view_access_for_estate(db, request, estate.id, permission="estate.read")
     payload = build_operations_summary(db, estate)
     db.close()
     return payload
@@ -5734,7 +5777,7 @@ def estate_document_readiness(estate_id: int, request: Request, db: Session = De
     estate = db.get(Estate, estate_id)
     if not estate:
         raise HTTPException(404, "Estate not found")
-    require_estate_view_access(db, request, estate.organization_id, permission="document.read")
+    require_estate_view_access_for_estate(db, request, estate.id, permission="document.read")
     allocations = db.query(EstateAllocation).filter(EstateAllocation.estate_id == estate_id, EstateAllocation.status.in_(("reserved", "allocated"))).order_by(EstateAllocation.created_at.desc()).all()
     result = []
     for allocation in allocations:
@@ -5758,7 +5801,7 @@ def estate_notification_log(estate_id: int, request: Request, limit: int = 100, 
     estate = db.get(Estate, estate_id)
     if not estate:
         raise HTTPException(404, "Estate not found")
-    require_estate_view_access(db, request, estate.organization_id, permission="estate.read")
+    require_estate_view_access_for_estate(db, request, estate.id, permission="estate.read")
     safe_limit = max(1, min(limit, 250))
     base_query = db.query(EstateNotificationLog).filter(
         EstateNotificationLog.estate_id == estate_id,
@@ -6273,7 +6316,7 @@ def agent_workspace(estate_id: int, request: Request, db: Session = Depends(get_
     estate = db.get(Estate, estate_id)
     if not estate:
         raise HTTPException(404, "Estate not found")
-    access = require_estate_access(db, request, estate.organization_id, permission="payment.read")
+    access = require_estate_access_for_estate(db, request, estate.id, permission="payment.read")
     is_sales_agent = access.role_key in {"sales", "marketer"}
     principal = access.principal
     lead_query = db.query(EstatePublicReservationRequest).filter(EstatePublicReservationRequest.estate_id == estate_id)
@@ -6311,7 +6354,7 @@ def list_qr_campaigns(estate_id: int, request: Request, db: Session = Depends(ge
     estate = db.get(Estate, estate_id)
     if not estate:
         raise HTTPException(404, "Estate not found")
-    require_estate_view_access(db, request, estate.organization_id, permission="estate.read")
+    require_estate_view_access_for_estate(db, request, estate.id, permission="estate.read")
     return [_qr_campaign_payload(row, estate) for row in db.query(EstateQrCampaign).filter(EstateQrCampaign.estate_id == estate_id).order_by(EstateQrCampaign.created_at.desc()).all()]
 
 
@@ -6320,7 +6363,7 @@ def create_qr_campaign(estate_id: int, payload: QrCampaignCreate, request: Reque
     estate = db.get(Estate, estate_id)
     if not estate:
         raise HTTPException(404, "Estate not found")
-    access = require_estate_access(db, request, estate.organization_id, permission="estate.read")
+    access = require_estate_access_for_estate(db, request, estate.id, permission="estate.read")
     can_assign = has_permission(access.role_key, "estate.manage")
     assigned_type = payload.assigned_agent_subject_type if can_assign else access.principal.subject_type
     assigned_id = payload.assigned_agent_subject_id if can_assign else access.principal.subject_id
@@ -6378,7 +6421,7 @@ def print_qr_campaign(campaign_id: int, request: Request, db: Session = Depends(
     if not row:
         raise HTTPException(404, "QR campaign not found")
     estate = db.get(Estate, row.estate_id)
-    access = require_estate_access(db, request, row.organization_id, permission="estate.read")
+    access = require_estate_access_for_estate(db, request, row.estate_id, permission="estate.read")
     result = _render_qr_campaign_pdf(row, estate)
     append_estate_audit_event(db, organization_id=row.organization_id, actor=access.principal, action="public_qr_campaign.printed", entity_type="estate_qr_campaign", entity_id=row.id)
     db.commit()
@@ -6390,7 +6433,7 @@ def estate_detail(estate_id: int, request: Request, db: Session = Depends(get_db
     estate = db.get(Estate, estate_id)
     if not estate:
         raise HTTPException(404, "Estate not found")
-    require_estate_view_access(db, request, estate.organization_id, permission="estate.read")
+    require_estate_view_access_for_estate(db, request, estate.id, permission="estate.read")
     return {
         "id": estate.id,
         "uid": estate.estate_uid,
