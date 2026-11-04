@@ -5,6 +5,12 @@ from app.routers.estates import (
     _CSV_Y_KEYS,
     _first_csv_value,
     _csv_number,
+    _import_boundary_candidate,
+    _import_candidate,
+    _geometry_coordinate_sample,
+    _infer_estate_import_source_crs,
+    _is_placeholder_plot_identifier,
+    _transform_import_geometry,
     _repeated_csv_plot_key,
     _polygonize_dxf_linework,
     _read_estate_csv_records,
@@ -12,10 +18,13 @@ from app.routers.estates import (
     _plot_number_from_georeference_feature,
     _polygon_geometry_from_georeference_feature,
 )
+import json
 from types import SimpleNamespace
 from io import BytesIO
 
 from openpyxl import Workbook
+from shapely.geometry import Polygon
+from app.routers import estates as estates_router
 
 
 def test_normalize_csv_records_matches_capitalized_excel_headers():
@@ -76,6 +85,102 @@ def test_repeated_point_label_can_group_a_parcel_but_unique_points_cannot():
 def test_csv_number_accepts_decimal_comma_and_thousands_separator():
     assert _csv_number("241123,5") == 241123.5
     assert _csv_number("241,123.5") == 241123.5
+
+
+def test_import_candidate_does_not_accept_a_multipart_repair():
+    candidate = _import_candidate(
+        row_number=1,
+        plot_number="P-001",
+        geometry={
+            "type": "Polygon",
+            "coordinates": [[
+                [0, 0], [4, 0], [4, 4], [0, 4], [2, 1], [1, 3], [0, 0],
+            ]],
+        },
+    )
+    assert candidate["valid"] is False
+    assert candidate["issues"]
+
+def test_import_candidate_records_a_warning_when_repair_is_one_polygon(monkeypatch):
+    # Exercise the repair branch deterministically without accepting a real multipart/bow-tie
+    # source geometry. Production data is accepted only when GEOS returns one valid Polygon.
+    monkeypatch.setattr(estates_router, "make_valid", lambda _source: Polygon([(0, 0), (4, 0), (4, 4), (0, 4), (0, 0)]))
+    candidate = _import_candidate(
+        row_number=1,
+        plot_number="P-001",
+        geometry={
+            "type": "Polygon",
+            "coordinates": [[
+                [0, 0], [4, 4], [0, 4], [4, 0], [0, 0],
+            ]],
+        },
+    )
+    assert candidate["valid"] is True
+    assert candidate["warnings"]
+
+
+def test_placeholder_boundary_self_intersection_is_reordered_for_review():
+    candidate = _import_boundary_candidate(
+        row_number=1,
+        geometry={
+            "type": "Polygon",
+            "coordinates": [[
+                [0, 0], [4, 4], [0, 4], [4, 0], [0, 0],
+            ]],
+        },
+    )
+    assert candidate["valid"] is True
+    assert any("reordered" in warning for warning in candidate["warnings"])
+
+
+def test_projected_geometry_column_is_available_for_crs_detection():
+    geometry = {
+        "type": "Polygon",
+        "coordinates": [[
+            [217549.731303332, 1027157.73696176],
+            [217559.731303332, 1027157.73696176],
+            [217559.731303332, 1027167.73696176],
+            [217549.731303332, 1027167.73696176],
+            [217549.731303332, 1027157.73696176],
+        ]],
+    }
+    assert _geometry_coordinate_sample(geometry) == (217549.731303332, 1027157.73696176)
+    source_crs, detected = _infer_estate_import_source_crs(
+        SimpleNamespace(boundary=None),
+        [{"geometry": json.dumps(geometry)}],
+        "EPSG:4326",
+    )
+    assert source_crs == "EPSG:32632"
+    assert detected is True
+    transformed = _transform_import_geometry(geometry, source_crs)
+    assert abs(transformed["coordinates"][0][0][0]) <= 180
+    assert abs(transformed["coordinates"][0][0][1]) <= 90
+
+
+def test_placeholder_instrument_identifier_is_not_treated_as_a_plot_number():
+    assert _is_placeholder_plot_identifier("0.0000") is True
+    assert _is_placeholder_plot_identifier("P-001") is False
+    assert _is_placeholder_plot_identifier("") is True
+
+
+def test_projected_estate_csv_defaults_to_a_nigerian_utm_source():
+    source_crs, detected = _infer_estate_import_source_crs(
+        SimpleNamespace(boundary=None),
+        [{"easting": "217549.731303332", "northing": "1027157.73696176"}],
+        "EPSG:4326",
+    )
+    assert source_crs == "EPSG:32632"
+    assert detected is True
+
+
+def test_explicit_import_crs_is_never_overridden():
+    source_crs, detected = _infer_estate_import_source_crs(
+        SimpleNamespace(boundary=None),
+        [{"easting": "217549.731303332", "northing": "1027157.73696176"}],
+        "EPSG:32633",
+    )
+    assert source_crs == "EPSG:32633"
+    assert detected is False
 
 
 def test_estate_csv_reader_accepts_coordinate_rows_without_a_header():

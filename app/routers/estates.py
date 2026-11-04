@@ -23,8 +23,9 @@ from reportlab.pdfgen import canvas
 from geoalchemy2.shape import from_shape, to_shape
 from pyproj import Transformer
 import ezdxf
-from shapely.geometry import LineString, mapping, shape
+from shapely.geometry import LineString, MultiPoint, mapping, shape
 from shapely.ops import polygonize, transform as shapely_transform, unary_union
+from shapely.validation import make_valid
 from sqlalchemy import and_, or_, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, aliased
@@ -636,18 +637,96 @@ def create_public_reservation(slug: str, plot_id: int, payload: PublicReservatio
     return {"status": "received", "request_id": row.request_uid, "notification_sent": notification_sent, "welcome_email_sent": welcome_email_sent, "already_processed": False}
 
 
+def _repair_import_polygon(geometry: dict) -> tuple[dict | None, str | None]:
+    """Repair only import geometries that can become one valid Polygon safely.
+
+    Estate imports are kept in a review queue, but rejecting every small ring defect makes
+    ordinary survey exports impossible to use.  Never turn a MultiPolygon or GeometryCollection
+    into a plot implicitly: those need an explicit surveyor decision.  A single Polygon returned
+    by GEOS is safe to review and store, and the warning is retained on the candidate so the user
+    can see that the source geometry was corrected.
+    """
+    try:
+        source = shape(geometry)
+        repaired = make_valid(source)
+        if repaired.geom_type != "Polygon" or repaired.is_empty or not repaired.is_valid or repaired.interiors:
+            return None, None
+        return mapping(repaired), "The uploaded outline had a geometry defect and was repaired for review. Confirm the shape before approving it."
+    except Exception:
+        return None, None
+
+
+def _repair_boundary_point_order(geometry: dict) -> tuple[dict | None, str | None]:
+    """Repair an unordered single boundary outline for explicit review.
+
+    Some survey exports contain a boundary point cloud with a placeholder identifier such as
+    ``0.0000`` instead of a traversal order.  Building a ring in file order can create a
+    self-intersection even though the points describe one outline.  Reordering the exterior
+    points around their centroid is used only for boundary candidates and only when it produces
+    one valid Polygon.  The review warning makes the correction visible before approval.
+    """
+    try:
+        source = shape(geometry)
+        if source.geom_type != "Polygon" or len(source.interiors) or source.is_empty:
+            return None, None
+        points = list(source.exterior.coords)[:-1]
+        unique_points = list(dict.fromkeys((float(x), float(y)) for x, y in points))
+        if len(unique_points) < 3:
+            return None, None
+        centre = MultiPoint(unique_points).centroid
+        ordered = sorted(
+            unique_points,
+            key=lambda point: math.atan2(point[1] - centre.y, point[0] - centre.x),
+        )
+        repaired = shape({"type": "Polygon", "coordinates": [[*ordered, ordered[0]]]})
+        if repaired.is_empty or repaired.geom_type != "Polygon" or not repaired.is_valid or repaired.interiors:
+            return None, None
+        return mapping(repaired), "The boundary points were reordered into one valid outline for review. Confirm the boundary before approving it."
+    except Exception:
+        return None, None
+
+
+def _import_boundary_candidate(*, row_number: int, geometry: dict) -> dict:
+    """Import a boundary candidate, allowing only a visible, single-polygon repair."""
+    candidate = _import_candidate(row_number=row_number, plot_number="Estate boundary", geometry=geometry)
+    if candidate["valid"]:
+        return candidate
+    repaired_geometry, repair_warning = _repair_boundary_point_order(geometry)
+    if repaired_geometry is None:
+        return candidate
+    repaired_candidate = _import_candidate(row_number=row_number, plot_number="Estate boundary", geometry=repaired_geometry)
+    if repaired_candidate["valid"] and repair_warning:
+        repaired_candidate.setdefault("warnings", []).append(repair_warning)
+    return repaired_candidate
+
+
 def _import_candidate(*, row_number: int, plot_number: str, geometry: dict) -> dict:
+    warnings: list[str] = []
     try:
         _, issues = validate_polygon(geometry)
         errors = [issue.message for issue in issues if issue.severity == "error"]
     except Exception:
         errors = ["geometry must be a valid GeoJSON Polygon"]
+    if errors:
+        repaired_geometry, repair_warning = _repair_import_polygon(geometry)
+        if repaired_geometry is not None:
+            try:
+                _, repaired_issues = validate_polygon(repaired_geometry)
+                repaired_errors = [issue.message for issue in repaired_issues if issue.severity == "error"]
+            except Exception:
+                repaired_errors = ["geometry repair failed validation"]
+            if not repaired_errors:
+                geometry = repaired_geometry
+                errors = []
+                if repair_warning:
+                    warnings.append(repair_warning)
     return {
         "row": row_number,
         "plot_number": plot_number.strip(),
         "geometry": geometry,
         "valid": not errors,
         "issues": errors,
+        "warnings": warnings,
     }
 
 
@@ -2042,6 +2121,101 @@ def _csv_coordinate_pair(record: dict) -> tuple[object, object] | None:
     return (values[0], values[1]) if len(values) >= 2 else None
 
 
+def _geometry_coordinate_sample(value: object) -> tuple[float, float] | None:
+    """Return one coordinate from a GeoJSON geometry value for CRS detection."""
+    try:
+        geometry = shape(json.loads(value) if isinstance(value, str) else value)
+        if geometry.is_empty:
+            return None
+        if geometry.geom_type == "Polygon":
+            x, y = next(iter(geometry.exterior.coords))
+        else:
+            x, y = geometry.centroid.x, geometry.centroid.y
+        return float(x), float(y)
+    except Exception:
+        return None
+
+
+def _transform_import_geometry(geometry: dict, source_crs: str) -> dict:
+    """Transform a GeoJSON geometry column into the database's WGS84 storage CRS."""
+    normalized = str(source_crs or "EPSG:4326").strip().lower()
+    if normalized in {"epsg:4326", "wgs84", "4326"}:
+        return geometry
+    transformer = Transformer.from_crs(source_crs, "EPSG:4326", always_xy=True)
+    return mapping(shapely_transform(transformer.transform, shape(geometry)))
+
+
+def _is_placeholder_plot_identifier(value: object) -> bool:
+    """Recognize instrument placeholder IDs without treating real plot labels as empty."""
+    text_value = str(value or "").strip()
+    if not text_value:
+        return True
+    try:
+        return _csv_number(text_value) == 0
+    except (TypeError, ValueError):
+        return False
+
+
+def _infer_estate_import_source_crs(estate: Estate, records: list[dict], requested_source_crs: str | None) -> tuple[str, bool]:
+    """Infer a Nigerian UTM source only when WGS84 was left as the default.
+
+    Survey files commonly contain projected Easting/Northing values.  Treating those as degrees
+    produces unusable geometry and empty map results.  Explicit user choices always win.  When
+    an Estate boundary exists, its centre disambiguates adjacent Nigerian UTM zones; without one,
+    UTM 32N is the documented central-Nigeria fallback and the response tells the UI what was
+    detected so the user can correct it before approval.
+    """
+    requested = str(requested_source_crs or "EPSG:4326").strip()
+    if requested.lower() not in {"epsg:4326", "wgs84", "4326"}:
+        return requested, False
+
+    sample_pair: tuple[float, float] | None = None
+    for record in records[:10]:
+        x_value = _first_csv_value(record, _CSV_X_KEYS, fuzzy=True)
+        y_value = _first_csv_value(record, _CSV_Y_KEYS, fuzzy=True)
+        if x_value in (None, "") or y_value in (None, ""):
+            pair = _csv_coordinate_pair(record)
+            if pair:
+                x_value, y_value = pair
+        try:
+            x = _csv_number(x_value)
+            y = _csv_number(y_value)
+        except (TypeError, ValueError):
+            sample = _geometry_coordinate_sample(record.get("geometry"))
+            if sample is None:
+                continue
+            x, y = sample
+        if abs(x) > 180 or abs(y) > 90:
+            sample_pair = (x, y)
+            break
+    if sample_pair is None:
+        return requested, False
+
+    x, y = sample_pair
+    estate_centre = None
+    try:
+        if estate.boundary:
+            centre = to_shape(estate.boundary).centroid
+            estate_centre = (float(centre.x), float(centre.y))
+    except Exception:
+        estate_centre = None
+
+    candidates: list[tuple[float, str]] = []
+    for epsg in ("EPSG:32631", "EPSG:32632", "EPSG:32633"):
+        try:
+            lng, lat = Transformer.from_crs(epsg, "EPSG:4326", always_xy=True).transform(x, y)
+        except Exception:
+            continue
+        if not (2.5 <= lng <= 14.7 and 4.0 <= lat <= 14.1):
+            continue
+        distance = 0.0 if estate_centre is None else abs(lng - estate_centre[0]) + abs(lat - estate_centre[1])
+        candidates.append((distance, epsg))
+    if candidates:
+        candidates.sort(key=lambda item: item[0])
+        return candidates[0][1], True
+    return "EPSG:32632", True
+
+
 @router.post("/{estate_id}/import-reviews/csv")
 async def import_estate_csv(estate_id: int, request: Request, source_crs: str | None = None, as_boundary: bool = False, file: UploadFile = File(...), db: Session = Depends(get_db)):
     estate=db.get(Estate,estate_id)
@@ -2052,14 +2226,20 @@ async def import_estate_csv(estate_id: int, request: Request, source_crs: str | 
     try: raw_records=_read_estate_csv_records(await read_limited_upload(file), file.filename or "")
     except Exception as exc: raise HTTPException(422,"CSV could not be read") from exc
     records = _normalize_csv_records(raw_records)
+    effective_source_crs, source_crs_detected = _infer_estate_import_source_crs(estate, records, source_crs)
     candidates = []
     suggest_boundary = False
     has_geometry = any(str(record.get("geometry") or "").strip() for record in records)
     if has_geometry:
         for index, record in enumerate(records, 1):
             try:
-                geometry = json.loads(record.get("geometry") or "")
-                candidates.append(_import_candidate(row_number=index, plot_number=str(record.get("plotnumber") or ""), geometry=geometry))
+                geometry = _transform_import_geometry(json.loads(record.get("geometry") or ""), effective_source_crs)
+                plot_number = str(record.get("plotnumber") or "").strip()
+                if len(records) == 1 and _is_placeholder_plot_identifier(plot_number):
+                    candidates.append(_import_boundary_candidate(row_number=index, geometry=geometry))
+                    suggest_boundary = True
+                else:
+                    candidates.append(_import_candidate(row_number=index, plot_number=plot_number, geometry=geometry))
             except Exception:
                 candidates.append({"row": index, "plot_number": str(record.get("plotnumber") or "").strip(), "valid": False, "issues": ["geometry must be a GeoJSON Polygon"]})
     elif as_boundary:
@@ -2067,7 +2247,7 @@ async def import_estate_csv(estate_id: int, request: Request, source_crs: str | 
         # plot_number column to group rows by (that's the per-plot shape below), so every row
         # with usable coordinates becomes a vertex of the single boundary ring in file order.
         try:
-            coordinate_transformer = Transformer.from_crs((source_crs or "EPSG:4326").strip(), "EPSG:4326", always_xy=True)
+            coordinate_transformer = Transformer.from_crs(effective_source_crs, "EPSG:4326", always_xy=True)
         except Exception as exc:
             raise HTTPException(status_code=422, detail="CSV source_crs is invalid") from exc
         boundary_points: list[list[float]] = []
@@ -2091,22 +2271,25 @@ async def import_estate_csv(estate_id: int, request: Request, source_crs: str | 
                 first_row = index
         if len(boundary_points) >= 3:
             ring = boundary_points if boundary_points[0] == boundary_points[-1] else boundary_points + [boundary_points[0]]
-            candidates.append(_import_candidate(row_number=first_row or 1, plot_number="Estate boundary", geometry={"type": "Polygon", "coordinates": [ring]}))
+            candidates.append(_import_boundary_candidate(row_number=first_row or 1, geometry={"type": "Polygon", "coordinates": [ring]}))
         else:
             candidates.append({"row": first_row or 1, "plot_number": "", "valid": False, "issues": ["A boundary requires at least three coordinate rows"]})
     else:
         repeated_plot_key = _repeated_csv_plot_key(records)
         try:
-            coordinate_transformer = Transformer.from_crs((source_crs or "EPSG:4326").strip(), "EPSG:4326", always_xy=True)
+            coordinate_transformer = Transformer.from_crs(effective_source_crs, "EPSG:4326", always_xy=True)
         except Exception as exc:
             raise HTTPException(status_code=422, detail="CSV source_crs is invalid") from exc
         explicit_plot_numbers = [str(_first_csv_value(record, _CSV_PLOT_NUMBER_KEYS) or "").strip() for record in records]
+        repeated_identifiers = [str(record.get(repeated_plot_key) or "").strip() for record in records] if repeated_plot_key else []
+        identifier_values = explicit_plot_numbers if any(explicit_plot_numbers) else repeated_identifiers
+        placeholder_identifier_only = bool(identifier_values) and all(_is_placeholder_plot_identifier(value) for value in identifier_values)
 
         # A complete coordinate list with no parcel identifier is a common estate-boundary export.
         # Offer it as one boundary candidate instead of reporting every row as an unusable plot.
         # This is only a recommendation: the frontend switches to boundary mode, and the normal
         # approval endpoint still requires the user's explicit `as_boundary` decision.
-        if not any(explicit_plot_numbers) and repeated_plot_key is None:
+        if (not any(explicit_plot_numbers) and repeated_plot_key is None) or placeholder_identifier_only:
             boundary_points: list[list[float]] = []
             boundary_valid = True
             for record in records:
@@ -2126,7 +2309,7 @@ async def import_estate_csv(estate_id: int, request: Request, source_crs: str | 
                     break
             if boundary_valid and len(boundary_points) >= 3:
                 ring = boundary_points if boundary_points[0] == boundary_points[-1] else boundary_points + [boundary_points[0]]
-                candidates.append(_import_candidate(row_number=1, plot_number="Estate boundary", geometry={"type": "Polygon", "coordinates": [ring]}))
+                candidates.append(_import_boundary_candidate(row_number=1, geometry={"type": "Polygon", "coordinates": [ring]}))
                 suggest_boundary = True
 
         if not suggest_boundary:
@@ -2159,7 +2342,7 @@ async def import_estate_csv(estate_id: int, request: Request, source_crs: str | 
     if not candidates: raise HTTPException(422,"CSV contains no rows")
     row=EstateImportReview(organization_id=estate.organization_id,estate_id=estate.id,source_type="csv",notes=f"{len(candidates)} candidate parcel(s) imported from {file.filename or 'CSV'}",candidate_data=candidates,created_by_subject_type=access.principal.subject_type,created_by_subject_id=access.principal.subject_id)
     db.add(row); db.flush(); append_estate_audit_event(db,organization_id=estate.organization_id,actor=access.principal,action="import_review.csv_uploaded",entity_type="estate_import_review",entity_id=row.id,after_data={"candidate_count":len(candidates),"valid_count":sum(1 for candidate in candidates if candidate["valid"])}) ; db.commit()
-    return {"id":row.id,"status":row.status,"candidate_count":len(candidates),"valid_count":sum(1 for candidate in candidates if candidate["valid"]),"suggest_boundary":suggest_boundary,"source_crs":source_crs or "EPSG:4326"}
+    return {"id":row.id,"status":row.status,"candidate_count":len(candidates),"valid_count":sum(1 for candidate in candidates if candidate["valid"]),"suggest_boundary":suggest_boundary,"source_crs":effective_source_crs,"source_crs_detected":source_crs_detected}
 
 @router.post("/{estate_id}/import-reviews/geojson")
 async def import_estate_geojson(estate_id:int,request:Request,file:UploadFile=File(...),db:Session=Depends(get_db)):
