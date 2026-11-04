@@ -44,7 +44,13 @@ from app.services.estates.permissions import PERMISSION_CATALOG, has_permission,
 from sqlalchemy import func
 from app.services.estates.allocations import release_allocation, reserve_or_allocate
 from app.services.estates.audit import append_estate_audit_event
-from app.services.estates.authorization import EstatePrincipal, require_estate_access, require_estate_view_access, require_estate_view_access_any
+from app.services.estates.authorization import (
+    EstatePrincipal,
+    require_estate_access,
+    require_estate_view_access,
+    require_estate_view_access_any,
+    require_estate_view_access_for_estate,
+)
 from app.services.estates.billing_plans import next_plan_with_estates, plan_label
 from app.services.estates.subscriptions import estate_limit_for_organization, get_subscription, has_hazard_access_for_organization, has_live_inspection_access_for_organization, has_sms_access_for_organization, has_soil_analysis_access_for_organization
 from app.services.estates.survey_requests import transition
