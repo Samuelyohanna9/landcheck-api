@@ -144,15 +144,21 @@ def test_superadmin_bypass_sees_everything(restricted_sessionmaker, two_orgs):
 
 
 def test_lookup_bypass_is_narrow_to_carve_out_tables(restricted_sessionmaker, two_orgs):
-    """'lookup' must grant estate_customers (a real carve-out table) but NOT estate_organizations
-    (not a carve-out table) - the whole point of scoping the bypass per-table."""
+    """'lookup' must grant estate_customers (a real carve-out table) but NOT estate_payments
+    (not a carve-out table) - the whole point of scoping the bypass per-table. estate_organizations
+    IS now a carve-out table too (20261104_0085) - the request bootstrap joins it to resolve
+    identity before any organization context exists, same as estate_auth_sessions/
+    estate_organization_members (20261104_0084)."""
     assert "estate_customers" in ESTATE_LOOKUP_SELECT_TABLES
-    assert "estate_organizations" not in ESTATE_LOOKUP_SELECT_TABLES
+    assert "estate_payments" not in ESTATE_LOOKUP_SELECT_TABLES
     assert "estate_auth_sessions" in ESTATE_LOOKUP_SELECT_TABLES
     assert "estate_organization_members" in ESTATE_LOOKUP_SELECT_TABLES
+    assert "estate_organizations" in ESTATE_LOOKUP_SELECT_TABLES
     result = _query_as(restricted_sessionmaker, organization_ids="", bypass="lookup", two_orgs=two_orgs)
     assert result["customers"] == {two_orgs["customer_a"]}
-    assert result["orgs"] == set()
+    # estate_organizations is a carve-out table (20261104_0085), so both orgs are visible under
+    # 'lookup' - this is what makes the request bootstrap's identity resolution possible at all.
+    assert result["orgs"] == {two_orgs["org_a"], two_orgs["org_b"]}
 
 
 def test_backfilled_organization_id_matches_parent_estate(admin_engine, two_orgs):
