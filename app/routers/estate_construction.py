@@ -53,6 +53,22 @@ def _plot_and_estate(db: Session, plot_id: int) -> tuple[EstatePlot, Estate]:
     return plot, estate
 
 
+def _estate_for_document(db: Session, document: EstateDocument) -> Estate:
+    """Resolves the estate a drawing belongs to via its plot link, so approval/annotation
+    endpoints can use require_estate_access_for_estate like every other plot-scoped handler in
+    this file - a document's bare organization_id isn't enough to enforce per-estate scoping."""
+    link = db.query(EstateDocumentLink).filter(EstateDocumentLink.document_id == document.id, EstateDocumentLink.entity_type == "plot").first()
+    if link is None:
+        raise HTTPException(404, "This document isn't linked to a plot")
+    plot = db.get(EstatePlot, int(link.entity_id))
+    if plot is None:
+        raise HTTPException(404, "Plot not found")
+    estate = db.get(Estate, plot.estate_id)
+    if estate is None:
+        raise HTTPException(404, "Estate not found")
+    return estate
+
+
 def _budget_payload(budget: EstatePlotConstructionBudget, lines: list[EstateConstructionBudgetLine]) -> dict:
     return {
         "id": budget.id, "plot_id": budget.plot_id, "total_budget": budget.total_budget, "currency": budget.currency,
@@ -470,7 +486,8 @@ def mark_snag_fixed(snag_id: int, request: Request, db: Session = Depends(get_db
     snag = db.get(EstateSnagItem, snag_id)
     if snag is None:
         raise HTTPException(404, "Snag item not found")
-    access = require_estate_access(db, request, snag.organization_id, permission=WRITE)
+    _, estate = _plot_and_estate(db, snag.plot_id)
+    access = require_estate_access_for_estate(db, request, estate.id, permission=WRITE)
     if snag.status != "open":
         raise HTTPException(409, "This snag item isn't open")
     snag.status = "fixed"
@@ -485,7 +502,8 @@ def verify_snag_item(snag_id: int, request: Request, db: Session = Depends(get_d
     snag = db.get(EstateSnagItem, snag_id)
     if snag is None:
         raise HTTPException(404, "Snag item not found")
-    access = require_estate_access(db, request, snag.organization_id, permission=WRITE)
+    _, estate = _plot_and_estate(db, snag.plot_id)
+    access = require_estate_access_for_estate(db, request, estate.id, permission=WRITE)
     if snag.status != "fixed":
         raise HTTPException(409, "Only a fixed snag item can be verified")
     snag.status = "verified"
@@ -532,7 +550,8 @@ def submit_drawing_for_approval(document_id: int, request: Request, db: Session 
         raise HTTPException(404, "Document not found")
     if document.document_type not in DRAWING_TYPES:
         raise HTTPException(422, "Only drawing-type documents (building plan, structural, MEP) go through approval")
-    access = require_estate_access(db, request, document.organization_id, permission=WRITE)
+    estate = _estate_for_document(db, document)
+    access = require_estate_access_for_estate(db, request, estate.id, permission=WRITE)
     existing = db.query(EstateDrawingApproval).filter(EstateDrawingApproval.document_id == document_id).one_or_none()
     if existing is not None:
         raise HTTPException(409, "This drawing already has an approval record")
@@ -552,7 +571,8 @@ def review_drawing_approval(document_id: int, payload: DrawingApprovalReview, re
     approval = db.query(EstateDrawingApproval).filter(EstateDrawingApproval.document_id == document_id).one_or_none()
     if approval is None:
         raise HTTPException(404, "This drawing hasn't been submitted for approval yet")
-    access = require_estate_access(db, request, document.organization_id, permission=WRITE)
+    estate = _estate_for_document(db, document)
+    access = require_estate_access_for_estate(db, request, estate.id, permission=WRITE)
     if approval.status != "submitted":
         raise HTTPException(409, "This drawing has already been reviewed")
     approval.status = payload.status
@@ -575,7 +595,8 @@ def list_annotations(document_id: int, request: Request, db: Session = Depends(g
     document = db.get(EstateDocument, document_id)
     if document is None:
         raise HTTPException(404, "Document not found")
-    require_estate_access(db, request, document.organization_id, permission=READ)
+    estate = _estate_for_document(db, document)
+    require_estate_access_for_estate(db, request, estate.id, permission=READ)
     rows = db.query(EstateDrawingAnnotation).filter(EstateDrawingAnnotation.document_id == document_id).order_by(EstateDrawingAnnotation.created_at.asc()).all()
     return [_annotation_payload(row) for row in rows]
 
@@ -589,7 +610,8 @@ def create_annotation(document_id: int, payload: AnnotationCreate, request: Requ
     document = db.get(EstateDocument, document_id)
     if document is None:
         raise HTTPException(404, "Document not found")
-    access = require_estate_access(db, request, document.organization_id, permission=WRITE)
+    estate = _estate_for_document(db, document)
+    access = require_estate_access_for_estate(db, request, estate.id, permission=WRITE)
     row = EstateDrawingAnnotation(
         document_id=document_id, organization_id=document.organization_id, kind=payload.kind, data=payload.data, label=payload.label,
         created_by_subject_type=access.principal.subject_type, created_by_subject_id=access.principal.subject_id,
@@ -606,7 +628,11 @@ def delete_annotation(annotation_id: int, request: Request, db: Session = Depend
     row = db.get(EstateDrawingAnnotation, annotation_id)
     if row is None:
         raise HTTPException(404, "Annotation not found")
-    access = require_estate_access(db, request, row.organization_id, permission=WRITE)
+    document = db.get(EstateDocument, row.document_id)
+    if document is None:
+        raise HTTPException(404, "Document not found")
+    estate = _estate_for_document(db, document)
+    access = require_estate_access_for_estate(db, request, estate.id, permission=WRITE)
     append_estate_audit_event(db, organization_id=row.organization_id, actor=access.principal, action="drawing_annotation.deleted", entity_type="estate_drawing_annotation", entity_id=row.id)
     db.delete(row)
     db.commit()
@@ -646,7 +672,8 @@ def answer_rfi(rfi_id: int, payload: RFIAnswer, request: Request, db: Session = 
     rfi = db.get(EstateRFI, rfi_id)
     if rfi is None:
         raise HTTPException(404, "RFI not found")
-    access = require_estate_access(db, request, rfi.organization_id, permission=WRITE)
+    _, estate = _plot_and_estate(db, rfi.plot_id)
+    access = require_estate_access_for_estate(db, request, estate.id, permission=WRITE)
     if rfi.status == "closed":
         raise HTTPException(409, "This RFI is closed")
     rfi.answer = payload.answer.strip()
@@ -664,7 +691,8 @@ def close_rfi(rfi_id: int, request: Request, db: Session = Depends(get_db)):
     rfi = db.get(EstateRFI, rfi_id)
     if rfi is None:
         raise HTTPException(404, "RFI not found")
-    access = require_estate_access(db, request, rfi.organization_id, permission=WRITE)
+    _, estate = _plot_and_estate(db, rfi.plot_id)
+    access = require_estate_access_for_estate(db, request, estate.id, permission=WRITE)
     rfi.status = "closed"
     rfi.closed_at = datetime.now(timezone.utc)
     append_estate_audit_event(db, organization_id=rfi.organization_id, actor=access.principal, action="rfi.closed", entity_type="estate_rfi", entity_id=rfi.id)
