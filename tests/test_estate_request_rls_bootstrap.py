@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from app import main
 from app.routers import plots
 
 
@@ -36,3 +37,39 @@ def test_estate_request_resolves_lookup_then_switches_to_tenant(monkeypatch):
         ("bypass", None),
         ("clear", None),
     ]
+
+
+def test_private_estate_middleware_resolves_identity_under_lookup_context(monkeypatch):
+    calls: list[tuple[str, object]] = []
+    db = _FakeSession()
+    request = SimpleNamespace(url=SimpleNamespace(path="/estates/foundation/access"))
+
+    monkeypatch.setattr(main, "SessionLocal", lambda: db)
+    monkeypatch.setattr(main, "_requires_green_session", lambda _request: False)
+    monkeypatch.setattr(main, "_requires_estate_session", lambda _request: True)
+    monkeypatch.setattr(main, "resolve_request_session", lambda _db, _request: None)
+    monkeypatch.setattr(main, "resolve_estate_session", lambda _db, _request: object())
+    monkeypatch.setattr(main, "set_estate_bypass", lambda _db, mode: calls.append(("bypass", mode)))
+
+    main._prepare_private_request_sync(request)
+
+    assert calls == [("bypass", "lookup"), ("bypass", None)]
+
+
+def test_private_estate_middleware_clears_lookup_context_when_identity_is_missing(monkeypatch):
+    calls: list[tuple[str, object]] = []
+    db = _FakeSession()
+    request = SimpleNamespace(url=SimpleNamespace(path="/estates/foundation/access"))
+
+    monkeypatch.setattr(main, "SessionLocal", lambda: db)
+    monkeypatch.setattr(main, "_requires_green_session", lambda _request: False)
+    monkeypatch.setattr(main, "_requires_estate_session", lambda _request: True)
+    monkeypatch.setattr(main, "resolve_request_session", lambda _db, _request: None)
+    monkeypatch.setattr(main, "resolve_estate_session", lambda _db, _request: None)
+    monkeypatch.setattr(main, "set_estate_bypass", lambda _db, mode: calls.append(("bypass", mode)))
+
+    with pytest.raises(main.HTTPException) as error:
+        main._prepare_private_request_sync(request)
+
+    assert error.value.status_code == 401
+    assert calls == [("bypass", "lookup"), ("bypass", None)]

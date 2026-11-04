@@ -49,6 +49,7 @@ from app.utils.auth_security import require_authenticated_session
 from app.utils.rate_limit import allow_request
 from app.utils.row_security import (
     clear_survey_user_context,
+    set_estate_bypass,
     set_survey_user_context,
     verify_estate_row_security,
     verify_survey_row_security,
@@ -795,8 +796,16 @@ def _prepare_private_request_sync(request: Request) -> None:
         if _requires_green_session(request):
             require_authenticated_session(session_db, request, auth_modes={"partner_user", "env_admin", "sponsor_user"})
         if _requires_estate_session(request):
-            if resolve_estate_session(session_db, request) is None:
-                raise HTTPException(status_code=401, detail="Authentication required")
+            # Estate identity lookup must happen before an organization is known. Under the
+            # tenant RLS boundary, use the narrow SELECT-only lookup context for the two identity
+            # tables, then clear it before this short-lived session is closed. The route dependency
+            # establishes the real organization context separately before any handler query runs.
+            set_estate_bypass(session_db, "lookup")
+            try:
+                if resolve_estate_session(session_db, request) is None:
+                    raise HTTPException(status_code=401, detail="Authentication required")
+            finally:
+                set_estate_bypass(session_db, None)
         if str(request.url.path or "").lower().startswith(("/plots/", "/hazards/jobs/", "/survey-georeference/sessions/")):
             survey_session = resolve_survey_session(session_db, request)
             set_survey_user_context(session_db, survey_session.user_id if survey_session else None)
