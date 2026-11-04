@@ -1882,24 +1882,42 @@ _CSV_PLOT_NUMBER_KEYS = (
     "parcelid", "parcel", "lotnumber", "lotno", "lotid", "unitnumber", "unitno", "unitid", "lot", "unit", "plot",
 )
 _CSV_X_KEYS = (
-    "longitude", "lng", "lon", "easting", "eastingm", "east", "x", "xcoordinate", "eastingcoordinate", "utm easting",
+    "longitude", "lng", "lon", "easting", "eastingm", "east", "x", "xcoordinate", "eastingcoordinate", "utm easting", "e",
 )
 _CSV_Y_KEYS = (
-    "latitude", "lat", "northing", "northingm", "north", "y", "ycoordinate", "northingcoordinate", "utm northing",
+    "latitude", "lat", "northing", "northingm", "north", "y", "ycoordinate", "northingcoordinate", "utm northing", "n",
 )
 _CSV_COORDINATE_KEYS = ("coordinates", "coordinate", "coord", "pointcoordinate", "xy")
 
 
-def _first_csv_value(record: dict, keys: tuple[str, ...]) -> object:
+def _first_csv_value(record: dict, keys: tuple[str, ...], *, fuzzy: bool = False) -> object:
+    # `fuzzy=True` matches the same forgiving logic the Survey Plan CSV importer's column
+    # auto-detection uses (CSVPreviewModal.tsx) instead of requiring an exact header match: a
+    # real-world export's header is rarely exactly "easting" - "Easting (UTM)", "X Coordinate" and
+    # similar all need to match too, which only a substring check catches. Used for the coordinate
+    # columns only, not plot_number: a short, generic word like "unit" or "lot" substring-matching
+    # against an unrelated column (e.g. "Unit Price") would silently misread that column as the
+    # plot number, so plot_number keeps requiring an exact header match. A bare one- or two-letter
+    # shorthand like "x"/"e"/"n" also stays exact-only even when fuzzy, since substring-matching
+    # those would false-positive on any unrelated header that happens to contain that letter
+    # (e.g. "Tax ID").
+    headers = list(record.keys())
     for key in keys:
-        value = record.get(_normalize_csv_header(key))
-        if value is not None and str(value).strip():
-            return value
+        normalized_key = _normalize_csv_header(key)
+        if not normalized_key:
+            continue
+        for header in headers:
+            matches = header == normalized_key if not fuzzy or len(normalized_key) <= 2 else normalized_key in header
+            if not matches:
+                continue
+            value = record.get(header)
+            if value is not None and str(value).strip():
+                return value
     return None
 
 
 def _csv_coordinate_pair(record: dict) -> tuple[object, object] | None:
-    raw = _first_csv_value(record, _CSV_COORDINATE_KEYS)
+    raw = _first_csv_value(record, _CSV_COORDINATE_KEYS, fuzzy=True)
     if raw is None:
         return None
     values = re.findall(r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?", str(raw))
@@ -1936,8 +1954,8 @@ async def import_estate_csv(estate_id: int, request: Request, source_crs: str | 
         boundary_points: list[list[float]] = []
         first_row: int | None = None
         for index, record in enumerate(records, 1):
-            x_value = _first_csv_value(record, _CSV_X_KEYS)
-            y_value = _first_csv_value(record, _CSV_Y_KEYS)
+            x_value = _first_csv_value(record, _CSV_X_KEYS, fuzzy=True)
+            y_value = _first_csv_value(record, _CSV_Y_KEYS, fuzzy=True)
             if x_value in (None, "") or y_value in (None, ""):
                 coordinate_pair = _csv_coordinate_pair(record)
                 if coordinate_pair:
@@ -1966,8 +1984,8 @@ async def import_estate_csv(estate_id: int, request: Request, source_crs: str | 
             raise HTTPException(status_code=422, detail="CSV source_crs is invalid") from exc
         for index, record in enumerate(records, 1):
             number = str(_first_csv_value(record, _CSV_PLOT_NUMBER_KEYS) or "").strip()
-            x_value = _first_csv_value(record, _CSV_X_KEYS)
-            y_value = _first_csv_value(record, _CSV_Y_KEYS)
+            x_value = _first_csv_value(record, _CSV_X_KEYS, fuzzy=True)
+            y_value = _first_csv_value(record, _CSV_Y_KEYS, fuzzy=True)
             if x_value in (None, "") or y_value in (None, ""):
                 coordinate_pair = _csv_coordinate_pair(record)
                 if coordinate_pair:
