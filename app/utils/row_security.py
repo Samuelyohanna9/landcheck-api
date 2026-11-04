@@ -154,7 +154,8 @@ ESTATE_LOOKUP_SELECT_TABLES: tuple[str, ...] = (
     "estate_canva_designs", "estate_notification_logs", "estate_marketing_optins", "estate_customers",
     "estate_estates", "estate_agent_portal_tokens", "estate_customer_portal_tokens",
     "estate_inspection_bookings", "estate_live_inspection_buyer_tokens", "estate_accounts",
-    "estate_auth_sessions", "estate_organization_members", "estate_social_posts", "estate_whatsapp_messages",
+    "estate_auth_sessions", "estate_organization_members", "estate_organizations", "estate_social_posts",
+    "estate_whatsapp_messages",
 )
 # estate_organizations also needs INSERT under the 'lookup' bypass: registration creates a brand
 # new organization row, whose id can't already be in the (not-yet-known) allow-list.
@@ -277,7 +278,7 @@ def verify_estate_row_security(db: Session) -> None:
         f"{table}:lc_{table}_tenant_policy" for table in expected_tables
         if (table, f"lc_{table}_tenant_policy") not in installed
     ]
-    lookup_tables = ("estate_auth_sessions", "estate_organization_members")
+    lookup_tables = ("estate_auth_sessions", "estate_organization_members", "estate_organizations")
     lookup_policy_rows = db.execute(
         text(
             """

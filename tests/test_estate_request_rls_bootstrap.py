@@ -6,6 +6,7 @@ import pytest
 
 from app import main
 from app.routers import plots
+from app.utils.row_security import ESTATE_LOOKUP_SELECT_TABLES
 
 
 class _FakeSession:
@@ -73,3 +74,7 @@ def test_private_estate_middleware_clears_lookup_context_when_identity_is_missin
 
     assert error.value.status_code == 401
     assert calls == [("bypass", "lookup"), ("bypass", None)]
+
+
+def test_estate_organization_is_available_for_identity_lookup_only():
+    assert "estate_organizations" in ESTATE_LOOKUP_SELECT_TABLES
