@@ -13,6 +13,9 @@ from app.routers.estates import (
     _polygon_geometry_from_georeference_feature,
 )
 from types import SimpleNamespace
+from io import BytesIO
+
+from openpyxl import Workbook
 
 
 def test_normalize_csv_records_matches_capitalized_excel_headers():
@@ -73,6 +76,30 @@ def test_repeated_point_label_can_group_a_parcel_but_unique_points_cannot():
 def test_csv_number_accepts_decimal_comma_and_thousands_separator():
     assert _csv_number("241123,5") == 241123.5
     assert _csv_number("241,123.5") == 241123.5
+
+
+def test_estate_csv_reader_accepts_coordinate_rows_without_a_header():
+    records = _normalize_csv_records(_read_estate_csv_records(
+        "P-001;241123.5;1006432.1\nP-001;241124.5;1006432.1\nP-001;241124.5;1006433.1\n".encode(),
+        "layout.csv",
+    ))
+    assert records == [
+        {"plotnumber": "P-001", "x": "241123.5", "y": "1006432.1"},
+        {"plotnumber": "P-001", "x": "241124.5", "y": "1006432.1"},
+        {"plotnumber": "P-001", "x": "241124.5", "y": "1006433.1"},
+    ]
+
+
+def test_estate_reader_accepts_xlsx_using_existing_spreadsheet_parser():
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.append(["Plot No.", "Easting (m)", "Northing (m)"])
+    sheet.append(["P-001", 241123.5, 1006432.1])
+    buffer = BytesIO()
+    workbook.save(buffer)
+
+    records = _normalize_csv_records(_read_estate_csv_records(buffer.getvalue(), "layout.xlsx"))
+    assert records == [{"plotno": "P-001", "eastingm": "241123.5", "northingm": "1006432.1"}]
 
 
 def test_dxf_linework_fallback_polygonizes_independent_closed_edges():

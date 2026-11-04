@@ -18,6 +18,7 @@ pyproj
 numpy
 pandas
 openpyxl
+xlrd>=2.0,<3.0
 requests
 earthengine-api
 google-auth

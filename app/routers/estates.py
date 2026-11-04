@@ -1873,24 +1873,74 @@ def _normalize_csv_records(raw_records: list[dict]) -> list[dict]:
     return normalized_records
 
 
-def _read_estate_csv_records(payload: bytes) -> list[dict]:
+def _read_estate_csv_records(payload: bytes, filename: str = "") -> list[dict]:
     """Read the small coordinate CSV used by Estate layout import.
 
     Surveyors commonly export semicolon- or tab-delimited files from CAD/GIS tools.  The old
     parser always assumed commas, which turned the complete header into one field and made every
-    row look as if it had no plot or coordinates.  Sniff only the delimiter (never the data type),
-    keep UTF-8 BOM support, and leave all values as strings for the explicit validation below.
+    row look as if it had no plot or coordinates.  Excel workbooks use the same normalized record
+    shape as the existing Estate spreadsheet importer.  For plain text, sniff only the delimiter
+    (never the data type), keep UTF-8 BOM support, and also accept coordinate rows without a header
+    by assigning the conventional plot/x/y positions. Values remain strings for explicit
+    validation below.
     """
+    extension = str(filename or "").strip().lower().rsplit(".", 1)[-1] if "." in str(filename or "") else ""
+    if extension in {"xlsx", "xls"}:
+        # Reuse the existing Estate integration parser so workbook handling, blank-row removal and
+        # Excel's numeric cell conversion stay consistent across both Estate upload workflows.
+        from app.services.estates.data_import import parse_spreadsheet
+
+        sheets = parse_spreadsheet(payload, filename)
+        for rows in sheets.values():
+            if rows:
+                return rows
+        return []
+
     text_payload = payload.decode("utf-8-sig")
     sample = text_payload[:8192]
     try:
         dialect = csv.Sniffer().sniff(sample, delimiters=",;\t|")
     except csv.Error:
         dialect = csv.excel
-    reader = csv.DictReader(io.StringIO(text_payload), dialect=dialect, skipinitialspace=True)
-    if not reader.fieldnames:
+    rows = [row for row in csv.reader(io.StringIO(text_payload), dialect=dialect, skipinitialspace=True) if any(str(cell).strip() for cell in row)]
+    if not rows:
         return []
-    return list(reader)
+
+    def is_known_header(value: object) -> bool:
+        normalized = _normalize_csv_header(value)
+        if not normalized:
+            return False
+        aliases = (*_CSV_PLOT_NUMBER_KEYS, *_CSV_X_KEYS, *_CSV_Y_KEYS, *_CSV_COORDINATE_KEYS, *_CSV_REPEATED_PLOT_KEYS)
+        return any(normalized == alias or (len(alias) > 5 and alias in normalized) for alias in aliases)
+
+    # A few exports prepend a title or instrument metadata before the actual header row. Locate
+    # the first row containing a recognized coordinate/plot role instead of treating the title as
+    # the header and losing every data column.
+    header_index = next((index for index, row in enumerate(rows[:10]) if any(is_known_header(cell) for cell in row)), None)
+    if header_index is not None:
+        header = rows[header_index]
+        records: list[dict] = []
+        for row in rows[header_index + 1:]:
+            records.append({str(header[index]).strip(): row[index] if index < len(row) else "" for index in range(len(header))})
+        return records
+
+    # Surveyor/CAD exports sometimes omit column names entirely. Treat the first text column as
+    # the plot/point label when the next two values are numeric; otherwise use the first two
+    # numeric columns as x/y. This is only a parsing fallback - individual plot creation still
+    # requires three vertices grouped under the same identifier.
+    def is_number(value: object) -> bool:
+        try:
+            _csv_number(value)
+            return True
+        except (TypeError, ValueError):
+            return False
+
+    data_start = next((index for index, row in enumerate(rows) if sum(is_number(cell) for cell in row[:3]) >= 2), 0)
+    data_rows = rows[data_start:]
+    first_row = data_rows[0] if data_rows else []
+    has_label = len(first_row) >= 3 and not is_number(first_row[0]) and is_number(first_row[1]) and is_number(first_row[2])
+    headers = ["plotnumber", "x", "y"] if has_label else ["x", "y"]
+    return [{headers[index]: row[index] if index < len(row) else "" for index in range(len(headers))} for row in data_rows]
 
 
 _CSV_PLOT_NUMBER_KEYS = (
@@ -1997,12 +2047,13 @@ async def import_estate_csv(estate_id: int, request: Request, source_crs: str | 
     estate=db.get(Estate,estate_id)
     if not estate: raise HTTPException(404,"Estate not found")
     access=require_estate_access_for_estate(db, request, estate.id,permission="plot.manage")
-    if upload_extension(file) not in {".csv", ".txt"}:
-        raise HTTPException(422, "Upload a CSV file")
-    try: raw_records=_read_estate_csv_records(await read_limited_upload(file))
+    if upload_extension(file) not in {".csv", ".txt", ".xlsx", ".xls"}:
+        raise HTTPException(422, "Upload a CSV or Excel file")
+    try: raw_records=_read_estate_csv_records(await read_limited_upload(file), file.filename or "")
     except Exception as exc: raise HTTPException(422,"CSV could not be read") from exc
     records = _normalize_csv_records(raw_records)
     candidates = []
+    suggest_boundary = False
     has_geometry = any(str(record.get("geometry") or "").strip() for record in records)
     if has_geometry:
         for index, record in enumerate(records, 1):
@@ -2044,41 +2095,71 @@ async def import_estate_csv(estate_id: int, request: Request, source_crs: str | 
         else:
             candidates.append({"row": first_row or 1, "plot_number": "", "valid": False, "issues": ["A boundary requires at least three coordinate rows"]})
     else:
-        grouped: dict[str, list[list[float]]] = {}
-        first_rows: dict[str, int] = {}
         repeated_plot_key = _repeated_csv_plot_key(records)
         try:
             coordinate_transformer = Transformer.from_crs((source_crs or "EPSG:4326").strip(), "EPSG:4326", always_xy=True)
         except Exception as exc:
             raise HTTPException(status_code=422, detail="CSV source_crs is invalid") from exc
-        for index, record in enumerate(records, 1):
-            number = str(_first_csv_value(record, _CSV_PLOT_NUMBER_KEYS) or "").strip()
-            if not number and repeated_plot_key:
-                number = str(record.get(repeated_plot_key) or "").strip()
-            x_value = _first_csv_value(record, _CSV_X_KEYS, fuzzy=True)
-            y_value = _first_csv_value(record, _CSV_Y_KEYS, fuzzy=True)
-            if x_value in (None, "") or y_value in (None, ""):
-                coordinate_pair = _csv_coordinate_pair(record)
-                if coordinate_pair:
-                    x_value, y_value = coordinate_pair
-            try:
-                if not number or x_value in (None, "") or y_value in (None, ""):
-                    raise ValueError
-                x, y = coordinate_transformer.transform(_csv_number(x_value), _csv_number(y_value))
-                grouped.setdefault(number, []).append([x, y])
-                first_rows.setdefault(number, index)
-            except (TypeError, ValueError):
-                candidates.append({"row": index, "plot_number": number, "valid": False, "issues": ["CSV rows require plot_number, longitude/latitude (or x/y) coordinates"]})
-        for number, points in grouped.items():
-            if len(points) >= 3:
-                ring = points if points[0] == points[-1] else points + [points[0]]
-                candidates.append(_import_candidate(row_number=first_rows[number], plot_number=number, geometry={"type": "Polygon", "coordinates": [ring]}))
-            else:
-                candidates.append({"row": first_rows[number], "plot_number": number, "valid": False, "issues": ["A parcel requires at least three coordinate rows"]})
+        explicit_plot_numbers = [str(_first_csv_value(record, _CSV_PLOT_NUMBER_KEYS) or "").strip() for record in records]
+
+        # A complete coordinate list with no parcel identifier is a common estate-boundary export.
+        # Offer it as one boundary candidate instead of reporting every row as an unusable plot.
+        # This is only a recommendation: the frontend switches to boundary mode, and the normal
+        # approval endpoint still requires the user's explicit `as_boundary` decision.
+        if not any(explicit_plot_numbers) and repeated_plot_key is None:
+            boundary_points: list[list[float]] = []
+            boundary_valid = True
+            for record in records:
+                x_value = _first_csv_value(record, _CSV_X_KEYS, fuzzy=True)
+                y_value = _first_csv_value(record, _CSV_Y_KEYS, fuzzy=True)
+                if x_value in (None, "") or y_value in (None, ""):
+                    coordinate_pair = _csv_coordinate_pair(record)
+                    if coordinate_pair:
+                        x_value, y_value = coordinate_pair
+                try:
+                    if x_value in (None, "") or y_value in (None, ""):
+                        raise ValueError
+                    x, y = coordinate_transformer.transform(_csv_number(x_value), _csv_number(y_value))
+                    boundary_points.append([x, y])
+                except (TypeError, ValueError):
+                    boundary_valid = False
+                    break
+            if boundary_valid and len(boundary_points) >= 3:
+                ring = boundary_points if boundary_points[0] == boundary_points[-1] else boundary_points + [boundary_points[0]]
+                candidates.append(_import_candidate(row_number=1, plot_number="Estate boundary", geometry={"type": "Polygon", "coordinates": [ring]}))
+                suggest_boundary = True
+
+        if not suggest_boundary:
+            grouped: dict[str, list[list[float]]] = {}
+            first_rows: dict[str, int] = {}
+            for index, record in enumerate(records, 1):
+                number = str(_first_csv_value(record, _CSV_PLOT_NUMBER_KEYS) or "").strip()
+                if not number and repeated_plot_key:
+                    number = str(record.get(repeated_plot_key) or "").strip()
+                x_value = _first_csv_value(record, _CSV_X_KEYS, fuzzy=True)
+                y_value = _first_csv_value(record, _CSV_Y_KEYS, fuzzy=True)
+                if x_value in (None, "") or y_value in (None, ""):
+                    coordinate_pair = _csv_coordinate_pair(record)
+                    if coordinate_pair:
+                        x_value, y_value = coordinate_pair
+                try:
+                    if not number or x_value in (None, "") or y_value in (None, ""):
+                        raise ValueError
+                    x, y = coordinate_transformer.transform(_csv_number(x_value), _csv_number(y_value))
+                    grouped.setdefault(number, []).append([x, y])
+                    first_rows.setdefault(number, index)
+                except (TypeError, ValueError):
+                    candidates.append({"row": index, "plot_number": number, "valid": False, "issues": ["CSV rows require plot_number, longitude/latitude (or x/y) coordinates"]})
+            for number, points in grouped.items():
+                if len(points) >= 3:
+                    ring = points if points[0] == points[-1] else points + [points[0]]
+                    candidates.append(_import_candidate(row_number=first_rows[number], plot_number=number, geometry={"type": "Polygon", "coordinates": [ring]}))
+                else:
+                    candidates.append({"row": first_rows[number], "plot_number": number, "valid": False, "issues": ["A parcel requires at least three coordinate rows"]})
     if not candidates: raise HTTPException(422,"CSV contains no rows")
     row=EstateImportReview(organization_id=estate.organization_id,estate_id=estate.id,source_type="csv",notes=f"{len(candidates)} candidate parcel(s) imported from {file.filename or 'CSV'}",candidate_data=candidates,created_by_subject_type=access.principal.subject_type,created_by_subject_id=access.principal.subject_id)
     db.add(row); db.flush(); append_estate_audit_event(db,organization_id=estate.organization_id,actor=access.principal,action="import_review.csv_uploaded",entity_type="estate_import_review",entity_id=row.id,after_data={"candidate_count":len(candidates),"valid_count":sum(1 for candidate in candidates if candidate["valid"])}) ; db.commit()
-    return {"id":row.id,"status":row.status,"candidate_count":len(candidates),"valid_count":sum(1 for candidate in candidates if candidate["valid"]),"source_crs":source_crs or "EPSG:4326"}
+    return {"id":row.id,"status":row.status,"candidate_count":len(candidates),"valid_count":sum(1 for candidate in candidates if candidate["valid"]),"suggest_boundary":suggest_boundary,"source_crs":source_crs or "EPSG:4326"}
 
 @router.post("/{estate_id}/import-reviews/geojson")
 async def import_estate_geojson(estate_id:int,request:Request,file:UploadFile=File(...),db:Session=Depends(get_db)):
