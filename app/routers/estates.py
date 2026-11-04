@@ -3916,6 +3916,21 @@ def _resolve_survey_owner_user_id(db: Session, principal) -> int:
     raise HTTPException(403, "Starting Survey requires an authenticated Survey user")
 
 
+def _survey_request_owner_user_id(row: EstateSurveyRequest) -> int:
+    """Return the owner recorded when the Estate request was materialized for Survey.
+
+    The Estate-to-Survey handoff runs under the Estate tenant context.  Re-querying the Survey
+    ``plots`` table here before the new Survey session is applied is incorrect under Survey RLS:
+    the current browser session may belong to another user (or be absent), so a valid working
+    plot is intentionally invisible.  The request stores the owner at materialization time; use
+    that already-authorized relationship to issue the handoff session instead of bypassing RLS.
+    """
+    owner_user_id = getattr(row, "survey_owner_user_id", None)
+    if owner_user_id is None:
+        raise HTTPException(404, "Survey working plot owner not found")
+    return int(owner_user_id)
+
+
 @router.post("/survey-requests/{request_id}/start")
 def start_survey_request(request_id:int,request:Request,db:Session=Depends(get_db)):
     row=db.get(EstateSurveyRequest,request_id)
@@ -3948,9 +3963,8 @@ def issue_survey_request_session(request_id: int, request: Request, response: Re
     if not row: raise HTTPException(404,"Survey request not found")
     require_estate_access_for_estate(db,request,row.estate_id,permission="survey.manage")
     if not row.survey_working_plot_id: raise HTTPException(409,"Survey has not been started for this request yet")
-    plot=db.get(Plot,row.survey_working_plot_id)
-    if not plot or not plot.owner_user_id: raise HTTPException(404,"Survey working plot not found")
-    session_payload = issue_survey_session(db, user_id=plot.owner_user_id)
+    owner_user_id = _survey_request_owner_user_id(row)
+    session_payload = issue_survey_session(db, user_id=owner_user_id)
     set_session_cookie(response, name=SURVEY_SESSION_COOKIE, token=session_payload["access_token"], max_age=30 * 24 * 60 * 60)
     if request_uses_browser_auth(request):
         session_payload["access_token"] = None
