@@ -23,6 +23,7 @@ from app.routers.plots import get_db
 from app.services.estates import estate_sms, marketing_render, social_broadcast, social_meta, social_planner, social_posts, social_templates, social_whatsapp, whatsapp_inbox
 from app.services.estates.audit import append_estate_audit_event
 from app.services.estates.authorization import require_estate_access, require_estate_access_for_estate
+from app.utils.row_security import set_estate_bypass, set_estate_tenant_context
 from app.services.estates.marketing_common import client_ip, normalize_phone_digits, public_page_url, throttled, web_url
 from app.services.estates.operations import record_notification_log
 from app.services.estates.subscriptions import has_auto_posting_access_for_organization, has_sms_access_for_organization, has_whatsapp_access_for_organization
@@ -231,9 +232,13 @@ def public_whatsapp_image(token: str, db: Session = Depends(get_db)):
     if parsed is None:
         raise HTTPException(404, "Image not found")
     estate_id, style = parsed
+    # estate_id comes from our own signed token - a trusted source, so the real org can be set
+    # directly once estate.organization_id is known below, same as meta_callback.
+    set_estate_bypass(db, "lookup")
     estate = db.get(Estate, estate_id)
     if estate is None or style not in marketing_render.AD_STYLES:
         raise HTTPException(404, "Image not found")
+    set_estate_tenant_context(db, [estate.organization_id])
     data = social_posts.render_image(db, estate, fmt="landscape", style=style, plot_id=None, source="whatsapp")
     db.commit()
     return _png(data, public=True)
@@ -256,7 +261,10 @@ def public_social_image(token: str, db: Session = Depends(get_db)):
     if parsed is None:
         raise HTTPException(404, "Image not found")
     post_id, fmt = parsed
+    set_estate_bypass(db, "lookup")
     post = db.get(EstateSocialPost, post_id)
+    if post is not None:
+        set_estate_tenant_context(db, [post.organization_id])
     estate = db.get(Estate, post.estate_id) if post else None
     if post is None or estate is None or fmt not in {"post", "status", "landscape", "poster"}:
         raise HTTPException(404, "Image not found")
@@ -281,7 +289,10 @@ def public_custom_social_image(token: str, db: Session = Depends(get_db)):
     post_id = social_posts.read_custom_image_token(token)
     if post_id is None:
         raise HTTPException(404, "Image not found")
+    set_estate_bypass(db, "lookup")
     post = db.get(EstateSocialPost, post_id)
+    if post is not None:
+        set_estate_tenant_context(db, [post.organization_id])
     if post is None or not post.custom_image_url:
         raise HTTPException(404, "Image not found")
     fetched = social_posts.fetch_custom_image(post)
@@ -718,6 +729,9 @@ def meta_callback(code: str | None = None, state: str | None = None, error: str 
     if not parts or len(parts) != 4:
         return HTMLResponse("<p>This connection link has expired. Close this window and try again from LandCheck.</p>", status_code=400)
     organization_id, estate_id, subject_type, subject_id = int(parts[0]), int(parts[1]), parts[2], parts[3]
+    # organization_id is decoded from our own signed token, not client-supplied - a trusted
+    # source, so the real org can be set directly rather than needing the 'lookup' bypass.
+    set_estate_tenant_context(db, [organization_id])
     if error or not code:
         return _back(estate_id, connect_error=error_description or "Facebook did not grant access")
     try:
@@ -825,6 +839,10 @@ def disconnect_account(account_id: int, request: Request, db: Session = Depends(
 
 
 def _forget_facebook_user(db: Session, facebook_user_id: str) -> int:
+    # Meta's compliance webhooks carry only a facebook_user_id - the organization isn't known
+    # until a matching connected account is found. The RLS 'lookup' bypass additionally allows
+    # DELETE on estate_social_accounts specifically, for exactly this narrow flow.
+    set_estate_bypass(db, "lookup")
     rows = db.query(EstateSocialAccount).filter(EstateSocialAccount.facebook_user_id == facebook_user_id).all()
     for row in rows:
         db.delete(row)
@@ -863,9 +881,13 @@ def meta_data_deletion(signed_request: str = Form(...), db: Session = Depends(ge
 # ── WhatsApp opt-ins and broadcasts ──────────────────────────────────────────────────────────
 @router.get("/marketing/public/{slug}/optin-info")
 def optin_info(slug: str, db: Session = Depends(get_db)):
+    # The organization isn't known until the estate is resolved by its public slug - the RLS
+    # 'lookup' bypass covers exactly this first SELECT.
+    set_estate_bypass(db, "lookup")
     estate = db.query(Estate).filter(Estate.public_slug == slug, Estate.public_enabled.is_(True), Estate.archived_at.is_(None)).one_or_none()
     if estate is None:
         raise HTTPException(404, "Estate not found")
+    set_estate_tenant_context(db, [estate.organization_id])
     return {"enabled": social_whatsapp.configured(), "consent_text": social_broadcast.consent_text(estate.name, _company_name(db, estate))}
 
 
@@ -873,9 +895,11 @@ def optin_info(slug: str, db: Session = Depends(get_db)):
 def create_optin(slug: str, payload: OptinCreate, request: Request, db: Session = Depends(get_db)):
     if throttled(client_ip(request), "optin", limit=8, window_seconds=600):
         raise HTTPException(429, "Too many requests. Please try again shortly.")
+    set_estate_bypass(db, "lookup")
     estate = db.query(Estate).filter(Estate.public_slug == slug, Estate.public_enabled.is_(True), Estate.archived_at.is_(None)).one_or_none()
     if estate is None:
         raise HTTPException(404, "Estate not found")
+    set_estate_tenant_context(db, [estate.organization_id])
     if not social_whatsapp.configured():
         raise HTTPException(503, "WhatsApp updates are not available yet")
     if not payload.consent:

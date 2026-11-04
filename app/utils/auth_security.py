@@ -681,6 +681,11 @@ def require_authenticated_session(
 def require_super_admin_request(db: Session, request: Request) -> AuthSessionContext:
     session = require_authenticated_session(db, request, auth_modes={"env_admin", "partner_user"})
     if session.is_super_admin:
+        # Platform admin requests legitimately query estate_* tables across every organization -
+        # grants the 'superadmin' branch of each table's RLS policy (app/utils/row_security.py).
+        from app.utils.row_security import set_estate_bypass
+
+        set_estate_bypass(db, "superadmin")
         return session
     raise HTTPException(status_code=403, detail="Super Admin access is required for this action.")
 

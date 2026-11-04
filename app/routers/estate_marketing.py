@@ -62,6 +62,7 @@ from app.services.estates.marketing_common import (
 from app.services.estates.operations import hash_portal_token, issue_agent_portal_token
 from app.services.estates.permissions import has_permission
 from app.utils.r2_objects import build_r2_settings, delete_object_best_effort
+from app.utils.row_security import set_estate_bypass, set_estate_tenant_context
 
 router = APIRouter(prefix="/estates", tags=["estate-marketing"])
 
@@ -383,9 +384,13 @@ def public_book_inspection(slug: str, payload: InspectionBookingCreate, request:
 
 
 def _booking_by_token(db: Session, token: str) -> EstateInspectionBooking:
+    # The organization isn't known until the booking is resolved by its token hash - the RLS
+    # 'lookup' bypass covers exactly this first SELECT.
+    set_estate_bypass(db, "lookup")
     booking = db.query(EstateInspectionBooking).filter(EstateInspectionBooking.manage_token_hash == hash_portal_token(token)).one_or_none()
     if booking is None:
         raise HTTPException(404, "This booking link is invalid")
+    set_estate_tenant_context(db, [booking.organization_id])
     return booking
 
 
@@ -1334,9 +1339,13 @@ def _mint_buyer_token(db: Session, session: EstateLiveInspectionSession) -> str:
 
 
 def _buyer_session_by_token(db: Session, token: str) -> EstateLiveInspectionSession:
+    # The organization isn't known until the token is resolved by its hash - the RLS 'lookup'
+    # bypass covers exactly this first SELECT.
+    set_estate_bypass(db, "lookup")
     row = db.query(EstateLiveInspectionBuyerToken).filter(EstateLiveInspectionBuyerToken.token_hash == hash_portal_token(token)).one_or_none()
     if row is None:
         raise HTTPException(404, "This live inspection link is invalid")
+    set_estate_tenant_context(db, [row.organization_id])
     session = db.get(EstateLiveInspectionSession, row.session_id)
     if session is None:
         raise HTTPException(404, "This live inspection link is invalid")

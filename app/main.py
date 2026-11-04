@@ -47,7 +47,12 @@ from app.utils.activity_logger import log_request_activity, should_skip_request_
 from app.utils.auth_security import resolve_request_session
 from app.utils.auth_security import require_authenticated_session
 from app.utils.rate_limit import allow_request
-from app.utils.row_security import clear_survey_user_context, set_survey_user_context, verify_survey_row_security
+from app.utils.row_security import (
+    clear_survey_user_context,
+    set_survey_user_context,
+    verify_estate_row_security,
+    verify_survey_row_security,
+)
 from app.services.estates.identity import resolve_session as resolve_estate_session
 from app.utils.survey_auth_security import require_survey_session
 from app.utils.survey_auth_security import resolve_survey_session
@@ -411,6 +416,7 @@ def _run_estate_subscription_billing_job():
     from sqlalchemy import text
 
     from app.services.estates import subscriptions as estate_subscriptions
+    from app.utils.row_security import clear_estate_tenant_context, set_estate_bypass
 
     session_db = SessionLocal()
     try:
@@ -424,6 +430,9 @@ def _run_estate_subscription_billing_job():
         if not got_lock:
             return
         try:
+            # See _run_locked_estate_marketing_job's comment - the discovery query here is itself
+            # cross-tenant, so the RLS bypass is set for the whole job, not per-row.
+            set_estate_bypass(session_db, "superadmin")
             estate_subscriptions.process_due_billing(session_db)
             # Send trial/renewal reminders in the same locked billing sweep so multiple
             # application workers cannot send the same subscription email twice.
@@ -433,6 +442,10 @@ def _run_estate_subscription_billing_job():
             session_db.rollback()
             raise
         finally:
+            try:
+                clear_estate_tenant_context(session_db)
+            except Exception:
+                session_db.rollback()
             session_db.execute(text("SELECT pg_advisory_unlock(:key)"), {"key": _ESTATE_SUBSCRIPTION_BILLING_LOCK_KEY})
     finally:
         session_db.close()
@@ -445,6 +458,7 @@ def _run_estate_reservation_expiry_job():
     from sqlalchemy import text
 
     from app.services.estates.operations import expire_due_reservations
+    from app.utils.row_security import clear_estate_tenant_context, set_estate_bypass
 
     session_db = SessionLocal()
     try:
@@ -452,12 +466,17 @@ def _run_estate_reservation_expiry_job():
         if not got_lock:
             return
         try:
+            set_estate_bypass(session_db, "superadmin")
             expire_due_reservations(session_db)
             session_db.commit()
         except Exception:
             session_db.rollback()
             raise
         finally:
+            try:
+                clear_estate_tenant_context(session_db)
+            except Exception:
+                session_db.rollback()
             session_db.execute(text("SELECT pg_advisory_unlock(:key)"), {"key": _ESTATE_RESERVATION_EXPIRY_LOCK_KEY})
     finally:
         session_db.close()
@@ -470,6 +489,7 @@ def _run_estate_payment_reminder_job():
     from sqlalchemy import text
 
     from app.services.estates.operations import send_due_payment_reminders
+    from app.utils.row_security import clear_estate_tenant_context, set_estate_bypass
 
     session_db = SessionLocal()
     try:
@@ -477,12 +497,17 @@ def _run_estate_payment_reminder_job():
         if not got_lock:
             return
         try:
+            set_estate_bypass(session_db, "superadmin")
             send_due_payment_reminders(session_db)
             session_db.commit()
         except Exception:
             session_db.rollback()
             raise
         finally:
+            try:
+                clear_estate_tenant_context(session_db)
+            except Exception:
+                session_db.rollback()
             session_db.execute(text("SELECT pg_advisory_unlock(:key)"), {"key": _ESTATE_PAYMENT_REMINDER_LOCK_KEY})
     finally:
         session_db.close()
@@ -496,18 +521,29 @@ def _run_locked_estate_marketing_job(lock_key: int, work) -> None:
     """Runs one marketing sweep under a Postgres advisory lock so only one worker process sends it."""
     from sqlalchemy import text
 
+    from app.utils.row_security import clear_estate_tenant_context, set_estate_bypass
+
     session_db = SessionLocal()
     try:
         got_lock = session_db.execute(text("SELECT pg_try_advisory_lock(:key)"), {"key": lock_key}).scalar()
         if not got_lock:
             return
         try:
+            # Trusted internal process with no untrusted input, same trust level as the Estates
+            # admin gate - grants the RLS 'superadmin' branch for this job's whole duration rather
+            # than per-row, since the discovery query that finds which rows to act on is itself
+            # cross-tenant and runs before any row (and its organization_id) is known.
+            set_estate_bypass(session_db, "superadmin")
             work(session_db)
             session_db.commit()
         except Exception:
             session_db.rollback()
             raise
         finally:
+            try:
+                clear_estate_tenant_context(session_db)
+            except Exception:
+                session_db.rollback()
             session_db.execute(text("SELECT pg_advisory_unlock(:key)"), {"key": lock_key})
     finally:
         session_db.close()
@@ -552,6 +588,7 @@ def startup_event():
     startup_db = SessionLocal()
     try:
         verify_survey_row_security(startup_db)
+        verify_estate_row_security(startup_db)
     finally:
         startup_db.close()
     # Persistent on-disk cache for basemap tiles (orthophoto/topo rendering) so a plot rendered

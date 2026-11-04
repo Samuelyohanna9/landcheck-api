@@ -239,9 +239,16 @@ def complete_allocation_payment(db: Session, verify_data: dict, tx_ref: str | No
     staff already apply by hand when confirming a manual payment - record_payment() then
     confirm_payment(), followed by the same auto-allocate-on-fully-paid + commission logic the
     staff confirm route runs."""
+    # Payment gateway callbacks (webhook, return redirect) know only a tx_ref/transaction_id -
+    # the organization isn't known until the charge attempt is matched, so the lookup itself
+    # needs the RLS 'lookup' bypass. See app/utils/row_security.py.
+    from app.utils.row_security import set_estate_bypass, set_estate_tenant_context
+
+    set_estate_bypass(db, "lookup")
     attempt = find_charge_attempt(db, verify_data, tx_ref)
     if not attempt:
         return {"ok": False, "message": "Could not match this payment to an allocation."}
+    set_estate_tenant_context(db, [attempt.organization_id])
     if attempt.status == "success":
         return {"ok": True, "already_completed": True}
 

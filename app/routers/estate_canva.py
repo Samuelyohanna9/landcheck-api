@@ -24,6 +24,7 @@ from app.services.estates.canva_editability import AUTOFILL_SCOPES, PDF_IMPORT_S
 from app.services.estates.documents import read_private_estate_file
 from app.services.estates.audit import append_estate_audit_event
 from app.utils.r2_objects import build_public_url, build_r2_settings, create_r2_client, delete_object_best_effort, normalize_object_key, upload_bytes
+from app.utils.row_security import set_estate_bypass, set_estate_tenant_context
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/estates", tags=["estate-canva"])
@@ -189,9 +190,13 @@ def canva_connect_start(estate_id: int, request: Request, db: Session = Depends(
 def canva_oauth_callback(code: str | None = None, state: str | None = None, error: str | None = None, db: Session = Depends(get_db)):
     if error or not code or not state:
         return _frontend_redirect("/estates", canva_error="Canva connection was cancelled.")
+    # The organization isn't known until the OAuth state row is resolved by its hash - the RLS
+    # 'lookup' bypass covers exactly this first SELECT.
+    set_estate_bypass(db, "lookup")
     row = db.query(EstateCanvaOAuthState).filter(EstateCanvaOAuthState.state_hash == _hash(state)).with_for_update().one_or_none()
     if row is None or row.used_at is not None or row.expires_at <= _now():
         return _frontend_redirect("/estates", canva_error="The Canva connection request expired. Please try again.")
+    set_estate_tenant_context(db, [row.organization_id])
     row.used_at = _now()
     db.commit()
     try:
@@ -459,9 +464,13 @@ def canva_return(correlation_jwt: str | None = Query(default=None), db: Session 
     try:
         claims = canva_connect.verify_correlation_jwt(correlation_jwt)
         key_hash = _hash(str(claims.get("correlation_state") or ""))
+        # The organization isn't known until the design row is resolved by its return-key hash -
+        # the RLS 'lookup' bypass covers exactly this first SELECT.
+        set_estate_bypass(db, "lookup")
         row = db.query(EstateCanvaDesign).filter(EstateCanvaDesign.return_key_hash == key_hash).one_or_none()
         if row is None or row.canva_design_id != str(claims.get("design_id") or "") or row.canva_user_id != str(claims.get("sub") or "") or row.canva_team_id != str(claims.get("team_id") or ""):
             raise canva_connect.CanvaApiError("The Canva design return does not match this LandCheck workspace.", 400, "invalid_return")
+        set_estate_tenant_context(db, [row.organization_id])
         row.last_return_at = _now()
         db.commit()
         return _frontend_redirect(f"/estates/{row.estate_id}/marketing?tab=materials", canva_return="1", canva_design=str(row.id))

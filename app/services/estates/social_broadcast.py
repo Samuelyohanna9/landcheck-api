@@ -55,7 +55,15 @@ def record_optin(db: Session, *, estate: Estate, company_name: str, full_name: s
 
 def revoke_phone_everywhere(db: Session, phone_digits: str) -> int:
     """A STOP reply ends messages from every estate/company that had this number."""
+    from app.utils.row_security import set_estate_bypass, set_estate_tenant_context
+
+    # Deliberately cross-tenant: a STOP reply must reach every organization's opt-in for this
+    # phone number, not just one, so the lookup needs the RLS 'lookup' bypass and the subsequent
+    # updates need the real org list set to every matched row's organization, not a single org.
+    set_estate_bypass(db, "lookup")
     rows = db.query(EstateMarketingOptin).filter(EstateMarketingOptin.phone_digits == phone_digits, EstateMarketingOptin.status == "active").all()
+    if rows:
+        set_estate_tenant_context(db, [row.organization_id for row in rows])
     now = datetime.now(timezone.utc)
     for row in rows:
         row.status = "revoked"

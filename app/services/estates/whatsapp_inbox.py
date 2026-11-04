@@ -80,10 +80,16 @@ def _message_type_and_media(message: dict[str, Any]) -> tuple[str, str | None, s
 def record_inbound(db: Session, message: dict[str, Any]) -> bool:
     """Stores one inbound WhatsApp message if its sender resolves to a known estate. Returns True if
     it was stored. Idempotent on wa_message_id, since Meta can redeliver the same webhook event."""
+    from app.utils.row_security import set_estate_bypass, set_estate_tenant_context
+
     from_raw = str(message.get("from") or "")
     digits = normalize_phone_digits(from_raw)
     if not digits:
         return False
+    # An inbound WhatsApp message carries only a phone number - the organization isn't known
+    # until resolve_estate_for_phone (or this dedup check) finds a match. The RLS 'lookup' bypass
+    # covers these identity-less lookups, same as the inbound-webhook pattern elsewhere.
+    set_estate_bypass(db, "lookup")
     wa_message_id = str(message.get("id") or "") or None
     if wa_message_id and db.query(EstateWhatsappMessage.id).filter(EstateWhatsappMessage.wa_message_id == wa_message_id).first():
         return False
@@ -91,6 +97,7 @@ def record_inbound(db: Session, message: dict[str, Any]) -> bool:
     if resolved is None:
         return False
     organization_id, estate_id, customer_id = resolved
+    set_estate_tenant_context(db, [organization_id])
     message_type, body, media_id, mime_type = _message_type_and_media(message)
     db.add(EstateWhatsappMessage(
         organization_id=organization_id, estate_id=estate_id, customer_id=customer_id, phone_digits=digits,
@@ -108,13 +115,18 @@ def record_status_update(db: Session, status_event: dict[str, Any]) -> bool:
     """Meta's delivery-status callback for an outbound message (sent/delivered/read/failed) - drives
     the WhatsApp-style tick in the inbox. Never moves a status backwards (a late "delivered" event
     arriving after "read" is ignored), and does nothing for a message id we don't recognise."""
+    from app.utils.row_security import set_estate_bypass, set_estate_tenant_context
+
     wa_message_id = str(status_event.get("id") or "")
     new_status = str(status_event.get("status") or "")
     if not wa_message_id or new_status not in STATUS_RANK:
         return False
+    # Same identity-less lookup pattern as record_inbound above - org unknown until matched.
+    set_estate_bypass(db, "lookup")
     row = db.query(EstateWhatsappMessage).filter(EstateWhatsappMessage.wa_message_id == wa_message_id, EstateWhatsappMessage.direction == "out").one_or_none()
     if row is None:
         return False
+    set_estate_tenant_context(db, [row.organization_id])
     if STATUS_RANK.get(row.status, -1) >= STATUS_RANK[new_status]:
         return False
     row.status = new_status

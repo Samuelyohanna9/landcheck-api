@@ -39,7 +39,9 @@ def test_checkout_scrubs_context_before_connection_reuse():
 
     database._on_survey_context_checkout(connection, None, None)
 
-    assert connection.statements == ["RESET app.survey_user_id"]
+    # Every session-scoped tenant GUC (Survey's and Estates') must be reset on checkout - see
+    # database._SESSION_SCOPED_TENANT_GUCS, the single list this must stay in sync with.
+    assert connection.statements == [f"RESET {guc}" for guc in database._SESSION_SCOPED_TENANT_GUCS]
     assert connection.rollback_count == 1
     assert connection.commit_count == 1
     assert connection.cursor_closed is True
@@ -50,7 +52,7 @@ def test_pool_reset_scrubs_context_unless_connection_is_being_terminated():
 
     database._on_survey_context_reset(connection, None, SimpleNamespace(terminate_only=False))
 
-    assert connection.statements == ["RESET app.survey_user_id"]
+    assert connection.statements == [f"RESET {guc}" for guc in database._SESSION_SCOPED_TENANT_GUCS]
 
     terminated = _FakeDbapiConnection()
     database._on_survey_context_reset(terminated, None, SimpleNamespace(terminate_only=True))
@@ -110,5 +112,13 @@ def test_all_context_writers_have_explicit_or_pool_cleanup_paths():
 
     assert "set_config('app.survey_user_id'" in row_security_source
     assert "clear_survey_user_context" in row_security_source
-    assert "RESET app.survey_user_id" in database_source
+    assert "set_config('app.estate_organization_ids'" in row_security_source
+    assert "set_config('app.estate_bypass'" in row_security_source
+    assert "clear_estate_tenant_context" in row_security_source
     assert "attach_survey_context_cleanup(engine)" in database_source
+    # Every GUC a context writer sets must be in the single reset list the pool-cleanup loop
+    # iterates - this is the guard against the "6th GUC added, reset list not updated" leak class
+    # the code comments warn about.
+    for guc in ("app.survey_user_id", "app.estate_organization_ids", "app.estate_bypass"):
+        assert guc in database._SESSION_SCOPED_TENANT_GUCS
+        assert f'"{guc}"' in row_security_source or f"'{guc}'" in row_security_source

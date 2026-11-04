@@ -217,6 +217,11 @@ def _complete_verification(db: Session, verify_data: dict) -> dict:
     provider = str(meta.get("provider") or "flutterwave").strip().lower()
     if provider not in {"flutterwave", "paystack"}:
         provider = "flutterwave"
+    # organization_id comes from verify_data (re-fetched from the gateway's own API, not the
+    # unverified webhook payload) - a trusted source, so the real org can be set directly here.
+    from app.utils.row_security import set_estate_tenant_context
+
+    set_estate_tenant_context(db, [organization_id])
     organization = db.get(EstateOrganization, organization_id)
     if account_id:
         account = db.query(EstateAccount).filter(EstateAccount.id == account_id, EstateAccount.organization_id == organization_id).with_for_update().one_or_none()
@@ -362,9 +367,15 @@ def _find_charge(db: Session, verify_data: dict, tx_ref: str | None = None) -> E
 
 
 def _complete_subscription_payment(db: Session, verify_data: dict, tx_ref: str | None = None) -> dict:
+    # Payment gateway callbacks know only a tx_ref/transaction_id - the organization isn't known
+    # until the charge is matched, so the lookup itself needs the RLS 'lookup' bypass.
+    from app.utils.row_security import set_estate_bypass, set_estate_tenant_context
+
+    set_estate_bypass(db, "lookup")
     charge = _find_charge(db, verify_data, tx_ref)
     if not charge or charge.charge_type not in {"retry", "trial_conversion", "renewal", "plan_change"}:
         return {"ok": False, "message": "Could not match this payment to a subscription."}
+    set_estate_tenant_context(db, [charge.organization_id])
     if charge.status == "success":
         return {"ok": True, "already_completed": True}
 
@@ -453,8 +464,12 @@ def checkout_return(transaction_id: str | None = None, tx_ref: str | None = None
     outcome = "failed"
     if str(status or "").lower() == "cancelled":
         if is_payment and tx_ref:
+            from app.utils.row_security import set_estate_bypass, set_estate_tenant_context
+
+            set_estate_bypass(db, "lookup")
             charge = db.query(EstateSubscriptionCharge).filter(EstateSubscriptionCharge.tx_ref == tx_ref, EstateSubscriptionCharge.status == "pending").with_for_update().first()
             if charge:
+                set_estate_tenant_context(db, [charge.organization_id])
                 charge.status = "failed"
                 charge.failure_reason = "Checkout cancelled by customer."
                 db.commit()
@@ -498,8 +513,11 @@ async def billing_webhook(request: Request, db: Session = Depends(get_db)):
     if not transaction_id and not tx_ref:
         return {"ok": True, "ignored": True}
     try:
+        from app.utils.row_security import set_estate_bypass
+
         verify_data = flw.verify_transaction(transaction_id) if transaction_id else flw.verify_transaction_by_reference(tx_ref)
         purpose = str((verify_data.get("meta") or {}).get("purpose") or "")
+        set_estate_bypass(db, "lookup")
         is_payment = purpose == "estate_subscription_payment" or bool(_find_charge(db, verify_data, tx_ref))
         result = _complete_subscription_payment(db, verify_data, tx_ref) if is_payment else _complete_verification(db, verify_data)
     except Exception:
@@ -524,8 +542,11 @@ async def billing_webhook_paystack(request: Request, db: Session = Depends(get_d
     try:
         # Never trust the webhook body's own claimed status - re-verify server-side, same as
         # the Flutterwave webhook above.
+        from app.utils.row_security import set_estate_bypass
+
         verify_data = pst.verify_transaction_by_reference(tx_ref)
         purpose = str((verify_data.get("meta") or {}).get("purpose") or "")
+        set_estate_bypass(db, "lookup")
         is_payment = purpose == "estate_subscription_payment" or bool(_find_charge(db, verify_data, tx_ref))
         result = _complete_subscription_payment(db, verify_data, tx_ref) if is_payment else _complete_verification(db, verify_data)
     except Exception:

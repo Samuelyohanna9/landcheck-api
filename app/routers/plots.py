@@ -40,10 +40,16 @@ import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 
 from app.db import SessionLocal
-from app.utils.row_security import clear_survey_user_context, set_survey_user_context
+from app.utils.row_security import (
+    clear_estate_tenant_context,
+    clear_survey_user_context,
+    set_estate_tenant_context,
+    set_survey_user_context,
+)
 from app.utils.schema_bootstrap import require_table, runtime_schema_bootstrap_enabled
 from app.models.plot import Plot
 from app.models.estate_foundation import Estate, EstateSurveyRequest
+from app.services.estates.authorization import list_estate_access, resolve_estate_principal
 from app.services.survey.plots import create_survey_plot
 from app.services.survey.dgps import alpha_station, render_dgps_staking_csv
 from app.models.plot_buffer import PlotBuffer
@@ -290,19 +296,43 @@ def ensure_plots_schema_once(db: Session):
         _PLOTS_SCHEMA_READY = True
 
 
+def _resolve_estate_organization_ids(db: Session, request: Request) -> list[int]:
+    """Every organization_id the current identity belongs to, for the RLS defense-in-depth
+    backstop (app.estate_organization_ids) set below - never the sole access check, that's still
+    require_estate_access*() in app/services/estates/authorization.py. Must never raise: an
+    unauthenticated or non-Estates request (the public storefront, a webhook, a login attempt)
+    is a completely normal case here, not an error - it just means an empty id list, so RLS denies
+    by default until a route explicitly resolves the real organization_id (or sets the narrow
+    'lookup'/'superadmin' bypass - see app/utils/row_security.py)."""
+    try:
+        principal = resolve_estate_principal(db, request)
+        return [item.organization_id for item in list_estate_access(db, principal)]
+    except Exception:
+        return []
+
+
 def get_db(request: Request):
     db = SessionLocal()
-    survey_path = str(request.url.path or "").lower().startswith(("/plots", "/hazards", "/survey-georeference"))
+    path = str(request.url.path or "").lower()
+    survey_path = path.startswith(("/plots", "/hazards", "/survey-georeference"))
+    estate_path = path.startswith(("/estates", "/estate-admin"))
     try:
         ensure_plots_schema_once(db)
         if survey_path:
             survey_session = resolve_survey_session(db, request)
             set_survey_user_context(db, survey_session.user_id if survey_session else None)
+        if estate_path:
+            set_estate_tenant_context(db, _resolve_estate_organization_ids(db, request))
         yield db
     finally:
         if survey_path:
             try:
                 clear_survey_user_context(db)
+            except Exception:
+                db.rollback()
+        if estate_path:
+            try:
+                clear_estate_tenant_context(db)
             except Exception:
                 db.rollback()
         db.close()

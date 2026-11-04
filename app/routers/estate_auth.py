@@ -31,6 +31,7 @@ from app.services.estates.identity import (
     verify_password,
 )
 from app.utils.http_security import ESTATE_SESSION_COOKIE, clear_session_cookie, request_uses_browser_auth, set_session_cookie
+from app.utils.row_security import set_estate_bypass, set_estate_tenant_context
 
 
 class ChangePasswordRequest(BaseModel):
@@ -103,6 +104,10 @@ def register(payload: EstateRegister, request: Request, db: Session = Depends(ge
         raise HTTPException(status_code=422, detail="Enter a valid email address")
     if not payload.accept_dpa:
         raise HTTPException(status_code=422, detail="Accept the Data Processing Agreement to create an account")
+    # Nothing is known yet - no account, no organization. The RLS 'lookup' bypass covers these
+    # dedup SELECTs and, for estate_organizations specifically, the brand-new row's own INSERT
+    # (its id can't already be in an allow-list that requires knowing it first).
+    set_estate_bypass(db, "lookup")
     if db.query(EstateAccount).filter(EstateAccount.email_normalized == email).first():
         raise HTTPException(status_code=409, detail="An account already exists for this email")
     base_slug = slugify(payload.organization_slug or payload.organization_name)
@@ -122,6 +127,10 @@ def register(payload: EstateRegister, request: Request, db: Session = Depends(ge
     )
     db.add(organization)
     db.flush()
+    # Now that the new organization has an id, switch off the narrow 'lookup' bypass and use the
+    # real tenant context for everything else this request creates.
+    set_estate_tenant_context(db, [organization.id])
+    set_estate_bypass(db, None)
     account = EstateAccount(
         organization_id=organization.id,
         email=payload.email.strip(),
@@ -187,11 +196,14 @@ def login(payload: EstateLogin, request: Request, response: Response, db: Sessio
     email = normalize_email(payload.email)
     if not EMAIL_PATTERN.fullmatch(email):
         raise HTTPException(status_code=422, detail="Enter a valid email address")
+    # No session exists yet - the organization isn't known until the account is found by email.
+    set_estate_bypass(db, "lookup")
     account = db.query(EstateAccount).filter(EstateAccount.email_normalized == email).one_or_none()
     if not account or account.status != "active" or not verify_password(payload.password, account.password_hash):
         raise HTTPException(status_code=401, detail="Invalid email or password")
     if account.email_verified_at is None:
         raise HTTPException(status_code=403, detail="Verify your email address before signing in")
+    set_estate_tenant_context(db, [account.organization_id])
     organization = db.get(EstateOrganization, account.organization_id)
     if not organization or organization.status != "active":
         raise HTTPException(status_code=403, detail="This account is not active")
@@ -235,9 +247,13 @@ def verify_email(token: str, workspace: str = "estate", db: Session = Depends(ge
     expires_at = row.expires_at if row and row.expires_at.tzinfo else (row.expires_at.replace(tzinfo=timezone.utc) if row else None)
     if not row or row.used_at is not None or (expires_at and expires_at <= now):
         raise HTTPException(status_code=400, detail="This verification link is invalid or has expired")
+    # estate_email_verification_tokens carries no RLS (it's account-scoped, not org-scoped - see
+    # app/utils/row_security.py), but estate_accounts does: org isn't known until this lookup.
+    set_estate_bypass(db, "lookup")
     account = db.get(EstateAccount, row.account_id)
     if not account or account.status != "active":
         raise HTTPException(status_code=400, detail="This verification link is invalid or has expired")
+    set_estate_tenant_context(db, [account.organization_id])
     account.email_verified_at = now
     row.used_at = now
     db.commit()
@@ -305,9 +321,12 @@ def forgot_password(payload: ForgotPasswordRequest, db: Session = Depends(get_db
     endpoint can't be used to discover which company emails have an Estate account."""
     generic_response = {"status": "ok", "message": "If an account exists for that email, a reset link has been sent."}
     email = normalize_email(payload.email)
+    # No session exists yet - org isn't known until the account is found by email.
+    set_estate_bypass(db, "lookup")
     account = db.query(EstateAccount).filter(EstateAccount.email_normalized == email, EstateAccount.status == "active").one_or_none()
     if not account:
         return generic_response
+    set_estate_tenant_context(db, [account.organization_id])
     raw_token = secrets.token_urlsafe(32)
     db.add(
         EstatePasswordResetToken(
@@ -331,9 +350,13 @@ def reset_password(payload: ResetPasswordRequest, response: Response, db: Sessio
     expires_at = row.expires_at if row and row.expires_at.tzinfo else (row.expires_at.replace(tzinfo=timezone.utc) if row else None)
     if not row or row.used_at is not None or (expires_at and expires_at <= now):
         raise HTTPException(status_code=400, detail="This reset link is invalid or has expired. Request a new one.")
+    # estate_password_reset_tokens carries no RLS, but estate_accounts and estate_auth_sessions
+    # (updated below) do - org isn't known until this lookup.
+    set_estate_bypass(db, "lookup")
     account = db.get(EstateAccount, row.account_id)
     if not account:
         raise HTTPException(status_code=400, detail="This reset link is invalid or has expired. Request a new one.")
+    set_estate_tenant_context(db, [account.organization_id])
     try:
         account.password_hash = hash_password(payload.new_password)
     except ValueError as exc:

@@ -130,20 +130,32 @@ def attach_pool_instrumentation(target_engine) -> None:
     target_engine._landcheck_pool_instrumented = True
 
 
-def _reset_survey_context_on_dbapi_connection(dbapi_connection) -> None:
-    """Remove the session-level Survey tenant context from a PostgreSQL connection.
+# Every session-scoped (set_config(..., false)) GUC that any tenant-context helper sets MUST be
+# listed here. This is the single place connection-pool scrubbing resets them all - a GUC added
+# anywhere else without being added to this tuple will silently leak its value across pooled
+# connections into a different request/tenant, which is the worst-case failure mode this whole
+# mechanism exists to prevent.
+_SESSION_SCOPED_TENANT_GUCS: tuple[str, ...] = (
+    "app.survey_user_id", "app.estate_organization_ids", "app.estate_bypass",
+)
 
-    Survey currently needs a session-level setting because handlers may commit more than once
-    during one request. The setting is therefore scrubbed both before checkout and after pool
-    reset so it cannot survive connection reuse. A rollback first discards any aborted or pending
-    transaction; the reset itself is then committed as connection housekeeping only.
+
+def _reset_survey_context_on_dbapi_connection(dbapi_connection) -> None:
+    """Remove every session-level tenant-context GUC (Survey's and Estates') from a PostgreSQL
+    connection.
+
+    These settings are session-scoped because handlers may commit more than once during one
+    request. They're therefore scrubbed both before checkout and after pool reset so none can
+    survive connection reuse. A rollback first discards any aborted or pending transaction; the
+    reset itself is then committed as connection housekeeping only.
     """
 
     try:
         dbapi_connection.rollback()
         cursor = dbapi_connection.cursor()
         try:
-            cursor.execute("RESET app.survey_user_id")
+            for guc in _SESSION_SCOPED_TENANT_GUCS:
+                cursor.execute(f"RESET {guc}")
         finally:
             cursor.close()
         dbapi_connection.commit()
@@ -166,27 +178,41 @@ def _on_survey_context_reset(dbapi_connection, _connection_record, reset_state) 
 
 
 def _on_survey_session_after_begin(session, _transaction, connection) -> None:
-    """Restore the requested Survey context whenever a Session starts a new transaction.
+    """Restore the requested tenant context (Survey's and/or Estates') whenever a Session starts
+    a new transaction.
 
     SQLAlchemy releases a connection on ``Session.commit()``.  Pool scrubbing must therefore be
     paired with Session-level intent: a later transaction in the same request/job must receive the
     same context before its first query, while a different Session still starts with no context.
     """
 
-    if connection.dialect.name != "postgresql" or "survey_user_id" not in session.info:
+    if connection.dialect.name != "postgresql":
         return
-    user_id = session.info.get("survey_user_id")
-    connection.execute(
-        text("SELECT set_config('app.survey_user_id', :user_id, false)"),
-        {"user_id": str(int(user_id)) if user_id is not None else ""},
-    )
+    if "survey_user_id" in session.info:
+        user_id = session.info.get("survey_user_id")
+        connection.execute(
+            text("SELECT set_config('app.survey_user_id', :user_id, false)"),
+            {"user_id": str(int(user_id)) if user_id is not None else ""},
+        )
+    if "estate_organization_ids" in session.info:
+        ids = session.info.get("estate_organization_ids") or []
+        connection.execute(
+            text("SELECT set_config('app.estate_organization_ids', :ids, false)"),
+            {"ids": ",".join(str(int(value)) for value in ids)},
+        )
+    if "estate_bypass" in session.info:
+        connection.execute(
+            text("SELECT set_config('app.estate_bypass', :mode, false)"),
+            {"mode": session.info.get("estate_bypass") or ""},
+        )
 
 
 event.listen(Session, "after_begin", _on_survey_session_after_begin)
 
 
 def attach_survey_context_cleanup(target_engine) -> None:
-    """Install connection-pool scrubbing for the session-scoped Survey RLS setting."""
+    """Install connection-pool scrubbing for every session-scoped tenant-context GUC
+    (_SESSION_SCOPED_TENANT_GUCS) - Survey's and Estates'."""
 
     if target_engine.dialect.name != "postgresql":
         return

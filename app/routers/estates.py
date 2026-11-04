@@ -74,6 +74,7 @@ from app.models.estate_foundation import EstateMemberEstateScope
 from app.utils import estate_flutterwave as flw
 from app.utils import estate_paystack as pst
 from app.utils.auth_security import require_signed_flutterwave_webhooks
+from app.utils.row_security import set_estate_bypass, set_estate_tenant_context
 from app.db import SessionLocal
 from app.utils.hazard_jobs import get_hazard_job, insert_hazard_job, make_progress_reporter, serialize_hazard_job, set_hazard_job_status, find_active_hazard_job, touch_hazard_job
 from app.utils.upload_security import read_limited_upload, upload_extension
@@ -206,9 +207,13 @@ def _enabled(db: Session, org_id: int) -> None:
 
 
 def _public_estate(db: Session, slug: str) -> Estate:
+    # The public storefront resolves an estate by its slug before any organization is known -
+    # the RLS 'lookup' bypass (app/utils/row_security.py) covers exactly this first SELECT.
+    set_estate_bypass(db, "lookup")
     estate = db.query(Estate).filter(Estate.public_slug == str(slug or "").strip().lower()).one_or_none()
     if not estate or estate.archived_at is not None or not estate.public_enabled or estate.status != "active":
         raise HTTPException(status_code=404, detail="This Estate is not available.")
+    set_estate_tenant_context(db, [estate.organization_id])
     if not get_estate_entitlement(db, estate.organization_id, "ESTATE_PUBLIC_MAP").is_enabled:
         raise HTTPException(status_code=404, detail="This Estate is not available.")
     return estate
@@ -5869,10 +5874,15 @@ async def termii_delivery_webhook(request: Request, token: str | None = None, db
     delivery_status = str(payload.get("status") or "").strip()
     if not message_id or not delivery_status:
         return {"ok": True, "ignored": True}
+    # Termii's callback carries only its own message_id - the organization isn't known until a
+    # matching log row is found, so this lookup needs the RLS 'lookup' bypass.
+    set_estate_bypass(db, "lookup")
     rows = db.query(EstateNotificationLog).filter(
         EstateNotificationLog.channel == "sms",
         EstateNotificationLog.details["message_id"].astext == message_id,
     ).all()
+    if rows:
+        set_estate_tenant_context(db, [row.organization_id for row in rows])
     for row in rows:
         row.details = {**(row.details or {}), "delivery_status": delivery_status, "delivery_checked_at": datetime.now(timezone.utc).isoformat()}
     db.commit()
@@ -5915,25 +5925,27 @@ def create_customer_portal_token(customer_id: int, payload: PortalTokenCreate, r
     return {"token": raw_token, "expires_at": row.expires_at, "url": portal_url, "email_sent": email_sent}
 
 
-@router.get("/buyer/{token}")
-def buyer_portal(token: str, db: Session = Depends(get_db)):
+def _resolve_buyer_portal_row(token: str, db: Session) -> EstateCustomerPortalToken:
+    # The buyer portal resolves identity by token hash before any organization is known - the RLS
+    # 'lookup' bypass covers exactly this first SELECT. Shared by every /buyer/{token}/... route
+    # below instead of each re-implementing the same lookup.
+    set_estate_bypass(db, "lookup")
     row = db.query(EstateCustomerPortalToken).filter(EstateCustomerPortalToken.token_hash == hash_portal_token(token)).one_or_none()
     now = datetime.now(timezone.utc)
     expires_at = row.expires_at if row and row.expires_at.tzinfo else (row.expires_at.replace(tzinfo=timezone.utc) if row else None)
     if not row or row.revoked_at is not None or not expires_at or expires_at <= now:
         raise HTTPException(404, "This buyer portal link is invalid or expired")
+    set_estate_tenant_context(db, [row.organization_id])
+    return row
+
+
+@router.get("/buyer/{token}")
+def buyer_portal(token: str, db: Session = Depends(get_db)):
+    row = _resolve_buyer_portal_row(token, db)
+    expires_at = row.expires_at if row.expires_at.tzinfo else row.expires_at.replace(tzinfo=timezone.utc)
     payload = buyer_portal_payload(db, row)
     db.commit()
     return {**payload, "expires_at": expires_at}
-
-
-def _resolve_buyer_portal_row(token: str, db: Session) -> EstateCustomerPortalToken:
-    row = db.query(EstateCustomerPortalToken).filter(EstateCustomerPortalToken.token_hash == hash_portal_token(token)).one_or_none()
-    now = datetime.now(timezone.utc)
-    expires_at = row.expires_at if row and row.expires_at.tzinfo else (row.expires_at.replace(tzinfo=timezone.utc) if row else None)
-    if not row or row.revoked_at is not None or not expires_at or expires_at <= now:
-        raise HTTPException(404, "This buyer portal link is invalid or expired")
-    return row
 
 
 @router.post("/buyer/{token}/allocations/{allocation_id}/pay")
@@ -5981,7 +5993,11 @@ def buyer_payment_return(transaction_id: str | None = None, tx_ref: str | None =
     tx_ref = tx_ref or reference or trxref
     web_url = str(os.getenv("LANDCHECK_WEB_URL") or "https://landcheck.online").rstrip("/")
     portal_token = None
+    # Same tx_ref-only lookup as complete_allocation_payment's - org isn't known until matched.
+    set_estate_bypass(db, "lookup")
     attempt = db.query(EstateAllocationChargeAttempt).filter(EstateAllocationChargeAttempt.tx_ref == tx_ref).one_or_none() if tx_ref else None
+    if attempt:
+        set_estate_tenant_context(db, [attempt.organization_id])
     if attempt and isinstance(attempt.provider_payload, dict):
         portal_token = attempt.provider_payload.get("portal_token")
     back_to = f"{web_url}/estates/buyer/{portal_token}" if portal_token else f"{web_url}/estates/buyer"
@@ -6055,11 +6071,7 @@ async def buyer_payment_webhook_paystack(request: Request, db: Session = Depends
 
 @router.get("/buyer/{token}/packet/{allocation_id}.pdf")
 def buyer_packet_pdf(token: str, allocation_id: int, db: Session = Depends(get_db)):
-    row = db.query(EstateCustomerPortalToken).filter(EstateCustomerPortalToken.token_hash == hash_portal_token(token)).one_or_none()
-    now = datetime.now(timezone.utc)
-    expires_at = row.expires_at if row and row.expires_at.tzinfo else (row.expires_at.replace(tzinfo=timezone.utc) if row else None)
-    if not row or row.revoked_at is not None or not expires_at or expires_at <= now:
-        raise HTTPException(404, "This buyer portal link is invalid or expired")
+    row = _resolve_buyer_portal_row(token, db)
     allocation = db.get(EstateAllocation, allocation_id)
     if not allocation or allocation.customer_id != row.customer_id or allocation.organization_id != row.organization_id:
         raise HTTPException(404, "Allocation not found")
@@ -6127,11 +6139,7 @@ def buyer_packet_pdf(token: str, allocation_id: int, db: Session = Depends(get_d
 
 @router.get("/buyer/{token}/documents/{document_id}/download")
 def buyer_document_download(token: str, document_id: int, db: Session = Depends(get_db)):
-    row = db.query(EstateCustomerPortalToken).filter(EstateCustomerPortalToken.token_hash == hash_portal_token(token)).one_or_none()
-    now = datetime.now(timezone.utc)
-    expires_at = row.expires_at if row and row.expires_at.tzinfo else (row.expires_at.replace(tzinfo=timezone.utc) if row else None)
-    if not row or row.revoked_at is not None or not expires_at or expires_at <= now:
-        raise HTTPException(404, "This buyer portal link is invalid or expired")
+    row = _resolve_buyer_portal_row(token, db)
     document = db.get(EstateDocument, document_id)
     if not document or document.organization_id != row.organization_id or document.document_type not in PUBLIC_DOCUMENT_TYPES:
         raise HTTPException(404, "Document not found")
@@ -6149,6 +6157,9 @@ def buyer_document_download(token: str, document_id: int, db: Session = Depends(
 
 
 def _agent_portal_context(db: Session, token: str):
+    # The agent portal resolves identity by token hash before any organization is known - the
+    # RLS 'lookup' bypass covers exactly this first SELECT.
+    set_estate_bypass(db, "lookup")
     row = db.query(EstateAgentPortalToken).filter(EstateAgentPortalToken.token_hash == hash_portal_token(token)).one_or_none()
     now = datetime.now(timezone.utc)
     expires_at = None
@@ -6156,6 +6167,7 @@ def _agent_portal_context(db: Session, token: str):
         expires_at = row.expires_at.replace(tzinfo=timezone.utc) if row.expires_at.tzinfo is None else row.expires_at
     if not row or row.revoked_at is not None or (expires_at is not None and expires_at <= now):
         raise HTTPException(404, "This agent workspace link is invalid or revoked")
+    set_estate_tenant_context(db, [row.organization_id])
     member = db.get(EstateOrganizationMember, row.member_id)
     organization = db.get(EstateOrganization, row.organization_id)
     if not member or not member.is_active or not organization or organization.status != "active":
@@ -6748,7 +6760,13 @@ def create_staff(organization_id: int, payload: StaffCreate, request: Request, d
     full_name = payload.full_name.strip()
     if not full_name:
         raise HTTPException(422, "Staff member's name is required")
-    if db.query(EstateAccount).filter(EstateAccount.email_normalized == email).first():
+    # This dedup check is intentionally platform-wide (an email must be unique across every
+    # organization's accounts, not just the caller's own), so it needs the RLS 'lookup' bypass
+    # even though the caller is already authenticated for organization_id.
+    set_estate_bypass(db, "lookup")
+    email_taken = db.query(EstateAccount).filter(EstateAccount.email_normalized == email).first() is not None
+    set_estate_bypass(db, None)
+    if email_taken:
         raise HTTPException(409, "An Estate account already exists for this email")
     role = None
     if payload.role_id is not None:
