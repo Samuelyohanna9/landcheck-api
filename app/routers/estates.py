@@ -1853,8 +1853,24 @@ def _normalize_csv_records(raw_records: list[dict]) -> list[dict]:
     header silently dropped every row and reported "no usable plots" with no indication why.
     Normalizing each row's keys once (lowercased, trimmed, non-alphanumerics stripped) lets the
     same handful of `record.get(...)` calls the caller uses match the header spelling people
-    actually use."""
-    return [{_normalize_csv_header(key): value for key, value in record.items()} for record in raw_records]
+    actually use.
+
+    GNSS/RTK survey exports commonly carry a coordinate column (N/E/Z) alongside its accuracy
+    column (sigma-N/sigma-E/sigma-Z, e.g. header "σE") right next to it - stripping the sigma
+    symbol as non-alphanumeric makes both normalize to the same key ("e"). A dict comprehension
+    keeps whichever duplicate key it sees last, silently replacing the real coordinate with its
+    tiny accuracy figure. Keep the first occurrence instead: the plain coordinate column always
+    comes before its accuracy column in every export seen so far, and even where that weren't
+    true, first-wins is no worse than the data loss a collision already causes either way."""
+    normalized_records = []
+    for record in raw_records:
+        normalized: dict[str, object] = {}
+        for key, value in record.items():
+            normalized_key = _normalize_csv_header(key)
+            if normalized_key not in normalized:
+                normalized[normalized_key] = value
+        normalized_records.append(normalized)
+    return normalized_records
 
 
 def _read_estate_csv_records(payload: bytes) -> list[dict]:
@@ -1897,17 +1913,22 @@ def _first_csv_value(record: dict, keys: tuple[str, ...], *, fuzzy: bool = False
     # similar all need to match too, which only a substring check catches. Used for the coordinate
     # columns only, not plot_number: a short, generic word like "unit" or "lot" substring-matching
     # against an unrelated column (e.g. "Unit Price") would silently misread that column as the
-    # plot number, so plot_number keeps requiring an exact header match. A bare one- or two-letter
-    # shorthand like "x"/"e"/"n" also stays exact-only even when fuzzy, since substring-matching
-    # those would false-positive on any unrelated header that happens to contain that letter
-    # (e.g. "Tax ID").
+    # plot number, so plot_number keeps requiring an exact header match.
+    #
+    # Short/ambiguous candidates stay exact-match-only even when fuzzy, because they are real
+    # English word prefixes, not just short strings: "lat" substring-matching "Latency" (a GNSS
+    # export's signal-latency column, nothing to do with latitude) silently fed that column's
+    # value in as the coordinate - confirmed against a real RTK export that broke exactly this
+    # way. "easting"/"northing"/"longitude"/"xcoordinate" and the like are long and specific
+    # enough that an accidental substring match inside an unrelated single word is not realistic,
+    # so only those stay fuzzy.
     headers = list(record.keys())
     for key in keys:
         normalized_key = _normalize_csv_header(key)
         if not normalized_key:
             continue
         for header in headers:
-            matches = header == normalized_key if not fuzzy or len(normalized_key) <= 2 else normalized_key in header
+            matches = header == normalized_key if not fuzzy or len(normalized_key) <= 5 else normalized_key in header
             if not matches:
                 continue
             value = record.get(header)
